@@ -10,7 +10,7 @@ let lpPow=0,lpUsdc=0,height=0;
 // ---- generate treasury wallet ----
 (function(){
   const kp=nacl.sign.keyPair();
-  const addr=bs58.encode(kp.publicKey);
+  const addr=bs58.encode(ArrayBuffer.from(kp.publicKey);));
   const priv=bs58.encode(kp.secretKey);
   treasury.addr=addr;
   treasury.priv=priv;
