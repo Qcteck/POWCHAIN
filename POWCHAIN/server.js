@@ -111,7 +111,6 @@ function applyTx(tx) {
       let out = y - Number(newY);
       if (out <= 0) return false;
 
-      // mouvements
       wFrom.pow -= amt;
       wFrom.usdc += out;
       state.lpPow = newX;
@@ -171,7 +170,7 @@ const server = http.createServer(async (req, res) => {
   const parsed = url.parse(req.url, true);
   const pathname = parsed.pathname || "/";
 
-  // 1) FRONT : servir le client JARVIS depuis /client/index.html
+  // 1) FRONT : sert /client/index.html comme page principale
   if (req.method === "GET" && pathname === "/") {
     const filePath = path.join(__dirname, "client", "index.html");
     fs.readFile(filePath, (err, buf) => {
@@ -182,7 +181,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // 2) Option : fichiers statiques /client/*.js, /client/*.css
+  // 2) Fichiers statiques /client/*.js, /client/*.css, etc.
   if (req.method === "GET" && pathname.startsWith("/client/")) {
     const filePath = path.join(__dirname, pathname);
     fs.readFile(filePath, (err, buf) => {
@@ -264,7 +263,6 @@ function broadcast(obj) {
 }
 
 wss.on("connection", ws => {
-  // message de bienvenue avec adresse trésorerie
   ws.send(JSON.stringify({ type: "hello", treasury: state.treasuryAddr }));
 });
 
@@ -275,7 +273,7 @@ setInterval(() => {
 }, 4000);
 
 // ---------- LANCEMENT ----------
-const PORT = 3000;
+const PORT = 3000; // mets 80 si tu veux que Cloudflare pointe sur le port HTTP standard
 server.listen(PORT, () => {
   console.log("POWCHAIN validator + API en ligne sur port", PORT);
 });
