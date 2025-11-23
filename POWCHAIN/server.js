@@ -1,12 +1,17 @@
-// POWCHAIN - mini validator + API pour client JARVIS
+// POWCHAIN — mini validator + API pour client JARVIS
+
 const http = require("http");
 const url = require("url");
+const fs = require("fs");
+const path = require("path");
 const crypto = require("crypto");
+const WebSocket = require("ws");
 
-// --------- ÉTAT POWCHAIN EN MÉMOIRE ---------
+// ---------- CONSTANTES ----------
 const DEC = 1e6;
 const TREASURY_ADDR = "BZJsWeJizv3YeyuWjF5187jrcduPFAHWjqL7jgq4kGwy";
 
+// ---------- ÉTAT EN MÉMOIRE ----------
 let state = {
   height: 0,
   lpPow: 0,
@@ -16,9 +21,9 @@ let state = {
   treasuryAddr: TREASURY_ADDR,
 };
 
-const wallets = {}; // addr -> {pow,usdc,staked,nonce}
-const mempool = []; // tx en attente
-const blocks = [];  // chaîne simple
+const wallets = {};   // addr -> {pow,usdc,staked,nonce}
+const mempool = [];   // txs en attente
+const blocks  = [];   // chaîne simple
 
 function getWallet(addr) {
   if (!wallets[addr]) {
@@ -27,11 +32,11 @@ function getWallet(addr) {
   return wallets[addr];
 }
 
-// Créditer la trésorerie de base pour tester
-getWallet(TREASURY_ADDR).usdc = 1_000_000 * DEC; // 1M USDC POW
+// Crédit de base de la trésorerie pour tester
+getWallet(TREASURY_ADDR).usdc = 1_000_000 * DEC;
 state.treasuryUsdc = getWallet(TREASURY_ADDR).usdc;
 
-// --------- UTILITAIRES HTTP ---------
+// ---------- UTILITAIRES HTTP ----------
 function sendHtml(res, code, html) {
   res.writeHead(code, { "Content-Type": "text/html; charset=utf-8" });
   res.end(html);
@@ -47,7 +52,7 @@ function notFound(res) {
 function parseBody(req) {
   return new Promise((resolve, reject) => {
     let data = "";
-    req.on("data", chunk => (data += chunk));
+    req.on("data", c => (data += c));
     req.on("end", () => {
       if (!data) return resolve({});
       try {
@@ -59,145 +64,143 @@ function parseBody(req) {
   });
 }
 
-// --------- LOGIQUE DES BLOCS ---------
+// ---------- LOGIQUE DES TX ----------
 function applyTx(tx) {
   const wFrom = getWallet(tx.from);
-  if (tx.nonce != null && tx.nonce <= wFrom.nonce) {
-    return false; // déjà utilisé / ordre invalide
-  }
-  if (tx.type === "SWAP") {
+  if (tx.nonce != null && tx.nonce <= wFrom.nonce) return false;
+
+  if (tx.type === "SEND") {
     const amt = tx.amount || 0;
-    if (tx.token === "pow2usdc") {
-      // POW -> USDC POW
-      if (wFrom.pow < amt) return false;
-      wFrom.pow -= amt;
-      wFrom.usdc += amt; // 1:1 pour demo
-      state.lpPow += amt;
-      state.lpUsdc -= amt;
-    } else if (tx.token === "usdc2pow") {
-      // USDC POW -> POW
-      if (wFrom.usdc < amt) return false;
-      wFrom.usdc -= amt;
-      wFrom.pow += amt;
-      state.lpUsdc += amt;
-      state.lpPow -= amt;
-    }
-  } else if (tx.type === "LP_ADD") {
+    if (amt <= 0) return false;
+    if (!tx.to) return false;
+    const wTo = getWallet(tx.to);
+    if (wFrom.pow < amt) return false;
+    wFrom.pow -= amt;
+    wTo.pow += amt;
+  }
+
+  if (tx.type === "LP_ADD") {
     const p = tx.pow || 0;
     const u = tx.usdc || 0;
+    if (p <= 0 || u <= 0) return false;
     if (wFrom.pow < p || wFrom.usdc < u) return false;
     wFrom.pow -= p;
     wFrom.usdc -= u;
     state.lpPow += p;
     state.lpUsdc += u;
-  } else if (tx.type === "SEND") {
+  }
+
+  if (tx.type === "SWAP") {
     const amt = tx.amount || 0;
-    const token = tx.token || "POW";
-    if (token === "POW") {
+    if (amt <= 0) return false;
+    if (!state.lpPow || !state.lpUsdc) return false;
+
+    // AMM x*y=k avec fee 0.3% vers la trésorerie
+    const feeRate = 0.003;
+
+    if (tx.token === "pow2usdc") {
       if (wFrom.pow < amt) return false;
+
+      const amountInNoFee = Math.floor(amt * (1 - feeRate));
+      const x = state.lpPow;
+      const y = state.lpUsdc;
+      const k = BigInt(x) * BigInt(y);
+
+      const newX = x + amountInNoFee;
+      const newY = k / BigInt(newX);
+      let out = y - Number(newY);
+      if (out <= 0) return false;
+
+      // mouvements
       wFrom.pow -= amt;
-      getWallet(tx.to).pow += amt;
-    } else if (token === "USDC") {
+      wFrom.usdc += out;
+      state.lpPow = newX;
+      state.lpUsdc = Number(newY);
+      state.treasuryUsdc += amt - amountInNoFee;
+    } else if (tx.token === "usdc2pow") {
       if (wFrom.usdc < amt) return false;
+
+      const amountInNoFee = Math.floor(amt * (1 - feeRate));
+      const x = state.lpUsdc;
+      const y = state.lpPow;
+      const k = BigInt(x) * BigInt(y);
+
+      const newX = x + amountInNoFee;
+      const newY = k / BigInt(newX);
+      let out = y - Number(newY);
+      if (out <= 0) return false;
+
       wFrom.usdc -= amt;
-      getWallet(tx.to).usdc += amt;
+      wFrom.pow += out;
+      state.lpUsdc = newX;
+      state.lpPow = Number(newY);
+      state.treasuryUsdc += amt - amountInNoFee;
+    } else {
+      return false;
     }
   }
-  // nonce OK
+
   if (tx.nonce != null) wFrom.nonce = tx.nonce;
   return true;
 }
 
+// ---------- BLOCS ----------
 function forgeBlock() {
   if (!mempool.length) return null;
   const txs = mempool.splice(0, mempool.length);
   state.height += 1;
+
   const blk = {
     height: state.height,
     time: Date.now(),
     validator: "POWCHAIN-DEV",
     txs,
   };
-  const h = crypto
+
+  blk.hash = crypto
     .createHash("sha256")
     .update(JSON.stringify(blk))
     .digest("hex");
-  blk.hash = h;
+
   blocks.push(blk);
   return blk;
 }
 
-// --------- PAGE SIMPLE "POWCHAIN ONLINE" ---------
-const PAGE_INDEX = `<!doctype html><html><head><meta charset="utf-8"/><title>POWCHAIN ONLINE</title><style>body{background:#000;color:#0ff;font-family:Arial;text-align:center;padding-top:60px}a{color:#0ff} .box{background:#001c41;border:1px solid #0ff;padding:20px;border-radius:10px;display:inline-block}</style></head><body><h1>POWCHAIN ONLINE</h1><div class="box"><p>Client connecté au serveur POWCHAIN</p><p>IP serveur: 72.60.65.18 — Port: 3000</p><a href="/balance">Voir SOLDE</a><br/><br/><a href="/mempool">Voir MEMPOOL</a><br/><br/><a href="/blocks">Voir BLOCKS</a><br/><br/><a href="/send?to=TEST&amount=1" style="color:red">Tester SEND (1 POW → TEST)</a></div></body></html>`;
-
-// --------- SERVEUR HTTP ---------
+// ---------- SERVEUR HTTP ----------
 const server = http.createServer(async (req, res) => {
   const parsed = url.parse(req.url, true);
-  const path = parsed.pathname || "/";
+  const pathname = parsed.pathname || "/";
 
-  // CORS simple pour ton client HTML externe
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  if (req.method === "OPTIONS") {
-    res.writeHead(204);
-    return res.end();
-  }
-
-  // PAGE SIMPLE
-  if (req.method === "GET" && path === "/") {
-    return sendHtml(res, 200, PAGE_INDEX);
+  // 1) FRONT : servir le client JARVIS depuis /client/index.html
+  if (req.method === "GET" && pathname === "/") {
+    const filePath = path.join(__dirname, "client", "index.html");
+    fs.readFile(filePath, (err, buf) => {
+      if (err) return notFound(res);
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      res.end(buf);
+    });
+    return;
   }
 
-  // -------- API POUR VIEUX CLIENT --------
-  if (req.method === "GET" && path === "/balance") {
-    return sendHtml(
-      res,
-      200,
-      "<pre>" + JSON.stringify(wallets, null, 2) + "</pre>"
-    );
-  }
-  if (req.method === "GET" && path === "/mempool") {
-    return sendHtml(
-      res,
-      200,
-      "<pre>" + JSON.stringify(mempool, null, 2) + "</pre>"
-    );
-  }
-  if (req.method === "GET" && path === "/blocks") {
-    return sendHtml(
-      res,
-      200,
-      "<pre>" + JSON.stringify(blocks, null, 2) + "</pre>"
-    );
-  }
-  if (req.method === "GET" && path === "/send") {
-    // petit test : créditer POW et envoyer
-    const from = TREASURY_ADDR;
-    const to = parsed.query.to || "TEST";
-    const amount = parseInt(parsed.query.amount || "1") * DEC;
-    const tx = {
-      type: "SEND",
-      from,
-      to,
-      amount,
-      token: "POW",
-      nonce: getWallet(from).nonce + 1,
-    };
-    mempool.push(tx);
-    applyTx(tx);
-    forgeBlock();
-    return sendHtml(
-      res,
-      200,
-      `<p>TX envoyée de ${from} vers ${to} (${amount / DEC} POW)</p><p><a href="/">Retour</a></p>`
-    );
+  // 2) Option : fichiers statiques /client/*.js, /client/*.css
+  if (req.method === "GET" && pathname.startsWith("/client/")) {
+    const filePath = path.join(__dirname, pathname);
+    fs.readFile(filePath, (err, buf) => {
+      if (err) return notFound(res);
+      let type = "text/plain; charset=utf-8";
+      if (filePath.endsWith(".html")) type = "text/html; charset=utf-8";
+      else if (filePath.endsWith(".js"))
+        type = "application/javascript; charset=utf-8";
+      else if (filePath.endsWith(".css"))
+        type = "text/css; charset=utf-8";
+      res.writeHead(200, { "Content-Type": type });
+      res.end(buf);
+    });
+    return;
   }
 
-  // -------- API POUR CLIENT JARVIS --------
-
-  // /stats : résumé réseau
-  if (req.method === "GET" && path === "/stats") {
+  // 3) API /stats
+  if (req.method === "GET" && pathname === "/stats") {
     const s = {
       height: state.height,
       lpPow: state.lpPow,
@@ -209,42 +212,40 @@ const server = http.createServer(async (req, res) => {
     return sendJson(res, s);
   }
 
-  // /wallet/:addr
-  if (req.method === "GET" && path.startsWith("/wallet/")) {
-    const addr = decodeURIComponent(path.slice("/wallet/".length));
+  // 4) API /wallet/:addr
+  if (req.method === "GET" && pathname.startsWith("/wallet/")) {
+    const addr = decodeURIComponent(pathname.slice("/wallet/".length));
     const w = getWallet(addr);
     return sendJson(res, { addr, ...w });
   }
 
-  // /block/:h
-  if (req.method === "GET" && path.startsWith("/block/")) {
-    const hStr = path.slice("/block/".length);
+  // 5) API /block/:h
+  if (req.method === "GET" && pathname.startsWith("/block/")) {
+    const hStr = pathname.slice("/block/".length);
     const h = parseInt(hStr, 10);
     const blk = blocks.find(b => b.height === h);
     if (!blk) return notFound(res);
     return sendJson(res, blk);
   }
 
-  // POST /tx  (SWAP / LP_ADD / SEND)
-  if (req.method === "POST" && path === "/tx") {
+  // 6) POST /tx (SWAP / LP_ADD / SEND)
+  if (req.method === "POST" && pathname === "/tx") {
     try {
       const tx = await parseBody(req);
       if (!tx || !tx.type || !tx.from) {
         res.writeHead(400);
-        return res.end("Bad tx");
+        return res.end("bad tx");
       }
-      // on applique direct + on ajoute au mempool pour l'historique
       if (!applyTx(tx)) {
         res.writeHead(400);
-        return res.end("TX invalid");
+        return res.end("rejected");
       }
       mempool.push(tx);
-      const blk = forgeBlock();
-      state.treasuryUsdc = getWallet(TREASURY_ADDR).usdc;
-      return sendJson(res, { ok: true, height: state.height, block: blk });
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ ok: true }));
     } catch (e) {
       res.writeHead(500);
-      return res.end("Server error: " + e.message);
+      return res.end("error");
     }
   }
 
@@ -252,8 +253,29 @@ const server = http.createServer(async (req, res) => {
   return notFound(res);
 });
 
-// --------- LANCEMENT ---------
+// ---------- WEBSOCKET ----------
+const wss = new WebSocket.Server({ server });
+
+function broadcast(obj) {
+  const msg = JSON.stringify(obj);
+  wss.clients.forEach(c => {
+    if (c.readyState === WebSocket.OPEN) c.send(msg);
+  });
+}
+
+wss.on("connection", ws => {
+  // message de bienvenue avec adresse trésorerie
+  ws.send(JSON.stringify({ type: "hello", treasury: state.treasuryAddr }));
+});
+
+// Boucle bloc automatique
+setInterval(() => {
+  const blk = forgeBlock();
+  if (blk) broadcast({ type: "block", height: blk.height, hash: blk.hash });
+}, 4000);
+
+// ---------- LANCEMENT ----------
 const PORT = 3000;
 server.listen(PORT, () => {
-  console.log("POWCHAIN server listening on port", PORT);
+  console.log("POWCHAIN validator + API en ligne sur port", PORT);
 });
