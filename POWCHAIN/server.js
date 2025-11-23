@@ -1,69 +1,118 @@
-const express = require("express");
-const app = express();
-app.use(express.json());
-app.use(express.static(__dirname + "/client"));
+const fs = require("fs");
+const http = require("http");
 
-let block = 1;
-let mempool = [];
-let totalSupply = 1000000;
-let lpTvl = 0;
-let balances = {}; // {addr:{pow,usd,staked}}
+const PORT = 3000;
+const walletFile = "wallet.json";
 
-function ensureWallet(a){
-  if(!balances[a]) balances[a] = {pow:0,usd:0,staked:0};
+// ------ Génération automatique du wallet ------
+let wallet;
+if (fs.existsSync(walletFile)) {
+  wallet = JSON.parse(fs.readFileSync(walletFile));
+} else {
+  const { generateKeyPairSync } = require("crypto");
+  const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+  wallet = {
+    address: publicKey.export({ type: "spki", format: "der" }).toString("hex"),
+    private: privateKey.export({ type: "pkcs8", format: "der" }).toString("hex"),
+    pow: 1000,
+    usdc: 0
+  };
+  fs.writeFileSync(walletFile, JSON.stringify(wallet, null, 2));
+  console.log("🚀 Nouveau wallet généré !");
+  console.log("Adresse :", wallet.address);
+  console.log("Clé privée :", wallet.private);
 }
 
-setInterval(()=>{ if(mempool.length>=1){
-  mempool = [];
-  block++;
-}},5000);
+// ------ Blockchain ------
+let chain = [];
+let mempool = [];
+let lp = { pow: 50000, usdc: 50000 }; // Liquidity pool
+let blockTxCount = 0;
 
-app.get("/state",(req,res)=>{
-  res.json({block,mempool,totalSupply,lpTvl,balances});
+// SHA256 util
+const sha = x => require("crypto").createHash("sha256").update(JSON.stringify(x)).digest("hex");
+
+// Crée un bloc
+function mineBlock() {
+  const block = {
+    id: chain.length,
+    time: Date.now(),
+    tx: mempool.splice(0, 5),
+    lp: { ...lp }
+  };
+  block.hash = sha(block);
+  chain.push(block);
+  blockTxCount = 0;
+  console.log("⛏️ Bloc miné :", block.id);
+}
+
+// Ajoute une TX dans mempool
+function pushTx(t) {
+  mempool.push(t);
+  blockTxCount++;
+  if (blockTxCount >= 5) mineBlock();
+}
+
+// Swap interne
+function swap(type, amount) {
+  if (type === "POW→USDC" && wallet.pow >= amount) {
+    const usdcRecv = (amount * lp.usdc) / lp.pow;
+    wallet.pow -= amount;
+    wallet.usdc += usdcRecv;
+    lp.pow += amount;
+    lp.usdc -= usdcRecv;
+    return { pow: wallet.pow, usdc: wallet.usdc };
+  }
+  if (type === "USDC→POW" && wallet.usdc >= amount) {
+    const powRecv = (amount * lp.pow) / lp.usdc;
+    wallet.usdc -= amount;
+    wallet.pow += powRecv;
+    lp.usdc += amount;
+    lp.pow -= powRecv;
+    return { pow: wallet.pow, usdc: wallet.usdc };
+  }
+  return null;
+}
+
+// ------ Serveur HTTP ------
+const server = http.createServer((req, res) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Content-Type", "application/json");
+
+  if (req.url === "/balance") return res.end(JSON.stringify(wallet));
+  if (req.url === "/mempool") return res.end(JSON.stringify(mempool));
+  if (req.url === "/blocks") return res.end(JSON.stringify(chain));
+
+  if (req.url.startsWith("/send?to=")) {
+    const url = new URL("http://x" + req.url);
+    const to = url.searchParams.get("to");
+    const amount = Number(url.searchParams.get("amount") || 0);
+    if (wallet.pow >= amount) {
+      wallet.pow -= amount;
+      pushTx({ from: wallet.address, to, amount });
+      return res.end(JSON.stringify({ ok: true, pow: wallet.pow }));
+    }
+    return res.end(JSON.stringify({ ok: false, reason: "insufficient" }));
+  }
+
+  if (req.url.startsWith("/swap?type=")) {
+    const url = new URL("http://x" + req.url);
+    const type = url.searchParams.get("type");
+    const amount = Number(url.searchParams.get("amount") || 0);
+    const r = swap(type, amount);
+    if (r) return res.end(JSON.stringify({ ok: true, balance: r }));
+    return res.end(JSON.stringify({ ok: false }));
+  }
+
+  return res.end(JSON.stringify({ ok: false, msg: "route unknown" }));
 });
 
-app.post("/tx",(req,res)=>{
-  let tx = req.body;
-  ensureWallet(tx.from);
+// ------ Auto sauvegarde ------
+setInterval(() => fs.writeFileSync(walletFile, JSON.stringify(wallet, null, 2)), 3000);
 
-  if(tx.type === "swap"){
-    if(tx.pair === "POWtoUSD"){
-      if(balances[tx.from].pow < tx.amount) return res.json({err:"No POW"});
-      balances[tx.from].pow -= tx.amount;
-      balances[tx.from].usd += tx.amount;
-    }
-    if(tx.pair === "USDtoPOW"){
-      if(balances[tx.from].usd < tx.amount) return res.json({err:"No USD"});
-      balances[tx.from].usd -= tx.amount;
-      balances[tx.from].pow += tx.amount;
-    }
-  }
-
-  if(tx.type === "stake"){
-    if(balances[tx.from].pow < tx.amount) return res.json({err:"No POW"});
-    balances[tx.from].pow -= tx.amount;
-    balances[tx.from].staked += tx.amount;
-  }
-
-  if(tx.type === "unstake"){
-    balances[tx.from].pow += balances[tx.from].staked;
-    balances[tx.from].staked = 0;
-  }
-
-  if(tx.type === "addLP"){
-    balances[tx.from].pow -= tx.pow;
-    balances[tx.from].usd -= tx.usd;
-    lpTvl += tx.pow + tx.usd;
-  }
-
-  if(tx.type === "remLP"){
-    balances[tx.from].pow += 10;
-    balances[tx.from].usd += 10;
-    lpTvl -= 20;
-  }
-
-  mempool.push(tx);
-  return res.json({ok:true});
+// Lancement
+server.listen(PORT, () => {
+  console.log("\n🔥 POWCHAIN SERVER démarré");
+  console.log("http://localhost:" + PORT);
+  console.log("Adresse POW :", wallet.address);
 });
-
-app.listen(3000, ()=> console.log("POWCHAIN server running on port 3000"));
