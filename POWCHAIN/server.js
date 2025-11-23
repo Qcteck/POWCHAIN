@@ -273,7 +273,7 @@ setInterval(() => {
 }, 4000);
 
 // ---------- LANCEMENT ----------
-const PORT = 3000; // mets 80 si tu veux que Cloudflare pointe sur le port HTTP standard
+const PORT = 80; // mets 80 si tu veux que Cloudflare pointe sur le port HTTP standard
 server.listen(PORT, () => {
   console.log("POWCHAIN validator + API en ligne sur port", PORT);
 });
