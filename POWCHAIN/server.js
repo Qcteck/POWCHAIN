@@ -1,279 +1,226 @@
-// POWCHAIN — mini validator + API pour client JARVIS
+// server.js — POWCHAIN Validator minimal (API + WS)
+// API:  http://127.0.0.1:3000
+// WS :  ws://0.0.0.0:2053  (exposé en wss://bbqfinance.fun:2053 via Cloudflare)
 
 const http = require("http");
-const url = require("url");
-const fs = require("fs");
-const path = require("path");
-const crypto = require("crypto");
+const express = require("express");
+const cors = require("cors");
 const WebSocket = require("ws");
 
-// ---------- CONSTANTES ----------
-const DEC = 1e6;
-const TREASURY_ADDR = "BZJsWeJizv3YeyuWjF5187jrcduPFAHWjqL7jgq4kGwy";
+// ----------- CONFIG ----------
+const HTTP_PORT = 3000;
+const WS_PORT = 2053;
+const TREASURY_SOLANA = "BZJsWeJizv3YeyuWjF5187jrcduPFAHWjqL7jgq4kGwy";
 
-// ---------- ÉTAT EN MÉMOIRE ----------
-let state = {
-  height: 0,
-  lpPow: 0,
-  lpUsdc: 0,
-  treasuryUsdc: 0,
-  treasurySol: 0,
-  treasuryAddr: TREASURY_ADDR,
+// ----------- ÉTAT POWCHAIN ----------
+let height = 0;
+let lastBlockTime = Date.now();
+
+const wallets = new Map(); // addr -> { pow, usdcPow, staked, nonce }
+const treasury = {
+  solBridge: 0,       // SOL reçus (bridges)
+  usdcPow: 0,         // réserve USDC POW
+  pow: 0,             // POW détenus par la trésorerie
 };
 
-const wallets = {};   // addr -> {pow,usdc,staked,nonce}
-const mempool = [];   // txs en attente
-const blocks  = [];   // chaîne simple
-
-function getWallet(addr) {
-  if (!wallets[addr]) {
-    wallets[addr] = { pow: 0, usdc: 0, staked: 0, nonce: 0 };
+function getOrCreateWallet(addr) {
+  if (!wallets.has(addr)) {
+    wallets.set(addr, { pow: 0, usdcPow: 0, staked: 0, nonce: 0 });
   }
-  return wallets[addr];
+  return wallets.get(addr);
 }
 
-// Crédit de base de la trésorerie pour tester
-getWallet(TREASURY_ADDR).usdc = 1_000_000 * DEC;
-state.treasuryUsdc = getWallet(TREASURY_ADDR).usdc;
+function computeTVL() {
+  let tvl = treasury.usdcPow;
+  for (const w of wallets.values()) tvl += w.usdcPow;
+  return tvl;
+}
 
-// ---------- UTILITAIRES HTTP ----------
-function sendHtml(res, code, html) {
-  res.writeHead(code, { "Content-Type": "text/html; charset=utf-8" });
-  res.end(html);
+function internalPrice() {
+  const tvl = computeTVL();
+  if (tvl === 0) return 1;
+  return 1 + height / 1000; // petite pente, juste un prix interne indicatif
 }
-function sendJson(res, obj) {
-  res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-  res.end(JSON.stringify(obj));
-}
-function notFound(res) {
-  res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
-  res.end("404");
-}
-function parseBody(req) {
-  return new Promise((resolve, reject) => {
-    let data = "";
-    req.on("data", c => (data += c));
-    req.on("end", () => {
-      if (!data) return resolve({});
-      try {
-        resolve(JSON.parse(data));
-      } catch (e) {
-        reject(e);
+
+// ----------- EXPRESS API ----------
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+// CORS sécurité de base
+app.use((req, res, next) => {
+  res.setHeader("X-Powchain-Node", "bbqfinance.fun-validator");
+  next();
+});
+
+// GET /api/state — infos réseau globales
+app.get("/api/state", (req, res) => {
+  res.json({
+    network: "POWCHAIN",
+    height,
+    tvl: computeTVL(),
+    price: internalPrice(),
+    lastBlockTime,
+    treasury: {
+      solBridge: treasury.solBridge,
+      usdcPow: treasury.usdcPow,
+      pow: treasury.pow,
+      solanaAddress: TREASURY_SOLANA,
+    },
+  });
+});
+
+// GET /api/wallet/:addr — infos d’un wallet POWCHAIN
+app.get("/api/wallet/:addr", (req, res) => {
+  const addr = String(req.params.addr);
+  const w = getOrCreateWallet(addr);
+  res.json({ addr, ...w });
+});
+
+// POST /api/tx — réception de tx simples (SWAP / BRIDGE_MINT)
+app.post("/api/tx", (req, res) => {
+  try {
+    const tx = req.body || {};
+    const { type, from, nonce, amount, token } = tx;
+
+    if (!type || !from || typeof nonce !== "number") {
+      return res.status(400).json({ ok: false, error: "TX invalide" });
+    }
+
+    const w = getOrCreateWallet(from);
+    if (nonce <= w.nonce) {
+      return res.status(400).json({ ok: false, error: "Nonce non croissant" });
+    }
+
+    // Simple anti valeurs folles
+    if (amount <= 0 || amount > 1e12) {
+      return res.status(400).json({ ok: false, error: "Montant invalide" });
+    }
+
+    if (type === "BRIDGE_MINT") {
+      // On crédite l’utilisateur en USDC POW
+      w.usdcPow += amount;
+      treasury.usdcPow += amount;
+      treasury.solBridge += tx.solAmount || 0;
+      w.nonce = nonce;
+      broadcastWallet(from);
+      broadcastState();
+      return res.json({ ok: true });
+    }
+
+    if (type === "SWAP") {
+      // DEX interne POW <-> USDC POW ultra simple
+      if (token !== "POW" && token !== "USDC_POW") {
+        return res.status(400).json({ ok: false, error: "Token inconnu" });
       }
-    });
+      const price = internalPrice(); // 1 POW ≈ price USDC POW
+
+      if (token === "POW") {
+        // L’utilisateur vend POW, reçoit USDC POW
+        if (w.pow < amount) {
+          return res.status(400).json({ ok: false, error: "POW insuffisant" });
+        }
+        const out = amount * price;
+        w.pow -= amount;
+        w.usdcPow += out;
+        treasury.pow += amount;
+        treasury.usdcPow -= out;
+      } else {
+        // L’utilisateur vend USDC POW, reçoit POW
+        if (w.usdcPow < amount) {
+          return res
+            .status(400)
+            .json({ ok: false, error: "USDC POW insuffisant" });
+        }
+        const out = amount / price;
+        w.usdcPow -= amount;
+        w.pow += out;
+        treasury.usdcPow += amount;
+        treasury.pow -= out;
+      }
+
+      w.nonce = nonce;
+      broadcastWallet(from);
+      broadcastState();
+      return res.json({ ok: true });
+    }
+
+    return res.status(400).json({ ok: false, error: "Type de TX inconnu" });
+  } catch (e) {
+    console.error("Erreur /api/tx", e);
+    res.status(500).json({ ok: false, error: "Erreur interne" });
+  }
+});
+
+// GET /api/proof — mini Proof-of-Reserves lecture seule
+app.get("/api/proof", (req, res) => {
+  res.json({
+    treasury: {
+      solBridge: treasury.solBridge,
+      usdcPow: treasury.usdcPow,
+      pow: treasury.pow,
+      solanaAddress: TREASURY_SOLANA,
+    },
+    powchain: {
+      tvl: computeTVL(),
+      height,
+      price: internalPrice(),
+    },
+  });
+});
+
+// HTTP server + attach WS séparé
+const httpServer = http.createServer(app);
+httpServer.listen(HTTP_PORT, () => {
+  console.log("POWCHAIN HTTP API sur port", HTTP_PORT);
+});
+
+// ----------- WebSocket ----------
+const wss = new WebSocket.Server({ port: WS_PORT }, () => {
+  console.log("POWCHAIN WS sur port", WS_PORT);
+});
+
+function broadcast(type, payload) {
+  const msg = JSON.stringify({ type, ...payload });
+  for (const client of wss.clients) {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(msg);
+    }
+  }
+}
+
+function broadcastState() {
+  broadcast("state", {
+    network: "POWCHAIN",
+    height,
+    tvl: computeTVL(),
+    price: internalPrice(),
+    lastBlockTime,
   });
 }
 
-// ---------- LOGIQUE DES TX ----------
-function applyTx(tx) {
-  const wFrom = getWallet(tx.from);
-  if (tx.nonce != null && tx.nonce <= wFrom.nonce) return false;
-
-  if (tx.type === "SEND") {
-    const amt = tx.amount || 0;
-    if (amt <= 0) return false;
-    if (!tx.to) return false;
-    const wTo = getWallet(tx.to);
-    if (wFrom.pow < amt) return false;
-    wFrom.pow -= amt;
-    wTo.pow += amt;
-  }
-
-  if (tx.type === "LP_ADD") {
-    const p = tx.pow || 0;
-    const u = tx.usdc || 0;
-    if (p <= 0 || u <= 0) return false;
-    if (wFrom.pow < p || wFrom.usdc < u) return false;
-    wFrom.pow -= p;
-    wFrom.usdc -= u;
-    state.lpPow += p;
-    state.lpUsdc += u;
-  }
-
-  if (tx.type === "SWAP") {
-    const amt = tx.amount || 0;
-    if (amt <= 0) return false;
-    if (!state.lpPow || !state.lpUsdc) return false;
-
-    // AMM x*y=k avec fee 0.3% vers la trésorerie
-    const feeRate = 0.003;
-
-    if (tx.token === "pow2usdc") {
-      if (wFrom.pow < amt) return false;
-
-      const amountInNoFee = Math.floor(amt * (1 - feeRate));
-      const x = state.lpPow;
-      const y = state.lpUsdc;
-      const k = BigInt(x) * BigInt(y);
-
-      const newX = x + amountInNoFee;
-      const newY = k / BigInt(newX);
-      let out = y - Number(newY);
-      if (out <= 0) return false;
-
-      wFrom.pow -= amt;
-      wFrom.usdc += out;
-      state.lpPow = newX;
-      state.lpUsdc = Number(newY);
-      state.treasuryUsdc += amt - amountInNoFee;
-    } else if (tx.token === "usdc2pow") {
-      if (wFrom.usdc < amt) return false;
-
-      const amountInNoFee = Math.floor(amt * (1 - feeRate));
-      const x = state.lpUsdc;
-      const y = state.lpPow;
-      const k = BigInt(x) * BigInt(y);
-
-      const newX = x + amountInNoFee;
-      const newY = k / BigInt(newX);
-      let out = y - Number(newY);
-      if (out <= 0) return false;
-
-      wFrom.usdc -= amt;
-      wFrom.pow += out;
-      state.lpUsdc = newX;
-      state.lpPow = Number(newY);
-      state.treasuryUsdc += amt - amountInNoFee;
-    } else {
-      return false;
-    }
-  }
-
-  if (tx.nonce != null) wFrom.nonce = tx.nonce;
-  return true;
+function broadcastWallet(addr) {
+  const w = wallets.get(addr);
+  if (!w) return;
+  broadcast("wallet", { addr, ...w });
 }
 
-// ---------- BLOCS ----------
-function forgeBlock() {
-  if (!mempool.length) return null;
-  const txs = mempool.splice(0, mempool.length);
-  state.height += 1;
-
-  const blk = {
-    height: state.height,
-    time: Date.now(),
-    validator: "POWCHAIN-DEV",
-    txs,
-  };
-
-  blk.hash = crypto
-    .createHash("sha256")
-    .update(JSON.stringify(blk))
-    .digest("hex");
-
-  blocks.push(blk);
-  return blk;
-}
-
-// ---------- SERVEUR HTTP ----------
-const server = http.createServer(async (req, res) => {
-  const parsed = url.parse(req.url, true);
-  const pathname = parsed.pathname || "/";
-
-  // 1) FRONT : sert /client/index.html comme page principale
-  if (req.method === "GET" && pathname === "/") {
-    const filePath = path.join(__dirname, "client", "index.html");
-    fs.readFile(filePath, (err, buf) => {
-      if (err) return notFound(res);
-      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-      res.end(buf);
-    });
-    return;
-  }
-
-  // 2) Fichiers statiques /client/*.js, /client/*.css, etc.
-  if (req.method === "GET" && pathname.startsWith("/client/")) {
-    const filePath = path.join(__dirname, pathname);
-    fs.readFile(filePath, (err, buf) => {
-      if (err) return notFound(res);
-      let type = "text/plain; charset=utf-8";
-      if (filePath.endsWith(".html")) type = "text/html; charset=utf-8";
-      else if (filePath.endsWith(".js"))
-        type = "application/javascript; charset=utf-8";
-      else if (filePath.endsWith(".css"))
-        type = "text/css; charset=utf-8";
-      res.writeHead(200, { "Content-Type": type });
-      res.end(buf);
-    });
-    return;
-  }
-
-  // 3) API /stats
-  if (req.method === "GET" && pathname === "/stats") {
-    const s = {
-      height: state.height,
-      lpPow: state.lpPow,
-      lpUsdc: state.lpUsdc,
-      treasuryUsdc: state.treasuryUsdc,
-      treasurySol: state.treasurySol,
-      treasuryAddr: state.treasuryAddr,
-    };
-    return sendJson(res, s);
-  }
-
-  // 4) API /wallet/:addr
-  if (req.method === "GET" && pathname.startsWith("/wallet/")) {
-    const addr = decodeURIComponent(pathname.slice("/wallet/".length));
-    const w = getWallet(addr);
-    return sendJson(res, { addr, ...w });
-  }
-
-  // 5) API /block/:h
-  if (req.method === "GET" && pathname.startsWith("/block/")) {
-    const hStr = pathname.slice("/block/".length);
-    const h = parseInt(hStr, 10);
-    const blk = blocks.find(b => b.height === h);
-    if (!blk) return notFound(res);
-    return sendJson(res, blk);
-  }
-
-  // 6) POST /tx (SWAP / LP_ADD / SEND)
-  if (req.method === "POST" && pathname === "/tx") {
-    try {
-      const tx = await parseBody(req);
-      if (!tx || !tx.type || !tx.from) {
-        res.writeHead(400);
-        return res.end("bad tx");
-      }
-      if (!applyTx(tx)) {
-        res.writeHead(400);
-        return res.end("rejected");
-      }
-      mempool.push(tx);
-      res.writeHead(200, { "Content-Type": "application/json" });
-      return res.end(JSON.stringify({ ok: true }));
-    } catch (e) {
-      res.writeHead(500);
-      return res.end("error");
-    }
-  }
-
-  // fallback
-  return notFound(res);
+wss.on("connection", (ws) => {
+  console.log("Client WS connecté");
+  ws.send(
+    JSON.stringify({
+      type: "hello",
+      network: "POWCHAIN",
+      height,
+      tvl: computeTVL(),
+      price: internalPrice(),
+    })
+  );
 });
 
-// ---------- WEBSOCKET ----------
-const wss = new WebSocket.Server({ server });
-
-function broadcast(obj) {
-  const msg = JSON.stringify(obj);
-  wss.clients.forEach(c => {
-    if (c.readyState === WebSocket.OPEN) c.send(msg);
-  });
-}
-
-wss.on("connection", ws => {
-  ws.send(JSON.stringify({ type: "hello", treasury: state.treasuryAddr }));
-});
-
-// Boucle bloc automatique
+// ----------- Production de blocs "PoS" simplifiée ----------
 setInterval(() => {
-  const blk = forgeBlock();
-  if (blk) broadcast({ type: "block", height: blk.height, hash: blk.hash });
-}, 4000);
-
-// ---------- LANCEMENT ----------
-const PORT = 80; // mets 80 si tu veux que Cloudflare pointe sur le port HTTP standard
-server.listen(PORT, () => {
-  console.log("POWCHAIN validator + API en ligne sur port", PORT);
-});
+  height += 1;
+  lastBlockTime = Date.now();
+  broadcastState();
+}, 5000);
