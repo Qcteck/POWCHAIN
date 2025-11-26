@@ -15,7 +15,9 @@ const app = express();
 app.use(express.json());
 
 const server = http.createServer(app);
-const wss = new WebSocket.Server({ server, path: "/ws" }); // <= /ws OK
+
+// ⚠️ WebSocket sur /ws (important pour nginx)
+const wss = new WebSocket.Server({ server, path: "/ws" });
 
 const TREASURY_POWCHAIN = "TREASURY_POWCHAIN";
 const TREASURY_SOL = "BZJsWeJizv3YeyuWjF5187jrcduPFAHWjqL7jgq4kGwy";
@@ -26,8 +28,8 @@ const state = {
   mempool: [],
   wallets: new Map(),
   lp: {
-    pow: 1000000,   // réserve POW du LP
-    usdc: 1000000   // réserve USDC POW du LP
+    pow: 1000000,   // réserve POW dans le pool
+    usdc: 1000000   // réserve USDC POW dans le pool
   },
   pricePow: 1
 };
@@ -46,156 +48,14 @@ function getWallet(pub) {
   return state.wallets.get(pub);
 }
 
+// -------------------- BLOCKCHAIN --------------------
 function hashBlock(data) {
   return crypto.createHash("sha256").update(JSON.stringify(data)).digest("hex");
 }
 
-// -------------------- BLOCKCHAIN --------------------
-function produceBlock(producer = TREASURY_POWCHAIN, txs = null) {
-  const prev = state.blocks[state.blocks.length - 1];
-  const block = {
-    index: state.blocks.length,
-    prevHash: prev ? prev.hash : "GENESIS",
-    timestamp: Date.now(),
-    producer,
-    txs: txs ? txs : state.mempool.splice(0)
-  };
-  block.hash = hashBlock(block);
-  state.blocks.push(block);
-  state.height = block.index;
-
-  if (state.lp.pow > 0) {
-    state.pricePow = state.lp.usdc / state.lp.pow;
-  } else {
-    state.pricePow = 0;
-  }
-
-  broadcastExplorer();
-  console.log(`Nouveau bloc ${block.index} par ${producer}`);
-  return block;
-}
-
-// Genesis immédiat pour que l'explorer ait des données
-(function initGenesis() {
-  const genesisWallet = getWallet(TREASURY_POWCHAIN);
-  genesisWallet.pow = 1000000;
-  genesisWallet.usdc = 1000000;
-  produceBlock(TREASURY_POWCHAIN, []); // bloc 0
-})();
-
-// -------------------- SIG / NONCE --------------------
-function verifyTxSig(tx) {
-  try {
-    const msg = {
-      type: tx.type,
-      from: tx.from,
-      to: tx.to ?? null,
-      amount: tx.amount ?? null,
-      token: tx.token ?? null,
-      nonce: tx.nonce
-    };
-    const msgBytes = new TextEncoder().encode(JSON.stringify(msg));
-    const sigBytes = bs58.decode(tx.sig);
-    const pubBytes = bs58.decode(tx.pub);
-    return nacl.sign.detached.verify(msgBytes, sigBytes, pubBytes);
-  } catch (e) {
-    console.error("verifyTxSig error", e);
-    return false;
-  }
-}
-
-function checkNonce(tx, wallet) {
-  return tx.nonce === wallet.nonce + 1;
-}
-
-// -------------------- APPLI TX --------------------
-function applyTransfer(tx) {
-  const from = getWallet(tx.from);
-  const to = getWallet(tx.to);
-  const amount = Number(tx.amount || 0);
-  if (amount <= 0 || !Number.isFinite(amount)) throw new Error("Montant invalide");
-  if (from.pow < amount) throw new Error("Solde POW insuffisant");
-  from.pow -= amount;
-  to.pow += amount;
-}
-
-function applySwapPowToUsdc(tx) {
-  const w = getWallet(tx.from);
-  const amountIn = Number(tx.amount || 0);
-  if (amountIn <= 0 || !Number.isFinite(amountIn)) throw new Error("Montant invalide");
-  if (w.pow < amountIn) throw new Error("Solde POW insuffisant");
-
-  const feeFactor = 0.998;
-  const amountInAfterFee = amountIn * feeFactor;
-  const x = state.lp.pow;
-  const y = state.lp.usdc;
-  const newX = x + amountInAfterFee;
-  const newY = (x * y) / newX;
-  const amountOut = y - newY;
-  if (amountOut <= 0) throw new Error("Swap impossible");
-
-  w.pow -= amountIn;
-  w.usdc += amountOut;
-  state.lp.pow = newX;
-  state.lp.usdc = newY;
-}
-
-function applySwapUsdcToPow(tx) {
-  const w = getWallet(tx.from);
-  const amountIn = Number(tx.amount || 0);
-  if (amountIn <= 0 || !Number.isFinite(amountIn)) throw new Error("Montant invalide");
-  if (w.usdc < amountIn) throw new Error("Solde USDC POW insuffisant");
-
-  const feeFactor = 0.998;
-  const amountInAfterFee = amountIn * feeFactor;
-  const x = state.lp.usdc;
-  const y = state.lp.pow;
-  const newX = x + amountInAfterFee;
-  const newY = (x * y) / newX;
-  const amountOut = y - newY;
-  if (amountOut <= 0) throw new Error("Swap impossible");
-
-  w.usdc -= amountIn;
-  w.pow += amountOut;
-  state.lp.usdc = newX;
-  state.lp.pow = newY;
-}
-
-function applyBridgeSolOut(tx) {
-  const w = getWallet(tx.from);
-  const amount = Number(tx.amount || 0);
-  if (amount <= 0 || !Number.isFinite(amount)) throw new Error("Montant invalide");
-  if (w.pow < amount) throw new Error("Solde POW insuffisant");
-
-  w.pow -= amount;
-  const t = getWallet(TREASURY_POWCHAIN);
-  t.pow += amount;
-  console.log(`Demande BRIDGE POWCHAIN → SOL de ${amount} POW pour ${tx.from}`);
-}
-
-function processTx(tx) {
-  if (!verifyTxSig(tx)) throw new Error("Signature invalide");
-  const w = getWallet(tx.from);
-  if (!checkNonce(tx, w)) throw new Error("Nonce invalide");
-
-  switch (tx.type) {
-    case "transfer":     applyTransfer(tx);       break;
-    case "powToUsdc":    applySwapPowToUsdc(tx);  break;
-    case "usdcToPow":    applySwapUsdcToPow(tx);  break;
-    case "bridgeSolOut": applyBridgeSolOut(tx);   break;
-    default: throw new Error("Type TX inconnu: " + tx.type);
-  }
-
-  w.nonce = tx.nonce;
-  state.mempool.push(tx);
-  const block = produceBlock(TREASURY_POWCHAIN);
-  return block;
-}
-
-// -------------------- EXPLORER + BROADCAST --------------------
 function totalSupplyPow() {
   let sum = 0;
-  state.wallets.forEach(w => sum += w.pow);
+  state.wallets.forEach(w => { sum += w.pow; });
   sum += state.lp.pow;
   return sum;
 }
@@ -222,14 +82,157 @@ function broadcastExplorer() {
   });
 }
 
+function produceBlock(producer = TREASURY_POWCHAIN) {
+  const prev = state.blocks[state.blocks.length - 1];
+  const block = {
+    index: state.blocks.length,
+    prevHash: prev ? prev.hash : "GENESIS",
+    timestamp: Date.now(),
+    producer,
+    txs: state.mempool.splice(0)
+  };
+  block.hash = hashBlock(block);
+  state.blocks.push(block);
+  state.height = block.index;
+
+  // mise à jour prix POW (x*y=k)
+  if (state.lp.pow > 0) {
+    state.pricePow = state.lp.usdc / state.lp.pow;
+  } else {
+    state.pricePow = 0;
+  }
+
+  broadcastExplorer();
+  console.log(`Nouveau bloc ${block.index} par ${producer}`);
+  return block;
+}
+
+// bloc "heartbeat" toutes les 15s pour nourrir le graphe
+setInterval(() => {
+  produceBlock(TREASURY_POWCHAIN);
+}, 15000);
+
+// -------------------- SIG / NONCE --------------------
+function verifyTxSig(tx) {
+  try {
+    const msgObj = {
+      type: tx.type,
+      from: tx.from,
+      to: tx.to ?? null,
+      amount: tx.amount ?? null,
+      token: tx.token ?? null,
+      nonce: tx.nonce
+    };
+    const msg = new TextEncoder().encode(JSON.stringify(msgObj));
+    const sigBytes = bs58.decode(tx.sig);
+    const pubBytes = bs58.decode(tx.pub);
+    return nacl.sign.detached.verify(msg, sigBytes, pubBytes);
+  } catch (e) {
+    console.error("verifyTxSig error", e);
+    return false;
+  }
+}
+
+function checkNonce(tx, wallet) {
+  return tx.nonce === wallet.nonce + 1;
+}
+
+// -------------------- TX HANDLERS --------------------
+function applyTransfer(tx) {
+  const from = getWallet(tx.from);
+  const to = getWallet(tx.to);
+  const amount = Number(tx.amount || 0);
+  if (!Number.isFinite(amount) || amount <= 0) throw new Error("Montant invalide");
+  if (from.pow < amount) throw new Error("Solde POW insuffisant");
+
+  from.pow -= amount;
+  to.pow += amount;
+}
+
+function applySwapPowToUsdc(tx) {
+  const w = getWallet(tx.from);
+  const amountIn = Number(tx.amount || 0);
+  if (!Number.isFinite(amountIn) || amountIn <= 0) throw new Error("Montant invalide");
+  if (w.pow < amountIn) throw new Error("Solde POW insuffisant");
+
+  const feeFactor = 0.998;
+  const amountAfterFee = amountIn * feeFactor;
+  const x = state.lp.pow;
+  const y = state.lp.usdc;
+  const newX = x + amountAfterFee;
+  const newY = (x * y) / newX;
+  const amountOut = y - newY;
+  if (amountOut <= 0) throw new Error("Swap impossible");
+
+  w.pow -= amountIn;
+  w.usdc += amountOut;  // USDC POW reçu
+
+  state.lp.pow = newX;
+  state.lp.usdc = newY;
+}
+
+function applySwapUsdcToPow(tx) {
+  const w = getWallet(tx.from);
+  const amountIn = Number(tx.amount || 0);
+  if (!Number.isFinite(amountIn) || amountIn <= 0) throw new Error("Montant invalide");
+  if (w.usdc < amountIn) throw new Error("Solde USDC POW insuffisant");
+
+  const feeFactor = 0.998;
+  const amountAfterFee = amountIn * feeFactor;
+  const x = state.lp.usdc;
+  const y = state.lp.pow;
+  const newX = x + amountAfterFee;
+  const newY = (x * y) / newX;
+  const amountOut = y - newY;
+  if (amountOut <= 0) throw new Error("Swap impossible");
+
+  w.usdc -= amountIn;
+  w.pow += amountOut;
+
+  state.lp.usdc = newX;
+  state.lp.pow = newY;
+}
+
+function applyBridgeSolOut(tx) {
+  const w = getWallet(tx.from);
+  const amount = Number(tx.amount || 0);
+  if (!Number.isFinite(amount) || amount <= 0) throw new Error("Montant invalide");
+  if (w.pow < amount) throw new Error("Solde POW insuffisant");
+
+  w.pow -= amount;
+  const t = getWallet(TREASURY_POWCHAIN);
+  t.pow += amount;
+
+  console.log(`Demande BRIDGE POWCHAIN → SOL de ${amount} POW pour ${tx.from}`);
+}
+
+function processTx(tx) {
+  if (!verifyTxSig(tx)) throw new Error("Signature invalide");
+  const w = getWallet(tx.from);
+  if (!checkNonce(tx, w)) throw new Error("Nonce invalide");
+
+  switch (tx.type) {
+    case "transfer":     applyTransfer(tx);      break;
+    case "powToUsdc":    applySwapPowToUsdc(tx); break;
+    case "usdcToPow":    applySwapUsdcToPow(tx); break;
+    case "bridgeSolOut": applyBridgeSolOut(tx);  break;
+    default: throw new Error("Type de TX inconnu : " + tx.type);
+  }
+
+  w.nonce = tx.nonce;
+  state.mempool.push(tx);
+  const block = produceBlock(TREASURY_POWCHAIN);
+  return block;
+}
+
+// -------------------- WS --------------------
 function sendWalletState(ws, pub) {
   const w = getWallet(pub);
   ws.send(JSON.stringify({ type: "state", wallet: w }));
 }
 
-// -------------------- WEBSOCKET --------------------
 wss.on("connection", ws => {
-  console.log("WS client connecté");
+  console.log("Client WS connecté");
   ws.send(JSON.stringify({ type: "info", msg: "Bienvenue sur POWCHAIN" }));
   ws.send(JSON.stringify({ type: "explorer", data: explorerPayload() }));
 
@@ -272,20 +275,22 @@ app.get("/stats", (req, res) => {
   });
 });
 
-app.get("/api/wallet/:addr", (req,res) => {
+app.get("/api/wallet/:addr", (req, res) => {
   const w = getWallet(req.params.addr);
   res.json(w);
 });
 
-app.get("/api/tx/:id", (req,res) => {
-  const [bIndexStr,tIndexStr] = req.params.id.split("-");
-  const bi = Number(bIndexStr);
-  const ti = Number(tIndexStr);
-  if (!Number.isInteger(bi) || !Number.isInteger(ti))
+app.get("/api/tx/:id", (req, res) => {
+  const [bStr,tStr] = req.params.id.split("-");
+  const bi = Number(bStr);
+  const ti = Number(tStr);
+  if (!Number.isInteger(bi) || !Number.isInteger(ti)) {
     return res.status(400).json({ error:"ID invalide" });
+  }
   const block = state.blocks[bi];
-  if (!block || !block.txs[ti])
+  if (!block || !block.txs[ti]) {
     return res.status(404).json({ error:"TX introuvable" });
+  }
   const tx = block.txs[ti];
   res.json({
     block: bi,
@@ -297,8 +302,8 @@ app.get("/api/tx/:id", (req,res) => {
   });
 });
 
-// -------------------- DÉMARRAGE --------------------
+// -------------------- START --------------------
 server.listen(PORT, () => {
   console.log("POWCHAIN v2 + LP running on port", PORT);
-  console.log("POWCHAIN validator + API en ligne sur port", PORT);
+  console.log("POWCHAIN validator + API en ligne sur port 3000");
 });
