@@ -1,4 +1,4 @@
-// POWCHAIN v2 + LP + Bridge + Swap + Explorer
+// POWCHAIN v2 — validator + LP + swap + bridge + explorer
 // server.js
 
 const express = require("express");
@@ -9,28 +9,24 @@ const nacl = require("tweetnacl");
 const bs58 = require("bs58");
 
 const PORT = 3000;
+const TREASURY_POWCHAIN = "TREASURY_POWCHAIN";
+const TREASURY_SOL = "BZJsWeJizv3YeyuWjF5187jrcduPFAHWjqL7jgq4kGwy";
 
-// -------------------- ÉTAT GLOBAL --------------------
+// --------- ÉTAT GLOBAL ----------
 const app = express();
 app.use(express.json());
 
 const server = http.createServer(app);
 
-// ⚠️ WebSocket sur /ws (important pour nginx)
+// ⚠️ WebSocket sur /ws (pour nginx)
 const wss = new WebSocket.Server({ server, path: "/ws" });
-
-const TREASURY_POWCHAIN = "TREASURY_POWCHAIN";
-const TREASURY_SOL = "BZJsWeJizv3YeyuWjF5187jrcduPFAHWjqL7jgq4kGwy";
 
 const state = {
   height: 0,
   blocks: [],
   mempool: [],
   wallets: new Map(),
-  lp: {
-    pow: 1000000,   // réserve POW dans le pool
-    usdc: 1000000   // réserve USDC POW dans le pool
-  },
+  lp: { pow: 1000000, usdc: 1000000 },
   pricePow: 1
 };
 
@@ -39,7 +35,7 @@ function getWallet(pub) {
     state.wallets.set(pub, {
       pub,
       pow: 0,
-      usdc: 0,   // USDC POW
+      usdc: 0,
       lp: 0,
       staked: 0,
       nonce: 0
@@ -48,7 +44,7 @@ function getWallet(pub) {
   return state.wallets.get(pub);
 }
 
-// -------------------- BLOCKCHAIN --------------------
+// --------- BLOCKCHAIN ----------
 function hashBlock(data) {
   return crypto.createHash("sha256").update(JSON.stringify(data)).digest("hex");
 }
@@ -95,24 +91,18 @@ function produceBlock(producer = TREASURY_POWCHAIN) {
   state.blocks.push(block);
   state.height = block.index;
 
-  // mise à jour prix POW (x*y=k)
-  if (state.lp.pow > 0) {
-    state.pricePow = state.lp.usdc / state.lp.pow;
-  } else {
-    state.pricePow = 0;
-  }
+  if (state.lp.pow > 0) state.pricePow = state.lp.usdc / state.lp.pow;
+  else state.pricePow = 0;
 
   broadcastExplorer();
   console.log(`Nouveau bloc ${block.index} par ${producer}`);
   return block;
 }
 
-// bloc "heartbeat" toutes les 15s pour nourrir le graphe
-setInterval(() => {
-  produceBlock(TREASURY_POWCHAIN);
-}, 15000);
+// heartbeat: bloc toutes les 15 s pour alimenter le graphe
+setInterval(() => produceBlock(TREASURY_POWCHAIN), 15000);
 
-// -------------------- SIG / NONCE --------------------
+// --------- SIGNATURES / NONCE ----------
 function verifyTxSig(tx) {
   try {
     const msgObj = {
@@ -137,14 +127,13 @@ function checkNonce(tx, wallet) {
   return tx.nonce === wallet.nonce + 1;
 }
 
-// -------------------- TX HANDLERS --------------------
+// --------- HANDLERS TX ----------
 function applyTransfer(tx) {
   const from = getWallet(tx.from);
   const to = getWallet(tx.to);
   const amount = Number(tx.amount || 0);
   if (!Number.isFinite(amount) || amount <= 0) throw new Error("Montant invalide");
   if (from.pow < amount) throw new Error("Solde POW insuffisant");
-
   from.pow -= amount;
   to.pow += amount;
 }
@@ -157,6 +146,7 @@ function applySwapPowToUsdc(tx) {
 
   const feeFactor = 0.998;
   const amountAfterFee = amountIn * feeFactor;
+
   const x = state.lp.pow;
   const y = state.lp.usdc;
   const newX = x + amountAfterFee;
@@ -165,7 +155,7 @@ function applySwapPowToUsdc(tx) {
   if (amountOut <= 0) throw new Error("Swap impossible");
 
   w.pow -= amountIn;
-  w.usdc += amountOut;  // USDC POW reçu
+  w.usdc += amountOut;
 
   state.lp.pow = newX;
   state.lp.usdc = newY;
@@ -179,6 +169,7 @@ function applySwapUsdcToPow(tx) {
 
   const feeFactor = 0.998;
   const amountAfterFee = amountIn * feeFactor;
+
   const x = state.lp.usdc;
   const y = state.lp.pow;
   const newX = x + amountAfterFee;
@@ -221,11 +212,10 @@ function processTx(tx) {
 
   w.nonce = tx.nonce;
   state.mempool.push(tx);
-  const block = produceBlock(TREASURY_POWCHAIN);
-  return block;
+  return produceBlock(TREASURY_POWCHAIN);
 }
 
-// -------------------- WS --------------------
+// --------- WS ----------
 function sendWalletState(ws, pub) {
   const w = getWallet(pub);
   ws.send(JSON.stringify({ type: "state", wallet: w }));
@@ -245,7 +235,6 @@ wss.on("connection", ws => {
       ws.send(JSON.stringify({ type: "explorer", data: explorerPayload() }));
       return;
     }
-
     if (msg.type === "requestState" && msg.pub) {
       sendWalletState(ws, msg.pub);
       return;
@@ -264,8 +253,8 @@ wss.on("connection", ws => {
   });
 });
 
-// -------------------- API HTTP --------------------
-app.get("/stats", (req, res) => {
+// --------- API HTTP ----------
+app.get("/stats", (req,res) => {
   res.json({
     height: state.height,
     nbWallets: state.wallets.size,
@@ -275,12 +264,12 @@ app.get("/stats", (req, res) => {
   });
 });
 
-app.get("/api/wallet/:addr", (req, res) => {
+app.get("/api/wallet/:addr", (req,res) => {
   const w = getWallet(req.params.addr);
   res.json(w);
 });
 
-app.get("/api/tx/:id", (req, res) => {
+app.get("/api/tx/:id", (req,res) => {
   const [bStr,tStr] = req.params.id.split("-");
   const bi = Number(bStr);
   const ti = Number(tStr);
@@ -302,7 +291,7 @@ app.get("/api/tx/:id", (req, res) => {
   });
 });
 
-// -------------------- START --------------------
+// --------- START ----------
 server.listen(PORT, () => {
   console.log("POWCHAIN v2 + LP running on port", PORT);
   console.log("POWCHAIN validator + API en ligne sur port 3000");
