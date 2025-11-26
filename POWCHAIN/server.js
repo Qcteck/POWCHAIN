@@ -1,228 +1,202 @@
-const http = require("http");
-const express = require("express");
+/* =========================
+   POWCHAIN — SERVER ULTIMATE
+   ========================= */
+
+const fs = require("fs");
+const path = require("path");
 const WebSocket = require("ws");
+const http = require("http");
+const nacl = require("tweetnacl");
+const bs58 = require("bs58");
 
-const app = express();
-const server = http.createServer(app);
+// --- STORAGE FILE ---
+const DB_FILE = path.join(__dirname, "state.json");
 
-// ======== ÉTAT POWCHAIN GLOBAL ========
+// --- STATE ---
 let state = {
   height: 0,
-  pow: 1000000,           // POW en circulation (ex: côté LP)
-  lp: 100000,             // USDC POW en réserve LP
-  price: 1,               // prix POW en USDC POW
-  producer: "TREASURY_POWCHAIN",
-  blocks: [],
-  txs: []
+  producer: "BOOT",
+  supplyPow: 1000000,
+  supplyLpPow: 200000,
+  pricePow: 0.01,
+  mempool: [],
+  users: {},        // {addr:{pow,usdc,staked,nonce}}
+  txs: [],          // history
 };
 
-// wallets POWCHAIN locaux : pub => { pow, usdc, nonce }
-const wallets = {};
-
-// pool LP pour le swap x*y = k
-const lp = {
-  pow: state.pow,
-  usdc: state.lp
-};
-
-function recalcPrice() {
-  if (lp.pow <= 0) lp.pow = 1;
-  state.pow = lp.pow;
-  state.lp = lp.usdc;
-  state.price = lp.usdc / lp.pow;
+// load storage
+if (fs.existsSync(DB_FILE)) {
+  try { state = JSON.parse(fs.readFileSync(DB_FILE, "utf8")); }
+  catch { console.log("⚠ DB corrompue, reset..."); }
 }
 
-function getWallet(pub) {
-  if (!wallets[pub]) {
-    wallets[pub] = { pow: 0, usdc: 0, nonce: 0 };
+// save periodically
+setInterval(() => fs.writeFileSync(DB_FILE, JSON.stringify(state, null, 2)), 5000);
+
+// --- SERVER HTTP (only to serve /ws upgrade) ---
+const server = http.createServer((req, res) => {
+  res.writeHead(200);
+  res.end("POWCHAIN RUNNING");
+});
+
+// --- WS HUB ---
+const wss = new WebSocket.Server({ server });
+
+function broadcast(obj) {
+  const msg = JSON.stringify(obj);
+  wss.clients.forEach(c => c.readyState === 1 && c.send(msg));
+}
+
+// === CREATE USER IF NEW ===
+function ensureUser(addr) {
+  if (!state.users[addr]) {
+    state.users[addr] = { pow: 0, usdc: 0, nonce: 0 };
   }
-  return wallets[pub];
+  return state.users[addr];
 }
 
-function pushTx(tx) {
-  const full = {
-    id: "tx_" + Date.now() + "_" + Math.floor(Math.random() * 1e6),
-    ts: Date.now(),
-    ...tx
-  };
-  state.txs.push(full);
-  if (state.txs.length > 200) state.txs.shift();
-  const payload = JSON.stringify({ type: "tx", tx: full });
-  wss.clients.forEach(c => {
-    if (c.readyState === WebSocket.OPEN) c.send(payload);
-  });
+// === VERIFY SIGNATURE ===
+function verifyTx(raw, sig, pub) {
+  try {
+    const ok = nacl.sign.detached.verify(
+      new TextEncoder().encode(JSON.stringify(raw)),
+      bs58.decode(sig),
+      bs58.decode(pub)
+    );
+    return ok;
+  } catch { return false; }
 }
 
-// ======== API /stats (graph + explorer) ========
-app.get("/stats", (req, res) => {
-  res.json({
-    pow: state.pow,
-    lp: state.lp,
-    price: state.price,
-    producer: state.producer,
-    height: state.height,
-    blocks: state.blocks.slice(-30),
-    txs: state.txs.slice(-30)
-  });
-});
+// === APPLY TX ===
+function applyTx(tx) {
+  const u = ensureUser(tx.from);
+  if (tx.nonce !== u.nonce + 1) return false;
+  u.nonce++;
 
-// ======== WEBSOCKET /ws ========
-const wss = new WebSocket.Server({ server, path: "/ws" });
+  switch (tx.action) {
+    case "faucet":
+      u.pow += 50;
+      break;
 
-wss.on("connection", ws => {
-  console.log("WS client connecté");
+    case "transfer":
+      if (u.pow < tx.amount) return false;
+      const dest = ensureUser(tx.to);
+      u.pow -= tx.amount;
+      dest.pow += tx.amount;
+      break;
 
-  // état de base
-  ws.send(JSON.stringify({ type: "chain", ...state }));
-
-  // derniers blocs
-  state.blocks.slice(-20).forEach(b => {
-    ws.send(JSON.stringify({ type: "block", block: b }));
-  });
-
-  // dernières TX
-  state.txs.slice(-20).forEach(t => {
-    ws.send(JSON.stringify({ type: "tx", tx: t }));
-  });
-
-  ws.on("message", msg => {
-    let d;
-    try { d = JSON.parse(msg.toString()); } catch { return; }
-
-    // simple ping/pong
-    if (d.type === "ping") {
-      return ws.send(JSON.stringify({ type: "pong" }));
-    }
-
-    // sync wallet : renvoie soldes POWCHAIN
-    if (d.type === "sync_wallet" && d.pub) {
-      const w = getWallet(d.pub);
-      return ws.send(JSON.stringify({
-        type: "wallet",
-        pub: d.pub,
-        pow: w.pow,
-        usdc: w.usdc,
-        nonce: w.nonce
-      }));
-    }
-
-    // BRIDGE : USDC (Solana) -> USDC POW (simulation)
-    if (d.type === "bridge" && d.pub && d.token === "USDC" && d.amount > 0) {
-      const w = getWallet(d.pub);
-      w.usdc += Number(d.amount);
-      pushTx({ kind: "BRIDGE_USDC_IN", from: d.pub, to: d.pub, amount: d.amount, token: "USDC_POW" });
-      ws.send(JSON.stringify({
-        type: "wallet",
-        pub: d.pub,
-        pow: w.pow,
-        usdc: w.usdc,
-        nonce: w.nonce
-      }));
-      return;
-    }
-
-    // SWAP POW <-> USDC POW via AMM x*y = k (sans frais)
-    if (d.type === "swap" && d.pub && d.direction && d.amount > 0) {
-      const amount = Number(d.amount);
-      const w = getWallet(d.pub);
-      const k = lp.pow * lp.usdc || 1;
-
-      if (d.direction === "powToUsdc") {
-        if (w.pow < amount) {
-          return ws.send(JSON.stringify({ type: "swap_error", msg: "POW insuffisant" }));
-        }
-        lp.pow += amount;
-        const newUsdc = k / lp.pow;
-        const out = lp.usdc - newUsdc;
-        if (out <= 0) return;
-        lp.usdc = newUsdc;
-        w.pow -= amount;
-        w.usdc += out;
-        recalcPrice();
-        pushTx({ kind: "SWAP", side: "POW->USDC", from: d.pub, to: d.pub, amountIn: amount, amountOut: out, tokenIn: "POW", tokenOut: "USDC_POW" });
+    case "swap":
+      if (tx.dir === "pow-usdc") {
+        if (u.pow < tx.amount) return false;
+        u.pow -= tx.amount;
+        u.usdc += tx.amount * state.pricePow;
+      } else {
+        const need = tx.amount * state.pricePow;
+        if (u.usdc < need) return false;
+        u.usdc -= need;
+        u.pow += tx.amount;
       }
+      break;
 
-      if (d.direction === "usdcToPow") {
-        if (w.usdc < amount) {
-          return ws.send(JSON.stringify({ type: "swap_error", msg: "USDC POW insuffisant" }));
-        }
-        lp.usdc += amount;
-        const newPow = k / lp.usdc;
-        const out = lp.pow - newPow;
-        if (out <= 0) return;
-        lp.pow = newPow;
-        w.usdc -= amount;
-        w.pow += out;
-        recalcPrice();
-        pushTx({ kind: "SWAP", side: "USDC->POW", from: d.pub, to: d.pub, amountIn: amount, amountOut: out, tokenIn: "USDC_POW", tokenOut: "POW" });
-      }
+    case "bridge_in": // SOL -> POWCHAIN
+      u.pow += tx.amount * 100; // = 1 SOL → 100 POW
+      state.supplyPow += tx.amount * 100;
+      break;
 
-      ws.send(JSON.stringify({
-        type: "wallet",
-        pub: d.pub,
-        pow: w.pow,
-        usdc: w.usdc,
-        nonce: w.nonce
-      }));
-      // broadcast nouveau state pour graph
-      const payloadChain = JSON.stringify({ type: "chain", ...state });
-      wss.clients.forEach(c => {
-        if (c.readyState === WebSocket.OPEN) c.send(payloadChain);
-      });
-      return;
-    }
+    case "bridge_out": // POWCHAIN -> SOL
+      if (u.pow < tx.amount) return false;
+      u.pow -= tx.amount;
+      state.supplyPow -= tx.amount;
+      break;
 
-    // Recherche wallet
-    if (d.type === "search_wallet" && d.wallet) {
-      const w = wallets[d.wallet] || { pow: 0, usdc: 0, nonce: 0 };
-      return ws.send(JSON.stringify({
-        type: "wallet_info",
-        pub: d.wallet,
-        pow: w.pow,
-        usdc: w.usdc,
-        nonce: w.nonce
-      }));
-    }
+    default: return false;
+  }
 
-    // Recherche TX simple par id
-    if (d.type === "search_tx" && d.id) {
-      const tx = state.txs.find(t => t.id === d.id);
-      return ws.send(JSON.stringify({
-        type: "tx_info",
-        id: d.id,
-        found: !!tx,
-        tx: tx || null
-      }));
-    }
-  });
-});
+  return true;
+}
 
-// ======== PRODUCTION DE BLOCS ========
-setInterval(() => {
+// === BLOCK PRODUCTION ===
+function produceBlock() {
+  const mp = [...state.mempool];
+  state.mempool = [];
+
+  for (const tx of mp) {
+    const ok = applyTx(tx);
+    if (!ok) continue;
+    state.txs.push({ ...tx, block: state.height + 1, timestamp: Date.now() });
+  }
+
   state.height++;
-  const block = {
-    height: state.height,
-    producer: state.producer,
-    ts: Date.now()
-  };
-  state.blocks.push(block);
-  if (state.blocks.length > 500) state.blocks.shift();
+  state.producer = "VALIDATOR";
+  const k = 0.0000001;
+  state.pricePow = Math.max(0.000001, state.pricePow + (mp.length * k));
+  if (state.pricePow > 10) state.pricePow = 10;
 
-  const payloadBlock = JSON.stringify({ type: "block", block });
-  const payloadChain = JSON.stringify({ type: "chain", ...state });
-
-  wss.clients.forEach(c => {
-    if (c.readyState === WebSocket.OPEN) {
-      c.send(payloadBlock);
-      c.send(payloadChain);
+  broadcast({
+    type: "explorer",
+    data: {
+      height: state.height,
+      producer: state.producer,
+      supplyPow: state.supplyPow,
+      supplyLpPow: state.supplyLpPow,
+      pricePow: state.pricePow,
+      mempool: mp.length,
+      timestamp: Date.now()
     }
   });
+}
 
-  console.log("Bloc", state.height);
-}, 5000);
+// every 3 seconds
+setInterval(produceBlock, 3000);
 
-// ======== LANCEMENT SERVEUR ========
-const PORT = 3000;
-server.listen(PORT, () => {
-  console.log("POWCHAIN v2 + LP + SWAP + BRIDGE running on port", PORT);
+// === WS HANDLERS ===
+wss.on("connection", ws => {
+  ws.send(JSON.stringify({ type: "info", msg: "Bienvenue sur POWCHAIN" }));
+
+  ws.on("message", raw => {
+    try {
+      const msg = JSON.parse(raw);
+
+      // only explorer request
+      if (msg.type === "explorer") {
+        ws.send(JSON.stringify({
+          type: "explorer",
+          data: {
+            height: state.height,
+            producer: state.producer,
+            supplyPow: state.supplyPow,
+            supplyLpPow: state.supplyLpPow,
+            pricePow: state.pricePow,
+            mempool: state.mempool.length,
+            timestamp: Date.now()
+          }
+        }));
+        return;
+      }
+
+      // tx
+      if (msg.type === "tx") {
+        const user = ensureUser(msg.from);
+        const rawTx = msg.obj;
+        rawTx.from = msg.from;
+        rawTx.nonce = user.nonce + 1;
+
+        if (!verifyTx(rawTx, msg.sig, msg.from)) {
+          ws.send(JSON.stringify({ type: "info", msg: "❌ Signature invalide" }));
+          return;
+        }
+
+        state.mempool.push(rawTx);
+        broadcast({ type: "info", msg: `🧾 TX reçue ${rawTx.action}` });
+        return;
+      }
+
+    } catch (e) {
+      ws.send(JSON.stringify({ type: "info", msg: "Erreur parsing" }));
+    }
+  });
 });
+
+// START
+const PORT = 8080;
+server.listen(PORT, () => console.log("🚀 POWCHAIN ULTIMATE online port", PORT));
