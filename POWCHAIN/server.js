@@ -1,52 +1,71 @@
 const http = require("http");
 const WebSocket = require("ws");
-const crypto = require("crypto");
 
+// ===========================
+//   ÉTAT POWCHAIN (démo)
+// ===========================
 let height = 0;
-let chain = [];
-let mempool = [];
-let supplyPow = 1000000;
-let supplyLp = 100000;
+let supplyPow = 1_000_000;
+let supplyLp = 100_000;
 let pricePow = 1;
-const treasury = "TREASURY_POWCHAIN";
+let mempool = [];
+const TREASURY = "TREASURY_POWCHAIN";
 
+// ===========================
+//   SERVEUR HTTP + WS
+// ===========================
 const server = http.createServer();
 const wss = new WebSocket.Server({ noServer: true });
 
+// Broadcast de l’état explorer
 function broadcastExplorer() {
-  const data = {
-    height,
-    producer: treasury,
-    supplyPow,
-    supplyLpPow: supplyLp,
-    pricePow,
-    mempool,
-    timestamp: Date.now()
+  const payload = {
+    type: "explorer",
+    data: {
+      height,
+      producer: TREASURY,
+      supplyPow,
+      supplyLpPow: supplyLp,
+      pricePow,
+      mempool,
+      timestamp: Date.now()
+    }
   };
-  const msg = JSON.stringify({ type: "explorer", data });
-  wss.clients.forEach(c => c.readyState === WebSocket.OPEN && c.send(msg));
+  const json = JSON.stringify(payload);
+  wss.clients.forEach(c => {
+    if (c.readyState === WebSocket.OPEN) c.send(json);
+  });
 }
 
-// Auto-mining
+// Petit auto-mining pour voir la chaîne bouger
 setInterval(() => {
   height++;
-  pricePow = pricePow * (1 + (Math.random() - 0.5) / 200);
+  // mini variation du prix POW
+  pricePow = pricePow * (1 + (Math.random() - 0.5) / 150);
   if (pricePow < 0.000001) pricePow = 0.000001;
-  chain.push({ height, producer: treasury, timestamp: Date.now() });
   broadcastExplorer();
 }, 4000);
 
-// WS handler
-wss.on("connection", (ws) => {
-  ws.send(JSON.stringify({ type: "info", msg: "WS connecté" }));
+// Gestion des connexions WS
+wss.on("connection", ws => {
+  ws.send(JSON.stringify({ type: "info", msg: "WebSocket POWCHAIN connecté" }));
+  // envoie l’état actuel dès la connexion
   broadcastExplorer();
 });
 
-// /ws endpoint
+// Upgrade HTTP -> WS sur /ws uniquement
 server.on("upgrade", (req, socket, head) => {
   if (req.url === "/ws") {
-    wss.handleUpgrade(req, socket, head, ws => wss.emit("connection", ws, req));
-  } else socket.destroy();
+    wss.handleUpgrade(req, socket, head, sock => {
+      wss.emit("connection", sock, req);
+    });
+  } else {
+    socket.destroy();
+  }
 });
 
-server.listen(3000, () => console.log("🚀 POWCHAIN Validator online on port 3000"));
+// Lancement
+const PORT = 3000;
+server.listen(PORT, () => {
+  console.log("🚀 POWCHAIN validator + WS actif sur port", PORT);
+});
