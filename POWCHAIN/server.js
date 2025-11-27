@@ -1,47 +1,52 @@
-// POWCHAIN v3 – validator + API + WS
+// POWCHAIN v4 – Validator + API + WS + DEX + Bridge SOL
+// Fichier : server.js
 
-const http = require("http");
-const WebSocket = require("ws");
-const crypto = require("crypto");
-const nacl = require("tweetnacl");
-const bs58 = require("bs58");
-const express = require("express");
-const cors = require("cors");
-const level = require("level");
+import http from "http";
+import WebSocket, { WebSocketServer } from "ws";
+import crypto from "crypto";
+import nacl from "tweetnacl";
+import bs58 from "bs58";
+import express from "express";
+import cors from "cors";
+import { Level } from "level";
 
-// --------- CONFIG ---------
 const PORT_WS  = process.env.WS  || 7001;
 const PORT_API = process.env.API || 3000;
 const PEERS    = (process.env.PEERS || "").split(",").filter(Boolean);
 
-const DEC           = 1e6;
-const USDC_PER_SOL  = 100e6;   // 1 SOL = 100M USDC POW max
-const BLOCK_REWARD  = 10 * DEC;
+const DEC          = 1e6;
+const USDC_PER_SOL = 100e6;     // capacité max USDC par SOL dans la trésorerie
+const BLOCK_REWARD = 10 * DEC;
 
-// --------- DB ---------
-const dbState   = level("./db/state",   { valueEncoding: "json" });
-const dbWallets = level("./db/wallets", { valueEncoding: "json" });
-const dbChain   = level("./db/chain",   { valueEncoding: "json" });
+// ---------- DB (Level) ----------
+const dbState   = new Level("./db/state",   { valueEncoding: "json" });
+const dbWallets = new Level("./db/wallets", { valueEncoding: "json" });
+const dbChain   = new Level("./db/chain",   { valueEncoding: "json" });
 
 let mempool = [];
 let lpPow = 0, lpUsdc = 0, treasurySol = 0, treasuryUsdc = 0;
 let height = 0;
 
-// --------- Utils ---------
+// ---------- Utils ----------
 async function w(addr) {
   try {
     return await dbWallets.get(addr);
-  } catch {
-    const nw = { pow: 0, usdc: 0, staked: 0, pub: null, nonce: 0 };
-    await dbWallets.put(addr, nw);
-    return nw;
+  } catch (e) {
+    if (e && e.code === "LEVEL_NOT_FOUND") {
+      const nw = { pow: 0, usdc: 0, staked: 0, pub: null, nonce: 0 };
+      await dbWallets.put(addr, nw);
+      return nw;
+    }
+    throw e;
   }
 }
 
-const hash = o => crypto.createHash("sha256").update(JSON.stringify(o)).digest("hex");
-const log  = (...x) => console.log("[POWCHAIN]", ...x);
+const hash = o =>
+  crypto.createHash("sha256").update(JSON.stringify(o)).digest("hex");
 
-// --------- Signature ---------
+const log = (...x) => console.log("[POWCHAIN]", ...x);
+
+// ---------- Signature ----------
 async function verifySig(tx) {
   const acc = await w(tx.from);
   if (!acc.pub && tx.pub) {
@@ -67,19 +72,22 @@ async function verifySig(tx) {
   );
 }
 
-// --------- Validator PoS ---------
+// ---------- Validator PoS ----------
 async function chooseValidator() {
   let sum = 0;
-  for await (const [, v] of dbWallets.iterator()) sum += v.staked;
-  if (sum === 0) return null;
+  for await (const [, v] of dbWallets.iterator()) {
+    sum += v.staked || 0;
+  }
+  if (!sum) return null;
   let r = Math.random() * sum;
   for await (const [a, v] of dbWallets.iterator()) {
-    if ((r -= v.staked) <= 0) return a;
+    r -= v.staked || 0;
+    if (r <= 0) return a;
   }
   return null;
 }
 
-// --------- P2P WS clients ---------
+// ---------- P2P ----------
 let sockets = [];
 
 function broadcast(x) {
@@ -103,7 +111,7 @@ function connectPeer(url) {
 }
 PEERS.forEach(connectPeer);
 
-// --------- Message handler ---------
+// ---------- Message handler ----------
 async function onMsg(ws, msg) {
   try {
     const d = typeof msg === "string" ? JSON.parse(msg) : JSON.parse(msg.toString());
@@ -112,19 +120,21 @@ async function onMsg(ws, msg) {
       return ws.send(JSON.stringify({ type: "STATE_SHORT", height }));
     }
 
-    // Secured operations (signature + nonce)
+    // opérations sécurisées (signature + nonce)
     const secured = ["TX_POW", "SEND_USDC", "LP_ADD", "SWAP", "STAKE", "BRIDGE_SOL"];
     if (secured.includes(d.type)) {
       if (!await verifySig(d))
         return ws.send(JSON.stringify({ type: "ERR", msg: "bad signature" }));
+
       const acc = await w(d.from);
       if (d.nonce !== acc.nonce + 1)
         return ws.send(JSON.stringify({ type: "ERR", msg: "bad nonce" }));
+
       acc.nonce++;
       await dbWallets.put(d.from, acc);
     }
 
-    // ---- POW transfer en mempool ----
+    // ---- TX_POW → mempool (inclus dans les blocs) ----
     if (d.type === "TX_POW") {
       const acc = await w(d.from);
       if (acc.pow < d.amount)
@@ -134,22 +144,23 @@ async function onMsg(ws, msg) {
       return ws.send(JSON.stringify({ type: "TX_OK" }));
     }
 
-    // ---- USDC direct (hors mempool) ----
+    // ---- SEND_USDC direct ----
     if (d.type === "SEND_USDC") {
       const a = await w(d.from), b = await w(d.to);
       if (a.usdc < d.amount)
         return ws.send(JSON.stringify({ type: "ERR", msg: "no usdc" }));
-      a.usdc -= d.amount; b.usdc += d.amount;
+      a.usdc -= d.amount;
+      b.usdc += d.amount;
       await dbWallets.put(d.from, a);
       await dbWallets.put(d.to, b);
       return ws.send(JSON.stringify({ type: "SEND_USDC_OK" }));
     }
 
-    // ---- MINT USDC contre collatéral Sol ----
+    // ---- MINT_USDC contre collatéral SOL ----
     if (d.type === "MINT_USDC") {
       const max = treasurySol * USDC_PER_SOL;
       let supply = 0;
-      for await (const [, v] of dbWallets.iterator()) supply += v.usdc;
+      for await (const [, v] of dbWallets.iterator()) supply += v.usdc || 0;
       if (supply + d.amount > max)
         return ws.send(JSON.stringify({ type: "ERR", msg: "no collateral" }));
       const acc = await w(d.addr);
@@ -158,13 +169,15 @@ async function onMsg(ws, msg) {
       return ws.send(JSON.stringify({ type: "MINT_OK" }));
     }
 
-    // ---- LP ADD ----
+    // ---- LP_ADD ----
     if (d.type === "LP_ADD") {
       const acc = await w(d.addr);
       if (acc.pow < d.pow || acc.usdc < d.usdc)
         return ws.send(JSON.stringify({ type: "ERR", msg: "no funds" }));
-      acc.pow -= d.pow; acc.usdc -= d.usdc;
-      lpPow += d.pow; lpUsdc += d.usdc;
+      acc.pow -= d.pow;
+      acc.usdc -= d.usdc;
+      lpPow   += d.pow;
+      lpUsdc  += d.usdc;
       await dbWallets.put(d.addr, acc);
       return ws.send(JSON.stringify({ type: "LP_OK" }));
     }
@@ -186,8 +199,10 @@ async function onMsg(ws, msg) {
         const newY = Math.floor(k / newX);
         const out = Y - newY;
         if (out <= 0) return ws.send(JSON.stringify({ type: "ERR", msg: "no output" }));
-        A.pow -= d.amount; A.usdc += out;
-        lpPow += d.amount; lpUsdc -= out;
+        A.pow  -= d.amount;
+        A.usdc += out;
+        lpPow  += d.amount;
+        lpUsdc -= out;
         treasuryUsdc += d.amount - dxEff;
       } else {
         if (A.usdc < d.amount)
@@ -198,8 +213,10 @@ async function onMsg(ws, msg) {
         const newX = Math.floor(k / newY);
         const out = X - newX;
         if (out <= 0) return ws.send(JSON.stringify({ type: "ERR", msg: "no output" }));
-        A.usdc -= d.amount; A.pow += out;
-        lpUsdc += d.amount; lpPow -= out;
+        A.usdc -= d.amount;
+        A.pow  += out;
+        lpUsdc += d.amount;
+        lpPow  -= out;
         treasuryUsdc += d.amount - dyEff;
       }
       await dbWallets.put(d.addr, A);
@@ -211,22 +228,22 @@ async function onMsg(ws, msg) {
       const acc = await w(d.addr);
       if (acc.pow < d.amount)
         return ws.send(JSON.stringify({ type: "ERR", msg: "no pow" }));
-      acc.pow -= d.amount;
+      acc.pow    -= d.amount;
       acc.staked += d.amount;
       await dbWallets.put(d.addr, acc);
       return ws.send(JSON.stringify({ type: "STAKE_OK" }));
     }
 
-    // ---- BRIDGE SOL (maj trésorerie + mint POW) ----
+    // ---- BRIDGE_SOL (trésorerie + mint POW) ----
     if (d.type === "BRIDGE_SOL") {
       treasurySol += d.solAmount;
       const acc = await w(d.addr);
-      acc.pow += Math.floor(d.solAmount * 10 * DEC); // 10 POW / SOL bridgé
+      acc.pow += Math.floor(d.solAmount * 10 * DEC); // 10 POW par SOL
       await dbWallets.put(d.addr, acc);
       return ws.send(JSON.stringify({ type: "BRIDGE_OK" }));
     }
 
-    // ---- GET_STATE wallet ----
+    // ---- GET_STATE ----
     if (d.type === "GET_STATE") {
       const a = await w(d.addr);
       return ws.send(JSON.stringify({
@@ -249,7 +266,7 @@ async function onMsg(ws, msg) {
   }
 }
 
-// --------- Block production ---------
+// ---------- Production de blocs ----------
 async function produce() {
   if (!mempool.length) return;
   const val = await chooseValidator();
@@ -266,7 +283,6 @@ async function produce() {
   };
   block.hash = hash(block);
 
-  // reward
   const vAcc = await w(val);
   vAcc.pow += BLOCK_REWARD;
   await dbWallets.put(val, vAcc);
@@ -275,13 +291,13 @@ async function produce() {
   height = block.height;
   mempool = [];
   broadcast({ type: "NEW_BLOCK", block });
-  log("⛏ Block", height, "→", val);
+  log("⛏ Bloc", height, "→", val);
 }
 setInterval(produce, 1800);
 
-// --------- WS Server ---------
+// ---------- WS Server ----------
 const serverWS = http.createServer();
-const wss = new WebSocket.Server({ server: serverWS });
+const wss = new WebSocketServer({ server: serverWS });
 
 wss.on("connection", ws => {
   sockets.push(ws);
@@ -293,10 +309,10 @@ wss.on("connection", ws => {
 
 serverWS.listen(PORT_WS, () => log("WS live →", PORT_WS));
 
-// --------- API / Explorer ---------
+// ---------- API / Explorer ----------
 const app = express();
 app.use(cors());
-app.use(express.static("./public"));   // sert index.html du client
+app.use(express.static("./public"));   // sert ton index.html HUD
 
 app.get("/stats", async (_, res) => {
   res.json({ height, lpPow, lpUsdc, treasurySol, treasuryUsdc });
