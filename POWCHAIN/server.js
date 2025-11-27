@@ -1,331 +1,409 @@
-// POWCHAIN — Serveur validateur complet
-// (PoS + LP + Swap + Staking + Mempool + Auto-block + WS temps réel)
+// POWCHAIN — Validator complet (staking + LP + swap + mempool + auto-block)
+// Node.js v18+ requis
 
-const express=require("express");
-const bodyParser=require("body-parser");
-const WebSocket=require("ws");
-const nacl=require("tweetnacl");
-const bs58=require("bs58");
+const http = require("http");
+const express = require("express");
+const bodyParser = require("body-parser");
+const WebSocket = require("ws");
+const nacl = require("tweetnacl");
 
-const app=express();
+const app = express();
 app.use(bodyParser.json());
+const httpServer = http.createServer(app);
+const wss = new WebSocket.Server({ server: httpServer, path: "/ws" });
 
-// CORS simple pour ton front bbqfinance.fun
-app.use((req,res,next)=>{
-  res.setHeader("Access-Control-Allow-Origin","*");
-  res.setHeader("Access-Control-Allow-Methods","GET,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers","Content-Type");
-  if(req.method==="OPTIONS")return res.sendStatus(200);
-  next();
-});
+const DEC = 1e6;
 
-const DEC=1e6;
+// ===== Base58 maison (alphabet Bitcoin) =====
+const B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
-// == Base58 compat (corrige ton bug bs58.encode is not a function) ==
-const b58enc=u8=>{
-  if(bs58.encode) return bs58.encode(u8);
-  return bs58(u8);
-};
-const b58dec=str=>{
-  if(bs58.decode) return bs58.decode(str);
-  return bs58(str);
-};
-
-// == État POWCHAIN ==
-let chain=[];           // {height,time,hash,txs,validator}
-let mempool=[];         // tx en attente
-let height=0;
-
-const wallets={};       // addr -> {pow,usdc,staked,nonce,pub}
-const treasury={};      // {addr,priv,pub}
-const lpPool={pow:0,usdc:0}; // AMM x*y=k
-
-// == Paramètres économiques ==
-const FEE_SWAP_BP=20;   // 0.20% pour la trésorerie
-const BLOCK_TIME_MS=8000; // auto-block toutes les 8s si mempool non vide
-
-// ======== INIT TRÉSORERIE + GENESIS ========
-
-function initTreasury(){
-  const kp=nacl.sign.keyPair();
-  const addr=b58enc(kp.publicKey);
-  const priv=b58enc(kp.secretKey);
-  treasury.addr=addr;
-  treasury.priv=priv;
-  treasury.pub=addr;
-  wallets[addr]={pow:0,usdc:0,staked:0,nonce:0,pub:addr};
-  console.log("💰 Trésorerie POWCHAIN:",addr);
-}
-
-function hashBlockObj(obj){
-  // hash très simple (pas pour la prod, mais suffisant pour démo)
-  const s=JSON.stringify(obj);
-  let h=0;
-  for(let i=0;i<s.length;i++) h=(h*31+s.charCodeAt(i))>>>0;
-  return "POW"+h.toString(16);
-}
-
-function addBlock(txs){
-  const blk={
-    height:height+1,
-    time:Date.now(),
-    txs,
-    validator:treasury.addr
-  };
-  blk.hash=hashBlockObj(blk);
-  chain.push(blk);
-  height=blk.height;
-  console.log("⛓ Bloc",blk.height,"(",txs.length,"tx )");
-  broadcast({type:"block",block:blk,stats:getStats()});
-}
-
-// ======== UTILITAIRES WALLET ========
-
-function ensureWallet(addr,pubOpt){
-  if(!wallets[addr]){
-    wallets[addr]={pow:0,usdc:0,staked:0,nonce:0,pub:pubOpt||addr};
-  }else if(pubOpt && !wallets[addr].pub){
-    wallets[addr].pub=pubOpt;
+function b58enc(buf) {
+  const bytes = Array.from(buf);
+  if (!bytes.length) return "";
+  const digits = [0];
+  for (let i = 0; i < bytes.length; i++) {
+    let carry = bytes[i];
+    for (let j = 0; j < digits.length; j++) {
+      carry += digits[j] << 8;
+      digits[j] = carry % 58;
+      carry = (carry / 58) | 0;
+    }
+    while (carry) {
+      digits.push(carry % 58);
+      carry = (carry / 58) | 0;
+    }
   }
-  return wallets[addr];
+  let out = "";
+  for (let k = 0; bytes[k] === 0 && k < bytes.length; k++) out += "1";
+  for (let q = digits.length - 1; q >= 0; q--) out += B58[digits[q]];
+  return out;
 }
 
-function getStats(){
-  let totalPow=0,totalUsdc=0,totalStaked=0;
-  for(const a in wallets){
-    const w=wallets[a];
-    totalPow+=w.pow;
-    totalUsdc+=w.usdc;
-    totalStaked+=w.staked;
+function b58dec(str) {
+  if (!str || typeof str !== "string") throw new Error("invalid base58");
+  const bytes = [0];
+  for (let i = 0; i < str.length; i++) {
+    const v = B58.indexOf(str[i]);
+    if (v < 0) throw new Error("invalid base58 char");
+    let carry = v;
+    for (let j = 0; j < bytes.length; j++) {
+      carry += bytes[j] * 58;
+      bytes[j] = carry & 0xff;
+      carry >>= 8;
+    }
+    while (carry) {
+      bytes.push(carry & 0xff);
+      carry >>= 8;
+    }
   }
-  return {
-    height,
-    totalPow,
-    totalUsdc,
-    totalStaked,
-    lpPow:lpPool.pow,
-    lpUsdc:lpPool.usdc,
-    treasury:treasury.addr,
-    wallets:Object.keys(wallets).length,
-    mempool:mempool.length,
-    lastBlockTime:chain.length?chain[chain.length-1].time:null
-  };
+  for (let k = 0; str[k] === "1" && k < str.length; k++) bytes.push(0);
+  return Uint8Array.from(bytes.reverse());
 }
 
-// ======== VÉRIF SIGNATURE ========
+// ===== État POWCHAIN =====
 
-function verifySignature(tx){
-  try{
-    if(!tx.sig || !tx.pub) return false;
-    const msgObj={
-      type:tx.type,
-      from:tx.from,
-      to:tx.to??null,
-      amount:tx.amount??0,
-      token:tx.token??"POW",
-      nonce:tx.nonce
-    };
-    const msg=new TextEncoder().encode(JSON.stringify(msgObj));
-    const sig=b58dec(tx.sig);
-    const pub=b58dec(tx.pub);
-    return nacl.sign.detached.verify(msg,sig,pub);
-  }catch(e){
-    console.error("❌ Erreur verifySignature:",e.message);
+// Chaîne de blocs : [{height,time,prev,hash,txs,validator}]
+const chain = [];
+
+// Mempool : txs en attente
+const mempool = [];
+
+// Wallets: addr -> {pow,usdc,staked,nonce,pub}
+const wallets = Object.create(null);
+
+// LP interne x*y = k (POW/USDC POW)
+const lp = { pow: 0, usdc: 0 };
+
+// Trésorerie officielle POWCHAIN (adresse fournie par toi)
+const TREASURY_ADDR = "BZJsWeJizv3YeyuWjF5187jrcduPFAHWjqL7jgq4kGwy";
+
+wallets[TREASURY_ADDR] = {
+  pow: 0,
+  usdc: 0,
+  staked: 0,
+  nonce: 0,
+  pub: null
+};
+
+// ===== Utilitaires =====
+
+function log(...args) {
+  console.log(new Date().toISOString(), "-", ...args);
+}
+
+function broadcast(obj) {
+  const data = JSON.stringify(obj);
+  wss.clients.forEach(c => {
+    if (c.readyState === WebSocket.OPEN) c.send(data);
+  });
+}
+
+function ensureWallet(addr, pub) {
+  if (!addr || typeof addr !== "string") throw new Error("ADDR_EMPTY");
+  let w = wallets[addr];
+  if (!w) {
+    w = wallets[addr] = { pow: 0, usdc: 0, staked: 0, nonce: 0, pub: null };
+  }
+  if (pub) {
+    if (w.pub && w.pub !== pub) throw new Error("PUB_MISMATCH");
+    if (!w.pub) w.pub = pub;
+  }
+  return w;
+}
+
+function chainHeight() {
+  return chain.length ? chain[chain.length - 1].height : 0;
+}
+
+function getSupply() {
+  let supplyPow = 0, supplyUsdc = 0;
+  for (const a of Object.keys(wallets)) {
+    const w = wallets[a];
+    supplyPow += (w.pow + w.staked);
+    supplyUsdc += w.usdc;
+  }
+  return { pow: supplyPow, usdc: supplyUsdc };
+}
+
+// ===== Vérification de signatures & tx =====
+
+function buildMsg(tx) {
+  return Buffer.from(
+    JSON.stringify({
+      type: tx.type,
+      from: tx.from,
+      to: tx.to ?? null,
+      amount: tx.amount ?? 0,
+      token: tx.token ?? null,
+      nonce: tx.nonce
+    })
+  );
+}
+
+function verifySig(tx) {
+  try {
+    if (!tx.sig || !tx.pub) return false;
+    const msg = buildMsg(tx);
+    const sig = b58dec(tx.sig);
+    const pub = b58dec(tx.pub);
+    return nacl.sign.detached.verify(msg, sig, pub);
+  } catch (e) {
     return false;
   }
 }
 
-// ======== APPLICATION DES TX ========
+function validateTxBasic(tx) {
+  if (!tx || typeof tx !== "object") return "TX_EMPTY";
+  if (typeof tx.type !== "string") return "TYPE";
+  if (typeof tx.from !== "string") return "FROM";
+  if (typeof tx.nonce !== "number") return "NONCE";
+  if (typeof tx.amount !== "number" || tx.amount <= 0) return "AMOUNT";
+  if (!["POW", "USDC"].includes(tx.token || "POW")) return "TOKEN";
+  return null;
+}
 
-function applyTx(tx){
-  const {type,from,to,amount,token,extra}=tx;
-  const amt=Number(amount||0);
+// ===== Application des tx sur l'état =====
 
-  if(!from) return {ok:false,reason:"from manquant"};
+function applyTx(tx) {
+  const basicErr = validateTxBasic(tx);
+  if (basicErr) throw new Error("BAD_" + basicErr);
 
-  const wFrom=ensureWallet(from,tx.pub);
-  const wTo=to?ensureWallet(to):null;
+  const wFrom = ensureWallet(tx.from, tx.pub);
+  if (tx.nonce !== wFrom.nonce + 1) throw new Error("BAD_NONCE");
+  if (!verifySig(tx)) throw new Error("BAD_SIG");
 
-  switch(type){
-    case "MINT_POW":{
-      // réservé à la trésorerie
-      if(from!==treasury.addr) return {ok:false,reason:"mint réservé trésorerie"};
-      wFrom.pow+=amt;
-      return {ok:true};
-    }
-    case "MINT_USDC":{
-      if(from!==treasury.addr) return {ok:false,reason:"mint réservé trésorerie"};
-      wFrom.usdc+=amt;
-      return {ok:true};
-    }
-    case "TRANSFER":{
-      const cur=token==="USDC"?"usdc":"pow";
-      if(wFrom[cur]<amt) return {ok:false,reason:"solde insuffisant"};
-      wFrom[cur]-=amt;
-      if(wTo) wTo[cur]+=amt;
-      return {ok:true};
-    }
-    case "STAKE":{
-      if(wFrom.pow<amt) return {ok:false,reason:"POW insuffisant"};
-      wFrom.pow-=amt;
-      wFrom.staked+=amt;
-      return {ok:true};
-    }
-    case "UNSTAKE":{
-      if(wFrom.staked<amt) return {ok:false,reason:"stake insuffisant"};
-      wFrom.staked-=amt;
-      wFrom.pow+=amt;
-      return {ok:true};
-    }
-    case "LP_ADD":{
-      if(wFrom.pow<amt || wFrom.usdc<extra.usdc) return {ok:false,reason:"fonds insuffisants"};
-      wFrom.pow-=amt;
-      wFrom.usdc-=extra.usdc;
-      lpPool.pow+=amt;
-      lpPool.usdc+=extra.usdc;
-      // pas de jeton LP/NFT pour l’instant (démo)
-      return {ok:true};
-    }
-    case "LP_REMOVE":{
-      // pour la démo, on laisse la trésorerie seule à gérer LP
-      if(from!==treasury.addr) return {ok:false,reason:"LP_REMOVE réservé trésorerie"};
-      const share=Math.min(1,Number(extra.share)||0);
-      const outPow=Math.floor(lpPool.pow*share);
-      const outUsdc=Math.floor(lpPool.usdc*share);
-      lpPool.pow-=outPow;
-      lpPool.usdc-=outUsdc;
-      wFrom.pow+=outPow;
-      wFrom.usdc+=outUsdc;
-      return {ok:true};
-    }
-    case "SWAP":{
-      // AMM x*y=k sur lpPool
-      if(lpPool.pow<=0||lpPool.usdc<=0) return {ok:false,reason:"LP vide"};
-      const dir=token==="POW2USDC"?"POW2USDC":"USDC2POW";
-      if(dir==="POW2USDC"){
-        if(wFrom.pow<amt) return {ok:false,reason:"POW insuffisant"};
-        // montant après fee
-        const fee=Math.floor(amt*FEE_SWAP_BP/10000);
-        const amtEff=amt-fee;
-        const k=lpPool.pow*lpPool.usdc;
-        const newPow=lpPool.pow+amtEff;
-        const newUsdc=Math.floor(k/newPow);
-        const out=lpPool.usdc-newUsdc;
-        if(out<=0) return {ok:false,reason:"out<=0"};
-        wFrom.pow-=amt;
-        wFrom.usdc+=out;
-        lpPool.pow=newPow;
-        lpPool.usdc=newUsdc;
-        wallets[treasury.addr].pow+=fee; // fee en POW
-        return {ok:true,swapped:out};
-      }else{
-        if(wFrom.usdc<amt) return {ok:false,reason:"USDC insuffisant"};
-        const fee=Math.floor(amt*FEE_SWAP_BP/10000);
-        const amtEff=amt-fee;
-        const k=lpPool.pow*lpPool.usdc;
-        const newUsdc=lpPool.usdc+amtEff;
-        const newPow=Math.floor(k/newUsdc);
-        const out=lpPool.pow-newPow;
-        if(out<=0) return {ok:false,reason:"out<=0"};
-        wFrom.usdc-=amt;
-        wFrom.pow+=out;
-        lpPool.usdc=newUsdc;
-        lpPool.pow=newPow;
-        wallets[treasury.addr].usdc+=fee;
-        return {ok:true,swapped:out};
+  const amt = Math.floor(tx.amount);
+
+  switch (tx.type) {
+    case "transfer": {
+      const wTo = ensureWallet(tx.to);
+      if (tx.token === "POW") {
+        if (wFrom.pow < amt) throw new Error("NO_FUNDS");
+        wFrom.pow -= amt;
+        wTo.pow += amt;
+      } else {
+        if (wFrom.usdc < amt) throw new Error("NO_FUNDS");
+        wFrom.usdc -= amt;
+        wTo.usdc += amt;
       }
+      break;
     }
+
+    case "stake": {
+      if (tx.token !== "POW") throw new Error("STAKE_POW_ONLY");
+      if (wFrom.pow < amt) throw new Error("NO_FUNDS");
+      wFrom.pow -= amt;
+      wFrom.staked += amt;
+      break;
+    }
+
+    case "unstake": {
+      if (tx.token !== "POW") throw new Error("UNSTAKE_POW_ONLY");
+      if (wFrom.staked < amt) throw new Error("NO_STAKED");
+      wFrom.staked -= amt;
+      wFrom.pow += amt;
+      break;
+    }
+
+    case "lp_add": {
+      // ajoute de la liquidité POW + USDC dans les mêmes proportions que le pool
+      const half = amt; // on suppose amt = POW, user envoie aussi amt en USDC
+      if (wFrom.pow < half || wFrom.usdc < half) throw new Error("NO_FUNDS");
+      wFrom.pow -= half;
+      wFrom.usdc -= half;
+      lp.pow += half;
+      lp.usdc += half;
+      break;
+    }
+
+    case "lp_remove": {
+      // retire une partie proportionnelle du pool
+      if (lp.pow === 0 || lp.usdc === 0) throw new Error("POOL_EMPTY");
+      const share = amt / (lp.pow + lp.usdc); // simplifié
+      const outPow = Math.floor(lp.pow * share);
+      const outUsdc = Math.floor(lp.usdc * share);
+      lp.pow -= outPow;
+      lp.usdc -= outUsdc;
+      wFrom.pow += outPow;
+      wFrom.usdc += outUsdc;
+      break;
+    }
+
+    case "swap_pow_usdc": {
+      if (lp.pow === 0 || lp.usdc === 0) throw new Error("POOL_EMPTY");
+      if (wFrom.pow < amt) throw new Error("NO_FUNDS");
+      const powIn = amt;
+      const k = lp.pow * lp.usdc;
+      const newPow = lp.pow + powIn;
+      const newUsdc = Math.floor(k / newPow);
+      const usdcOut = lp.usdc - newUsdc;
+      if (usdcOut <= 0) throw new Error("NO_LIQ");
+      const fee = Math.floor(usdcOut * 2 / 100); // 2% fee vers trésorerie
+      const net = usdcOut - fee;
+
+      wFrom.pow -= powIn;
+      wFrom.usdc += net;
+      lp.pow = newPow;
+      lp.usdc = newUsdc + fee;
+
+      wallets[TREASURY_ADDR].usdc += fee;
+      break;
+    }
+
+    case "swap_usdc_pow": {
+      if (lp.pow === 0 || lp.usdc === 0) throw new Error("POOL_EMPTY");
+      if (wFrom.usdc < amt) throw new Error("NO_FUNDS");
+      const usdcIn = amt;
+      const k = lp.pow * lp.usdc;
+      const newUsdc = lp.usdc + usdcIn;
+      const newPow = Math.floor(k / newUsdc);
+      const powOut = lp.pow - newPow;
+      if (powOut <= 0) throw new Error("NO_LIQ");
+      const fee = Math.floor(powOut * 2 / 100);
+      const net = powOut - fee;
+
+      wFrom.usdc -= usdcIn;
+      wFrom.pow += net;
+      lp.usdc = newUsdc;
+      lp.pow = newPow + fee;
+
+      wallets[TREASURY_ADDR].pow += fee;
+      break;
+    }
+
     default:
-      return {ok:false,reason:"type inconnu"};
+      throw new Error("TYPE_UNKNOWN");
+  }
+
+  wFrom.nonce += 1;
+}
+
+// ===== Bloc + auto-minage =====
+
+function makeHash(obj) {
+  // hash léger (pas cryptographique, mais suffisant pour visualiser)
+  const s = JSON.stringify(obj);
+  let h = 0;
+  for (let i = 0; i < s.length; i++) {
+    h = (h * 31 + s.charCodeAt(i)) >>> 0;
+  }
+  return h.toString(16).padStart(8, "0");
+}
+
+function mineBlock() {
+  if (!mempool.length) return;
+  const height = chainHeight() + 1;
+  const ts = Date.now();
+  const txs = mempool.splice(0, mempool.length);
+  const prev = chain.length ? chain[chain.length - 1].hash : "GENESIS";
+
+  try {
+    // On applique les tx de façon déterministe
+    for (const tx of txs) applyTx(tx);
+
+    const blk = {
+      height,
+      time: ts,
+      prev,
+      txs,
+      validator: TREASURY_ADDR, // pour l’instant : ce node
+    };
+    blk.hash = makeHash(blk);
+    chain.push(blk);
+
+    const reward = Math.floor(10 * DEC);
+    wallets[TREASURY_ADDR].pow += reward;
+
+    log("✅ Bloc", height, "miné avec", txs.length, "tx");
+    broadcast({ type: "block", block: blk, stats: getStats() });
+  } catch (e) {
+    log("❌ Erreur bloc, rollback mempool:", e.message);
+    // Si ça plante, on remet les tx dans le mempool (simple)
+    mempool.unshift(...txs);
   }
 }
 
-function processMempool(){
-  if(!mempool.length) return;
-  const txs=mempool.splice(0,mempool.length);
-  const applied=[];
-  for(const tx of txs){
-    const res=applyTx(tx);
-    if(res.ok) applied.push(tx);
-    else console.log("❌ TX rejetée",tx.type,tx.from,"raison:",res.reason);
-  }
-  if(applied.length) addBlock(applied);
+function getStats() {
+  const { pow, usdc } = getSupply();
+  const t = wallets[TREASURY_ADDR] || { pow: 0, usdc: 0, staked: 0 };
+  return {
+    height: chainHeight(),
+    blocks: chain.length,
+    mempool: mempool.length,
+    lp,
+    supplyPow: pow,
+    supplyUsdc: usdc,
+    treasuryPow: t.pow,
+    treasuryUsdc: t.usdc,
+    treasuryStaked: t.staked
+  };
 }
 
-// ======== BOUCLE AUTO-BLOCK ========
+// ===== API HTTP =====
 
-setInterval(processMempool,BLOCK_TIME_MS);
-
-// ======== WEBSOCKET ========
-
-const wss=new WebSocket.Server({port:7001});
-wss.on("connection",ws=>{
-  console.log("🔌 Client WS connecté");
-  ws.send(JSON.stringify({type:"hello",stats:getStats(),height}));
-  ws.on("close",()=>console.log("🔌 Client WS déconnecté"));
-});
-
-function broadcast(obj){
-  const msg=JSON.stringify(obj);
-  wss.clients.forEach(c=>{
-    if(c.readyState===WebSocket.OPEN) c.send(msg);
-  });
-}
-
-// ======== API HTTP ========
-
-// Ping simple
-app.get("/ping",(req,res)=>{
-  res.json({ok:true,stats:getStats()});
-});
-
-// Stats POWCHAIN
-app.get("/stats",(req,res)=>{
+// Stats pour ton dashboard
+app.get("/stats", (req, res) => {
   res.json(getStats());
 });
 
-// Chaîne complète
-app.get("/chain",(req,res)=>{
-  res.json(chain);
+// Récup d’un wallet
+app.get("/wallet/:addr", (req, res) => {
+  const addr = req.params.addr;
+  const w = wallets[addr];
+  if (!w) return res.status(404).json({ error: "NOT_FOUND" });
+  res.json(w);
 });
 
-// Infos wallet
-app.get("/wallet/:addr",(req,res)=>{
-  const w=wallets[req.params.addr];
-  if(!w) return res.status(404).json({error:"wallet inconnu"});
-  res.json({addr:req.params.addr,...w});
-});
+// Soumission de tx signée
+app.post("/tx", (req, res) => {
+  const tx = req.body;
+  try {
+      const basicErr = validateTxBasic(tx);
+      if (basicErr) return res.status(400).json({ ok: false, error: "BAD_" + basicErr });
 
-// Soumission TX signée
-app.post("/tx",(req,res)=>{
-  const tx=req.body||{};
-  try{
-    if(!tx.type||!tx.from) return res.status(400).json({error:"type/from manquant"});
-    const w=ensureWallet(tx.from,tx.pub);
-    const expectedNonce=w.nonce+1;
-    if(typeof tx.nonce!=="number"||tx.nonce!==expectedNonce){
-      return res.status(400).json({error:"nonce invalide",expected:expectedNonce,got:tx.nonce});
-    }
-    if(!verifySignature(tx)){
-      return res.status(400).json({error:"signature invalide"});
-    }
-    mempool.push(tx);
-    w.nonce=tx.nonce;
-    broadcast({type:"mempool",mempool:mempool.length});
-    res.json({ok:true,queued:true,nonce:w.nonce});
-  }catch(e){
-    console.error("❌ Erreur /tx:",e);
-    res.status(500).json({error:"server error"});
+      if (!verifySig(tx)) return res.status(400).json({ ok: false, error: "BAD_SIG" });
+
+      // On ne l’applique pas encore, on la met dans le mempool,
+      // l’application réelle se fait dans mineBlock()
+      mempool.push(tx);
+      broadcast({ type: "mempool", mempool: mempool.length });
+      res.json({ ok: true });
+  } catch (e) {
+      res.status(400).json({ ok: false, error: e.message });
   }
 });
 
-// ======== BOOT ========
+// ===== WebSocket =====
 
-initTreasury();
-addBlock([]); // genesis vide
+wss.on("connection", ws => {
+  log("🌐 Client WS connecté");
+  ws.send(JSON.stringify({ type: "hello", stats: getStats(), chainHeight: chainHeight() }));
+});
 
-const PORT=3000;
-app.listen(PORT,"0.0.0.0",()=>{
-  console.log("🔥 POWCHAIN en ligne sur port",PORT);
-  console.log("curl http://127.0.0.1:"+PORT+"/stats");
+// ===== Genesis + boucle de bloc =====
+
+function initGenesis() {
+  if (chain.length) return;
+  const genesis = {
+    height: 1,
+    time: Date.now(),
+    prev: null,
+    txs: [],
+    validator: "GENESIS"
+  };
+  genesis.hash = makeHash(genesis);
+  chain.push(genesis);
+  log("🚀 Genesis créé, height=1");
+}
+
+initGenesis();
+setInterval(mineBlock, 5000);
+
+// ===== Lancement serveur =====
+
+const PORT = 3000;
+const WSPORT = 7001;
+
+httpServer.listen(PORT, () => {
+  log("🔥 POWCHAIN HTTP+WS en ligne sur port", PORT, "(WS path /ws, port interne", WSPORT, ")");
 });
