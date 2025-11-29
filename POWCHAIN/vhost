@@ -1,41 +1,232 @@
-nano /root/powchain/server.js
+cd /root/powchain
+nano server.js
 
 
+"use strict";
 
-// ======================== API REST =========================
+const fs = require("fs");
+const path = require("path");
+const http = require("http");
+const WebSocket = require("ws");
+const express = require("express");
+const crypto = require("crypto");
 
-// /stats  → état blockchain + comptes
-app.get("/stats", (req,res)=>{
+// ----------------- CONFIG -----------------
+const PORT_HTTP = 3000;
+const PORT_WS   = 7001;
+const CHAIN_FILE = path.join(__dirname, "chain.json");
+const DEC = 1e6;
+
+// ----------------- ÉTAT EN MÉMOIRE -----------------
+let chain = [];
+let state = {
+  wallets: {},       // addr -> {pow,usdc,staked,nonce,pub}
+  lpPow: 0,
+  lpUsdc: 0,
+  treasuryUsdc: 0,
+  treasurySol: 0
+};
+let mempool = [];
+let wss; // sera défini après
+
+// ----------------- UTILITAIRES -----------------
+function loadChain() {
+  try {
+    const raw = fs.readFileSync(CHAIN_FILE, "utf8");
+    const parsed = JSON.parse(raw);
+    chain = parsed.chain || [];
+    state = parsed.state || state;
+    console.log("✅ Blockchain chargée :", chain.length, "blocs");
+  } catch (e) {
+    console.log("ℹ️ Aucune chain.json valide, nouvelle chaîne.");
+    chain = [];
+    if (!state.wallets) state.wallets = {};
+  }
+}
+
+function saveChain() {
+  try {
+    fs.writeFileSync(CHAIN_FILE, JSON.stringify({ chain, state }, null, 2));
+  } catch (e) {
+    console.error("❌ Erreur saveChain :", e.message);
+  }
+}
+
+function getWallet(addr, pubOpt) {
+  if (!state.wallets[addr]) {
+    state.wallets[addr] = { pow: 0, usdc: 0, staked: 0, nonce: 0, pub: pubOpt || addr };
+  }
+  if (pubOpt && !state.wallets[addr].pub) state.wallets[addr].pub = pubOpt;
+  return state.wallets[addr];
+}
+
+function applyTx(tx) {
+  if (!tx || !tx.type || !tx.from) return false;
+  const w = getWallet(tx.from, tx.pub);
+
+  if (typeof tx.nonce === "number" && tx.nonce <= w.nonce) {
+    return false;
+  }
+
+  switch (tx.type) {
+    case "TX_POW": {
+      if (!tx.to || typeof tx.amount !== "number") return false;
+      const toW = getWallet(tx.to);
+      if (w.pow < tx.amount) return false;
+      w.pow -= tx.amount;
+      toW.pow += tx.amount;
+      break;
+    }
+    case "STAKE": {
+      if (typeof tx.amount !== "number") return false;
+      if (w.pow < tx.amount) return false;
+      w.pow -= tx.amount;
+      w.staked += tx.amount;
+      break;
+    }
+    case "LP_ADD": {
+      if (typeof tx.pow !== "number" || typeof tx.usdc !== "number") return false;
+      if (w.pow < tx.pow || w.usdc < tx.usdc) return false;
+      w.pow -= tx.pow;
+      w.usdc -= tx.usdc;
+      state.lpPow += tx.pow;
+      state.lpUsdc += tx.usdc;
+      break;
+    }
+    case "SWAP": {
+      if (typeof tx.amount !== "number") return false;
+      if (state.lpPow <= 0 || state.lpUsdc <= 0) return false;
+      const k = state.lpPow * state.lpUsdc;
+
+      if (tx.token === "pow2usdc") {
+        if (w.pow < tx.amount) return false;
+        const newPow = state.lpPow + tx.amount;
+        const newUsdc = k / newPow;
+        const out = state.lpUsdc - newUsdc;
+        if (out <= 0) return false;
+        w.pow -= tx.amount;
+        w.usdc += out;
+        state.lpPow = newPow;
+        state.lpUsdc = newUsdc;
+      } else if (tx.token === "usdc2pow") {
+        if (w.usdc < tx.amount) return false;
+        const newUsdc = state.lpUsdc + tx.amount;
+        const newPow = k / newUsdc;
+        const out = state.lpPow - newPow;
+        if (out <= 0) return false;
+        w.usdc -= tx.amount;
+        w.pow += out;
+        state.lpUsdc = newUsdc;
+        state.lpPow = newPow;
+      } else {
+        return false;
+      }
+      break;
+    }
+    default:
+      return false;
+  }
+
+  w.nonce = tx.nonce || (w.nonce + 1);
+  return true;
+}
+
+function broadcast(obj) {
+  if (!wss) return;
+  const msg = JSON.stringify(obj);
+  wss.clients.forEach(c => {
+    if (c.readyState === WebSocket.OPEN) c.send(msg);
+  });
+}
+
+function mineBlock() {
+  if (!mempool.length) return;
+  const prev = chain[chain.length - 1];
+  const height = prev ? prev.height + 1 : 0;
+  const block = {
+    height,
+    time: Date.now(),
+    prevHash: prev ? prev.hash : null,
+    txs: mempool.splice(0),
+    validator: "SERVER"
+  };
+  const hashData = JSON.stringify(block);
+  block.hash = crypto.createHash("sha256").update(hashData).digest("hex");
+  chain.push(block);
+  saveChain();
+  broadcast({ type: "NEW_BLOCK", block });
+  console.log("⛏️ Bloc miné", height, "TX:", block.txs.length);
+}
+
+// lancement
+loadChain();
+setInterval(mineBlock, 5000);
+
+// ----------------- HTTP API (Express) -----------------
+const app = express();
+app.use(express.json());
+
+app.get("/stats", (req, res) => {
+  const height = chain.length ? chain[chain.length - 1].height : 0;
   res.json({
-    blocks: chain.length,
-    treasury: accounts[treasury].pow,
-    usdcTreasury: accounts[treasury].usdc,
-    accounts: Object.keys(accounts).length
+    height,
+    lpPow: Math.floor(state.lpPow || 0),
+    lpUsdc: Math.floor(state.lpUsdc || 0),
+    treasuryUsdc: Math.floor(state.treasuryUsdc || 0),
+    treasurySol: state.treasurySol || 0
   });
 });
 
-// /chain → renvoie tous les blocs
-app.get("/chain", (req,res)=>{
-  res.json(chain);
+app.get("/wallet/:addr", (req, res) => {
+  const w = getWallet(req.params.addr);
+  res.json(w);
 });
 
-// /tx  → nouvelle transaction {from,to,amount,type}
-app.post("/tx", (req,res)=>{
-  try{
-    const tx = req.body;
+app.get("/block/:h", (req, res) => {
+  const h = parseInt(req.params.h, 10);
+  const b = chain.find(b => b.height === h);
+  if (!b) return res.status(404).json({ error: "block not found" });
+  res.json(b);
+});
+
+app.get("/chain", (req, res) => {
+  // derniers 30 blocs
+  res.json(chain.slice(-30));
+});
+
+app.post("/tx", (req, res) => {
+  const tx = req.body;
+  if (!tx || !tx.type) return res.status(400).json({ error: "invalid tx" });
+  if (applyTx(tx)) {
     mempool.push(tx);
-    broadcast({type:"mempool",tx});
-    res.json({ok:true});
-  }catch(e){
-    res.json({ok:false,error:e.toString()});
+    res.json({ ok: true });
+  } else {
+    res.status(400).json({ ok: false });
   }
 });
 
-// ======================== WEBSOCKET =========================
-wss.on("connection",(ws)=>{
-  ws.send(JSON.stringify({type:"hello",msg:"WS POWCHAIN connecté"}));
+const httpServer = http.createServer(app);
+httpServer.listen(PORT_HTTP, () => {
+  console.log("✅ HTTP API POWCHAIN sur port", PORT_HTTP, "(/stats /tx /wallet /block /chain)");
 });
 
-// ======================== LANCEMENT SERVEURS =========================
-server.listen(3000,()=> console.log("⚡ HTTP API POWCHAIN online sur port 3000 (/stats /tx /chain)"));
-wsServer.listen(7001,()=> console.log("🔌 WebSocket POWCHAIN en ligne sur port 7001 (/ws)"));
+// ----------------- WebSocket -----------------
+const wsServer = http.createServer();
+wss = new WebSocket.Server({ server: wsServer });
+
+wsServer.listen(PORT_WS, () => {
+  console.log("✅ WebSocket POWCHAIN sur port", PORT_WS, "(/ws via Nginx)");
+});
+
+wss.on("connection", (socket) => {
+  console.log("🔌 Client WebSocket connecté");
+  socket.send(JSON.stringify({ type: "HELLO", height: chain.length }));
+  socket.on("message", (data) => {
+    try {
+      const tx = JSON.parse(data.toString());
+      if (applyTx(tx)) mempool.push(tx);
+    } catch (e) {
+      console.error("WS message error:", e.message);
+    }
+  });
+});
