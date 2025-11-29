@@ -1,7 +1,236 @@
 cd /root/powchain
-npm install express ws
+pm2 start server.js --name powchain
 
+"use strict";
 
-pm2 delete powchain
-pm2 start /root/powchain/server.js --name powchain
-pm2 logs powchain --lines 20
+const http = require("http");
+const fs = require("fs");
+const path = require("path");
+const crypto = require("crypto");
+const WebSocket = require("ws");
+
+// Fichiers locaux
+const DATA_DIR = __dirname;
+const CHAIN_FILE = path.join(DATA_DIR, "chain.json");
+
+// État en mémoire
+let chain = [];
+let mempool = [];
+
+// ---------------------
+// Chargement / sauvegarde
+// ---------------------
+function loadChain() {
+  try {
+    if (!fs.existsSync(CHAIN_FILE)) {
+      console.log("⚠️ chain.json absent -> initialisation tableau vide");
+      chain = [];
+      return;
+    }
+
+    const raw = fs.readFileSync(CHAIN_FILE, "utf8");
+    const data = JSON.parse(raw);
+
+    if (Array.isArray(data)) {
+      chain = data;
+    } else {
+      console.log("⚠️ chain.json mauvais format -> reset tableau vide");
+      chain = [];
+    }
+
+    console.log("✅ Blockchain chargée :", chain.length, "blocs");
+  } catch (e) {
+    console.error("❌ Erreur lecture chain.json :", e.message);
+    chain = [];
+  }
+}
+
+function saveChain() {
+  try {
+    fs.writeFileSync(CHAIN_FILE, JSON.stringify(chain, null, 2), "utf8");
+  } catch (e) {
+    console.error("❌ Erreur sauvegarde chain.json :", e.message);
+  }
+}
+
+// ---------------------
+// Utilitaires blockchain
+// ---------------------
+function hashBlock(block) {
+  const h = crypto.createHash("sha256");
+  h.update(JSON.stringify({
+    height: block.height,
+    prevHash: block.prevHash,
+    ts: block.ts,
+    txs: block.txs || []
+  }));
+  return h.digest("hex");
+}
+
+function getStats() {
+  const height = chain.length;
+  const last = height > 0 ? chain[height - 1] : null;
+
+  let txCount = 0;
+  let powSupply = 0;
+  let usdcSupply = 0;
+
+  for (const b of chain) {
+    if (Array.isArray(b.txs)) txCount += b.txs.length;
+    if (typeof b.powSupply === "number") powSupply = b.powSupply;
+    if (typeof b.usdcSupply === "number") usdcSupply = b.usdcSupply;
+  }
+
+  return {
+    height,
+    blocks: height,
+    txCount,
+    powSupply,
+    usdcSupply,
+    lastHash: last ? last.hash : null,
+    updatedAt: new Date().toISOString()
+  };
+}
+
+function addTx(tx) {
+  const clean = {
+    from: tx.from || null,
+    to: tx.to || null,
+    amount: Number(tx.amount) || 0,
+    token: tx.token || "POW",
+    nonce: tx.nonce || 0,
+    memo: tx.memo || ""
+  };
+  mempool.push(clean);
+  console.log("🧾 TX ajoutée au mempool :", clean);
+  broadcast({ type: "mempool", mempoolSize: mempool.length });
+}
+
+function mineBlock() {
+  const prev = chain[chain.length - 1] || null;
+  const height = chain.length;
+  const txs = mempool;
+  mempool = [];
+
+  const block = {
+    height,
+    ts: Date.now(),
+    prevHash: prev ? prev.hash : "GENESIS",
+    txs,
+    powSupply: prev && typeof prev.powSupply === "number" ? prev.powSupply : 0,
+    usdcSupply: prev && typeof prev.usdcSupply === "number" ? prev.usdcSupply : 0
+  };
+  block.hash = hashBlock(block);
+
+  chain.push(block);
+  saveChain();
+
+  console.log("⛏️ Nouveau bloc miné :", height, "hash:", block.hash);
+  broadcast({ type: "block", block, stats: getStats() });
+}
+
+// ---------------------
+// HTTP API (/stats, /tx)
+// ---------------------
+const HTTP_PORT = 3000;
+
+const httpServer = http.createServer((req, res) => {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const { pathname } = url;
+
+  // CORS simple (au cas où depuis dashboard)
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+  if (req.method === "OPTIONS") {
+    res.writeHead(204);
+    return res.end();
+  }
+
+  if (req.method === "GET" && pathname === "/stats") {
+    try {
+      const stats = getStats();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ ok: true, stats }));
+    } catch (e) {
+      console.error("❌ Erreur /stats :", e);
+      res.writeHead(500, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ ok: false, error: "stats_failed" }));
+    }
+  }
+
+  if (req.method === "POST" && pathname === "/tx") {
+    let body = "";
+    req.on("data", chunk => { body += chunk; if (body.length > 1e6) req.destroy(); });
+    req.on("end", () => {
+      try {
+        const tx = JSON.parse(body || "{}");
+        addTx(tx);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, mempoolSize: mempool.length }));
+      } catch (e) {
+        console.error("❌ Erreur /tx :", e.message);
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "bad_tx" }));
+      }
+    });
+    return;
+  }
+
+  // Fallback 404
+  res.writeHead(404, { "Content-Type": "text/plain" });
+  res.end("Not Found");
+});
+
+httpServer.listen(HTTP_PORT, () => {
+  console.log(`🌐 HTTP API POWCHAIN en ligne sur port ${HTTP_PORT} (/stats /tx)`);
+});
+
+// ---------------------
+// WebSocket (/ws, port 7001)
+// ---------------------
+const WS_PORT = 7001;
+const wss = new WebSocket.Server({ port: WS_PORT });
+
+function broadcast(obj) {
+  const msg = JSON.stringify(obj);
+  wss.clients.forEach(c => {
+    if (c.readyState === WebSocket.OPEN) c.send(msg);
+  });
+}
+
+wss.on("connection", ws => {
+  console.log("🛰️ Client WebSocket connecté");
+  // Envoi snapshot initial
+  ws.send(JSON.stringify({
+    type: "hello",
+    stats: getStats(),
+    head: chain[chain.length - 1] || null
+  }));
+
+  ws.on("message", raw => {
+    try {
+      const msg = JSON.parse(raw.toString());
+      if (msg.type === "ping") {
+        ws.send(JSON.stringify({ type: "pong", ts: Date.now() }));
+      }
+      if (msg.type === "mine") {
+        mineBlock();
+      }
+    } catch (e) {
+      console.error("❌ Message WS invalide :", e.message);
+    }
+  });
+
+  ws.on("close", () => {
+    console.log("📴 Client WebSocket déconnecté");
+  });
+});
+
+console.log(`📡 WebSocket POWCHAIN en ligne sur port ${WS_PORT} (/ws)`);
+
+// ---------------------
+// Démarrage
+// ---------------------
+loadChain();
