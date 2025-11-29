@@ -1,235 +1,174 @@
-// POWCHAIN server.js — API 3000 + WS 7001
-const http = require('http');
-const fs = require('fs');
-const path = require('path');
-const crypto = require('crypto');
-const WebSocket = require('ws');
+const http = require("http");
+const fs = require("fs");
+const path = require("path");
+const url = require("url");
+const WebSocket = require("ws");
 
-const DATA_DIR = __dirname;
-const CHAIN_FILE = path.join(DATA_DIR, 'chain.json');
-const WALLETS_FILE = path.join(DATA_DIR, 'wallets.json');
+const DATA_FILE = path.join(__dirname, "chain.json");
 
-let chain = [];
-let wallets = {};
-let lpPow = 0;
-let lpUsdc = 0;
-let treasuryUsdc = 0;
-let treasurySol = 0;
-let height = 0;
+// État POWCHAIN minimal compatible avec le Dashboard
+let state = {
+  height: 0,
+  chain: [],
+  wallets: {},
+  lpPow: 0,
+  lpUsdc: 0,
+  treasuryUsdc: 0,
+  treasurySol: 0,
+  mempool: []
+};
 
-// ---------- Helpers persistence ----------
-function loadJSON(file, fallback) {
+function loadState() {
   try {
-    const txt = fs.readFileSync(file, 'utf8');
-    return JSON.parse(txt);
+    const raw = fs.readFileSync(DATA_FILE, "utf8");
+    const parsed = JSON.parse(raw);
+    state = { ...state, ...parsed };
+    console.log(`✅ Blockchain chargée : ${state.height} blocs`);
   } catch (e) {
-    console.log('[POWCHAIN] Impossible de lire', file, '-> fallback');
-    return fallback;
+    console.log("ℹ️ chain.json absent ou invalide -> init vide");
+    state.height = 0;
+    state.chain = [];
+    state.wallets = {};
+    state.mempool = [];
   }
 }
-function saveJSON(file, obj) {
-  try {
-    fs.writeFileSync(file, JSON.stringify(obj, null, 2));
-  } catch (e) {
-    console.log('[POWCHAIN] Impossible d\'écrire', file, e.message);
-  }
-}
 
-// ---------- State init ----------
-chain = loadJSON(CHAIN_FILE, []);
-wallets = loadJSON(WALLETS_FILE, {});
-height = chain.length;
-console.log('✅ Blockchain chargée :', height, 'blocs');
+function saveState() {
+  fs.writeFile(DATA_FILE, JSON.stringify(state, null, 2), (err) => {
+    if (err) console.error("Erreur save chain.json :", err.message);
+  });
+}
 
 function getWallet(addr) {
-  if (!wallets[addr]) {
-    wallets[addr] = { pow: 0, usdc: 0, staked: 0, nonce: 0, pub: addr };
+  if (!state.wallets[addr]) {
+    state.wallets[addr] = { pow: 0, usdc: 0, staked: 0, nonce: 0, pub: addr };
   }
-  return wallets[addr];
+  return state.wallets[addr];
 }
 
-function addBlock(txs, note) {
-  const h = chain.length + 1;
-  const prevHash = chain.length ? chain[chain.length - 1].hash : 'GENESIS';
-  const time = Date.now();
-  const body = { height: h, prevHash, time, txs: txs || [], note: note || '' };
-  const hash = crypto.createHash('sha256').update(JSON.stringify(body)).digest('hex');
-  const block = { ...body, hash };
-  chain.push(block);
-  height = chain.length;
-  saveJSON(CHAIN_FILE, chain);
-  console.log('⛓️ Nouveau bloc #', h, '(', txs ? txs.length : 0, 'TX )');
-  return block;
+function json(res, code, body) {
+  res.writeHead(code, {
+    "Content-Type": "application/json",
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Allow-Methods": "GET,POST,OPTIONS"
+  });
+  res.end(JSON.stringify(body));
 }
 
-// ---------- TX processing ----------
-function processTx(tx) {
-  try {
-    if (!tx || !tx.type || !tx.from) throw new Error('TX invalide');
-    const DEC = 1e6;
-    const type = tx.type;
-    const wFrom = getWallet(tx.from);
-    if (typeof tx.nonce === 'number' && tx.nonce <= wFrom.nonce) {
-      throw new Error('Nonce trop bas');
-    }
-    if (type === 'TX_POW') {
-      const amt = tx.amount | 0;
-      if (amt <= 0) throw new Error('Montant invalide');
-      const to = tx.to;
-      if (!to) throw new Error('Destinataire manquant');
-      if (wFrom.pow < amt) throw new Error('Solde POW insuffisant');
-      const wTo = getWallet(to);
-      wFrom.pow -= amt;
-      wTo.pow += amt;
-    } else if (type === 'STAKE') {
-      const amt = tx.amount | 0;
-      if (amt <= 0) throw new Error('Montant invalide');
-      if (wFrom.pow < amt) throw new Error('Solde POW insuffisant');
-      wFrom.pow -= amt;
-      wFrom.staked += amt;
-    } else if (type === 'SWAP') {
-      const amt = tx.amount | 0;
-      if (amt <= 0) throw new Error('Montant invalide');
-      if (tx.token === 'pow2usdc') {
-        if (wFrom.pow < amt) throw new Error('Solde POW insuffisant');
-        wFrom.pow -= amt;
-        wFrom.usdc += amt;
-        lpPow += amt;
-        lpUsdc -= amt;
-      } else if (tx.token === 'usdc2pow') {
-        if (wFrom.usdc < amt) throw new Error('Solde USDC insuffisant');
-        wFrom.usdc -= amt;
-        wFrom.pow += amt;
-        lpUsdc += amt;
-        lpPow -= amt;
-      } else {
-        throw new Error('Token swap inconnu');
-      }
-    } else if (type === 'LP_ADD') {
-      const powAmt = tx.pow | 0;
-      const usdcAmt = tx.usdc | 0;
-      if (powAmt <= 0 || usdcAmt <= 0) throw new Error('Montants LP invalides');
-      if (wFrom.pow < powAmt || wFrom.usdc < usdcAmt) throw new Error('Solde insuffisant LP');
-      wFrom.pow -= powAmt;
-      wFrom.usdc -= usdcAmt;
-      lpPow += powAmt;
-      lpUsdc += usdcAmt;
-    } else {
-      throw new Error('Type TX inconnu: ' + type);
-    }
-
-    // mise à jour nonce + persistance
-    if (typeof tx.nonce === 'number') wFrom.nonce = tx.nonce;
-    saveJSON(WALLETS_FILE, wallets);
-    const block = addBlock([tx], 'TX ' + type);
-    return { ok: true, block };
-  } catch (e) {
-    console.log('❌ Erreur processTx:', e.message);
-    return { ok: false, error: e.message };
-  }
+function notFound(res) {
+  res.writeHead(404, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ error: "not found" }));
 }
 
-// ---------- HTTP API (port 3000) ----------
-const httpServer = http.createServer((req, res) => {
-  const url = new URL(req.url, 'http://localhost');
-  const pathName = url.pathname;
-  const method = req.method || 'GET';
+const api = http.createServer((req, res) => {
+  const parsed = url.parse(req.url, true);
+  const p = parsed.pathname;
 
-  // CORS simple
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  if (method === 'OPTIONS') {
-    res.writeHead(204);
+  if (req.method === "OPTIONS") {
+    res.writeHead(200, {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Headers": "Content-Type",
+      "Access-Control-Allow-Methods": "GET,POST,OPTIONS"
+    });
     return res.end();
   }
 
-  if (method === 'GET' && pathName === '/stats') {
-    const body = {
-      height,
-      lpPow,
-      lpUsdc,
-      treasuryUsdc,
-      treasurySol
-    };
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify(body));
-  }
-
-  if (method === 'GET' && pathName.startsWith('/wallet/')) {
-    const addr = decodeURIComponent(pathName.split('/')[2] || '');
-    const w = getWallet(addr);
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify(w));
-  }
-
-  if (method === 'GET' && pathName.startsWith('/block/')) {
-    const n = parseInt(pathName.split('/')[2] || '0', 10);
-    const block = chain[n - 1];
-    if (!block) {
-      res.writeHead(404, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ error: 'Bloc introuvable' }));
-    }
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify(block));
-  }
-
-  if (method === 'GET' && pathName === '/chain') {
-    const last = chain.slice(-30);
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ height, blocks: last }));
-  }
-
-  if (method === 'POST' && pathName === '/tx') {
-    let body = '';
-    req.on('data', chunk => {
-      body += chunk;
-      if (body.length > 1e6) req.destroy(); // sécurité basique
+  if (req.method === "GET" && p === "/stats") {
+    return json(res, 200, {
+      height: state.height,
+      lpPow: state.lpPow,
+      lpUsdc: state.lpUsdc,
+      treasuryUsdc: state.treasuryUsdc,
+      treasurySol: state.treasurySol
     });
-    req.on('end', () => {
+  }
+
+  if (req.method === "GET" && p.startsWith("/wallet/")) {
+    const addr = decodeURIComponent(p.split("/")[2] || "");
+    if (!addr) return json(res, 400, { error: "addr required" });
+    const w = getWallet(addr);
+    return json(res, 200, w);
+  }
+
+  if (req.method === "GET" && p.startsWith("/block/")) {
+    const h = parseInt(p.split("/")[2] || "0", 10);
+    const b = state.chain.find((b) => b.height === h);
+    if (!b) return json(res, 404, { error: "block not found" });
+    return json(res, 200, b);
+  }
+
+  if (req.method === "GET" && p === "/chain") {
+    const last = state.chain.slice(-30);
+    return json(res, 200, last);
+  }
+
+  if (req.method === "POST" && p === "/tx") {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
       try {
-        const tx = JSON.parse(body || '{}');
-        const resTx = processTx(tx);
-        res.writeHead(resTx.ok ? 200 : 400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(resTx));
+        const tx = JSON.parse(body || "{}");
+        console.log(
+          "TX reçue",
+          tx.type,
+          tx.from,
+          "→",
+          tx.to,
+          "montant",
+          tx.amount
+        );
+        state.mempool.push(tx);
+        saveState();
+        broadcast({ type: "tx", tx });
+        json(res, 200, { ok: true });
       } catch (e) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: false, error: 'JSON invalide' }));
+        json(res, 400, { error: "bad json", msg: e.message });
       }
     });
     return;
   }
 
-  res.writeHead(404, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ error: 'Not found' }));
+  return notFound(res);
 });
 
-httpServer.listen(3000, () => {
-  console.log('✅ HTTP API POWCHAIN en ligne sur port 3000 (/stats /wallet /block /chain /tx)');
+const PORT = 3000;
+api.listen(PORT, () => {
+  console.log(
+    `✅ HTTP API POWCHAIN en ligne sur port ${PORT} (/stats /wallet /block /chain /tx)`
+  );
 });
 
-// ---------- WebSocket (port 7001) ----------
-const wss = new WebSocket.Server({ port: 7001 }, () => {
-  console.log('✅ WebSocket POWCHAIN en ligne sur port 7001 (/ws)');
-});
+// WebSocket POWCHAIN sur 7001
+const wsServer = http.createServer();
+const WSPORT = 7001;
+const wss = new WebSocket.Server({ server: wsServer });
 
-wss.on('connection', ws => {
-  console.log('🔌 Client WebSocket connecté');
-  ws.send(JSON.stringify({ type: 'hello', height }));
-  ws.on('message', msg => {
-    try {
-      const tx = JSON.parse(msg.toString());
-      const resTx = processTx(tx);
-      ws.send(JSON.stringify({ type: 'tx_result', ...resTx }));
-      if (resTx.ok) {
-        const payload = JSON.stringify({ type: 'new_block', height });
-        wss.clients.forEach(c => {
-          if (c.readyState === WebSocket.OPEN) c.send(payload);
-        });
-      }
-    } catch (e) {
-      ws.send(JSON.stringify({ type: 'error', error: e.message }));
-    }
+function broadcast(obj) {
+  const msg = JSON.stringify(obj);
+  wss.clients.forEach((c) => {
+    if (c.readyState === WebSocket.OPEN) c.send(msg);
   });
-  ws.on('close', () => console.log('🔌 Client WebSocket déconnecté'));
+}
+
+wss.on("connection", (ws) => {
+  console.log("🔌 Client WebSocket connecté");
+  ws.on("close", () => console.log("🔌 Client WebSocket déconnecté"));
 });
+
+wsServer.listen(WSPORT, () => {
+  console.log(`📡 WebSocket POWCHAIN en ligne sur port ${WSPORT} (/ws)`);
+});
+
+// Charger l'état au démarrage
+loadState();
+
+
+
+
+
+pm2 delete powchain
+pm2 start /root/powchain/server.js --name powchain
+pm2 logs powchain --lines 20
+
+
