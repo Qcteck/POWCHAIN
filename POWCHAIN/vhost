@@ -1,174 +1,62 @@
-const http = require("http");
-const fs = require("fs");
-const path = require("path");
-const url = require("url");
-const WebSocket = require("ws");
+nano /etc/nginx/sites-available/bbqfinance
 
-const DATA_FILE = path.join(__dirname, "chain.json");
 
-// État POWCHAIN minimal compatible avec le Dashboard
-let state = {
-  height: 0,
-  chain: [],
-  wallets: {},
-  lpPow: 0,
-  lpUsdc: 0,
-  treasuryUsdc: 0,
-  treasurySol: 0,
-  mempool: []
-};
 
-function loadState() {
-  try {
-    const raw = fs.readFileSync(DATA_FILE, "utf8");
-    const parsed = JSON.parse(raw);
-    state = { ...state, ...parsed };
-    console.log(`✅ Blockchain chargée : ${state.height} blocs`);
-  } catch (e) {
-    console.log("ℹ️ chain.json absent ou invalide -> init vide");
-    state.height = 0;
-    state.chain = [];
-    state.wallets = {};
-    state.mempool = [];
-  }
+server {
+    listen 80;
+    server_name bbqfinance.fun www.bbqfinance.fun;
+    return 301 https://bbqfinance.fun$request_uri;
 }
 
-function saveState() {
-  fs.writeFile(DATA_FILE, JSON.stringify(state, null, 2), (err) => {
-    if (err) console.error("Erreur save chain.json :", err.message);
-  });
+server {
+    listen 443 ssl;
+    server_name bbqfinance.fun www.bbqfinance.fun;
+
+    root /var/www/bbqfinance;
+    index index.html;
+
+    ssl_certificate     /etc/letsencrypt/live/bbqfinance.fun/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/bbqfinance.fun/privkey.pem;
+    include /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+
+    location / {
+        try_files $uri /index.html;
+    }
+
+    location /stats {
+        proxy_pass http://127.0.0.1:3000/stats;
+        include /etc/nginx/proxy_params;
+    }
+
+    location /wallet/ {
+        proxy_pass http://127.0.0.1:3000;
+        include /etc/nginx/proxy_params;
+    }
+
+    location /block/ {
+        proxy_pass http://127.0.0.1:3000;
+        include /etc/nginx/proxy_params;
+    }
+
+    location /chain {
+        proxy_pass http://127.0.0.1:3000/chain;
+        include /etc/nginx/proxy_params;
+    }
+
+    location /tx {
+        proxy_pass http://127.0.0.1:3000/tx;
+        include /etc/nginx/proxy_params;
+    }
+
+    location /ws {
+        proxy_pass http://127.0.0.1:7001;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "Upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_read_timeout 60s;
+    }
 }
-
-function getWallet(addr) {
-  if (!state.wallets[addr]) {
-    state.wallets[addr] = { pow: 0, usdc: 0, staked: 0, nonce: 0, pub: addr };
-  }
-  return state.wallets[addr];
-}
-
-function json(res, code, body) {
-  res.writeHead(code, {
-    "Content-Type": "application/json",
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Headers": "Content-Type",
-    "Access-Control-Allow-Methods": "GET,POST,OPTIONS"
-  });
-  res.end(JSON.stringify(body));
-}
-
-function notFound(res) {
-  res.writeHead(404, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ error: "not found" }));
-}
-
-const api = http.createServer((req, res) => {
-  const parsed = url.parse(req.url, true);
-  const p = parsed.pathname;
-
-  if (req.method === "OPTIONS") {
-    res.writeHead(200, {
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Headers": "Content-Type",
-      "Access-Control-Allow-Methods": "GET,POST,OPTIONS"
-    });
-    return res.end();
-  }
-
-  if (req.method === "GET" && p === "/stats") {
-    return json(res, 200, {
-      height: state.height,
-      lpPow: state.lpPow,
-      lpUsdc: state.lpUsdc,
-      treasuryUsdc: state.treasuryUsdc,
-      treasurySol: state.treasurySol
-    });
-  }
-
-  if (req.method === "GET" && p.startsWith("/wallet/")) {
-    const addr = decodeURIComponent(p.split("/")[2] || "");
-    if (!addr) return json(res, 400, { error: "addr required" });
-    const w = getWallet(addr);
-    return json(res, 200, w);
-  }
-
-  if (req.method === "GET" && p.startsWith("/block/")) {
-    const h = parseInt(p.split("/")[2] || "0", 10);
-    const b = state.chain.find((b) => b.height === h);
-    if (!b) return json(res, 404, { error: "block not found" });
-    return json(res, 200, b);
-  }
-
-  if (req.method === "GET" && p === "/chain") {
-    const last = state.chain.slice(-30);
-    return json(res, 200, last);
-  }
-
-  if (req.method === "POST" && p === "/tx") {
-    let body = "";
-    req.on("data", (c) => (body += c));
-    req.on("end", () => {
-      try {
-        const tx = JSON.parse(body || "{}");
-        console.log(
-          "TX reçue",
-          tx.type,
-          tx.from,
-          "→",
-          tx.to,
-          "montant",
-          tx.amount
-        );
-        state.mempool.push(tx);
-        saveState();
-        broadcast({ type: "tx", tx });
-        json(res, 200, { ok: true });
-      } catch (e) {
-        json(res, 400, { error: "bad json", msg: e.message });
-      }
-    });
-    return;
-  }
-
-  return notFound(res);
-});
-
-const PORT = 3000;
-api.listen(PORT, () => {
-  console.log(
-    `✅ HTTP API POWCHAIN en ligne sur port ${PORT} (/stats /wallet /block /chain /tx)`
-  );
-});
-
-// WebSocket POWCHAIN sur 7001
-const wsServer = http.createServer();
-const WSPORT = 7001;
-const wss = new WebSocket.Server({ server: wsServer });
-
-function broadcast(obj) {
-  const msg = JSON.stringify(obj);
-  wss.clients.forEach((c) => {
-    if (c.readyState === WebSocket.OPEN) c.send(msg);
-  });
-}
-
-wss.on("connection", (ws) => {
-  console.log("🔌 Client WebSocket connecté");
-  ws.on("close", () => console.log("🔌 Client WebSocket déconnecté"));
-});
-
-wsServer.listen(WSPORT, () => {
-  console.log(`📡 WebSocket POWCHAIN en ligne sur port ${WSPORT} (/ws)`);
-});
-
-// Charger l'état au démarrage
-loadState();
-
-
-
-
-
-pm2 delete powchain
-pm2 start /root/powchain/server.js --name powchain
-pm2 logs powchain --lines 20
-
-
