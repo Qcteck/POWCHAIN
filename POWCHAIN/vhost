@@ -1,15 +1,116 @@
-app.get('/stats',(req,res)=>{
-  try{
-    const payload={
-      ok:true,
-      time:new Date().toISOString(),
-      height:global.height||0,
-      totalPow:global.totalPow||0,
-      treasury:global.treasury||0
-    };
-    res.json(payload);
-  }catch(e){
-    console.error('Erreur /stats',e);
-    res.status(500).json({ok:false,error:'stats_failed'});
+// ========================= POWCHAIN — Complete Production =========================
+const http=require("http"),WebSocket=require("ws"),level=require("level"),nacl=require("tweetnacl"),bs58=require("bs58");
+
+// ---------- DB ----------
+const db=level("./chaindb",{valueEncoding:"json"});
+let chain=[],mempool=[],validators=[],wallets={},lp={},nonce=0;
+
+// ---------- Genesis ----------
+(async()=>{try{
+  chain=await db.get("chain");
+  wallets=await db.get("wallets");
+  lp=await db.get("lp");
+  validators=await db.get("validators");
+  console.log("DB loaded");
+}catch(e){
+  chain=[{index:0,time:Date.now(),prev:"0",tx:[],hash:"GENESIS"}];
+  await db.put("chain",chain);
+  await db.put("wallets",{});
+  await db.put("lp",{pow:0,usdc:0});
+  await db.put("validators",[]);
+  console.log("Genesis created");
+}})();
+
+// ---------- Helpers ----------
+const hash=x=>require("crypto").createHash("sha256").update(JSON.stringify(x)).digest("hex");
+const save=async()=>{await db.put("chain",chain);await db.put("wallets",wallets);await db.put("lp",lp);await db.put("validators",validators)};
+
+// ---------- Validate TX signature ----------
+function verify(tx){
+  const msg=new TextEncoder().encode(JSON.stringify({type:tx.type,from:tx.from,to:tx.to,amount:tx.amount,token:tx.token,nonce:tx.nonce}));
+  return nacl.sign.detached.verify(msg,bs58.decode(tx.sig),bs58.decode(tx.pub));
+}
+
+// ---------- Process TX ----------
+async function applyTx(tx){
+  if(!wallets[tx.from]||wallets[tx.from].nonce>=tx.nonce)return false;
+  if(tx.type==="TRANSFER"){
+    if(wallets[tx.from].pow<tx.amount)return false;
+    wallets[tx.from].pow-=tx.amount;
+    wallets[tx.to]=(wallets[tx.to]||{pow:0,usdc:0,staked:0,nonce:0}).pow+=tx.amount;
   }
+  if(tx.type==="LP_ADD"){
+    lp.pow+=tx.pow; lp.usdc+=tx.usdc;
+  }
+  if(tx.type==="STAKE"){
+    wallets[tx.from].pow-=tx.amount;
+    wallets[tx.from].staked=(wallets[tx.from].staked||0)+tx.amount;
+  }
+  if(tx.type==="BRIDGE_MINT"){
+    wallets[tx.to]=(wallets[tx.to]||{pow:0,usdc:0,staked:0,nonce:0}).pow+=tx.amount;
+  }
+  wallets[tx.from].nonce=tx.nonce;
+  return true;
+}
+
+// ---------- Create Block (POS) ----------
+async function forge(){
+  if(mempool.length===0)return;
+  const bucket=validators.map(v=>v.stake).reduce((a,b)=>a+b,0);
+  if(bucket===0)return;
+  const r=Math.random()*bucket;
+  let pick,acc=0;
+  for(const v of validators){acc+=v.stake;if(acc>=r){pick=v;break;}}
+  const block={index:chain.length,time:Date.now(),prev:chain.at(-1).hash,tx:mempool};
+  block.hash=hash(block);
+  pick.rewards=(pick.rewards||0)+10;
+  chain.push(block);
+  mempool=[];
+  await save();
+  broadcast({type:"block",block});
+}
+
+// ---------- WebSocket sync ----------
+const wss=new WebSocket.Server({port:7001});
+let sockets=[];
+wss.on("connection",ws=>{sockets.push(ws);ws.on("close",()=>sockets=sockets.filter(s=>s!==ws));ws.send(JSON.stringify({type:"chain",chain,wallets,lp}))});
+const broadcast=obj=>sockets.forEach(ws=>ws.readyState===1&&ws.send(JSON.stringify(obj)));
+
+// ---------- HTTP API ----------
+const server=http.createServer(async(req,res)=>{
+  if(req.method==="GET"&&req.url==="/stats"){
+    res.writeHead(200,{"Content-Type":"application/json"});
+    return res.end(JSON.stringify({
+      blocks:chain.length,
+      lastHash:chain.at(-1).hash,
+      wallets:Object.keys(wallets).length,
+      lp,
+      supply:Object.values(wallets).reduce((a,b)=>a+b.pow,0),
+      time:Date.now()
+    }));
+  }
+
+  if(req.method==="POST"&&req.url==="/tx"){
+    let body="";req.on("data",c=>body+=c);
+    req.on("end",async()=>{
+      try{
+        const tx=JSON.parse(body);
+        if(!verify(tx))throw 0;
+        mempool.push(tx);
+        await applyTx(tx);
+        await save();
+        broadcast({type:"tx",tx});
+        res.writeHead(200);res.end("OK");
+      }catch(e){res.writeHead(400);res.end("ERR")}
+    });
+    return;
+  }
+
+  res.writeHead(404);res.end("NOT FOUND");
 });
+
+// ---------- Auto forge ----------
+setInterval(forge,5000);
+
+// ---------- Start ----------
+server.listen(3000,()=>console.log("POWCHAIN API 3000 + WS 7001"));
