@@ -1,64 +1,46 @@
-// /root/server.js
-// POWCHAIN – Validator + API + WebSocket
+// POWCHAIN server.js — API 3000 + WS 7001
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+const WebSocket = require('ws');
 
-const fs = require("fs");
-const path = require("path");
-const crypto = require("crypto");
-const express = require("express");
-const WebSocket = require("ws");
-const nacl = require("tweetnacl");
-const bs58 = require("bs58");
+const DATA_DIR = __dirname;
+const CHAIN_FILE = path.join(DATA_DIR, 'chain.json');
+const WALLETS_FILE = path.join(DATA_DIR, 'wallets.json');
 
-// ---------- Constantes ----------
-const HTTP_PORT = 3000;
-const WS_PORT = 7001;
-const DATA_FILE = path.join(__dirname, "powchain_state.json");
-const DEC = 1e6;
-
-// ---------- État en mémoire ----------
-let chain = [];                // liste de blocs
-let wallets = {};              // addr -> {pow,usdc,staked,nonce,pub}
+let chain = [];
+let wallets = {};
 let lpPow = 0;
 let lpUsdc = 0;
-let treasury = { usdc: 0, sol: 0 };
-let mempool = [];
-const wsClients = new Set();
+let treasuryUsdc = 0;
+let treasurySol = 0;
+let height = 0;
 
-// ---------- Persistance ----------
-function loadState() {
+// ---------- Helpers persistence ----------
+function loadJSON(file, fallback) {
   try {
-    if (fs.existsSync(DATA_FILE)) {
-      const raw = fs.readFileSync(DATA_FILE, "utf8");
-      const obj = JSON.parse(raw);
-      chain = Array.isArray(obj.chain) ? obj.chain : [];
-      wallets = obj.wallets || {};
-      lpPow = obj.lpPow || 0;
-      lpUsdc = obj.lpUsdc || 0;
-      treasury = obj.treasury || { usdc: 0, sol: 0 };
-      console.log("✅ État POWCHAIN chargé:", chain.length, "blocs");
-    } else {
-      console.log("ℹ️ Pas de state trouvé, nouvelle chaîne");
-    }
+    const txt = fs.readFileSync(file, 'utf8');
+    return JSON.parse(txt);
   } catch (e) {
-    console.error("⚠️ State corrompu, reset:", e.message);
-    chain = [];
-    wallets = {};
-    lpPow = 0;
-    lpUsdc = 0;
-    treasury = { usdc: 0, sol: 0 };
+    console.log('[POWCHAIN] Impossible de lire', file, '-> fallback');
+    return fallback;
   }
 }
-function saveState() {
+function saveJSON(file, obj) {
   try {
-    const obj = { chain, wallets, lpPow, lpUsdc, treasury };
-    fs.writeFileSync(DATA_FILE, JSON.stringify(obj, null, 2));
+    fs.writeFileSync(file, JSON.stringify(obj, null, 2));
   } catch (e) {
-    console.error("❌ Erreur sauvegarde state:", e.message);
+    console.log('[POWCHAIN] Impossible d\'écrire', file, e.message);
   }
 }
-loadState();
 
-// ---------- Utilitaires ----------
+// ---------- State init ----------
+chain = loadJSON(CHAIN_FILE, []);
+wallets = loadJSON(WALLETS_FILE, {});
+height = chain.length;
+console.log('✅ Blockchain chargée :', height, 'blocs');
+
 function getWallet(addr) {
   if (!wallets[addr]) {
     wallets[addr] = { pow: 0, usdc: 0, staked: 0, nonce: 0, pub: addr };
@@ -66,184 +48,188 @@ function getWallet(addr) {
   return wallets[addr];
 }
 
-function hashBlock(b) {
-  const h = crypto
-    .createHash("sha256")
-    .update(
-      JSON.stringify({
-        height: b.height,
-        prev: b.prev,
-        time: b.time,
-        validator: b.validator,
-        txs: b.txs,
-      })
-    )
-    .digest("hex");
-  return h;
+function addBlock(txs, note) {
+  const h = chain.length + 1;
+  const prevHash = chain.length ? chain[chain.length - 1].hash : 'GENESIS';
+  const time = Date.now();
+  const body = { height: h, prevHash, time, txs: txs || [], note: note || '' };
+  const hash = crypto.createHash('sha256').update(JSON.stringify(body)).digest('hex');
+  const block = { ...body, hash };
+  chain.push(block);
+  height = chain.length;
+  saveJSON(CHAIN_FILE, chain);
+  console.log('⛓️ Nouveau bloc #', h, '(', txs ? txs.length : 0, 'TX )');
+  return block;
 }
 
-function chooseValidator() {
-  const entries = Object.entries(wallets).filter(([_, w]) => w.staked > 0);
-  if (!entries.length) return "SYSTEM";
-  const total = entries.reduce((s, [, w]) => s + w.staked, 0);
-  let r = Math.random() * total;
-  for (const [addr, w] of entries) {
-    if ((r -= w.staked) <= 0) return addr;
-  }
-  return entries[0][0];
-}
-
-function verifySig(tx) {
+// ---------- TX processing ----------
+function processTx(tx) {
   try {
-    if (!tx.sig || !tx.from) return false;
-    const msg = Buffer.from(
-      JSON.stringify({
-        type: tx.type,
-        from: tx.from,
-        to: tx.to ?? null,
-        amount: tx.amount ?? null,
-        token: tx.token ?? null,
-        nonce: tx.nonce,
-      }),
-      "utf8"
-    );
-    const sig = bs58.decode(tx.sig);
-    const pk = bs58.decode(tx.from); // adresse = pubkey
-    return nacl.sign.detached.verify(msg, sig, pk);
+    if (!tx || !tx.type || !tx.from) throw new Error('TX invalide');
+    const DEC = 1e6;
+    const type = tx.type;
+    const wFrom = getWallet(tx.from);
+    if (typeof tx.nonce === 'number' && tx.nonce <= wFrom.nonce) {
+      throw new Error('Nonce trop bas');
+    }
+    if (type === 'TX_POW') {
+      const amt = tx.amount | 0;
+      if (amt <= 0) throw new Error('Montant invalide');
+      const to = tx.to;
+      if (!to) throw new Error('Destinataire manquant');
+      if (wFrom.pow < amt) throw new Error('Solde POW insuffisant');
+      const wTo = getWallet(to);
+      wFrom.pow -= amt;
+      wTo.pow += amt;
+    } else if (type === 'STAKE') {
+      const amt = tx.amount | 0;
+      if (amt <= 0) throw new Error('Montant invalide');
+      if (wFrom.pow < amt) throw new Error('Solde POW insuffisant');
+      wFrom.pow -= amt;
+      wFrom.staked += amt;
+    } else if (type === 'SWAP') {
+      const amt = tx.amount | 0;
+      if (amt <= 0) throw new Error('Montant invalide');
+      if (tx.token === 'pow2usdc') {
+        if (wFrom.pow < amt) throw new Error('Solde POW insuffisant');
+        wFrom.pow -= amt;
+        wFrom.usdc += amt;
+        lpPow += amt;
+        lpUsdc -= amt;
+      } else if (tx.token === 'usdc2pow') {
+        if (wFrom.usdc < amt) throw new Error('Solde USDC insuffisant');
+        wFrom.usdc -= amt;
+        wFrom.pow += amt;
+        lpUsdc += amt;
+        lpPow -= amt;
+      } else {
+        throw new Error('Token swap inconnu');
+      }
+    } else if (type === 'LP_ADD') {
+      const powAmt = tx.pow | 0;
+      const usdcAmt = tx.usdc | 0;
+      if (powAmt <= 0 || usdcAmt <= 0) throw new Error('Montants LP invalides');
+      if (wFrom.pow < powAmt || wFrom.usdc < usdcAmt) throw new Error('Solde insuffisant LP');
+      wFrom.pow -= powAmt;
+      wFrom.usdc -= usdcAmt;
+      lpPow += powAmt;
+      lpUsdc += usdcAmt;
+    } else {
+      throw new Error('Type TX inconnu: ' + type);
+    }
+
+    // mise à jour nonce + persistance
+    if (typeof tx.nonce === 'number') wFrom.nonce = tx.nonce;
+    saveJSON(WALLETS_FILE, wallets);
+    const block = addBlock([tx], 'TX ' + type);
+    return { ok: true, block };
   } catch (e) {
-    console.error("verifySig error:", e.message);
-    return false;
+    console.log('❌ Erreur processTx:', e.message);
+    return { ok: false, error: e.message };
   }
 }
 
-// ---------- Application TX ----------
-function applyTx(tx) {
-  if (!tx || !tx.type) return false;
+// ---------- HTTP API (port 3000) ----------
+const httpServer = http.createServer((req, res) => {
+  const url = new URL(req.url, 'http://localhost');
+  const pathName = url.pathname;
+  const method = req.method || 'GET';
 
-  const wFrom = tx.from ? getWallet(tx.from) : null;
-
-  if (wFrom) {
-    // nonce strict
-    if (typeof tx.nonce !== "number" || tx.nonce !== wFrom.nonce + 1) {
-      console.log("❌ TX nonce invalide", tx);
-      return false;
-    }
-    // signature
-    if (!verifySig(tx)) {
-      console.log("❌ TX signature invalide");
-      return false;
-    }
+  // CORS simple
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  if (method === 'OPTIONS') {
+    res.writeHead(204);
+    return res.end();
   }
 
-  switch (tx.type) {
-    case "TX_POW": {
-      const amount = tx.amount | 0;
-      if (!wFrom || amount <= 0 || wFrom.pow < amount) return false;
-      const wTo = getWallet(tx.to);
-      wFrom.pow -= amount;
-      wTo.pow += amount;
-      wFrom.nonce = tx.nonce;
-      break;
+  if (method === 'GET' && pathName === '/stats') {
+    const body = {
+      height,
+      lpPow,
+      lpUsdc,
+      treasuryUsdc,
+      treasurySol
+    };
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify(body));
+  }
+
+  if (method === 'GET' && pathName.startsWith('/wallet/')) {
+    const addr = decodeURIComponent(pathName.split('/')[2] || '');
+    const w = getWallet(addr);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify(w));
+  }
+
+  if (method === 'GET' && pathName.startsWith('/block/')) {
+    const n = parseInt(pathName.split('/')[2] || '0', 10);
+    const block = chain[n - 1];
+    if (!block) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: 'Bloc introuvable' }));
     }
-    case "STAKE": {
-      const amount = tx.amount | 0;
-      if (!wFrom || amount <= 0 || wFrom.pow < amount) return false;
-      wFrom.pow -= amount;
-      wFrom.staked +=
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify(block));
+  }
 
+  if (method === 'GET' && pathName === '/chain') {
+    const last = chain.slice(-30);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ height, blocks: last }));
+  }
 
-cd /root/powchain
-nano server.js
+  if (method === 'POST' && pathName === '/tx') {
+    let body = '';
+    req.on('data', chunk => {
+      body += chunk;
+      if (body.length > 1e6) req.destroy(); // sécurité basique
+    });
+    req.on('end', () => {
+      try {
+        const tx = JSON.parse(body || '{}');
+        const resTx = processTx(tx);
+        res.writeHead(resTx.ok ? 200 : 400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(resTx));
+      } catch (e) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'JSON invalide' }));
+      }
+    });
+    return;
+  }
 
-pm2 stop powchain
-pm2 start /root/powchain/server.js --name powchain
-pm2 save
+  res.writeHead(404, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ error: 'Not found' }));
+});
 
+httpServer.listen(3000, () => {
+  console.log('✅ HTTP API POWCHAIN en ligne sur port 3000 (/stats /wallet /block /chain /tx)');
+});
 
-pm2 logs powchain --lines 10
+// ---------- WebSocket (port 7001) ----------
+const wss = new WebSocket.Server({ port: 7001 }, () => {
+  console.log('✅ WebSocket POWCHAIN en ligne sur port 7001 (/ws)');
+});
 
-
-
-
-ngin
-
-
-sudo nano /etc/nginx/sites-available/bbqfinance
-
-location /chain {
-    proxy_pass http://127.0.0.1:3000/chain;
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto $scheme;
-}
-
-
-
-
-
-
-server {
-    listen 80;
-    listen [::]:80;
-    server_name bbqfinance.fun www.bbqfinance.fun;
-
-    root /var/www/bbqfinance;
-    index index.html;
-
-    # Proxy POWCHAIN API (/stats, /chain, /wallet, /block, etc.)
-    location /stats {
-        proxy_pass http://127.0.0.1:3000/stats;
+wss.on('connection', ws => {
+  console.log('🔌 Client WebSocket connecté');
+  ws.send(JSON.stringify({ type: 'hello', height }));
+  ws.on('message', msg => {
+    try {
+      const tx = JSON.parse(msg.toString());
+      const resTx = processTx(tx);
+      ws.send(JSON.stringify({ type: 'tx_result', ...resTx }));
+      if (resTx.ok) {
+        const payload = JSON.stringify({ type: 'new_block', height });
+        wss.clients.forEach(c => {
+          if (c.readyState === WebSocket.OPEN) c.send(payload);
+        });
+      }
+    } catch (e) {
+      ws.send(JSON.stringify({ type: 'error', error: e.message }));
     }
-
-    location /chain {
-        proxy_pass http://127.0.0.1:3000/chain;
-    }
-
-    location /wallet {
-        proxy_pass http://127.0.0.1:3000;
-    }
-
-    location /block {
-        proxy_pass http://127.0.0.1:3000;
-    }
-
-    # WebSocket POWCHAIN
-    location /ws {
-        proxy_pass http://127.0.0.1:7001;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "Upgrade";
-    }
-
-    # Static dashboard
-    location / {
-        try_files $uri $uri/ =404;
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-sudo nano /var/www/bbqfinance/index.html   # coller tout
-sudo systemctl restart nginx
-
-
-curl http://127.0.0.1
-curl http://127.0.0.1/stats
-curl http://127.0.0.1/chain   # si ton server.js expose /chain
+  });
+  ws.on('close', () => console.log('🔌 Client WebSocket déconnecté'));
+});
