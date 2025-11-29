@@ -1,111 +1,286 @@
-        <!-- Network -->
-        <div class="card" data-section="network">
-          <span class="pill">Network</span>
-          <div class="titleRow">
-            <div class="big" id="netHeight">0</div>
-            <span style="font-size:10px;border-radius:999px;border:1px solid #1f2937;padding:2px 7px;color:#93c5fd;background:#020617">Blocks</span>
-          </div>
-          <div class="line"><span>TVL</span><span class="v" id="netTVL">0</span></div>
-          <div class="line"><span>Prix interne</span><span class="v" id="netPrice">0</span></div>
-          <div class="line"><span>Trésorerie</span><span class="v" id="netTreasury">0</span></div>
-          <div class="muted">Mise à jour toutes les 4s.</div>
-        </div>
+const API="",WS=(location.protocol==="https:"?"wss://":"ws://")+location.host+"/ws",DEC=1e6,ALPH="123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+const SOL_RPC="https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac";
+const USDC_MINT_STR="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1";
 
-        <!-- Wallet POWCHAIN générateur -->
-        <div class="card" data-section="wallet">
-          <span class="pill">Wallet POWCHAIN · Générateur</span>
-          <div style="font-size:11px;color:#fbbf24;margin-bottom:4px">WALLET GENERATOR ONLINE</div>
-          <input id="walletAddr" placeholder="Adresse POWCHAIN"/>
-          <input id="walletPriv" placeholder="Private key POWCHAIN" style="margin-top:4px"/>
-          <div class="row" style="margin-top:4px">
-            <button id="btnGen">Generate</button>
-            <button id="btnLoad">Connect</button>
-            <button id="btnRefreshW">Refresh</button>
-          </div>
-          <div class="line" style="margin-top:6px"><span>POW</span><span class="v" id="wpow">0</span></div>
-          <div class="line"><span>USDC POW</span><span class="v" id="wusdc">0</span></div>
-          <div class="line"><span>Staked</span><span class="v" id="wstk">0</span></div>
-        </div>
+let addr=null,priv=null,pub=null,nonce=0,sock=null,phantomPubkey=null,solConn=null;
 
-        <!-- Actions POWCHAIN -->
-        <div class="card" data-section="wallet">
-          <span class="pill">Actions Wallet POWCHAIN</span>
-          <input id="sendTo" placeholder="Destinataire POWCHAIN"/>
-          <div class="row">
-            <input id="sendAmt" placeholder="Montant POW"/>
-            <button id="btnSend">Send</button>
-          </div>
-          <input id="stakeAmt" placeholder="Montant POW à staker" style="margin-top:8px"/>
-          <button id="btnStake" style="margin-top:4px">Stake</button>
-        </div>
+const q=s=>document.querySelector(s);
+const log=m=>{
+  const b=q("#log");
+  if(b)b.textContent="["+new Date().toLocaleTimeString()+"] "+m+"\n"+b.textContent;
+};
+const fmt=n=>(n/DEC).toFixed(6);
 
-        <!-- Solana Phantom -->
-        <div class="card" data-section="wallet">
-          <span class="pill">Solana Wallet · Phantom</span>
-          <div class="line"><span>Adresse</span><span class="v" id="phantAddr">Non connecté</span></div>
-          <div class="line"><span>SOL</span><span class="v" id="solBalance">0</span></div>
-          <div class="line"><span>USDC</span><span class="v" id="usdcBalance">0</span></div>
-          <button id="btnPhantom" style="margin-top:6px">Connect Phantom</button>
-          <div class="muted">Lecture via RPC drpc.live (mainnet-beta).</div>
-        </div>
+function b58encode(bytes){
+  if(!bytes||!bytes.length)return"";
+  let d=[0];
+  for(let i=0;i<bytes.length;i++){
+    let c=bytes[i];
+    for(let j=0;j<d.length;j++){
+      let x=d[j]*256+c;
+      d[j]=x%58;
+      c=(x/58)|0;
+    }
+    while(c>0){
+      d.push(c%58);
+      c=(c/58)|0;
+    }
+  }
+  let z=0;
+  while(z<bytes.length&&bytes[z]===0)z++;
+  let r="";
+  for(let i=0;i<z;i++)r+="1";
+  for(let i=d.length-1;i>=0;i--)r+=ALPH[d[i]];
+  return r;
+}
 
-        <!-- DEX POWCHAIN -->
-        <div class="card" data-section="dex">
-          <span class="pill">DEX POWCHAIN</span>
-          <div class="line"><span>LP POW</span><span class="v" id="lpPow">0</span></div>
-          <div class="line"><span>LP USDC POW</span><span class="v" id="lpUsdc">0</span></div>
-          <div class="row">
-            <input id="swapAmt" placeholder="Montant"/>
-            <select id="swapDir">
-              <option value="pow2usdc">POW → USDC POW</option>
-              <option value="usdc2pow">USDC POW → POW</option>
-            </select>
-          </div>
-          <button id="btnSwap" style="margin-top:4px">Swap</button>
-          <div class="muted">x·y = k interne, frais vers trésorerie.</div>
-        </div>
+function b58decode(str){
+  if(!str)return new Uint8Array(0);
+  let b=[0];
+  for(let i=0;i<str.length;i++){
+    let c=ALPH.indexOf(str[i]);
+    if(c<0)throw Error("base58 invalide");
+    for(let j=0;j<b.length;j++){
+      let x=b[j]*58+c;
+      b[j]=x&255;
+      c=x>>8;
+    }
+    while(c>0){
+      b.push(c&255);
+      c>>=8;
+    }
+  }
+  let z=0;
+  while(z<str.length&&str[z]==="1")z++;
+  let r=new Uint8Array(z+b.length);
+  for(let i=0;i<b.length;i++)r[r.length-1-i]=b[i];
+  return r;
+}
 
-        <!-- Ajouter de la liquidité -->
-        <div class="card" data-section="dex">
-          <span class="pill">LP Add</span>
-          <div class="row">
-            <input id="lpPOW" placeholder="POW"/>
-            <input id="lpUSDC" placeholder="USDC POW"/>
-          </div>
-          <button id="btnLPAdd" style="margin-top:4px">Add LP</button>
-        </div>
+async function jget(p){
+  const t0=performance.now();
+  const r=await fetch(API+p);
+  const t1=performance.now();
+  const lat=q("#latency");
+  if(lat)lat.textContent="Latency: "+(t1-t0).toFixed(0)+" ms";
+  if(!r.ok)throw Error("HTTP "+r.status);
+  return r.json();
+}
 
-        <!-- Scan wallet POWCHAIN -->
-        <div class="card" data-section="tools">
-          <span class="pill">Scan Wallet POWCHAIN</span>
-          <input id="scanAddr" placeholder="Adresse POWCHAIN à scanner"/>
-          <button id="btnScan" style="margin-top:4px">SCAN</button>
-          <div id="scanRes"></div>
-        </div>
+function connectWS(){
+  try{
+    sock=new WebSocket(WS);
+    sock.onopen=()=>{
+      log("WS connecté");
+      q("#syncText").textContent="Synced";
+      q("#syncChipText").textContent="Online";
+      q("#syncDot").style.background="#22c55e";
+    };
+    sock.onclose=()=>{
+      q("#syncText").textContent="Reconnecting";
+      q("#syncChipText").textContent="Sync…";
+      q("#syncDot").style.background="#f97316";
+      setTimeout(connectWS,1500);
+    };
+    sock.onerror=()=>{
+      q("#syncText").textContent="Error";
+      q("#syncChipText").textContent="Error";
+      q("#syncDot").style.background="#ef4444";
+    };
+  }catch(e){
+    log("WS ERR "+e.message);
+  }
+}
+connectWS();
 
-        <!-- WebHash -->
-        <div class="card" data-section="tools">
-          <span class="pill">WebHash FULL</span>
-          <input id="whHeight" placeholder="# bloc"/>
-          <button id="btnWebHash" style="margin-top:4px">GET HASH</button>
-          <div id="whOut" style="margin-top:6px;font-size:10px;max-height:110px;overflow:auto;white-space:pre-wrap"></div>
-        </div>
+async function refreshNet(){
+  try{
+    const s=await jget("/stats");
+    q("#netHeight").textContent=s.height;
+    q("#lpPow").textContent=fmt(s.lpPow||0);
+    q("#lpUsdc").textContent=fmt(s.lpUsdc||0);
+    q("#netPrice").textContent=(s.lpPow&&s.lpUsdc?(s.lpUsdc/s.lpPow/DEC).toFixed(6):"0");
+    q("#netTVL").textContent=((s.lpUsdc||0)/DEC).toFixed(2)+" USDC POW";
+    q("#netTreasury").textContent=((s.treasuryUsdc||0)/DEC).toFixed(2)+" USDC POW · "+(s.treasurySol||0).toFixed(3)+" SOL";
+  }catch(e){
+    log("NET ERR "+e.message);
+  }
+}
+setInterval(refreshNet,4000);
+refreshNet();
 
-        <!-- POW Explorer -->
-        <div class="card" data-section="explorer">
-          <span class="pill">POW Explorer</span>
-          <button id="btnLoadChain">Charger derniers blocs</button>
-          <pre id="chainList"></pre>
-          <div class="muted">Affiche les ~30 derniers blocs depuis /chain.</div>
-        </div>
-      </div>
-      <div id="log"></div>
-    </div>
-  </div>
-</div>
-<script src="https://cdn.jsdelivr.net/npm/tweetnacl/nacl.min.js"></script>
-<script src="https://unpkg.com/@solana/web3.js@1.95.3/lib/index.iife.min.js"></script>
-<script>
+function signTx(o){
+  const payload={
+    type:o.type,
+    from:o.from??addr,
+    to:o.to??null,
+    amount:o.amount??null,
+    token:o.token??null,
+    nonce:nonce+1
+  };
+  const msg=new TextEncoder().encode(JSON.stringify(payload));
+  const sk=b58decode(priv);
+  const sig=nacl.sign.detached(msg,sk);
+  return b58encode(sig);
+}
+
+async function loadWallet(){
+  addr=q("#walletAddr").value.trim();
+  priv=q("#walletPriv").value.trim();
+  if(!addr||!priv){
+    alert("Adresse + clé privée requises");
+    return;
+  }
+  const r=await jget("/wallet/"+addr);
+  nonce=r.nonce||0;
+  pub=r.pub||addr;
+  q("#wpow").textContent=fmt(r.pow||0);
+  q("#wusdc").textContent=fmt(r.usdc||0);
+  q("#wstk").textContent=fmt(r.staked||0);
+  log("Wallet POWCHAIN chargé "+addr);
+}
+
+q("#btnLoad").onclick=loadWallet;
+q("#btnRefreshW").onclick=loadWallet;
+
+q("#btnGen").onclick=()=>{
+  try{
+    const kp=nacl.sign.keyPair();
+    addr=b58encode(kp.publicKey);
+    priv=b58encode(kp.secretKey);
+    pub=addr;
+    nonce=0;
+    q("#walletAddr").value=addr;
+    q("#walletPriv").value=priv;
+    q("#wpow").textContent="0.000000";
+    q("#wusdc").textContent="0.000000";
+    q("#wstk").textContent="0.000000";
+    log("Nouveau wallet POWCHAIN généré, sauvegarde la clé privée");
+  }catch(e){
+    log("GEN ERR "+e.message);
+    alert("Erreur génération wallet : "+e.message);
+  }
+};
+
+q("#btnSend").onclick=()=>{
+  if(!addr){alert("Connect wallet POWCHAIN");return;}
+  const to=q("#sendTo").value.trim();
+  const a=parseFloat(q("#sendAmt").value||"0");
+  if(!to||a<=0)return;
+  const tx={type:"TX_POW",from:addr,to,amount:Math.floor(a*DEC),nonce:nonce+1,pub};
+  try{
+    tx.sig=signTx(tx);
+  }catch(e){
+    log("SIGN ERR "+e.message);
+    alert(e.message);
+    return;
+  }
+  if(sock&&sock.readyState===1){
+    sock.send(JSON.stringify(tx));
+    log("TX POW envoyée "+a);
+  }else{
+    log("WS non connecté");
+  }
+  nonce++;
+};
+
+q("#btnStake").onclick=()=>{
+  if(!addr){alert("Connect wallet POWCHAIN");return;}
+  const a=parseFloat(q("#stakeAmt").value||"0");
+  if(a<=0)return;
+  const tx={type:"STAKE",addr,amount:Math.floor(a*DEC),from:addr,nonce:nonce+1,pub};
+  try{
+    tx.sig=signTx(tx);
+  }catch(e){
+    log("SIGN ERR "+e.message);
+    alert(e.message);
+    return;
+  }
+  if(sock&&sock.readyState===1){
+    sock.send(JSON.stringify(tx));
+    log("STAKE envoyé "+a);
+  }else{
+    log("WS non connecté");
+  }
+  nonce++;
+};
+
+q("#btnSwap").onclick=()=>{
+  if(!addr){alert("Connect wallet POWCHAIN");return;}
+  const a=parseFloat(q("#swapAmt").value||"0");
+  if(a<=0)return;
+  const tx={type:"SWAP",addr,amount:Math.floor(a*DEC),token:q("#swapDir").value,from:addr,nonce:nonce+1,pub};
+  try{
+    tx.sig=signTx(tx);
+  }catch(e){
+    log("SIGN ERR "+e.message);
+    alert(e.message);
+    return;
+  }
+  if(sock&&sock.readyState===1){
+    sock.send(JSON.stringify(tx));
+    log("SWAP envoyé "+a);
+  }else{
+    log("WS non connecté");
+  }
+  nonce++;
+};
+
+q("#btnLPAdd").onclick=()=>{
+  if(!addr){alert("Connect wallet POWCHAIN");return;}
+  const p=parseFloat(q("#lpPOW").value||"0");
+  const u=parseFloat(q("#lpUSDC").value||"0");
+  if(p<=0||u<=0)return;
+  const tx={type:"LP_ADD",addr,pow:Math.floor(p*DEC),usdc:Math.floor(u*DEC),from:addr,nonce:nonce+1,pub};
+  try{
+    tx.sig=signTx(tx);
+  }catch(e){
+    log("SIGN ERR "+e.message);
+    alert(e.message);
+    return;
+  }
+  if(sock&&sock.readyState===1){
+    sock.send(JSON.stringify(tx));
+    log("LP ADD envoyé");
+  }else{
+    log("WS non connecté");
+  }
+  nonce++;
+};
+
+q("#btnScan").onclick=async()=>{
+  const a=q("#scanAddr").value.trim();
+  if(!a)return;
+  try{
+    const w=await jget("/wallet/"+a);
+    q("#scanRes").textContent="POW: "+fmt(w.pow||0)+"\nUSDC POW: "+fmt(w.usdc||0)+"\nStake: "+fmt(w.staked||0);
+    log("SCAN "+a);
+  }catch(e){
+    log("SCAN ERR "+e.message);
+  }
+};
+
+q("#btnWebHash").onclick=async()=>{
+  const h=parseInt(q("#whHeight").value||"0");
+  if(!h){alert("Hauteur bloc requise");return;}
+  try{
+    const b=await jget("/block/"+h);
+    let out="HASH: "+b.hash+"\nValidator: "+(b.validator||"—")+"\nTime: "+(b.time?new Date(b.time).toLocaleString():"—")+"\nTXs:\n";
+    if(b.txs&&b.txs.length){
+      b.txs.forEach(t=>{
+        const amt=t.amount?t.amount/DEC:0;
+        out+=" - "+t.type+" "+(t.from||"")+" → "+(t.to||"")+" : "+(amt?amt.toFixed(6):"0")+" "+(t.token||"")+"\n";
+      });
+    }else{
+      out+="(aucune TX)\n";
+    }
+    q("#whOut").textContent=out;
+    log("WEBHASH bloc #"+h);
+  }catch(e){
+    q("#whOut").textContent="Erreur: "+e.message;
+    log("WEBHASH ERR "+e.message);
+  }
+};
 
 
 sudo nano /var/www/bbqfinance/index.html   # coller tout
