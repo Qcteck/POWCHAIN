@@ -3,286 +3,356 @@
 nano /root/powchain/server.js
 
 
+// ===================== POWCHAIN — Validator + HTTP API + WebSocket =====================
 
-// ===================== POWCHAIN — Validator + API + WebSocket =====================
-
-const http = require("http");
-const url = require("url");
-const fs = require("fs");
-const crypto = require("crypto");
-const WebSocket = require("ws");
-const nacl = require("tweetnacl");
-const bs58 = require("bs58");
-
-// ---------- Ports backend ----------
+// Ports
 const PORT_HTTP = 3000;
-const PORT_WS = 7001;
+const PORT_WS   = 7001;
 
-// ---------- Trésorerie ----------
-const TREASURY_ADDR = "BZJsWeWiz2v3YewjFS18JrxcdvPAHWjqL7jgq4kGwy";
+// Librairies
+const http     = require("http");
+const url      = require("url");
+const fs       = require("fs");
+const crypto   = require("crypto");
+const WebSocket= require("ws");
 
-// ---------- Ledger ----------
+// Fichier de persistance
 const LEDGER_FILE = "/root/powchain/ledger.json";
 
-// ---------- État du réseau ----------
+// Adresse trésorerie POWCHAIN (déjà connue, pas générée ici)
+const TREASURY_ADDR = "BZJsWeJizv3YeyuWjF5187jrcduPFAHWjqL7jgq4kGwy";
+
+// ---------------- ÉTAT GLOBAL ----------------
+
 let state = {
   chain: [],
-  wallets: {},
+  wallets: {},       // { addr: { pow, usdc, staked } }
   treasuryPow: 0,
   treasuryUsdc: 0,
   lpPow: 0,
-  lpUsdc: 0,
-  mempool: []
+  lpUsdc: 0
 };
 
-function log(...m) {
-  console.log(new Date().toISOString(), ...m);
+// ---------------- UTILITAIRES ----------------
+
+function log(...args) {
+  console.log("[POWCHAIN]", ...args);
 }
 
-// ---------- Hash d’un bloc ----------
-function hashBlock(b) {
-  const h = crypto.createHash("sha256");
-  h.update(JSON.stringify({ index: b.index, time: b.time, prevHash: b.prevHash, txs: b.txs }));
-  return h.digest("hex");
+function loadLedger() {
+  try {
+    if (fs.existsSync(LEDGER_FILE)) {
+      const raw = fs.readFileSync(LEDGER_FILE, "utf8");
+      const data = JSON.parse(raw);
+      state = Object.assign(
+        {
+          chain: [],
+          wallets: {},
+          treasuryPow: 0,
+          treasuryUsdc: 0,
+          lpPow: 0,
+          lpUsdc: 0
+        },
+        data || {}
+      );
+      log("Ledger chargé, height =", getHeight());
+    } else {
+      log("Aucun ledger trouvé, création genesis...");
+      createGenesis();
+      saveLedger();
+    }
+  } catch (e) {
+    console.error("Erreur loadLedger:", e);
+    // En cas de corruption, on repart sur un genesis minimal
+    createGenesis();
+    saveLedger();
+  }
 }
 
-// ---------- Sauvegarde ledger ----------
 function saveLedger() {
   try {
     fs.writeFileSync(LEDGER_FILE, JSON.stringify(state, null, 2));
   } catch (e) {
-    console.error("SAVE ERROR:", e);
+    console.error("Erreur saveLedger:", e);
   }
 }
 
-// ---------- Lecture ledger ou GENESIS ----------
-function loadLedger() {
-  if (fs.existsSync(LEDGER_FILE)) {
-    try {
-      state = JSON.parse(fs.readFileSync(LEDGER_FILE, "utf8"));
-      log("Ledger chargé – height =", state.chain.length);
-      return;
-    } catch (e) {
-      console.error("LECTURE FAIL → création GENESIS");
-    }
-  }
-  const g = {
-    index: 0,
-    time: Date.now(),
+function getHeight() {
+  return state.chain.length ? state.chain[state.chain.length - 1].height : 0;
+}
+
+function createGenesis() {
+  const genesis = {
+    height: 1,
+    ts: Date.now(),
     prevHash: "0".repeat(64),
-    txs: [{ type: "GENESIS" }]
+    txs: [],
+    treasuryPow: 0,
+    treasuryUsdc: 0,
+    lpPow: 0,
+    lpUsdc: 0
   };
-  g.hash = hashBlock(g);
-  state.chain = [g];
-  saveLedger();
-  log("GENESIS créé");
+  genesis.hash = hashBlock(genesis);
+  state.chain = [genesis];
+  state.wallets = {};
+  state.treasuryPow = 0;
+  state.treasuryUsdc = 0;
+  state.lpPow = 0;
+  state.lpUsdc = 0;
+  log("Bloc genesis créé.");
 }
 
-// ---------- Wallet ----------
-function getWallet(addr) {
+function hashBlock(b) {
+  const h = crypto.createHash("sha256");
+  h.update(String(b.height));
+  h.update(String(b.ts));
+  h.update(String(b.prevHash));
+  h.update(JSON.stringify(b.txs || []));
+  h.update(String(b.treasuryPow));
+  h.update(String(b.treasuryUsdc));
+  h.update(String(b.lpPow));
+  h.update(String(b.lpUsdc));
+  return h.digest("hex");
+}
+
+function ensureWallet(addr) {
+  if (!addr || typeof addr !== "string") return null;
   if (!state.wallets[addr]) {
-    state.wallets[addr] = { pow: 0, usdc: 0, staked: 0, pub: null, nonce: 0 };
+    state.wallets[addr] = { pow: 0, usdc: 0, staked: 0 };
   }
   return state.wallets[addr];
 }
 
-// ---------- Vérification signature POWCHAIN ----------
-function verifySignature(tx) {
-  try {
-    const msg = new TextEncoder().encode(JSON.stringify({
-      type: tx.type,
-      from: tx.from,
-      to: tx.to ?? null,
-      amount: tx.amount ?? null,
-      token: tx.token ?? null,
-      nonce: tx.nonce
-    }));
-    return nacl.sign.detached.verify(
-      msg,
-      bs58.decode(tx.sig),
-      bs58.decode(tx.pub)
-    );
-  } catch {
-    return false;
-  }
-}
+// ---------------- BLOC + TX ----------------
 
-// ---------- Application TX POWCHAIN ----------
-function applyTx(tx) {
-  const wFrom = getWallet(tx.from);
-
-  if (tx.nonce !== wFrom.nonce + 1) return "bad nonce";
-  if (!verifySignature(tx)) return "bad sig";
-
-  if (tx.type === "TRANSFER") {
-    if (tx.token === "POW") {
-      if (wFrom.pow < tx.amount) return "solde POW insuffisant";
-      getWallet(tx.to).pow += tx.amount;
-      wFrom.pow -= tx.amount;
-    } else if (tx.token === "USDCPOW") {
-      if (wFrom.usdc < tx.amount) return "solde USDC insuffisant";
-      getWallet(tx.to).usdc += tx.amount;
-      wFrom.usdc -= tx.amount;
-    } else return "token inconnu";
-
-  } else if (tx.type === "STAKE") {
-    if (wFrom.pow < tx.amount) return "solde POW insuffisant";
-    wFrom.pow -= tx.amount;
-    wFrom.staked += tx.amount;
-
-  } else if (tx.type === "UNSTAKE") {
-    if (wFrom.staked < tx.amount) return "stake insuffisant";
-    wFrom.staked -= tx.amount;
-    wFrom.pow += tx.amount;
-
-  } else if (tx.type === "LP_ADD") {
-    if (wFrom.pow < tx.pow || wFrom.usdc < tx.usdc) return "solde LP insuffisant";
-    wFrom.pow -= tx.pow;
-    wFrom.usdc -= tx.usdc;
-    state.lpPow += tx.pow;
-    state.lpUsdc += tx.usdc;
-
-  } else {
-    return "type inconnu";
-  }
-
-  wFrom.nonce++;
-  return null;
-}
-
-// ---------- Création bloc ----------
-function mineBlock(txs) {
+function appendBlock(txs) {
   const prev = state.chain[state.chain.length - 1];
   const block = {
-    index: state.chain.length,
-    time: Date.now(),
-    prevHash: prev.hash,
-    txs
+    height: prev ? prev.height + 1 : 1,
+    ts: Date.now(),
+    prevHash: prev ? prev.hash : "0".repeat(64),
+    txs: txs || [],
+    treasuryPow: state.treasuryPow,
+    treasuryUsdc: state.treasuryUsdc,
+    lpPow: state.lpPow,
+    lpUsdc: state.lpUsdc
   };
   block.hash = hashBlock(block);
   state.chain.push(block);
   saveLedger();
-  broadcast({ type: "block", height: state.chain.length });
+  broadcast({ type: "stats", ...getStats() });
+  log("Nouveau bloc height =", block.height, "txs =", block.txs.length);
 }
 
-// ---------- WebSocket ----------
-const wss = new WebSocket.Server({ port: PORT_WS });
-let wsClients = [];
+function getStats() {
+  return {
+    height: getHeight(),
+    wallets: Object.keys(state.wallets).length,
+    treasuryPow: state.treasuryPow,
+    treasuryUsdc: state.treasuryUsdc,
+    lpPow: state.lpPow,
+    lpUsdc: state.lpUsdc
+  };
+}
 
-wss.on("connection", ws => {
-  wsClients.push(ws);
-  ws.send(JSON.stringify({ type: "welcome", height: state.chain.length }));
-  ws.on("close", () => wsClients = wsClients.filter(c => c !== ws));
-});
+// Applique une transaction interne POWCHAIN
+function applyTx(tx) {
+  try {
+    if (!tx || typeof tx !== "object") return "invalid tx";
+    const t = tx.type;
 
-function broadcast(o) {
-  wsClients.forEach(ws => {
-    try { ws.send(JSON.stringify(o)); } catch {}
+    if (t === "TRANSFER_POW") {
+      const from = state.wallets[tx.from];
+      const to = ensureWallet(tx.to);
+      const amt = Number(tx.amount) || 0;
+      if (!from || !to) return "wallet not found";
+      if (amt <= 0) return "amount <= 0";
+      if (from.pow < amt) return "insufficient pow";
+      from.pow -= amt;
+      to.pow += amt;
+      return null;
+    }
+
+    if (t === "LP_ADD") {
+      const w = state.wallets[tx.from];
+      const pow = Number(tx.pow) || 0;
+      const usdc = Number(tx.usdc) || 0;
+      if (!w) return "wallet not found";
+      if (pow <= 0 || usdc <= 0) return "lp amount <= 0";
+      if (w.pow < pow || w.usdc < usdc) return "insufficient balance";
+      w.pow -= pow;
+      w.usdc -= usdc;
+      state.lpPow += pow;
+      state.lpUsdc += usdc;
+      return null;
+    }
+
+    // BRIDGE_INTERNAL peut être utilisé plus tard si tu veux traiter manuellement les demandes
+    if (t === "BRIDGE_INTERNAL") {
+      const dest = ensureWallet(tx.powAddr);
+      const minted = Number(tx.mintedPow) || 0;
+      if (!dest) return "dest invalid";
+      if (minted <= 0) return "minted <= 0";
+      dest.pow += minted;
+      return null;
+    }
+
+    return "unknown type";
+  } catch (e) {
+    console.error("applyTx error:", e);
+    return "apply error";
+  }
+}
+
+// ---------------- HTTP HELPERS ----------------
+
+function sendJson(res, code, obj) {
+  res.writeHead(code, { "Content-Type": "application/json" });
+  res.end(JSON.stringify(obj));
+}
+
+function readBody(req, cb) {
+  let data = "";
+  req.on("data", chunk => {
+    data += chunk;
+    if (data.length > 1e6) {
+      // trop gros
+      req.destroy();
+    }
+  });
+  req.on("end", () => {
+    if (!data.trim()) return cb(null, {});
+    try {
+      const json = JSON.parse(data);
+      cb(null, json);
+    } catch (e) {
+      cb(e);
+    }
   });
 }
 
-// ---------- HTTP API ----------
-const server = http.createServer((req, res) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  if (req.method === "OPTIONS") return res.end();
+// ---------------- HTTP SERVER ----------------
 
+const httpServer = http.createServer((req, res) => {
   const parsed = url.parse(req.url, true);
-  const path = parsed.pathname;
+  const path = parsed.pathname || "/";
 
-  // /stats
-  if (path === "/stats") {
-    return res.end(JSON.stringify({
-      height: state.chain.length,
-      wallets: Object.keys(state.wallets).length,
-      treasuryPow: state.treasuryPow,
-      treasuryUsdc: state.treasuryUsdc,
-      lpPow: state.lpPow,
-      lpUsdc: state.lpUsdc
-    }));
+  // CORS simple (pour éventuels tests)
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  if (req.method === "OPTIONS") {
+    res.writeHead(204);
+    return res.end();
   }
 
-  // /wallet?id=
-  if (path === "/wallet") {
-    return res.end(JSON.stringify(getWallet(parsed.query.id)));
+  // GET /stats
+  if (req.method === "GET" && path === "/stats") {
+    return sendJson(res, 200, getStats());
   }
 
-  // /chain
-  if (path === "/chain") return res.end(JSON.stringify(state.chain));
-
-  // /block?i=
-  if (path === "/block") {
-    const i = +parsed.query.i;
-    return res.end(JSON.stringify(state.chain[i]));
+  // GET /chain
+  if (req.method === "GET" && path === "/chain") {
+    return sendJson(res, 200, state.chain);
   }
 
-  // /tx — TX POWCHAIN signée
-  if (path === "/tx" && req.method === "POST") {
-    let body = "";
-    req.on("data", d => body += d);
-    req.on("end", () => {
-      const tx = JSON.parse(body || "{}");
-      const err = applyTx(tx);
-      if (err) return res.end(JSON.stringify({ error: err }));
-      mineBlock([tx]);
-      broadcast({ type: "stats" });
-      res.end(JSON.stringify({ ok: true, height: state.chain.length }));
+  // GET /wallet?id=ADDR
+  if (req.method === "GET" && path === "/wallet") {
+    const id = parsed.query.id;
+    if (!id || typeof id !== "string") {
+      return sendJson(res, 400, { error: "missing id" });
+    }
+    const w = state.wallets[id] || { pow: 0, usdc: 0, staked: 0 };
+    return sendJson(res, 200, { id, ...w });
+  }
+
+  // POST /tx  (transactions internes POWCHAIN)
+  if (req.method === "POST" && path === "/tx") {
+    return readBody(req, (err, body) => {
+      if (err) return sendJson(res, 400, { error: "invalid json" });
+      const tx = body || {};
+      const errTx = applyTx(tx);
+      if (errTx) return sendJson(res, 400, { error: errTx });
+      appendBlock([tx]);
+      return sendJson(res, 200, { ok: true });
     });
-    return;
   }
 
-  // /bridge — crédit POW après réception SOL
-  if (path === "/bridge" && req.method === "POST") {
-    let body = "";
-    req.on("data", d => body += d);
-    req.on("end", () => {
-      const { to, lamports } = JSON.parse(body || "{}");
-      if (!to || !lamports) return res.end(JSON.stringify({ error: "missing params" }));
+  // POST /bridge  (bridge SOL → POWCHAIN)
+  // body attendu : { solAddr, powAddr, amountSol }
+  if (req.method === "POST" && path === "/bridge") {
+    return readBody(req, (err, body) => {
+      if (err) return sendJson(res, 400, { error: "invalid json" });
+      const solAddr   = body.solAddr || body.from || null;
+      const powAddr   = body.powAddr || body.dest || body.to || null;
+      const amountSol = Number(body.amountSol || body.amount || 0);
 
-      const pow = lamports / 1e8;
-      const fee = pow * 0.02;
-      const credited = pow - fee;
+      if (!solAddr || !powAddr || !(amountSol > 0)) {
+        return sendJson(res, 400, { error: "invalid bridge" });
+      }
 
-      const w = getWallet(to);
-      w.pow += credited;
-      state.treasuryPow += fee;
+      // Logique simple : on crédite le wallet POWCHAIN immédiatement
+      const dest = ensureWallet(powAddr);
+      const MINT_RATE = 1000; // 1 SOL = 1000 POW par exemple (à ajuster si tu veux)
+      const mintedPow = amountSol * MINT_RATE;
 
-      // Block interne
+      dest.pow += mintedPow;
+
+      // On peut aussi créditer un peu la trésorerie si tu veux plus tard
+      // state.treasuryPow += mintedPow * 0.01;
+
       const tx = {
-        type: "BRIDGE_MINT",
-        from: TREASURY_ADDR,
-        to,
-        amount: credited,
-        fee,
-        nonce: getWallet(TREASURY_ADDR).nonce + 1,
-        sig: "",
-        pub: ""
+        type: "BRIDGE_INTERNAL",
+        solAddr,
+        powAddr,
+        amountSol,
+        mintedPow,
+        ts: Date.now()
       };
-      getWallet(TREASURY_ADDR).nonce = tx.nonce;
-      mineBlock([tx]);
-      broadcast({ type: "stats" });
 
-      res.end(JSON.stringify({ ok: true, powMinted: credited, fee, height: state.chain.length }));
+      appendBlock([tx]);
+      log("Bridge traité:", amountSol, "SOL ->", mintedPow, "POW pour", powAddr);
+      return sendJson(res, 200, { ok: true, mintedPow });
     });
-    return;
   }
 
-  res.end(JSON.stringify({ error: "invalid endpoint" }));
+  // Tout le reste : endpoint invalide
+  return sendJson(res, 404, { error: "invalid endpoint" });
 });
 
-// ---------- Lancement ----------
+// ---------------- WEBSOCKET SERVER ----------------
+
+const wss = new WebSocket.Server({ port: PORT_WS });
+let wsClients = new Set();
+
+wss.on("connection", ws => {
+  wsClients.add(ws);
+  ws.on("close", () => wsClients.delete(ws));
+  ws.on("error", () => wsClients.delete(ws));
+
+  // Message de bienvenue
+  ws.send(JSON.stringify({ type: "welcome", height: getHeight() }));
+});
+
+function broadcast(obj) {
+  const msg = JSON.stringify(obj);
+  for (const ws of wsClients) {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(msg);
+    }
+  }
+}
+
+// Envoie périodique des stats réseau
+setInterval(() => {
+  broadcast({ type: "stats", ...getStats() });
+}, 10000);
+
+// ---------------- LANCEMENT ----------------
+
 loadLedger();
-server.listen(PORT_HTTP, () => log("HTTP API sur", PORT_HTTP));
-log("WebSocket POWCHAIN sur", PORT_WS);
 
-
-
-pm2 restart powchain
-
-
-pm2 logs powchain
-
-curl -s http://127.0.0.1:3000/stats
-
-
+httpServer.listen(PORT_HTTP, () => {
+  log("HTTP API POWCHAIN sur port", PORT_HTTP, "(/stats /chain /wallet /tx /bridge)");
+});
+log("WebSocket POWCHAIN sur port", PORT_WS, "(via Nginx possible /ws)");
