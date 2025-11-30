@@ -1,158 +1,20 @@
-nano /root/powchain/server.js
+nano /etc/nginx/sites-available/bbqfinance
 
 
-// POWCHAIN validator + HTTP API + WebSocket
-const PORT_HTTP = 3000;
-const PORT_WS = 7001;
-
-const http = require("http");
-const url = require("url");
-const fs = require("fs");
-const crypto = require("crypto");
-const WebSocket = require("ws");
-const nacl = require("tweetnacl");
-const bs58 = require("bs58");
-
-const LEDGER_FILE = "/root/powchain/ledger.json";
-const TREASURY_ADDR = "BZJsWeJeiv2y3YewjFS18JrxcdvPAHWjqL7jgq4kGwy";
-
-let state = { chain: [], wallets: {}, nonce: {} };
-
-function loadLedger(){
-  try{
-    const d = JSON.parse(fs.readFileSync(LEDGER_FILE,"utf8"));
-    state = d;
-  }catch(e){
-    console.log("⚠ Aucun ledger trouvé, création genesis...");
-    state = { chain:[{height:1,time:Date.now(),tx:[]}], wallets:{}, nonce:{} };
-    saveLedger();
-  }
-}
-function saveLedger(){
-  fs.writeFileSync(LEDGER_FILE, JSON.stringify(state,null,2));
+location /ws {
+    proxy_pass http://127.0.0.1:7001;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;
+    proxy_read_timeout 86400;
 }
 
-function signTx(type,obj){
-  const tx = { type, ...obj };
-  state.chain.push({height:state.chain.length+1,time:Date.now(),tx:[tx]});
-  saveLedger();
-  return { ok:true, height:state.chain.length };
-}
 
-loadLedger();
-
-// =============== HTTP API =================
-const httpServer = http.createServer((req,res)=>{
-  res.setHeader("Access-Control-Allow-Origin","*");
-  res.setHeader("Content-Type","application/json");
-  const q = url.parse(req.url,true);
-
-  if(q.pathname==="/stats"){
-    return res.end(JSON.stringify({
-      height: state.chain.length,
-      wallets: Object.keys(state.wallets).length,
-      treasury: state.wallets[TREASURY_ADDR]||0
-    }));
-  }
-
-  if(q.pathname==="/chain"){
-    return res.end(JSON.stringify(state.chain));
-  }
-
-  if(q.pathname==="/wallet"){
-    const id = q.query.id;
-    if(!id) return res.end(JSON.stringify({error:"missing id"}));
-    return res.end(JSON.stringify({
-      balance: state.wallets[id]||0,
-      nonce: state.nonce[id]||0
-    }));
-  }
-
-  if(q.pathname==="/tx" && req.method==="POST"){
-    let body="";
-    req.on("data",chunk=>body+=chunk);
-    req.on("end",()=>{
-      try{
-        const tx = JSON.parse(body);
-        if(!tx.from || !tx.sig || !tx.nonce || !tx.amount || tx.amount<=0)
-          return res.end(JSON.stringify({error:"invalid tx"}));
-
-        const msg = new TextEncoder().encode(JSON.stringify({
-          from: tx.from, to: tx.to, amount: tx.amount, nonce: tx.nonce
-        }));
-        const pub = bs58.decode(tx.pub);
-        const sig = bs58.decode(tx.sig);
-        if(!nacl.sign.detached.verify(msg,sig,pub))
-          return res.end(JSON.stringify({error:"bad signature"}));
-
-        if(state.nonce[tx.from] && tx.nonce <= state.nonce[tx.from])
-          return res.end(JSON.stringify({error:"bad nonce"}));
-
-        if((state.wallets[tx.from]||0) < tx.amount)
-          return res.end(JSON.stringify({error:"insufficient funds"}));
-
-        state.wallets[tx.from] -= tx.amount;
-        state.wallets[tx.to] = (state.wallets[tx.to]||0)+tx.amount;
-        state.nonce[tx.from] = tx.nonce;
-        saveLedger();
-        return res.end(JSON.stringify(signTx("transfer", tx)));
-      }catch(e){
-        return res.end(JSON.stringify({error:"json error"}));
-      }
-    });
-    return;
-  }
-
-  res.end(JSON.stringify({error:"invalid endpoint"}));
-});
-httpServer.listen(PORT_HTTP, ()=> console.log("🌐 HTTP API POWCHAIN sur port", PORT_HTTP));
-
-// =============== WebSocket =================
-const wss = new WebSocket.Server({ port: PORT_WS });
-console.log("🔌 WebSocket POWCHAIN sur port", PORT_WS);
-
-wss.on("connection", ws=>{
-  ws.send(JSON.stringify({type:"welcome",height:state.chain.length}));
-  ws.on("message", raw=>{
-    try{
-      const msg = JSON.parse(raw.toString());
-      if(msg.type==="stats"){
-        return ws.send(JSON.stringify({
-          height: state.chain.length,
-          wallets: Object.keys(state.wallets).length
-        }));
-      }
-      if(msg.type==="chain"){
-        return ws.send(JSON.stringify(state.chain));
-      }
-      if(msg.type==="wallet" && msg.id){
-        return ws.send(JSON.stringify({
-          balance: state.wallets[msg.id]||0,
-          nonce: state.nonce[msg.id]||0
-        }));
-      }
-    }catch(e){}
-  });
-});
-
-
-pm2 restart powchain
-
-
-curl -s http://127.0.0.1:3000/stats
-curl -s http://bbqfinance.fun/stats
-curl -s http://bbqfinance.fun/chain
-curl -s "http://bbqfinance.fun/wallet?id=BZJsWeJeiv2y3YewjFS18JrxcdvPAHWjqL7jgq4kGwy"
-
-
+nginx -t
+sudo systemctl restart nginx
 
 wscat -c wss://bbqfinance.fun/ws
 
 
 {"type":"stats"}
-
-
-
-
-
-
