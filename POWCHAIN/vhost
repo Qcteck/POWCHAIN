@@ -1,7 +1,157 @@
+
+nano /root/powchain/server.js
+
+
+
+// server.js – POWCHAIN Validator + HTTP API + WebSocket
+
+// Ports
+const PORT_HTTP = 3000;
+const PORT_WS = 7001;
+
+// Librairies
+const http = require("http");
+const url = require("url");
+const fs = require("fs");
+const crypto = require("crypto");
+const WebSocket = require("ws");
+const nacl = require("tweetnacl");
+const bs58 = require("bs58");
+
+// Fichier de persistance
+const LEDGER_FILE = "/root/powchain/ledger.json";
+
+// Adresse trésorerie POWCHAIN (déjà connue)
+const TREASURY_ADDR = "BZJsWeJeizv3EywWjFS187jrcduPFAHWjqL7jgq4kGwy";
+
+// --------- ÉTAT GLOBAL ---------
+let state = {
+  chain: [],
+  wallets: {},
+  treasuryPow: 0,
+  treasuryUsdc: 0,
+  treasurySol: 0
+};
+
+let mempool = [];
+
+// --------- UTIL ---------
+function sha(x) {
+  return crypto.createHash("sha256").update(x).digest("hex");
+}
+
+// Chargement du ledger
+if (fs.existsSync(LEDGER_FILE)) {
+  try {
+    state = JSON.parse(fs.readFileSync(LEDGER_FILE));
+    console.log("📌 Ledger chargé, height =", state.chain.length);
+  } catch {
+    console.log("⚠️ Ledger corrompu → reset");
+  }
+}
+
+// Si aucun bloc → création genesis
+if (state.chain.length === 0) {
+  const genesis = { index: 0, time: Date.now(), prev: "0", tx: [] };
+  genesis.hash = sha(JSON.stringify(genesis));
+  state.chain.push(genesis);
+  console.log("⚡ Aucun ledger trouvé — création genesis…");
+}
+
+function persist() {
+  fs.writeFileSync(LEDGER_FILE, JSON.stringify(state, null, 2));
+}
+
+// --------- VALIDATION DE BLOC (boucle 800ms) ---------
+setInterval(() => {
+  if (!mempool.length) return;
+
+  const txs = mempool.splice(0, mempool.length);
+  const last = state.chain[state.chain.length - 1];
+  const block = {
+    index: last.index + 1,
+    time: Date.now(),
+    prev: last.hash,
+    tx: txs
+  };
+  block.hash = sha(JSON.stringify(block));
+  state.chain.push(block);
+  persist();
+
+  console.log("⛓️ Nouveau bloc", block.index, "— tx:", txs.length);
+  broadcast({ type: "newBlock", height: state.chain.length });
+}, 800);
+
+// ======================================================
+// HTTP API
+// ======================================================
+const server = http.createServer(async (req, res) => {
+  res.setHeader("Content-Type", "application/json");
+  res.setHeader("Access-Control-Allow-Origin", "*");
+
+  const path = url.parse(req.url, true).pathname;
+
+  if (path === "/stats")
+    return res.end(JSON.stringify({
+      height: state.chain.length,
+      wallets: Object.keys(state.wallets).length,
+      treasuryPow: state.treasuryPow,
+      treasuryUsdc: state.treasuryUsdc,
+      treasurySol: state.treasurySol
+    }));
+
+  if (path === "/chain") return res.end(JSON.stringify(state.chain));
+
+  if (path === "/wallet") return res.end(JSON.stringify(state.wallets));
+
+  res.end(JSON.stringify({ error: "route not found" }));
+});
+
+server.listen(PORT_HTTP, () => {
+  console.log(`🌐 HTTP API POWCHAIN sur port ${PORT_HTTP} (/stats /wallet /chain)`);
+});
+
+// ======================================================
+// WEBSOCKET
+// ======================================================
+const wss = new WebSocket.Server({ port: PORT_WS });
+
+wss.on("connection", ws => {
+  console.log("🔌 Connexion WebSocket");
+
+  ws.send(JSON.stringify({
+    type: "welcome",
+    height: state.chain.length
+  }));
+
+  ws.on("message", raw => {
+    try {
+      const tx = JSON.parse(raw.toString());
+      mempool.push(tx);
+      broadcast({ type: "mempool", pending: mempool.length });
+    } catch (e) {
+      ws.send(JSON.stringify({ error: "invalid tx" }));
+    }
+  });
+});
+
+function broadcast(msg) {
+  wss.clients.forEach(ws =>
+    ws.readyState === WebSocket.OPEN && ws.send(JSON.stringify(msg))
+  );
+}
+
+console.log(`🔊 WebSocket POWCHAIN sur port ${PORT_WS} (ws://IP:7001 ou via Nginx /ws)`);
+
+
 pm2 restart powchain
-pm2 logs powchain
 
 
 curl -s http://127.0.0.1:3000/stats
 
 wscat -c ws://127.0.0.1:7001
+
+
+
+
+
