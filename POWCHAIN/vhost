@@ -1,351 +1,81 @@
-
 nano /root/server.js
 
 
-
-"use strict";
-
-const fs = require("fs");
-const path = require("path");
-const express = require("express");
+const http = require("http");
 const WebSocket = require("ws");
-const crypto = require("crypto");
 
-// ----------------- CONFIG -----------------
 const PORT_HTTP = 3000;
 const PORT_WS = 7001;
-const CHAIN_FILE = path.join(__dirname, "chain.json");
-const DEC = 1e6;
 
-// ----------------- ÉTAT EN MÉMOIRE -----------------
+// ──────────────── STATE ────────────────
 let chain = [];
-let state = {
-  wallets: {},        // addr -> { pow, usdc, staked, nonce }
-  lpPow: 0,
-  lpUsdc: 0,
-  treasuryUsdc: 0,
-  treasurySol: 0
-};
 let mempool = [];
+let wallets = {};
+let lpPow = 0;
+let lpUsdc = 0;
+let treasuryUsdc = 0;
+let treasurySol = 0;
 
-// ----------------- UTILITAIRES -----------------
-function loadChain() {
-  try {
-    const raw = fs.readFileSync(CHAIN_FILE, "utf8");
-    const parsed = JSON.parse(raw);
-    chain = parsed.chain || [];
-    state = parsed.state || state;
-    if (!state.wallets) state.wallets = {};
-    console.log("✅ Blockchain chargée :", chain.length, "blocs");
-  } catch (e) {
-    console.log("⚠️ Aucune chain.json valide, nouvelle chaîne.");
-    chain = [];
-    state.wallets = {};
-    state.lpPow = 0;
-    state.lpUsdc = 0;
-    state.treasuryUsdc = 0;
-    state.treasurySol = 0;
+// ──────────────── HTTP API ────────────────
+const api = http.createServer((req,res)=>{
+  res.setHeader("Access-Control-Allow-Origin","*");
+  res.setHeader("Content-Type","application/json");
+
+  if(req.url==="/stats"){
+    return res.end(JSON.stringify({height:chain.length,lpPow,lpUsdc,treasuryUsdc,treasurySol}));
   }
-}
-
-function saveChain() {
-  try {
-    const data = JSON.stringify({ chain, state }, null, 2);
-    fs.writeFileSync(CHAIN_FILE, data, "utf8");
-  } catch (e) {
-    console.error("❌ Erreur saveChain:", e);
+  if(req.url==="/chain"){
+    return res.end(JSON.stringify(chain.slice(-30)));
   }
-}
-
-function getWallet(addr) {
-  if (!state.wallets[addr]) {
-    state.wallets[addr] = { pow: 0, usdc: 0, staked: 0, nonce: 0 };
+  if(req.url==="/mempool"){
+    return res.end(JSON.stringify(mempool));
   }
-  return state.wallets[addr];
-}
-
-function hashBlock(block) {
-  const h = crypto.createHash("sha256");
-  h.update(JSON.stringify(block));
-  return h.digest("hex");
-}
-
-// ----------------- LOGIQUE DES TX -----------------
-function applyTx(tx, dry = false) {
-  const snapshot = dry ? JSON.parse(JSON.stringify({ state })) : null;
-  const S = dry ? snapshot.state : state;
-
-  const W = (addr) => {
-    if (!S.wallets[addr]) {
-      S.wallets[addr] = { pow: 0, usdc: 0, staked: 0, nonce: 0 };
-    }
-    return S.wallets[addr];
-  };
-
-  try {
-    switch (tx.type) {
-      case "MINT_POW": {
-        const w = W(tx.to);
-        w.pow += Math.floor(tx.amount * DEC);
-        break;
-      }
-      case "MINT_USDC_POW": {
-        const w = W(tx.to);
-        w.usdc += Math.floor(tx.amount * DEC);
-        S.treasuryUsdc += Math.floor(tx.fee || 0);
-        break;
-      }
-      case "TRANSFER_POW": {
-        const from = W(tx.from);
-        const to = W(tx.to);
-        const amt = Math.floor(tx.amount * DEC);
-        if (from.pow < amt) throw new Error("Solde POW insuffisant");
-        from.pow -= amt;
-        to.pow += amt;
-        break;
-      }
-      case "TRANSFER_USDC_POW": {
-        const from = W(tx.from);
-        const to = W(tx.to);
-        const amt = Math.floor(tx.amount * DEC);
-        if (from.usdc < amt) throw new Error("Solde USDC POW insuffisant");
-        from.usdc -= amt;
-        to.usdc += amt;
-        break;
-      }
-      case "STAKE_POW": {
-        const w = W(tx.from);
-        const amt = Math.floor(tx.amount * DEC);
-        if (w.pow < amt) throw new Error("Solde POW insuffisant");
-        w.pow -= amt;
-        w.staked += amt;
-        break;
-      }
-      case "UNSTAKE_POW": {
-        const w = W(tx.from);
-        const amt = Math.floor(tx.amount * DEC);
-        if (w.staked < amt) throw new Error("Solde staké insuffisant");
-        w.staked -= amt;
-        w.pow += amt;
-        break;
-      }
-      case "ADD_LP": {
-        const w = W(tx.from);
-        const powAmt = Math.floor(tx.powAmount * DEC);
-        const usdcAmt = Math.floor(tx.usdcAmount * DEC);
-        if (w.pow < powAmt || w.usdc < usdcAmt) {
-          throw new Error("Solde insuffisant pour LP");
-        }
-        w.pow -= powAmt;
-        w.usdc -= usdcAmt;
-        S.lpPow += powAmt;
-        S.lpUsdc += usdcAmt;
-        break;
-      }
-      case "SWAP_POW_USDC": {
-        // AMM x*y=k simple
-        if (S.lpPow <= 0 || S.lpUsdc <= 0) throw new Error("LP vide");
-        const w = W(tx.from);
-        const direction = tx.direction || "POW_TO_USDC";
-        const amount = Math.floor(tx.amount * DEC);
-        const feeBps = tx.feeBps || 30; // 0.3%
-        const fee = Math.floor((amount * feeBps) / 10000);
-
-        if (direction === "POW_TO_USDC") {
-          if (w.pow < amount) throw new Error("POW insuffisant");
-          const dx = amount - fee;
-          const k = BigInt(S.lpPow) * BigInt(S.lpUsdc);
-          const newLpPow = BigInt(S.lpPow) + BigInt(dx);
-          const newLpUsdc = k / newLpPow;
-          const dy = BigInt(S.lpUsdc) - newLpUsdc;
-          const out = Number(dy);
-          if (out <= 0) throw new Error("Swap invalide");
-          w.pow -= amount;
-          w.usdc += out;
-          S.lpPow += dx;
-          S.lpUsdc -= out;
-          S.treasuryUsdc += fee;
-        } else if (direction === "USDC_TO_POW") {
-          if (w.usdc < amount) throw new Error("USDC POW insuffisant");
-          const dx = amount - fee;
-          const k = BigInt(S.lpPow) * BigInt(S.lpUsdc);
-          const newLpUsdc = BigInt(S.lpUsdc) + BigInt(dx);
-          const newLpPow = k / newLpUsdc;
-          const dy = BigInt(S.lpPow) - newLpPow;
-          const out = Number(dy);
-          if (out <= 0) throw new Error("Swap invalide");
-          w.usdc -= amount;
-          w.pow += out;
-          S.lpUsdc += dx;
-          S.lpPow -= out;
-          S.treasuryUsdc += fee;
-        } else {
-          throw new Error("Direction inconnue");
-        }
-        break;
-      }
-      case "BRIDGE_MINT": {
-        // Bridge côté Solana déjà validé → ici on crédite juste POWCHAIN
-        const w = W(tx.to);
-        const powAmt = Math.floor((tx.powAmount || 0) * DEC);
-        const usdcAmt = Math.floor((tx.usdcAmount || 0) * DEC);
-        w.pow += powAmt;
-        w.usdc += usdcAmt;
-        break;
-      }
-      default:
-        throw new Error("Type de TX inconnu: " + tx.type);
-    }
-
-    if (!dry) {
-      const w = state.wallets[tx.from];
-      if (w) {
-        w.nonce = (w.nonce || 0) + 1;
-      }
-    }
-
-    return { ok: true };
-  } catch (e) {
-    if (dry) return { ok: false, error: e.message };
-    throw e;
-  }
-}
-
-// ----------------- MINAGE -----------------
-function mineBlock() {
-  if (mempool.length === 0) return;
-  const prevHash = chain.length ? chain[chain.length - 1].hash : "GENESIS";
-  const height = chain.length;
-  const txs = mempool.splice(0, mempool.length);
-  const block = {
-    index: height,
-    prev: prevHash,
-    time: Date.now(),
-    txs
-  };
-  block.hash = hashBlock(block);
-  chain.push(block);
-  saveChain();
-  console.log("📦 Bloc miné", height, "TX:", txs.length);
-  broadcast({ type: "NEW_BLOCK", block });
-}
-
-loadChain();
-setInterval(mineBlock, 5000);
-
-// ----------------- WEBSOCKET SERVER -----------------
-const wss = new WebSocket.Server({ port: PORT_WS });
-let wsClients = [];
-
-wss.on("connection", (ws) => {
-  wsClients.push(ws);
-  console.log("🔌 Client WebSocket connecté");
-
-  // Envoi d’un snapshot initial
-  const height = chain.length ? chain[chain.length - 1].index : 0;
-  ws.send(
-    JSON.stringify({
-      type: "HELLO",
-      height,
-      lpPow: state.lpPow,
-      lpUsdc: state.lpUsdc,
-      treasuryUsdc: state.treasuryUsdc,
-      treasurySol: state.treasurySol
-    })
-  );
-
-  ws.on("message", (msg) => {
-    try {
-      const data = JSON.parse(msg.toString());
-      if (data.type === "PING") {
-        ws.send(JSON.stringify({ type: "PONG", t: Date.now() }));
-      }
-    } catch (e) {
-      console.error("WS msg error:", e.message);
-    }
-  });
-
-  ws.on("close", () => {
-    wsClients = wsClients.filter((c) => c !== ws);
-    console.log("🔌 Client WebSocket déconnecté");
-  });
+  res.statusCode = 404;
+  res.end(JSON.stringify({error:"Not found"}));
 });
+api.listen(PORT_HTTP,()=>console.log("HTTP OK",PORT_HTTP));
 
-function broadcast(obj) {
-  const payload = JSON.stringify(obj);
-  wsClients.forEach((ws) => {
-    if (ws.readyState === WebSocket.OPEN) {
-      try {
-        ws.send(payload);
-      } catch (e) {
-        console.error("WS send error:", e.message);
-      }
-    }
+// ──────────────── WEBSOCKET ────────────────
+const wss = new WebSocket.Server({ port: PORT_WS }, () =>
+  console.log("WS OK", PORT_WS)
+);
+
+// envoi à tous
+function broadcast(obj){
+  const msg = JSON.stringify(obj);
+  wss.clients.forEach(c=>{
+    if(c.readyState===WebSocket.OPEN) c.send(msg);
   });
 }
 
-console.log("✅ WebSocket POWCHAIN sur port", PORT_WS, "(/ws via Nginx)");
+wss.on("connection", ws=>{
+  ws.send(JSON.stringify({type:"WELCOME",height:chain.length}));
 
-// ----------------- HTTP API (Express) -----------------
-const app = express();
-app.use(express.json());
+  ws.on("message", raw=>{
+    try{
+      const tx = JSON.parse(raw);
 
-app.get("/stats", (req, res) => {
-  const height = chain.length ? chain[chain.length - 1].index : 0;
-  res.json({
-    height,
-    lpPow: state.lpPow,
-    lpUsdc: state.lpUsdc,
-    treasuryUsdc: state.treasuryUsdc,
-    treasurySol: state.treasurySol
+      // ajouter TX au mempool
+      if(tx.type==="TX"){
+        mempool.push(tx);
+        broadcast({type:"NEW_TX",tx});
+      }
+
+      // faire un bloc à chaque TX
+      if(tx.type==="TX"){
+        const blk = {index:chain.length,time:Date.now(),tx};
+        chain.push(blk);
+        broadcast({type:"NEW_BLOCK",blk});
+      }
+    }catch(e){ console.log("WS err",e); }
   });
 });
-
-app.get("/wallet/:addr", (req, res) => {
-  const addr = req.params.addr;
-  const w = getWallet(addr);
-  res.json({ addr, ...w });
-});
-
-app.post("/tx", (req, res) => {
-  const tx = req.body || {};
-  try {
-    const sim = applyTx(tx, true);
-    if (!sim.ok) {
-      return res.status(400).json({ ok: false, error: sim.error });
-    }
-    tx.time = Date.now();
-    mempool.push(tx);
-    console.log("💠 TX ajoutée au mempool:", tx.type);
-    res.json({ ok: true, queued: true });
-  } catch (e) {
-    console.error("Erreur /tx:", e.message);
-    res.status(400).json({ ok: false, error: e.message });
-  }
-});
-
-app.get("/block/:h", (req, res) => {
-  const h = parseInt(req.params.h, 10);
-  const b = chain[h];
-  if (!b) return res.status(404).json({ error: "Bloc inconnu" });
-  res.json(b);
-});
-
-app.get("/chain", (req, res) => {
-  res.json({ chain });
-});
-
-// HTTP server
-app.listen(PORT_HTTP, () => {
-  console.log("✅ HTTP API POWCHAIN sur port", PORT_HTTP, "(/stats /tx /wallet /block /chain)");
-});
-
 
 
 pm2 restart all
 
 
 
-
 curl -s http://127.0.0.1:3000/stats
+
 wscat -c ws://127.0.0.1:7001
