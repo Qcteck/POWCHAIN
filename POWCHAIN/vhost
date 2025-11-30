@@ -1,268 +1,670 @@
-mkdir -p /var/www/html/modules
-
-<!doctype html>
-<html lang="fr">
-<head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>FIREINNERS — Client Complet</title>
-
-<style>
-body{
-  margin:0;
-  background:#050505;
-  color:#fff;
-  font-family:system-ui,Segoe UI,sans-serif;
-}
-h1{
-  text-align:center;
-  margin:18px 0;
-  font-size:32px;
-  color:#ffd700;
-  text-shadow:0 0 8px #ff0000;
-}
-.section{
-  border:1px solid #666;
-  border-radius:14px;
-  padding:16px;
-  margin:16px;
-  background:radial-gradient(circle,#1a1a1a,#000);
-  box-shadow:0 0 12px #7b0000;
-}
-button{
-  border:none;
-  padding:10px 15px;
-  margin:4px;
-  border-radius:8px;
-  cursor:pointer;
-  font-weight:600;
-}
-.red{background:#b30000;color:white;}
-.blue{background:#0044aa;color:white;}
-.gold{background:#d4af37;color:black;}
-input{
-  width:100%;
-  background:#111;
-  border:1px solid #666;
-  color:white;
-  padding:8px;
-  border-radius:6px;
-  margin-bottom:6px;
-}
-#log{
-  height:220px;
-  overflow:auto;
-  white-space:pre-wrap;
-  background:#080808;
-  padding:8px;
-  border-radius:6px;
-  font-size:13px;
-}
-.statusLight{padding:4px 10px;border-radius:20px;font-size:13px;font-weight:700;}
-.ok{background:#067f00;}
-.err{background:#7f0000;}
-</style>
-</head>
-<body>
-
-<h1>🔥 FIREINNERS — Client Complet</h1>
-
-<div style="text-align:center;margin-bottom:20px;">
-  Backend :
-  <span id="httpStatus" class="statusLight err">HTTP ?</span>
-  <span id="wsStatus" class="statusLight err">WS ?</span>
-</div>
-
-<!-- =================== RÉSEAU =================== -->
-<div class="section">
-  <h2 style="color:#ffd700;margin-top:0;">RÉSEAU FIREINNERS</h2>
-  Hauteur : <span id="h"></span><br/>
-  NB wallets : <span id="nb"></span><br/>
-  TVL POW : <span id="tvlPow"></span><br/>
-  TVL USDC POW : <span id="tvlUsdc"></span><br/>
-  Trésorerie POW : <span id="tPow"></span><br/>
-  Trésorerie USDC POW : <span id="tUsdc"></span><br/>
-</div>
+cd /root/powchain
+nano server.js
 
 
+// server.js - POWCHAIN / FIREINNERS Validator + API + WS
 
-nano /var/www/html/modules/wallet.js
+const express = require("express");
+const bodyParser = require("body-parser");
+const WebSocket = require("ws");
+const nacl = require("tweetnacl");
+const bs58 = require("bs58");
+const crypto = require("crypto");
+const http = require("http");
+const { TextEncoder } = require("util");
 
-<!-- =================== WALLET FIREINNERS =================== -->
-<div class="section">
-  <h2 style="color:#ff0000;margin-top:0;">Wallet FIREINNERS — Générateur</h2>
-  <input id="addrFI" placeholder="Adresse FIREINNERS (base58)" readonly/>
-  <button class="red" onclick="FI_wallet.generate()">Générer wallet</button>
-  <button class="blue" onclick="FI_wallet.reload()">Recharger</button>
-  <div style="text-align:center;margin-top:8px;">
-    <canvas id="qr" width="170" height="170"></canvas>
-  </div>
-  <button class="gold" onclick="FI_wallet.copy()">Copier adresse</button>
-  <br/><br/>
-  Solde POW : <span id="bPow">0</span><br/>
-  Solde USDC POW : <span id="bUsdc">0</span><br/>
-</div>
+// =========================
+// CONFIG SERVEUR
+// =========================
 
+const HTTP_PORT = 3000; // nginx proxy vers 127.0.0.1:3000
+const WS_PATH = "/ws";  // nginx location /ws
 
-nano /var/www/html/modules/phantom.js
+const app = express();
+app.use(bodyParser.json());
 
-<!-- =================== PHANTOM =================== -->
-<div class="section">
-  <h2 style="color:#ff0000;margin-top:0;">Wallet Solana — Phantom</h2>
-  <input id="solAddr" placeholder="Adresse Solana" readonly/>
-  <button class="red" onclick="FI_phantom.connect()">Connecter Phantom</button>
-  <button class="blue" onclick="FI_phantom.refresh()">Refresh</button>
-  <br/><br/>
-  SOL : <span id="solBal">0</span><br/>
-  USDC Solana : <span id="usdcBal">0</span><br/><br/>
-  <h3 style="color:#ffd700;">Bridge vers FIREINNERS</h3>
-  <input id="amountBridge" placeholder="ex. 0.0015"/>
-  <button class="gold" onclick="FI_backend.bridge()">SOL → FIREINNERS</button>
-</div>
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server, path: WS_PATH });
 
-<!-- =================== LOGS =================== -->
-<div class="section">
-  <h2 style="color:#ffd700;margin-top:0;">Logs</h2>
-  <div id="log"></div>
-  <button class="blue" onclick="document.getElementById('log').innerHTML=''">CLEAR LOG</button>
-  <button class="gold" onclick="FI_backend.loadBlocks()">Charger derniers blocs</button>
-</div>
+const clients = new Set();
 
-<script src="/modules/wallet.js"></script>
-<script src="/modules/phantom.js"></script>
-<script src="/modules/backend.js"></script>
-<script src="/modules/ui.js"></script>
+// =========================
+// CONFIG ECONOMIE POWCHAIN
+// =========================
 
-</body>
-</html>
+const DEC = 1e6; // 6 décimales
+const SUPPLY_MAX = 100_000_000 * DEC; // hard cap 100M POW
 
+// Taux dynamique POW/SOL
+const RATE_BASE = 1000;           // base POW par SOL
+const TVL_REF = 1_000_000 * DEC;  // 1M USDC POW de référence
+const RATE_MIN = 800;             // min POW / SOL
+const RATE_MAX = 5000;            // max POW / SOL
 
+// Frais en basis points (1% = 100 bp)
+const FEE_TRANSFER_BURN_BP = 50;   // 0.5% burn sur transfert POW
+const FEE_SWAP_TOTAL_BP = 30;      // 0.3% total fees sur swap
+const FEE_SWAP_BURN_PART = 0.5;    // 50% des fees swap brûlés
+const FEE_BRIDGE_IN_TREAS_BP = 500; // 5% vers trésorerie à l'entrée
+const FEE_BRIDGE_IN_BURN_BP = 200;  // 2% burn à l'entrée
+const FEE_BRIDGE_OUT_BURN_BP = 1000; // 10% burn sur POW renvoyés
+const FEE_UNSTAKE_BURN_BP = 300;   // 3% burn si unstake anticipé
 
-nano /var/www/html/modules/wallet.js
+const STAKE_MIN_LOCK_MS = 30 * 24 * 60 * 60 * 1000; // 30 jours
 
-window.FI_wallet = {};
-const log = t => document.getElementById("log").innerHTML += t + "\n";
+// =========================
+// ETAT GLOBAL
+// =========================
 
-// Base58 interne (PAS de bibliothèque externe → pas d’erreur)
-const ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-function toBase58(bytes){
-  let x = BigInt("0x"+[...bytes].map(b=>b.toString(16).padStart(2,"0")).join(""));
-  let r = "";
-  while(x>0){ let mod = x % 58n; r = ALPHABET[mod] + r; x = x/58n; }
-  return r;
+let wallets = {}; // addr -> { pow, usdc, staked, pub, nonce, stakeLock }
+let treasury = { pow: 0, usdc: 0, sol: 0 };
+let lp = { pow: 0, usdc: 0 };
+
+let supplyCirculante = 0;
+let mintedPowTotal = 0;
+let burnedPowTotal = 0;
+
+let chain = [];
+let mempool = [];
+
+// =========================
+// GENESIS
+// =========================
+
+(function initGenesis() {
+  const genesisSupply = 100_000_000 * DEC;
+  supplyCirculante = genesisSupply;
+  mintedPowTotal = genesisSupply;
+  treasury.pow = genesisSupply;
+  const genesis = {
+    height: 1,
+    time: Date.now(),
+    prevHash: "0".repeat(64),
+    hash: "GENESIS",
+    txs: [],
+    treasurySnapshot: { ...treasury },
+    lpSnapshot: { ...lp }
+  };
+  chain.push(genesis);
+})();
+
+// =========================
+// OUTILS GENERAUX
+// =========================
+
+function ensureWallet(addr) {
+  if (!wallets[addr]) {
+    wallets[addr] = {
+      pow: 0,
+      usdc: 0,
+      staked: 0,
+      pub: addr,
+      nonce: 0,
+      stakeLock: 0
+    };
+  }
+  return wallets[addr];
 }
 
-FI_wallet.generate = () => {
-  try{
-    const priv = crypto.getRandomValues(new Uint8Array(32));
-    const pub = crypto.getRandomValues(new Uint8Array(32));
-    const addr = toBase58(pub);
-
-    localStorage.setItem("fi_priv",Array.from(priv));
-    localStorage.setItem("fi_pub",Array.from(pub));
-    localStorage.setItem("fi_addr",addr);
-
-    document.getElementById("addrFI").value = addr;
-    FI_wallet.qr(addr);
-    log("Wallet FIREINNERS généré");
-  }catch(e){ alert("Erreur génération wallet : "+e); }
-};
-
-FI_wallet.reload = () => {
-  const a = localStorage.getItem("fi_addr");
-  if(!a) return;
-  document.getElementById("addrFI").value = a;
-  FI_wallet.qr(a);
-};
-
-FI_wallet.copy = () => navigator.clipboard.writeText(addrFI.value);
-
-FI_wallet.qr = str => {
-  const ctx = qr.getContext("2d");
-  ctx.fillStyle="#000";ctx.fillRect(0,0,170,170);
-  for(let i=0;i<160;i+=10)
-    for(let j=0;j<160;j+=10)
-      if((i*j+str.length)%17<8){ctx.fillStyle="#fff";ctx.fillRect(i+5,j+5,8,8);}
-};
-
-nano /var/www/html/modules/phantom.js
-
-window.FI_phantom = {};
-const logP = t => document.getElementById("log").innerHTML += t + "\n";
-
-FI_phantom.connect = async () => {
-  try{
-    const resp = await window.phantom.solana.connect();
-    solAddr.value = resp.publicKey.toString();
-    logP("Phantom connecté : "+solAddr.value);
-    FI_phantom.refresh();
-  }catch(e){ alert("Erreur Phantom : "+e); }
-};
-
-FI_phantom.refresh = async () => {
-  try{
-    const c = new solanaWeb3.Connection("https://api.mainnet-beta.solana.com");
-    const pub = new solanaWeb3.PublicKey(solAddr.value);
-    const bal = await c.getBalance(pub);
-    solBal.textContent = (bal/1e9).toFixed(6);
-    logP("SOL = "+solBal.textContent);
-  }catch(e){ logP("Erreur refresh Solana : "+e); }
-};
-
-
-
-nano /var/www/html/modules/backend.js
-window.FI_backend = {};
-const L = t => document.getElementById("log").innerHTML += t+"\n";
-const API = "https://bbqfinance.fun"; // pas besoin de changer côté serveur
-
-FI_backend.bridge = async () => {
-  const addrFI = localStorage.getItem("fi_addr");
-  if(!addrFI) return alert("⚠ Génère d’abord un wallet FIREINNERS");
-
-  try{
-    const r = await fetch(API+"/bridge",{
-      method:"POST",
-      headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({
-        powAddress: addrFI,
-        solAddress: solAddr.value,
-        amountSol: parseFloat(amountBridge.value)
-      })
-    });
-    const j = await r.json();
-    L("Bridge → "+JSON.stringify(j));
-  }catch(e){ L("Erreur bridge : "+e); }
-};
-
-FI_backend.loadBlocks = async () => {
-  try{
-    const r = await fetch(API+"/stats");
-    const j = await r.json();
-    document.getElementById("h").textContent=j.height;
-    L("Derniers blocs chargés");
-  }catch(e){L("Erreur stats : "+e);}
-};
-nano /var/www/html/modules/ui.js
-
-const logUI = t => document.getElementById("log").innerHTML += t+"\n";
-const API_URL = "https://bbqfinance.fun";
-
-async function checkHTTP(){
-  try{
-    const r = await fetch(API_URL+"/stats");
-    if(r.ok){ httpStatus.className="statusLight ok"; httpStatus.textContent="HTTP OK"; }
-    else throw "";
-  }catch{ httpStatus.className="statusLight err"; httpStatus.textContent="HTTP ?"; }
+function clamp(x, min, max) {
+  return x < min ? min : x > max ? max : x;
 }
-checkHTTP();
-setInterval(checkHTTP,5000);
 
-let ws;
-function connectWS(){
-  ws = new WebSocket("wss://bbqfinance.fun/ws");
-  ws.onopen=()=>{wsStatus.className="statusLight ok"; wsStatus.textContent="WS OK";};
-  ws.onclose=()=>{wsStatus.className="statusLight err"; wsStatus.textContent="WS OFF"; setTimeout(connectWS,1000);};
-  ws.onmessage=e=>logUI("[WS] "+e.data);
+// TVL en USDC POW: LP + trésorerie
+function getTVL() {
+  const lpUsdc = lp.usdc || 0;
+  const treUsdc = treasury.usdc || 0;
+  return lpUsdc + treUsdc;
 }
-connectWS();
+
+// Taux dynamique POW / SOL borné
+function getPowRatePowPerSol() {
+  const tvl = getTVL();
+  const factor = 1 + tvl / (TVL_REF || DEC);
+  const rawRate = RATE_BASE * factor;
+  const rate = clamp(rawRate, RATE_MIN, RATE_MAX);
+  return rate;
+}
+
+function burnPow(amount) {
+  if (!amount || amount <= 0) return 0;
+  const actual = Math.min(amount, supplyCirculante);
+  burnedPowTotal += actual;
+  supplyCirculante -= actual;
+  return actual;
+}
+
+function mintPow(amount) {
+  if (!amount || amount <= 0) return 0;
+  const spaceLeft = SUPPLY_MAX - supplyCirculante;
+  const mintable = Math.max(0, Math.min(amount, spaceLeft));
+  mintedPowTotal += mintable;
+  supplyCirculante += mintable;
+  return mintable;
+}
+
+function addPowToWallet(addr, amount) {
+  const w = ensureWallet(addr);
+  w.pow += amount;
+}
+
+function subPowFromWallet(addr, amount) {
+  const w = ensureWallet(addr);
+  if (w.pow < amount) throw new Error("Solde POW insuffisant");
+  w.pow -= amount;
+}
+
+function addUsdcToWallet(addr, amount) {
+  const w = ensureWallet(addr);
+  w.usdc += amount;
+}
+
+function subUsdcFromWallet(addr, amount) {
+  const w = ensureWallet(addr);
+  if (w.usdc < amount) throw new Error("Solde USDC POW insuffisant");
+  w.usdc -= amount;
+}
+
+function applyBp(amount, bp) {
+  return Math.floor(amount * bp / 10000);
+}
+
+// Prix LP (microUSDC / microPOW)
+function getLpPrice() {
+  if (lp.pow <= 0 || lp.usdc <= 0) return 0;
+  return lp.usdc / lp.pow;
+}
+
+function computeBlockHash(block) {
+  const h = crypto.createHash("sha256");
+  const payload = {
+    height: block.height,
+    prevHash: block.prevHash,
+    time: block.time,
+    txs: block.txs
+  };
+  h.update(JSON.stringify(payload));
+  return h.digest("hex");
+}
+
+function broadcast(msg) {
+  const data = JSON.stringify(msg);
+  for (const ws of clients) {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(data);
+    }
+  }
+}
+
+// =========================
+// VERIFICATION SIGNATURE
+// =========================
+
+function verifySignature(tx) {
+  if (!tx.sig || !tx.pub || !tx.nonce) {
+    throw new Error("Signature ou nonce manquant");
+  }
+  const from = tx.from || tx.addr;
+  if (!from) throw new Error("Champ from/addr manquant pour la signature");
+
+  const payload = {
+    type: tx.type,
+    from: from,
+    to: tx.to || null,
+    amount: tx.amount || null,
+    token: tx.token || null,
+    nonce: tx.nonce
+  };
+
+  const enc = new TextEncoder();
+  const msgBytes = enc.encode(JSON.stringify(payload));
+  const sigBytes = bs58.decode(tx.sig);
+  const pubBytes = bs58.decode(tx.pub);
+
+  const ok = nacl.sign.detached.verify(msgBytes, sigBytes, pubBytes);
+  if (!ok) throw new Error("Signature invalide");
+
+  const w = ensureWallet(from);
+  if (tx.nonce <= (w.nonce || 0)) {
+    throw new Error("Nonce rejeté (replay)");
+  }
+  w.nonce = tx.nonce;
+  w.pub = tx.pub;
+}
+
+// =========================
+// HANDLERS ECONOMIQUES
+// =========================
+
+// 1) TRANSFERT POW
+function processPowTransfer(tx) {
+  if (!tx.from || !tx.to) throw new Error("from/to manquant");
+  if (!tx.amount || tx.amount <= 0) throw new Error("amount invalide");
+
+  const gross = tx.amount;
+  const feeBurn = applyBp(gross, FEE_TRANSFER_BURN_BP);
+  const sendAmount = gross - feeBurn;
+  if (sendAmount <= 0) throw new Error("montant après burn insuffisant");
+
+  subPowFromWallet(tx.from, gross);
+  addPowToWallet(tx.to, sendAmount);
+  burnPow(feeBurn);
+
+  return {
+    type: "TX_POW",
+    from: tx.from,
+    to: tx.to,
+    gross,
+    sendAmount,
+    burned: feeBurn
+  };
+}
+
+// 2) SWAP POW / USDC POW
+function processSwap(tx) {
+  const { addr, amount, token } = tx;
+  if (!addr) throw new Error("addr manquant");
+  if (!amount || amount <= 0) throw new Error("amount invalide");
+  if (!lp.pow || !lp.usdc) throw new Error("pool LP vide");
+  if (token !== "pow2usdc" && token !== "usdc2pow") {
+    throw new Error("direction swap invalide");
+  }
+
+  const feeTotal = applyBp(amount, FEE_SWAP_TOTAL_BP);
+  const amountNet = amount - feeTotal;
+  if (amountNet <= 0) throw new Error("amount net swap invalide");
+
+  const feeBurn = Math.floor(feeTotal * FEE_SWAP_BURN_PART);
+  const feeTreas = feeTotal - feeBurn;
+
+  if (token === "pow2usdc") {
+    subPowFromWallet(addr, amount);
+    lp.pow += amountNet;
+
+    const k = lp.pow * lp.usdc;
+    const newPow = lp.pow;
+    const newUsdc = Math.floor(k / newPow);
+    const deltaUsdc = lp.usdc - newUsdc;
+    if (deltaUsdc <= 0) throw new Error("delta usdc invalide");
+    lp.usdc = newUsdc;
+
+    addUsdcToWallet(addr, deltaUsdc);
+
+    const burned = burnPow(feeBurn);
+    treasury.pow += feeTreas;
+    supplyCirculante += feeTreas;
+
+    return {
+      type: "SWAP",
+      dir: "pow2usdc",
+      inPow: amount,
+      outUsdc: deltaUsdc,
+      feeBurn: burned,
+      feeTreasPow: feeTreas
+    };
+  } else {
+    subUsdcFromWallet(addr, amount);
+    lp.usdc += amountNet;
+
+    const k = lp.pow * lp.usdc;
+    const newUsdc = lp.usdc;
+    const newPow = Math.floor(k / newUsdc);
+    const deltaPow = lp.pow - newPow;
+    if (deltaPow <= 0) throw new Error("delta pow invalide");
+    lp.pow = newPow;
+
+    addPowToWallet(addr, deltaPow);
+
+    const burned = burnPow(feeBurn);
+    treasury.usdc += feeTreas;
+
+    return {
+      type: "SWAP",
+      dir: "usdc2pow",
+      inUsdc: amount,
+      outPow: deltaPow,
+      feeBurn: burned,
+      feeTreasUsdc: feeTreas
+    };
+  }
+}
+
+// 3) LP ADD
+function processLPAdd(tx) {
+  const { addr, pow, usdc } = tx;
+  if (!addr) throw new Error("addr manquant");
+  if (!pow || pow <= 0 || !usdc || usdc <= 0) {
+    throw new Error("valeurs LP invalides");
+  }
+  subPowFromWallet(addr, pow);
+  subUsdcFromWallet(addr, usdc);
+  lp.pow += pow;
+  lp.usdc += usdc;
+  return {
+    type: "LP_ADD",
+    addr,
+    pow,
+    usdc
+  };
+}
+
+// 4) BRIDGE SOL -> POWCHAIN
+// Ici on suppose que le front a déjà fait envoyer du SOL/USDC vers la trésorerie côté Solana.
+// Ce handler crédite simplement des POW en fonction du montant déclaré.
+function processBridgeIn(tx) {
+  const { addr, solAmount } = tx;
+  if (!addr) throw new Error("addr manquant");
+  if (!solAmount || solAmount <= 0) throw new Error("solAmount invalide");
+
+  const rate = getPowRatePowPerSol();
+  const powBrut = Math.floor(solAmount * rate * DEC);
+
+  const powToMint = mintPow(powBrut);
+  if (powToMint <= 0) throw new Error("supply max atteint");
+
+  const feeTreas = applyBp(powToMint, FEE_BRIDGE_IN_TREAS_BP);
+  const feeBurn = applyBp(powToMint, FEE_BRIDGE_IN_BURN_BP);
+  const userPow = powToMint - feeTreas - feeBurn;
+  if (userPow <= 0) throw new Error("bridge in net <= 0");
+
+  treasury.pow += feeTreas;
+  const burned = burnPow(feeBurn);
+  addPowToWallet(addr, userPow);
+
+  treasury.sol += solAmount;
+
+  return {
+    type: "BRIDGE_IN",
+    addr,
+    solAmount,
+    rate,
+    powMinted: powToMint,
+    userPow,
+    feeTreasPow: feeTreas,
+    burnedPow: burned
+  };
+}
+
+// 5) BRIDGE POW -> SOL
+function processBridgeOut(tx) {
+  const { addr, powAmount } = tx;
+  if (!addr) throw new Error("addr manquant");
+  if (!powAmount || powAmount <= 0) throw new Error("powAmount invalide");
+
+  const rate = getPowRatePowPerSol();
+
+  subPowFromWallet(addr, powAmount);
+
+  const feeBurn = applyBp(powAmount, FEE_BRIDGE_OUT_BURN_BP);
+  const powNet = powAmount - feeBurn;
+  if (powNet <= 0) throw new Error("bridge out net <= 0");
+
+  const burned = burnPow(powAmount);
+
+  const solOut = powNet / (rate * DEC);
+  if (treasury.sol < solOut) {
+    throw new Error("SOL trésorerie insuffisant pour bridge out");
+  }
+  treasury.sol -= solOut;
+
+  return {
+    type: "BRIDGE_OUT",
+    addr,
+    powSent: powAmount,
+    powNet,
+    burnedPow: burned,
+    rate,
+    solOut
+  };
+}
+
+// 6) STAKING
+function processStake(tx) {
+  const { addr, amount } = tx;
+  if (!addr) throw new Error("addr manquant");
+  if (!amount || amount <= 0) throw new Error("amount invalide");
+
+  const w = ensureWallet(addr);
+  if (w.pow < amount) throw new Error("solde POW insuffisant");
+
+  w.pow -= amount;
+  w.staked += amount;
+  w.stakeLock = Date.now() + STAKE_MIN_LOCK_MS;
+
+  return {
+    type: "STAKE",
+    addr,
+    amount,
+    lockUntil: w.stakeLock
+  };
+}
+
+function processUnstake(tx) {
+  const { addr, amount } = tx;
+  if (!addr) throw new Error("addr manquant");
+  if (!amount || amount <= 0) throw new Error("amount invalide");
+
+  const w = ensureWallet(addr);
+  if (w.staked < amount) throw new Error("solde STAKE insuffisant");
+
+  let penalty = 0;
+  if (Date.now() < (w.stakeLock || 0)) {
+    penalty = applyBp(amount, FEE_UNSTAKE_BURN_BP);
+  }
+  const net = amount - penalty;
+  if (net <= 0) throw new Error("unstake net <= 0");
+
+  w.staked -= amount;
+  w.pow += net;
+
+  const burned = burnPow(penalty);
+
+  return {
+    type: "UNSTAKE",
+    addr,
+    amount,
+    net,
+    burned
+  };
+}
+
+// =========================
+// APPLICATION TX + BLOCS
+// =========================
+
+function applyTxAndMakeBlock(tx) {
+  const from = tx.from || tx.addr;
+  if (!from) throw new Error("from/addr manquant");
+
+  verifySignature(tx);
+
+  let effect;
+  switch (tx.type) {
+    case "TX_POW":
+      effect = processPowTransfer(tx);
+      break;
+    case "SWAP":
+      effect = processSwap(tx);
+      break;
+    case "LP_ADD":
+      effect = processLPAdd(tx);
+      break;
+    case "BRIDGE_IN":
+      effect = processBridgeIn(tx);
+      break;
+    case "BRIDGE_OUT":
+      effect = processBridgeOut(tx);
+      break;
+    case "STAKE":
+      effect = processStake(tx);
+      break;
+    case "UNSTAKE":
+      effect = processUnstake(tx);
+      break;
+    default:
+      throw new Error("type de TX inconnu: " + tx.type);
+  }
+
+  const prev = chain[chain.length - 1];
+  const block = {
+    height: prev.height + 1,
+    time: Date.now(),
+    prevHash: prev.hash,
+    txs: [{ ...tx, effect }],
+    treasurySnapshot: { ...treasury },
+    lpSnapshot: { ...lp }
+  };
+  block.hash = computeBlockHash(block);
+  chain.push(block);
+
+  return { effect, block };
+}
+
+// =========================
+// API HTTP
+// =========================
+
+// Stats globales
+app.get("/stats", (req, res) => {
+  const last = chain[chain.length - 1];
+  res.json({
+    height: last ? last.height : 0,
+    supplyCirculante,
+    mintedPowTotal,
+    burnedPowTotal,
+    lpPow: lp.pow,
+    lpUsdc: lp.usdc,
+    priceLp: getLpPrice(),
+    tvl: getTVL(),
+    treasuryPow: treasury.pow,
+    treasuryUsdc: treasury.usdc,
+    treasurySol: treasury.sol
+  });
+});
+
+// Wallet
+app.get("/wallet/:addr", (req, res) => {
+  const addr = req.params.addr;
+  const w = ensureWallet(addr);
+  res.json({
+    addr,
+    pow: w.pow,
+    usdc: w.usdc,
+    staked: w.staked,
+    nonce: w.nonce,
+    pub: w.pub,
+    stakeLock: w.stakeLock
+  });
+});
+
+// Bloc par hauteur
+app.get("/block/:height", (req, res) => {
+  const h = parseInt(req.params.height, 10);
+  if (Number.isNaN(h)) return res.status(400).json({ error: "height invalide" });
+  const b = chain.find(b => b.height === h);
+  if (!b) return res.status(404).json({ error: "bloc introuvable" });
+  res.json(b);
+});
+
+// Liste de quelques blocs récents pour l'explorateur
+app.get("/blocks/recent", (req, res) => {
+  const n = Math.max(1, Math.min(50, parseInt(req.query.n || "20", 10)));
+  const out = chain.slice(-n);
+  res.json(out);
+});
+
+// Bridge IN via HTTP (optionnel, le front peut aussi utiliser WS)
+app.post("/bridge/in", (req, res) => {
+  try {
+    const tx = req.body || {};
+    tx.type = "BRIDGE_IN";
+    if (!tx.addr || typeof tx.solAmount !== "number") {
+      return res.status(400).json({ error: "addr/solAmount requis" });
+    }
+    const { effect, block } = applyTxAndMakeBlock(tx);
+    broadcast({ type: "NEW_BLOCK", height: block.height });
+    res.json({ ok: true, effect, height: block.height });
+  } catch (e) {
+    res.status(400).json({ error: e.message || String(e) });
+  }
+});
+
+// Bridge OUT via HTTP (optionnel)
+app.post("/bridge/out", (req, res) => {
+  try {
+    const tx = req.body || {};
+    tx.type = "BRIDGE_OUT";
+    if (!tx.addr || typeof tx.powAmount !== "number") {
+      return res.status(400).json({ error: "addr/powAmount requis" });
+    }
+    const { effect, block } = applyTxAndMakeBlock(tx);
+    broadcast({ type: "NEW_BLOCK", height: block.height });
+    res.json({ ok: true, effect, height: block.height });
+  } catch (e) {
+    res.status(400).json({ error: e.message || String(e) });
+  }
+});
+
+// =========================
+// WEBSOCKET
+// =========================
+
+wss.on("connection", ws => {
+  clients.add(ws);
+
+  const last = chain[chain.length - 1];
+  ws.send(JSON.stringify({
+    type: "HELLO",
+    height: last ? last.height : 0,
+    tvl: getTVL()
+  }));
+
+  ws.on("message", data => {
+    try {
+      let tx;
+      try {
+        tx = JSON.parse(data.toString());
+      } catch {
+        throw new Error("payload JSON invalide");
+      }
+      const { effect, block } = applyTxAndMakeBlock(tx);
+      ws.send(JSON.stringify({
+        ok: true,
+        type: "TX_ACCEPTED",
+        txType: tx.type,
+        height: block.height,
+        effect
+      }));
+      broadcast({
+        type: "NEW_BLOCK",
+        height: block.height
+      });
+    } catch (e) {
+      ws.send(JSON.stringify({
+        ok: false,
+        error: e.message || String(e)
+      }));
+    }
+  });
+
+  ws.on("close", () => {
+    clients.delete(ws);
+  });
+});
+
+// =========================
+// DEMARRAGE SERVEUR
+// =========================
+
+server.listen(HTTP_PORT, () => {
+  console.log("HTTP + WS POWCHAIN sur port", HTTP_PORT);
+});
+
+
+cd /root/powchain
+nano server.js   # coller tout ça, sauvegarder
+pm2 delete powchain || true
+pm2 start server.js --name powchain
+pm2 save
+pm2 status
+curl http://127.0.0.1:3000/stats
