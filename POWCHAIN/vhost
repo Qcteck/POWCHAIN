@@ -1,7 +1,261 @@
-btnBridge → POST /bridge → { powAddress, solAddress, amountSol }
+nano /root/POWCHAIN/server.js
 
 
+// POWCHAIN backend – server.js
+const fs = require("fs");
+const path = require("path");
+const http = require("http");
+const express = require("express");
+const cors = require("cors");
+const bodyParser = require("body-parser");
+const WebSocket = require("ws");
 
-curl -X POST https://bbqfinance.fun/bridge \
-  -H "Content-Type: application/json" \
-  -d '{"powAddress":"PUB_POW","solAddress":"PUB_SOL","amountSol":0.001}'
+// Ports
+const HTTP_PORT = 3000;
+const WS_PORT = 7001;
+
+// Fichier de ledger
+const LEDGER_FILE = path.join(__dirname, "ledger.json");
+
+// ---------- Ledger : chargement / sauvegarde ----------
+let ledger;
+
+function loadLedger() {
+  try {
+    const txt = fs.readFileSync(LEDGER_FILE, "utf8");
+    ledger = JSON.parse(txt);
+    if (!ledger || typeof ledger !== "object") throw new Error("bad file");
+    console.log("📘 Ledger chargé, height =", ledger.height || 0);
+  } catch (e) {
+    console.log("🆕 Aucun ledger trouvé, initialisation neuve.");
+    ledger = {
+      height: 0,
+      wallets: {},        // { addr: { pow, usdc, staked } }
+      treasuryPow: 0,
+      treasuryUsdc: 0,
+      lpPow: 0,
+      lpUsdc: 0,
+      blocks: []          // petits snapshots
+    };
+    saveLedger();
+  }
+}
+
+function saveLedger() {
+  fs.writeFileSync(LEDGER_FILE, JSON.stringify(ledger, null, 2));
+}
+
+// Stats minimales pour le client
+function getStats() {
+  return {
+    height: ledger.height || 0,
+    wallets: Object.keys(ledger.wallets || {}).length,
+    treasuryPow: ledger.treasuryPow || 0,
+    treasuryUsdc: ledger.treasuryUsdc || 0,
+    lpPow: ledger.lpPow || 0,
+    lpUsdc: ledger.lpUsdc || 0
+  };
+}
+
+// Ajout d’un bloc “virtuel”
+function addBlock(type, payload) {
+  ledger.height = (ledger.height || 0) + 1;
+  const block = {
+    height: ledger.height,
+    ts: Date.now(),
+    type,
+    payload
+  };
+  ledger.blocks = ledger.blocks || [];
+  ledger.blocks.push(block);
+  if (ledger.blocks.length > 1000) {
+    ledger.blocks = ledger.blocks.slice(-1000);
+  }
+  saveLedger();
+  broadcast({ type: "block", block, stats: getStats() });
+}
+
+// S’assurer qu’un wallet existe
+function ensureWallet(addr) {
+  if (!addr) return;
+  ledger.wallets[addr] = ledger.wallets[addr] || { pow: 0, usdc: 0, staked: 0 };
+}
+
+// ---------- Express + HTTP ----------
+loadLedger();
+
+const app = express();
+app.use(cors());
+app.use(bodyParser.json());
+
+// Ping / infos rapides
+app.get("/", (req, res) => {
+  res.json({ ok: true, service: "POWCHAIN", stats: getStats() });
+});
+
+// Stats pour le dashboard
+app.get("/stats", (req, res) => {
+  res.json(getStats());
+});
+
+// Historique des blocs
+app.get("/chain", (req, res) => {
+  res.json({ height: ledger.height || 0, blocks: ledger.blocks || [] });
+});
+
+// ---------- Endpoint TX interne POWCHAIN ----------
+app.post("/tx", (req, res) => {
+  try {
+    const body = req.body || {};
+    const { type, from, to, amount, token } = body;
+
+    if (!type || !from || amount === undefined) {
+      return res.status(400).json({ ok: false, error: "params manquants" });
+    }
+
+    const amt = Number(amount);
+    if (!Number.isFinite(amt) || amt <= 0) {
+      return res.status(400).json({ ok: false, error: "montant invalide" });
+    }
+
+    const t = token === "USDC" ? "usdc" : "pow";
+
+    ensureWallet(from);
+    if (to) ensureWallet(to);
+
+    if (type === "TRANSFER") {
+      if (ledger.wallets[from][t] < amt) {
+        return res.status(400).json({ ok: false, error: "solde insuffisant" });
+      }
+      ledger.wallets[from][t] -= amt;
+      if (to) ledger.wallets[to][t] += amt;
+    } else if (type === "STAKE") {
+      if (ledger.wallets[from].pow < amt) {
+        return res.status(400).json({ ok: false, error: "solde POW insuffisant" });
+      }
+      ledger.wallets[from].pow -= amt;
+      ledger.wallets[from].staked += amt;
+    } else if (type === "UNSTAKE") {
+      if (ledger.wallets[from].staked < amt) {
+        return res.status(400).json({ ok: false, error: "stake insuffisant" });
+      }
+      ledger.wallets[from].staked -= amt;
+      ledger.wallets[from].pow += amt;
+    } else if (type === "ADD_LP") {
+      // amount pour LP est un objet { pow, usdc }
+      const lpPow = Number(amount.pow || 0);
+      const lpUsdc = Number(amount.usdc || 0);
+      if (
+        !Number.isFinite(lpPow) || !Number.isFinite(lpUsdc) ||
+        lpPow <= 0 || lpUsdc <= 0
+      ) {
+        return res.status(400).json({ ok: false, error: "LP amount invalide" });
+      }
+      if (ledger.wallets[from].pow < lpPow || ledger.wallets[from].usdc < lpUsdc) {
+        return res.status(400).json({ ok: false, error: "fonds LP insuffisants" });
+      }
+      ledger.wallets[from].pow -= lpPow;
+      ledger.wallets[from].usdc -= lpUsdc;
+      ledger.lpPow += lpPow;
+      ledger.lpUsdc += lpUsdc;
+    } else {
+      return res.status(400).json({ ok: false, error: "type inconnu" });
+    }
+
+    addBlock("tx", { type, from, to, amount: amt, token: t });
+    return res.json({ ok: true, stats: getStats() });
+  } catch (e) {
+    console.error("TX ERROR", e);
+    return res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+// ---------- Endpoint BRIDGE SOL → POWCHAIN (Option C) ----------
+const BRIDGE_RATE = 1000;    // 1 SOL = 1000 POW
+const BRIDGE_FEE_PCT = 0.02; // 2% fee vers la trésorerie POW
+
+app.post("/bridge", (req, res) => {
+  try {
+    const body = req.body || {};
+    const { powAddress, solAddress, amountSol } = body;
+
+    if (!powAddress || !solAddress || amountSol === undefined) {
+      return res.status(400).json({ ok: false, error: "params manquants" });
+    }
+
+    const sol = Number(amountSol);
+    if (!Number.isFinite(sol) || sol <= 0) {
+      return res.status(400).json({ ok: false, error: "amountSol invalide" });
+    }
+
+    ensureWallet(powAddress);
+
+    const grossPow = sol * BRIDGE_RATE;
+    const feePow = Math.round(grossPow * BRIDGE_FEE_PCT);   // vers trésorerie
+    const netPow = Math.round(grossPow - feePow);           // pour le wallet
+
+    ledger.wallets[powAddress].pow += netPow;
+    ledger.treasuryPow = (ledger.treasuryPow || 0) + feePow;
+
+    addBlock("bridge", {
+      powAddress,
+      solAddress,
+      amountSol: sol,
+      netPow,
+      feePow
+    });
+
+    console.log("🌉 Bridge SOL→POWCHAIN", {
+      powAddress,
+      solAddress,
+      sol,
+      netPow,
+      feePow
+    });
+
+    return res.json({
+      ok: true,
+      mintedPow: netPow,
+      feePow,
+      stats: getStats(),
+      wallet: ledger.wallets[powAddress]
+    });
+  } catch (e) {
+    console.error("BRIDGE ERROR", e);
+    return res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+// ---------- HTTP server + WebSocket (port 7001) ----------
+const httpServer = http.createServer(app);
+
+httpServer.listen(HTTP_PORT, () => {
+  console.log(`✅ POWCHAIN backend HTTP sur port ${HTTP_PORT}`);
+});
+
+const wss = new WebSocket.Server({ port: WS_PORT }, () => {
+  console.log(`✅ WebSocket POWCHAIN sur port ${WS_PORT} (/ws via Nginx possible)`);
+});
+
+function broadcast(obj) {
+  const payload = JSON.stringify(obj);
+  wss.clients.forEach(c => {
+    if (c.readyState === WebSocket.OPEN) c.send(payload);
+  });
+}
+
+wss.on("connection", ws => {
+  ws.send(JSON.stringify({
+    type: "welcome",
+    stats: getStats(),
+    height: ledger.height || 0
+  }));
+});
+
+cd /root/POWCHAIN
+nano server.js        # colle ce fichier complet
+pm2 restart powchain
+pm2 logs powchain --lines 20
+curl -s http://127.0.0.1:3000/stats
+
+
