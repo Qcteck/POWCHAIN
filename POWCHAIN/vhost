@@ -1,7 +1,9 @@
 
 nano /root/powchain/server.js
 
-// server.js - FIREINNERS Validator + API + WS
+
+
+// server.js - FIREINNERS Validator + API + WS (bridge réel SOL -> FIREINNERS)
 
 const express = require("express");
 const bodyParser = require("body-parser");
@@ -10,52 +12,55 @@ const nacl = require("tweetnacl");
 const bs58 = require("bs58");
 const crypto = require("crypto");
 const http = require("http");
+const { TextEncoder } = require("util");
 
 // =========================
 // CONFIG SERVEUR
 // =========================
 
-const HTTP_PORT = 3000;   // nginx proxy vers 127.0.0.1:3000
-const WS_PATH = "/ws";    // nginx location /ws
+const HTTP_PORT = 3000; // nginx proxy vers 127.0.0.1:3000
+const WS_PATH = "/ws";  // nginx location /ws
+
+const SOLANA_RPC = "https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac";
+const TREASURY_SOL = "BZJsWeJizv3YeyuWjF5187jrcduPFAHWjqL7jgq4kGwy";
 
 const app = express();
 app.use(bodyParser.json());
 
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: WS_PATH });
+
 const clients = new Set();
 
 // =========================
 // CONFIG ECONOMIE FIREINNERS
 // =========================
 
-const DEC = 1e6; // 6 décimales
+const DEC = 1e6; // 6 décimales microFIRE
+const SUPPLY_MAX = 100_000_000 * DEC; // hard cap 100M FIRE
 
-// Hard cap total : 100M FIRE
-const SUPPLY_MAX = 100_000_000 * DEC;
+// Taux dynamique FIRE/SOL (borne)
+const RATE_BASE = 1000; // base FIRE par SOL
+const TVL_REF = 1_000_000 * DEC; // 1M USDC FIRE de référence
+const RATE_MIN = 800;
+const RATE_MAX = 5000;
 
-// Taux dynamique FIRE / SOL borné
-const RATE_BASE = 1000;              // FIRE par SOL à TVL de référence
-const TVL_REF  = 1_000_000 * DEC;    // 1M USDC FIRE
-const RATE_MIN = 800;                // min FIRE / SOL
-const RATE_MAX = 5000;               // max FIRE / SOL
-
-// Frais (basis points : 1% = 100 bp)
-const FEE_TRANSFER_BURN_BP    = 50;   // 0.5% burn sur transfert FIRE
-const FEE_SWAP_TOTAL_BP       = 30;   // 0.3% total sur swap
-const FEE_SWAP_BURN_PART      = 0.5;  // 50% des fees swap brûlés
-const FEE_BRIDGE_IN_TREAS_BP  = 500;  // 5% vers trésorerie à l'entrée
-const FEE_BRIDGE_IN_BURN_BP   = 200;  // 2% burn à l'entrée
-const FEE_BRIDGE_OUT_BURN_BP  = 1000; // 10% burn sur FIRE renvoyés
-const FEE_UNSTAKE_BURN_BP     = 300;  // 3% burn si unstake anticipé
+// Frais en basis points
+const FEE_TRANSFER_BURN_BP = 50;   // 0.5% burn sur transferts FIRE
+const FEE_SWAP_TOTAL_BP = 30;      // 0.3% fees total sur swap
+const FEE_SWAP_BURN_PART = 0.5;    // 50% des fees swap brûlés
+const FEE_BRIDGE_IN_TREAS_BP = 500; // 5% vers trésorerie à l'entrée
+const FEE_BRIDGE_IN_BURN_BP = 200;  // 2% burn à l'entrée
+const FEE_BRIDGE_OUT_BURN_BP = 1000; // 10% burn sur FIRE renvoyés
+const FEE_UNSTAKE_BURN_BP = 300;   // 3% burn sur unstake anticipé
 
 const STAKE_MIN_LOCK_MS = 30 * 24 * 60 * 60 * 1000; // 30 jours
 
-// -------------------------
+// =========================
 // ETAT GLOBAL
-// -------------------------
+// =========================
 
-let wallets = {};                    // addr -> { fire, usdc, staked, pub, nonce, stakeLock }
+let wallets = {}; // addr -> { fire, usdc, staked, pub, nonce, stakeLock }
 let treasury = { fire: 0, usdc: 0, sol: 0 };
 let lp = { fire: 0, usdc: 0 };
 
@@ -66,17 +71,20 @@ let burnedFireTotal = 0;
 let chain = [];
 let mempool = [];
 
+const bridgedTx = new Set(); // txSig déjà utilisés pour bridge
+
 // =========================
-// GENESIS : supply = 0
+// GENESIS
 // =========================
 
-(function initGenesis(){
-  const genesisSupply = 0;          // toute l’émission viendra du bridge
-  supplyCirculante = genesisSupply;
-  mintedFireTotal = genesisSupply;
+(function initGenesis() {
+  // Option 1 : toute l’émission vient du bridge SOL -> FIREINNERS
+  supplyCirculante = 0;
+  mintedFireTotal = 0;
+  burnedFireTotal = 0;
   treasury.fire = 0;
   treasury.usdc = 0;
-  treasury.sol  = 0;
+  treasury.sol = 0;
 
   const genesis = {
     height: 1,
@@ -87,17 +95,25 @@ let mempool = [];
     treasurySnapshot: { ...treasury },
     lpSnapshot: { ...lp },
     supplyCirculante,
-    supplyMax: SUPPLY_MAX
+    supplyDisponible: SUPPLY_MAX - supplyCirculante
   };
   chain.push(genesis);
-  console.log("[fireinners] Genesis initialisée, supply = 0 /", SUPPLY_MAX);
 })();
 
 // =========================
-// OUTILS ECONOMIQUES
+// OUTILS
 // =========================
 
-function ensureWallet(addr){
+function broadcast(obj) {
+  const msg = JSON.stringify(obj);
+  for (const ws of clients) {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(msg);
+    }
+  }
+}
+
+function ensureWallet(addr) {
   if (!wallets[addr]) {
     wallets[addr] = {
       fire: 0,
@@ -111,19 +127,19 @@ function ensureWallet(addr){
   return wallets[addr];
 }
 
-function clamp(x,min,max){
-  return x < min ? min : (x > max ? max : x);
+function clamp(x, min, max) {
+  return x < min ? min : x > max ? max : x;
 }
 
-// TVL en USDC FIRE : LP + trésorerie
-function getTVL(){
+// TVL en USDC FIRE: LP + trésorerie
+function getTVL() {
   const lpUsdc = lp.usdc || 0;
   const treUsdc = treasury.usdc || 0;
   return lpUsdc + treUsdc;
 }
 
 // Taux dynamique FIRE / SOL borné
-function getFireRatePerSol(){
+function getFireRatePerSol() {
   const tvl = getTVL();
   const factor = 1 + tvl / (TVL_REF || DEC);
   const rawRate = RATE_BASE * factor;
@@ -131,11 +147,7 @@ function getFireRatePerSol(){
   return rate;
 }
 
-function getSupplyAvailable(){
-  return SUPPLY_MAX - supplyCirculante;
-}
-
-function burnFire(amount){
+function burnFire(amount) {
   if (!amount || amount <= 0) return 0;
   const actual = Math.min(amount, supplyCirculante);
   burnedFireTotal += actual;
@@ -143,7 +155,7 @@ function burnFire(amount){
   return actual;
 }
 
-function mintFire(amount){
+function mintFire(amount) {
   if (!amount || amount <= 0) return 0;
   const spaceLeft = SUPPLY_MAX - supplyCirculante;
   const mintable = Math.max(0, Math.min(amount, spaceLeft));
@@ -152,76 +164,101 @@ function mintFire(amount){
   return mintable;
 }
 
-function addFireToWallet(addr,amount){
+function addFireToWallet(addr, amount) {
   const w = ensureWallet(addr);
   w.fire += amount;
 }
 
-function subFireFromWallet(addr,amount){
+function subFireFromWallet(addr, amount) {
   const w = ensureWallet(addr);
   if (w.fire < amount) throw new Error("Solde FIRE insuffisant");
   w.fire -= amount;
 }
 
-function addUsdcToWallet(addr,amount){
+function addUsdcToWallet(addr, amount) {
   const w = ensureWallet(addr);
   w.usdc += amount;
 }
 
-function subUsdcFromWallet(addr,amount){
+function subUsdcFromWallet(addr, amount) {
   const w = ensureWallet(addr);
   if (w.usdc < amount) throw new Error("Solde USDC FIRE insuffisant");
   w.usdc -= amount;
 }
 
-function applyBp(amount,bp){
+function applyBp(amount, bp) {
   return Math.floor(amount * bp / 10000);
 }
 
 // Prix LP (microUSDC / microFIRE)
-function getLpPrice(){
+function getLpPrice() {
   if (lp.fire <= 0 || lp.usdc <= 0) return 0;
   return lp.usdc / lp.fire;
 }
 
+function fmtMicro(x) {
+  return (x / DEC).toFixed(6);
+}
+
 // =========================
-// VERIF SIGNATURE TX
+// BLOCKCHAIN LOCALE
 // =========================
 
-function verifySignedTx(tx){
-  if (!tx || typeof tx !== "object") throw new Error("TX invalide");
+function appendBlock(tx) {
+  const prev = chain[chain.length - 1];
+  const height = prev.height + 1;
+  const payload = {
+    height,
+    time: Date.now(),
+    prevHash: prev.hash,
+    txs: [tx],
+    treasurySnapshot: { ...treasury },
+    lpSnapshot: { ...lp },
+    supplyCirculante,
+    supplyDisponible: SUPPLY_MAX - supplyCirculante
+  };
+  const hash = crypto
+    .createHash("sha256")
+    .update(JSON.stringify(payload))
+    .digest("hex");
+  const block = { ...payload, hash };
+  chain.push(block);
+  broadcast({ type: "BLOCK", block });
+}
+
+// =========================
+// VERIFICATION SIGNATURE TX
+// =========================
+
+function verifySignedTxShape(tx) {
   if (!tx.type) throw new Error("type manquant");
   if (!tx.from) throw new Error("from manquant");
-  if (!tx.pub) throw new Error("pub manquant");
   if (typeof tx.nonce !== "number") throw new Error("nonce manquant");
-  if (!tx.sig) throw new Error("signature manquante");
+  if (!tx.pub) throw new Error("pub manquant");
+  if (!tx.sig) throw new Error("sig manquant");
+}
 
-  const pubBytes = bs58.decode(tx.pub);
-  const sigBytes = bs58.decode(tx.sig);
-
-  const addrFromPub = bs58.encode(pubBytes);
-  if (addrFromPub !== tx.from) {
-    throw new Error("pub != adresse (from)");
-  }
-
-  const msgObj = {
+function verifySignature(tx) {
+  verifySignedTxShape(tx);
+  const msg = {
     type: tx.type,
     from: tx.from,
-    to: tx.to || null,
-    amount: tx.amount || null,
-    token: tx.token || null,
+    to: tx.to ?? null,
+    amount: tx.amount ?? null,
+    token: tx.token ?? null,
     nonce: tx.nonce
   };
-  const msg = Buffer.from(JSON.stringify(msgObj),"utf8");
-  const ok = nacl.sign.detached.verify(msg, sigBytes, pubBytes);
-  if (!ok) throw new Error("Signature ED25519 invalide");
-
+  const enc = new TextEncoder();
+  const msgBytes = enc.encode(JSON.stringify(msg));
+  const pub = bs58.decode(tx.pub);
+  const sig = bs58.decode(tx.sig);
+  const ok = nacl.sign.detached.verify(msgBytes, sig, pub);
+  if (!ok) throw new Error("signature invalide");
   const w = ensureWallet(tx.from);
   if (tx.nonce !== w.nonce + 1) {
-    throw new Error("Nonce invalide (attendu " + (w.nonce+1) + ")");
+    throw new Error("nonce invalide");
   }
   w.nonce = tx.nonce;
-  return w;
 }
 
 // =========================
@@ -229,7 +266,7 @@ function verifySignedTx(tx){
 // =========================
 
 // 1) TRANSFERT FIRE
-function processFireTransfer(tx){
+function processFireTransfer(tx) {
   if (!tx.from || !tx.to) throw new Error("from/to manquant");
   if (!tx.amount || tx.amount <= 0) throw new Error("amount invalide");
 
@@ -252,10 +289,10 @@ function processFireTransfer(tx){
   };
 }
 
-// 2) SWAP FIRE / USDC FIRE (AMM x*y = k)
-function processSwap(tx){
-  const { addr, amount, token } = tx;
-  if (!addr) throw new Error("addr manquant");
+// 2) SWAP FIRE / USDC FIRE
+function processSwap(tx) {
+  const { from, amount, token } = tx;
+  if (!from) throw new Error("from manquant");
   if (!amount || amount <= 0) throw new Error("amount invalide");
   if (!lp.fire || !lp.usdc) throw new Error("pool LP vide");
   if (token !== "fire2usdc" && token !== "usdc2fire") {
@@ -270,7 +307,7 @@ function processSwap(tx){
   const feeTreas = feeTotal - feeBurn;
 
   if (token === "fire2usdc") {
-    subFireFromWallet(addr, amount);
+    subFireFromWallet(from, amount);
     lp.fire += amountNet;
 
     const k = lp.fire * lp.usdc;
@@ -280,7 +317,7 @@ function processSwap(tx){
     if (deltaUsdc <= 0) throw new Error("delta usdc invalide");
     lp.usdc = newUsdc;
 
-    addUsdcToWallet(addr, deltaUsdc);
+    addUsdcToWallet(from, deltaUsdc);
 
     const burned = burnFire(feeBurn);
     treasury.fire += feeTreas;
@@ -295,7 +332,7 @@ function processSwap(tx){
       feeTreasFire: feeTreas
     };
   } else {
-    subUsdcFromWallet(addr, amount);
+    subUsdcFromWallet(from, amount);
     lp.usdc += amountNet;
 
     const k = lp.fire * lp.usdc;
@@ -305,7 +342,7 @@ function processSwap(tx){
     if (deltaFire <= 0) throw new Error("delta fire invalide");
     lp.fire = newFire;
 
-    addFireToWallet(addr, deltaFire);
+    addFireToWallet(from, deltaFire);
 
     const burned = burnFire(feeBurn);
     treasury.usdc += feeTreas;
@@ -322,40 +359,40 @@ function processSwap(tx){
 }
 
 // 3) LP ADD
-function processLPAdd(tx){
-  const { addr, fire, usdc } = tx;
-  if (!addr) throw new Error("addr manquant");
-  if (!fire || fire <= 0 || !usdc || usdc <= 0) {
+function processLPAdd(tx) {
+  const { from, pow, usdc } = tx;
+  const fireAmt = pow; // compat précédent code (champ pow)
+  if (!from) throw new Error("from manquant");
+  if (!fireAmt || fireAmt <= 0 || !usdc || usdc <= 0) {
     throw new Error("valeurs LP invalides");
   }
-  subFireFromWallet(addr, fire);
-  subUsdcFromWallet(addr, usdc);
-  lp.fire += fire;
+  subFireFromWallet(from, fireAmt);
+  subUsdcFromWallet(from, usdc);
+  lp.fire += fireAmt;
   lp.usdc += usdc;
   return {
     type: "LP_ADD",
-    addr,
-    fire,
+    addr: from,
+    fire: fireAmt,
     usdc
   };
 }
 
-// 4) BRIDGE SOL -> FIREINNERS (entrée)
-function processBridgeIn(params){
-  const { addr, solAmount } = params;
-  if (!addr) throw new Error("adresse manquante");
+// 4) BRIDGE SOL -> FIREINNERS (côté économie seulement)
+function processBridgeIn({ addr, solAmount }) {
+  if (!addr) throw new Error("addr manquant");
   if (!solAmount || solAmount <= 0) throw new Error("solAmount invalide");
 
-  const rate = getFireRatePerSol();              // FIRE par SOL
+  const rate = getFireRatePerSol();
   const fireBrut = Math.floor(solAmount * rate * DEC);
 
   const fireMinted = mintFire(fireBrut);
-  if (fireMinted <= 0) throw new Error("Supply max atteint");
+  if (fireMinted <= 0) throw new Error("supply max atteint");
 
   const feeTreas = applyBp(fireMinted, FEE_BRIDGE_IN_TREAS_BP);
-  const feeBurn  = applyBp(fireMinted, FEE_BRIDGE_IN_BURN_BP);
+  const feeBurn = applyBp(fireMinted, FEE_BRIDGE_IN_BURN_BP);
   const userFire = fireMinted - feeTreas - feeBurn;
-  if (userFire <= 0) throw new Error("Bridge net <= 0");
+  if (userFire <= 0) throw new Error("bridge in net <= 0");
 
   treasury.fire += feeTreas;
   const burned = burnFire(feeBurn);
@@ -373,26 +410,26 @@ function processBridgeIn(params){
     feeTreasFire: feeTreas,
     burnedFire: burned,
     supplyCirculante,
-    supplyDisponible: getSupplyAvailable()
+    supplyDisponible: SUPPLY_MAX - supplyCirculante
   };
 }
 
-// 5) BRIDGE FIRE -> SOL (sortie)
-function processBridgeOut(params){
-  const { addr, fireAmount } = params;
-  if (!addr) throw new Error("adresse manquante");
+// 5) BRIDGE FIRE -> SOL (optionnel, garde la logique)
+function processBridgeOut(tx) {
+  const { from, powAmount } = tx;
+  const fireAmount = powAmount;
+  if (!from) throw new Error("addr manquant");
   if (!fireAmount || fireAmount <= 0) throw new Error("fireAmount invalide");
 
   const rate = getFireRatePerSol();
 
-  subFireFromWallet(addr, fireAmount);
+  subFireFromWallet(from, fireAmount);
 
   const feeBurn = applyBp(fireAmount, FEE_BRIDGE_OUT_BURN_BP);
   const fireNet = fireAmount - feeBurn;
   if (fireNet <= 0) throw new Error("bridge out net <= 0");
 
   const burned = burnFire(fireAmount);
-
   const solOut = fireNet / (rate * DEC);
   if (treasury.sol < solOut) {
     throw new Error("SOL trésorerie insuffisant pour bridge out");
@@ -401,24 +438,22 @@ function processBridgeOut(params){
 
   return {
     type: "BRIDGE_OUT",
-    addr,
+    addr: from,
     fireSent: fireAmount,
     fireNet,
     burnedFire: burned,
     rateFirePerSol: rate,
-    solOut,
-    supplyCirculante,
-    supplyDisponible: getSupplyAvailable()
+    solOut
   };
 }
 
 // 6) STAKING
-function processStake(tx){
-  const { addr, amount } = tx;
-  if (!addr) throw new Error("addr manquant");
+function processStake(tx) {
+  const { from, amount } = tx;
+  if (!from) throw new Error("addr manquant");
   if (!amount || amount <= 0) throw new Error("amount invalide");
 
-  const w = ensureWallet(addr);
+  const w = ensureWallet(from);
   if (w.fire < amount) throw new Error("solde FIRE insuffisant");
 
   w.fire -= amount;
@@ -427,255 +462,250 @@ function processStake(tx){
 
   return {
     type: "STAKE",
-    addr,
+    addr: from,
     amount,
     lockUntil: w.stakeLock
   };
 }
 
-function processUnstake(tx){
-  const { addr, amount } = tx;
-  if (!addr) throw new Error("addr manquant");
+function processUnstake(tx) {
+  const { from, amount } = tx;
+  if (!from) throw new Error("addr manquant");
   if (!amount || amount <= 0) throw new Error("amount invalide");
 
-  const w = ensureWallet(addr);
+  const w = ensureWallet(from);
   if (w.staked < amount) throw new Error("staked insuffisant");
 
   const now = Date.now();
-  let burn = 0;
+  let burnFee = 0;
   let net = amount;
-  if (now < w.stakeLock) {
-    burn = applyBp(amount, FEE_UNSTAKE_BURN_BP);
-    net = amount - burn;
-    if (net <= 0) throw new Error("unstake net <= 0");
+
+  if (now < (w.stakeLock || 0)) {
+    burnFee = applyBp(amount, FEE_UNSTAKE_BURN_BP);
+    net = amount - burnFee;
   }
 
   w.staked -= amount;
   w.fire += net;
-  const burned = burnFire(burn);
+  const burned = burnFire(burnFee);
 
   return {
     type: "UNSTAKE",
-    addr,
+    addr: from,
     amount,
     net,
-    burnedFire: burned,
-    early: now < w.stakeLock
+    burned
   };
 }
 
 // =========================
-// CHAINE & BLOCS
+// TRAITEMENT TX INBOUND WS
 // =========================
 
-function appendBlock(txs){
-  const prev = chain[chain.length - 1];
-  const height = prev ? prev.height + 1 : 1;
-  const time = Date.now();
-  const prevHash = prev ? prev.hash : "0".repeat(64);
-  const headerStr = height + "|" + time + "|" + prevHash + "|" + JSON.stringify(txs);
-  const hash = crypto.createHash("sha256").update(headerStr).digest("hex");
-
-  const block = {
-    height,
-    time,
-    prevHash,
-    hash,
-    txs,
-    treasurySnapshot: { ...treasury },
-    lpSnapshot: { ...lp },
-    supplyCirculante,
-    supplyMax: SUPPLY_MAX
-  };
-  chain.push(block);
-  broadcast({ type: "NEW_BLOCK", block });
-}
-
-// =========================
-// WEBSOCKET
-// =========================
-
-function broadcast(obj){
-  const msg = JSON.stringify(obj);
-  for (const ws of clients) {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(msg);
-    }
+function applyTx(tx) {
+  switch (tx.type) {
+    case "TX_FIRE":
+    case "TX_POW": // compat ancien client
+      return processFireTransfer(tx);
+    case "SWAP":
+      return processSwap(tx);
+    case "LP_ADD":
+      return processLPAdd(tx);
+    case "STAKE":
+      return processStake(tx);
+    case "UNSTAKE":
+      return processUnstake(tx);
+    case "BRIDGE_OUT":
+      return processBridgeOut(tx);
+    default:
+      throw new Error("type de tx inconnu");
   }
 }
 
-wss.on("connection",(ws)=>{
+wss.on("connection", (ws) => {
   clients.add(ws);
-  console.log("[fireinners] WS client connecté, total =", clients.size);
-  ws.on("close",()=>{
-    clients.delete(ws);
-    console.log("[fireinners] WS client déconnecté, total =", clients.size);
+  ws.on("close", () => clients.delete(ws));
+
+  ws.on("message", (data) => {
+    let tx;
+    try {
+      const txt = typeof data === "string" ? data : data.toString("utf8");
+      tx = JSON.parse(txt);
+    } catch (e) {
+      console.error("WS parse error", e.message);
+      return;
+    }
+
+    try {
+      verifySignature(tx);
+      const result = applyTx(tx);
+      const record = { ...tx, result };
+      mempool.push(record);
+      appendBlock(record);
+      ws.send(JSON.stringify({ type: "TX_OK", tx: tx.type, result }));
+    } catch (e) {
+      console.error("TX error", e.message);
+      ws.send(JSON.stringify({ type: "TX_ERR", error: e.message }));
+    }
   });
-  ws.on("message",(data)=>{
-    // simple ping/pong éventuellement
-    try{
-      const msg = JSON.parse(data.toString());
-      if (msg.type === "PING") {
-        ws.send(JSON.stringify({ type:"PONG", t:Date.now() }));
-      }
-    }catch(e){}
-  });
-  ws.send(JSON.stringify({ type:"HELLO", msg:"FIREINNERS WS OK" }));
 });
 
-// push état toutes les 5s
-setInterval(()=>{
-  const height = chain.length ? chain[chain.length-1].height : 0;
-  const payload = {
-    type: "STATE",
-    height,
-    wallets: Object.keys(wallets).length,
-    treasury,
-    lp,
-    tvlUsdc: getTVL(),
-    lpPrice: getLpPrice(),
-    supplyMax: SUPPLY_MAX,
-    supplyCirculante,
-    supplyDisponible: getSupplyAvailable()
+// =========================
+// RPC SOLANA: VERIF BRIDGE
+// =========================
+
+async function fetchSolanaTransaction(txSig) {
+  const body = {
+    jsonrpc: "2.0",
+    id: 1,
+    method: "getTransaction",
+    params: [
+      txSig,
+      {
+        encoding: "jsonParsed",
+        commitment: "confirmed",
+        maxSupportedTransactionVersion: 0
+      }
+    ]
   };
-  broadcast(payload);
-}, 5000);
+  const r = await fetch(SOLANA_RPC, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  if (!r.ok) {
+    throw new Error("RPC HTTP " + r.status);
+  }
+  const j = await r.json();
+  if (!j.result) throw new Error("tx introuvable");
+  return j.result;
+}
+
+async function verifySolanaBridgeTx(fromSol, txSig) {
+  const tx = await fetchSolanaTransaction(txSig);
+
+  if (tx.meta && tx.meta.err) {
+    throw new Error("transaction Solana en erreur");
+  }
+
+  const keysRaw = tx.transaction.message.accountKeys || [];
+  const keys = keysRaw.map((k) =>
+    typeof k === "string" ? k : k.pubkey
+  );
+
+  const fromIndex = keys.findIndex((k) => k === fromSol);
+  const treIndex = keys.findIndex((k) => k === TREASURY_SOL);
+
+  if (fromIndex < 0 || treIndex < 0) {
+    throw new Error("compte source ou trésorerie non trouvé dans la tx");
+  }
+
+  const preFrom = tx.meta.preBalances[fromIndex];
+  const postFrom = tx.meta.postBalances[fromIndex];
+  const preTre = tx.meta.preBalances[treIndex];
+  const postTre = tx.meta.postBalances[treIndex];
+
+  const spent = preFrom - postFrom;
+  const received = postTre - preTre;
+  const lamports = Math.min(spent, received);
+
+  if (lamports <= 0) {
+    throw new Error("aucun SOL transféré vers la trésorerie");
+  }
+
+  const solAmount = lamports / 1_000_000_000;
+  return { solAmount, lamports };
+}
 
 // =========================
 // API HTTP
 // =========================
 
-// Stats globales
-app.get("/stats",(req,res)=>{
-  try{
-    const height = chain.length ? chain[chain.length-1].height : 0;
+// Stats globales pour le Dashboard
+app.get("/stats", (req, res) => {
+  const tvl = getTVL();
+  const rate = getFireRatePerSol();
+  res.json({
+    height: chain.length ? chain[chain.length - 1].height : 0,
+    supplyCirculante,
+    supplyMax: SUPPLY_MAX,
+    supplyDisponible: SUPPLY_MAX - supplyCirculante,
+    mintedFireTotal,
+    burnedFireTotal,
+    treasury,
+    lp,
+    tvl,
+    lpPrice: getLpPrice(),
+    rateFirePerSol: rate,
+    timestamp: Date.now()
+  });
+});
+
+// Wallet
+app.get("/wallet/:addr", (req, res) => {
+  const addr = req.params.addr;
+  const w = ensureWallet(addr);
+  res.json({
+    addr,
+    fire: w.fire,
+    usdc: w.usdc,
+    staked: w.staked,
+    nonce: w.nonce,
+    stakeLock: w.stakeLock,
+    pub: w.pub
+  });
+});
+
+// Explorer bloc
+app.get("/block/:height", (req, res) => {
+  const h = parseInt(req.params.height, 10);
+  if (Number.isNaN(h)) return res.status(400).json({ error: "height invalide" });
+  const b = chain.find((x) => x.height === h);
+  if (!b) return res.status(404).json({ error: "bloc introuvable" });
+  res.json(b);
+});
+
+// Bridge réel SOL -> FIREINNERS
+app.post("/bridge", async (req, res) => {
+  try {
+    const { addr, fromSol, txSig } = req.body || {};
+    if (!addr || !fromSol || !txSig) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "addr, fromSol et txSig requis" });
+    }
+    if (bridgedTx.has(txSig)) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "bridge déjà utilisé pour cette tx" });
+    }
+
+    const { solAmount } = await verifySolanaBridgeTx(fromSol, txSig);
+    const bridge = processBridgeIn({ addr, solAmount });
+    bridgedTx.add(txSig);
+
+    const record = {
+      type: "BRIDGE_IN",
+      addr,
+      fromSol,
+      txSig,
+      solAmount,
+      ...bridge
+    };
+    appendBlock(record);
+
     res.json({
       ok: true,
-      height,
-      wallets: Object.keys(wallets).length,
-      treasuryFire: treasury.fire,
-      treasuryUsdc: treasury.usdc,
-      treasurySol: treasury.sol,
-      lpFire: lp.fire,
-      lpUsdc: lp.usdc,
-      tvlUsdc: getTVL(),
-      lpPrice: getLpPrice(),
-      supplyMax: SUPPLY_MAX,
+      bridge,
       supplyCirculante,
-      supplyDisponible: getSupplyAvailable()
+      supplyDisponible: SUPPLY_MAX - supplyCirculante
     });
-  }catch(e){
-    console.error("[fireinners] Erreur /stats:", e);
-    res.status(500).json({ ok:false, error:e.message });
-  }
-});
-
-// Chaine complète (attention taille)
-app.get("/chain",(req,res)=>{
-  res.json({ ok:true, chain });
-});
-
-// Alias /explorer
-app.get("/explorer",(req,res)=>{
-  res.json({ ok:true, chain });
-});
-
-// Historique des bridges
-app.get("/bridge-history",(req,res)=>{
-  const bridges = [];
-  for (const b of chain){
-    for (const tx of b.txs){
-      if (tx.type === "BRIDGE_IN" || tx.type === "BRIDGE_OUT") {
-        bridges.push({
-          height: b.height,
-          time: b.time,
-          ...tx
-        });
-      }
-    }
-  }
-  res.json({ ok:true, bridges });
-});
-
-// TX signées (transfert, swap, LP, stake, unstake)
-app.post("/tx",(req,res)=>{
-  try{
-    const tx = req.body || {};
-    verifySignedTx(tx);
-
-    let result;
-    switch (tx.type) {
-      case "TX_FIRE":
-        result = processFireTransfer(tx);
-        break;
-      case "SWAP":
-        result = processSwap(tx);
-        break;
-      case "LP_ADD":
-        result = processLPAdd(tx);
-        break;
-      case "STAKE":
-        result = processStake(tx);
-        break;
-      case "UNSTAKE":
-        result = processUnstake(tx);
-        break;
-      default:
-        throw new Error("type de TX inconnu: " + tx.type);
-    }
-
-    appendBlock([result]);
-    console.log("[fireinners] TX", result.type, "ok pour", tx.from);
-    res.json({ ok:true, tx: result });
-  }catch(e){
-    console.error("[fireinners] Erreur /tx:", e);
-    res.status(400).json({ ok:false, error:e.message });
-  }
-});
-
-// Bridge SOL -> FIREINNERS
-app.post("/bridge",(req,res)=>{
-  try{
-    const body = req.body || {};
-    const addr = body.addr || body.fireAddress || body.powAddress || body.fireAddr;
-    const solAmountRaw = body.solAmount ?? body.amountSol ?? body.sol ?? body.amount;
-    const solAmount = Number(solAmountRaw);
-
-    if (!addr) throw new Error("adresse manquante");
-    if (!Number.isFinite(solAmount) || solAmount <= 0){
-      throw new Error("montant SOL invalide");
-    }
-
-    const bridgeTx = processBridgeIn({ addr, solAmount });
-    appendBlock([bridgeTx]);
-    console.log("[fireinners] 🔥 Bridge SOL->FIREINNERS", bridgeTx);
-    res.json({ ok:true, bridge: bridgeTx });
-  }catch(e){
-    console.error("[fireinners] Erreur /bridge:", e);
-    res.status(400).json({ ok:false, error:e.message });
-  }
-});
-
-// Bridge FIRE -> SOL (optionnel)
-app.post("/bridge-out",(req,res)=>{
-  try{
-    const body = req.body || {};
-    const addr = body.addr || body.fireAddress || body.powAddress || body.fireAddr;
-    const fireAmountRaw = body.fireAmount ?? body.amountFire ?? body.amount;
-    const fireAmount = Number(fireAmountRaw);
-
-    if (!addr) throw new Error("adresse manquante");
-    if (!Number.isFinite(fireAmount) || fireAmount <= 0){
-      throw new Error("montant FIRE invalide");
-    }
-
-    const bridgeTx = processBridgeOut({ addr, fireAmount });
-    appendBlock([bridgeTx]);
-    console.log("[fireinners] 🔥 Bridge FIRE->SOL", bridgeTx);
-    res.json({ ok:true, bridge: bridgeTx });
-  }catch(e){
-    console.error("[fireinners] Erreur /bridge-out:", e);
-    res.status(400).json({ ok:false, error:e.message });
+  } catch (e) {
+    console.error("BRIDGE ERR", e);
+    res.status(400).json({
+      ok: false,
+      error: e.message || String(e)
+    });
   }
 });
 
@@ -683,14 +713,11 @@ app.post("/bridge-out",(req,res)=>{
 // LANCEMENT SERVEUR
 // =========================
 
-server.listen(HTTP_PORT,()=>{
-  console.log(`[fireinners] 🔥 FIREINNERS Validator prêt – HTTP + WS sur port ${HTTP_PORT}`);
+server.listen(HTTP_PORT, () => {
+  console.log("FIREINNERS validator HTTP+WS sur port", HTTP_PORT);
 });
 
-
-pm2 restart powchain
-
-curl -s http://127.0.0.1:3000/stats
-
-
-
+cd /root/powchain
+pm2 stop powchain || true
+pm2 start server.js --name powchain
+pm2 save
