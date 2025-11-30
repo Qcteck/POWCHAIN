@@ -1,7 +1,228 @@
 cd /root/powchain
+nano server.js
+
+
+
+
+
+
+// =========================================================
+// FIREINNERS (ex POWCHAIN) — Validator + API + WebSocket
+// =========================================================
+
+const express = require("express");
+const bodyParser = require("body-parser");
+const WebSocket = require("ws");
+const nacl = require("tweetnacl");
+const bs58 = require("bs58");
+const crypto = require("crypto");
+const http = require("http");
+
+// ------------------------------
+// CONFIG SERVEUR
+// ------------------------------
+const HTTP_PORT = 3000;
+const WS_PATH = "/ws";
+
+const app = express();
+app.use(bodyParser.json());
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server, path: WS_PATH });
+const clients = new Set();
+
+// ------------------------------
+// ECONOMIE FIREINNERS
+// ------------------------------
+const DEC = 1e6;
+const SUPPLY_MAX = 100_000_000 * DEC;
+
+const RATE_BASE = 1000;
+const TVL_REF = 1_000_000 * DEC;
+const RATE_MIN = 800;
+const RATE_MAX = 5000;
+
+const FEE_TRANSFER_BURN_BP = 50;
+const FEE_SWAP_TOTAL_BP = 30;
+const FEE_SWAP_BURN_PART = 0.5;
+const FEE_BRIDGE_IN_TREAS_BP = 500;
+const FEE_BRIDGE_IN_BURN_BP = 200;
+
+let wallets = {};            // addr -> { fire, usdc, staked, nonce }
+let treasury = { fire: 0, usdc: 0, sol: 0 };
+let lp = { fire: 0, usdc: 0 };
+let supplyCirculante = 0;
+let mintedFireTotal = 0;
+let burnedFireTotal = 0;
+let chain = [];
+let mempool = [];
+
+(function initGenesis() {
+  const genesisSupply = 100_000_000 * DEC;
+  supplyCirculante = genesisSupply;
+  mintedFireTotal = genesisSupply;
+  treasury.fire = genesisSupply;
+
+  chain.push({
+    height: 1,
+    time: Date.now(),
+    prevHash: "0".repeat(64),
+    hash: "GENESIS",
+    txs: [],
+    treasurySnapshot: { ...treasury },
+    lpSnapshot: { ...lp }
+  });
+})();
+
+// =========================================================
+// OUTILS
+// =========================================================
+
+const log = (...msg) => console.log("|fireinners|", ...msg);
+
+function ensureWallet(addr) {
+  if (!wallets[addr]) {
+    wallets[addr] = { fire: 0, usdc: 0, staked: 0, nonce: 0 };
+  }
+  return wallets[addr];
+}
+function applyBp(amount, bp) { return Math.floor(amount * bp / 10000); }
+function clamp(x, min, max) { return x < min ? min : x > max ? max : x; }
+
+function getTVL() {
+  return (lp.usdc || 0) + (treasury.usdc || 0);
+}
+function getFireRateFirePerSol() {
+  const tvl = getTVL();
+  const factor = 1 + tvl / (TVL_REF || DEC);
+  return clamp(RATE_BASE * factor, RATE_MIN, RATE_MAX);
+}
+
+function burnFire(amount) {
+  const real = Math.min(amount, supplyCirculante);
+  burnedFireTotal += real;
+  supplyCirculante -= real;
+  return real;
+}
+function mintFire(amount) {
+  const space = SUPPLY_MAX - supplyCirculante;
+  const mintable = Math.max(0, Math.min(amount, space));
+  mintedFireTotal += mintable;
+  supplyCirculante += mintable;
+  return mintable;
+}
+
+function addFire(addr, amount) { ensureWallet(addr).fire += amount; }
+function subFire(addr, amount) {
+  if (ensureWallet(addr).fire < amount) throw new Error("Solde FIRE insuffisant");
+  ensureWallet(addr).fire -= amount;
+}
+
+// =========================================================
+// PROCESS Bridge IN (SOL → FIREINNERS)
+// =========================================================
+function processBridgeIn(tx) {
+  const { addr, solAmount } = tx;
+  if (!addr) throw new Error("addr manquant");
+  if (!solAmount || solAmount <= 0) throw new Error("solAmount invalide");
+
+  const rate = getFireRateFirePerSol();
+  const fireBrut = Math.floor(solAmount * rate * DEC);
+
+  const mintAmount = mintFire(fireBrut);
+  const feeTreas = applyBp(mintAmount, FEE_BRIDGE_IN_TREAS_BP);
+  const feeBurn = applyBp(mintAmount, FEE_BRIDGE_IN_BURN_BP);
+  const userFire = mintAmount - feeTreas - feeBurn;
+
+  treasury.fire += feeTreas;
+  burnFire(feeBurn);
+  addFire(addr, userFire);
+  treasury.sol += solAmount;
+
+  return {
+    type: "BRIDGE_IN",
+    addr,
+    solAmount,
+    rate,
+    fireMinted: mintAmount,
+    userFire,
+    feeTreas,
+    burnedFire: feeBurn
+  };
+}
+
+// =========================================================
+// API HTTP
+// =========================================================
+
+// ROUTE FIXÉE ⭐⭐ (c’est elle qui manquait)
+app.post("/bridge", (req, res) => {
+  try {
+    const { powAddress, solAddress, sol } = req.body;
+    if (!powAddress || !solAddress || !sol) {
+      return res.status(400).json({ ok: false, error: "params manquants" });
+    }
+
+    const result = processBridgeIn({
+      addr: powAddress,
+      solAmount: Math.floor(Number(sol) * DEC)
+    });
+
+    log("🌉Bridge SOL→FIREINNERS", result);
+    res.json({ ok: true, bridge: result });
+
+  } catch (e) {
+    log("Erreur bridge HTTP", e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Monitoring
+app.get("/stats", (req, res) => {
+  res.json({
+    height: chain.length,
+    supply: supplyCirculante,
+    treasury,
+    lp,
+    wallets: Object.keys(wallets).length
+  });
+});
+
+// =========================================================
+// WEBSOCKET
+// =========================================================
+wss.on("connection", ws => {
+  clients.add(ws);
+  log("WS client connecté — total =", clients.size);
+  ws.on("close", () => clients.delete(ws));
+});
+
+function broadcast(obj) {
+  const msg = JSON.stringify(obj);
+  clients.forEach(ws => {
+    try { ws.send(msg); } catch {}
+  });
+}
+
+// =========================================================
+// LANCEMENT SERVEUR
+// =========================================================
+server.listen(HTTP_PORT, () => {
+  log(`🔥 FIREINNERS Validator prêt — HTTP + WS sur port ${HTTP_PORT}`);
+});
+
+
+
+
+
 pm2 restart powchain
-pm2 logs powchain --lines 20
 
 
-curl -s http://127.0.0.1:3000/stats
-curl -s http://127.0.0.1:3000/bridge-history
+pm2 start server.js --name powchain
+
+
+pm2 logs powchain
+
+
+curl http://127.0.0.1:3000/stats
+
+
