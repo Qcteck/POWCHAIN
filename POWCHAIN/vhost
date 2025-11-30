@@ -1,4 +1,408 @@
+nano /root/powchain/server.js
+
+// server.js – POWCHAIN validator + HTTP API + WebSocket
+
+const PORT_HTTP = 3000;
+const PORT_WS = 7001;
+
+const http = require("http");
+const url = require("url");
+const fs = require("fs");
+const crypto = require("crypto");
+const WebSocket = require("ws");
+
+// Fichier de persistance
+const LEDGER_FILE = "/root/powchain/ledger.json";
+
+// Trésorerie POWCHAIN (même adresse que tu utilises déjà)
+const TREASURY_ADDR = "BZJsWeJizv3YeyuWjF5187jrcduPFAHWjqL7jgq4kGwy";
+
+// --------- ÉTAT GLOBAL ---------
+let state = {
+  chain: [],
+  wallets: {},
+  lpPow: 0,
+  lpUsdcPow: 0,
+  treasuryPow: 0,
+  treasuryUsdc: 0,
+  height: 0
+};
+
+function log(...args) {
+  console.log("[POWCHAIN]", ...args);
+}
+
+// --------- LEDGER ---------
+function hashBlock(b) {
+  const h = crypto.createHash("sha256");
+  h.update(
+    JSON.stringify({
+      index: b.index,
+      time: b.time,
+      prevHash: b.prevHash,
+      txs: b.txs,
+      treasuryPow: b.treasuryPow,
+      treasuryUsdc: b.treasuryUsdc,
+      lpPow: b.lpPow,
+      lpUsdcPow: b.lpUsdcPow,
+      reward: b.reward
+    })
+  );
+  return h.digest("hex");
+}
+
+function saveLedger() {
+  fs.writeFileSync(LEDGER_FILE, JSON.stringify(state, null, 2));
+}
+
+function loadLedger() {
+  try {
+    const raw = fs.readFileSync(LEDGER_FILE, "utf8");
+    state = JSON.parse(raw);
+    if (!Array.isArray(state.chain) || !state.chain.length) {
+      throw new Error("ledger vide");
+    }
+    state.height = state.chain.length;
+    log("Ledger chargé, height =", state.height);
+  } catch (e) {
+    log("Aucun ledger trouvé, création genesis...");
+    const genesis = {
+      index: 0,
+      time: Date.now(),
+      prevHash: "0".repeat(64),
+      hash: "",
+      txs: [],
+      treasuryPow: 0,
+      treasuryUsdc: 0,
+      lpPow: 0,
+      lpUsdcPow: 0,
+      reward: 10
+    };
+    genesis.hash = hashBlock(genesis);
+    state.chain = [genesis];
+    state.wallets = {};
+    state.lpPow = 0;
+    state.lpUsdcPow = 0;
+    state.treasuryPow = 0;
+    state.treasuryUsdc = 0;
+    state.height = 1;
+    saveLedger();
+  }
+}
+
+// --------- WALLET / BLOCK ---------
+function ensureWallet(addr) {
+  if (!state.wallets[addr]) {
+    state.wallets[addr] = { pow: 0, usdc: 0, staked: 0 };
+  }
+  return state.wallets[addr];
+}
+
+function addBlock(txs) {
+  const prev = state.chain[state.chain.length - 1];
+  const block = {
+    index: prev.index + 1,
+    time: Date.now(),
+    prevHash: prev.hash,
+    hash: "",
+    txs,
+    treasuryPow: state.treasuryPow,
+    treasuryUsdc: state.treasuryUsdc,
+    lpPow: state.lpPow,
+    lpUsdcPow: state.lpUsdcPow,
+    reward: 10
+  };
+  block.hash = hashBlock(block);
+  state.chain.push(block);
+  state.height = state.chain.length;
+  saveLedger();
+  broadcast({
+    type: "stats",
+    height: state.height,
+    wallets: Object.keys(state.wallets).length,
+    treasuryPow: state.treasuryPow,
+    treasuryUsdc: state.treasuryUsdc,
+    lpPow: state.lpPow,
+    lpUsdcPow: state.lpUsdcPow
+  });
+}
+
+// --------- LOGIQUE DES TX ---------
+function handleTx(tx) {
+  const fail = (msg) => ({ ok: false, error: msg });
+  const ok = (res) => ({ ok: true, res: res || {} });
+
+  if (!tx || typeof tx.type !== "string") return fail("missing type");
+
+  // Envoi POW → POW
+  if (tx.type === "send") {
+    const { from, to } = tx;
+    const amount = Number(tx.amount);
+    if (typeof from !== "string" || typeof to !== "string")
+      return fail("send: addr");
+    if (!amount || amount <= 0) return fail("send: amount");
+
+    const wFrom = ensureWallet(from);
+    const wTo = ensureWallet(to);
+    if (wFrom.pow < amount) return fail("send: balance");
+
+    wFrom.pow -= amount;
+    wTo.pow += amount;
+
+    addBlock([{ type: "send", from, to, amount }]);
+    return ok({ from: wFrom, to: wTo });
+  }
+
+  // Stake POW
+  if (tx.type === "stake") {
+    const { from } = tx;
+    const amount = Number(tx.amount);
+    if (typeof from !== "string") return fail("stake: addr");
+    if (!amount || amount <= 0) return fail("stake: amount");
+
+    const w = ensureWallet(from);
+    if (w.pow < amount) return fail("stake: balance");
+
+    w.pow -= amount;
+    w.staked += amount;
+
+    addBlock([{ type: "stake", from, amount }]);
+    return ok(w);
+  }
+
+  // Unstake POW
+  if (tx.type === "unstake") {
+    const { from } = tx;
+    const amount = Number(tx.amount);
+    if (typeof from !== "string") return fail("unstake: addr");
+    if (!amount || amount <= 0) return fail("unstake: amount");
+
+    const w = ensureWallet(from);
+    if (w.staked < amount) return fail("unstake: balance");
+
+    w.staked -= amount;
+    w.pow += amount;
+
+    addBlock([{ type: "unstake", from, amount }]);
+    return ok(w);
+  }
+
+  // Ajouter de la liquidité interne POW / USDC POW
+  if (tx.type === "addLP") {
+    const from = String(tx.from || "");
+    const powAmt = Number(tx.pow);
+    const usdcAmt = Number(tx.usdc);
+    if (!powAmt || powAmt <= 0 || !usdcAmt || usdcAmt <= 0)
+      return fail("lp: amount");
+
+    const w = ensureWallet(from);
+    if (w.pow < powAmt || w.usdc < usdcAmt) return fail("lp: balance");
+
+    w.pow -= powAmt;
+    w.usdc -= usdcAmt;
+    state.lpPow += powAmt;
+    state.lpUsdcPow += usdcAmt;
+
+    addBlock([{ type: "addLP", from, pow: powAmt, usdc: usdcAmt }]);
+    return ok({ lpPow: state.lpPow, lpUsdcPow: state.lpUsdcPow });
+  }
+
+  // BRIDGE SOL → POWCHAIN (crédit POW une fois le SOL envoyé à la trésorerie)
+  if (tx.type === "bridge") {
+    const { to, amountSol, solanaSig } = tx;
+    if (typeof to !== "string") return fail("bridge: addr");
+    const amtSol = Number(amountSol);
+    if (!amtSol || amtSol <= 0) return fail("bridge: amount");
+
+    const w = ensureWallet(to);
+
+    // Exemple : 1 SOL bridgé = 1 000 POW crédités
+    const powMint = Math.floor(amtSol * 1000);
+    w.pow += powMint;
+
+    // On pourrait aussi augmenter une réserve POW spéciale bridge si tu veux
+    addBlock([
+      {
+        type: "bridge",
+        to,
+        amountSol: amtSol,
+        amountPow: powMint,
+        solanaSig: solanaSig || null,
+        treasurySol: TREASURY_ADDR
+      }
+    ]);
+
+    log("Bridge validé pour", to, "=>", powMint, "POW");
+    return ok({ pow: w.pow, amountPow: powMint });
+  }
+
+  return fail("unknown type");
+}
+
+// --------- HTTP API ---------
+const server = http.createServer((req, res) => {
+  const parsed = url.parse(req.url, true);
+  const path = parsed.pathname || "/";
+
+  // CORS simple pour le client
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  if (req.method === "OPTIONS") {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
+  // /stats
+  if (req.method === "GET" && path === "/stats") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(
+      JSON.stringify({
+        height: state.height,
+        wallets: Object.keys(state.wallets).length,
+        treasuryPow: state.treasuryPow,
+        treasuryUsdc: state.treasuryUsdc,
+        lpPow: state.lpPow,
+        lpUsdcPow: state.lpUsdcPow
+      })
+    );
+    return;
+  }
+
+  // /wallet?id=ADDR
+  if (req.method === "GET" && path === "/wallet") {
+    const id = parsed.query.id;
+    if (!id) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "missing id" }));
+      return;
+    }
+    const w = ensureWallet(String(id));
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(w));
+    return;
+  }
+
+  // /chain complet
+  if (req.method === "GET" && path === "/chain") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(state.chain));
+    return;
+  }
+
+  // /block?h=INDEX
+  if (req.method === "GET" && path === "/block") {
+    const h = Number(parsed.query.h || state.height - 1);
+    const blk = state.chain.find((b) => b.index === h);
+    if (!blk) {
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "not found" }));
+      return;
+    }
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(blk));
+    return;
+  }
+
+  // /tx (POST JSON)
+  if (req.method === "POST" && path === "/tx") {
+    let buf = "";
+    req.on("data", (chunk) => {
+      buf += chunk;
+      if (buf.length > 1e6) req.destroy();
+    });
+    req.on("end", () => {
+      try {
+        const tx = JSON.parse(buf || "{}");
+        const r = handleTx(tx);
+        if (!r.ok) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: r.error }));
+        } else {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true, ...r.res }));
+        }
+      } catch (e) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "bad json" }));
+      }
+    });
+    return;
+  }
+
+  // index.html pour /
+  if (req.method === "GET" && (path === "/" || path === "/index.html")) {
+    try {
+      const html = fs.readFileSync("/var/www/html/index.html", "utf8");
+      res.writeHead(200, { "Content-Type": "text/html" });
+      res.end(html);
+    } catch (e) {
+      res.writeHead(500, { "Content-Type": "text/plain" });
+      res.end("index.html manquant");
+    }
+    return;
+  }
+
+  // Autre endpoint
+  res.writeHead(404, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ error: "invalid endpoint" }));
+});
+
+// --------- WEBSOCKET ---------
+const wss = new WebSocket.Server({ port: PORT_WS });
+let clients = [];
+
+wss.on("connection", (ws) => {
+  clients.push(ws);
+  ws.send(JSON.stringify({ type: "welcome", height: state.height }));
+  ws.on("close", () => {
+    clients = clients.filter((c) => c !== ws);
+  });
+});
+
+function broadcast(msg) {
+  const raw = JSON.stringify(msg);
+  clients.forEach((ws) => {
+    try {
+      ws.send(raw);
+    } catch (e) {}
+  });
+}
+
+// Tick stats régulier
+setInterval(() => {
+  broadcast({
+    type: "stats",
+    height: state.height,
+    wallets: Object.keys(state.wallets).length,
+    treasuryPow: state.treasuryPow,
+    treasuryUsdc: state.treasuryUsdc,
+    lpPow: state.lpPow,
+    lpUsdcPow: state.lpUsdcPow
+  });
+}, 10000);
+
+// --------- DÉMARRAGE ---------
+loadLedger();
+
+server.listen(PORT_HTTP, () => {
+  log("HTTP API POWCHAIN sur port", PORT_HTTP, "(/stats /wallet /block /chain /tx)");
+});
+log("WebSocket POWCHAIN sur port", PORT_WS, "(/ws via Nginx)");
+
+
+
+
+
+
+
+pm2 restart powchain
+
+
+
+
 nano /var/www/html/index.html
+
 
 
 <!doctype html>
@@ -7,420 +411,580 @@ nano /var/www/html/index.html
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
   <title>POWCHAIN — Client Complet</title>
-  <style>
-    body{margin:0;background:#05070b;color:#e5ecff;font-family:system-ui,Arial;}
-    #wrap{max-width:1100px;margin:20px auto;padding:16px;border-radius:12px;border:1px solid #222b37;background:#0b111c;box-shadow:0 0 18px #000;}
-    h1{margin:0 0 4px;font-size:22px;letter-spacing:1px;}
-    .backend{display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap;}
-    .chip{padding:4px 10px;border-radius:999px;font-size:11px;border:1px solid #1f2937;background:#020617;display:flex;align-items:center;gap:5px;}
-    .dot{width:8px;height:8px;border-radius:999px;background:#f97316;}
-    .dot.ok{background:#22c55e;}
-    .grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;}
-    @media(max-width:960px){.grid{grid-template-columns:repeat(2,minmax(0,1fr));}}
-    @media(max-width:720px){.grid{grid-template-columns:1fr;}}
-    .card{background:radial-gradient(circle at top,#111827,#020617);border-radius:14px;border:1px solid #1f2937;padding:10px 12px;box-shadow:0 0 12px #0008;font-size:13px;}
-    .card h2{margin:0 0 8px;font-size:14px;letter-spacing:.8px;text-transform:uppercase;color:#a5d8ff;}
-    label{display:block;font-size:11px;text-transform:uppercase;letter-spacing:.6px;margin:6px 0 2px;opacity:.9;}
-    input,button,textarea{font-family:inherit;font-size:13px;border-radius:7px;border:1px solid #1f2937;padding:6px 7px;background:#020617;color:#e5ecff;box-sizing:border-box;}
-    input,textarea{width:100%;}
-    button{cursor:pointer;background:linear-gradient(135deg,#1d4ed8,#22d3ee);border:none;margin-top:6px;font-weight:600;}
-    button.secondary{background:#020617;border:1px solid #1f2937;}
-    button:disabled{opacity:.5;cursor:not-allowed;}
-    .row{display:flex;gap:6px;}
-    .row>div{flex:1;}
-    .value{font-size:12px;margin:2px 0;}
-    .value b{font-size:13px;}
-    #log{width:100%;height:150px;background:#020617;border-radius:8px;border:1px solid #1f2937;padding:6px;box-sizing:border-box;font-size:11px;white-space:pre-wrap;overflow:auto;}
-    .small{font-size:11px;opacity:.8;margin-top:4px;}
-    .chart{height:120px;border-radius:10px;border:1px solid #1f2937;background:radial-gradient(circle at 20% 0,#1d4ed8,#020617 55%,#000 100%);position:relative;overflow:hidden;}
-    .chart canvas{position:absolute;inset:0;width:100%;height:100%;}
-  </style>
-  <!-- Solana Web3 pour Phantom -->
+
+  <!-- Solana Web3 + libs pour wallet POWCHAIN -->
   <script src="https://unpkg.com/@solana/web3.js@1.95.3/lib/index.iife.min.js"></script>
-  <!-- Crypto POWCHAIN (Ed25519) -->
-  <script src="https://cdn.jsdelivr.net/npm/tweetnacl@1.0.3/nacl.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/tweetnacl@1.0.3/nacl-fast.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/bs58@5.0.0/dist/bs58.min.js"></script>
+
+  <style>
+    body{
+      margin:0;
+      background:#05070b;
+      color:#e5ecff;
+      font-family:system-ui,Arial,sans-serif;
+    }
+    h1{
+      margin:12px 0 4px;
+      text-align:center;
+      font-size:26px;
+      letter-spacing:1px;
+    }
+    #statusBar{
+      text-align:center;
+      margin-bottom:10px;
+    }
+    .pill{
+      display:inline-block;
+      padding:4px 10px;
+      border-radius:999px;
+      font-size:12px;
+      margin:0 4px;
+      border:1px solid #0f766e;
+      background:#022c22;
+    }
+    .pill.bad{border-color:#b91c1c;background:#451a1a;}
+    #wrap{
+      max-width:1200px;
+      margin:0 auto 30px;
+      padding:12px;
+      display:grid;
+      grid-template-columns:repeat(3,minmax(0,1fr));
+      gap:12px;
+      box-sizing:border-box;
+    }
+    .card{
+      border-radius:12px;
+      border:1px solid #1f2937;
+      background:radial-gradient(circle at top,#111827,#020617 55%,#000 100%);
+      padding:10px 12px;
+      box-shadow:0 0 18px #000c;
+      box-sizing:border-box;
+    }
+    .card h2{
+      margin:0 0 8px;
+      font-size:16px;
+      letter-spacing:.5px;
+      color:#a5f3fc;
+    }
+    label{
+      display:block;
+      font-size:12px;
+      margin-top:4px;
+      opacity:.9;
+    }
+    input{
+      width:100%;
+      box-sizing:border-box;
+      padding:7px 8px;
+      margin-top:2px;
+      border-radius:6px;
+      border:1px solid #374151;
+      background:#020617;
+      color:#e5ecff;
+      font-size:13px;
+    }
+    button{
+      display:inline-block;
+      padding:7px 10px;
+      margin-top:6px;
+      margin-right:4px;
+      border-radius:7px;
+      border:1px solid #38bdf8;
+      background:#0b1120;
+      color:#e0f2fe;
+      font-size:13px;
+      cursor:pointer;
+    }
+    button:hover{background:#020617;}
+    .row{
+      display:flex;
+      gap:6px;
+      align-items:center;
+      font-size:13px;
+      margin-top:4px;
+    }
+    .value{
+      font-weight:600;
+      color:#e0f2fe;
+    }
+    #log{
+      width:100%;
+      height:220px;
+      box-sizing:border-box;
+      margin-top:6px;
+      border-radius:8px;
+      border:1px solid #1f2937;
+      background:#020617;
+      color:#e5ecff;
+      font-size:12px;
+      padding:6px;
+      white-space:pre-wrap;
+      overflow:auto;
+    }
+    #chart{
+      width:100%;
+      height:140px;
+      border-radius:8px;
+      border:1px solid #1f2937;
+      background:linear-gradient(180deg,#0f172a,#020617);
+    }
+    small{font-size:11px;opacity:.8;}
+  </style>
 </head>
 <body>
-<div id="wrap">
   <h1>POWCHAIN — Client Complet</h1>
-  <div class="backend">
-    <div class="chip"><span class="dot" id="dotHttp"></span>Backend : <b>HTTP <span id="httpStatusTxt">...</span></b></div>
-    <div class="chip"><span class="dot" id="dotWs"></span><b>WS <span id="wsStatusTxt">...</span></b></div>
+  <div id="statusBar">
+    <span id="pillHttp" class="pill">Backend : HTTP ?</span>
+    <span id="pillWs" class="pill">WS ?</span>
   </div>
 
-  <div class="grid">
-    <!-- RÉSEAU -->
+  <div id="wrap">
+    <!-- RÉSEAU POWCHAIN -->
     <div class="card">
-      <h2>Réseau POWCHAIN</h2>
-      <div class="value">Hauteur : <b id="height">-</b></div>
-      <div class="value">Nb wallets : <b id="nbWallets">-</b></div>
-      <div class="value">TVL POW : <b id="tvlPow">-</b></div>
-      <div class="value">TVL USDC POW : <b id="tvlUsdc">-</b></div>
-      <div class="value">Trésorerie POW : <b id="treasuryPow">-</b></div>
-      <div class="value">Trésorerie USDC POW : <b id="treasuryUsdc">-</b></div>
-      <div class="small">Données HTTP : <span id="lastHttp">-</span></div>
+      <h2>RÉSEAU POWCHAIN</h2>
+      <div class="row"><span>Hauteur :</span><span id="netHeight" class="value">-</span></div>
+      <div class="row"><span>Nb wallets :</span><span id="netWallets" class="value">-</span></div>
+      <div class="row"><span>TVL POW :</span><span id="netLpPow" class="value">-</span></div>
+      <div class="row"><span>TVL USDC POW :</span><span id="netLpUsdc" class="value">-</span></div>
+      <div class="row"><span>Trésorerie POW :</span><span id="netTreasPow" class="value">-</span></div>
+      <div class="row"><span>Trésorerie USDC POW :</span><span id="netTreasUsdc" class="value">-</span></div>
+      <small>Données HTTP /stats</small>
     </div>
 
-    <!-- WALLET POWCHAIN -->
+    <!-- WALLET POWCHAIN LOCAL -->
     <div class="card">
-      <h2>Wallet POWCHAIN — Générateur</h2>
+      <h2>WALLET POWCHAIN — GÉNÉRATEUR</h2>
       <label>Adresse POWCHAIN (base58)</label>
-      <input id="powAddr" readonly/>
+      <input id="powAddr" readonly placeholder="Clique sur GÉNÉRER pour créer un wallet local"/>
       <div class="row">
         <button id="btnGenPow">Générer wallet POWCHAIN</button>
-        <button id="btnReloadPow" class="secondary">Recharger</button>
+        <button id="btnReloadPow">Recharger</button>
       </div>
-      <div class="row">
-        <div>
-          <label>Solde POW</label>
-          <input id="balPow" readonly/>
-        </div>
-        <div>
-          <label>Solde USDC POW</label>
-          <input id="balUsdcPow" readonly/>
-        </div>
-      </div>
-      <div class="small">
-        Le wallet est généré localement (nacl + base58) et stocké en localStorage.
-        Rien n’est envoyé au serveur sauf les TX signées.
-      </div>
+      <div class="row"><span>Solde POW :</span><span id="powPow" class="value">0</span></div>
+      <div class="row"><span>Solde USDC POW :</span><span id="powUsdc" class="value">0</span></div>
+      <small>Le wallet est généré localement (nacl + bs58) et stocké en localStorage. Seules les TX signées sont envoyées au serveur POWCHAIN.</small>
     </div>
 
-    <!-- WALLET SOLANA / BRIDGE -->
+    <!-- WALLET SOLANA & BRIDGE -->
     <div class="card">
-      <h2>Wallet Solana — Phantom</h2>
-      <label>Adresse Solana</label>
-      <input id="solAddr" readonly/>
+      <h2>WALLET SOLANA — PHANTOM</h2>
       <div class="row">
         <button id="btnConnectPhantom">Connecter Phantom</button>
-        <button id="btnRefreshSol" class="secondary">Refresh</button>
+        <button id="btnRefreshSol">Refresh</button>
       </div>
-      <div class="row">
-        <div>
-          <label>SOL (wallet)</label>
-          <input id="balSol" readonly/>
-        </div>
-        <div>
-          <label>USDC Solana</label>
-          <input id="balUsdcSol" readonly/>
-        </div>
-      </div>
+      <label>Adresse Solana</label>
+      <input id="solAddr" readonly/>
+      <div class="row"><span>SOL (wallet) :</span><span id="solBal" class="value">0</span></div>
+      <div class="row"><span>USDC Solana :</span><span id="usdcBal" class="value">0</span></div>
+      <small>Soldes lus via RPC drpc Solana mainnet (SOL + USDC EPj...). Aucun lien direct avec USDC POWCHAIN interne.</small>
 
-      <h2 style="margin-top:12px;">Bridge vers POWCHAIN</h2>
+      <hr style="border:none;border-top:1px solid #1f2937;margin:10px 0"/>
+
+      <h2 style="margin-top:0;font-size:15px;">BRIDGE vers POWCHAIN</h2>
       <label>Montant SOL à bridger</label>
-      <input id="bridgeAmount" placeholder="0.001"/>
+      <input id="bridgeAmount" placeholder="ex. 0.001"/>
       <button id="btnBridge">SOL → POWCHAIN</button>
-      <div class="small">
-        Envoie une requête BRIDGE_REQUEST au serveur POWCHAIN.
-        Les détails du pont sont gérés côté backend.
-      </div>
+      <small>Envoie une transaction Solana réelle vers la trésorerie POWCHAIN, puis une requête <code>bridge</code> au serveur.</small>
     </div>
-  </div>
 
-  <div class="grid" style="margin-top:10px;">
-    <!-- ACTIONS POWCHAIN -->
+    <!-- ACTIONS WALLET POWCHAIN -->
     <div class="card">
-      <h2>Actions Wallet POWCHAIN</h2>
+      <h2>ACTIONS WALLET POWCHAIN</h2>
       <label>Destinataire POWCHAIN</label>
-      <input id="destPow"/>
+      <input id="sendTo" placeholder="Adresse POWCHAIN"/>
       <label>Montant POW</label>
-      <input id="sendAmount"/>
-      <button id="btnSend">Send</button>
+      <input id="sendAmount" placeholder="0.0"/>
+      <button id="btnSend">SEND</button>
 
       <label style="margin-top:10px;">Montant POW à staker</label>
-      <input id="stakeAmount"/>
-      <button id="btnStake">Stake</button>
+      <input id="stakeAmount" placeholder="0.0"/>
+      <button id="btnStake">STAKE</button>
+      <button id="btnUnstake">UNSTAKE</button>
     </div>
 
-    <!-- DEX / LP -->
+    <!-- DEX POWCHAIN -->
     <div class="card">
       <h2>DEX POWCHAIN</h2>
       <label>Ajouter de la liquidité (POW / USDC POW)</label>
       <label>Montant POW</label>
-      <input id="lpPow"/>
+      <input id="lpPow" placeholder="0.0"/>
       <label>Montant USDC POW</label>
-      <input id="lpUsdc"/>
-      <button id="btnAddLp">Add LP</button>
-      <div class="small">
-        Un add LP ≥ 10 000 POW et 10 000 USDC POW donne le badge session WHALE.
-      </div>
-      <label style="margin-top:10px;">Graphique DEX POW / USDC POW</label>
-      <div class="chart">
-        <canvas id="chart"></canvas>
-      </div>
+      <input id="lpUsdc" placeholder="0.0"/>
+      <button id="btnAddLp">ADD LP</button>
+      <small>Un add LP ≥ 10 000 POW et 10 000 USDC POW peut donner un badge WHALE (logique à gérer côté serveur).</small>
+      <div id="chart"></div>
     </div>
 
     <!-- EXPLORER & LOG -->
-    <div class="card">
-      <h2>Explorer & Log</h2>
+    <div class="card" style="grid-column:1 / span 3;">
+      <h2>EXPLORER & LOG</h2>
       <div class="row">
         <button id="btnLoadBlocks">Charger derniers blocs</button>
-        <button id="btnClearLog" class="secondary">Clear log</button>
+        <button id="btnClearLog">Clear log</button>
       </div>
       <textarea id="log" readonly></textarea>
     </div>
   </div>
-</div>
 
 <script>
 (function(){
-  const API_BASE = (location.protocol==="https:"?"https://":"http://")+location.host;
-  const WS_URL   = (location.protocol==="https:"?"wss://":"ws://")+location.host+"/ws";
-  const DRPC_URL = "https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac";
-  const USDC_SOL_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1";
+  const RPC_SOL = "https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac";
+  const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1";
+  const TREASURY_SOL = "BZJsWeJizv3YeyuWjF5187jrcduPFAHWjqL7jgq4kGwy";
 
-  let ws=null, lastHttpTime=null, solConn=null, solPublicKey=null;
-  const el=id=>document.getElementById(id);
-  const logBox=el("log");
+  let ws = null;
+  let powAddr = null;
+  let powPriv = null;
 
-  // ---- Base58 encode pour l'adresse POWCHAIN ----
-  const ALPHABET="123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-  function base58Encode(buffer){
-    if(!buffer||buffer.length===0) return "";
-    let digits=[0];
-    for(let i=0;i<buffer.length;i++){
-      let carry=buffer[i];
-      for(let j=0;j<digits.length;j++){
-        const x=digits[j]*256+carry;
-        digits[j]=x%58;
-        carry=(x/58)|0;
-      }
-      while(carry){
-        digits.push(carry%58);
-        carry=(carry/58)|0;
-      }
-    }
-    let zeros=0;
-    for(let k=0;k<buffer.length && buffer[k]===0;k++) zeros++;
-    let res="";
-    for(let z=0;z<zeros;z++) res+="1";
-    for(let q=digits.length-1;q>=0;q--) res+=ALPHABET[digits[q]];
-    return res;
+  const el = id => document.getElementById(id);
+
+  function logMsg(msg){
+    const box = el("log");
+    const now = new Date();
+    const t = now.toTimeString().slice(0,8);
+    box.value += "["+t+"] "+msg+"\n";
+    box.scrollTop = box.scrollHeight;
+    console.log("[LOG]",msg);
   }
 
-  function nowLabel(){const d=new Date();return d.toTimeString().slice(0,8);}
-  function logLine(txt){logBox.value+="["+nowLabel()+"] "+txt+"\n";logBox.scrollTop=logBox.scrollHeight;}
-
-  function setBackendStatus(httpOk,wsOk){
-    el("dotHttp").className="dot"+(httpOk?" ok":"");
-    el("dotWs").className="dot"+(wsOk?" ok":"");
-    el("httpStatusTxt").textContent=httpOk?"OK":"ERR";
-    el("wsStatusTxt").textContent=wsOk?"OK":"ERR";
-  }
-
-  async function fetchJSON(path,opts){
-    const url=API_BASE+path;
-    const res=await fetch(url,opts||{});
-    if(!res.ok) throw new Error("HTTP "+res.status+" "+path);
-    return res.json();
-  }
-
+  // ---------- BACKEND STATS ----------
   async function refreshStats(){
     try{
-      const s=await fetchJSON("/stats");
-      lastHttpTime=Date.now();
-      el("height").textContent=s.height;
-      el("nbWallets").textContent=s.wallets;
-      el("tvlPow").textContent=s.tvlPow;
-      el("tvlUsdc").textContent=s.tvlUsdc;
-      el("treasuryPow").textContent=s.treasuryPow;
-      el("treasuryUsdc").textContent=s.treasuryUsdc;
-      el("lastHttp").textContent=new Date().toLocaleTimeString();
-      setBackendStatus(true,ws&&ws.readyState===WebSocket.OPEN);
-      logLine("Stats réseau mises à jour.");
+      const r = await fetch("/stats");
+      if(!r.ok) throw new Error("HTTP "+r.status);
+      const s = await r.json();
+      el("netHeight").textContent = s.height;
+      el("netWallets").textContent = s.wallets;
+      el("netLpPow").textContent = s.lpPow;
+      el("netLpUsdc").textContent = s.lpUsdcPow;
+      el("netTreasPow").textContent = s.treasuryPow;
+      el("netTreasUsdc").textContent = s.treasuryUsdc;
+      setPill("pillHttp",true);
     }catch(e){
-      setBackendStatus(false,ws&&ws.readyState===WebSocket.OPEN);
-      logLine("ERR stats: "+e.message);
+      setPill("pillHttp",false);
+      logMsg("HTTP stats ERR: "+e);
     }
   }
 
-  async function loadBlocks(){
-    try{
-      const chain=await fetchJSON("/chain");
-      const last=chain.slice(-30);
-      logLine("Derniers blocs ("+last.length+") :");
-      last.forEach(b=>{
-        logLine("  height="+b.index+" ts="+b.time+" txs="+(b.txs?b.txs.length:0)+" hash="+String(b.hash).slice(0,10)+"...");
-      });
-    }catch(e){logLine("ERR chain: "+e.message);}
-  }
-
-  // ---- WALLET POWCHAIN LOCAL ----
-  function loadLocalWallet(){
-    try{const raw=localStorage.getItem("pow_wallet");if(!raw)return null;return JSON.parse(raw);}catch(_){return null;}
-  }
-  function saveLocalWallet(w){localStorage.setItem("pow_wallet",JSON.stringify(w));}
-  function updatePowBalancesView(w){
-    el("powAddr").value=w?w.addr:"";
-    el("balPow").value=w?w.pow:"";
-    el("balUsdcPow").value=w?w.usdc:"";
-  }
-  async function syncPowWalletFromServer(){
-    const w=loadLocalWallet();if(!w)return;
-    try{
-      const info=await fetchJSON("/wallet?id="+encodeURIComponent(w.addr));
-      w.pow=info.pow;w.usdc=info.usdc;saveLocalWallet(w);updatePowBalancesView(w);
-      logLine("Wallet POWCHAIN rechargé depuis le serveur.");
-    }catch(e){logLine("ERR wallet POWCHAIN: "+e.message);}
-  }
-  function generatePowWallet(){
-    try{
-      const kp=nacl.sign.keyPair(); // Uint8Array
-      const addr=base58Encode(kp.publicKey);
-      const privArr=Array.from(kp.secretKey); // stocké en tableau de nombres
-      const w={addr,priv:privArr,pow:0,usdc:0};
-      saveLocalWallet(w);
-      updatePowBalancesView(w);
-      logLine("Nouveau wallet POWCHAIN généré.");
-    }catch(e){
-      logLine("ERR génération wallet POWCHAIN: "+e.message);
-      alert("Erreur génération wallet POWCHAIN : "+e.message);
+  function setPill(id,ok){
+    const p = el(id);
+    if(ok){
+      p.classList.remove("bad");
+      p.textContent = id==="pillHttp" ? "Backend : HTTP OK" : "WS OK";
+    }else{
+      p.classList.add("bad");
+      p.textContent = id==="pillHttp" ? "Backend : HTTP OFF" : "WS OFF";
     }
   }
 
-  async function signPowTx(obj){
-    const w=loadLocalWallet();
-    if(!w){alert("Génère d'abord un wallet POWCHAIN.");return null;}
-    const msgObj={type:obj.type,from:w.addr,to:obj.to??null,amount:obj.amount??null,extra:obj.extra??null};
-    const msg=new TextEncoder().encode(JSON.stringify(msgObj));
-    const privBytes=new Uint8Array(w.priv);        // reconstruit la clé privée
-    const sig=nacl.sign.detached(msg,privBytes);
-    const tx={...obj,from:w.addr,sig:base58Encode(sig)};
-    return tx;
-  }
-
-  async function sendPowTx(tx){
-    const res=await fetchJSON("/tx",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(tx)});
-    return res;
-  }
-
-  // ---- Phantom ----
-  async function connectPhantom(){
-    if(!window.solana||!window.solana.isPhantom){alert("Phantom n'est pas disponible dans ce navigateur.");return;}
-    try{
-      const resp=await window.solana.connect();
-      solPublicKey=resp.publicKey;
-      el("solAddr").value=solPublicKey.toBase58();
-      logLine("Phantom connecté : "+el("solAddr").value);
-      await refreshSolBalances();
-    }catch(e){logLine("ERR Phantom connect: "+e.message);}
-  }
-  async function refreshSolBalances(){
-    if(!solPublicKey){logLine("Connecte Phantom d'abord.");return;}
-    try{
-      if(!solConn){solConn=new solanaWeb3.Connection(DRPC_URL,"confirmed");}
-      const solLamports=await solConn.getBalance(solPublicKey);
-      el("balSol").value=(solLamports/1e9).toFixed(5);
-      const ata=await solConn.getParsedTokenAccountsByOwner(solPublicKey,{mint:new solanaWeb3.PublicKey(USDC_SOL_MINT)});
-      let usdc=0;ata.value.forEach(a=>{const info=a.account.data.parsed.info;const amt=Number(info.tokenAmount.uiAmount||0);usdc+=amt;});
-      el("balUsdcSol").value=usdc.toFixed(2);
-      logLine("Soldes Solana mis à jour (SOL + USDC).");
-    }catch(e){logLine("PHANTOM ERR: "+e.message);}
-  }
-
-  // ---- Bridge SOL → POWCHAIN ----
-  async function doBridge(){
-    const w=loadLocalWallet();if(!w){alert("Génère d'abord un wallet POWCHAIN.");return;}
-    if(!solPublicKey){alert("Connecte Phantom d'abord.");return;}
-    const amtStr=el("bridgeAmount").value.trim();const amount=Number(amtStr);
-    if(!amtStr||!Number.isFinite(amount)||amount<=0){alert("Montant SOL invalide.");return;}
-    try{
-      logLine("BRIDGE_REQUEST préparation "+amount+" SOL → "+w.addr+" ...");
-      const payload={fromSol:solPublicKey.toBase58(),toPow:w.addr,amount,sig:"phantom-"+Date.now()};
-      const res=await fetchJSON("/bridge",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
-      logLine("Bridge réponse: "+JSON.stringify(res));
-      alert("Requête de bridge envoyée (voir log).");
-      await syncPowWalletFromServer();
-      await refreshStats();
-    }catch(e){logLine("ERR bridge: "+e.message);alert("Erreur bridge (voir log).");}
-  }
-
-  // ---- WebSocket ----
+  // ---------- WS ----------
   function connectWs(){
-    try{ws=new WebSocket(WS_URL);}catch(e){logLine("WS création échouée: "+e.message);setBackendStatus(!!lastHttpTime,false);return;}
-    ws.onopen=()=>{logLine("WebSocket connecté.");setBackendStatus(!!lastHttpTime,true);};
-    ws.onclose=()=>{logLine("WebSocket fermé. Reconnexion dans 3 s.");setBackendStatus(!!lastHttpTime,false);setTimeout(connectWs,3000);};
-    ws.onerror=e=>{logLine("WS error: "+(e.message||"undefined"));};
-    ws.onmessage=msg=>{
-      try{
-        const data=JSON.parse(msg.data);
-        if(data.type==="welcome"){logLine("WS welcome, height="+data.height);}
-        else if(data.type==="block"){logLine("Nouveau bloc height="+data.height);refreshStats();syncPowWalletFromServer();}
-        else{logLine("WS msg: "+JSON.stringify(data));}
-      }catch(e){logLine("WS parse error: "+e.message);}
-    };
-  }
-
-  // ---- Chart POW/USDC ----
-  function drawChart(){
-    const canvas=el("chart");const ctx=canvas.getContext("2d");
-    const w=canvas.width=canvas.clientWidth;const h=canvas.height=canvas.clientHeight;
-    ctx.clearRect(0,0,w,h);ctx.strokeStyle="#22d3ee";ctx.lineWidth=2;ctx.beginPath();
-    const points=30;
-    for(let i=0;i<points;i++){
-      const x=(i/(points-1))*w;
-      const y=h-Math.pow(i/(points-1),1.4)*h*0.8-h*0.1;
-      if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y);
+    try{
+      const proto = location.protocol === "https:" ? "wss" : "ws";
+      ws = new WebSocket(proto + "://" + location.host + "/ws");
+      ws.onopen = () => {
+        setPill("pillWs",true);
+        logMsg("WebSocket connecté.");
+      };
+      ws.onclose = () => {
+        setPill("pillWs",false);
+        logMsg("WebSocket fermé. Reconnexion dans 3 s.");
+        setTimeout(connectWs,3000);
+      };
+      ws.onerror = (e) => {
+        setPill("pillWs",false);
+        logMsg("WS error: "+(e && e.message ? e.message : "undefined"));
+      };
+      ws.onmessage = (ev) => {
+        try{
+          const msg = JSON.parse(ev.data);
+          if(msg.type === "welcome"){
+            logMsg("WS welcome, height="+msg.height);
+          }else if(msg.type === "stats"){
+            el("netHeight").textContent = msg.height;
+            el("netWallets").textContent = msg.wallets;
+            el("netLpPow").textContent = msg.lpPow;
+            el("netLpUsdc").textContent = msg.lpUsdcPow;
+            el("netTreasPow").textContent = msg.treasuryPow;
+            el("netTreasUsdc").textContent = msg.treasuryUsdc;
+          }
+        }catch(e){}
+      };
+    }catch(e){
+      logMsg("WS connect ERR: "+e);
     }
-    ctx.stroke();
   }
 
-  // ---- Boutons ----
-  el("btnGenPow").onclick=()=>{generatePowWallet();syncPowWalletFromServer();};
-  el("btnReloadPow").onclick=syncPowWalletFromServer;
-  el("btnConnectPhantom").onclick=connectPhantom;
-  el("btnRefreshSol").onclick=refreshSolBalances;
-  el("btnLoadBlocks").onclick=loadBlocks;
-  el("btnClearLog").onclick=()=>{logBox.value="";};
-  el("btnBridge").onclick=doBridge;
-
-  el("btnSend").onclick=async()=>{
+  // ---------- WALLET POWCHAIN LOCAL ----------
+  function loadPowWallet(){
     try{
-      const to=el("destPow").value.trim();
-      const amount=Number(el("sendAmount").value.trim());
-      if(!to||!Number.isFinite(amount)||amount<=0){alert("Remplis destinataire + montant.");return;}
-      const tx=await signPowTx({type:"transfer",to,amount});if(!tx)return;
-      const res=await sendPowTx(tx);
-      logLine("TX transfer réponse: "+JSON.stringify(res));
-      await syncPowWalletFromServer();await refreshStats();
-    }catch(e){logLine("ERR send POW: "+e.message);}
-  };
+      powAddr = localStorage.getItem("pow_addr") || null;
+      powPriv = localStorage.getItem("pow_priv") || null;
+      if(powAddr){
+        el("powAddr").value = powAddr;
+        fetchWallet();
+      }
+    }catch(e){
+      logMsg("loadPowWallet ERR: "+e);
+    }
+  }
 
-  el("btnStake").onclick=async()=>{
+  function genPowWallet(){
     try{
-      const amount=Number(el("stakeAmount").value.trim());
-      if(!Number.isFinite(amount)||amount<=0){alert("Montant stake invalide.");return;}
-      const tx=await signPowTx({type:"stake",amount});if(!tx)return;
-      const res=await sendPowTx(tx);
-      logLine("TX stake réponse: "+JSON.stringify(res));
-      await syncPowWalletFromServer();await refreshStats();
-    }catch(e){logLine("ERR stake: "+e.message);}
-  };
+      const kp = nacl.sign.keyPair();
+      powAddr = bs58.default ? bs58.default.encode(kp.publicKey) : bs58.encode(kp.publicKey);
+      powPriv = bs58.default ? bs58.default.encode(kp.secretKey) : bs58.encode(kp.secretKey);
+      localStorage.setItem("pow_addr",powAddr);
+      localStorage.setItem("pow_priv",powPriv);
+      el("powAddr").value = powAddr;
+      logMsg("Nouveau wallet POWCHAIN généré.");
+      fetchWallet();
+    }catch(e){
+      alert("Erreur génération wallet POWCHAIN : "+e);
+      logMsg("Wallet gen ERR: "+e);
+    }
+  }
 
-  el("btnAddLp").onclick=async()=>{
+  async function fetchWallet(){
+    if(!powAddr) return;
     try{
-      const amountPow=Number(el("lpPow").value.trim());
-      const amountUsdc=Number(el("lpUsdc").value.trim());
-      if(amountPow<=0||amountUsdc<=0){alert("Montants LP invalides.");return;}
-      const tx=await signPowTx({type:"add_lp",amountPow,amountUsdc});if(!tx)return;
-      const res=await sendPowTx(tx);
-      logLine("TX add_lp réponse: "+JSON.stringify(res));
-      await syncPowWalletFromServer();await refreshStats();
-    }catch(e){logLine("ERR add LP: "+e.message);}
-  };
+      const r = await fetch("/wallet?id="+encodeURIComponent(powAddr));
+      if(!r.ok) throw new Error("HTTP "+r.status);
+      const w = await r.json();
+      el("powPow").textContent = w.pow;
+      el("powUsdc").textContent = w.usdc;
+    }catch(e){
+      logMsg("Wallet fetch ERR: "+e);
+    }
+  }
 
-  // ---- Init ----
-  window.addEventListener("load",()=>{
-    drawChart();
-    const w=loadLocalWallet();if(w)updatePowBalancesView(w);
-    refreshStats();syncPowWalletFromServer();connectWs();
-    setInterval(refreshStats,30000);
-    window.addEventListener("resize",drawChart);
-  });
+  // ---------- PHANTOM ----------
+  async function connectPhantom(){
+    try{
+      if(!window.solana || !window.solana.isPhantom){
+        alert("Phantom non détecté.");
+        return;
+      }
+      const resp = await window.solana.connect();
+      const pub = resp.publicKey.toString();
+      el("solAddr").value = pub;
+      logMsg("Phantom connecté: "+pub);
+      await refreshSol();
+    }catch(e){
+      logMsg("Phantom connect ERR: "+e);
+    }
+  }
+
+  async function refreshSol(){
+    try{
+      const addr = el("solAddr").value;
+      if(!addr){
+        logMsg("refreshSol: pas d'adresse Phantom.");
+        return;
+      }
+      const conn = new solanaWeb3.Connection(RPC_SOL);
+      const pub = new solanaWeb3.PublicKey(addr);
+      const lamports = await conn.getBalance(pub,"confirmed");
+      const sol = lamports / 1e9;
+
+      // USDC SPL
+      let usdc = 0;
+      try{
+        const mint = new solanaWeb3.PublicKey(USDC_MINT);
+        const toks = await conn.getParsedTokenAccountsByOwner(pub,{ mint });
+        toks.value.forEach(a=>{
+          const amt = a.account.data.parsed.info.tokenAmount.uiAmount || 0;
+          usdc += Number(amt);
+        });
+      }catch(e){}
+
+      el("solBal").textContent = sol.toFixed(5);
+      el("usdcBal").textContent = usdc.toFixed(2);
+      logMsg("Soldes Phantom mis à jour.");
+    }catch(e){
+      logMsg("refreshSol ERR: "+e);
+    }
+  }
+
+  // ---------- BRIDGE SOL → POWCHAIN ----------
+  async function bridgeSol(){
+    try{
+      if(!powAddr){
+        alert("Génère d'abord un wallet POWCHAIN.");
+        return;
+      }
+      if(!window.solana || !window.solana.isPhantom){
+        alert("Connecte Phantom d'abord.");
+        return;
+      }
+      const amtStr = el("bridgeAmount").value.trim();
+      const amt = Number(amtStr);
+      if(!amt || amt <= 0){
+        alert("Montant SOL invalide.");
+        return;
+      }
+
+      const conn = new solanaWeb3.Connection(RPC_SOL);
+      const fromPub = window.solana.publicKey;
+      const toPub = new solanaWeb3.PublicKey(TREASURY_SOL);
+      const lamports = Math.floor(amt * 1e9);
+
+      let tx = new solanaWeb3.Transaction().add(
+        solanaWeb3.SystemProgram.transfer({
+          fromPubkey: fromPub,
+          toPubkey: toPub,
+          lamports
+        })
+      );
+      tx.feePayer = fromPub;
+      const { blockhash } = await conn.getLatestBlockhash();
+      tx.recentBlockhash = blockhash;
+
+      const signed = await window.solana.signTransaction(tx);
+      const sig = await conn.sendRawTransaction(signed.serialize());
+      await conn.confirmTransaction(sig,"confirmed");
+
+      logMsg("Bridge SOL on-chain envoyé: "+sig);
+
+      // Notify POWCHAIN backend pour créditer POW
+      const r = await fetch("/tx",{
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({
+          type:"bridge",
+          to: powAddr,
+          amountSol: amt,
+          solanaSig: sig
+        })
+      });
+
+      const js = await r.json();
+      if(!r.ok || js.error){
+        logMsg("Bridge backend ERR: "+(js.error || r.status));
+        alert("Bridge côté POWCHAIN refusé: "+(js.error || "HTTP "+r.status));
+        return;
+      }
+      logMsg("Bridge validé sur POWCHAIN, +" + js.amountPow + " POW.");
+      alert("Requête de bridge envoyée et validée. Regarde le solde POWCHAIN.");
+      fetchWallet();
+    }catch(e){
+      logMsg("Bridge ERR: "+e);
+      alert("Erreur bridge: "+e);
+    }
+  }
+
+  // ---------- ACTIONS POWCHAIN (send / stake) ----------
+  async function sendPow(){
+    if(!powAddr){alert("Génère un wallet POWCHAIN d'abord.");return;}
+    const dest = el("sendTo").value.trim();
+    const amt = Number(el("sendAmount").value.trim());
+    if(!dest || !amt || amt<=0){alert("Paramètres SEND invalides.");return;}
+    try{
+      const r = await fetch("/tx",{
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({type:"send",from:powAddr,to:dest,amount:amt})
+      });
+      const js = await r.json();
+      if(!r.ok || js.error){alert("SEND ERR: "+(js.error||r.status));logMsg("SEND ERR: "+(js.error||r.status));return;}
+      logMsg("SEND OK "+amt+" POW → "+dest);
+      fetchWallet();
+    }catch(e){
+      logMsg("SEND fetch ERR: "+e);
+    }
+  }
+
+  async function stakePow(kind){
+    if(!powAddr){alert("Génère un wallet POWCHAIN d'abord.");return;}
+    const amt = Number(el("stakeAmount").value.trim());
+    if(!amt || amt<=0){alert("Montant stake invalide.");return;}
+    const type = kind==="in" ? "stake" : "unstake";
+    try{
+      const r = await fetch("/tx",{
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({type,from:powAddr,amount:amt})
+      });
+      const js = await r.json();
+      if(!r.ok || js.error){alert("STAKE ERR: "+(js.error||r.status));logMsg("STAKE ERR: "+(js.error||r.status));return;}
+      logMsg(type.toUpperCase()+" OK "+amt+" POW");
+      fetchWallet();
+    }catch(e){
+      logMsg("STAKE fetch ERR: "+e);
+    }
+  }
+
+  async function addLp(){
+    if(!powAddr){alert("Génère un wallet POWCHAIN d'abord.");return;}
+    const powAmt = Number(el("lpPow").value.trim());
+    const usdcAmt = Number(el("lpUsdc").value.trim());
+    if(!powAmt||powAmt<=0||!usdcAmt||usdcAmt<=0){alert("Montants LP invalides.");return;}
+    try{
+      const r = await fetch("/tx",{
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({type:"addLP",from:powAddr,pow:powAmt,usdc:usdcAmt})
+      });
+      const js = await r.json();
+      if(!r.ok || js.error){alert("ADD LP ERR: "+(js.error||r.status));logMsg("ADD LP ERR: "+(js.error||r.status));return;}
+      logMsg("ADD LP OK POW="+powAmt+" / USDC POW="+usdcAmt);
+      refreshStats();
+    }catch(e){
+      logMsg("ADD LP fetch ERR: "+e);
+    }
+  }
+
+  // ---------- Explorer ----------
+  async function loadLastBlocks(){
+    try{
+      const r = await fetch("/chain");
+      if(!r.ok) throw new Error("HTTP "+r.status);
+      const chain = await r.json();
+      const last = chain.slice(-30);
+      logMsg("Derniers blocs :");
+      last.forEach(b=>{
+        logMsg("Block #"+b.index+" txs="+(b.txs?b.txs.length:0)+" hash="+(b.hash||""));
+      });
+    }catch(e){
+      logMsg("Explorer ERR: "+e);
+    }
+  }
+
+  // ---------- INIT ----------
+  function init(){
+    el("btnGenPow").onclick = genPowWallet;
+    el("btnReloadPow").onclick = fetchWallet;
+    el("btnConnectPhantom").onclick = connectPhantom;
+    el("btnRefreshSol").onclick = refreshSol;
+    el("btnBridge").onclick = bridgeSol;
+    el("btnSend").onclick = sendPow;
+    el("btnStake").onclick = ()=>stakePow("in");
+    el("btnUnstake").onclick = ()=>stakePow("out");
+    el("btnAddLp").onclick = addLp;
+    el("btnLoadBlocks").onclick = loadLastBlocks;
+    el("btnClearLog").onclick = ()=>{el("log").value="";};
+
+    loadPowWallet();
+    refreshStats();
+    connectWs();
+    setInterval(refreshStats,60000);
+  }
+
+  window.addEventListener("load",init);
 })();
 </script>
 </body>
 </html>
 
 
-sudo systemctl restart nginx
+
+
+
+
+
+
+
+
+
+
