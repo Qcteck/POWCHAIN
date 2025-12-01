@@ -1,1 +1,544 @@
-nano /root/server.js
+mkdir -p /root/fireinners
+nano /root/fireinners/server.js
+
+
+
+
+// ===================== FIREINNERS — SERVER.JS (vraie tx Solana) =====================
+const express = require("express");
+const bodyParser = require("body-parser");
+const WebSocket = require("ws");
+const nacl = require("tweetnacl");
+const bs58 = require("bs58");
+const http = require("http");
+
+// ------------------- CONFIG SERVEUR -------------------
+const HTTP_PORT = 3000;
+const WS_PATH = "/ws";
+
+// RPC Solana (drpc de l'utilisateur)
+const RPC_URL = "https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac";
+const LAMPORTS_PER_SOL = 1_000_000_000;
+
+// Adresse de TRÉSORERIE Solana (FIREINNERS)
+const TREASURY_SOL = "BZJsWeJizv3YeyuWjF5187jrcduPFAHWjqL7jgq4kGwy";
+
+const app = express();
+app.use(bodyParser.json());
+
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server, path: WS_PATH });
+const clients = new Set();
+
+// ------------------- ECONOMIE FIREINNERS -------------------
+const DEC = 1e6;
+const SUPPLY_MAX = 100_000_000 * DEC; // hard cap 100M FIRE
+
+let supplyCirculante = 0;
+let mintedTotal = 0;
+let burnedTotal = 0;
+
+let treasury = { fire: 0, sol: 0, usdc: 0 };
+let wallets = {}; // addr -> { pub, fire, usdc, nonce }
+let chain = [];   // historique des bridges + events simples
+let usedTxSigs = new Set(); // pour éviter de re-utiliser la même tx
+
+// ------------------- OUTILS -------------------
+function ensureWallet(addr) {
+  if (!wallets[addr]) {
+    wallets[addr] = {
+      pub: addr,
+      fire: 0,
+      usdc: 0,
+      nonce: 0
+    };
+  }
+  return wallets[addr];
+}
+
+function mint(amount) {
+  const cap = SUPPLY_MAX - supplyCirculante;
+  const x = Math.max(0, Math.min(amount, cap));
+  supplyCirculante += x;
+  mintedTotal += x;
+  return x;
+}
+
+function burn(amount) {
+  const x = Math.max(0, Math.min(amount, supplyCirculante));
+  supplyCirculante -= x;
+  burnedTotal += x;
+  return x;
+}
+
+function broadcast(obj) {
+  const msg = JSON.stringify(obj);
+  for (const c of clients) {
+    if (c.readyState === 1) c.send(msg);
+  }
+}
+
+// ------------------- RPC SOLANA — VERIF TX -------------------
+async function fetchJsonRPC(body) {
+  const res = await fetch(RPC_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  if (!res.ok) throw new Error("RPC HTTP " + res.status);
+  const json = await res.json();
+  if (json.error) throw new Error("RPC error: " + JSON.stringify(json.error));
+  return json.result;
+}
+
+/**
+ * Vérifie une transaction Solana :
+ * - pas d'erreur
+ * - transferts vers TREASURY_SOL
+ * - calcule les lamports réellement reçus par la trésorerie
+ */
+async function verifyBridgeTxSig(txSig) {
+  const result = await fetchJsonRPC({
+    jsonrpc: "2.0",
+    id: 1,
+    method: "getTransaction",
+    params: [txSig, { encoding: "jsonParsed", commitment: "confirmed" }]
+  });
+
+  if (!result) throw new Error("Transaction introuvable");
+  if (result.meta && result.meta.err) throw new Error("Transaction en erreur");
+
+  const msg = result.transaction.message;
+  const meta = result.meta;
+  if (!msg || !meta) throw new Error("Transaction incomplète");
+
+  const accountKeys = msg.accountKeys.map(k => (k.pubkey ? k.pubkey : k));
+  const idxTreasury = accountKeys.findIndex(k => k === TREASURY_SOL);
+  if (idxTreasury < 0) throw new Error("Trésorerie non trouvée dans la tx");
+
+  const pre = meta.preBalances[idxTreasury] || 0;
+  const post = meta.postBalances[idxTreasury] || 0;
+  const diff = post - pre;
+  if (diff <= 0) throw new Error("Aucun SOL reçu par la trésorerie");
+
+  const solAmount = diff / LAMPORTS_PER_SOL;
+  return { lamports: diff, solAmount };
+}
+
+// ------------------- API WALLET -------------------
+app.get("/wallet/:addr", (req, res) => {
+  const w = ensureWallet(req.params.addr);
+  res.json({
+    addr: w.pub,
+    fire: w.fire,
+    usdc: w.usdc,
+    nonce: w.nonce,
+    supplyCirculante,
+    supplyDisponible: SUPPLY_MAX - supplyCirculante,
+    mintedTotal,
+    burnedTotal,
+    treasury
+  });
+});
+
+// petit endpoint de "ping" pour l'UI
+app.get("/wallet/ping-test", (req, res) => {
+  res.json({ ok: true });
+});
+
+// ------------------- API BRIDGE (VRAIE TX SOLANA) -------------------
+app.post("/bridge", async (req, res) => {
+  try {
+    const { addr, txSig } = req.body;
+    if (!addr || !txSig) {
+      return res.status(400).json({ ok: false, error: "addr ou txSig manquant" });
+    }
+
+    if (usedTxSigs.has(txSig)) {
+      return res.status(400).json({ ok: false, error: "Bridge déjà utilisé pour cette transaction" });
+    }
+
+    // Vérif on-chain via RPC
+    const { solAmount } = await verifyBridgeTxSig(txSig);
+    if (solAmount <= 0) {
+      return res.status(400).json({ ok: false, error: "SOL reçu = 0" });
+    }
+
+    // Log côté trésorerie
+    treasury.sol += solAmount;
+
+    // Économie FIRE :
+    //  - 1000 FIRE par SOL
+    //  - 7% de frais total
+    const fireBrut = Math.floor(solAmount * 1000 * DEC);
+    const fireMinted = mint(fireBrut);
+    if (fireMinted <= 0) {
+      return res.status(400).json({ ok: false, error: "Plus de supply FIRE disponible" });
+    }
+
+    const feeTotal = Math.floor(fireMinted * 7 / 100); // 7%
+    const fireUser = fireMinted - feeTotal;
+    if (fireUser <= 0) {
+      return res.status(400).json({ ok: false, error: "Net FIRE <= 0" });
+    }
+
+    const feeBurn = Math.floor(feeTotal / 2);
+    const feeTreas = feeTotal - feeBurn;
+
+    const burned = burn(feeBurn);
+    treasury.fire += feeTreas;
+
+    const w = ensureWallet(addr);
+    w.fire += fireUser;
+
+    usedTxSigs.add(txSig);
+
+    const evt = {
+      type: "BRIDGE_IN",
+      time: Date.now(),
+      addr,
+      txSig,
+      solAmount,
+      fireMinted,
+      fireUser,
+      feeBurned: burned,
+      feeTreas,
+      supplyCirculante,
+      supplyDisponible: SUPPLY_MAX - supplyCirculante,
+      treasurySnapshot: { ...treasury }
+    };
+    chain.push(evt);
+    broadcast({ type: "bridge", bridge: evt });
+
+    return res.json({ ok: true, bridge: evt });
+
+  } catch (e) {
+    console.error("Bridge error:", e);
+    return res.status(500).json({ ok: false, error: e.message || "Erreur bridge" });
+  }
+});
+
+// ------------------- API CHAIN -------------------
+app.get("/chain", (req, res) => {
+  res.json(chain);
+});
+
+// ------------------- WEBSOCKET -------------------
+wss.on("connection", ws => {
+  clients.add(ws);
+  ws.on("close", () => clients.delete(ws));
+});
+
+// ------------------- DEMARRAGE -------------------
+server.listen(HTTP_PORT, () => {
+  console.log("FIREINNERS API + WS en ligne sur port", HTTP_PORT);
+});
+
+
+
+
+
+
+pm2 restart fireinners
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+nano /var/www/html/index.html
+
+
+
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<title>FIREINNERS Dashboard</title>
+<style>
+body{margin:0;background:#05070b;color:#e5ecff;font-family:system-ui}
+#wrap{max-width:960px;margin:20px auto;padding:16px;border-radius:10px;border:1px solid #222b37;background:#0b111c;box-shadow:0 0 22px #000}
+h1{margin:0 0 10px;text-align:center;color:#f97316}
+h2{margin:14px 0 6px;color:#93c5fd}
+button,input{border-radius:6px;border:1px solid #374151;background:#111827;color:#e5ecff;padding:7px 9px;margin:3px 2px;font-size:13px}
+button{cursor:pointer}
+button:hover{background:#1f2937}
+.row{display:flex;flex-wrap:wrap;gap:6px}
+.row>*{flex:1 1 160px}
+#log{background:#020617;border-radius:8px;border:1px solid #1f2937;margin-top:10px;padding:6px;height:200px;overflow:auto;font-size:12px;white-space:pre-wrap}
+.badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;border:1px solid #374151;background:#020617;margin-left:6px}
+#wsState,#apiState{width:10px;height:10px;border-radius:999px;display:inline-block;margin-left:4px;background:#4b5563}
+.green{background:#22c55e!important}
+.red{background:#ef4444!important}
+#supply{font-size:13px;margin-top:4px}
+</style>
+<!-- Solana web3.js pour construire la vraie transaction -->
+<script src="https://unpkg.com/@solana/web3.js@1.95.3/lib/index.iife.min.js"></script>
+</head>
+<body>
+<div id="wrap">
+<h1>FIREINNERS Network <span class="badge">Mainnet Bridge</span></h1>
+
+<h2>Wallet FIREINNERS</h2>
+<div class="row">
+  <button id="btnGen">Générer Wallet FIREINNERS</button>
+  <button id="btnLoad">Charger Wallet FIREINNERS</button>
+</div>
+<div class="row">
+  <input id="addrInput" placeholder="Adresse FIREINNERS (base58)"/>
+</div>
+<p id="addrView">Aucun wallet FIREINNERS chargé</p>
+
+<h2>Solana / Phantom</h2>
+<div class="row">
+  <button id="btnPhantom">Connecter Phantom</button>
+  <button id="btnBridge">Bridge SOL → FIREINNERS</button>
+</div>
+<p id="solInfo">Wallet Solana : —</p>
+
+<h2>Soldes FIREINNERS</h2>
+<p id="balView">FIRE : 0 | USDC : 0</p>
+<p id="supply">Supply circulante : 0 | Supply disponible : 0</p>
+
+<h2>Etat réseau</h2>
+<p>
+  API <span id="apiState"></span> |
+  WS <span id="wsState"></span>
+</p>
+
+<h2>Logs</h2>
+<div id="log"></div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/tweetnacl@1.0.3/nacl.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/bs58@5.0.0/index.min.js"></script>
+<script>
+const API = location.origin;
+const RPC_URL = "https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac";
+const TREASURY_SOL = "BZJsWeJizv3YeyuWjF5187jrcduPFAHWjqL7jgq4kGwy";
+const LAMPORTS_PER_SOL = 1_000_000_000;
+
+// -------- LOG UI --------
+function log(msg){
+  const box=document.getElementById("log");
+  box.textContent += "["+new Date().toLocaleTimeString()+"] "+msg+"\n";
+  box.scrollTop = box.scrollHeight;
+}
+
+// -------- WALLET FIREINNERS --------
+let fireAddr = null;
+let firePriv = null;
+
+function updateAddrView(){
+  document.getElementById("addrView").textContent = fireAddr
+    ? "Wallet FIREINNERS : "+fireAddr
+    : "Aucun wallet FIREINNERS chargé";
+}
+
+// génération locale (clé Ed25519, adresse = pubkey base58)
+document.getElementById("btnGen").onclick = () => {
+  try{
+    const kp = nacl.sign.keyPair();
+    fireAddr = bs58.default.encode(kp.publicKey);
+    firePriv = bs58.default.encode(kp.secretKey);
+    document.getElementById("addrInput").value = fireAddr;
+    updateAddrView();
+    log("Nouveau wallet FIREINNERS généré");
+    refreshWallet();
+  }catch(e){
+    log("Erreur génération wallet: "+e.message);
+  }
+};
+
+document.getElementById("btnLoad").onclick = () => {
+  const a = document.getElementById("addrInput").value.trim();
+  if(!a){ alert("Entre une adresse FIREINNERS"); return; }
+  fireAddr = a;
+  updateAddrView();
+  refreshWallet();
+};
+
+// lecture côté backend
+async function refreshWallet(){
+  if(!fireAddr) return;
+  try{
+    const r = await fetch(API+"/wallet/"+encodeURIComponent(fireAddr));
+    if(!r.ok) throw new Error("HTTP "+r.status);
+    const j = await r.json();
+    document.getElementById("balView").textContent =
+      "FIRE : "+(j.fire/1e6).toFixed(6)+" | USDC : "+(j.usdc/1e6).toFixed(6);
+    document.getElementById("supply").textContent =
+      "Supply circulante : "+(j.supplyCirculante/1e6).toFixed(2)+
+      " | Supply disponible : "+(j.supplyDisponible/1e6).toFixed(2);
+    log("Wallet FIREINNERS refresh OK");
+  }catch(e){
+    log("Erreur refresh wallet: "+e.message);
+  }
+}
+setInterval(refreshWallet,5000);
+
+// -------- PHANTOM / SOLANA --------
+let phantom = null;
+let solPubkey = null;
+
+document.getElementById("btnPhantom").onclick = async () => {
+  try{
+    if(!window.phantom || !window.phantom.solana){
+      alert("Phantom non détecté");
+      return;
+    }
+    phantom = window.phantom.solana;
+    const c = await phantom.connect();
+    solPubkey = c.publicKey.toString();
+    document.getElementById("solInfo").textContent = "Wallet Solana : "+solPubkey;
+    log("Phantom connecté : "+solPubkey);
+  }catch(e){
+    log("Erreur connexion Phantom: "+e.message);
+  }
+};
+
+document.getElementById("btnBridge").onclick = async () => {
+  try{
+    if(!phantom || !solPubkey){
+      alert("Connecte Phantom d'abord");
+      return;
+    }
+    if(!fireAddr){
+      alert("Génère ou charge un wallet FIREINNERS avant de bridger");
+      return;
+    }
+    const amountStr = prompt("Combien de SOL veux-tu envoyer vers FIREINNERS ?");
+    if(!amountStr) return;
+    const solAmount = Number(amountStr);
+    if(!Number.isFinite(solAmount) || solAmount <= 0){
+      alert("Montant invalide");
+      return;
+    }
+    const lamports = Math.round(solAmount * LAMPORTS_PER_SOL);
+
+    const { Connection, PublicKey, SystemProgram, Transaction } = solanaWeb3;
+    const conn = new Connection(RPC_URL, "confirmed");
+    const from = new PublicKey(solPubkey);
+    const to = new PublicKey(TREASURY_SOL);
+
+    const { blockhash } = await conn.getLatestBlockhash("finalized");
+    const tx = new Transaction({ feePayer: from, recentBlockhash: blockhash });
+    tx.add(SystemProgram.transfer({
+      fromPubkey: from,
+      toPubkey: to,
+      lamports
+    }));
+
+    log("Signature de la transaction Solana en cours…");
+    const signed = await phantom.signAndSendTransaction(tx);
+    const txSig = signed.signature;
+    log("Tx envoyée sur Solana : "+txSig);
+
+    // on informe maintenant le backend FIREINNERS avec txSig
+    log("Envoi au bridge FIREINNERS pour vérification on-chain…");
+    const r = await fetch(API+"/bridge",{
+      method:"POST",
+      headers:{ "Content-Type":"application/json" },
+      body:JSON.stringify({ addr: fireAddr, txSig })
+    });
+    const j = await r.json();
+    if(!j.ok){
+      log("Bridge FAIL: "+j.error);
+      alert("Bridge échoué: "+j.error);
+      return;
+    }
+    log("Bridge OK: "+JSON.stringify(j.bridge));
+    refreshWallet();
+  }catch(e){
+    log("Erreur bridge: "+e.message);
+  }
+};
+
+// -------- INDICATEURS API / WS --------
+function setApiState(ok){
+  const el=document.getElementById("apiState");
+  el.classList.remove("green","red");
+  el.classList.add(ok?"green":"red");
+}
+
+async function pingApi(){
+  try{
+    const r = await fetch(API+"/wallet/ping-test");
+    if(!r.ok) throw new Error("HTTP "+r.status);
+    setApiState(true);
+  }catch(e){
+    setApiState(false);
+  }
+}
+setInterval(pingApi,4000);
+pingApi();
+
+// WebSocket
+(function initWS(){
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const ws = new WebSocket(proto + "://" + location.host + "/ws");
+  const wsState = document.getElementById("wsState");
+  ws.onopen = () => {
+    wsState.classList.remove("red");
+    wsState.classList.add("green");
+    log("WS connecté");
+  };
+  ws.onclose = () => {
+    wsState.classList.remove("green");
+    wsState.classList.add("red");
+    log("WS fermé");
+    setTimeout(initWS,3000);
+  };
+  ws.onerror = () => {
+    wsState.classList.remove("green");
+    wsState.classList.add("red");
+    log("WS erreur");
+  };
+  ws.onmessage = ev => {
+    log("WS → "+ev.data);
+  };
+})();
+</script>
+</body>
+</html>
+
+
+
+
+
+nano /etc/nginx/sites-available/bbqfinance
+
+
+nginx -t
+systemctl restart nginx
+pm2 restart fireinners
+
+
+
+
+
+
+
+
+
+
+
+
+
