@@ -1,1 +1,299 @@
-pm2 start /root/fireinners/server.js --name fireinners
+sudo mkdir -p /root/powchain
+sudo nano /root/powchain/server.js
+
+
+
+
+// POWCHAIN — Validator Node Officiel (Version A)
+// PoS • Mempool • Production de blocs • LP • Wallets • Bridge SOL • WebSocket • API 3000
+// Version mémorisée (2025-11-21)
+
+// Dépendances
+const express = require("express");
+const cors = require("cors");
+const http = require("http");
+const WebSocket = require("ws");
+const nacl = require("tweetnacl");
+const bs58 = require("bs58");
+const crypto = require("crypto");
+const fs = require("fs");
+
+// Stockage chaîne (LevelDB simplifié → JSON local)
+const DB_FILE = "/root/powchain/db.json";
+
+// Charger DB
+let DB = { chain: [], wallets: {}, lp: { pow: 0, usdc: 0 }, mempool: [] };
+try {
+  if (fs.existsSync(DB_FILE)) {
+    DB = JSON.parse(fs.readFileSync(DB_FILE, "utf8"));
+    console.log("[DB] Chargée");
+  } else {
+    console.log("[DB] Nouvelle base créée");
+  }
+} catch (e) {
+  console.log("[DB] Erreur → reset DB", e);
+}
+
+// Sauvegarde DB
+function save() {
+  fs.writeFileSync(DB_FILE, JSON.stringify(DB, null, 2));
+}
+
+// Créer un hash sha256
+function sha(x) {
+  return crypto.createHash("sha256").update(x).digest("hex");
+}
+
+// Générer block genesis si vide
+if (DB.chain.length === 0) {
+  const genesis = {
+    index: 0,
+    time: Date.now(),
+    prev: "0",
+    pow: sha("genesis"),
+    tx: [],
+    stakers: {},
+    reward: 10
+  };
+  DB.chain.push(genesis);
+  save();
+  console.log("[GENESIS] Bloc Genesis créé");
+}
+
+// Express
+const app = express();
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
+
+app.use(cors());
+app.use(express.json());
+
+// Trésorerie Solana
+const TREASURY_SOL = "BZJsWeJizv3YeyuWjF5187jrcduPFAHWjqL7jgq4kGwy";
+
+// POWCHAIN paramètres
+const BLOCK_REWARD = 10;
+const BLOCK_TIME = 8000; // 8 sec
+const PORT = 3000;
+const WSPORT = 7001;
+
+// Créer wallet POWCHAIN
+function createWallet() {
+  const kp = nacl.sign.keyPair();
+  const pub = bs58.encode(kp.publicKey);
+  const priv = bs58.encode(kp.secretKey);
+  if (!DB.wallets[pub]) {
+    DB.wallets[pub] = { pow: 0, usdc: 0, staked: 0, nonce: 0, pub };
+    save();
+  }
+  return { pub, priv };
+}
+
+// Vérifier signature
+function verify(tx) {
+  try {
+    const msg = Buffer.from(
+      `${tx.from}|${tx.to}|${tx.amount}|${tx.token}|${tx.nonce}`
+    );
+    const pub = bs58.decode(tx.pub);
+    const sig = bs58.decode(tx.sig);
+    return nacl.sign.detached.verify(msg, sig, pub);
+  } catch (e) {
+    return false;
+  }
+}
+
+// Ajouter transaction dans mempool
+function addTx(tx) {
+  if (!DB.wallets[tx.from]) return false;
+  if (tx.nonce !== DB.wallets[tx.from].nonce + 1) return false;
+  if (!verify(tx)) return false;
+  DB.mempool.push(tx);
+  DB.wallets[tx.from].nonce++;
+  save();
+  return true;
+}
+
+// Appliquer TX
+function applyTx(tx) {
+  const wFrom = DB.wallets[tx.from];
+  const wTo = DB.wallets[tx.to] || (DB.wallets[tx.to] = { pow: 0, usdc: 0, staked: 0, nonce: 0, pub: tx.to });
+
+  if (tx.token === "POW") {
+    if (wFrom.pow < tx.amount) return false;
+    wFrom.pow -= tx.amount;
+    wTo.pow += tx.amount;
+  }
+
+  if (tx.token === "USDC") {
+    if (wFrom.usdc < tx.amount) return false;
+    wFrom.usdc -= tx.amount;
+    wTo.usdc += tx.amount;
+  }
+
+  return true;
+}
+
+// Produire un bloc
+function produceBlock() {
+  if (DB.mempool.length === 0) return;
+
+  const prev = DB.chain[DB.chain.length - 1];
+  const tx = [...DB.mempool];
+  DB.mempool = [];
+
+  tx.forEach(applyTx);
+
+  // PoS : choisir staker
+  const stakers = {};
+  Object.values(DB.wallets).forEach(w => {
+    if (w.staked > 0) stakers[w.pub] = w.staked;
+  });
+
+  let winner = Object.keys(stakers)[0] || null;
+  if (winner) DB.wallets[winner].pow += BLOCK_REWARD;
+
+  const block = {
+    index: prev.index + 1,
+    time: Date.now(),
+    prev: sha(JSON.stringify(prev)),
+    pow: sha(JSON.stringify(tx) + Date.now()),
+    tx,
+    stakers,
+    reward: BLOCK_REWARD,
+    winner
+  };
+
+  DB.chain.push(block);
+  save();
+  broadcast({ type: "block", block });
+
+  console.log("[BLOCK] Nouveau bloc", block.index);
+}
+
+// Boucle de production de blocs
+setInterval(produceBlock, BLOCK_TIME);
+
+// WebSocket
+function broadcast(o) {
+  const m = JSON.stringify(o);
+  wss.clients.forEach(c => {
+    if (c.readyState === WebSocket.OPEN) c.send(m);
+  });
+}
+
+wss.on("connection", ws => {
+  console.log("[WS] client connecté");
+  ws.send(JSON.stringify({ type: "chain", height: DB.chain.length }));
+});
+
+// API EXPRESS
+
+// /wallet/create
+app.get("/wallet/create", (req, res) => {
+  res.json(createWallet());
+});
+
+// /wallet/:pub
+app.get("/wallet/:pub", (req, res) => {
+  const w = DB.wallets[req.params.pub];
+  res.json(w || {});
+});
+
+// /tx (POST)
+app.post("/tx", (req, res) => {
+  const ok = addTx(req.body);
+  res.json({ ok });
+});
+
+// /chain
+app.get("/chain", (req, res) => {
+  res.json(DB.chain);
+});
+
+// LP POW ↔ USDC (x*y=k)
+app.get("/lp", (req, res) => {
+  res.json(DB.lp);
+});
+
+// BRIDGE notify
+app.post("/bridge", (req, res) => {
+  const { sig, from, to, lamports, fireAddr } = req.body;
+
+  if (to !== TREASURY_SOL) return res.json({ ok: false, error: "bad treasury" });
+
+  const sol = lamports / 1_000_000_000;
+
+  if (!DB.wallets[fireAddr]) createWallet(fireAddr);
+
+  DB.wallets[fireAddr].pow += sol * 10; // ratio ex. 1 SOL = 10 POW
+  save();
+
+  broadcast({ type: "bridge", fireAddr, sol });
+
+  res.json({ ok: true });
+});
+
+// Stats POWCHAIN
+app.get("/stats", (req, res) => {
+  const totalPow = Object.values(DB.wallets).reduce((a, w) => a + w.pow, 0);
+  const totalStaked = Object.values(DB.wallets).reduce((a, w) => a + w.staked, 0);
+
+  res.json({
+    height: DB.chain.length,
+    blocks: DB.chain.length,
+    wallets: Object.keys(DB.wallets).length,
+    mempool: DB.mempool.length,
+    totalPow,
+    totalStaked,
+    lp: DB.lp
+  });
+});
+
+// Lancer serveur
+server.listen(PORT, () => console.log("POWCHAIN HTTP API sur port", PORT));
+server.on("upgrade", (req, socket, head) => {
+  if (req.url === "/ws") wss.handleUpgrade(req, socket, head, ws => wss.emit("connection", ws, req));
+});
+
+server.listen(PORT);
+console.log("POWCHAIN WebSocket sur port", WSPORT);
+
+
+
+pm2 stop fireinners
+pm2 delete fireinners
+pm2 start /root/powchain/server.js --name powchain
+pm2 save
+pm2 logs powchain --lines 30
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+sudo nano /var/www/bbqfinance/index.html
+
+
+<!doctype html><html lang="fr"><head><meta charset="utf-8"/><meta name="viewport"content="width=device-width,initial-scale=1"/><title>POWCHAIN — Wallet & Bridge</title><script src="https://unpkg.com/@solana/web3.js@1.95.3/lib/index.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/tweetnacl@1.0.3/nacl.min.js"></script><script src="https://cdn.jsdelivr.net/npm/bs58@5.0.0/index.min.js"></script><style>body{margin:0;background:#05070b;color:#e5ecff;font-family:system-ui,Arial}#wrap{max-width:1150px;margin:18px auto;padding:16px;border-radius:12px;border:1px solid #1f2933;background:#050816;box-shadow:0 0 25px #000}h1{text-align:center;margin:0 0 10px;font-size:22px;color:#7dd3fc;text-shadow:0 0 10px #38bdf8}h2{margin:8px 0 4px;font-size:16px;color:#fca5a5}.row{display:flex;flex-wrap:wrap;gap:12px}.card{flex:1 1 260px;padding:10px;border-radius:10px;border:1px solid #374151;background:#020617cc}button,input,select{width:100%;margin:4px 0;padding:7px;border-radius:6px;border:1px solid #4b5563;background:#020617;color:#e5ecff;font-size:13px}#log{margin-top:10px;height:170px;overflow:auto;border-radius:8px;border:1px solid #374151;background:#020617;font-size:12px;white-space:pre-line;padding:6px}#stats span{color:#bbf7d0}#wsDot{display:inline-block;width:10px;height:10px;border-radius:50%;background:#ef4444;margin-left:6px;vertical-align:middle}</style></head><body><div id="wrap"><h1>POWCHAIN — Wallet • Bridge • Stats <span id="wsDot" title="WebSocket"></span></h1><div class="row"><div class="card"><h2>1. Connexion Phantom</h2><button id="btnConnectPhantom">Connecter Phantom</button><div style="font-size:12px;margin-top:4px">Phantom: <span id="phStatus">non connecté</span><br>Adresse: <span id="phAddr">-</span><br>SOL: <span id="phSol">-</span></div><div id="phMsg" style="font-size:12px;color:#9ca3af;margin-top:4px"></div></div><div class="card"><h2>2. Wallet POWCHAIN</h2><button id="btnCreate">Créer un wallet POWCHAIN (serveur)</button><button id="btnGenLocal">Générer un wallet POWCHAIN (local)</button><div style="font-size:12px;margin-top:4px">Adresse POWCHAIN: <span id="pwAddr">-</span><br>Clé privée locale: <span id="pwPriv">-</span></div><button id="btnLoad">Recharger le wallet (balances)</button><div style="font-size:12px;margin-top:4px">POW: <span id="pwPow">-</span> • USDC: <span id="pwUsdc">-</span> • Staked: <span id="pwStaked">-</span> • Nonce: <span id="pwNonce">-</span></div></div><div class="card"><h2>3. Bridge SOL → POWCHAIN</h2><div style="font-size:12px;margin-bottom:4px">Adresse trésorerie Solana: <span id="treasurySpan"></span></div><input id="bridgeAmount" type="number" step="0.001" min="0" placeholder="Montant SOL à bridger"><button id="btnBridge">Bridge SOL vers POWCHAIN</button><div style="font-size:12px;margin-top:4px;color:#9ca3af">Envoie du SOL avec Phantom vers la trésorerie, puis crédit en POW sur ton wallet POWCHAIN.</div></div></div><div class="row" style="margin-top:10px"><div class="card"><h2>4. Envoyer une TX POWCHAIN</h2><select id="txToken"><option value="POW">POW</option><option value="USDC">USDC</option></select><input id="txTo" placeholder="Adresse destinataire POWCHAIN"><input id="txAmount" type="number" step="0.0001" min="0" placeholder="Montant"><button id="btnSendTx">Envoyer TX</button><div style="font-size:12px;margin-top:4px;color:#9ca3af">La transaction sera signée localement avec ta clé privée et envoyée à /tx (mempool POWCHAIN).</div></div><div class="card" id="stats"><h2>5. Stats POWCHAIN</h2><div style="font-size:13px">Hauteur: <span id="stHeight">-</span><br>Wallets: <span id="stWallets">-</span><br>Mempool: <span id="stMempool">-</span><br>Total POW: <span id="stPow">-</span><br>Total Staked: <span id="stStaked">-</span></div><h2 style="margin-top:10px;font-size:14px">LP</h2><div style="font-size:13px">LP POW: <span id="stLpPow">-</span><br>LP USDC: <span id="stLpUsdc">-</span></div></div><div class="card"><h2>6. Chaîne</h2><button id="btnChain">Voir la hauteur de chaîne</button><div style="font-size:12px;margin-top:4px">Dernier bloc: <span id="lastBlock">-</span></div><div style="font-size:12px;margin-top:4px;color:#9ca3af">Les nouveaux blocs seront aussi annoncés via WebSocket.</div></div></div><div id="log"></div></div><script>(function(){const API_BASE=location.origin.replace(/\/$/,""),RPC_URL="https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac",TREASURY_SOL="BZJsWeJizv3YeyuWjF5187jrcduPFAHWjqL7jgq4kGwy";const wsDot=document.getElementById("wsDot"),logEl=document.getElementById("log"),btnConnectPhantom=document.getElementById("btnConnectPhantom"),phStatus=document.getElementById("phStatus"),phAddr=document.getElementById("phAddr"),phSol=document.getElementById("phSol"),phMsg=document.getElementById("phMsg"),btnCreate=document.getElementById("btnCreate"),btnGenLocal=document.getElementById("btnGenLocal"),btnLoad=document.getElementById("btnLoad"),pwAddr=document.getElementById("pwAddr"),pwPriv=document.getElementById("pwPriv"),pwPow=document.getElementById("pwPow"),pwUsdc=document.getElementById("pwUsdc"),pwStaked=document.getElementById("pwStaked"),pwNonce=document.getElementById("pwNonce"),bridgeAmount=document.getElementById("bridgeAmount"),btnBridge=document.getElementById("btnBridge"),treasurySpan=document.getElementById("treasurySpan"),txToken=document.getElementById("txToken"),txTo=document.getElementById("txTo"),txAmount=document.getElementById("txAmount"),btnSendTx=document.getElementById("btnSendTx"),stHeight=document.getElementById("stHeight"),stWallets=document.getElementById("stWallets"),stMempool=document.getElementById("stMempool"),stPow=document.getElementById("stPow"),stStaked=document.getElementById("stStaked"),stLpPow=document.getElementById("stLpPow"),stLpUsdc=document.getElementById("stLpUsdc"),btnChain=document.getElementById("btnChain"),lastBlock=document.getElementById("lastBlock");let provider=null,connection=null,publicKey=null,localPriv=null;treasurySpan.textContent=TREASURY_SOL;function log(m){logEl.textContent+=m+"\\n";logEl.scrollTop=logEl.scrollHeight}function saveLocal(pub,priv){try{localStorage.setItem("pow_pub",pub);localStorage.setItem("pow_priv",priv)}catch(e){}}function loadLocal(){try{const pub=localStorage.getItem("pow_pub"),priv=localStorage.getItem("pow_priv");if(pub){pwAddr.textContent=pub;if(!pwPriv.textContent||pwPriv.textContent==="-" )pwPriv.textContent=priv||"-";localPriv=priv||null;log("Wallet POWCHAIN local rechargé");}}catch(e){}}async function connectPhantom(){if(!window.solana||!window.solana.isPhantom){phMsg.textContent="Phantom non détecté. Ouvre en HTTPS avec l’extension ou navigateur Phantom.";return}provider=window.solana;try{const r=await provider.connect();publicKey=r.publicKey;phStatus.textContent="connecté";phAddr.textContent=publicKey.toBase58();connection=new solanaWeb3.Connection(RPC_URL,"confirmed");const bal=await connection.getBalance(publicKey);phSol.textContent=(bal/solanaWeb3.LAMPORTS_PER_SOL).toFixed(4);phMsg.textContent="Connecté à Phantom.";log("Phantom connecté: "+publicKey.toBase58());}catch(e){phMsg.textContent="Erreur Phantom: "+e.message;log("Erreur Phantom: "+e.message);}}async function createWalletServer(){try{const r=await fetch(API_BASE+"/wallet/create");const j=await r.json();if(j.pub){pwAddr.textContent=j.pub;pwPriv.textContent=j.priv||"-";localPriv=j.priv||null;saveLocal(j.pub,j.priv||"");log("Wallet POWCHAIN créé côté serveur.");}else log("Réponse /wallet/create invalide");}catch(e){log("Erreur /wallet/create: "+e.message);}}function genLocalWallet(){const kp=nacl.sign.keyPair(),pub=bs58.encode(kp.publicKey),priv=bs58.encode(kp.secretKey);pwAddr.textContent=pub;pwPriv.textContent=priv;localPriv=priv;saveLocal(pub,priv);log("Wallet POWCHAIN généré localement.");}async function loadWalletState(){const pub=pwAddr.textContent;if(!pub||pub==="-" ){log("Aucun wallet POWCHAIN sélectionné.");return}try{const r=await fetch(API_BASE+"/wallet/"+pub);const j=await r.json();pwPow.textContent=j.pow??0;pwUsdc.textContent=j.usdc??0;pwStaked.textContent=j.staked??0;pwNonce.textContent=j.nonce??0;log("Wallet POWCHAIN mis à jour.");}catch(e){log("Erreur /wallet/:pub: "+e.message);}}async function doBridge(){if(!publicKey){log("Connecte Phantom avant de bridger.");return}const powAddr=pwAddr.textContent;if(!powAddr||powAddr==="-" ){log("Sélectionne ou génère un wallet POWCHAIN avant de bridger.");return}const amt=parseFloat(bridgeAmount.value);if(!amt||amt<=0){log("Montant SOL invalide pour bridge.");return}if(!connection)connection=new solanaWeb3.Connection(RPC_URL,"confirmed");try{const lamports=Math.round(amt*solanaWeb3.LAMPORTS_PER_SOL),{blockhash}=await connection.getLatestBlockhash(),tx=new solanaWeb3.Transaction().add(solanaWeb3.SystemProgram.transfer({fromPubkey:publicKey,toPubkey:new solanaWeb3.PublicKey(TREASURY_SOL),lamports}));tx.feePayer=publicKey;tx.recentBlockhash=blockhash;const signed=await provider.signTransaction(tx),sig=await connection.sendRawTransaction(signed.serialize());log("TX Solana envoyée: "+sig);await connection.confirmTransaction(sig,"confirmed");await fetch(API_BASE+"/bridge",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sig,from:publicKey.toBase58(),to:TREASURY_SOL,lamports,fireAddr:powAddr})});log("Bridge notifié à POWCHAIN.");const bal=await connection.getBalance(publicKey);phSol.textContent=(bal/solanaWeb3.LAMPORTS_PER_SOL).toFixed(4);await loadWalletState();}catch(e){log("Erreur bridge: "+e.message);}}async function sendTx(){const from=pwAddr.textContent;if(!from||from==="-" ){log("Aucun wallet POWCHAIN sélectionné.");return}if(!localPriv){log("Aucune clé privée locale disponible pour signer.");return}const to=txTo.value.trim(),amount=parseFloat(txAmount.value),token=txToken.value;if(!to){log("Destinataire manquant.");return}if(!amount||amount<=0){log("Montant invalide.");return}let nonce=parseInt(pwNonce.textContent||"0",10);if(isNaN(nonce))nonce=0;nonce+=1;const msgStr=`${from}|${to}|${amount}|${token}|${nonce}`;const msg=new TextEncoder().encode(msgStr);const sk=bs58.decode(localPriv);const sig=nacl.sign.detached(msg,sk);const tx={from,to,amount,token,nonce,pub:from,sig:bs58.encode(sig)};try{const r=await fetch(API_BASE+"/tx",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(tx)});const j=await r.json();if(j.ok){log("TX envoyée au mempool.");pwNonce.textContent=nonce;await loadWalletState();}else log("TX refusée par le noeud.");}catch(e){log("Erreur /tx: "+e.message);}}async function refreshStats(){try{const r=await fetch(API_BASE+"/stats");if(!r.ok)return;const j=await r.json();stHeight.textContent=j.height;stWallets.textContent=j.wallets;stMempool.textContent=j.mempool;stPow.textContent=j.totalPow;stStaked.textContent=j.totalStaked;stLpPow.textContent=j.lp?.pow??0;stLpUsdc.textContent=j.lp?.usdc??0;}catch(e){}}async function showChainHeight(){try{const r=await fetch(API_BASE+"/chain");if(!r.ok)return;const arr=await r.json();lastBlock.textContent=arr.length>0?arr[arr.length-1].index:"-";}catch(e){}}function setupWS(){const url=(location.protocol==="https:"?"wss://":"ws://")+location.host+"/ws";const ws=new WebSocket(url);ws.onopen=()=>{wsDot.style.background="#22c55e";log("WS POWCHAIN connecté.");};ws.onclose=()=>{wsDot.style.background="#ef4444";log("WS POWCHAIN déconnecté, reconnexion dans 5s.");setTimeout(setupWS,5000);};ws.onerror=()=>{wsDot.style.background="#f97316";};ws.onmessage=e=>{try{const j=JSON.parse(e.data);if(j.type==="block"){lastBlock.textContent=j.block.index;stHeight.textContent=j.block.index;}if(j.type==="bridge"){log("Bridge WS: "+JSON.stringify(j));}}catch(err){}};}btnConnectPhantom.onclick=connectPhantom;btnCreate.onclick=createWalletServer;btnGenLocal.onclick=genLocalWallet;btnLoad.onclick=loadWalletState;btnBridge.onclick=doBridge;btnSendTx.onclick=sendTx;btnChain.onclick=showChainHeight;loadLocal();refreshStats();setInterval(refreshStats,5000);setupWS();log("Client POWCHAIN initialisé. API: "+API_BASE);})();</script></body></html>
+
+
+pm2 logs powchain --lines 20
