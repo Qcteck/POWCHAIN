@@ -1,1 +1,807 @@
-curl -s http://127.0.0.1:3000/stats
+
+
+
+
+cd /root/powchain
+nano server.js 
+
+
+// FIREINNERS — serveur principal HTTP + WebSocket
+// Ports : HTTP 3000 (API) / WS 7001 (broadcast état)
+
+const fs = require("fs");
+const path = require("path");
+const http = require("http");
+const express = require("express");
+const cors = require("cors");
+const WebSocket = require("ws");
+const nacl = require("tweetnacl");
+const naclUtil = require("tweetnacl-util");
+const bs58 = require("bs58");
+
+const PORT_HTTP = 3000;
+const PORT_WS = 7001;
+const DB_FILE = path.join(__dirname, "fireinners-db.json");
+
+// ----------------- STATE -----------------
+
+let state = {
+  height: 1,
+  wallets: {},          // addr -> {pub, priv, fire, usdc}
+  treasuryFire: 0,
+  treasuryUsdc: 0,
+  tvlFire: 0,
+  tvlUsdc: 0,
+  lpFire: 0,
+  lpUsdc: 0,
+  supplyTotal: 1_000_000_000,
+  lastId: 0,
+  bridgeEvents: []
+};
+
+function loadState() {
+  try {
+    if (fs.existsSync(DB_FILE)) {
+      const raw = fs.readFileSync(DB_FILE, "utf8");
+      state = JSON.parse(raw);
+      console.log("[FIREINNERS] État chargé.");
+    } else {
+      saveState();
+      console.log("[FIREINNERS] Nouveau state créé.");
+    }
+  } catch (e) {
+    console.error("Erreur loadState:", e);
+  }
+}
+
+function saveState() {
+  try {
+    fs.writeFileSync(DB_FILE, JSON.stringify(state, null, 2));
+  } catch (e) {
+    console.error("Erreur saveState:", e);
+  }
+}
+
+function nextId() {
+  state.lastId += 1;
+  return state.lastId;
+}
+
+// ----------------- WALLET LOCAL -----------------
+
+function newWallet() {
+  const kp = nacl.sign.keyPair();
+  const pub58 = bs58.encode(Buffer.from(kp.publicKey));
+  const priv58 = bs58.encode(Buffer.from(kp.secretKey));
+  const addr = pub58; // pour FIREINNERS, adresse = pubkey base58
+  state.wallets[addr] = {
+    pub: pub58,
+    priv: priv58,
+    fire: 0,
+    usdc: 0
+  };
+  saveState();
+  return { address: addr, pub: pub58, priv: priv58 };
+}
+
+// ----------------- EXPRESS APP -----------------
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+app.get("/stats", (req, res) => {
+  res.json({
+    ok: true,
+    height: state.height,
+    tvlFire: state.tvlFire,
+    tvlUsdc: state.tvlUsdc,
+    treasuryFire: state.treasuryFire,
+    treasuryUsdc: state.treasuryUsdc,
+    lpFire: state.lpFire,
+    lpUsdc: state.lpUsdc,
+    supplyTotal: state.supplyTotal
+  });
+});
+
+app.post("/wallet/new", (req, res) => {
+  const w = newWallet();
+  console.log("[FIREINNERS] Nouveau wallet", w.address);
+  broadcastState();
+  res.json(w);
+});
+
+app.post("/lp/add", (req, res) => {
+  const fire = Number(req.body.fire) || 0;
+  const usdc = Number(req.body.usdc) || 0;
+  if (fire <= 0 || usdc <= 0) {
+    return res.status(400).json({ ok: false, error: "Montants invalides" });
+  }
+  state.lpFire += fire;
+  state.lpUsdc += usdc;
+  state.tvlFire += fire;
+  state.tvlUsdc += usdc;
+  const id = nextId();
+  console.log(`[FIREINNERS] LP add id=${id} FIRE=${fire} USDC=${usdc}`);
+  if (fire >= 10_000 && usdc >= 10_000) {
+    console.log("[FIREINNERS] Session Whale détectée (LP élevé).");
+  }
+  saveState();
+  broadcastState();
+  res.json({ ok: true, id, lpFire: state.lpFire, lpUsdc: state.lpUsdc });
+});
+
+// Bridge SOL → FIREINNERS (enregistrement simple)
+app.post("/bridge/sol", (req, res) => {
+  const { from, amountSol, signature } = req.body || {};
+  if (!from || !amountSol || amountSol <= 0) {
+    return res.status(400).json({ ok: false, error: "Paramètres invalides" });
+  }
+  const id = nextId();
+  state.bridgeEvents.push({
+    id,
+    from,
+    amountSol: Number(amountSol),
+    signature: signature || null,
+    ts: Date.now()
+  });
+  // Ici tu peux ajouter la logique : créditer FIRE interne, etc.
+  console.log(`[FIREINNERS] BRIDGE_REQUEST id=${id} from=${from} sol=${amountSol}`);
+  saveState();
+  broadcastState();
+  res.json({ ok: true, id });
+});
+
+// simple endpoint chaînes (placeholder)
+app.get("/chain", (req, res) => {
+  res.json({ ok: true, height: state.height, blocks: [] });
+});
+
+// ----------------- HTTP & WS SERVERS -----------------
+
+const server = http.createServer(app);
+
+const wss = new WebSocket.Server({ server });
+
+const allowedOrigins = [
+  "https://bbqfinance.fun",
+  "https://www.bbqfinance.fun",
+  "http://bbqfinance.fun",
+  "http://www.bbqfinance.fun",
+  "http://localhost:3000",
+  "http://127.0.0.1:3000"
+];
+
+wss.on("connection", (ws, req) => {
+  const origin = req.headers.origin;
+  if (origin && !allowedOrigins.includes(origin)) {
+    console.log("[FIREINNERS] WS refusé (origin)", origin);
+    ws.close();
+    return;
+  }
+  console.log("[FIREINNERS] WS client connecté");
+
+  ws.send(JSON.stringify({ type: "state", state }));
+
+  ws.on("close", () => {
+    console.log("[FIREINNERS] WS client déconnecté");
+  });
+});
+
+function broadcastState() {
+  const payload = JSON.stringify({ type: "state", state });
+  wss.clients.forEach(c => {
+    if (c.readyState === WebSocket.OPEN) c.send(payload);
+  });
+}
+
+setInterval(() => {
+  broadcastState();
+}, 5000);
+
+// ----------------- START -----------------
+
+loadState();
+
+server.listen(PORT_HTTP, () => {
+  console.log(`[FIREINNERS] HTTP API sur port ${PORT_HTTP} (/stats /wallet /lp /bridge /chain)`);
+  console.log(`[FIREINNERS] WebSocket sur port ${PORT_WS} (via Nginx /ws)`);
+});
+
+// WS pur si tu préfères HTTP + WS séparés (ici on réutilise le même serveur HTTP)
+const wsServer = new WebSocket.Server({ port: PORT_WS });
+wsServer.on("connection", (ws) => {
+  console.log("[FIREINNERS] WS direct 7001 connecté");
+  ws.send(JSON.stringify({ type: "state", state }));
+  ws.on("close", () => console.log("[FIREINNERS] WS direct 7001 déconnecté"));
+});
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+nano /var/www/bbqfinance/index.html
+
+
+
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8"/>
+  <title>FIREINNERS — Client Complet</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <script src="https://unpkg.com/@solana/web3.js@1.95.3/lib/index.iife.min.js"></script>
+  <style>
+    :root{
+      --bg:#05070b;
+      --panel:#08111f;
+      --panel-soft:#0b1322;
+      --accent:#f97316;
+      --accent-soft:#fbbf24;
+      --accent-deep:#ea580c;
+      --txt:#e5ecff;
+      --txt-muted:#9ca3af;
+      --border:#273549;
+      --green:#22c55e;
+      --red:#ef4444;
+      --badge-bg:#111827;
+      --badge-ok:#15803d;
+      --badge-bad:#7f1d1d;
+    }
+    *{box-sizing:border-box}
+    body{
+      margin:0;
+      font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+      background:
+        radial-gradient(circle at 0 0,#111827 0,#020617 45%,#000 90%);
+      color:var(--txt);
+      min-height:100vh;
+    }
+    #wrap{
+      max-width:1180px;
+      margin:20px auto;
+      padding:18px;
+      border-radius:14px;
+      border:1px solid #111827;
+      background:linear-gradient(135deg,#020617,#020617 40%,#050816);
+      box-shadow:0 0 40px #000a;
+    }
+    header{
+      display:flex;
+      flex-wrap:wrap;
+      justify-content:space-between;
+      align-items:center;
+      gap:12px;
+      margin-bottom:14px;
+    }
+    h1{
+      margin:0;
+      font-size:26px;
+      letter-spacing:.12em;
+      text-transform:uppercase;
+      color:var(--accent-soft);
+      text-shadow:0 0 12px rgba(249,115,22,.7);
+    }
+    .subtitle{
+      font-size:12px;
+      color:var(--txt-muted);
+      text-transform:uppercase;
+      letter-spacing:.18em;
+    }
+    .badges{
+      display:flex;
+      flex-wrap:wrap;
+      gap:8px;
+    }
+    .badge{
+      display:inline-flex;
+      align-items:center;
+      gap:6px;
+      padding:4px 10px;
+      border-radius:999px;
+      background:var(--badge-bg);
+      border:1px solid #1f2937;
+      font-size:11px;
+      text-transform:uppercase;
+      letter-spacing:.08em;
+    }
+    .dot{
+      width:9px;
+      height:9px;
+      border-radius:50%;
+      background:var(--red);
+      box-shadow:0 0 10px #000;
+    }
+    .dot.ok{
+      background:var(--green);
+      box-shadow:0 0 10px #22c55eaa;
+    }
+    .badge-label{color:var(--txt-muted);}
+    .badge-value{font-weight:600;color:var(--accent-soft);}
+    main{display:grid;grid-template-columns:1.3fr 1.1fr;gap:14px;}
+    @media(max-width:900px){main{grid-template-columns:1fr}}
+    .card{
+      background:radial-gradient(circle at 0 0,#111827,#020617 70%);
+      border-radius:12px;
+      padding:12px 14px;
+      border:1px solid var(--border);
+      box-shadow:0 0 18px #000c;
+    }
+    .card-title{
+      font-size:14px;
+      text-transform:uppercase;
+      letter-spacing:.2em;
+      margin:0 0 8px;
+      color:var(--accent-soft);
+    }
+    .card-title span{
+      font-size:11px;
+      color:var(--txt-muted);
+      text-transform:none;
+      letter-spacing:normal;
+    }
+    .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;}
+    .stat{
+      padding:6px 8px;
+      border-radius:8px;
+      background:var(--panel-soft);
+      border:1px solid #1f2937;
+      font-size:12px;
+    }
+    .stat-label{color:var(--txt-muted);font-size:11px;text-transform:uppercase;letter-spacing:.12em;}
+    .stat-value{margin-top:2px;font-size:13px;font-weight:600;}
+    .stat-value.accent{color:var(--accent-soft);}
+    .stat-value.danger{color:var(--red);}
+    label{
+      font-size:11px;
+      text-transform:uppercase;
+      letter-spacing:.12em;
+      color:var(--txt-muted);
+      display:block;
+      margin-bottom:3px;
+    }
+    input,select{
+      width:100%;
+      padding:7px 9px;
+      border-radius:7px;
+      border:1px solid #374151;
+      background:var(--panel-soft);
+      color:var(--txt);
+      font-size:13px;
+      outline:none;
+    }
+    input:focus,select:focus{
+      border-color:var(--accent-soft);
+      box-shadow:0 0 0 1px rgba(251,191,36,.35);
+    }
+    button{
+      border:none;
+      border-radius:999px;
+      padding:7px 14px;
+      font-size:13px;
+      font-weight:600;
+      text-transform:uppercase;
+      letter-spacing:.12em;
+      cursor:pointer;
+      background:linear-gradient(135deg,var(--accent),var(--accent-deep));
+      color:#111827;
+      box-shadow:0 0 16px rgba(248,113,22,.45);
+    }
+    button.secondary{
+      background:transparent;
+      color:var(--accent-soft);
+      border:1px solid #4b5563;
+      box-shadow:none;
+    }
+    button.full{width:100%;}
+    button:disabled{
+      opacity:.45;
+      cursor:not-allowed;
+      box-shadow:none;
+    }
+    .row{display:flex;flex-wrap:wrap;gap:8px;margin-top:6px;}
+    .row > *{flex:1 1 0;}
+    .addr{
+      font-family:SFMono-Regular,Menlo,Monaco,Consolas,monospace;
+      font-size:12px;
+      padding:6px 8px;
+      border-radius:7px;
+      background:#020617;
+      border:1px dashed #374151;
+      color:var(--accent-soft);
+      word-break:break-all;
+    }
+    #log{
+      height:190px;
+      background:#020617;
+      border-radius:10px;
+      border:1px solid #1f2937;
+      padding:8px;
+      font-family:SFMono-Regular,Menlo,Monaco,Consolas,monospace;
+      font-size:11px;
+      white-space:pre-wrap;
+      overflow-y:auto;
+      color:#e5e7eb;
+    }
+    .log-line{margin-bottom:2px;}
+    .log-time{color:#6b7280;margin-right:4px;}
+    .log-tag{display:inline-block;min-width:40px;font-weight:600;margin-right:4px;}
+    .log-tag.sys{color:#f97316;}
+    .log-tag.ws{color:#22c55e;}
+    .log-tag.err{color:#ef4444;}
+    #dexChart{
+      width:100%;
+      height:110px;
+      border-radius:9px;
+      background:linear-gradient(90deg,#111827,#1e293b,#111827);
+      border:1px solid #1f2937;
+      position:relative;
+      overflow:hidden;
+    }
+    #dexBarFire,#dexBarUsdc{
+      position:absolute;
+      bottom:0;
+      width:50%;
+      max-height:100%;
+      transition:height .35s ease;
+    }
+    #dexBarFire{left:0;background:linear-gradient(to top,#ea580c,#fde68a);}
+    #dexBarUsdc{right:0;background:linear-gradient(to top,#0369a1,#7dd3fc);}
+    #dexLabels{
+      position:absolute;
+      inset:6px 8px auto;
+      display:flex;
+      justify-content:space-between;
+      font-size:11px;
+      color:#e5e7eb;
+      text-shadow:0 0 6px #000;
+    }
+    .pill{
+      display:inline-flex;
+      align-items:center;
+      gap:4px;
+      padding:3px 8px;
+      border-radius:999px;
+      background:#111827dd;
+      border:1px solid #374151;
+    }
+    .pill span{font-weight:600;}
+    .help{
+      font-size:11px;
+      color:#6b7280;
+      margin-top:4px;
+    }
+  </style>
+</head>
+<body>
+<div id="wrap">
+  <header>
+    <div>
+      <h1>FIREINNERS — Client Complet</h1>
+      <div class="subtitle">Mainnet bridge · DEX interne FIRE · Dashboard réseau</div>
+    </div>
+    <div class="badges">
+      <div class="badge" id="httpBadge"><span class="dot" id="httpDot"></span><span class="badge-label">Backend :</span><span class="badge-value" id="httpState">HTTP OFF</span></div>
+      <div class="badge" id="wsBadge"><span class="dot" id="wsDot"></span><span class="badge-label">WS :</span><span class="badge-value" id="wsState">OFFLINE</span></div>
+    </div>
+  </header>
+
+  <main>
+    <!-- Colonne gauche : Solana + Bridge + Logs -->
+    <section class="card">
+      <h2 class="card-title">Wallet Solana — Phantom <span>(bridge vers FIREINNERS)</span></h2>
+
+      <div class="row">
+        <div>
+          <label>Adresse Solana</label>
+          <div class="addr" id="solAddr">Aucun wallet Solana connecté</div>
+        </div>
+      </div>
+
+      <div class="row" style="margin-top:8px;">
+        <button id="btnConnectPhantom">Connecter Phantom</button>
+        <button id="btnRefreshSol" class="secondary">Refresh</button>
+      </div>
+
+      <div class="grid" style="margin-top:10px;">
+        <div class="stat">
+          <div class="stat-label">SOL (wallet)</div>
+          <div class="stat-value accent" id="solBalance">–</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">USDC on Solana</div>
+          <div class="stat-value" id="usdcBalance">–</div>
+        </div>
+      </div>
+
+      <h2 class="card-title" style="margin-top:14px;">Bridge vers FIREINNERS</h2>
+
+      <label for="bridgeAmount">Montant SOL à bridger</label>
+      <input id="bridgeAmount" type="number" min="0" step="0.0001" placeholder="0.01"/>
+      <div class="help">Simulation de bridge : Phantom signe la transaction, le backend enregistre l'événement FIREINNERS.</div>
+      <button id="btnBridge" class="full" style="margin-top:8px;">SOL → FIREINNERS</button>
+
+      <h2 class="card-title" style="margin-top:16px;">Logs</h2>
+      <div id="log"></div>
+    </section>
+
+    <!-- Colonne droite : TVL + DEX interne + Trésorerie -->
+    <section class="card">
+      <h2 class="card-title">TVL & Trésorerie FIREINNERS</h2>
+      <div class="grid">
+        <div class="stat">
+          <div class="stat-label">TVL FIRE (interne)</div>
+          <div class="stat-value accent" id="tvlFire">–</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">TVL USDC FIRE (interne)</div>
+          <div class="stat-value accent" id="tvlUsdc">–</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">Trésorerie FIRE</div>
+          <div class="stat-value" id="tresFire">–</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">Trésorerie USDC FIRE</div>
+          <div class="stat-value" id="tresUsdc">–</div>
+        </div>
+      </div>
+
+      <h2 class="card-title" style="margin-top:14px;">DEX FIREINNERS — Pool FIRE / USDC FIRE</h2>
+
+      <div id="dexChart">
+        <div id="dexBarFire"></div>
+        <div id="dexBarUsdc"></div>
+        <div id="dexLabels">
+          <div class="pill">🔥 <span id="dexFireLabel">FIRE : –</span></div>
+          <div class="pill">💧 <span id="dexUsdcLabel">USDC FIRE : –</span></div>
+        </div>
+      </div>
+
+      <div class="row" style="margin-top:10px;">
+        <div>
+          <label>Montant FIRE</label>
+          <input id="lpFire" type="number" min="0" step="0.1" placeholder="1000"/>
+        </div>
+        <div>
+          <label>Montant USDC FIRE</label>
+          <input id="lpUsdc" type="number" min="0" step="0.1" placeholder="1000"/>
+        </div>
+      </div>
+      <button id="btnAddLp" class="full" style="margin-top:8px;">Ajouter de la liquidité</button>
+      <div class="help">Un add LP ≥ 10 000 FIRE et 10 000 USDC FIRE pourra déclencher un badge Whale côté backend.</div>
+
+      <h2 class="card-title" style="margin-top:16px;">État global FIREINNERS</h2>
+      <div class="grid">
+        <div class="stat">
+          <div class="stat-label">Blocs</div>
+          <div class="stat-value" id="height">–</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">Supply FIRE</div>
+          <div class="stat-value" id="supplyTotal">–</div>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<script>
+(function(){
+  const logEl=document.getElementById("log");
+  function log(tag,msg,isErr){
+    const line=document.createElement("div");
+    line.className="log-line";
+    const t=document.createElement("span");
+    t.className="log-time";
+    t.textContent="["+new Date().toLocaleTimeString()+"]";
+    const tg=document.createElement("span");
+    tg.className="log-tag "+(tag==="WS"?"ws":tag==="SYS"?"sys":"err");
+    tg.textContent=tag;
+    const m=document.createElement("span");
+    m.textContent=" "+msg;
+    line.appendChild(t);line.appendChild(tg);line.appendChild(m);
+    logEl.appendChild(line);
+    logEl.scrollTop=logEl.scrollHeight;
+  }
+
+  const httpDot=document.getElementById("httpDot");
+  const httpState=document.getElementById("httpState");
+  const wsDot=document.getElementById("wsDot");
+  const wsState=document.getElementById("wsState");
+
+  function setHttp(ok){
+    if(ok){httpDot.classList.add("ok");httpState.textContent="HTTP OK";}
+    else{httpDot.classList.remove("ok");httpState.textContent="HTTP OFF";}
+  }
+  function setWs(ok){
+    if(ok){wsDot.classList.add("ok");wsState.textContent="WS : OK";}
+    else{wsDot.classList.remove("ok");wsState.textContent="WS : OFF";}
+  }
+
+  const tvlFire=document.getElementById("tvlFire");
+  const tvlUsdc=document.getElementById("tvlUsdc");
+  const tresFire=document.getElementById("tresFire");
+  const tresUsdc=document.getElementById("tresUsdc");
+  const height=document.getElementById("height");
+  const supplyTotal=document.getElementById("supplyTotal");
+  const dexBarFire=document.getElementById("dexBarFire");
+  const dexBarUsdc=document.getElementById("dexBarUsdc");
+  const dexFireLabel=document.getElementById("dexFireLabel");
+  const dexUsdcLabel=document.getElementById("dexUsdcLabel");
+
+  let lastState=null;
+
+  async function fetchStats(){
+    try{
+      const r=await fetch("/stats");
+      if(!r.ok)throw new Error("HTTP "+r.status);
+      const j=await r.json();
+      setHttp(true);
+      lastState=j;
+      tvlFire.textContent=(j.tvlFire??0).toLocaleString("fr-CA",{maximumFractionDigits:2});
+      tvlUsdc.textContent=(j.tvlUsdc??0).toLocaleString("fr-CA",{maximumFractionDigits:2});
+      tresFire.textContent=(j.treasuryFire??0).toLocaleString("fr-CA",{maximumFractionDigits:2});
+      tresUsdc.textContent=(j.treasuryUsdc??0).toLocaleString("fr-CA",{maximumFractionDigits:2});
+      height.textContent=j.height??"-";
+      supplyTotal.textContent=(j.supplyTotal??0).toLocaleString("fr-CA",{maximumFractionDigits:0});
+
+      const fire=j.lpFire??0;
+      const usdc=j.lpUsdc??0;
+      dexFireLabel.textContent="FIRE : "+fire.toLocaleString("fr-CA");
+      dexUsdcLabel.textContent="USDC FIRE : "+usdc.toLocaleString("fr-CA");
+      const total=fire+usdc;
+      const pFire=total?Math.max(8,Math.min(92,fire/total*100)):50;
+      const pUsdc=100-pFire;
+      dexBarFire.style.height=pFire+"%";
+      dexBarUsdc.style.height=pUsdc+"%";
+    }catch(e){
+      setHttp(false);
+      log("ERR","/stats → "+e.message,true);
+    }
+  }
+
+  setInterval(fetchStats,4000);
+  fetchStats();
+
+  // WebSocket auto
+  let ws=null,wsTimer=null;
+  function wsUrl(){
+    if(location.hostname==="localhost"||location.hostname==="127.0.0.1"){
+      return "ws://127.0.0.1:7001";
+    }
+    return "wss://bbqfinance.fun/ws";
+  }
+  function connectWs(){
+    try{
+      ws=new WebSocket(wsUrl());
+      ws.onopen=()=>{setWs(true);log("WS","Connecté");};
+      ws.onclose=()=>{setWs(false);log("WS","Déconnecté");ws=null;wsTimer=setTimeout(connectWs,4000);};
+      ws.onerror=(e)=>{log("ERR","WS erreur",true);};
+      ws.onmessage=(ev)=>{
+        try{
+          const msg=JSON.parse(ev.data);
+          if(msg.type==="state"){
+            lastState=msg.state;
+            // Option : rafraîchir ici aussi
+          }
+        }catch{}
+      };
+    }catch(e){
+      setWs(false);log("ERR","WS exception "+e.message,true);
+    }
+  }
+  connectWs();
+
+  // Solana / Phantom
+  const solAddr=document.getElementById("solAddr");
+  const solBalanceEl=document.getElementById("solBalance");
+  const usdcBalanceEl=document.getElementById("usdcBalance");
+  const btnConnect=document.getElementById("btnConnectPhantom");
+  const btnRefresh=document.getElementById("btnRefreshSol");
+  const btnBridge=document.getElementById("btnBridge");
+  const bridgeAmount=document.getElementById("bridgeAmount");
+
+  const RPC_URL="https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac";
+  const FIRE_USDC_MINT="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1";
+  const connection=new solanaWeb3.Connection(RPC_URL,"confirmed");
+  let solPubkey=null;
+
+  async function refreshSolana(){
+    if(!solPubkey)return;
+    try{
+      const lamports=await connection.getBalance(solPubkey);
+      solBalanceEl.textContent=(lamports/1e9).toFixed(4);
+    }catch(e){
+      log("ERR","SOL balance → "+e.message,true);
+    }
+    try{
+      const tokenAccounts=await connection.getParsedTokenAccountsByOwner(solPubkey,{mint:new solanaWeb3.PublicKey(FIRE_USDC_MINT)});
+      let total=0;
+      for(const a of tokenAccounts.value){
+        const ui=a.account.data.parsed.info.tokenAmount.uiAmount||0;
+        total+=ui;
+      }
+      usdcBalanceEl.textContent=total.toFixed(2);
+    }catch(e){
+      log("ERR","USDC balance → "+e.message,true);
+    }
+  }
+
+  btnConnect.onclick=async()=>{
+    try{
+      if(!window.solana||!window.solana.isPhantom){
+        alert("Phantom n'est pas détecté dans ce navigateur.");
+        return;
+      }
+      const r=await window.solana.connect();
+      solPubkey=new solanaWeb3.PublicKey(r.publicKey.toString());
+      solAddr.textContent=solPubkey.toString();
+      log("SYS","Phantom connecté");
+      await refreshSolana();
+    }catch(e){
+      log("ERR","Connexion Phantom refusée",true);
+    }
+  };
+  btnRefresh.onclick=refreshSolana;
+
+  // Bridge (simulation backend)
+  btnBridge.onclick=async()=>{
+    const amt=parseFloat(bridgeAmount.value);
+    if(!solPubkey){alert("Connecte Phantom d'abord.");return;}
+    if(!amt||amt<=0){alert("Montant SOL invalide.");return;}
+    btnBridge.disabled=true;
+    try{
+      // Ici on ne fait qu'un appel backend de preuve de bridge.
+      const res=await fetch("/bridge/sol",{
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({from:solPubkey.toString(),amountSol:amt,signature:null})
+      });
+      if(!res.ok)throw new Error("HTTP "+res.status);
+      const j=await res.json();
+      log("SYS","Bridge SOL→FIREINNERS accepté id="+j.id);
+      fetchStats();
+    }catch(e){
+      log("ERR","Bridge SOL→FIREINNERS → "+e.message,true);
+    }finally{
+      btnBridge.disabled=false;
+    }
+  };
+
+  // Add LP
+  document.getElementById("btnAddLp").onclick=async()=>{
+    const fire=parseFloat(document.getElementById("lpFire").value)||0;
+    const usdc=parseFloat(document.getElementById("lpUsdc").value)||0;
+    if(fire<=0||usdc<=0){alert("Montants invalides.");return;}
+    try{
+      const r=await fetch("/lp/add",{
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({fire,usdc})
+      });
+      if(!r.ok)throw new Error("HTTP "+r.status);
+      const j=await r.json();
+      log("SYS","LP ajouté, pool FIRE="+j.lpFire+" USDC="+j.lpUsdc);
+      fetchStats();
+    }catch(e){
+      log("ERR","LP add → "+e.message,true);
+    }
+  };
+
+})();
+</script>
+</body>
+</html>
