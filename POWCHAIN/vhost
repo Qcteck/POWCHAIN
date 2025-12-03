@@ -1,2 +1,260 @@
-:> /root/powchain/server.js
-sudo nano /root/powchain/server.js
+const express = require("express");
+const cors = require("cors");
+const fs = require("fs");
+const crypto = require("crypto");
+const WebSocket = require("ws");
+const nacl = require("tweetnacl");
+const bs58 = require("bs58");
+const { TextEncoder } = require("util");
+
+const DB_FILE = "/root/powchain/db.json";
+const TREASURY_SOL = "BZJsWeJizv3XeyuWjF5I87jrccduPEAHWjqL7jgg4kGwy";
+
+const PORT = 3000;
+const WSPORT = 7001;
+const MIN_TX_PER_BLOCK = 5;
+const BLOCK_REWARD = 2;
+
+/* --------- CHARGEMENT DB --------- */
+let DB = { chain: [], wallets: {}, lp: { pow: 0, usdc: 0 }, mempool: [] };
+
+try {
+    if (fs.existsSync(DB_FILE)) {
+        DB = JSON.parse(fs.readFileSync(DB_FILE, "utf8"));
+    } else {
+        console.log("[DB] Nouvelle base créée");
+    }
+} catch (e) {
+    console.log("[DB] Erreur de lecture :", e.message);
+}
+
+function saveDB() {
+    try {
+        fs.writeFileSync(DB_FILE, JSON.stringify(DB, null, 2));
+    } catch (e) {
+        console.log("[DB] Erreur save:", e.message);
+    }
+}
+
+/* --------- UTILITAIRES --------- */
+function sha(x) { return crypto.createHash("sha256").update(x).digest("hex"); }
+
+/* --------- GENESIS --------- */
+if (!Array.isArray(DB.chain) || DB.chain.length === 0) {
+    const genesis = {
+        index: 0,
+        time: Date.now(),
+        prev: "0",
+        hash: sha("GENESIS"),
+        tx: [],
+        stakers: {},
+        winner: null,
+        reward: 0
+    };
+    DB.chain = [genesis];
+    saveDB();
+    console.log("[GENESIS] Bloc Genesis créé");
+} else {
+    console.log("[GENESIS] 1 bloc minimum présent");
+}
+
+/* --------- WALLET --------- */
+function ensureWallet(pub) {
+    if (!DB.wallets[pub]) {
+        DB.wallets[pub] = { pow: 0, usdc: 0, staked: 0, nonce: 0, pub };
+    }
+    return DB.wallets[pub];
+}
+
+function createWallet() {
+    const kp = nacl.sign.keyPair();
+    const pub = bs58.encode(kp.publicKey);
+    const priv = bs58.encode(kp.secretKey);
+    ensureWallet(pub);
+    saveDB();
+    return { pub, priv };
+}
+
+/* --------- SIGNATURE TX --------- */
+function verifyTxSignature(tx) {
+    try {
+        const { from, to, amount, token, nonce, pub, sig } = tx;
+        if (!from || !to || typeof amount !== "number" || !token || !nonce) return false;
+        if (from !== pub) return false;
+
+        const msgStr = `${from}|${to}|${amount}|${token}|${nonce}`;
+        const msg = new TextEncoder().encode(msgStr);
+        const pubKey = bs58.decode(pub);
+        const sigBytes = bs58.decode(sig);
+
+        return nacl.sign.detached.verify(msg, sigBytes, pubKey);
+
+    } catch (e) {
+        console.log("[TX] Signature invalid:", e.message);
+        return false;
+    }
+}
+
+/* --------- APPLY TX --------- */
+function applyTx(tx) {
+    const { from, to, amount, token } = tx;
+    const wFrom = ensureWallet(from);
+    const wTo = ensureWallet(to);
+
+    if (token === "POW") {
+        if (wFrom.pow < amount) return false;
+        wFrom.pow -= amount;
+        wTo.pow += amount;
+    }
+
+    if (token === "USDC") {
+        if (wFrom.usdc < amount) return false;
+        wFrom.usdc -= amount;
+        wTo.usdc += amount;
+    }
+
+    return true;
+}
+
+/* --------- CHOIX VALIDATEUR --------- */
+function chooseWinner() {
+    const st = Object.entries(DB.wallets)
+        .filter(([pub, w]) => w.staked > 0)
+        .sort((a, b) => b[1].staked - a[1].staked);
+
+    return st.length > 0 ? st[0][0] : null;
+}
+
+/* --------- FORGE BLOC (5 TX) --------- */
+function forgeBlockIfNeeded() {
+    while (DB.mempool.length >= MIN_TX_PER_BLOCK) {
+
+        const batch = DB.mempool.splice(0, MIN_TX_PER_BLOCK);
+        const applied = [];
+
+        for (const tx of batch) {
+            if (applyTx(tx)) applied.push(tx);
+        }
+
+        const prev = DB.chain[DB.chain.length - 1];
+        const stakersSnapshot = {};
+
+        Object.entries(DB.wallets).forEach(([pub, w]) => {
+            if (w.staked > 0) stakersSnapshot[pub] = w.staked;
+        });
+
+        const winner = chooseWinner();
+
+        if (winner) ensureWallet(winner).pow += BLOCK_REWARD;
+
+        const block = {
+            index: DB.chain.length,
+            time: Date.now(),
+            prev: sha(JSON.stringify(prev)),
+            hash: sha(JSON.stringify(applied) + Date.now()),
+            tx: applied,
+            stakers: stakersSnapshot,
+            winner,
+            reward: BLOCK_REWARD
+        };
+
+        DB.chain.push(block);
+        saveDB();
+        broadcast({ type: "block", block });
+        console.log("[BLOCK] Nouveau bloc forgé index", block.index);
+    }
+}
+
+/* --------- MEMPOOL --------- */
+function addTxToMempool(tx) {
+    if (!verifyTxSignature(tx)) return false;
+    DB.mempool.push(tx);
+    saveDB();
+    forgeBlockIfNeeded();
+    return true;
+}
+
+/* --------- WEBSOCKET --------- */
+const wss = new WebSocket.Server({ port: WSPORT });
+wss.on("connection", ws => {
+    console.log("[WS] Client connecté");
+    ws.send(JSON.stringify({ type: "chain", chain: DB.chain }));
+});
+function broadcast(obj) {
+    const msg = JSON.stringify(obj);
+    wss.clients.forEach(c => { if (c.readyState === WebSocket.OPEN) c.send(msg); });
+}
+console.log("[WS] POWCHAIN WebSocket sur port", WSPORT);
+
+/* --------- API HTTP --------- */
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+app.get("/wallet/create", (req, res) => res.json(createWallet()));
+app.get("/wallet/:pub", (req, res) => res.json(DB.wallets[req.params.pub] || {}));
+app.post("/tx", (req, res) => res.json({ ok: addTxToMempool(req.body || {}) }));
+app.get("/chain", (req, res) => res.json(DB.chain));
+app.get("/explorer", (req, res) => {
+    const depth = parseInt(req.query.depth || "20");
+    const blocks = DB.chain.slice(-depth).map(b => ({
+        index: b.index,
+        time: b.time,
+        winner: b.winner,
+        hash: b.hash,
+        prev: b.prev,
+        txCount: Array.isArray(b.tx) ? b.tx.length : 0
+    }));
+    res.json({ height: DB.chain.length, blocks });
+});
+app.get("/lp", (req, res) => res.json(DB.lp || { pow: 0, usdc: 0 }));
+
+/* --------- BRIDGE SOL → POWCHAIN --------- */
+app.post("/bridge", (req, res) => {
+    const { sig, from, to, lamports, fireAddr } = req.body || {};
+    if (!from || !to || !lamports) return res.json({ ok: false });
+    if (to !== TREASURY_SOL) return res.json({ ok: false, error: "mauvaise trésorerie" });
+
+    const sol = lamports / 1_000_000_000;
+    const w = ensureWallet(fireAddr);
+    const minted = sol * 10;
+    w.pow += minted;
+
+    saveDB();
+    broadcast({ type: "bridge", fireAddr, sol, minted });
+    res.json({ ok: true });
+});
+
+/* --------- STATS --------- */
+app.get("/stats", (req, res) => {
+    const walletsArr = Object.values(DB.wallets);
+    const totalPow = walletsArr.reduce((s, w) => s + (w.pow || 0), 0);
+    const totalStaked = walletsArr.reduce((s, w) => s + (w.staked || 0), 0);
+    res.json({
+        height: DB.chain.length,
+        wallets: Object.keys(DB.wallets).length,
+        mempool: DB.mempool.length,
+        totalPow,
+        totalStaked,
+        lp: DB.lp
+    });
+});
+
+/* --------- LANCEMENT UNIQUE --------- */
+app.listen(PORT, () => {
+    console.log("[HTTP] POWCHAIN API sur port", PORT);
+    console.log("[HTTP] Routes: /wallet/create /wallet/:pub /tx /chain /explorer /lp /bridge /stats");
+    console.log("[BRIDGE] Trésorerie SOL:", TREASURY_SOL);
+});
+
+
+
+
+
+
+pm2 stop powchain
+pm2 delete powchain
+pm2 start /root/powchain/server.js --name powchain
+pm2 save
+pm2 logs powchain --lines 20
+
