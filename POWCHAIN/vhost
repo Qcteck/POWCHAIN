@@ -1,4 +1,7 @@
+:> /root/powchain/server.js
 sudo nano /root/powchain/server.js
+
+
 
 // POWCHAIN — Validator Node OFFICIEL (Version A révisée)
 // PoS • Mempool • Blocs sur 5 TX • LP • Bridge SOL • WebSocket 7001 • API 3000
@@ -12,11 +15,12 @@ const nacl = require("tweetnacl");
 const bs58 = require("bs58");
 const { TextEncoder } = require("util");
 
-// Fichier de DB
+// ---------- DB ----------
+
 const DB_FILE = "/root/powchain/db.json";
 
-// Chargement DB
 let DB = { chain: [], wallets: {}, lp: { pow: 0, usdc: 0 }, mempool: [] };
+
 try {
   if (fs.existsSync(DB_FILE)) {
     DB = JSON.parse(fs.readFileSync(DB_FILE, "utf8"));
@@ -28,7 +32,6 @@ try {
   console.error("[DB] Erreur de lecture, réinitialisation soft:", e.message);
 }
 
-// Sauvegarde DB
 function saveDB() {
   try {
     fs.writeFileSync(DB_FILE, JSON.stringify(DB, null, 2));
@@ -37,7 +40,8 @@ function saveDB() {
   }
 }
 
-// Utilitaires
+// ---------- Utilitaires chaîne ----------
+
 function sha(x) {
   return crypto.createHash("sha256").update(x).digest("hex");
 }
@@ -62,14 +66,16 @@ if (DB.chain.length === 0) {
   console.log("[GENESIS] 1 bloc minimum présent");
 }
 
-// Paramètres POWCHAIN
+// ---------- Paramètres POWCHAIN ----------
+
 const PORT = 3000;
 const WSPORT = 7001;
 const BLOCK_REWARD = 10;
-const MIN_TX_PER_BLOCK = 5;
-const TREASURY_SOL = "BZJsWeJizv3YeyuWjF5187jrcduPFAHWjqL7jgq4kGwy";
+const MIN_TX_PER_BLOCK = 5; // 1 bloc pour 5 TX en mempool
+const TREASURY_SOL = "BZJsWeJizv3XeyuWjE5I87jrccduPFAHWjqL7jgq4kGwy";
 
-// Création / accès wallet POWCHAIN
+// ---------- Wallets POWCHAIN ----------
+
 function ensureWallet(pub) {
   if (!DB.wallets[pub]) {
     DB.wallets[pub] = { pow: 0, usdc: 0, staked: 0, nonce: 0, pub };
@@ -86,17 +92,20 @@ function createWallet() {
   return { pub, priv };
 }
 
-// Vérification de signature TX
+// ---------- Vérification des TX ----------
+
 function verifyTxSignature(tx) {
   try {
     const { from, to, amount, token, nonce, pub, sig } = tx;
     if (!from || !to || typeof amount !== "number" || !token || !nonce) return false;
     if (!pub || !sig) return false;
     if (from !== pub) return false;
+
     const msgStr = `${from}|${to}|${amount}|${token}|${nonce}`;
     const msg = new TextEncoder().encode(msgStr);
     const pubKey = bs58.decode(pub);
     const sigBytes = bs58.decode(sig);
+
     return nacl.sign.detached.verify(msg, sigBytes, pubKey);
   } catch (e) {
     console.error("[TX] Erreur verify:", e.message);
@@ -104,7 +113,7 @@ function verifyTxSignature(tx) {
   }
 }
 
-// Application d'une TX dans l'état
+// Appliquer TX dans l'état
 function applyTx(tx) {
   const { from, to, amount, token } = tx;
   const wFrom = ensureWallet(from);
@@ -116,17 +125,20 @@ function applyTx(tx) {
     wTo.pow += amount;
     return true;
   }
+
   if (token === "USDC") {
     if (wFrom.usdc < amount) return false;
     wFrom.usdc -= amount;
     wTo.usdc += amount;
     return true;
   }
-  // Hooks futurs pour STAKE / UNSTAKE
+
+  // Hooks futurs : STAKE / UNSTAKE...
   return true;
 }
 
-// PoS simple — choisir un gagnant basé sur staked
+// ---------- PoS & forge de blocs ----------
+
 function chooseWinner() {
   const entries = Object.entries(DB.wallets).filter(([, w]) => w.staked > 0);
   if (entries.length === 0) return null;
@@ -136,26 +148,29 @@ function chooseWinner() {
     if (r < w.staked) return pub;
     r -= w.staked;
   }
-  return entries[0][0] || null;
+  return entries[0]?.[0] || null;
 }
 
-// Forge d'un bloc (1 bloc = 5 TX)
 function forgeBlockIfNeeded() {
   while (DB.mempool.length >= MIN_TX_PER_BLOCK) {
     const txBatch = DB.mempool.splice(0, MIN_TX_PER_BLOCK);
     const applied = [];
+
     for (const tx of txBatch) {
       if (applyTx(tx)) applied.push(tx);
     }
+
     const prev = DB.chain[DB.chain.length - 1];
     const stakersSnapshot = {};
     Object.entries(DB.wallets).forEach(([pub, w]) => {
       if (w.staked > 0) stakersSnapshot[pub] = w.staked;
     });
+
     const winner = chooseWinner();
     if (winner) {
       ensureWallet(winner).pow += BLOCK_REWARD;
     }
+
     const block = {
       index: prev.index + 1,
       time: Date.now(),
@@ -166,6 +181,7 @@ function forgeBlockIfNeeded() {
       winner,
       reward: BLOCK_REWARD
     };
+
     DB.chain.push(block);
     saveDB();
     broadcast({ type: "block", block });
@@ -173,18 +189,20 @@ function forgeBlockIfNeeded() {
   }
 }
 
-// Ajout TX au mempool
 function addTxToMempool(tx) {
   const w = ensureWallet(tx.from);
   const expectedNonce = (w.nonce || 0) + 1;
+
   if (tx.nonce !== expectedNonce) {
     console.log("[TX] Nonce invalide pour", tx.from, "reçu", tx.nonce, "attendu", expectedNonce);
     return false;
   }
+
   if (!verifyTxSignature(tx)) {
     console.log("[TX] Signature invalide pour", tx.from);
     return false;
   }
+
   DB.mempool.push(tx);
   w.nonce = expectedNonce;
   saveDB();
@@ -192,25 +210,32 @@ function addTxToMempool(tx) {
   return true;
 }
 
-// WebSocket serveur (port dédié 7001)
+// ---------- WebSocket (port 7001) ----------
+
 const wss = new WebSocket.Server({ port: WSPORT });
+
 wss.on("connection", ws => {
   console.log("[WS] client connecté");
-  ws.send(JSON.stringify({
-    type: "hello",
-    height: DB.chain.length,
-    wallets: Object.keys(DB.wallets).length
-  }));
+  ws.send(
+    JSON.stringify({
+      type: "hello",
+      height: DB.chain.length,
+      wallets: Object.keys(DB.wallets).length
+    })
+  );
 });
+
 function broadcast(msg) {
   const data = JSON.stringify(msg);
   wss.clients.forEach(c => {
     if (c.readyState === WebSocket.OPEN) c.send(data);
   });
 }
+
 console.log("[WS] POWCHAIN WebSocket sur port", WSPORT);
 
-// EXPRESS API
+// ---------- API HTTP EXPRESS ----------
+
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -267,14 +292,18 @@ app.post("/bridge", (req, res) => {
   if (to !== TREASURY_SOL) {
     return res.json({ ok: false, error: "mauvaise trésorerie" });
   }
+
   const sol = lamports / 1_000_000_000;
   const w = ensureWallet(fireAddr);
   const minted = sol * 10; // ratio 1 SOL → 10 POW
+
   w.pow += minted;
   saveDB();
+
   const evt = { type: "bridge", fireAddr, sol, minted };
   broadcast(evt);
   console.log("[BRIDGE]", evt);
+
   res.json({ ok: true });
 });
 
@@ -283,6 +312,7 @@ app.get("/stats", (req, res) => {
   const walletsArr = Object.values(DB.wallets);
   const totalPow = walletsArr.reduce((s, w) => s + (w.pow || 0), 0);
   const totalStaked = walletsArr.reduce((s, w) => s + (w.staked || 0), 0);
+
   res.json({
     height: DB.chain.length,
     wallets: Object.keys(DB.wallets).length,
@@ -296,13 +326,17 @@ app.get("/stats", (req, res) => {
 // Lancement HTTP API
 app.listen(PORT, () => {
   console.log("[HTTP] POWCHAIN API sur port", PORT);
-  console.log("[HTTP] Routes: /wallet/create /wallet/:pub /tx /chain /explorer /lp /bridge /stats");
+  console.log(
+    "[HTTP] Routes: /wallet/create /wallet/:pub /tx /chain /explorer /lp /bridge /stats"
+  );
   console.log("[BRIDGE] Trésorerie SOL:", TREASURY_SOL);
 });
 
 
-
 pm2 stop powchain
+pm2 delete powchain
 pm2 start /root/powchain/server.js --name powchain
 pm2 save
 pm2 logs powchain --lines 30
+
+
