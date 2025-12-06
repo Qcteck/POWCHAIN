@@ -66,3 +66,400 @@ sudo /root/deploy_fireinners.sh
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+// =====================================================
+// FIREINNERS — Backend Officiel
+// HTTP API + WebSocket + Bridge Phantom + DEX + Stats
+// =====================================================
+
+const express = require("express");
+const cors = require("cors");
+const bodyParser = require("body-parser");
+const WebSocket = require("ws");
+const fetch = require("node-fetch"); // Node18 compatible
+
+const app = express();
+app.use(cors());
+app.use(bodyParser.json());
+
+// ---------------- CONSTANTES ----------------
+const DEC = 1e6;        // 1 FIRE = 1e6 unités internes
+const SOL_DEC = 1e9;    // 1 SOL = 1e9 lamports
+const SOL_RPC = "https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac";
+
+// Adresse de trésorerie Solana (REÇOIT LES BRIDGES)
+const TREASURY_SOL = "BZJsWeJizv3YeyuWjF5187jrcduPFAHWjqL7jgq4kGwy";
+
+// ---------------- ETAT GLOBAL ----------------
+let state = {
+  height: 1,
+  wallets: {},
+  treasury: {
+    solAddress: TREASURY_SOL,
+    solBalance: 0,            // sol reçu total
+    fireBalance: 0,           // FIRE de la trésorerie
+    usdcBalance: 0            // USDC FIRE (DEX fees)
+  },
+  lp: {
+    fire: 0,
+    usdc: 0
+  },
+  staking: {
+    total: 0
+  },
+  mempool: [],
+  chain: [
+    {
+      height: 1,
+      timestamp: Date.now(),
+      type: "genesis",
+      data: { msg: "Fireinners Genesis Block" }
+    }
+  ]
+};
+
+// ---------------- WALLET MANAGER ----------------
+function getWallet(addr) {
+  if (!state.wallets[addr]) {
+    state.wallets[addr] = {
+      pub: addr,
+      fire: 0,
+      usdc: 0,
+      staked: 0,
+      nonce: 0
+    };
+  }
+  return state.wallets[addr];
+}
+
+// ---------------- BLOCKCHAIN ----------------
+function pushBlock(type, data) {
+  state.height++;
+  const blk = {
+    height: state.height,
+    timestamp: Date.now(),
+    type,
+    data
+  };
+  state.chain.push(blk);
+  if (state.chain.length > 2000) {
+    state.chain = state.chain.slice(-2000);
+  }
+  broadcast({ type: "new_block", block: blk });
+}
+
+function addToMempool(tx) {
+  state.mempool.push(tx);
+  if (state.mempool.length > 300) {
+    state.mempool = state.mempool.slice(-300);
+  }
+  broadcast({ type: "mempool", mempool: state.mempool });
+}
+
+// ---------------- SOLANA RPC ----------------
+async function rpcCall(body) {
+  const r = await fetch(SOL_RPC, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  if (!r.ok) throw new Error("RPC HTTP " + r.status);
+  return r.json();
+}
+
+// ---------------- API ROUTES ----------------
+
+// ========== STATS ==========
+app.get("/stats", (req, res) => {
+  let totals = { fire: 0, staked: 0 };
+  for (const w of Object.values(state.wallets)) {
+    totals.fire += w.fire;
+    totals.staked += w.staked;
+  }
+  res.json({
+    height: state.height,
+    wallets: Object.keys(state.wallets).length,
+    mempool: state.mempool.length,
+    totalFire: totals.fire,
+    totalStaked: totals.staked,
+    lpFire: state.lp.fire,
+    lpUsdc: state.lp.usdc,
+    solTreasury: state.treasury.solBalance,
+    fireTreasury: state.treasury.fireBalance,
+    usdcTreasury: state.treasury.usdcBalance
+  });
+});
+
+// ========== WALLET ==========
+app.get("/wallet/:addr", (req, res) => {
+  const w = getWallet(req.params.addr);
+  res.json({
+    pub: w.pub,
+    fire: w.fire,
+    usdc: w.usdc,
+    staked: w.staked,
+    nonce: w.nonce
+  });
+});
+
+// ========== BRIDGE SOL → FIREINNERS (avec vérification on-chain) ==========
+app.post("/bridge", async (req, res) => {
+  try {
+    const { addr, amount, fromSol, txSig } = req.body || {};
+    if (!addr) return res.json({ ok:false, error:"Missing addr" });
+    if (!txSig || !fromSol) return res.json({ ok:false, error:"Missing Phantom tx" });
+
+    const solAmt = Number(amount || 0);
+    if (!(solAmt > 0)) return res.json({ ok:false, error:"Invalid amount" });
+
+    // 1) Vérifier statut transaction
+    const st = await rpcCall({
+      jsonrpc:"2.0",
+      id:1,
+      method:"getSignatureStatuses",
+      params: [[txSig], {searchTransactionHistory:true}]
+    });
+
+    const ss = st.result?.value?.[0];
+    if (!ss || !ss.confirmationStatus) {
+      return res.json({ ok:false, error:"Tx not confirmed" });
+    }
+
+    // 2) Lire transaction complète
+    const full = await rpcCall({
+      jsonrpc:"2.0",
+      id:2,
+      method:"getTransaction",
+      params:[txSig, {encoding:"jsonParsed", maxSupportedTransactionVersion:0}]
+    });
+
+    const tx = full.result;
+    if (!tx || !tx.meta) return res.json({ ok:false, error:"Invalid tx meta" });
+
+    const keys = tx.transaction.message.accountKeys.map(a => (typeof a==="string"?a:a.pubkey));
+    const pre = tx.meta.preBalances;
+    const post = tx.meta.postBalances;
+
+    const idxFrom = keys.indexOf(fromSol);
+    const idxTreas = keys.indexOf(TREASURY_SOL);
+
+    if (idxFrom < 0 || idxTreas < 0)
+      return res.json({ ok:false, error:"Wrong accounts" });
+
+    const deltaTreas = (post[idxTreas] - pre[idxTreas]) / SOL_DEC;
+    if (deltaTreas <= 0)
+      return res.json({ ok:false, error:"No SOL received" });
+
+    // Tolérance 5%
+    if (Math.abs(deltaTreas - solAmt) > solAmt*0.05)
+      return res.json({ ok:false, error:"Amount mismatch", deltaTreas });
+
+    // 3) Crédits FIRE
+    const fireCredit = Math.round(solAmt * DEC * 100);
+
+    const w = getWallet(addr);
+    w.fire += fireCredit;
+    w.nonce++;
+
+    // trésorerie
+    state.treasury.solBalance += deltaTreas;
+    state.treasury.fireBalance += fireCredit;
+
+    const txObj = {
+      type:"bridge_in",
+      addr,
+      fromSol,
+      sol:deltaTreas,
+      fireCredited:fireCredit,
+      txSig
+    };
+
+    addToMempool(txObj);
+    pushBlock("bridge_in", txObj);
+
+    res.json({ ok:true, credited:fireCredit });
+
+  } catch(e){
+    console.error("Bridge ERR:", e);
+    res.status(500).json({ ok:false, error:e.message });
+  }
+});
+
+// ========== DEX LP + SWAP ==========
+app.post("/lp/add", (req,res)=>{
+  const { addr, fire, usdc } = req.body || {};
+  const f=Number(fire||0), u=Number(usdc||0);
+  if(!addr) return res.json({ok:false,error:"Missing addr"});
+  if(!(f>0 && u>0)) return res.json({ok:false,error:"Invalid LP amounts"});
+  const w = getWallet(addr);
+  if(w.fire<f || w.usdc<u) return res.json({ok:false,error:"Insufficient"});
+
+  w.fire -= f;
+  w.usdc -= u;
+  state.lp.fire += f;
+  state.lp.usdc += u;
+  w.nonce++;
+
+  const tx = {type:"lp_add",addr,fire:f,usdc:u};
+  addToMempool(tx);
+  pushBlock("lp_add",tx);
+
+  res.json({ok:true});
+});
+
+app.post("/swap",(req,res)=>{
+  try{
+    const { addr, dir, amount } = req.body;
+    const a=Number(amount||0);
+    if(!addr) return res.json({ok:false,error:"Missing addr"});
+    if(!(a>0)) return res.json({ok:false,error:"Invalid amount"});
+    if(dir!=="fire2usdc" && dir!=="usdc2fire")
+      return res.json({ok:false,error:"Invalid dir"});
+
+    const w=getWallet(addr);
+    const feeRate=0.003;
+
+    const k = state.lp.fire * state.lp.usdc;
+    if(k<=0) return res.json({ok:false,error:"Empty LP"});
+
+    if(dir==="fire2usdc"){
+      if(w.fire<a) return res.json({ok:false,error:"Insufficient FIRE"});
+
+      const fireAfter=state.lp.fire + a;
+      const usdcAfter=k/fireAfter;
+      let out=state.lp.usdc - usdcAfter;
+      const fee=out*feeRate;
+      out-=fee;
+
+      if(out<=0) return res.json({ok:false,error:"Swap too small"});
+
+      w.fire-=a;
+      w.usdc+=out;
+      state.lp.fire+=a;
+      state.lp.usdc-=out;
+      state.treasury.usdcBalance+=fee;
+      w.nonce++;
+
+      const tx={type:"swap_fire2usdc",addr,in:a,out};
+      addToMempool(tx);
+      pushBlock("swap_fire2usdc",tx);
+
+      return res.json({ok:true,received:out});
+    }
+
+    if(dir==="usdc2fire"){
+      if(w.usdc<a) return res.json({ok:false,error:"Insufficient USDC"});
+
+      const usdcAfter=state.lp.usdc + a;
+      const fireAfter=k/usdcAfter;
+      let out=state.lp.fire - fireAfter;
+      const fee=out*feeRate;
+      out-=fee;
+
+      if(out<=0) return res.json({ok:false,error:"Swap too small"});
+
+      w.usdc-=a;
+      w.fire+=out;
+      state.lp.usdc+=a;
+      state.lp.fire-=out;
+      state.treasury.fireBalance+=fee;
+      w.nonce++;
+
+      const tx={type:"swap_usdc2fire",addr,in:a,out};
+      addToMempool(tx);
+      pushBlock("swap_usdc2fire",tx);
+
+      return res.json({ok:true,received:out});
+    }
+
+  }catch(e){
+    res.json({ok:false,error:e.message});
+  }
+});
+
+// ========== STAKING ==========
+app.post("/stake",(req,res)=>{
+  const {addr,amount}=req.body||{};
+  const a=Number(amount||0);
+  if(!addr) return res.json({ok:false,error:"Missing addr"});
+  if(!(a>0)) return res.json({ok:false,error:"Invalid amount"});
+  const w=getWallet(addr);
+  if(w.fire<a) return res.json({ok:false,error:"Insufficient FIRE"});
+
+  w.fire-=a;
+  w.staked+=a;
+  state.staking.total+=a;
+  w.nonce++;
+
+  const tx={type:"stake",addr,amount:a};
+  addToMempool(tx);
+  pushBlock("stake",tx);
+
+  res.json({ok:true});
+});
+
+// ========== EXPLORER ==========
+app.get("/chain",(req,res)=> res.json(state.chain));
+app.get("/block/:h",(req,res)=>{
+  const b=state.chain.find(x=>x.height==Number(req.params.h));
+  if(!b) return res.status(404).json({error:"Not found"});
+  res.json(b);
+});
+
+// =====================================================
+// WEBSOCKET SERVER
+// =====================================================
+const server = app.listen(3000,()=>console.log("API Fireinners :3000"));
+
+const wss = new WebSocket.Server({ noServer:true });
+
+server.on("upgrade",(req,socket,head)=>{
+  if(req.url==="/ws"){
+    wss.handleUpgrade(req,socket,head,(ws)=>{
+      wss.emit("connection",ws,req);
+    });
+  }
+});
+
+function broadcast(obj){
+  const msg=JSON.stringify(obj);
+  wss.clients.forEach(c=>{
+    if(c.readyState===WebSocket.OPEN) c.send(msg);
+  });
+}
+
+wss.on("connection",(ws)=>{
+  console.log("WS client connected");
+
+  // Envoyer visiteurs
+  broadcast({type:"clients",count:wss.clients.size});
+
+  // Envoyer mempool initial
+  ws.send(JSON.stringify({type:"mempool",mempool:state.mempool}));
+
+  ws.on("close",()=>{
+    broadcast({type:"clients",count:wss.clients.size});
+  });
+});
+
+
+
+
+
+
+
+
+
+
+
+
