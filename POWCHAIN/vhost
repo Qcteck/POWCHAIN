@@ -3,6 +3,525 @@ sudo nano server.js
 
 
 
+// server.js — FIREINNERS backend (wallets / DEX / LP / staking / bridge / mining / WS)
+const express = require("express");
+const http = require("http");
+const crypto = require("crypto");
+const WebSocket = require("ws");
+const cors = require("cors");
+
+// ================== CONFIG ==================
+const PORT = 3000;
+const DEC = 1e6;
+
+const SOL_RPC = "https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac";
+const TREASURY_SOL = "BZJsWeJizv3YeyuWjF5187jrcduPFAHWjqL7jgq4kGwy";
+
+// 1 SOL => X FIRE + Y USDC(FIRE)
+const BRIDGE_RATE_FIRE = 100;   // 1 SOL -> 100 FIRE
+const BRIDGE_RATE_USDC = 50;    // 1 SOL -> 50 USDC(FIRE)
+
+// Mining / PoW paramètres
+const TARGET_BLOCK_TIME = 30;        // secondes par bloc (cible)
+const HALVING_INTERVAL = 1000;       // tous les 1000 blocs
+const BASE_REWARD = 10 * DEC;        // 10 FIRE par bloc au début
+
+// ================== ETAT GLOBAL ==================
+const state = {
+  height: 0,
+  wallets: {},      // addr -> { pow, usdc, staked, nonce }
+  lpPow: 0,
+  lpUsdc: 0,
+  treasury: { sol: 0, usdc: 0, fire: 0 },
+  totalPow: 0,
+  totalStaked: 0,
+  mempool: [],      // liste de tx {id, type, ...}
+  blocks: [],       // blockchain
+  mining: {
+    difficulty: 4,        // nb de zéros hex au début du hash
+    lastBlockTime: Date.now()
+  }
+};
+
+const seenSolTx = new Set();   // anti double-crédit bridge
+let nextTxId = 1;
+
+// ================== APP / WS ==================
+const app = express();
+app.use(express.json());
+app.use(cors());
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server, path: "/ws" });
+
+// ================== UTILS ==================
+function getWallet(addr) {
+  if (!state.wallets[addr]) {
+    state.wallets[addr] = { pow: 0, usdc: 0, staked: 0, nonce: 0 };
+  }
+  return state.wallets[addr];
+}
+
+function broadcast(msgObj) {
+  const data = JSON.stringify(msgObj);
+  wss.clients.forEach(c => {
+    if (c.readyState === WebSocket.OPEN) c.send(data);
+  });
+}
+
+function nowSeconds() {
+  return Math.floor(Date.now() / 1000);
+}
+
+function sha256Hex(str) {
+  return crypto.createHash("sha256").update(str).digest("hex");
+}
+
+function currentReward() {
+  const halvings = Math.floor(state.height / HALVING_INTERVAL);
+  const reward = BASE_REWARD >> BigInt(halvings);
+  return reward > 0 ? Number(reward) : 0;
+}
+
+function adjustDifficulty(blockTimeSec) {
+  const target = TARGET_BLOCK_TIME;
+  if (blockTimeSec < target / 2 && state.mining.difficulty < 10) {
+    state.mining.difficulty++;
+  } else if (blockTimeSec > target * 2 && state.mining.difficulty > 1) {
+    state.mining.difficulty--;
+  }
+}
+
+// PoW simple : N zéros hex au début du hash
+function checkPowValid(header, nonce, difficulty) {
+  const hash = sha256Hex(header + ":" + nonce);
+  const prefix = "0".repeat(difficulty);
+  return hash.startsWith(prefix);
+}
+
+// ================== SOLANA : VERIF BRIDGE ==================
+async function verifySolBridge(signature, expectedSolAmount) {
+  try {
+    const body = {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "getTransaction",
+      params: [signature, { encoding: "jsonParsed", commitment: "confirmed" }]
+    };
+    const res = await fetch(SOL_RPC, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    });
+    const json = await res.json();
+    if (!json.result) return { ok: false, error: "TX introuvable" };
+
+    const tx = json.result;
+    if (tx.meta && tx.meta.err) {
+      return { ok: false, error: "TX en erreur Solana" };
+    }
+
+    const msg = tx.transaction.message;
+    const keys = msg.accountKeys || [];
+    const meta = tx.meta || {};
+    const pre = meta.preBalances || [];
+    const post = meta.postBalances || [];
+
+    let idxTreasury = -1;
+    keys.forEach((k, i) => {
+      const pub = typeof k === "string" ? k : k.pubkey;
+      if (pub === TREASURY_SOL) idxTreasury = i;
+    });
+    if (idxTreasury === -1) {
+      return { ok: false, error: "Trésorerie non trouvée dans la TX" };
+    }
+
+    const before = pre[idxTreasury] || 0;
+    const after = post[idxTreasury] || 0;
+    const delta = after - before;
+    const expectedLamports = Math.floor(expectedSolAmount * 1e9);
+
+    if (delta < expectedLamports) {
+      return { ok: false, error: "Montant reçu < attendu" };
+    }
+    return { ok: true, lamports: delta };
+  } catch (e) {
+    return { ok: false, error: "Erreur RPC Solana : " + e.message };
+  }
+}
+
+// ================== MEMPOOL / BLOCS ==================
+function addToMempool(tx) {
+  tx.id = nextTxId++;
+  state.mempool.push(tx);
+  broadcast({ type: "mempool", mempool: state.mempool });
+}
+
+function buildBlock(minerAddr, nonce) {
+  const height = state.height + 1;
+  const prevHash = state.blocks.length ? state.blocks[state.blocks.length - 1].hash : "GENESIS";
+  const txs = state.mempool.slice();
+  const timestamp = nowSeconds();
+
+  const headerObj = { height, prevHash, ts: timestamp, miner: minerAddr, txCount: txs.length };
+  const header = JSON.stringify(headerObj);
+  const hash = sha256Hex(header + ":" + nonce);
+
+  return {
+    height,
+    prevHash,
+    ts: timestamp,
+    miner: minerAddr,
+    nonce,
+    hash,
+    difficulty: state.mining.difficulty,
+    txs
+  };
+}
+
+function applyTx(tx) {
+  if (!tx || !tx.type) return;
+  if (tx.type === "BRIDGE_CREDIT") {
+    const w = getWallet(tx.addr);
+    w.pow += tx.fire;
+    w.usdc += tx.usdc;
+    w.nonce++;
+    state.totalPow += tx.fire;
+    state.treasury.fire += tx.fire;
+    state.treasury.usdc += tx.usdc;
+    state.treasury.sol += tx.sol;
+  } else if (tx.type === "SWAP") {
+    const w = getWallet(tx.addr);
+    if (tx.dir === "pow2usdc") {
+      w.pow -= tx.deltaIn;
+      w.usdc += tx.deltaOut;
+    } else {
+      w.usdc -= tx.deltaIn;
+      w.pow += tx.deltaOut;
+    }
+    w.nonce++;
+  } else if (tx.type === "LP_ADD") {
+    const w = getWallet(tx.addr);
+    w.pow -= tx.pow;
+    w.usdc -= tx.usdc;
+    w.nonce++;
+    state.lpPow += tx.pow;
+    state.lpUsdc += tx.usdc;
+  } else if (tx.type === "STAKE") {
+    const w = getWallet(tx.addr);
+    w.pow -= tx.amount;
+    w.staked += tx.amount;
+    w.nonce++;
+    state.totalStaked += tx.amount;
+  } else if (tx.type === "REWARD") {
+    const w = getWallet(tx.addr);
+    w.pow += tx.amount;
+    w.nonce++;
+    state.totalPow += tx.amount;
+  }
+}
+
+function applyBlock(block) {
+  block.txs.forEach(applyTx);
+  state.blocks.push(block);
+  state.height = block.height;
+  const now = Date.now();
+  const diffTime = (now - state.mining.lastBlockTime) / 1000;
+  adjustDifficulty(diffTime);
+  state.mining.lastBlockTime = now;
+  state.mempool = [];
+  broadcast({ type: "new_block", block });
+  broadcast({ type: "mempool", mempool: state.mempool });
+}
+
+// ================== ENDPOINTS REST ==================
+
+// Wallet
+app.get("/wallet/:addr", (req, res) => {
+  const addr = req.params.addr;
+  const w = getWallet(addr);
+  res.json({
+    addr,
+    pow: w.pow,
+    usdc: w.usdc,
+    staked: w.staked,
+    nonce: w.nonce
+  });
+});
+
+// Stats
+app.get("/stats", (req, res) => {
+  res.json({
+    height: state.height,
+    wallets: Object.keys(state.wallets).length,
+    mempool: state.mempool.length,
+    totalPow: state.totalPow,
+    totalStaked: state.totalStaked,
+    lpPow: state.lpPow,
+    lpUsdc: state.lpUsdc,
+    solTreasury: state.treasury.sol / 1e9,
+    usdcTreasury: state.treasury.usdc / DEC,
+    fireTreasury: state.treasury.fire / DEC,
+    miningDiff: state.mining.difficulty
+  });
+});
+
+// Bridge SOL -> FIREINNERS
+app.post("/bridge", async (req, res) => {
+  try {
+    const { addr, amount, signature } = req.body || {};
+    if (!addr || !amount || !signature) {
+      return res.status(400).json({ ok: false, error: "Paramètres manquants" });
+    }
+    if (seenSolTx.has(signature)) {
+      return res.status(400).json({ ok: false, error: "TX déjà utilisée" });
+    }
+
+    const solAmt = Number(amount);
+    if (!(solAmt > 0)) {
+      return res.status(400).json({ ok: false, error: "Montant SOL invalide" });
+    }
+
+    const check = await verifySolBridge(signature, solAmt);
+    if (!check.ok) {
+      return res.status(400).json({ ok: false, error: "Vérif Solana: " + check.error });
+    }
+
+    seenSolTx.add(signature);
+
+    const fire = Math.floor(solAmt * BRIDGE_RATE_FIRE * DEC);
+    const usdc = Math.floor(solAmt * BRIDGE_RATE_USDC * DEC);
+    const solLam = Math.floor(solAmt * 1e9);
+
+    const tx = {
+      type: "BRIDGE_CREDIT",
+      addr,
+      fire,
+      usdc,
+      sol: solLam,
+      sig: signature
+    };
+    addToMempool(tx);
+
+    res.json({ ok: true, creditedFire: fire / DEC, creditedUsdc: usdc / DEC });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// DEX swap
+app.post("/swap", (req, res) => {
+  try {
+    const { addr, dir, amount } = req.body || {};
+    if (!addr || !dir || !amount) {
+      return res.status(400).json({ ok: false, error: "Paramètres manquants" });
+    }
+    const w = getWallet(addr);
+    const amt = Number(amount);
+    if (!(amt > 0)) return res.status(400).json({ ok: false, error: "Montant invalide" });
+
+    let x = state.lpPow;
+    let y = state.lpUsdc;
+    if (x <= 0 || y <= 0) return res.status(400).json({ ok: false, error: "Pool vide" });
+
+    const feeRate = 0.003;
+    let deltaOut = 0;
+    if (dir === "pow2usdc") {
+      if (w.pow < amt) return res.status(400).json({ ok: false, error: "Solde FIRE insuffisant" });
+      const amtAfterFee = amt * (1 - feeRate);
+      const k = x * y;
+      const newX = x + amtAfterFee;
+      const newY = k / newX;
+      deltaOut = y - newY;
+      if (deltaOut <= 0) return res.status(400).json({ ok: false, error: "DeltaOut <= 0" });
+      x = newX; y = newY;
+    } else if (dir === "usdc2pow") {
+      if (w.usdc < amt) return res.status(400).json({ ok: false, error: "Solde USDC(FIRE) insuffisant" });
+      const amtAfterFee = amt * (1 - feeRate);
+      const k = x * y;
+      const newY = y + amtAfterFee;
+      const newX = k / newY;
+      deltaOut = x - newX;
+      if (deltaOut <= 0) return res.status(400).json({ ok: false, error: "DeltaOut <= 0" });
+      x = newX; y = newY;
+    } else {
+      return res.status(400).json({ ok: false, error: "Direction invalide" });
+    }
+
+    const tx = {
+      type: "SWAP",
+      addr,
+      dir,
+      deltaIn: amt,
+      deltaOut: Math.floor(deltaOut)
+    };
+    addToMempool(tx);
+
+    state.lpPow = x;
+    state.lpUsdc = y;
+
+    res.json({ ok: true, received: Math.floor(deltaOut) });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// LP ADD
+app.post("/lp/add", (req, res) => {
+  try {
+    const { addr, pow, usdc } = req.body || {};
+    if (!addr || !pow || !usdc) {
+      return res.status(400).json({ ok: false, error: "Paramètres manquants" });
+    }
+    const w = getWallet(addr);
+    const p = Number(pow);
+    const u = Number(usdc);
+    if (!(p > 0 && u > 0)) return res.status(400).json({ ok: false, error: "Montants invalides" });
+    if (w.pow < p || w.usdc < u) {
+      return res.status(400).json({ ok: false, error: "Soldes insuffisants" });
+    }
+
+    const tx = { type: "LP_ADD", addr, pow: p, usdc: u };
+    addToMempool(tx);
+
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// STAKE
+app.post("/stake", (req, res) => {
+  try {
+    const { addr, amount } = req.body || {};
+    if (!addr || !amount) {
+      return res.status(400).json({ ok: false, error: "Paramètres manquants" });
+    }
+    const w = getWallet(addr);
+    const a = Number(amount);
+    if (!(a > 0)) return res.status(400).json({ ok: false, error: "Montant invalide" });
+    if (w.pow < a) return res.status(400).json({ ok: false, error: "Solde FIRE insuffisant" });
+
+    const tx = { type: "STAKE", addr, amount: a };
+    addToMempool(tx);
+
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Explorer : bloc par hauteur
+app.get("/block/:h", (req, res) => {
+  const h = parseInt(req.params.h, 10);
+  if (!(h > 0 && h <= state.height)) {
+    return res.status(404).json({ error: "Bloc introuvable" });
+  }
+  const blk = state.blocks.find(b => b.height === h);
+  if (!blk) return res.status(404).json({ error: "Bloc introuvable" });
+  res.json(blk);
+});
+// ================== MINING /mine/test ==================
+app.post("/mine/test", async (req, res) => {
+  try {
+    const { addr } = req.body || {};
+    if (!addr) return res.status(400).json({ ok: false, error: "addr manquant" });
+    getWallet(addr);
+
+    const start = Date.now();
+    const difficulty = state.mining.difficulty;
+    const prevHash = state.blocks.length ? state.blocks[state.blocks.length - 1].hash : "GENESIS";
+    const headerBase = JSON.stringify({
+      height: state.height + 1,
+      prevHash,
+      ts: nowSeconds(),
+      miner: addr,
+      txCount: state.mempool.length
+    });
+
+    let nonce = 0;
+    let found = false;
+    const maxLoops = 200000;
+    for (let i = 0; i < maxLoops; i++) {
+      nonce = Math.floor(Math.random() * 1e12);
+      if (checkPowValid(headerBase, nonce, difficulty)) {
+        found = true;
+        break;
+      }
+    }
+
+    const elapsed = (Date.now() - start) / 1000;
+    const hashrate = Math.round(maxLoops / (elapsed || 1));
+
+    let reward = 0;
+    if (found) {
+      reward = currentReward();
+      const rewardTx = { type: "REWARD", addr, amount: reward };
+      state.mempool.push(rewardTx);
+
+      const block = buildBlock(addr, nonce);
+      applyBlock(block);
+
+      broadcast({
+        type: "mining",
+        msg: `Bloc #${block.height} trouvé par ${addr} diff=${difficulty} reward=${reward / DEC}`
+      });
+    } else {
+      broadcast({
+        type: "mining",
+        msg: `Test mining non concluant pour ${addr} sur ${maxLoops} essais`
+      });
+    }
+
+    res.json({
+      ok: true,
+      found,
+      diff: difficulty,
+      reward: reward / DEC,
+      hashrate: hashrate + " H/s"
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ================== WEBSOCKET ==================
+wss.on("connection", ws => {
+  ws.send(JSON.stringify({
+    type: "hello",
+    height: state.height,
+    mempool: state.mempool.length
+  }));
+  ws.send(JSON.stringify({ type: "mempool", mempool: state.mempool }));
+});
+
+// ================== GENESIS ==================
+function createGenesis() {
+  if (state.height > 0) return;
+  const genesis = {
+    height: 1,
+    prevHash: "GENESIS0",
+    ts: nowSeconds(),
+    miner: "GENESIS",
+    nonce: 0,
+    hash: sha256Hex("GENESIS"),
+    difficulty: state.mining.difficulty,
+    txs: []
+  };
+  state.blocks.push(genesis);
+  state.height = 1;
+  state.mining.lastBlockTime = Date.now();
+}
+createGenesis();
+
+// ================== LANCEMENT ==================
+server.listen(PORT, () => {
+  console.log("🔥 FIREINNERS backend en ligne sur port", PORT);
+});
+
+
+
+
+
 
 
 
