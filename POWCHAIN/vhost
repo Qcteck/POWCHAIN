@@ -1,2 +1,380 @@
 sudo nano /root/fireinners/server.js
-# ou ton chemin réel
+// server.js – FIREINNERS backend complet (API + WebSocket)
+// Démarrage conseillé : pm2 start server.js --name fireinners
+
+const express = require("express");
+const cors = require("cors");
+const http = require("http");
+const WebSocket = require("ws");
+
+//------------------------
+// Config de base
+//------------------------
+const PORT = 3000;
+const DEC = 1e6; // même décimales que le front
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+//------------------------
+// Etat en mémoire
+//------------------------
+const state = {
+  height: 0,
+  wallets: {},     // addr -> { pow, usdc, staked, nonce }
+  mempool: [],     // tx en attente
+  blocks: [],      // { height, ts, txs, hash }
+  lpPow: 0,
+  lpUsdc: 0,
+  treasury: {
+    sol: 0,
+    usdc: 0,
+    fire: 0
+  }
+};
+
+function ensureWallet(addr) {
+  if (!addr) throw new Error("Adresse manquante");
+  if (!state.wallets[addr]) {
+    state.wallets[addr] = {
+      pow: 0,
+      usdc: 0,
+      staked: 0,
+      nonce: 0
+    };
+  }
+  return state.wallets[addr];
+}
+
+// Simple hash texte (pas cryptographique, juste pour l’explorer)
+function simpleHash(str) {
+  let h = 0;
+  for (let i = 0; i < str.length; i++) {
+    h = (h * 31 + str.charCodeAt(i)) >>> 0;
+  }
+  return h.toString(16).padStart(8, "0");
+}
+
+// Création d’un bloc à partir des tx en mempool
+function produceBlock() {
+  const txs = state.mempool.splice(0, state.mempool.length);
+  state.height += 1;
+  const block = {
+    height: state.height,
+    ts: Date.now(),
+    txs,
+    txCount: txs.length
+  };
+  block.hash = simpleHash(
+    `${block.height}|${block.ts}|${JSON.stringify(txs)}`
+  );
+  state.blocks.push(block);
+
+  broadcast({
+    type: "new_block",
+    block
+  });
+
+  console.log(`Bloc #${block.height} produit (${txs.length} tx)`);
+  return block;
+}
+
+// Application d’une transaction simple au state
+function applyTx(tx) {
+  const w = ensureWallet(tx.addr || tx.from);
+  if (tx.type === "bridge") {
+    // Crédit de FIRE + USDC(FIRE) basé sur montant SOL
+    const solAmount = Number(tx.amount) || 0;
+    if (solAmount <= 0) throw new Error("Montant SOL invalide");
+    const creditPow = Math.floor(solAmount * 1000 * DEC);
+    const creditUsdc = Math.floor(solAmount * 100 * DEC);
+
+    w.pow += creditPow;
+    w.usdc += creditUsdc;
+    state.treasury.sol += solAmount;
+    state.treasury.fire += creditPow;
+    state.treasury.usdc += creditUsdc;
+
+  } else if (tx.type === "swap") {
+    const side = tx.dir || tx.side;
+    const amount = Number(tx.amount) || 0;
+    if (amount <= 0) throw new Error("Montant swap invalide");
+    if (state.lpPow <= 0 || state.lpUsdc <= 0) {
+      throw new Error("LP vide");
+    }
+
+    const feeBps = 30; // 0.30 %
+    if (side === "pow2usdc") {
+      // FIRE -> USDC(FIRE)
+      if (w.pow < amount) throw new Error("Balance FIRE insuffisante");
+      const amountNet = amount * (10000 - feeBps) / 10000;
+      const k = state.lpPow * state.lpUsdc;
+      const newPow = state.lpPow + amountNet;
+      const newUsdc = k / newPow;
+      let out = state.lpUsdc - newUsdc;
+      out = Math.floor(out);
+
+      if (out <= 0) throw new Error("Sortie USDC trop faible");
+
+      w.pow -= amount;
+      w.usdc += out;
+      state.lpPow += amountNet;
+      state.lpUsdc -= out;
+      state.treasury.fire += Math.floor(amount - amountNet);  // frais en FIRE
+
+      tx.received = out;
+    } else if (side === "usdc2pow" || side === "buy") {
+      // USDC(FIRE) -> FIRE
+      if (w.usdc < amount) throw new Error("Balance USDC(FIRE) insuffisante");
+      const amountNet = amount * (10000 - feeBps) / 10000;
+      const k = state.lpPow * state.lpUsdc;
+      const newUsdc = state.lpUsdc + amountNet;
+      const newPow = k / newUsdc;
+      let out = state.lpPow - newPow;
+      out = Math.floor(out);
+
+      if (out <= 0) throw new Error("Sortie FIRE trop faible");
+
+      w.usdc -= amount;
+      w.pow += out;
+      state.lpUsdc += amountNet;
+      state.lpPow -= out;
+      state.treasury.usdc += Math.floor(amount - amountNet); // frais USDC
+
+      tx.received = out;
+    } else {
+      throw new Error("Direction swap inconnue");
+    }
+
+  } else if (tx.type === "lp_add") {
+    const addPow = Number(tx.pow) || 0;
+    const addUsdc = Number(tx.usdc) || 0;
+    if (addPow <= 0 || addUsdc <= 0) throw new Error("Montants LP invalides");
+    if (w.pow < addPow || w.usdc < addUsdc) {
+      throw new Error("Balances insuffisantes pour LP");
+    }
+    w.pow -= addPow;
+    w.usdc -= addUsdc;
+    state.lpPow += addPow;
+    state.lpUsdc += addUsdc;
+
+  } else if (tx.type === "stake") {
+    const amt = Number(tx.amount) || 0;
+    if (amt <= 0) throw new Error("Montant stake invalide");
+    if (w.pow < amt) throw new Error("Balance FIRE insuffisante");
+    w.pow -= amt;
+    w.staked += amt;
+    state.totalStaked += amt;
+
+  } else {
+    throw new Error("Type de transaction inconnu");
+  }
+
+  w.nonce += 1;
+}
+
+//------------------------
+// API HTTP
+//------------------------
+
+app.get("/", (req, res) => {
+  res.send("FIREINNERS backend en ligne");
+});
+
+// Wallet FIREINNERS
+app.get("/wallet/:addr", (req, res) => {
+  try {
+    const addr = req.params.addr;
+    const w = ensureWallet(addr);
+    res.json({
+      addr,
+      pow: w.pow,
+      usdc: w.usdc,
+      staked: w.staked,
+      nonce: w.nonce
+    });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+// Bridge SOL -> FIREINNERS (déclaration après Phantom)
+app.post("/bridge", (req, res) => {
+  try {
+    const { addr, amount, signature } = req.body || {};
+    if (!addr) throw new Error("Adresse FIREINNERS manquante");
+    if (!amount) throw new Error("Montant SOL manquant");
+    if (!signature) console.warn("Bridge sans signature vérifiée (mode demo)");
+
+    const tx = {
+      type: "bridge",
+      addr,
+      amount: Number(amount)
+    };
+    state.mempool.push(tx);
+    applyTx(tx);
+    const block = produceBlock();
+
+    res.json({
+      ok: true,
+      block: block.height
+    });
+  } catch (e) {
+    console.error("Bridge ERR:", e.message);
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+// Swap
+app.post("/swap", (req, res) => {
+  try {
+    const { addr, dir, amount } = req.body || {};
+    if (!addr) throw new Error("Adresse FIREINNERS manquante");
+    const tx = {
+      type: "swap",
+      addr,
+      dir,
+      amount: Number(amount)
+    };
+    state.mempool.push(tx);
+    applyTx(tx);
+    const block = produceBlock();
+    res.json({
+      ok: true,
+      received: tx.received || 0,
+      block: block.height
+    });
+  } catch (e) {
+    console.error("Swap ERR:", e.message);
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+// Ajout LP
+app.post("/lp/add", (req, res) => {
+  try {
+    const { addr, pow, usdc } = req.body || {};
+    if (!addr) throw new Error("Adresse FIREINNERS manquante");
+    const tx = {
+      type: "lp_add",
+      addr,
+      pow: Number(pow),
+      usdc: Number(usdc)
+    };
+    state.mempool.push(tx);
+    applyTx(tx);
+    const block = produceBlock();
+    res.json({ ok: true, block: block.height });
+  } catch (e) {
+    console.error("LP_ADD ERR:", e.message);
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+// Staking
+app.post("/stake", (req, res) => {
+  try {
+    const { addr, amount } = req.body || {};
+    if (!addr) throw new Error("Adresse FIREINNERS manquante");
+    const tx = {
+      type: "stake",
+      addr,
+      amount: Number(amount)
+    };
+    state.mempool.push(tx);
+    applyTx(tx);
+    const block = produceBlock();
+    res.json({ ok: true, block: block.height });
+  } catch (e) {
+    console.error("Stake ERR:", e.message);
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+// Explorer: bloc par hauteur
+app.get("/block/:h", (req, res) => {
+  const h = parseInt(req.params.h, 10);
+  const b = state.blocks.find(x => x.height === h);
+  if (!b) return res.status(404).json({ error: "Bloc introuvable" });
+  res.json(b);
+});
+
+// Liste mempool (optionnel, pour debug)
+app.get("/mempool", (req, res) => {
+  res.json({ txs: state.mempool });
+});
+
+// Stats globales pour le HTML
+app.get("/stats", (req, res) => {
+  res.json({
+    height: state.height,
+    wallets: Object.keys(state.wallets).length,
+    mempool: state.mempool.length,
+    totalPow: state.blocks.reduce((a, b) => a, 0), // placeholder simple
+    totalStaked: state.totalStaked || 0,
+    lpPow: state.lpPow,
+    lpUsdc: state.lpUsdc,
+    solTreasury: state.treasury.sol,
+    usdcTreasury: state.treasury.usdc,
+    fireTreasury: state.treasury.fire
+  });
+});
+
+//------------------------
+// HTTP + WebSocket /ws
+//------------------------
+const server = http.createServer(app);
+
+// WebSocket en upgrade sur /ws (compatible Nginx proxy_pass /ws)
+const wss = new WebSocket.Server({ noServer: true });
+
+server.on("upgrade", (req, socket, head) => {
+  if (req.url === "/ws") {
+    wss.handleUpgrade(req, socket, head, ws => {
+      wss.emit("connection", ws, req);
+    });
+  } else {
+    socket.destroy();
+  }
+});
+
+function broadcast(obj) {
+  const data = JSON.stringify(obj);
+  wss.clients.forEach(c => {
+    if (c.readyState === WebSocket.OPEN) {
+      c.send(data);
+    }
+  });
+}
+
+wss.on("connection", ws => {
+  console.log("WS client connecté");
+  ws.send(JSON.stringify({ type: "info", message: "WS connecté" }));
+  ws.send(JSON.stringify({ type: "mempool", mempool: state.mempool }));
+  ws.send(JSON.stringify({ type: "stats", stats: {
+    height: state.height,
+    wallets: Object.keys(state.wallets).length,
+    mempool: state.mempool.length,
+    lpPow: state.lpPow,
+    lpUsdc: state.lpUsdc
+  }}));
+
+  ws.on("close", () => {
+    console.log("WS client déconnecté");
+  });
+});
+
+//------------------------
+// Démarrage
+//------------------------
+server.listen(PORT, () => {
+  console.log("🔥 FIREINNERS backend en ligne sur port", PORT);
+});
+
+
+
+cd /root/fireinners   # adapte si besoin
+nano server.js        # colle tout le code, enregistre (Ctrl+O, Enter, Ctrl+X)
+pm2 restart fireinners
+pm2 save
+
