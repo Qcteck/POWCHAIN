@@ -1,103 +1,69 @@
 #!/bin/bash
 set -e
+echo "🔥 FIREINNERS — Diagnostic + Fix WS"
 
-echo "🔥 FIREINNERS — Batch correctif WS / NGINX / PM2"
+API_PORT=3000
+DOMAIN="bbqfinance.fun"
+SITE="/etc/nginx/sites-enabled/bbqfinance.fun"
 
-### 1️⃣ Sécuriser le backend PM2
-echo "▶️ Redémarrage propre du backend PM2"
-pm2 stop fireinners || true
-pm2 delete fireinners || true
+echo "== 1) Etat PM2 =="
+pm2 status || true
+echo "== 2) Port local =="
+ss -lntp | grep ":$API_PORT" || true
 
-cd /root/fireinners
-pm2 start server.js --name fireinners
-pm2 save
+echo "== 3) Test WS DIRECT (localhost) =="
+npm i -g wscat >/dev/null 2>&1 || true
+echo "-> Tentative: ws://127.0.0.1:${API_PORT}/ws (doit CONNECTED)"
+set +e
+wscat -c "ws://127.0.0.1:${API_PORT}/ws" -x '{"type":"ping"}' -w 2
+LOCAL_WS=$?
+set -e
 
-### 2️⃣ Patch NGINX (WebSocket stable)
-echo "▶️ Correction configuration NGINX WebSocket"
+echo "== 4) Test WS VIA DOMAINE (wss) =="
+echo "-> Tentative: wss://${DOMAIN}/ws (doit CONNECTED)"
+set +e
+wscat -c "wss://${DOMAIN}/ws" -x '{"type":"ping"}' -w 2
+DOMAIN_WS=$?
+set -e
 
-NGINX_SITE="/etc/nginx/sites-enabled/bbqfinance.fun"
+echo "== 5) Si localhost OK mais domaine FAIL => Fix NGINX WS headers + buffering =="
+if [ "$LOCAL_WS" -eq 0 ] && [ "$DOMAIN_WS" -ne 0 ]; then
+  echo "✅ WS local OK, problème proxy. Patch NGINX..."
 
-cat > "$NGINX_SITE" <<'EOF'
-server {
-    listen 80;
-    server_name bbqfinance.fun;
-    return 301 https://$host$request_uri;
-}
-
-server {
-    listen 443 ssl http2;
-    server_name bbqfinance.fun;
-
-    ssl_certificate /etc/letsencrypt/live/bbqfinance.fun/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/bbqfinance.fun/privkey.pem;
-
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_prefer_server_ciphers off;
-
-    root /var/www/html;
-    index index.html;
-
-    location / {
-        try_files $uri $uri/ =404;
-    }
-
-    # 🔥 API backend
-    location /stats {
-        proxy_pass http://127.0.0.1:3000;
-        proxy_set_header Host $host;
-    }
-
-    location /wallet {
-        proxy_pass http://127.0.0.1:3000;
-        proxy_set_header Host $host;
-    }
-
-    location /bridge {
-        proxy_pass http://127.0.0.1:3000;
-        proxy_set_header Host $host;
-    }
-
-    location /swap {
-        proxy_pass http://127.0.0.1:3000;
-        proxy_set_header Host $host;
-    }
-
-    location /stake {
-        proxy_pass http://127.0.0.1:3000;
-        proxy_set_header Host $host;
-    }
-
-    location /block {
-        proxy_pass http://127.0.0.1:3000;
-        proxy_set_header Host $host;
-    }
-
-    # 🚀 WEBSOCKET STABLE
-    location /ws {
-        proxy_pass http://127.0.0.1:3000;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "Upgrade";
-        proxy_set_header Host $host;
-        proxy_read_timeout 86400;
-        proxy_send_timeout 86400;
-    }
+  # Ajouter un map propre pour Connection upgrade (dans conf.d)
+  cat > /etc/nginx/conf.d/ws_map.conf <<'EOF'
+map $http_upgrade $connection_upgrade {
+  default upgrade;
+  ''      close;
 }
 EOF
 
-nginx -t
-systemctl reload nginx
+  # Patch location /ws dans le site (sans casser le reste)
+  # Si /ws existe déjà: on remplace le bloc location /ws {...}
+  if grep -q "location /ws" "$SITE"; then
+    perl -0777 -i -pe 's/location\s+\/ws\s*\{.*?\}/location \/ws {\n  proxy_pass http:\/\/127.0.0.1:3000;\n  proxy_http_version 1.1;\n  proxy_set_header Upgrade $http_upgrade;\n  proxy_set_header Connection $connection_upgrade;\n  proxy_set_header Host $host;\n  proxy_read_timeout 86400;\n  proxy_send_timeout 86400;\n  proxy_buffering off;\n}\n/sms' "$SITE"
+  else
+    # sinon on l'ajoute avant la dernière accolade du server 443
+    perl -i -pe 'if($.==1){$seen=0} END{}' "$SITE"
+    perl -0777 -i -pe 's/\n}\s*$/\n\n  location \/ws {\n    proxy_pass http:\/\/127.0.0.1:3000;\n    proxy_http_version 1.1;\n    proxy_set_header Upgrade $http_upgrade;\n    proxy_set_header Connection $connection_upgrade;\n    proxy_set_header Host $host;\n    proxy_read_timeout 86400;\n    proxy_send_timeout 86400;\n    proxy_buffering off;\n  }\n}\n/s' "$SITE"
+  fi
 
-### 3️⃣ Vérification API
-echo "▶️ Test API /stats"
-curl -s https://bbqfinance.fun/stats | head -n 5
+  nginx -t
+  systemctl reload nginx
 
-### 4️⃣ Vérification WebSocket
-echo "▶️ Test WebSocket avec wscat"
-npm i -g wscat >/dev/null 2>&1 || true
-echo "→ Si CONNECTED + message JSON = OK"
-wscat -c wss://bbqfinance.fun/ws || true
+  echo "== Retest WS domaine après patch =="
+  set +e
+  wscat -c "wss://${DOMAIN}/ws" -x '{"type":"ping"}' -w 2
+  set -e
+fi
 
-### 5️⃣ Logs finaux
-echo "▶️ Logs backend (CTRL+C pour quitter)"
-pm2 logs fireinners --lines 20
+echo "== 6) Si localhost FAIL => le backend n’expose PAS /ws (corriger server.js) =="
+if [ "$LOCAL_WS" -ne 0 ]; then
+  echo "❌ WS local KO: ton server.js ne sert pas le WS sur /ws:3000."
+  echo "Action: il faut corriger server.js (WebSocketServer path:'/ws' sur le même serveur HTTP)."
+fi
+
+echo "== 7) Log backend (20 lignes) =="
+pm2 logs fireinners --lines 20 || true
+
+echo "✅ Terminé"
