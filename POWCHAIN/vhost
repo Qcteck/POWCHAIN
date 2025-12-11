@@ -1,69 +1,10 @@
 #!/bin/bash
 set -e
-echo "🔥 FIREINNERS — Diagnostic + Fix WS"
+HTML="/var/www/bbqfinance.fun/index.html"
+cp -a "$HTML" "$HTML.bak.$(date +%s)"
 
-API_PORT=3000
-DOMAIN="bbqfinance.fun"
-SITE="/etc/nginx/sites-enabled/bbqfinance.fun"
+perl -i -pe 's/const API="https:\/\/bbqfinance\.fun";/const API=location.origin;/g' "$HTML"
+perl -i -pe 's/const WS_URL="wss:\/\/bbqfinance\.fun\/ws";/const WS_URL=(location.protocol==="https:"?"wss":"ws")+":\/\/"+location.host+"\/ws";/g' "$HTML"
 
-echo "== 1) Etat PM2 =="
-pm2 status || true
-echo "== 2) Port local =="
-ss -lntp | grep ":$API_PORT" || true
-
-echo "== 3) Test WS DIRECT (localhost) =="
-npm i -g wscat >/dev/null 2>&1 || true
-echo "-> Tentative: ws://127.0.0.1:${API_PORT}/ws (doit CONNECTED)"
-set +e
-wscat -c "ws://127.0.0.1:${API_PORT}/ws" -x '{"type":"ping"}' -w 2
-LOCAL_WS=$?
-set -e
-
-echo "== 4) Test WS VIA DOMAINE (wss) =="
-echo "-> Tentative: wss://${DOMAIN}/ws (doit CONNECTED)"
-set +e
-wscat -c "wss://${DOMAIN}/ws" -x '{"type":"ping"}' -w 2
-DOMAIN_WS=$?
-set -e
-
-echo "== 5) Si localhost OK mais domaine FAIL => Fix NGINX WS headers + buffering =="
-if [ "$LOCAL_WS" -eq 0 ] && [ "$DOMAIN_WS" -ne 0 ]; then
-  echo "✅ WS local OK, problème proxy. Patch NGINX..."
-
-  # Ajouter un map propre pour Connection upgrade (dans conf.d)
-  cat > /etc/nginx/conf.d/ws_map.conf <<'EOF'
-map $http_upgrade $connection_upgrade {
-  default upgrade;
-  ''      close;
-}
-EOF
-
-  # Patch location /ws dans le site (sans casser le reste)
-  # Si /ws existe déjà: on remplace le bloc location /ws {...}
-  if grep -q "location /ws" "$SITE"; then
-    perl -0777 -i -pe 's/location\s+\/ws\s*\{.*?\}/location \/ws {\n  proxy_pass http:\/\/127.0.0.1:3000;\n  proxy_http_version 1.1;\n  proxy_set_header Upgrade $http_upgrade;\n  proxy_set_header Connection $connection_upgrade;\n  proxy_set_header Host $host;\n  proxy_read_timeout 86400;\n  proxy_send_timeout 86400;\n  proxy_buffering off;\n}\n/sms' "$SITE"
-  else
-    # sinon on l'ajoute avant la dernière accolade du server 443
-    perl -i -pe 'if($.==1){$seen=0} END{}' "$SITE"
-    perl -0777 -i -pe 's/\n}\s*$/\n\n  location \/ws {\n    proxy_pass http:\/\/127.0.0.1:3000;\n    proxy_http_version 1.1;\n    proxy_set_header Upgrade $http_upgrade;\n    proxy_set_header Connection $connection_upgrade;\n    proxy_set_header Host $host;\n    proxy_read_timeout 86400;\n    proxy_send_timeout 86400;\n    proxy_buffering off;\n  }\n}\n/s' "$SITE"
-  fi
-
-  nginx -t
-  systemctl reload nginx
-
-  echo "== Retest WS domaine après patch =="
-  set +e
-  wscat -c "wss://${DOMAIN}/ws" -x '{"type":"ping"}' -w 2
-  set -e
-fi
-
-echo "== 6) Si localhost FAIL => le backend n’expose PAS /ws (corriger server.js) =="
-if [ "$LOCAL_WS" -ne 0 ]; then
-  echo "❌ WS local KO: ton server.js ne sert pas le WS sur /ws:3000."
-  echo "Action: il faut corriger server.js (WebSocketServer path:'/ws' sur le même serveur HTTP)."
-fi
-
-echo "== 7) Log backend (20 lignes) =="
-pm2 logs fireinners --lines 20 || true
-
-echo "✅ Terminé"
+nginx -t && systemctl reload nginx
+echo "✅ Patch HTML OK. Backup: $HTML.bak.*"
