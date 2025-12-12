@@ -1,330 +1,67 @@
-# FIREINNERS – install complet (HTML + server.js + Nginx SSL + WebSocket)
-# Domaine: bbqfinance.fun
-# Backend: 127.0.0.1:3000
-# WS: /ws
-# Lance: sudo bash install_fireinners.sh
 
-set -e
+nano /etc/nginx/sites-available/fireinners
 
-DOMAIN="bbqfinance.fun"
-APPDIR="/root/fireinners"
-WEBDIR="/var/www/fireinners"
-PORT="3000"
 
-apt-get update -y
-apt-get install -y nginx curl ufw
 
-# Node/PM2 (si déjà installé, ça ne casse rien)
-if ! command -v node >/dev/null 2>&1; then
-  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-  apt-get install -y nodejs
-fi
-npm i -g pm2 >/dev/null 2>&1 || true
+server {
+    listen 443 ssl http2;
+    server_name bbqfinance.fun;
 
-mkdir -p "$APPDIR" "$WEBDIR"
+    root /var/www/html;
+    index index.html;
 
-############################################
-# 1) server.js (API + WS /ws compatible Nginx)
-############################################
-cat > "$APPDIR/server.js" <<'EOF'
-const express=require("express");
-const cors=require("cors");
-const http=require("http");
-const WebSocket=require("ws");
+    ssl_certificate /etc/letsencrypt/live/bbqfinance.fun/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/bbqfinance.fun/privkey.pem;
 
-const PORT=3000;
-const DEC=1e6;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
 
-const app=express();
-app.use(cors());
-app.use(express.json());
-
-const state={
-  height:0,
-  wallets:{},
-  mempool:[],
-  blocks:[],
-  lpPow:0,
-  lpUsdc:0,
-  totalStaked:0,
-  treasury:{sol:0,usdc:0,fire:0}
-};
-
-function ensureWallet(addr){
-  if(!addr) throw new Error("Adresse manquante");
-  if(!state.wallets[addr]) state.wallets[addr]={pow:0,usdc:0,staked:0,nonce:0};
-  return state.wallets[addr];
-}
-
-function simpleHash(str){
-  let h=0;
-  for(let i=0;i<str.length;i++) h=(h*31+str.charCodeAt(i))>>>0;
-  return h.toString(16).padStart(8,"0");
-}
-
-function broadcast(obj){
-  const msg=JSON.stringify(obj);
-  wss.clients.forEach(c=>{if(c.readyState===WebSocket.OPEN)c.send(msg);});
-}
-
-function produceBlock(){
-  const txs=state.mempool.splice(0,state.mempool.length);
-  state.height++;
-  const block={height:state.height,ts:Date.now(),txs,txCount:txs.length,hash:simpleHash(`${state.height}|${JSON.stringify(txs)}`)};
-  state.blocks.push(block);
-  broadcast({type:"new_block",block});
-  broadcast({type:"mempool",mempool:state.mempool});
-  return block;
-}
-
-function applyTx(tx){
-  const w=ensureWallet(tx.addr);
-
-  if(tx.type==="bridge"){
-    const solAmount=Number(tx.amount)||0;
-    if(solAmount<=0) throw new Error("Montant SOL invalide");
-    const creditPow=Math.floor(solAmount*1000*DEC);
-    const creditUsdc=Math.floor(solAmount*100*DEC);
-    w.pow+=creditPow;
-    w.usdc+=creditUsdc;
-    state.treasury.sol+=solAmount;
-    state.treasury.fire+=creditPow;
-    state.treasury.usdc+=creditUsdc;
-  } else if(tx.type==="swap"){
-    const dir=tx.dir;
-    const amount=Number(tx.amount);
-    if(amount<=0) throw new Error("Montant swap invalide");
-    if(state.lpPow===0||state.lpUsdc===0) throw new Error("LP vide");
-    const fee=30;
-
-    if(dir==="pow2usdc"){
-      if(w.pow<amount) throw new Error("Balance FIRE insuffisante");
-      const amountNet=amount*(10000-fee)/10000;
-      const k=state.lpPow*state.lpUsdc;
-      const newPow=state.lpPow+amountNet;
-      const newUsdc=k/newPow;
-      const out=Math.floor(state.lpUsdc-newUsdc);
-      if(out<=0) throw new Error("Sortie USDC trop faible");
-      w.pow-=amount;
-      w.usdc+=out;
-      state.lpPow+=amountNet;
-      state.lpUsdc-=out;
-      state.treasury.fire+=Math.floor(amount-amountNet);
-      tx.received=out;
-    } else if(dir==="usdc2pow"){
-      if(w.usdc<amount) throw new Error("Balance USDC insuffisante");
-      const amountNet=amount*(10000-fee)/10000;
-      const k=state.lpPow*state.lpUsdc;
-      const newUsdc=state.lpUsdc+amountNet;
-      const newPow=k/newUsdc;
-      const out=Math.floor(state.lpPow-newPow);
-      if(out<=0) throw new Error("Sortie FIRE trop faible");
-      w.usdc-=amount;
-      w.pow+=out;
-      state.lpUsdc+=amountNet;
-      state.lpPow-=out;
-      state.treasury.usdc+=Math.floor(amount-amountNet);
-      tx.received=out;
-    } else {
-      throw new Error("Direction inconnue");
+    # ====== STATIC ======
+    location /static/ {
+        expires 30d;
+        access_log off;
+        add_header Cache-Control "public";
     }
-  } else if(tx.type==="lp_add"){
-    const p=Number(tx.pow), u=Number(tx.usdc);
-    if(p<=0||u<=0) throw new Error("Montants LP invalides");
-    if(w.pow<p||w.usdc<u) throw new Error("Balance insuffisante LP");
-    w.pow-=p; w.usdc-=u;
-    state.lpPow+=p; state.lpUsdc+=u;
-  } else if(tx.type==="stake"){
-    const amt=Number(tx.amount);
-    if(amt<=0) throw new Error("Montant stake invalide");
-    if(w.pow<amt) throw new Error("Balance FIRE insuffisante");
-    w.pow-=amt;
-    w.staked+=amt;
-    state.totalStaked+=amt;
-  } else {
-    throw new Error("Type TX inconnu");
-  }
 
-  w.nonce++;
+    # ====== API NODE ======
+    location /api/ {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+
+    # ====== WEBSOCKET ======
+    location /ws {
+        proxy_pass http://127.0.0.1:3000/ws;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_read_timeout 86400;
+        proxy_send_timeout 86400;
+    }
+
+    # ====== SPA FALLBACK ======
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
 }
 
-app.get("/",(req,res)=>res.send("FIREINNERS backend OK"));
-
-app.get("/wallet/:addr",(req,res)=>{
-  try{res.json(ensureWallet(req.params.addr));}
-  catch(e){res.status(400).json({ok:false,error:e.message});}
-});
-
-app.post("/bridge",(req,res)=>{
-  try{
-    const tx={type:"bridge",addr:req.body.addr,amount:req.body.amount,signature:req.body.signature||null};
-    state.mempool.push(tx);
-    applyTx(tx);
-    const b=produceBlock();
-    res.json({ok:true,block:b.height});
-  }catch(e){res.status(400).json({ok:false,error:e.message});}
-});
-
-app.post("/swap",(req,res)=>{
-  try{
-    const tx={type:"swap",addr:req.body.addr,dir:req.body.dir,amount:req.body.amount};
-    state.mempool.push(tx);
-    applyTx(tx);
-    const b=produceBlock();
-    res.json({ok:true,received:tx.received||0,block:b.height});
-  }catch(e){res.status(400).json({ok:false,error:e.message});}
-});
-
-app.post("/lp/add",(req,res)=>{
-  try{
-    const tx={type:"lp_add",addr:req.body.addr,pow:req.body.pow,usdc:req.body.usdc};
-    state.mempool.push(tx);
-    applyTx(tx);
-    const b=produceBlock();
-    res.json({ok:true,block:b.height});
-  }catch(e){res.status(400).json({ok:false,error:e.message});}
-});
-
-app.post("/stake",(req,res)=>{
-  try{
-    const tx={type:"stake",addr:req.body.addr,amount:req.body.amount};
-    state.mempool.push(tx);
-    applyTx(tx);
-    const b=produceBlock();
-    res.json({ok:true,block:b.height});
-  }catch(e){res.status(400).json({ok:false,error:e.message});}
-});
-
-app.get("/block/:h",(req,res)=>{
-  const b=state.blocks.find(x=>x.height===Number(req.params.h));
-  if(!b) return res.status(404).json({error:"Bloc introuvable"});
-  res.json(b);
-});
-
-app.get("/stats",(req,res)=>{
-  res.json({
-    height:state.height,
-    wallets:Object.keys(state.wallets).length,
-    mempool:state.mempool.length,
-    totalPow:0,
-    totalStaked:state.totalStaked,
-    lpPow:state.lpPow,
-    lpUsdc:state.lpUsdc,
-    solTreasury:state.treasury.sol,
-    usdcTreasury:state.treasury.usdc,
-    fireTreasury:state.treasury.fire
-  });
-});
-
-const server=http.createServer(app);
-
-/* WS /ws (compatible Nginx Upgrade) */
-const wss=new WebSocket.Server({server,path:"/ws"});
-
-wss.on("connection",ws=>{
-  ws.send(JSON.stringify({type:"mempool",mempool:state.mempool}));
-  ws.send(JSON.stringify({type:"stats",stats:{
-    height:state.height,
-    wallets:Object.keys(state.wallets).length,
-    mempool:state.mempool.length
-  }}));
-});
-
-server.listen(PORT,()=>console.log("FIREINNERS backend en ligne sur port",PORT));
-EOF
-
-############################################
-# 2) Deps Node
-############################################
-cd "$APPDIR"
-if [ ! -f package.json ]; then npm init -y >/dev/null 2>&1; fi
-npm i express cors ws >/dev/null 2>&1
-
-############################################
-# 3) HTML (ton fichier, inchangé)
-############################################
-cat > "$WEBDIR/index.html" <<'EOF'
-PASTE_TON_HTML_ICI_SANS_LE_MODIFIER
-EOF
-
-# Remplace le placeholder avec TON HTML exact (évite les erreurs de quoting)
-python3 - <<'PY'
-import pathlib,sys,re
-p=pathlib.Path("/var/www/fireinners/index.html")
-txt=p.read_text(encoding="utf-8")
-if "PASTE_TON_HTML_ICI_SANS_LE_MODIFIER" in txt:
-  # rien: tu dois coller ton HTML à la place du placeholder si tu exécutes ce script tel quel
-  pass
-PY
-
-############################################
-# 4) Nginx (static + proxy API + WS)
-# IMPORTANT: on sert le HTML en static et on proxy seulement les routes API, sinon ça casse l'interface
-############################################
-cat > /etc/nginx/sites-available/fireinners <<EOF
+# HTTP → HTTPS
 server {
-  listen 80;
-  server_name $DOMAIN;
-  return 301 https://\$host\$request_uri;
+    listen 80;
+    server_name bbqfinance.fun;
+    return 301 https://$host$request_uri;
 }
 
-server {
-  listen 443 ssl http2;
-  server_name $DOMAIN;
 
-  ssl_certificate     /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
-  ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
 
-  ssl_protocols TLSv1.2 TLSv1.3;
-  ssl_prefer_server_ciphers off;
 
-  root $WEBDIR;
-  index index.html;
 
-  # WebSocket
-  location /ws {
-    proxy_pass http://127.0.0.1:$PORT/ws;
-    proxy_http_version 1.1;
-    proxy_set_header Upgrade \$http_upgrade;
-    proxy_set_header Connection "upgrade";
-    proxy_set_header Host \$host;
-    proxy_read_timeout 3600;
-  }
 
-  # API backend (routes exactes utilisées par ton HTML)
-  location ~ ^/(wallet/|bridge$|swap$|lp/add$|stake$|block/|stats$) {
-    proxy_pass http://127.0.0.1:$PORT;
-    proxy_set_header Host \$host;
-    proxy_set_header X-Real-IP \$remote_addr;
-    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto \$scheme;
-  }
 
-  # Static (HTML/CSS/JS)
-  location / {
-    try_files \$uri \$uri/ /index.html;
-  }
-}
-EOF
 
 ln -sf /etc/nginx/sites-available/fireinners /etc/nginx/sites-enabled/fireinners
-rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
-
 nginx -t
 systemctl reload nginx
-
-############################################
-# 5) PM2 start
-############################################
-pm2 delete fireinners >/dev/null 2>&1 || true
-pm2 start "$APPDIR/server.js" --name fireinners
-pm2 save
-
-############################################
-# 6) Tests locaux
-############################################
-echo "TEST /stats:"
-curl -s http://127.0.0.1:$PORT/stats || true
-echo
-echo "OK. Ouvre https://$DOMAIN puis regarde WS: online."
-echo "Si WS reste offline: vérifie Cloudflare -> WebSockets ON et SSL Full (Strict)."
