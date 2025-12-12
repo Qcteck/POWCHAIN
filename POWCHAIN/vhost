@@ -1,17 +1,184 @@
-#!/usr/bin/env bash
-set -euo pipefail
-HTML="/var/www/bbqfinance.fun/index.html"
-test -f "$HTML" || { echo "HTML introuvable: $HTML"; exit 1; }
-cp -a "$HTML" "$HTML.bak.$(date +%s)"
+############################################
+# 1. STOP / NETTOYAGE PROPRE
+############################################
+pm2 delete fireinners 2>/dev/null || true
+pm2 save
+sleep 1
 
-# 1) API + WS dynamiques (évite les mismatches Cloudflare/Nginx)
-perl -i -pe 's#const\s+API\s*=\s*"https?://bbqfinance\.fun"\s*;#const API=location.origin;#g' "$HTML"
-perl -i -pe 's#const\s+WS_URL\s*=\s*"wss?://bbqfinance\.fun/ws"\s*;#const WS_URL=(location.protocol==="https:"?"wss://":"ws://")+location.host+"/ws";#g' "$HTML"
+############################################
+# 2. DOSSIERS
+############################################
+mkdir -p /root/fireinners
+mkdir -p /var/www/html
 
-# 2) (optionnel) enlève les emojis du ticker si tu veux du 100% clean
-perl -i -pe 's/[🟠🟣🔵🧊🔥]//g' "$HTML"
+############################################
+# 3. SERVER.JS (WS CORRIGÉ)
+############################################
+cat > /root/fireinners/server.js <<'EOF'
+const express=require("express");
+const http=require("http");
+const WebSocket=require("ws");
+const cors=require("cors");
 
-# 3) reload nginx (si tu sers le HTML via nginx)
+const PORT=3000;
+const DEC=1e6;
+
+const app=express();
+app.use(cors());
+app.use(express.json());
+
+const state={
+  height:0,
+  wallets:{},
+  mempool:[],
+  blocks:[],
+  lpPow:0,
+  lpUsdc:0,
+  totalStaked:0,
+  treasury:{sol:0,usdc:0,fire:0}
+};
+
+const ensure=w=>{
+  if(!state.wallets[w])state.wallets[w]={pow:0,usdc:0,staked:0,nonce:0};
+  return state.wallets[w];
+};
+
+const hash=s=>require("crypto").createHash("sha256").update(s).digest("hex").slice(0,16);
+
+function produceBlock(){
+  const txs=state.mempool.splice(0);
+  state.height++;
+  const b={height:state.height,ts:Date.now(),txs};
+  b.hash=hash(JSON.stringify(b));
+  state.blocks.push(b);
+  broadcast({type:"new_block",block:b});
+  return b;
+}
+
+function apply(tx){
+  const w=ensure(tx.addr);
+  if(tx.type==="bridge"){
+    const sol=Number(tx.amount);
+    const fire=sol*1000*DEC;
+    const usdc=sol*100*DEC;
+    w.pow+=fire; w.usdc+=usdc;
+    state.treasury.sol+=sol;
+    state.treasury.fire+=fire;
+    state.treasury.usdc+=usdc;
+  }
+  if(tx.type==="swap"){
+    const a=Number(tx.amount);
+    if(tx.dir==="pow2usdc"){
+      w.pow-=a; w.usdc+=a;
+    }else{
+      w.usdc-=a; w.pow+=a;
+    }
+  }
+  if(tx.type==="stake"){
+    w.pow-=tx.amount;
+    w.staked+=tx.amount;
+    state.totalStaked+=tx.amount;
+  }
+  w.nonce++;
+}
+
+app.get("/stats",(req,res)=>res.json({
+  height:state.height,
+  wallets:Object.keys(state.wallets).length,
+  mempool:state.mempool.length,
+  totalStaked:state.totalStaked,
+  lpPow:state.lpPow,
+  lpUsdc:state.lpUsdc,
+  solTreasury:state.treasury.sol,
+  usdcTreasury:state.treasury.usdc,
+  fireTreasury:state.treasury.fire
+}));
+
+app.get("/wallet/:a",(r,s)=>s.json(ensure(r.params.a)));
+app.post("/bridge",(r,s)=>{const tx={type:"bridge",addr:r.body.addr,amount:r.body.amount};state.mempool.push(tx);apply(tx);produceBlock();s.json({ok:true});});
+app.post("/swap",(r,s)=>{const tx={type:"swap",addr:r.body.addr,dir:r.body.dir,amount:r.body.amount};state.mempool.push(tx);apply(tx);produceBlock();s.json({ok:true});});
+app.post("/stake",(r,s)=>{const tx={type:"stake",addr:r.body.addr,amount:r.body.amount};state.mempool.push(tx);apply(tx);produceBlock();s.json({ok:true});});
+
+const server=http.createServer(app);
+const wss=new WebSocket.Server({server,path:"/ws"});
+
+function broadcast(o){
+  const m=JSON.stringify(o);
+  wss.clients.forEach(c=>c.readyState===1&&c.send(m));
+}
+
+wss.on("connection",ws=>{
+  ws.send(JSON.stringify({type:"stats",stats:state}));
+});
+
+server.listen(PORT,()=>console.log("🔥 FIREINNERS backend OK :",PORT));
+EOF
+
+############################################
+# 4. FRONTEND HTML
+############################################
+cat > /var/www/html/index.html <<'EOF'
+<!doctype html><html lang=fr><head>
+<meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>🔥 FIREINNERS</title>
+<style>
+body{margin:0;background:#020005;color:#eee;font-family:system-ui}
+#ws{position:fixed;top:10px;right:10px;padding:6px 12px;border-radius:8px;background:#300}
+.ok{background:#063}.bad{background:#300}
+</style>
+</head><body>
+<div id=ws class=bad>WS OFFLINE</div>
+<h1>🔥 FIREINNERS</h1>
+<pre id=log></pre>
+<script>
+const API=location.origin;
+const WS=(location.protocol==="https:"?"wss":"ws")+"://"+location.host+"/ws";
+const log=t=>logEl.textContent=t+"\n"+logEl.textContent;
+const logEl=document.getElementById("log");
+let s=new WebSocket(WS);
+s.onopen=()=>{ws.className="ok";ws.textContent="WS ONLINE";};
+s.onclose=()=>{ws.className="bad";ws.textContent="WS OFFLINE";setTimeout(()=>location.reload(),3000)};
+s.onmessage=e=>log(e.data);
+</script>
+</body></html>
+EOF
+
+############################################
+# 5. NGINX WS OK
+############################################
+cat > /etc/nginx/sites-available/fireinners <<'EOF'
+server{
+  listen 80;
+  server_name bbqfinance.fun;
+  location / {
+    root /var/www/html;
+    index index.html;
+  }
+  location /ws {
+    proxy_pass http://127.0.0.1:3000/ws;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;
+  }
+  location / {
+    proxy_pass http://127.0.0.1:3000;
+  }
+}
+EOF
+
+ln -sf /etc/nginx/sites-available/fireinners /etc/nginx/sites-enabled/fireinners
 nginx -t && systemctl reload nginx
 
-echo "OK patch HTML. Backup: $HTML.bak.*"
+############################################
+# 6. PM2
+############################################
+cd /root/fireinners
+pm2 start server.js --name fireinners
+pm2 save
+
+############################################
+# 7. TESTS
+############################################
+curl http://localhost:3000/stats
+echo "FINI 🔥"
