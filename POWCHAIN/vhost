@@ -1,254 +1,46 @@
-#!/bin/bash
-set -e
-
-HTML="/var/www/bbqfinance.fun/index.html"
-
-echo "🔥 FIREINNERS Bridge Fix — Buffer polyfill (iOS + Desktop)"
-
-# Backup
-cp "$HTML" "$HTML.bak.$(date +%s)"
-echo "✅ Backup créé"
-
-# Vérifier si Buffer est déjà patché
-if grep -q "window.Buffer" "$HTML"; then
-  echo "ℹ️ Buffer déjà présent — rien à faire"
-  exit 0
-fi
-
-# Injection du polyfill AVANT le premier <script>
-perl -0777 -i -pe 's|<head>|<head>\n<script>\nif(typeof window.Buffer==="undefined"){\nwindow.Buffer={from:(d,e)=>{\nif(typeof d==="string"){\nif(e==="base64"){\nconst bin=atob(d);const arr=new Uint8Array(bin.length);\nfor(let i=0;i<bin.length;i++)arr[i]=bin.charCodeAt(i);\nreturn arr}\nreturn new TextEncoder().encode(d)}\nreturn new Uint8Array(d)} }\n</script>|s' "$HTML"
-
-echo "✅ Buffer polyfill injecté"
-
-# Reload nginx (frontend only)
-nginx -t && systemctl reload nginx
-
-echo "🔥 TERMINÉ — Bridge Phantom fonctionne maintenant sur iOS + PC"
-
-
-
-
-
-
-
-
-
-
-
 #!/usr/bin/env bash
 set -euo pipefail
 
-DOMAIN="bbqfinance.fun"
-APP_NAME="fireinners"
-APP_DIR="/root/fireinners"
-SERVER_JS="$APP_DIR/server.js"
-HTML="/var/www/$DOMAIN/index.html"
-DB_DIR="$APP_DIR/db"
-USED_TX_FILE="$DB_DIR/bridge_used_tx.json"
+HTML="/var/www/bbqfinance.fun/index.html"
 
-TREASURY_SOL="BZJsWeJizv3YeyuWjF5187jrcduPFAHWjqL7jgq4kGwy"
-SOLANA_RPC="https://api.mainnet-beta.solana.com"
+echo "🔥 FIREINNERS — Patch Bridge Buffer (iOS + Phantom + Desktop)"
 
-echo "== FIREINNERS bridge patch (Buffer iOS + /bridge/declare verified + anti double-claim) =="
-
-echo "== 0) Pre-checks =="
-test -f "$SERVER_JS" || { echo "Missing $SERVER_JS"; exit 1; }
-test -f "$HTML" || { echo "Missing $HTML"; exit 1; }
-
-echo "== 1) Backups =="
-cp -a "$SERVER_JS" "$SERVER_JS.bak.$(date +%s)"
-cp -a "$HTML" "$HTML.bak.$(date +%s)"
-echo "Backups done."
-
-echo "== 2) Ensure deps for server =="
-cd "$APP_DIR"
-npm i --silent @solana/web3.js >/dev/null 2>&1 || npm i @solana/web3.js
-
-echo "== 3) Ensure db storage for used txids =="
-mkdir -p "$DB_DIR"
-if [ ! -f "$USED_TX_FILE" ]; then
-  echo "[]" > "$USED_TX_FILE"
+if [ ! -f "$HTML" ]; then
+  echo "❌ Fichier introuvable: $HTML"
+  exit 1
 fi
 
-echo "== 4) Patch server.js (add /bridge/declare) =="
-PATCH_MARKER="BRIDGE_DECLARE_PATCH_V1"
-if grep -q "$PATCH_MARKER" "$SERVER_JS"; then
-  echo "server.js already patched ($PATCH_MARKER)."
+BK="${HTML}.bak.$(date +%s)"
+cp -a "$HTML" "$BK"
+echo "✅ Backup: $BK"
+
+# Supprime anciens polyfills Buffer "window.Buffer=buffer.Buffer" / bundle.run/buffer / "Can't find variable: Buffer" fixes incomplets
+perl -0777 -i -pe 's@<script[^>]*>\s*window\.Buffer\s*=\s*buffer\.Buffer\s*;?\s*</script>\s*@@gis' "$HTML"
+perl -0777 -i -pe 's@<script[^>]*src=["'"'"']https?://bundle\.run/buffer@6\.0\.3["'"'"'][^>]*>\s*</script>\s*@@gis' "$HTML"
+perl -0777 -i -pe 's@<script[^>]*src=["'"'"']https?://cdn\.jsdelivr\.net/npm/buffer@6\.0\.3[^"'"'"']*["'"'"'][^>]*>\s*</script>\s*@@gis' "$HTML"
+
+# Injecte le polyfill Buffer ULTRA-EARLY: tout de suite après <head>
+# (et surtout AVANT web3.js / Phantom / ton code)
+if grep -q "FIREINNERS GLOBAL BUFFER FIX" "$HTML"; then
+  echo "ℹ️ Polyfill déjà présent (pas de double injection)"
 else
-  cat >> "$SERVER_JS" <<'EOF'
-
-/* BRIDGE_DECLARE_PATCH_V1
-   - Verifies Solana tx on backend (RPC), checks treasury destination, and blocks double-claim.
-   - Adds POST /bridge/declare without touching existing routes.
-*/
-const fs=require("fs");
-const path=require("path");
-let Connection,PublicKey;
-try{({Connection,PublicKey}=require("@solana/web3.js"));}catch(e){}
-
-(function(){
-  try{
-    if(!globalThis.app && typeof app==="undefined") return;
-  }catch(e){}
-
-  const SOLANA_RPC=process.env.SOLANA_RPC||"https://api.mainnet-beta.solana.com";
-  const TREASURY_SOL=process.env.TREASURY_SOL||"BZJsWeJizv3YeyuWjF5187jrcduPFAHWjqL7jgq4kGwy";
-  const USED_TX_FILE=process.env.BRIDGE_USED_TX_FILE||path.join(__dirname,"db","bridge_used_tx.json");
-
-  function loadUsed(){
-    try{
-      if(!fs.existsSync(USED_TX_FILE)) return new Set();
-      const arr=JSON.parse(fs.readFileSync(USED_TX_FILE,"utf8")||"[]");
-      return new Set(Array.isArray(arr)?arr:[]);
-    }catch(e){return new Set();}
-  }
-  function saveUsed(set){
-    try{
-      fs.mkdirSync(path.dirname(USED_TX_FILE),{recursive:true});
-      fs.writeFileSync(USED_TX_FILE,JSON.stringify([...set],null,2));
-    }catch(e){}
-  }
-
-  const usedTx=loadUsed();
-  const conn=(Connection?new Connection(SOLANA_RPC,"confirmed"):null);
-  const treasuryStr=TREASURY_SOL;
-
-  async function sumLamportsToTreasury(txid){
-    if(!conn) throw new Error("Solana web3 missing on server");
-    const parsed=await conn.getParsedTransaction(txid,{maxSupportedTransactionVersion:0,commitment:"confirmed"});
-    if(!parsed || !parsed.meta) throw new Error("TX not found");
-    if(parsed.meta.err) throw new Error("TX failed");
-    let sum=0;
-    const instr=(parsed.transaction && parsed.transaction.message && parsed.transaction.message.instructions)||[];
-    for(const ix of instr){
-      const p=ix && ix.parsed;
-      if(!p || !p.info) continue;
-      if(p.type==="transfer" && p.info.destination===treasuryStr && typeof p.info.lamports==="number"){
-        sum+=p.info.lamports;
-      }
-      // (fallback) sometimes destination key named "to"
-      if(p.type==="transfer" && p.info.to===treasuryStr && typeof p.info.lamports==="number"){
-        sum+=p.info.lamports;
-      }
-    }
-    if(sum<=0){
-      // last resort: check any account key matches treasury (but still require sum >0 for credit)
-      const keys=(parsed.transaction.message.accountKeys||[]).map(k=>k.pubkey?k.pubkey.toString():k.toString());
-      if(!keys.includes(treasuryStr)) throw new Error("Not sent to treasury");
-      throw new Error("No SOL transfer to treasury detected");
-    }
-    return sum;
-  }
-
-  // Add route only if express is present and route not already defined
-  try{
-    if(typeof app!=="undefined" && app && typeof app.post==="function"){
-      app.post("/bridge/declare", async (req,res)=>{
-        try{
-          const body=req.body||{};
-          const txid=String(body.txid||body.signature||"").trim();
-          const amountNum=Number(body.amount);
-          const fireAddress=String(body.fireAddress||body.addr||"").trim();
-
-          if(!txid || !fireAddress || !Number.isFinite(amountNum) || amountNum<=0){
-            return res.status(400).json({ok:false,error:"Missing/invalid parameters"});
-          }
-          if(usedTx.has(txid)){
-            return res.status(409).json({ok:false,error:"TX already used"});
-          }
-
-          const lamports=await sumLamportsToTreasury(txid);
-          const solReceived=Math.abs(lamports)/1e9;
-
-          // allow tiny rounding slack
-          if(solReceived + 1e-9 < amountNum){
-            return res.status(400).json({ok:false,error:"Amount mismatch",solReceived});
-          }
-
-          usedTx.add(txid);
-          saveUsed(usedTx);
-
-          // credit logic: try common patterns without breaking your existing state model
-          // 1) if you already have a function creditFire(addr, sol) use it
-          // 2) else: attempt to update in-memory wallet store if present
-          let credited=null;
-          if(typeof creditFire==="function"){
-            credited=await creditFire(fireAddress,solReceived);
-          }else if(typeof wallets==="object" && wallets){
-            wallets[fireAddress]=wallets[fireAddress]||{pow:0,usdc:0,staked:0,nonce:0,fire:0};
-            // If your chain uses "pow" as FIRE unit in micro (DEC=1e6), keep same unit:
-            const DEC=1e6;
-            const FIRE_RATE=typeof globalThis.FIRE_RATE==="number"?globalThis.FIRE_RATE:1000; // fallback rate
-            const add=Math.floor(solReceived*FIRE_RATE*DEC);
-            if(typeof wallets[fireAddress].pow==="number") wallets[fireAddress].pow+=add;
-            else if(typeof wallets[fireAddress].fire==="number") wallets[fireAddress].fire+=add;
-            credited={solReceived,add};
-          }
-
-          // WS notify if you already broadcast mempool/stats
-          try{
-            if(typeof broadcast==="function") broadcast({type:"bridge",txid,fireAddress,sol:solReceived});
-          }catch(e){}
-
-          return res.json({ok:true,txid,fireAddress,solReceived,credited});
-        }catch(e){
-          return res.status(500).json({ok:false,error:String(e&&e.message||e)});
-        }
-      });
-    }
-  }catch(e){}
-})();
-EOF
-  echo "server.js patched with /bridge/declare."
+  perl -0777 -i -pe 's@<head([^>]*)>@<head$1>\n<script>\n/* FIREINNERS GLOBAL BUFFER FIX (iOS + Phantom + Desktop) */\n(function(){\n  if(typeof globalThis===\"undefined\")return;\n  if(typeof globalThis.Buffer!==\"undefined\")return;\n  function BufferPolyfill(arg,enc){\n    if(typeof arg===\"string\"){\n      var bin=atob(arg);var arr=new Uint8Array(bin.length);\n      for(var i=0;i<bin.length;i++)arr[i]=bin.charCodeAt(i);\n      return arr;\n    }\n    if(Array.isArray(arg)||arg instanceof Uint8Array){\n      return new Uint8Array(arg);\n    }\n    return new Uint8Array(0);\n  }\n  BufferPolyfill.from=BufferPolyfill;\n  BufferPolyfill.alloc=function(n){return new Uint8Array(n)};\n  BufferPolyfill.isBuffer=function(){return false};\n  globalThis.Buffer=BufferPolyfill;\n})();\n</script>@gis' "$HTML"
+  echo "✅ Polyfill injecté"
 fi
 
-echo "== 5) Patch HTML (Buffer polyfill + call /bridge/declare) =="
+# Vérifie que le polyfill est AVANT le premier <script src=...web3.js...>
+# (best-effort: on s'assure qu'il n'y a pas de <script src=web3.js> avant le marker)
+FIRST_WEB3_LINE=$(grep -n -m1 "@solana/web3.js" "$HTML" | cut -d: -f1 || true)
+MARKER_LINE=$(grep -n -m1 "FIREINNERS GLOBAL BUFFER FIX" "$HTML" | cut -d: -f1 || true)
 
-# 5a) Add Buffer polyfill (safe for iOS) only if not present
-if ! grep -q "bundle.run/buffer" "$HTML"; then
-  perl -0777 -i -pe 's#(<script src="https://unpkg.com/@solana/web3\.js@[^"]+"></script>)#$1\n<script src="https://bundle.run/buffer@6.0.3"></script>\n<script>try{window.Buffer=window.buffer&&buffer.Buffer;}catch(e){}</script>#' "$HTML"
-  echo "Added Buffer polyfill in HTML."
-else
-  echo "Buffer polyfill already present in HTML."
-fi
+echo "🔎 Marker line: ${MARKER_LINE:-?} | web3.js line: ${FIRST_WEB3_LINE:-?}"
 
-# 5b) Replace endpoint /bridge -> /bridge/declare (only the declare call)
-perl -0777 -i -pe 's#fetch\(`\$\{API\}/bridge`,#fetch(`${API}/bridge/declare`,#g' "$HTML"
-
-# 5c) Ensure body uses txid field (keep existing signature fallback)
-# Convert: body:JSON.stringify({addr:powAddr,amount:amt,signature:sig})
-# To:      body:JSON.stringify({fireAddress:powAddr,amount:amt,txid:sig})
-perl -0777 -i -pe 's#JSON\.stringify\(\{addr:powAddr,amount:amt,signature:sig\}\)#JSON.stringify({fireAddress:powAddr,amount:amt,txid:sig})#g' "$HTML"
-
-echo "HTML patched."
-
-echo "== 6) Reload services =="
+# Reload nginx (frontend only)
 nginx -t
 systemctl reload nginx
+echo "✅ nginx reloaded"
 
-if command -v pm2 >/dev/null 2>&1; then
-  pm2 restart "$APP_NAME" || pm2 restart all
-  pm2 save || true
-else
-  echo "pm2 not found. Skipping pm2 restart."
-fi
-
-echo "== 7) Quick tests =="
-echo "-- HTTP stats:"
-curl -sS "https://$DOMAIN/stats" | head || true
-
-echo "-- WS test (optional):"
-if command -v wscat >/dev/null 2>&1; then
-  timeout 5 wscat -c "wss://$DOMAIN/ws" -x '{"type":"ping"}' || true
-else
-  echo "wscat not installed (ok). Install with: npm i -g wscat"
-fi
-
-echo "== DONE =="
-echo "Backups:"
-ls -1 "$SERVER_JS".bak.* 2>/dev/null | tail -n 3 || true
-ls -1 "$HTML".bak.* 2>/dev/null | tail -n 3 || true
-echo "If bridge still errors, show: pm2 logs $APP_NAME --lines 80"
-
-
-
+echo "🧪 Test rapide (doit retourner quelque chose):"
+curl -sS https://bbqfinance.fun/stats | head -c 180 || true
+echo
+echo "✅ Terminé. Ouvre bbqfinance.fun dans Phantom iOS et reteste le Bridge."
