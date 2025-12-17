@@ -1,3 +1,151 @@
-Err: https://ppa.launchpadcontent.net/bitcoin/bitcoin/ubuntu noble Release
-404 Not Found
-E: The repository ... does not have a Release file.
+### ===== BBTRADER IA ULTRA — INSTALL ONE SHOT =====
+
+# 1) Dossier isolé
+mkdir -p /opt/bbtrader-ultra && cd /opt/bbtrader-ultra || exit 1
+
+# 2) Init Node
+npm init -y >/dev/null 2>&1
+
+# 3) Dépendances locales (aucun conflit global)
+npm install @solana/web3.js node-fetch dotenv bs58 >/dev/null 2>&1
+
+# 4) ENV
+cat > .env <<'EOF'
+BOT_PRIVATE_KEY=BASE58_PRIVATE_KEY_WALLET_BOT
+RPC=https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac
+TOTAL_BUDGET_SOL=0.01
+MAX_SLOTS=10
+TP_PCT=12
+SL_PCT=6
+COOLDOWN_MS=3000
+EOF
+
+# 5) BOT IA ULTRA
+cat > bot.js <<'EOF'
+import 'dotenv/config';
+import fetch from 'node-fetch';
+import bs58 from 'bs58';
+import {Connection,Keypair,VersionedTransaction} from '@solana/web3.js';
+
+const RPC=process.env.RPC;
+const TOTAL=Number(process.env.TOTAL_BUDGET_SOL);
+const MAX_SLOTS=Number(process.env.MAX_SLOTS);
+const TP0=Number(process.env.TP_PCT)/100;
+const SL0=Number(process.env.SL_PCT)/100;
+const COOLDOWN0=Number(process.env.COOLDOWN_MS);
+
+const SOL_MINT='So11111111111111111111111111111111111111112';
+const JUP='https://quote-api.jup.ag';
+
+const kp=Keypair.fromSecretKey(bs58.decode(process.env.BOT_PRIVATE_KEY));
+const conn=new Connection(RPC,{commitment:'confirmed'});
+
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+const log=(...a)=>console.log(new Date().toISOString(),...a);
+
+let traded=new Set(),mintBanUntil=new Map();
+let slots=[...Array(MAX_SLOTS)].map(()=>null);
+let HISTORY=[],PRICEH={},AI={mode:'MOYEN',conf:50,tp:TP0,sl:SL0,cool:COOLDOWN0,activeSlots:2,slotLamports:0};
+
+const now=()=>Date.now();
+const clamp=(x,a,b)=>Math.max(a,Math.min(b,x));
+const mean=a=>a.length?a.reduce((s,v)=>s+v,0)/a.length:0;
+const std=a=>{if(a.length<2)return 0;const m=mean(a);return Math.sqrt(mean(a.map(x=>(x-m)*(x-m))))};
+
+async function quote(i,o,a){
+  const r=await fetch(`${JUP}/v6/quote?inputMint=${i}&outputMint=${o}&amount=${a}&slippageBps=250`);
+  if(!r.ok) throw 'quote '+r.status;
+  const j=await r.json(); if(!j?.data?.[0]) throw 'no route';
+  return j.data[0];
+}
+async function swap(q){
+  const r=await fetch(`${JUP}/v6/swap`,{method:'POST',headers:{'content-type':'application/json'},
+    body:JSON.stringify({quoteResponse:q,userPublicKey:kp.publicKey.toBase58(),wrapAndUnwrapSol:true,useSharedAccounts:true,prioritizationFeeLamports:'auto'})});
+  if(!r.ok) throw 'swap '+r.status;
+  const j=await r.json(); if(!j?.swapTransaction) throw 'no tx';
+  return j.swapTransaction;
+}
+async function signSend(txB64){
+  const tx=VersionedTransaction.deserialize(Buffer.from(txB64,'base64'));
+  tx.sign([kp]);
+  const sig=await conn.sendRawTransaction(tx.serialize(),{skipPreflight:false,maxRetries:3});
+  await conn.confirmTransaction(sig,'confirmed');
+  return sig;
+}
+function pushPrice(m,p){const h=PRICEH[m]=PRICEH[m]||[];h.push(p);if(h.length>40)h.shift();}
+function globalVol(){
+  const vs=Object.values(PRICEH).map(h=>{
+    if(h.length<6)return 0;
+    let r=[];for(let i=1;i<h.length;i++)r.push(Math.log(h[i]/h[i-1]));
+    return std(r);
+  }).filter(v=>v>0);
+  return vs.length?mean(vs):0;
+}
+function updateAI(){
+  const v=globalVol();
+  let mode=v>=0.03?'ULTRA':v>=0.018?'RAPIDE':v<=0.01?'LONG':'MOYEN';
+  let tp=TP0,sl=SL0,cool=COOLDOWN0,slotsN=2;
+  if(mode==='ULTRA'){tp=0.03;sl=0.02;cool=200;slotsN=1;}
+  if(mode==='RAPIDE'){tp=TP0*0.75;sl=SL0*0.75;cool=900;slotsN=3;}
+  if(mode==='LONG'){tp=TP0*1.3;sl=SL0*1.2;cool=5000;slotsN=5;}
+  const baseLam=Math.floor((TOTAL/MAX_SLOTS)*1e9);
+  AI={mode,tp,sl,cool,activeSlots:slotsN,slotLamports:mode==='ULTRA'?Math.floor(baseLam*0.4):baseLam};
+}
+async function mintPump(){
+  const r=await fetch('https://api.dexscreener.com/token-profiles/latest/v1',{cache:'no-store'});
+  const j=await r.json(); let out=[];
+  for(const it of j){
+    if(it.chainId!=='solana')continue;
+    const m=it.tokenAddress||it.address;
+    if(!m||traded.has(m))continue;
+    out.push({sym:(it.symbol||'TKN').slice(0,6),mint:m});
+    if(out.length>=50)break;
+  }
+  return out;
+}
+async function openPos(i){
+  updateAI();
+  const list=await mintPump(); if(!list.length)return;
+  const p=list[Math.floor(Math.random()*list.length)];
+  const q=await quote(SOL_MINT,p.mint,AI.slotLamports);
+  const tx=await swap(q); const sig=await signSend(tx);
+  const entry=q.outAmount/q.inAmount;
+  slots[i]={mint:p.mint,sym:p.sym,entry};
+  traded.add(p.mint);
+  log('BUY',p.sym,'MODE',AI.mode,sig);
+}
+async function checkPos(i){
+  updateAI();
+  const p=slots[i]; if(!p)return;
+  const q=await quote(p.mint,SOL_MINT,1e6);
+  const price=q.outAmount/q.inAmount; pushPrice(p.mint,price);
+  if(price>=p.entry*(1+AI.tp)||price<=p.entry*(1-AI.sl)){
+    const q2=await quote(p.mint,SOL_MINT,q.inAmount);
+    const tx=await swap(q2); const sig=await signSend(tx);
+    slots[i]=null;
+    log('SELL',p.sym,'MODE',AI.mode,sig);
+  }
+}
+async function loop(){
+  log('BBTRADER ULTRA START',kp.publicKey.toBase58());
+  while(true){
+    try{
+      updateAI();
+      for(let i=0;i<AI.activeSlots;i++) if(!slots[i]) await openPos(i);
+      for(let i=0;i<MAX_SLOTS;i++) if(slots[i]) await checkPos(i);
+    }catch(e){log('ERR',e);}
+    await sleep(AI.cool);
+  }
+}
+loop();
+EOF
+
+# 6) PM2 (si absent)
+if ! command -v pm2 >/dev/null 2>&1; then npm install -g pm2; fi
+
+# 7) Lancer
+pm2 start /opt/bbtrader-ultra/bot.js --name bbtrader-ultra --cwd /opt/bbtrader-ultra
+pm2 save
+
+echo "✅ BBTRADER ULTRA LANCÉ"
+pm2 status
