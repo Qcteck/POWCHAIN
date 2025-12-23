@@ -1,20 +1,84 @@
+getent hostssentinel.fireinners.online || true
+
+
+
 set -euo pipefail
-HOST="sentinel.fireinners.online"
-PORT="9696"
 APP_DIR="/root/fireinners-security-sentinel"
-echo "=== PREFLIGHT ==="
-echo "[SYSTEM]";uname -a||true;lsb_release -a 2>/dev/null||true;date||true
-echo;echo "[DNS] $HOST";getent hosts "$HOST"||echo "DNS_FAIL"
-echo;echo "[PORTS] (80/443/nginx + $PORT)";sudo ss -lntp | egrep "(:80\b|:443\b|:${PORT}\b|nginx)" || true
-echo;echo "[NGINX]";sudo systemctl is-active nginx && echo "nginx:active" || echo "nginx:inactive";sudo nginx -t||true
-echo;echo "[UFW]";sudo ufw status||true
-echo;echo "[CERT]";command -v certbot >/dev/null 2>&1 && certbot --version || echo "certbot absent";sudo test -d "/etc/letsencrypt/live/$HOST" && echo "cert:present" || echo "cert:absent"
-echo;echo "[APP]";if [ -d "$APP_DIR" ]; then echo "app:present";ls -la "$APP_DIR" | sed -n '1,80p';else echo "app:absent";fi
-echo;echo "[LOCAL HTTP]";curl -sS --max-time 2 "http://127.0.0.1:${PORT}/public/state" >/dev/null && echo "local:OK" || echo "local:FAIL"
-DNS_OK=0;APP_OK=0;LOCAL_OK=0
-getent hosts "$HOST" >/dev/null 2>&1 && DNS_OK=1 || true
-[ -d "$APP_DIR" ] && APP_OK=1 || true
-curl -sS --max-time 2 "http://127.0.0.1:${PORT}/public/state" >/dev/null 2>&1 && LOCAL_OK=1 || true
-echo;echo "[DECISION] DNS_OK=$DNS_OK APP_OK=$APP_OK LOCAL_OK=$LOCAL_OK"
-if [ "$DNS_OK" -eq 1 ] && [ "$APP_OK" -eq 1 ] && [ "$LOCAL_OK" -eq 1 ]; then echo "GO"; else echo "NO-GO"; fi
-echo "=== END ===" 
+PORT="9696"
+
+mkdir -p "$APP_DIR/public"
+cd "$APP_DIR"
+
+cat > package.json <<'EOF'
+{"name":"sentinel","version":"1.0.0","type":"module","private":true,"scripts":{"start":"node server.js"},"dependencies":{"express":"^4.19.2"}}
+EOF
+
+cat > .env <<EOF
+PORT=$PORT
+EOF
+
+cat > server.js <<'EOF'
+import "dotenv/config";
+import express from "express";
+import http from "http";
+
+const PORT=parseInt(process.env.PORT||"9696",10);
+const app=express();
+app.disable("x-powered-by");
+app.use((req,res,next)=>{res.setHeader("Cache-Control","no-store");next();});
+app.use(express.static("public"));
+
+let score=92,reliability=70,seq=0;
+function bulletin(){
+  seq++;
+  const t=Date.now();
+  score=Math.max(0,Math.min(100,score+(Math.random()>.1?1:-5)));
+  reliability=Math.max(0,Math.min(100,reliability+(Math.random()>.15?1:-6)));
+  const level=score>80?"STABLE":score>55?"ALERT":score>30?"ALARM":"CRITICAL";
+  return {kind:"SECURITY_BULLETIN",seq,ts:t,level,score,reliability,events:[{time:t,level,origin:"Q+Local",type:"pulse",status:"observed",message:"surveillance lecture seule",next:"aucune action destructive"}]};
+}
+
+app.get("/public/state",(req,res)=>res.json(bulletin()));
+app.get("/",(req,res)=>res.redirect("/public.html"));
+
+const server=http.createServer(app);
+server.listen(PORT,"127.0.0.1",()=>console.log("[Sentinel] http://127.0.0.1:"+PORT));
+EOF
+
+cat > public/public.html <<'EOF'
+<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Sentinel Public</title><style>body{margin:0;background:#070a12;color:#e9f2ff;font:14px system-ui}#w{max-width:900px;margin:18px auto;padding:14px}h1{margin:0 0 10px;font-size:16px}#box{border:1px solid #23324f;border-radius:14px;padding:12px;background:#0b1222}b{color:#7dfbd1}pre{white-space:pre-wrap;word-break:break-word;margin:10px 0 0}</style><div id=w><h1>Sentinel Public (lecture seule)</h1><div id=box>Etat: <b id=l>—</b><br>Score: <b id=s>—</b><br>Fiabilite: <b id=r>—</b><pre id=j>{}</pre></div></div><script>const $=id=>document.getElementById(id);async function tick(){const d=await (await fetch("/public/state")).json();$("l").textContent=d.level;$("s").textContent=d.score;$("r").textContent=d.reliability+"%";$("j").textContent=JSON.stringify(d,null,2);}tick();setInterval(tick,2500);</script>
+EOF
+
+npm i
+
+sudo tee /etc/systemd/system/security-sentinel.service >/dev/null <<EOF
+[Unit]
+Description=Security Sentinel (read-only)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=$APP_DIR
+EnvironmentFile=$APP_DIR/.env
+ExecStart=/usr/bin/node $APP_DIR/server.js
+Restart=always
+RestartSec=2
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now security-sentinel
+sudo systemctl status security-sentinel --no-pager
+
+curl -sS --max-time 2 http://127.0.0.1:9696/public/state | head -c 220; echo
+
+
+
+
+HOST="sentinel.fireinners.online";PORT="9696";APP_DIR="/root/fireinners-security-sentinel";getent hosts "$HOST"||true;curl -sS --max-time 2 "http://127.0.0.1:${PORT}/public/state" | head -c 120; echo
+
+
