@@ -72,4 +72,4 @@ sec "DONE";
 echo \"Report: $R\";
 tar -czf \"$OUT.tgz\" -C \"/tmp\" \"VPS_EAGLE_${TS}\" 2>/dev/null || true;
 echo \"Bundle: $OUT.tgz\";
-'
+' 
