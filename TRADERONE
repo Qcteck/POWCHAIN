@@ -1,110 +1,91 @@
 set -euo pipefail
+echo "[A] DNS (voir si IPv6 existe)"
+getent ahosts fireinners.online | head -n 10 || true
 
-echo "[0] Etat avant"
-ss -lntp | egrep ':(3000|8484)\b|:443\b' || true
+echo "[B] UFW avant"
 ufw status numbered || true
 
-echo "[1] Identifier les PIDs qui ecoutent 3000/8484"
-PID3000="$(ss -lntp 2>/dev/null | awk '/:3000[[:space:]]/ {print $NF}' | head -n1 | sed -n 's/.*pid=\([0-9]\+\).*/\1/p')"
-PID8484="$(ss -lntp 2>/dev/null | awk '/:8484[[:space:]]/ {print $NF}' | head -n1 | sed -n 's/.*pid=\([0-9]\+\).*/\1/p')"
-echo "PID3000=${PID3000:-NA} PID8484=${PID8484:-NA}"
-
-echo "[2] Trouver le repertoire de travail (cwd) de chaque process (si possible)"
-CWD3000=""; CWD8484=""
-if [ -n "${PID3000:-}" ] && [ -d "/proc/$PID3000" ]; then CWD3000="$(readlink -f /proc/$PID3000/cwd || true)"; fi
-if [ -n "${PID8484:-}" ] && [ -d "/proc/$PID8484" ]; then CWD8484="$(readlink -f /proc/$PID8484/cwd || true)"; fi
-echo "CWD3000=${CWD3000:-NA}"
-echo "CWD8484=${CWD8484:-NA}"
-
-echo "[3] Dossiers candidats (on ajoute aussi /root/qplu et /opt/fireinners si existants)"
-CANDS=()
-[ -n "${CWD3000:-}" ] && CANDS+=("$CWD3000")
-[ -n "${CWD8484:-}" ] && CANDS+=("$CWD8484")
-[ -d "/root/qplu" ] && CANDS+=("/root/qplu")
-[ -d "/opt/fireinners" ] && CANDS+=("/opt/fireinners")
-# dedupe
-CANDS_UNIQ=()
-for d in "${CANDS[@]}"; do
-  [ -d "$d" ] || continue
-  skip=0
-  for e in "${CANDS_UNIQ[@]}"; do [ "$e" = "$d" ] && skip=1 && break; done
-  [ $skip -eq 0 ] && CANDS_UNIQ+=("$d")
+echo "[C] Supprime TOUTE regle UFW qui contient 3000/tcp ou 8484/tcp (ALLOW ou DENY), en partant du bas"
+mapfile -t nums < <(ufw status numbered | awk '/3000\/tcp|8484\/tcp/ {gsub(/\[|\]/,"",$1); print $1}' | sort -rn)
+for n in "${nums[@]}"; do
+  echo "Deleting rule #$n"
+  yes y | ufw delete "$n" >/dev/null
 done
-printf "Candidats:\n"; printf " - %s\n" "${CANDS_UNIQ[@]:-}"
 
-echo "[4] Backup dossier patch"
-BK="/root/beton_bind_$(date +%Y%m%d-%H%M%S)"
-mkdir -p "$BK"
+echo "[D] Remet DENY (v4+v6 geres par UFW)"
+ufw deny in 3000/tcp
+ufw deny in 8484/tcp
 
-echo "[5] Chercher des patterns listen(3000|8484) dans .js (max 50 hits) et patcher securise"
-patch_one_port () {
-  local PORT="$1"
-  local DONE=0
-  for BASE in "${CANDS_UNIQ[@]}"; do
-    [ -d "$BASE" ] || continue
-    # Liste des fichiers .js contenant listen(PORT
-    mapfile -t HITS < <(grep -RIn --include='*.js' -E "\.listen\([[:space:]]*${PORT}([[:space:]]*,|\))" "$BASE" 2>/dev/null | head -n 50 || true)
-    [ "${#HITS[@]}" -eq 0 ] && continue
+echo "[E] UFW apres"
+ufw status numbered | egrep '3000|8484|443|22|51820' || true
 
-    echo "Hits pour port $PORT dans $BASE:"
-    printf "%s\n" "${HITS[@]}"
+echo "[F] Tests depuis le VPS (v4/v6) : ca DOIT echouer (timeout/refused)"
+curl -4 -m 3 -I http://fireinners.online:3000 | head -n 1 || echo "OK: v4 3000 bloque"
+curl -4 -m 3 -I http://fireinners.online:8484 | head -n 1 || echo "OK: v4 8484 bloque"
+curl -6 -m 3 -I http://fireinners.online:3000 | head -n 1 || echo "OK: v6 3000 bloque"
+curl -6 -m 3 -I http://fireinners.online:8484 | head -n 1 || echo "OK: v6 8484 bloque"
+echo "DONE UFW"
 
-    # On patch seulement si on trouve une ligne simple .listen(PORT) ou .listen(PORT,
-    # et si cette ligne ne contient pas deja 127.0.0.1
-    for h in "${HITS[@]}"; do
-      FILE="${h%%:*}"
-      [ -f "$FILE" ] || continue
-      cp -a "$FILE" "$BK/$(basename "$FILE").bak.$PORT" 2>/dev/null || true
 
-      # Patch 1: .listen(PORT) -> .listen(PORT,"127.0.0.1")
-      # Patch 2: .listen(PORT, ...) -> .listen(PORT,"127.0.0.1", ...)
-      perl -0777 -i -pe '
-        my $p = $ENV{PORT};
-        s/\.listen\(\s*'"$PORT"'\s*\)(?!\s*;)/.listen('"$PORT"',"127.0.0.1")/g;
-        s/\.listen\(\s*'"$PORT"'\s*,\s*(?!\s*"127\.0\.0\.1")/\.listen('"$PORT"',"127.0.0.1",/g;
-      ' "$FILE"
 
-      if ! grep -q '127\.0\.0\.1' "$FILE"; then
-        # revert si rien n'a change
-        cp -a "$BK/$(basename "$FILE").bak.$PORT" "$FILE" 2>/dev/null || true
-      else
-        echo "Patche: $FILE (port $PORT -> 127.0.0.1)"
-        DONE=1
-      fi
-    done
 
-    [ $DONE -eq 1 ] && break
+PID3000="$(ss -lntp | sed -n 's/.*:3000 .*pid=\([0-9]\+\).*/\1/p' | head -n1)"
+PID8484="$(ss -lntp | sed -n 's/.*:8484 .*pid=\([0-9]\+\).*/\1/p' | head -n1)"
+echo "PID3000=$PID3000 PID8484=$PID8484"
+ps -p "$PID3000" -o pid,cmd --no-headers || true
+ps -p "$PID8484" -o pid,cmd --no-headers || true
+readlink -f /proc/"$PID3000"/cwd || true
+readlink -f /proc/"$PID8484"/cwd || true
+
+
+
+set -euo pipefail
+BK="/root/beton_bind_$(date +%Y%m%d-%H%M%S)"; mkdir -p "$BK"
+echo "Backup: $BK"
+
+for PORT in 3000 8484; do
+  echo "== PORT $PORT =="
+  # on cherche dans /root et /opt (tes cas typiques)
+  mapfile -t files < <(grep -RIn --include='*.js' -E "\.listen\([[:space:]]*${PORT}([[:space:]]*,|\))" /root /opt 2>/dev/null | awk -F: '{print $1}' | sort -u | head -n 50 || true)
+  if [ "${#files[@]}" -eq 0 ]; then
+    echo "Aucun fichier .js trouve avec listen($PORT) dans /root ou /opt"
+    continue
+  fi
+  for f in "${files[@]}"; do
+    [ -f "$f" ] || continue
+    cp -a "$f" "$BK/$(basename "$f").bak.$PORT" 2>/dev/null || true
+
+    # Patch:
+    # .listen(PORT) => .listen(PORT,"127.0.0.1")
+    # .listen(PORT, X) => .listen(PORT,"127.0.0.1", X) (si pas deja 127.0.0.1)
+    perl -0777 -i -pe '
+      s/\.listen\(\s*'"$PORT"'\s*\)/.listen('"$PORT"',"127.0.0.1")/g;
+      s/\.listen\(\s*'"$PORT"'\s*,\s*(?!\s*"127\.0\.0\.1")/\.listen('"$PORT"',"127.0.0.1",/g;
+      s/\.listen\(\s*'"$PORT"'\s*,\s*["'\'']0\.0\.0\.0["'\'']\s*,/\.listen('"$PORT"',"127.0.0.1",/g;
+    ' "$f"
+
+    if grep -q "listen(${PORT}.*127\.0\.0\.1" "$f"; then
+      echo "Patche: $f"
+    fi
   done
-  echo "$DONE"
-}
+done
 
-export PORT=3000
-DONE3000="$(patch_one_port 3000)"
-export PORT=8484
-DONE8484="$(patch_one_port 8484)"
-
-echo "[6] Restart services probables (sans casser si absent)"
+echo "Restart services (si presents)"
 systemctl restart amcq.service 2>/dev/null || true
 systemctl restart fireinners-qplus-wasm.service 2>/dev/null || true
 
-echo "[7] Verif bind: on veut 127.0.0.1:3000 et 127.0.0.1:8484 (ou au moins plus 0.0.0.0)"
+echo "Bind apres restart (on veut 127.0.0.1:3000 et 127.0.0.1:8484, pas 0.0.0.0)"
 ss -lntp | egrep ':(3000|8484)\b|:443\b' || true
 
-echo "[8] Tests locaux (doivent repondre)"
-curl -m 3 -I http://127.0.0.1:3000  | head -n 1 || true
-curl -m 3 -I http://127.0.0.1:8484  | head -n 1 || true
-
-echo "[9] Tests publics (doivent echouer depuis une machine externe; depuis le VPS ca peut tromper)."
-echo "A faire depuis iPhone en LTE:"
-echo " - http://fireinners.online:3000 (doit echouer)"
-echo " - http://fireinners.online:8484 (doit echouer)"
-
-echo "DONE. Backup: $BK"
-echo "DONE3000=$DONE3000 DONE8484=$DONE8484"
 
 
 
 
 ss -lntp | egrep ':(3000|8484)\b'
-ps -p $(ss -lntp | awk '/:3000[[:space:]]/ {print $NF}' | sed -n 's/.*pid=\([0-9]\+\).*/\1/p') -o cmd= 2>/dev/null || true
-ps -p $(ss -lntp | awk '/:8484[[:space:]]/ {print $NF}' | sed -n 's/.*pid=\([0-9]\+\).*/\1/p') -o cmd= 2>/dev/null || true
+ufw status numbered | egrep '3000|8484'
+
+
+
+
+
+
