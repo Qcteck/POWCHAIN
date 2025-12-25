@@ -1,86 +1,105 @@
 set -euo pipefail
-SECRET_PATH="/sentinel1"
-APP_DIR="/opt/traderone"
+PATH_SECRET="/eagle"
+APP_DIR="/opt/eagle-sites"
 NGX="/etc/nginx/sites-available/fireinners.online-ssl"
-HTPASS="/etc/nginx/.htpasswd_sentinel1"
+HTPASS="/etc/nginx/.htpasswd_eagle"
 AUTH_USER="sentinel"
 AUTH_PASS="Sentinel1"
 
-echo "=== MEGA BATCH / TRADERONE ==="
-
-echo "[0] Checks"
-test -f "$NGX" || { echo "NGINX VHOST missing: $NGX"; exit 1; }
-
-echo "[1] Backup nginx vhost"
+echo "=== MEGA / EAGLE SITES UI ==="
+test -f "$NGX" || { echo "Missing vhost: $NGX"; exit 1; }
 cp -a "$NGX" "$NGX.bak.$(date +%Y%m%d-%H%M%S)"
 
-echo "[2] Create app dir + placeholder index"
-mkdir -p "$APP_DIR"
-chmod 755 "$APP_DIR"
+mkdir -p "$APP_DIR";chmod 755 "$APP_DIR"
+
+cat > "$APP_DIR/gen.py" <<'PY'
+#!/usr/bin/env python3
+import json,re,subprocess,os
+from datetime import datetime,timezone
+OUT_DIR=os.environ.get("OUT_DIR","/opt/eagle-sites")
+OUT_JSON=os.path.join(OUT_DIR,"data.json")
+def run(cmd,timeout=8):
+  try:
+    p=subprocess.run(cmd,capture_output=True,text=True,timeout=timeout)
+    return p.returncode,p.stdout,p.stderr
+  except Exception as e:
+    return 1,"",str(e)
+def title_from_html(html):
+  m=re.search(r"<title[^>]*>\s*(.*?)\s*</title>",html,flags=re.I|re.S)
+  if not m:return "-"
+  t=re.sub(r"\s+"," ",m.group(1)).strip()
+  return (t[:90] if t else "-")
+def curl_probe(url,host,https=True):
+  cmd=["curl","-sS","--max-time","2","-H",f"Host: {host}",url]
+  if https:cmd.insert(1,"-k")
+  rc,out,err=run(cmd,timeout=3)
+  cmd2=["curl","-sS","--max-time","2","-o","/dev/null","-w","%{http_code}","-H",f"Host: {host}",url]
+  if https:cmd2.insert(1,"-k")
+  rc2,code,err2=run(cmd2,timeout=3)
+  return (code.strip() if code else "000"),title_from_html(out or "")
+def parse_server_blocks(txt):
+  blocks=[];lines=txt.splitlines();i=0
+  while i<len(lines):
+    if re.match(r"^\s*server\s*\{\s*$",lines[i]):
+      buf=[lines[i]];depth=1;i+=1
+      while i<len(lines) and depth>0:
+        l=lines[i];buf.append(l);depth+=l.count("{");depth-=l.count("}");i+=1
+      blocks.append("\n".join(buf))
+    else:i+=1
+  return blocks
+def first_tokens(s):
+  return [t for t in s.split() if t and t!="_"]
+def main():
+  os.makedirs(OUT_DIR,exist_ok=True)
+  p=subprocess.run(["nginx","-T"],capture_output=True,text=True)
+  nginxT=(p.stdout or "")+"\n"+(p.stderr or "")
+  blocks=parse_server_blocks(nginxT)
+  servers=[];hosts=set()
+  for b in blocks:
+    listens=re.findall(r"^\s*listen\s+([^;]+);",b,flags=re.M)
+    names=re.findall(r"^\s*server_name\s+([^;]+);",b,flags=re.M)
+    roots=re.findall(r"^\s*root\s+([^;]+);",b,flags=re.M)
+    for raw in names:
+      for tok in first_tokens(raw):
+        if "*" in tok or tok=="_":continue
+        hosts.add(tok.strip())
+    servers.append({"listen":listens[:6],"server_name_raw":names[:6],"root":roots[:6]})
+  probed=[]
+  for h in sorted(hosts):
+    https_code,https_title=curl_probe("https://127.0.0.1/",h,https=True)
+    http_code,http_title=curl_probe("http://127.0.0.1/",h,https=False)
+    probed.append({"host":h,"https":{"code":https_code,"title":https_title},"http":{"code":http_code,"title":http_title}})
+  data={"generated_at":datetime.now(timezone.utc).isoformat(),"nginx_T_rc":p.returncode,"hosts":probed,"servers":servers}
+  tmp=OUT_JSON+".tmp"
+  with open(tmp,"w",encoding="utf-8") as f:json.dump(data,f,ensure_ascii=False,indent=2)
+  os.replace(tmp,OUT_JSON)
+if __name__=="__main__":main()
+PY
+chmod 755 "$APP_DIR/gen.py"
+
 cat > "$APP_DIR/index.html" <<'HTML'
-<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>TraderOne Placeholder</title><body style="margin:0;background:#070a12;color:#e9f2ff;font:14px system-ui;padding:16px">Route OK. Remplace /opt/traderone/index.html par ton Trader One complet.</body>
+<!doctype html><html lang=fr><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Eagle Sites</title><style>html,body{margin:0;background:#070a12;color:#e9f2ff;font:14px system-ui}header{position:sticky;top:0;background:#070a12cc;backdrop-filter:blur(8px);border-bottom:1px solid #223;padding:10px 12px;display:flex;gap:10px;align-items:center}input{flex:1;background:#0b1020;color:#e9f2ff;border:1px solid #223;border-radius:10px;padding:9px 10px;outline:none}button{background:#0b1020;color:#e9f2ff;border:1px solid #223;border-radius:10px;padding:9px 10px;cursor:pointer}main{padding:12px}table{width:100%;border-collapse:collapse}th,td{border-bottom:1px solid #1b2a44;padding:8px 6px;vertical-align:top}th{color:#b9c9ff;text-align:left;position:sticky;top:52px;background:#070a12}small{color:#9fb3d7}details{border:1px solid #1b2a44;border-radius:12px;padding:8px 10px;margin:12px 0;background:#0a1020}code{font-family:ui-monospace,Menlo,Consolas,monospace;color:#cfe2ff}</style></head><body><header><div style="font-weight:700">Eagle Sites</div><input id=q placeholder="filtrer host, title, code"><button id=r>refresh</button><small id=ts></small></header><main><div id=st>Loading…</div><div id=tbl></div><details><summary>Servers (raw directives)</summary><pre id=raw style="white-space:pre-wrap;margin:8px 0 0"></pre></details></main><script>
+let DATA=null;const esc=s=>String(s).replace(/[&<>"']/g,m=>({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[m]));
+const row=h=>`<tr><td><code>${esc(h.host)}</code></td><td>${esc(h.https.code)}<br><small>${esc(h.https.title)}</small></td><td>${esc(h.http.code)}<br><small>${esc(h.http.title)}</small></td></tr>`;
+function render(){if(!DATA)return;const q=(document.getElementById("q").value||"").toLowerCase().trim();const list=(DATA.hosts||[]).filter(x=>{const s=(x.host+" "+x.https.code+" "+x.https.title+" "+x.http.code+" "+x.http.title).toLowerCase();return !q||s.includes(q)});document.getElementById("ts").textContent=DATA.generated_at?("UTC "+DATA.generated_at.replace("T"," ").replace("Z","")):"";document.getElementById("st").innerHTML=`hosts: <b>${list.length}</b> / ${(DATA.hosts||[]).length} | nginx -T rc: ${esc(DATA.nginx_T_rc)}`;document.getElementById("tbl").innerHTML=`<table><thead><tr><th>host</th><th>https (code/title)</th><th>http (code/title)</th></tr></thead><tbody>${list.map(row).join("")}</tbody></table>`;document.getElementById("raw").textContent=JSON.stringify(DATA.servers||[],null,2);}
+async function load(){const res=await fetch("data.json?ts="+Date.now(),{cache:"no-store"});DATA=await res.json();render();}
+document.getElementById("q").addEventListener("input",render);document.getElementById("r").addEventListener("click",load);
+load().catch(e=>{document.getElementById("st").textContent="Load error: "+e;});
+</script></body></html>
 HTML
 chmod 644 "$APP_DIR/index.html"
 
-echo "[3] Install htpasswd tool if needed"
+OUT_DIR="$APP_DIR" "$APP_DIR/gen.py";chmod 644 "$APP_DIR/data.json"
+
 command -v htpasswd >/dev/null 2>&1 || { apt-get update -y; apt-get install -y apache2-utils; }
+htpasswd -bc "$HTPASS" "$AUTH_USER" "$AUTH_PASS";chmod 640 "$HTPASS"
 
-echo "[4] Create htpasswd"
-htpasswd -bc "$HTPASS" "$AUTH_USER" "$AUTH_PASS"
-chmod 640 "$HTPASS"
-
-echo "[5] Insert location into nginx server block (only if absent)"
-if ! grep -q "TRADERONE_SENTINEL1_BEGIN" "$NGX"; then
+if ! grep -q "EAGLE_SITES_BEGIN" "$NGX"; then
   tmp="$(mktemp)"
-  awk -v sp="$SECRET_PATH" -v ad="$APP_DIR" -v hp="$HTPASS" '
+  awk -v sp="$PATH_SECRET" -v ad="$APP_DIR" -v hp="$HTPASS" '
     {lines[NR]=$0}
     END{
-      ins="    # TRADERONE_SENTINEL1_BEGIN\n"
+      ins="    # EAGLE_SITES_BEGIN\n"
       ins=ins "    location ^~ " sp "/ {\n"
-      ins=ins "        auth_basic \"Sentinel\";\n"
-      ins=ins "        auth_basic_user_file " hp ";\n"
-      ins=ins "        alias " ad "/;\n"
-      ins=ins "        try_files $uri $uri/ " sp "/index.html;\n"
-      ins=ins "        add_header Cache-Control \"no-store\" always;\n"
-      ins=ins "    }\n"
-      ins=ins "    # TRADERONE_SENTINEL1_END\n"
-      last=NR
-      for(i=NR;i>=1;i--){
-        if(lines[i] ~ /^[[:space:]]*}[[:space:]]*$/){ last=i; break }
-      }
-      for(i=1;i<=NR;i++){
-        if(i==last){ printf "%s", ins }
-        print lines[i]
-      }
-    }
-  ' "$NGX" > "$tmp"
-  cp -a "$tmp" "$NGX"
-  rm -f "$tmp"
-else
-  echo "Already patched: TRADERONE_SENTINEL1 markers found"
-fi
-
-echo "[6] nginx test + reload"
-nginx -t
-systemctl reload nginx
-
-echo "[7] Local tests"
-echo "Expect 401:"
-curl -k -sS -I "https://127.0.0.1${SECRET_PATH}/" | sed -n '1,12p' || true
-echo
-echo "Expect HTML placeholder (200) with auth:"
-curl -k -sS -u "${AUTH_USER}:${AUTH_PASS}" "https://127.0.0.1${SECRET_PATH}/" | head -c 220; echo
-
-echo
-echo "DONE: https://fireinners.online${SECRET_PATH}/  user=${AUTH_USER} pass
-
-
-
-
-
-
-
-
-nano /opt/traderone/index.html
-# colle ton HTML Trader One complet
-nginx -t && systemctl reload nginx
+      ins=ins "        auth_basic \"Eagle\";\n"
+      ins=
