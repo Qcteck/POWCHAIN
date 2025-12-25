@@ -1,58 +1,130 @@
-[LISTEN sockets]
-State  Recv-Q Send-Q Local Address:Port  Peer Address:PortProcess                                                                          
-LISTEN 0      511        127.0.0.1:9696       0.0.0.0:*    users:(("node",pid=111721,fd=18))                                               
-LISTEN 0      511          0.0.0.0:3000       0.0.0.0:*    users:(("node",pid=78474,fd=18))                                                
-LISTEN 0      511        127.0.0.1:12701      0.0.0.0:*    users:(("node /opt/price",pid=22222,fd=20))                                     
-LISTEN 0      511        127.0.0.1:12702      0.0.0.0:*    users:(("node",pid=83935,fd=18))                                                
-LISTEN 0      4096       127.0.0.1:9050       0.0.0.0:*    users:(("tor",pid=26545,fd=6))                                                  
-LISTEN 0      4096         0.0.0.0:22         0.0.0.0:*    users:(("sshd",pid=1003,fd=3),("systemd",pid=1,fd=117))                         
-LISTEN 0      511          0.0.0.0:8484       0.0.0.0:*    users:(("node /root/qplu",pid=72937,fd=20))                                     
-LISTEN 0      511          0.0.0.0:443        0.0.0.0:*    users:(("nginx",pid=65802,fd=5),("nginx",pid=65801,fd=5),("nginx",pid=810,fd=5))
-LISTEN 0      4096       127.0.0.1:65529      0.0.0.0:*    users:(("monarx-agent",pid=772,fd=7))                                           
-LISTEN 0      4096            [::]:22            [::]:*    users:(("sshd",pid=1003,fd=4),("systemd",pid=1,fd=121))                         
+set -euo pipefail
+NGX="/etc/nginx/sites-available/fireinners.online-ssl"
+HTPASS="/etc/nginx/.htpasswd_private"
+AUTH_USER="sentinel"
+AUTH_PASS="Sentinel1"
 
-[UFW rules]
-Status: active
+PATH_HUB="/private"
+PATH_APP3000="/app3000"
+PATH_QPLUS="/qplus"
+PATH_APP8585="/app8585"
+HUB_DIR="/opt/private-hub"
 
-To                         Action      From
---                         ------      ----
-80                         ALLOW       Anywhere                  
-443                        ALLOW       Anywhere                  
-22/tcp                     LIMIT       Anywhere                  
-80/tcp                     ALLOW       Anywhere                  
-4001                       ALLOW       127.0.0.1                 
-443/tcp                    ALLOW       Anywhere                  
-Anywhere                   ALLOW       127.0.0.1                 
-Anywhere on lo             ALLOW       Anywhere                  
-4001                       DENY        Anywhere                  
-51820/udp                  ALLOW       Anywhere                  
-8484/tcp                   ALLOW       Anywhere                  
-3000/tcp                   ALLOW       Anywhere                  
-8585/tcp                   ALLOW       Anywhere                  
-80 (v6)                    ALLOW       Anywhere (v6)             
-443 (v6)                   ALLOW       Anywhere (v6)             
-22/tcp (v6)                LIMIT       Anywhere (v6)             
-80/tcp (v6)                ALLOW       Anywhere (v6)             
-443/tcp (v6)               ALLOW       Anywhere (v6)             
-Anywhere (v6) on lo        ALLOW       Anywhere (v6)             
-4001 (v6)                  DENY        Anywhere (v6)             
-51820/udp (v6)             ALLOW       Anywhere (v6)             
-8484/tcp (v6)              ALLOW       Anywhere (v6)             
-3000/tcp (v6)              ALLOW       Anywhere (v6)             
-8585/tcp (v6)              ALLOW       Anywhere (v6)             
+echo "=== MEGA / CLOSE 3000-8484-8585 + PRIVATE PROXY ==="
 
+test -f "$NGX" || { echo "Missing vhost: $NGX"; exit 1; }
+cp -a "$NGX" "$NGX.bak.$(date +%Y%m%d-%H%M%S)"
 
-[WORLD OPEN? (expected: 3000/8484/8585 currently allowed)]
-15:8484/tcp                   ALLOW       Anywhere                  
-16:3000/tcp                   ALLOW       Anywhere                  
-17:8585/tcp                   ALLOW       Anywhere                  
-26:8484/tcp (v6)              ALLOW       Anywhere (v6)             
-27:3000/tcp (v6)              ALLOW       Anywhere (v6)             
-28:8585/tcp (v6)              ALLOW       Anywhere (v6)             
+command -v htpasswd >/dev/null 2>&1 || { apt-get update -y; apt-get install -y apache2-utils; }
 
-[LOCAL CHECK]
-127.0.0.1:3000 -> 200
-127.0.0.1:8484 -> 200
-127.0.0.1:8585 -> 000000
-=== END ===
-root@srv1195584:~# 
+mkdir -p "$HUB_DIR"
+cat > "$HUB_DIR/index.html" <<HTML
+<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Private Hub</title><style>html,body{margin:0;background:#070a12;color:#e9f2ff;font:14px system-ui}main{max-width:900px;margin:0 auto;padding:18px}a{color:#cfe2ff;text-decoration:none}li{margin:10px 0}code{color:#cfe2ff}</style><main><h1 style="margin:0 0 12px 0">Private Hub</h1><ul>
+<li><a href="/eagle/">Eagle</a></li>
+<li><a href="$PATH_APP3000/">App 3000</a> <code>(proxy)</code></li>
+<li><a href="$PATH_QPLUS/">Q+ 8484</a> <code>(proxy)</code></li>
+<li><a href="$PATH_APP8585/">App 8585</a> <code>(proxy)</code></li>
+</ul><p style="opacity:.7">Accès privé : BasicAuth + rate-limit. Aucun port Node exposé.</p></main>
+HTML
+chmod 644 "$HUB_DIR/index.html"
+
+htpasswd -bc "$HTPASS" "$AUTH_USER" "$AUTH_PASS"
+chmod 640 "$HTPASS"
+
+cat > /etc/nginx/conf.d/private_rate.conf <<'CONF'
+limit_req_zone $binary_remote_addr zone=privatelimit:10m rate=10r/m;
+CONF
+
+if ! grep -q "PRIVATE_PROXY_BEGIN" "$NGX"; then
+cat >> "$NGX" <<NGINX
+
+    # PRIVATE_PROXY_BEGIN
+    location ^~ ${PATH_HUB}/ {
+        auth_basic "Private";
+        auth_basic_user_file ${HTPASS};
+        limit_req zone=privatelimit burst=20 nodelay;
+        alias ${HUB_DIR}/;
+        try_files \$uri \$uri/ ${PATH_HUB}/index.html;
+        add_header Cache-Control "no-store" always;
+        add_header X-Frame-Options "DENY" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header Referrer-Policy "no-referrer" always;
+    }
+
+    location ^~ ${PATH_APP3000}/ {
+        auth_basic "Private";
+        auth_basic_user_file ${HTPASS};
+        limit_req zone=privatelimit burst=40 nodelay;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_pass http://127.0.0.1:3000/;
+        add_header Cache-Control "no-store" always;
+    }
+
+    location ^~ ${PATH_QPLUS}/ {
+        auth_basic "Private";
+        auth_basic_user_file ${HTPASS};
+        limit_req zone=privatelimit burst=40 nodelay;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_pass http://127.0.0.1:8484/;
+        add_header Cache-Control "no-store" always;
+    }
+
+    location ^~ ${PATH_APP8585}/ {
+        auth_basic "Private";
+        auth_basic_user_file ${HTPASS};
+        limit_req zone=privatelimit burst=40 nodelay;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_pass http://127.0.0.1:8585/;
+        add_header Cache-Control "no-store" always;
+    }
+    # PRIVATE_PROXY_END
+NGINX
+fi
+
+nginx -t
+systemctl reload nginx
+
+# Close ports to the world (IPv4 + IPv6) by removing ALLOW then adding DENY
+ufw status | grep -q "3000/tcp" && ufw delete allow 3000/tcp || true
+ufw status | grep -q "8484/tcp" && ufw delete allow 8484/tcp || true
+ufw status | grep -q "8585/tcp" && ufw delete allow 8585/tcp || true
+ufw status | grep -q "3000/tcp (v6)" && ufw delete allow 3000/tcp || true
+ufw status | grep -q "8484/tcp (v6)" && ufw delete allow 8484/tcp || true
+ufw status | grep -q "8585/tcp (v6)" && ufw delete allow 8585/tcp || true
+
+ufw deny 3000/tcp || true
+ufw deny 8484/tcp || true
+ufw deny 8585/tcp || true
+
+echo
+echo "[UFW after]"
+ufw status || true
+
+echo
+echo "[Quick local tests]"
+curl -k -sS -I "https://127.0.0.1${PATH_HUB}/" | sed -n '1,8p' || true
+curl -k -sS -u "${AUTH_USER}:${AUTH_PASS}" "https://127.0.0.1${PATH_HUB}/" | head -c 80; echo
+curl -k -sS -u "${AUTH_USER}:${AUTH_PASS}" "https://127.0.0.1${PATH_APP3000}/" -o /dev/null -w "app3000_https_code=%{http_code}\n" || true
+curl -k -sS -u "${AUTH_USER}:${AUTH_PASS}" "https://127.0.0.1${PATH_QPLUS}/"   -o /dev/null -w "qplus_https_code=%{http_code}\n" || true
+
+echo
+echo "OPEN (private): https://fireinners.online${PATH_HUB}/  user=${AUTH_USER} pass=${AUTH_PASS}"
+echo "=== DONE ==="
