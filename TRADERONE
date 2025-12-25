@@ -1,98 +1,22 @@
 bash -lc 'set -euo pipefail;
-SNIP="/etc/nginx/snippets/private_sentinel1.conf";
-echo "== FIND ERROR FILE/LINE ==";
-ERR="$(nginx -t 2>&1 >/dev/null || true)";
-echo "$ERR" | tail -n +1 | sed -n "1,6p";
-FILE="$(echo "$ERR" | sed -n "s/.* in \\(\\/[^:]*\\):\\([0-9]\\+\\).*/\\1/p" | head -n1 || true)";
-LINE="$(echo "$ERR" | sed -n "s/.* in \\(\\/[^:]*\\):\\([0-9]\\+\\).*/\\2/p" | head -n1 || true)";
-if [ -z "${FILE:-}" ] || [ ! -f "$FILE" ]; then
-  echo "Could not parse nginx -t. Fallback grep…";
-  HIT="$(grep -RIn "include.*private_sentinel1" /etc/nginx 2>/dev/null | head -n1 || true)";
-  FILE="$(echo "$HIT" | cut -d: -f1)";
-  LINE="$(echo "$HIT" | cut -d: -f2)";
-fi
-echo "TARGET: ${FILE:-<none>} : ${LINE:-<none>}";
-[ -n "${FILE:-}" ] && [ -f "$FILE" ] || { echo "No target file found"; exit 1; }
+V="/etc/nginx/sites-available/fireinners.online-ssl";
+echo "== nginx -t (etat actuel) ==";
+nginx -t || true;
 
-echo "== SHOW OFFENDING CONTEXT ==";
-nl -ba "$FILE" | sed -n "$(( (LINE>5?LINE-5:1) )),$((LINE+5))p" || true;
+echo "== dernier backup dispo ==";
+BK="$(ls -1t ${V}.bak.* 2>/dev/null | head -n1 || true)";
+echo "${BK:-<aucun>}";
 
-echo "== BACKUP ==";
-BK="${FILE}.bak.$(date +%Y%m%d-%H%M%S)";
-cp -a "$FILE" "$BK";
-echo "$BK";
-
-echo "== UNLOCK immutable (if set) ==";
-chattr -i "$FILE" 2>/dev/null || true;
-
-echo "== FIX include/private_sentinel1 lines (force clean include on its own line) ==";
-TMP="$(mktemp)";
-awk -v snip="$SNIP" '
-BEGIN{inc_printed=0}
-{
-  line=$0;
-
-  # if listen 443 line contains include private_sentinel1 on same line => split
-  if(line ~ /^[ \t]*listen[ \t]+443/ && line ~ /include/ && line ~ /private_sentinel1/){
-    gsub(/include[ \t]+[^;]*private_sentinel1[^;]*;/,"",line);
-    sub(/[ \t]+$/,"",line);
-    if(line !~ /;[ \t]*$/) line=line";";
-    print line;
-    if(!inc_printed){ print "    include " snip ";"; inc_printed=1; }
-    next;
-  }
-
-  # any include line referencing private_sentinel1 => replace with clean include
-  if(line ~ /^[ \t]*include[ \t]+/ && line ~ /private_sentinel1/){
-    if(!inc_printed){ print "    include " snip ";"; inc_printed=1; }
-    next;
-  }
-
-  # if random garbage contains private_sentinel1 include fragment => drop fragment
-  if(line ~ /private_sentinel1/ && line ~ /include/){
-    gsub(/include[ \t]+[^;]*private_sentinel1[^;]*;/,"",line);
-    sub(/[ \t]+$/,"",line);
-  }
-
-  print line;
-}
-END{
-  # if never printed include, inject after first listen 443 later is not possible here safely
-}
-' "$FILE" > "$TMP";
-cp -a "$TMP" "$FILE";
-rm -f "$TMP";
-
-echo "== ENSURE snippet exists ==";
-if [ ! -f "$SNIP" ]; then
-  mkdir -p /etc/nginx/snippets;
-  cat > "$SNIP" <<'"'"'EOF'"'"'
-location ^~ /_private_sentinel1/ {
-  auth_basic "Sentinel";
-  auth_basic_user_file /etc/nginx/.htpasswd_private_sentinel1;
-  proxy_pass http://127.0.0.1:3000/;
-  proxy_http_version 1.1;
-  proxy_set_header Host $host;
-  proxy_set_header X-Real-IP $remote_addr;
-  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto $scheme;
-  add_header Cache-Control "no-store" always;
-}
-EOF
-  chmod 644 "$SNIP";
+if ! nginx -t >/dev/null 2>&1; then
+  if [ -n "${BK:-}" ] && [ -f "$BK" ]; then
+    echo "== RESTORE backup -> $V ==";
+    cp -a "$BK" "$V";
+  else
+    echo "Pas de backup trouve. Stop.";
+    exit 1;
+  fi
 fi
 
-echo "== SHOW RESULT (listen 443 + include) ==";
-grep -nE "listen[ \t]+443|include .*private_sentinel1" "$FILE" || true;
-
-echo "== NGINX TEST ==";
-if nginx -t; then
-  systemctl reload nginx;
-  echo "OK: nginx reloaded";
-else
-  echo "FAIL: rollback to backup";
-  cp -a "$BK" "$FILE";
-  nginx -t || true;
-  exit 1;
-fi
-echo "DONE"'
+echo "== nginx -t apres restore ==";
+nginx -t
+echo "OK"'
