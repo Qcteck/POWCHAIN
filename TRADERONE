@@ -1,23 +1,40 @@
 set -euo pipefail
-echo "== AMCQ MainPID =="
-MPID="$(systemctl show -p MainPID --value amcq 2>/dev/null || true)"
-echo "MainPID=$MPID"
-[ -n "$MPID" ] && [ "$MPID" != "0" ] || { echo "ERREUR: amcq pas running"; systemctl status amcq --no-pager -l | head -n 40; exit 1; }
+TS=$(date +%Y%m%d-%H%M%S)
+BK="/root/beton_amcq_endpoints_$TS"
+mkdir -p "$BK"
+cp -a /root/amcq/server.js "$BK/server.js"
 
-echo
-echo "== LISTEN sockets for AMCQ PID only =="
+echo "== PATCH AMCQ endpoints: /health /ping /api/status (keep /status) =="
+# 1) Ensure /health exists
+if ! grep -q 'app\.get("/health"' /root/amcq/server.js; then
+  perl -0777 -pi -e 's/(const\s+app\s*=\s*express\(\)\s*;\s*)/\1\napp.get("\/health",(req,res)=>res.status(200).send("ok"));\n/s' /root/amcq/server.js
+fi
+
+# 2) Ensure /ping exists (alias)
+if ! grep -q 'app\.get("/ping"' /root/amcq/server.js; then
+  perl -0777 -pi -e 's/(app\.get\("\/status"[^\;]*\;\s*)/\1\napp.get("\/ping",(req,res)=>res.status(200).send("pong"));\n/s' /root/amcq/server.js
+fi
+
+# 3) Ensure /api/status exists (alias JSON)
+if ! grep -q 'app\.get("/api/status"' /root/amcq/server.js; then
+  perl -0777 -pi -e 's/(app\.get\("\/status"[^\;]*\;\s*)/\1\napp.get("\/api\/status",(req,res)=>res.status(200).json({status:"OK",service:"AMCQ LIVE"}));\n/s' /root/amcq/server.js
+fi
+
+echo "== RESTART =="
+systemctl restart amcq
+sleep 1
+
+echo "== DETECT port by MainPID (safe) =="
+MPID="$(systemctl show -p MainPID --value amcq 2>/dev/null || true)"
+PORT="$(ss -lntp | sed -n "s/.*127\\.0\\.0\\.1:\\([0-9]\\+\\).*pid=$MPID,.*/\\1/p" | head -n1)"
+echo "MainPID=$MPID PORT=$PORT"
 ss -lntp | grep "pid=$MPID," || true
 
-echo
-echo "== PORT AMCQ (depuis ss pid) =="
-PORT="$(ss -lntp | sed -n "s/.*127\\.0\\.0\\.1:\\([0-9]\\+\\).*pid=$MPID,.*/\\1/p" | head -n1)"
-echo "PORT=$PORT"
-[ -n "$PORT" ] || { echo "ERREUR: port introuvable pour pid=$MPID"; exit 1; }
-
-echo
-echo "== CURL local (essais) =="
-for P in "/" "/health" "/status" "/api/status" "/ping"; do
+echo "== TEST =="
+for P in "/health" "/status" "/api/status" "/ping"; do
   echo "-- $P"
-  curl -m 2 -sS -i "http://127.0.0.1:$PORT$P" | head -n 12 || true
+  curl -m 2 -sS -i "http://127.0.0.1:$PORT$P" | head -n 15 || true
   echo
 done
+
+echo "DONE. Backup: $BK"
