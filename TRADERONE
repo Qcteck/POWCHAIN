@@ -1,39 +1,19 @@
 set -euo pipefail
-TS=$(date +%Y%m%d-%H%M%S)
-BK="/root/beton_amcqlogfix_$TS"
-mkdir -p "$BK"
-cp -a /root/amcq/server.js "$BK/server.js"
-
-echo "== BEFORE (grep) =="
-grep -nE 'AMCQ WEB \+ API LIVE|0\.0\.0\.0:3000|app\.listen\(\s*3000' /root/amcq/server.js || true
-
-# 1) Corrige le message de log 0.0.0.0 -> 127.0.0.1 (log seulement)
-perl -pi -e 's#http://0\.0\.0\.0:3000#http://127.0.0.1:3000#g' /root/amcq/server.js
-
-# 2) Force le bind 3000 sur 127.0.0.1 si jamais c’était en 0.0.0.0
-perl -0777 -pi -e 's/app\.listen\(\s*3000\s*,\s*["'\'']0\.0\.0\.0["'\'']/app.listen(3000,"127.0.0.1"/g' /root/amcq/server.js
-perl -0777 -pi -e 's/app\.listen\(\s*3000\s*\)/app.listen(3000,"127.0.0.1")/g' /root/amcq/server.js
-
-echo "== AFTER (grep) =="
-grep -nE 'AMCQ WEB \+ API LIVE|127\.0\.0\.1:3000|app\.listen\(\s*3000' /root/amcq/server.js || true
-
-echo "== RESTART =="
-systemctl restart amcq
-
-echo "== STATUS =="
-systemctl status amcq --no-pager -l | head -n 25 || true
-
-echo "== LISTEN CHECK (expect 127.0.0.1:3000 only) =="
-ss -lntp | egrep ':(3000|8484)\b|:443\b' || true
-
-echo "== LOCAL TESTS =="
-curl -m 3 -sS -I http://127.0.0.1:3000 | head -n 1 || true
-curl -m 3 -sS http://127.0.0.1:3000/status 2>/dev/null | head -c 120 || true; echo
-
-echo "== EXTERNAL-IP SHOULD FAIL =="
-IP=$(ip -4 route get 1.1.1.1 | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
-echo "IP=$IP"
-curl -m 3 -I "http://$IP:3000" && echo "ATTENTION: ouvert" || echo "OK: fermé"
-curl -m 3 -I "http://$IP:8484" && echo "ATTENTION: ouvert" || echo "OK: fermé"
-
-echo "DONE. Backup: $BK"
+echo "== amcq.service (extraits) =="
+systemctl cat amcq | sed -n '1,160p' | egrep -n 'ExecStart|Environment|PORT|WorkingDirectory|User|Group' || true
+echo
+echo "== LISTEN node =="
+ss -lntp | egrep 'node|:(3000|4044|8484)\b|:443\b' || true
+echo
+echo "== PORT détecté (prio: Environment PORT, sinon ss) =="
+PORT="$(systemctl show -p Environment amcq | sed -n 's/.*PORT=\([0-9]\+\).*/\1/p' | head -n1 || true)"
+if [ -z "${PORT:-}" ]; then PORT="$(ss -lntp | sed -n 's/.*127\.0\.0\.1:\([0-9]\+\).*node.*/\1/p' | head -n1 || true)"; fi
+echo "PORT=${PORT:-?}"
+echo
+echo "== CURL local =="
+if [ -n "${PORT:-}" ]; then
+  curl -m 3 -sS -I "http://127.0.0.1:${PORT}/health" | head -n 1 || true
+  curl -m 3 -sS "http://127.0.0.1:${PORT}/status" 2>/dev/null | head -c 200 || true; echo
+else
+  echo "Impossible de détecter le port automatiquement."
+fi
