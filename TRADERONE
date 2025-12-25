@@ -1,90 +1,125 @@
 set -euo pipefail
 
-echo "== PRECHECK =="
-whoami
-node -v || true
-date
-HOSTIP="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{print $7;exit}')"
-echo "Detected IPv4: ${HOSTIP:-unknown}"
+JS_SIGNER="/root/qplus-secure/signer.js"
+JS_AMCQ="/root/amcq/server.js"
 
-SIGNER_JS="/root/qplus-secure/signer.js"
-UNIT="/etc/systemd/system/qplus-signer.service"
-BK="/root/beton_fixsigner_$(date +%Y%m%d-%H%M%S)"
+TS="$(date +%Y%m%d-%H%M%S)"
+BK="/root/beton_batch_${TS}"
 mkdir -p "$BK"
-cp -a "$SIGNER_JS" "$BK/signer.js.bak" 2>/dev/null || true
-cp -a "$UNIT" "$BK/qplus-signer.service.bak" 2>/dev/null || true
+
+echo "== PRECHECK =="
+echo "node: $(node -v 2>/dev/null || echo 'MISSING')"
+echo "hostname: $(hostname)"
+echo "time: $(date -u)"
+IPV4="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)"
+echo "Detected IPv4: ${IPV4:-unknown}"
+[ -f "$JS_SIGNER" ] && echo "OK: $JS_SIGNER" || { echo "ERR: missing $JS_SIGNER"; exit 1; }
+[ -f "$JS_AMCQ" ] && echo "OK: $JS_AMCQ" || { echo "ERR: missing $JS_AMCQ"; exit 1; }
+
 echo "Backup: $BK"
+cp -a "$JS_SIGNER" "$BK/$(basename "$JS_SIGNER").bak" 2>/dev/null || true
+cp -a "$JS_AMCQ"   "$BK/$(basename "$JS_AMCQ").bak"   2>/dev/null || true
+cp -a /etc/systemd/system/qplus-signer.service "$BK/qplus-signer.service.bak" 2>/dev/null || true
+cp -a /etc/systemd/system/amcq.service "$BK/amcq.service.bak" 2>/dev/null || true
 
-echo "== SHOW CURRENT PIDS (signer.js) =="
-pgrep -af '/root/qplus-secure/signer\.js' || true
-echo "== LISTEN (8484/3000/443) =="
-ss -lntp | egrep ':(8484|3000)\b|:443\b' || true
+echo "== BEFORE: listeners (3000/8484/443) =="
+ss -lntp | egrep ':(3000|8484|443)\b' || true
 
-echo "== STOP OLD MANAGERS (PM2 if any) =="
-command -v pm2 >/dev/null 2>&1 && (pm2 list || true) || true
-command -v pm2 >/dev/null 2>&1 && (pm2 delete all || true) || true
-command -v pm2 >/dev/null 2>&1 && (pm2 save || true) || true
+echo "== PATCH signer.js: bind 127.0.0.1 on 8484 + add /health & /status if missing =="
+grep -qE 'app\.get\(\"/health\"' "$JS_SIGNER" || perl -0777 -i -pe 's/(app\s*=\s*express\(\)\s*;)/$1\napp.get("\/health",(req,res)=>res.status(200).send("ok"));\napp.get("\/status",(req,res)=>res.status(200).json({ok:true,ts:Date.now()}));/s' "$JS_SIGNER" || true
+perl -0777 -i -pe '
+  s/\bapp\.listen\(\s*8484\s*,\s*([^\)]*)\)/app.listen(8484,"127.0.0.1",$1)/g;
+  s/\bapp\.listen\(\s*8484\s*\)/app.listen(8484,"127.0.0.1")/g;
+  s/\bapp\.listen\(\s*8484\s*,\s*"0\.0\.0\.0"\s*,/app.listen(8484,"127.0.0.1",/g;
+' "$JS_SIGNER" || true
+grep -qE 'app\.listen\(\s*8484\s*,\s*"127\.0\.0\.1"' "$JS_SIGNER" && echo "OK: signer bound to 127.0.0.1" || echo "WARN: signer bind pattern not found (check manually)"
 
-echo "== STOP SYSTEMD UNIT (clean restart) =="
-systemctl stop qplus-signer 2>/dev/null || true
+echo "== PATCH amcq/server.js: bind 127.0.0.1 on 3000 =="
+perl -0777 -i -pe '
+  s/\bapp\.listen\(\s*3000\s*,\s*([^\)]*)\)/app.listen(3000,"127.0.0.1",$1)/g;
+  s/\bapp\.listen\(\s*3000\s*\)/app.listen(3000,"127.0.0.1")/g;
+  s/\bapp\.listen\(\s*3000\s*,\s*"0\.0\.0\.0"\s*,/app.listen(3000,"127.0.0.1",/g;
+' "$JS_AMCQ" || true
+grep -qE 'app\.listen\(\s*3000\s*,\s*"127\.0\.0\.1"' "$JS_AMCQ" && echo "OK: amcq bound to 127.0.0.1" || echo "WARN: amcq bind pattern not found (check manually)"
 
-echo "== KILL ALL signer.js PROCESSES (hard clean) =="
-pkill -f '/root/qplus-secure/signer\.js' 2>/dev/null || true
+echo "== STOP DOUBLONS (pm2/nohup/old) =="
+command -v pm2 >/dev/null 2>&1 && {
+  pm2 delete qplus-signer 2>/dev/null || true
+  pm2 delete amcq 2>/dev/null || true
+  pm2 save --force 2>/dev/null || true
+} || true
+pkill -f "$JS_SIGNER" 2>/dev/null || true
+pkill -f "$JS_AMCQ" 2>/dev/null || true
 sleep 1
-pgrep -af '/root/qplus-secure/signer\.js' || true
 
-echo "== ENSURE signer binds 127.0.0.1 on 8484 (idempotent patch) =="
-perl -0777 -i -pe 's/app\.listen\(\s*8484\s*,\s*([^)]+)\)/app.listen(8484,"127.0.0.1",$1)/g; s/app\.listen\(\s*8484\s*\)/app.listen(8484,"127.0.0.1")/g; s/app\.listen\(\s*8484\s*,\s*"(?:0\.0\.0\.0)"\s*(,?)/app.listen(8484,"127.0.0.1"$1)/g' "$SIGNER_JS" || true
-
-echo "== CREATE/REPLACE SYSTEMD UNIT (single source of truth) =="
-cat > "$UNIT" <<'EOF'
+echo "== SYSTEMD: create/replace qplus-signer + amcq (single source of truth) =="
+cat >/etc/systemd/system/qplus-signer.service <<'UNIT'
 [Unit]
 Description=QPLUS Signer (loopback only)
 After=network.target
 
 [Service]
 Type=simple
+User=root
 WorkingDirectory=/root/qplus-secure
+Environment=NODE_ENV=production
 ExecStart=/usr/bin/node /root/qplus-secure/signer.js
 Restart=always
-RestartSec=1
-Environment=NODE_ENV=production
+RestartSec=2
+KillSignal=SIGINT
+TimeoutStopSec=10
+LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
-EOF
+UNIT
+
+cat >/etc/systemd/system/amcq.service <<'UNIT'
+[Unit]
+Description=AMCQ API (loopback only)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/amcq
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/node /root/amcq/server.js
+Restart=always
+RestartSec=2
+KillSignal=SIGINT
+TimeoutStopSec=10
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+UNIT
 
 systemctl daemon-reload
-systemctl enable --now qplus-signer
+systemctl enable --now qplus-signer.service
+systemctl enable --now amcq.service
+systemctl restart qplus-signer.service
+systemctl restart amcq.service
 sleep 1
 
-echo "== VERIFY: systemd main PID =="
-systemctl status qplus-signer --no-pager -l | sed -n '1,12p' || true
-MAINPID="$(systemctl show -p MainPID --value qplus-signer 2>/dev/null || true)"
-echo "MainPID=$MAINPID"
+echo "== AFTER: listeners (must be 127.0.0.1:8484 + 127.0.0.1:3000) =="
+ss -lntp | egrep ':(3000|8484|443)\b' || true
 
-echo "== VERIFY: who LISTENS on 8484/3000 =="
-ss -lntp | egrep ':(8484|3000)\b' || true
+echo "== LOCAL TESTS (should be 200) =="
+curl -m 3 -sS -i http://127.0.0.1:8484/health | head -n 5 || true
+curl -m 3 -sS -i http://127.0.0.1:8484/status | head -n 8 || true
+curl -m 3 -sS -I http://127.0.0.1:3000/ | head -n 1 || true
 
-echo "== CHECK: listener PID must match MainPID =="
-LPID="$(ss -lntp 2>/dev/null | awk '/:8484 /{gsub(/.*pid=/,"",$0);gsub(/,.*/,"",$0);print $0;exit}')"
-echo "ListenPID8484=${LPID:-none}"
-if [ -n "${MAINPID:-}" ] && [ -n "${LPID:-}" ] && [ "$MAINPID" = "$LPID" ]; then
-  echo "OK: 8484 is owned by systemd MainPID"
+echo "== EXTERNAL-IP TEST from VPS (should FAIL if loopback) =="
+if [ -n "${IPV4:-}" ]; then
+  curl -m 3 -sS -I "http://${IPV4}:8484" | head -n 1 && echo "ATTENTION: 8484 répond encore (pas béton)" || echo "OK: 8484 fermé (bind loopback)"
+  curl -m 3 -sS -I "http://${IPV4}:3000" | head -n 1 && echo "ATTENTION: 3000 répond encore (pas béton)" || echo "OK: 3000 fermé (bind loopback)"
 else
-  echo "WARNING: 8484 PID != systemd MainPID (investigate)."
+  echo "IPV4 unknown, skip external-ip test"
 fi
 
-echo "== LOCAL TESTS =="
-curl -m 3 -i http://127.0.0.1:8484/health | head -n 5 || true
-curl -m 3 -i http://127.0.0.1:8484/status | head -n 8 || true
+echo "== STATUS systemd =="
+systemctl status qplus-signer --no-pager -l | head -n 20 || true
+systemctl status amcq --no-pager -l | head -n 20 || true
 
-echo "== EXTERNAL-IP TEST FROM VPS (should FAIL if loopback) =="
-if [ -n "${HOSTIP:-}" ]; then
-  curl -m 3 -I "http://${HOSTIP}:8484/" | head -n 1 || echo "OK: closed (bind loopback)"
-  curl -m 3 -I "http://${HOSTIP}:3000/" | head -n 1 || echo "OK: closed (bind loopback)"
-else
-  echo "Skipped: HOSTIP not detected."
-fi
-
-echo "== DONE. Backup at $BK =="
+echo "== DONE. Backup: $BK =="
