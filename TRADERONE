@@ -1,14 +1,68 @@
-bash -lc 'set -euo pipefail;DOMAIN="fireinners.online";LINK="/etc/nginx/sites-enabled/fireinners.online-ssl";VHOST="$(readlink -f "$LINK")";PATHLOC="/_private_sentinel1_/";HTPASS="/etc/nginx/.htpasswd_sentinel";SNIP="/etc/nginx/snippets/private_sentinel1.conf";echo "LINK=$LINK";ls -l "$LINK"||true;echo "VHOST(real)=$VHOST";[ -f "$VHOST" ]||{ echo "ERROR: vhost not found"; exit 1; };echo "== (1) unlock immutable if needed ==";if command -v lsattr >/dev/null 2>&1;then A="$(lsattr -d "$VHOST" 2>/dev/null|awk "{print \$1}")";echo "attr=$A";echo "$A"|grep -q i && { chattr -i "$VHOST"; echo "unlocked"; }||true;fi;echo "== (2) backup ==";cp -a "$VHOST" "$VHOST.bak.$(date +%Y%m%d-%H%M%S)";echo "== (3) ensure htpasswd tool ==";command -v htpasswd >/dev/null 2>&1||{ apt-get update -y; apt-get install -y apache2-utils; };echo "== (4) create/update htpasswd user: sentinel (password prompts only) ==";if [ -f "$HTPASS" ];then htpasswd "$HTPASS" sentinel;else htpasswd -c "$HTPASS" sentinel;fi;chmod 640 "$HTPASS";chown root:www-data "$HTPASS" 2>/dev/null||true;echo "== (5) write nginx snippet ==";mkdir -p /etc/nginx/snippets;cat >"$SNIP"<<EOF
-location ^~ $PATHLOC {
-    auth_basic "sentinel";
-    auth_basic_user_file $HTPASS;
-    add_header Cache-Control "no-store" always;
-    proxy_pass http://127.0.0.1:3000/;
-    proxy_http_version 1.1;
-    proxy_set_header Host \$host;
-    proxy_set_header X-Real-IP \$remote_addr;
-    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto \$scheme;
+bash -lc 'set -euo pipefail;
+DOMAIN="fireinners.online";
+VHOST_A="/etc/nginx/sites-available/${DOMAIN}-ssl";
+VHOST_E="/etc/nginx/sites-enabled/${DOMAIN}-ssl";
+VHOST="$( [ -f "$VHOST_E" ] && readlink -f "$VHOST_E" || true )"; [ -z "${VHOST:-}" ] && VHOST="$VHOST_A";
+SNIP="/etc/nginx/snippets/private_sentinel1.conf";
+HTPASS="/etc/nginx/.htpasswd_private_sentinel1";
+echo "== TARGET VHOST =="; echo "$VHOST"; [ -f "$VHOST" ] || { echo "VHOST not found"; exit 1; }
+echo "== BACKUP =="; BK="${VHOST}.bak.$(date +%Y%m%d-%H%M%S)"; cp -a "$VHOST" "$BK"; echo "$BK";
+echo "== UNLOCK immutable (if set) =="; lsattr -d "$VHOST" 2>/dev/null || true; chattr -i "$VHOST" 2>/dev/null || true;
+echo "== SHOW current suspect lines =="; grep -nE "include|private_sentinel" "$VHOST" || true;
+echo "== CLEAN any broken include occurrences (inline or standalone) ==";
+TMP="$(mktemp)";
+awk '"'"'{
+  gsub(/include[ \t]+[^;]*private_sentinel1[^;]*;[ \t]*/,"");
+  if($0 ~ /^[ \t]*include[ \t]+.*private_sentinel1/){ next }
+  if($0 ~ /private_sentinel1/ && $0 !~ /location/){ sub(/private_sentinel1/,"") }
+  print
+}'"'"' "$VHOST" > "$TMP";
+cp -a "$TMP" "$VHOST"; rm -f "$TMP";
+echo "== ENSURE snippet exists (create if missing) ==";
+if [ ! -f "$SNIP" ]; then
+  mkdir -p /etc/nginx/snippets;
+  cat > "$SNIP" <<'"'"'EOF'"'"'
+location ^~ /_private_sentinel1/ {
+  auth_basic "Sentinel";
+  auth_basic_user_file /etc/nginx/.htpasswd_private_sentinel1;
+  proxy_pass http://127.0.0.1:3000/;
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  add_header Cache-Control "no-store" always;
 }
 EOF
-chmod 644 "$SNIP";echo "== (6) inject include after listen 443 (no perl) ==";if grep -qF "include $SNIP;" "$VHOST";then echo "include already present";else TMP="$(mktemp)";awk -v inc="    include '"$SNIP"';" '\''{print} !done && $0 ~ /listen[ \t]+443/ {print inc; done=1} END{if(!done){exit 2}}'\'' "$VHOST" >"$TMP" || { echo "ERROR: couldnt find listen 443 in vhost"; rm -f "$TMP"; exit 1; };chmod --reference="$VHOST" "$TMP" 2>/dev/null||true;chown --reference="$VHOST" "$TMP" 2>/dev/null||true;mv "$TMP" "$VHOST";echo "include injected";fi;echo "== (7) nginx test + reload ==";nginx -t;systemctl reload nginx;echo "== (8) ORIGIN test (bypass Cloudflare) should be 401 ==";IP="$(hostname -I|awk "{print \$1}")";curl -skI --resolve "$DOMAIN:443:$IP" "https://$DOMAIN$PATHLOC" | head -n 30;echo "== (9) show include line ==";grep -nF "include $SNIP;" "$VHOST"||true;echo "== done ==";'
+  chmod 644 "$SNIP";
+fi
+echo "== ENSURE htpasswd file exists (prompt if needed) ==";
+command -v htpasswd >/dev/null 2>&1 || (apt-get update -y && apt-get install -y apache2-utils);
+if [ -f "$HTPASS" ]; then htpasswd "$HTPASS" sentinel; else htpasswd -c "$HTPASS" sentinel; fi
+chmod 640 "$HTPASS"; chown root:www-data "$HTPASS" 2>/dev/null || true;
+echo "== INJECT clean include after first listen 443 (if missing) ==";
+INC="include $SNIP;";
+if ! grep -qF "$INC" "$VHOST"; then
+  TMP="$(mktemp)";
+  awk -v inc="    $INC" '"'"'
+    {print}
+    !done && $0 ~ /^[ \t]*listen[ \t]+443/ { print inc; done=1 }
+  '"'"' "$VHOST" > "$TMP";
+  cp -a "$TMP" "$VHOST"; rm -f "$TMP";
+fi
+echo "== SHOW final relevant lines ==";
+grep -nE "listen[ \t]+443|include .*private_sentinel1|_private_sentinel1" "$VHOST" || true;
+echo "== NGINX TEST ==";
+if nginx -t; then
+  systemctl reload nginx;
+  echo "OK: nginx reloaded";
+else
+  echo "FAIL: rolling back";
+  cp -a "$BK" "$VHOST";
+  nginx -t || true;
+  exit 1;
+fi
+echo "== ORIGIN TEST (bypass Cloudflare) ==";
+IP="$(hostname -I | awk '"'"'{print $1}'"'"')";
+curl -skI --resolve "${DOMAIN}:443:${IP}" "https://${DOMAIN}/_private_sentinel1/" | head -n 20;
+echo "DONE"'
