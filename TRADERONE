@@ -1,24 +1,69 @@
 bash -lc 'set -euo pipefail;
-DOMAIN="fireinners.online";
-VHOST_A="/etc/nginx/sites-available/${DOMAIN}-ssl";
-VHOST_E="/etc/nginx/sites-enabled/${DOMAIN}-ssl";
-VHOST="$( [ -f "$VHOST_E" ] && readlink -f "$VHOST_E" || true )"; [ -z "${VHOST:-}" ] && VHOST="$VHOST_A";
 SNIP="/etc/nginx/snippets/private_sentinel1.conf";
-HTPASS="/etc/nginx/.htpasswd_private_sentinel1";
-echo "== TARGET VHOST =="; echo "$VHOST"; [ -f "$VHOST" ] || { echo "VHOST not found"; exit 1; }
-echo "== BACKUP =="; BK="${VHOST}.bak.$(date +%Y%m%d-%H%M%S)"; cp -a "$VHOST" "$BK"; echo "$BK";
-echo "== UNLOCK immutable (if set) =="; lsattr -d "$VHOST" 2>/dev/null || true; chattr -i "$VHOST" 2>/dev/null || true;
-echo "== SHOW current suspect lines =="; grep -nE "include|private_sentinel" "$VHOST" || true;
-echo "== CLEAN any broken include occurrences (inline or standalone) ==";
+echo "== FIND ERROR FILE/LINE ==";
+ERR="$(nginx -t 2>&1 >/dev/null || true)";
+echo "$ERR" | tail -n +1 | sed -n "1,6p";
+FILE="$(echo "$ERR" | sed -n "s/.* in \\(\\/[^:]*\\):\\([0-9]\\+\\).*/\\1/p" | head -n1 || true)";
+LINE="$(echo "$ERR" | sed -n "s/.* in \\(\\/[^:]*\\):\\([0-9]\\+\\).*/\\2/p" | head -n1 || true)";
+if [ -z "${FILE:-}" ] || [ ! -f "$FILE" ]; then
+  echo "Could not parse nginx -t. Fallback grep…";
+  HIT="$(grep -RIn "include.*private_sentinel1" /etc/nginx 2>/dev/null | head -n1 || true)";
+  FILE="$(echo "$HIT" | cut -d: -f1)";
+  LINE="$(echo "$HIT" | cut -d: -f2)";
+fi
+echo "TARGET: ${FILE:-<none>} : ${LINE:-<none>}";
+[ -n "${FILE:-}" ] && [ -f "$FILE" ] || { echo "No target file found"; exit 1; }
+
+echo "== SHOW OFFENDING CONTEXT ==";
+nl -ba "$FILE" | sed -n "$(( (LINE>5?LINE-5:1) )),$((LINE+5))p" || true;
+
+echo "== BACKUP ==";
+BK="${FILE}.bak.$(date +%Y%m%d-%H%M%S)";
+cp -a "$FILE" "$BK";
+echo "$BK";
+
+echo "== UNLOCK immutable (if set) ==";
+chattr -i "$FILE" 2>/dev/null || true;
+
+echo "== FIX include/private_sentinel1 lines (force clean include on its own line) ==";
 TMP="$(mktemp)";
-awk '"'"'{
-  gsub(/include[ \t]+[^;]*private_sentinel1[^;]*;[ \t]*/,"");
-  if($0 ~ /^[ \t]*include[ \t]+.*private_sentinel1/){ next }
-  if($0 ~ /private_sentinel1/ && $0 !~ /location/){ sub(/private_sentinel1/,"") }
-  print
-}'"'"' "$VHOST" > "$TMP";
-cp -a "$TMP" "$VHOST"; rm -f "$TMP";
-echo "== ENSURE snippet exists (create if missing) ==";
+awk -v snip="$SNIP" '
+BEGIN{inc_printed=0}
+{
+  line=$0;
+
+  # if listen 443 line contains include private_sentinel1 on same line => split
+  if(line ~ /^[ \t]*listen[ \t]+443/ && line ~ /include/ && line ~ /private_sentinel1/){
+    gsub(/include[ \t]+[^;]*private_sentinel1[^;]*;/,"",line);
+    sub(/[ \t]+$/,"",line);
+    if(line !~ /;[ \t]*$/) line=line";";
+    print line;
+    if(!inc_printed){ print "    include " snip ";"; inc_printed=1; }
+    next;
+  }
+
+  # any include line referencing private_sentinel1 => replace with clean include
+  if(line ~ /^[ \t]*include[ \t]+/ && line ~ /private_sentinel1/){
+    if(!inc_printed){ print "    include " snip ";"; inc_printed=1; }
+    next;
+  }
+
+  # if random garbage contains private_sentinel1 include fragment => drop fragment
+  if(line ~ /private_sentinel1/ && line ~ /include/){
+    gsub(/include[ \t]+[^;]*private_sentinel1[^;]*;/,"",line);
+    sub(/[ \t]+$/,"",line);
+  }
+
+  print line;
+}
+END{
+  # if never printed include, inject after first listen 443 later is not possible here safely
+}
+' "$FILE" > "$TMP";
+cp -a "$TMP" "$FILE";
+rm -f "$TMP";
+
+echo "== ENSURE snippet exists ==";
 if [ ! -f "$SNIP" ]; then
   mkdir -p /etc/nginx/snippets;
   cat > "$SNIP" <<'"'"'EOF'"'"'
@@ -36,33 +81,18 @@ location ^~ /_private_sentinel1/ {
 EOF
   chmod 644 "$SNIP";
 fi
-echo "== ENSURE htpasswd file exists (prompt if needed) ==";
-command -v htpasswd >/dev/null 2>&1 || (apt-get update -y && apt-get install -y apache2-utils);
-if [ -f "$HTPASS" ]; then htpasswd "$HTPASS" sentinel; else htpasswd -c "$HTPASS" sentinel; fi
-chmod 640 "$HTPASS"; chown root:www-data "$HTPASS" 2>/dev/null || true;
-echo "== INJECT clean include after first listen 443 (if missing) ==";
-INC="include $SNIP;";
-if ! grep -qF "$INC" "$VHOST"; then
-  TMP="$(mktemp)";
-  awk -v inc="    $INC" '"'"'
-    {print}
-    !done && $0 ~ /^[ \t]*listen[ \t]+443/ { print inc; done=1 }
-  '"'"' "$VHOST" > "$TMP";
-  cp -a "$TMP" "$VHOST"; rm -f "$TMP";
-fi
-echo "== SHOW final relevant lines ==";
-grep -nE "listen[ \t]+443|include .*private_sentinel1|_private_sentinel1" "$VHOST" || true;
+
+echo "== SHOW RESULT (listen 443 + include) ==";
+grep -nE "listen[ \t]+443|include .*private_sentinel1" "$FILE" || true;
+
 echo "== NGINX TEST ==";
 if nginx -t; then
   systemctl reload nginx;
   echo "OK: nginx reloaded";
 else
-  echo "FAIL: rolling back";
-  cp -a "$BK" "$VHOST";
+  echo "FAIL: rollback to backup";
+  cp -a "$BK" "$FILE";
   nginx -t || true;
   exit 1;
 fi
-echo "== ORIGIN TEST (bypass Cloudflare) ==";
-IP="$(hostname -I | awk '"'"'{print $1}'"'"')";
-curl -skI --resolve "${DOMAIN}:443:${IP}" "https://${DOMAIN}/_private_sentinel1/" | head -n 20;
 echo "DONE"'
