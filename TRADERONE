@@ -1,10 +1,90 @@
-systemctl status qplus-signer --no-pager -l
-pgrep -af '/root/qplus-secure/signer\.js'
-ss -lntp | egrep ':(8484|3000)\b'
+set -euo pipefail
 
+echo "== PRECHECK =="
+whoami
+node -v || true
+date
+HOSTIP="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{print $7;exit}')"
+echo "Detected IPv4: ${HOSTIP:-unknown}"
 
-pkill -f 'node .*qplus-secure/signer\.js' || true
-systemctl restart qplus-signer
+SIGNER_JS="/root/qplus-secure/signer.js"
+UNIT="/etc/systemd/system/qplus-signer.service"
+BK="/root/beton_fixsigner_$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$BK"
+cp -a "$SIGNER_JS" "$BK/signer.js.bak" 2>/dev/null || true
+cp -a "$UNIT" "$BK/qplus-signer.service.bak" 2>/dev/null || true
+echo "Backup: $BK"
+
+echo "== SHOW CURRENT PIDS (signer.js) =="
+pgrep -af '/root/qplus-secure/signer\.js' || true
+echo "== LISTEN (8484/3000/443) =="
+ss -lntp | egrep ':(8484|3000)\b|:443\b' || true
+
+echo "== STOP OLD MANAGERS (PM2 if any) =="
+command -v pm2 >/dev/null 2>&1 && (pm2 list || true) || true
+command -v pm2 >/dev/null 2>&1 && (pm2 delete all || true) || true
+command -v pm2 >/dev/null 2>&1 && (pm2 save || true) || true
+
+echo "== STOP SYSTEMD UNIT (clean restart) =="
+systemctl stop qplus-signer 2>/dev/null || true
+
+echo "== KILL ALL signer.js PROCESSES (hard clean) =="
+pkill -f '/root/qplus-secure/signer\.js' 2>/dev/null || true
 sleep 1
-pgrep -af '/root/qplus-secure/signer\.js'
-ss -lntp | egrep ':(8484)\b'
+pgrep -af '/root/qplus-secure/signer\.js' || true
+
+echo "== ENSURE signer binds 127.0.0.1 on 8484 (idempotent patch) =="
+perl -0777 -i -pe 's/app\.listen\(\s*8484\s*,\s*([^)]+)\)/app.listen(8484,"127.0.0.1",$1)/g; s/app\.listen\(\s*8484\s*\)/app.listen(8484,"127.0.0.1")/g; s/app\.listen\(\s*8484\s*,\s*"(?:0\.0\.0\.0)"\s*(,?)/app.listen(8484,"127.0.0.1"$1)/g' "$SIGNER_JS" || true
+
+echo "== CREATE/REPLACE SYSTEMD UNIT (single source of truth) =="
+cat > "$UNIT" <<'EOF'
+[Unit]
+Description=QPLUS Signer (loopback only)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/qplus-secure
+ExecStart=/usr/bin/node /root/qplus-secure/signer.js
+Restart=always
+RestartSec=1
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now qplus-signer
+sleep 1
+
+echo "== VERIFY: systemd main PID =="
+systemctl status qplus-signer --no-pager -l | sed -n '1,12p' || true
+MAINPID="$(systemctl show -p MainPID --value qplus-signer 2>/dev/null || true)"
+echo "MainPID=$MAINPID"
+
+echo "== VERIFY: who LISTENS on 8484/3000 =="
+ss -lntp | egrep ':(8484|3000)\b' || true
+
+echo "== CHECK: listener PID must match MainPID =="
+LPID="$(ss -lntp 2>/dev/null | awk '/:8484 /{gsub(/.*pid=/,"",$0);gsub(/,.*/,"",$0);print $0;exit}')"
+echo "ListenPID8484=${LPID:-none}"
+if [ -n "${MAINPID:-}" ] && [ -n "${LPID:-}" ] && [ "$MAINPID" = "$LPID" ]; then
+  echo "OK: 8484 is owned by systemd MainPID"
+else
+  echo "WARNING: 8484 PID != systemd MainPID (investigate)."
+fi
+
+echo "== LOCAL TESTS =="
+curl -m 3 -i http://127.0.0.1:8484/health | head -n 5 || true
+curl -m 3 -i http://127.0.0.1:8484/status | head -n 8 || true
+
+echo "== EXTERNAL-IP TEST FROM VPS (should FAIL if loopback) =="
+if [ -n "${HOSTIP:-}" ]; then
+  curl -m 3 -I "http://${HOSTIP}:8484/" | head -n 1 || echo "OK: closed (bind loopback)"
+  curl -m 3 -I "http://${HOSTIP}:3000/" | head -n 1 || echo "OK: closed (bind loopback)"
+else
+  echo "Skipped: HOSTIP not detected."
+fi
+
+echo "== DONE. Backup at $BK =="
