@@ -1,25 +1,119 @@
-echo "== signer PIDs =="
-pgrep -f 'node .*qplus-secure/signer\.js' | xargs -r ps -o pid,ppid,etimes,cmd -p
+# MEGA BATCH "BÉTON" : signer(8484) + amcq(3000) bind 127.0.0.1, stop doublons, systemd propre
+# À lancer en root (SSH) : bash -lc '...'
 
-echo
-echo "== parents details =="
-for PP in 123874 15732; do
-  echo "--- PPID $PP ---"
-  ps -p "$PP" -o pid,ppid,etimes,cmd --no-headers || echo "PPID $PP n'existe plus"
-done
+set -euo pipefail
 
-echo
-echo "== pstree =="
-for P in $(pgrep -f 'node .*qplus-secure/signer\.js' || true); do
-  echo "### $P"
-  pstree -sap "$P" || true
-done
+echo "== PRECHECK =="
+id -u | grep -qx 0 || { echo "ERREUR: lance en root"; exit 1; }
+command -v node >/dev/null || { echo "ERREUR: node absent"; exit 1; }
+echo "node: $(node -v)"
+echo "hostname: $(hostname)"
+echo "time: $(date -u)"
 
+echo "== PATHS detect =="
+SIG_JS="/root/qplus-secure/signer.js"
+AMC_JS="/root/amcq/server.js"
+[ -f "$SIG_JS" ] || { echo "ERREUR: introuvable $SIG_JS"; exit 1; }
+[ -f "$AMC_JS" ] || { echo "ERREUR: introuvable $AMC_JS"; exit 1; }
+echo "OK: $SIG_JS"
+echo "OK: $AMC_JS"
 
+BK="/root/beton_batch_$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$BK"
+cp -a "$SIG_JS" "$BK/signer.js.bak" || true
+cp -a "$AMC_JS" "$BK/server.js.bak" || true
+echo "Backup: $BK"
 
-pkill -f 'node .*qplus-secure/signer\.js' || true
-sleep 1
-nohup node /root/qplus-secure/signer.js >/var/log/qplus-signer.log 2>&1 &
-sleep 1
+echo "== PATCH: bind 127.0.0.1 for 8484 (signer) =="
+perl -0777 -i -pe '
+s/\b(app\.listen\(\s*8484\s*)(\))/\1,"127.0.0.1"\2/g;
+s/\b(app\.listen\(\s*8484\s*,\s*)(?!["\x27]127\.0\.0\.1["\x27])/\1"127.0.0.1",/g;
+s/\b(listen\(\s*8484\s*)(\))/\1,"127.0.0.1"\2/g;
+s/\b(listen\(\s*8484\s*,\s*)(?!["\x27]127\.0\.0\.1["\x27])/\1"127.0.0.1",/g;
+' "$SIG_JS"
+
+echo "== PATCH: add /health & /status if missing (signer) =="
+grep -qE 'app\.get\(\s*["'\'']\/health["'\'']' "$SIG_JS" || perl -0777 -i -pe '
+s/(const\s+express\s*=\s*require\(\s*["'\'']express["'\'']\s*\)\s*;?)/$1\n/;
+s/(const\s+app\s*=\s*express\(\)\s*;?)/$1\napp.get("\/health",(req,res)=>res.status(200).send("ok"));\napp.get("\/status",(req,res)=>res.status(200).json({ok:true,ts:Date.now()}));/;
+' "$SIG_JS" || true
+
+echo "== PATCH: bind 127.0.0.1 for 3000 (amcq/server.js) =="
+perl -0777 -i -pe '
+s/\b(app\.listen\(\s*3000\s*)(\))/\1,"127.0.0.1"\2/g;
+s/\b(app\.listen\(\s*3000\s*,\s*)(?!["\x27]127\.0\.0\.1["\x27])/\1"127.0.0.1",/g;
+s/\b(listen\(\s*3000\s*)(\))/\1,"127.0.0.1"\2/g;
+s/\b(listen\(\s*3000\s*,\s*)(?!["\x27]127\.0\.0\.1["\x27])/\1"127.0.0.1",/g;
+' "$AMC_JS"
+
+echo "== STOP DOUBLONS signer (pm2/nohup/old) =="
+command -v pm2 >/dev/null && { pm2 delete signer 2>/dev/null || true; pm2 save 2>/dev/null || true; } || true
+pkill -f 'node .*qplus-secure/signer\.js' 2>/dev/null || true
+
+echo "== STOP DOUBLONS amcq (old) =="
+pkill -f 'node .*amcq.*/server\.js' 2>/dev/null || true
+
+echo "== SYSTEMD: create/replace qplus-signer =="
+cat >/etc/systemd/system/qplus-signer.service <<'UNIT'
+[Unit]
+Description=QPLUS Signer (loopback only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/qplus-secure
+ExecStart=/usr/bin/node /root/qplus-secure/signer.js
+Restart=always
+RestartSec=2
+Environment=NODE_ENV=production
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+echo "== SYSTEMD: create/replace amcq =="
+cat >/etc/systemd/system/amcq.service <<'UNIT'
+[Unit]
+Description=AMCQ API (loopback only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/amcq
+ExecStart=/usr/bin/node /root/amcq/server.js
+Restart=always
+RestartSec=2
+Environment=NODE_ENV=production
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now qplus-signer amcq
+
+echo "== VERIFY BIND (want 127.0.0.1:8484 and 127.0.0.1:3000) =="
+ss -lntp | egrep ':(8484|3000|443)\b' || true
+echo "--- signer pgrep ---"
 pgrep -af 'node .*qplus-secure/signer\.js' || true
-ss -lntp | egrep ':(8484)\b' || true
+echo "--- amcq pgrep ---"
+pgrep -af 'node .*amcq.*/server\.js' || true
+
+echo "== LOCAL TESTS =="
+curl -m 3 -sS -i http://127.0.0.1:8484/health | head -n 5 || true
+curl -m 3 -sS -i http://127.0.0.1:8484/status | head -n 5 || true
+curl -m 3 -sS -i http://127.0.0.1:3000/ | head -n 1 || true
+
+echo "== EXTERNAL-IP TEST from VPS (should FAIL) =="
+IP="$(hostname -I | awk '{print $1}')"
+echo "IP=$IP"
+curl -m 3 -sS -I "http://$IP:8484/" | head -n 1 && echo "ATTENTION: 8484 répond encore" || echo "OK: 8484 fermé (bind loopback)"
+curl -m 3 -sS -I "http://$IP:3000/" | head -n 1 && echo "ATTENTION: 3000 répond encore" || echo "OK: 3000 fermé (bind loopback)"
+
+echo "== DONE. Backup at: $BK =="
