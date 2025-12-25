@@ -1,22 +1,117 @@
-bash -lc 'set -euo pipefail;
-V="/etc/nginx/sites-available/fireinners.online-ssl";
-echo "== nginx -t (etat actuel) ==";
-nginx -t || true;
+cat >/root/fix_private_sentinel1.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
 
-echo "== dernier backup dispo ==";
-BK="$(ls -1t ${V}.bak.* 2>/dev/null | head -n1 || true)";
-echo "${BK:-<aucun>}";
+DOMAIN="fireinners.online"
+PATHLOC="/_private_sentinel1/"
+UPSTREAM="http://127.0.0.1:3000"
+SNIP="/etc/nginx/snippets/private_sentinel1.conf"
+HTPASS="/etc/nginx/htpasswd_private_sentinel1"
+VHOST="/etc/nginx/sites-available/${DOMAIN}-ssl"
+ENABLED="/etc/nginx/sites-enabled/${DOMAIN}-ssl"
 
-if ! nginx -t >/dev/null 2>&1; then
-  if [ -n "${BK:-}" ] && [ -f "$BK" ]; then
-    echo "== RESTORE backup -> $V ==";
-    cp -a "$BK" "$V";
-  else
-    echo "Pas de backup trouve. Stop.";
-    exit 1;
+[[ -f "$VHOST" ]] || { echo "Missing vhost: $VHOST"; exit 1; }
+
+echo "VHOST:   $VHOST"
+echo "ENABLED: $ENABLED -> $(readlink -f "$ENABLED" 2>/dev/null || echo "(not linked yet)")"
+
+UNLOCKED=0
+if command -v lsattr >/dev/null 2>&1; then
+  if lsattr -d "$VHOST" 2>/dev/null | grep -q '\-i\-'; then
+    echo "Immutable detected: unlocking"
+    chattr -i "$VHOST" || true
+    UNLOCKED=1
   fi
 fi
 
-echo "== nginx -t apres restore ==";
-nginx -t
-echo "OK"'
+TS="$(date +%Y%m%d-%H%M%S)"
+BK="${VHOST}.bak.${TS}"
+cp -a "$VHOST" "$BK"
+echo "Backup: $BK"
+
+if ! command -v htpasswd >/dev/null 2>&1; then
+  apt-get update -y
+  apt-get install -y apache2-utils
+fi
+
+read -r -p "User [sentinel]: " U
+U="${U:-sentinel}"
+if [[ "$U" =~ [^a-zA-Z0-9_-] ]]; then
+  echo "Bad username (use letters/numbers/_/- only)."
+  exit 1
+fi
+read -r -s -p "New password: " P; echo
+read -r -s -p "Re-type password: " P2; echo
+[[ "$P" == "$P2" ]] || { echo "Passwords do not match."; exit 1; }
+
+mkdir -p /etc/nginx
+printf '%s\n' "$P" | htpasswd -ci "$HTPASS" "$U" >/dev/null
+chmod 640 "$HTPASS"
+chown root:www-data "$HTPASS" 2>/dev/null || true
+
+mkdir -p /etc/nginx/snippets
+cat >"$SNIP" <<EOF
+location ^~ ${PATHLOC} {
+  auth_basic "Sentinel";
+  auth_basic_user_file ${HTPASS};
+  proxy_pass ${UPSTREAM}/;
+  proxy_http_version 1.1;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+  add_header Cache-Control "no-store" always;
+}
+EOF
+chmod 644 "$SNIP"
+
+# Clean any previous broken injections (include/location) that mention private_sentinel1
+perl -0777 -i -pe '
+s/^\s*include\s+[^;]*private_sentinel1[^;]*;\s*\n//mg;
+s/^\s*location\s+\^\~\s+\/_private_sentinel1\/\s*\{.*?\n\}\s*\n//msg;
+' "$VHOST"
+
+# Ensure sites-enabled symlink
+if [[ ! -e "$ENABLED" ]]; then
+  ln -s "$VHOST" "$ENABLED"
+fi
+
+# Insert include after first "listen 443" line inside the SSL server block
+if ! grep -qF "$SNIP" "$VHOST"; then
+  awk -v ins="  include ${SNIP};" '
+    BEGIN{done=0}
+    {print}
+    (!done && $0 ~ /listen[[:space:]]+443/){print ins; done=1}
+  ' "$VHOST" >"${VHOST}.tmp"
+  mv "${VHOST}.tmp" "$VHOST"
+fi
+
+echo "Show suspect lines (listen/include/private):"
+grep -nE 'listen[[:space:]]+443|include|private_sentinel1' "$VHOST" || true
+
+echo "nginx -t ..."
+if nginx -t; then
+  systemctl reload nginx
+  echo "OK: nginx reloaded"
+else
+  echo "FAIL: nginx test failed -> restoring backup"
+  cp -a "$BK" "$VHOST"
+  nginx -t || true
+  exit 1
+fi
+
+echo "Origin test (should be 401):"
+curl -kis --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}${PATHLOC}" | sed -n '1,12p'
+
+echo "Public test (should be 401, unless Cloudflare cache/rule serves 200):"
+curl -s -o /dev/null -w "HTTP:%{http_code}\n" "https://${DOMAIN}${PATHLOC}"
+
+if [[ "$UNLOCKED" == "1" ]]; then
+  chattr +i "$VHOST" || true
+  echo "Immutable restored"
+fi
+
+echo "DONE"
+BASH
+
+bash /root/fix_private_sentinel1.sh
