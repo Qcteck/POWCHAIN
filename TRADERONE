@@ -1,3 +1,34 @@
-ss -lntp | egrep ':(3000|8484)\b|:443\b' || true
-ps -p 72937 -o pid,ppid,cmd --no-headers || true
-sudo grep -nE '8484|listen\(|0\.0\.0\.0|HOST|bind' /root/qplus-secure/signer.js || true
+set -euo pipefail
+PID="$(ss -lntp | sed -n 's/.*:8484 .*pid=\([0-9]\+\).*/\1/p' | head -n1 || true)"
+echo "PID8484=$PID"
+[ -n "${PID}" ] || { echo "ERREUR: rien n'ecoute sur 8484"; exit 1; }
+
+JS="$(tr '\0' ' ' </proc/"$PID"/cmdline | tr ' ' '\n' | grep -E '\.js$' | tail -n1 || true)"
+[ -n "${JS}" ] || JS="/root/qplus-secure/signer.js"
+echo "JS=$JS"
+[ -f "$JS" ] || { echo "ERREUR: fichier introuvable: $JS"; exit 1; }
+
+cp -a "$JS" "$JS.bak.$(date +%Y%m%d-%H%M%S)"
+
+perl -0777 -i -pe 's/app\.listen\(\s*8484[\s\S]*?\);\s*/app.listen(8484,"127.0.0.1",()=>console.log("signer on http:\/\/127.0.0.1:8484"));\n/s' "$JS"
+
+echo "Check listen line:"
+grep -nE 'listen\(8484' "$JS" || true
+
+UNIT="$(systemctl status --pid="$PID" --no-pager 2>/dev/null | sed -n 's|.*CGroup: /system.slice/\(.*\.service\).*|\1|p' | head -n1 || true)"
+if [ -n "$UNIT" ]; then
+  echo "Restart unit: $UNIT"
+  systemctl restart "$UNIT"
+else
+  echo "No systemd unit found for PID, restarting process directly"
+  kill "$PID" || true
+  nohup node "$JS" >/var/log/qplus-signer.log 2>&1 &
+  sleep 1
+fi
+
+echo "After restart:"
+ss -lntp | egrep ':(8484)\b|:443\b' || true
+echo "Local test (should be 200):"
+curl -m 3 -I http://127.0.0.1:8484 | head -n 1 || true
+echo "External-IP test from VPS (should FAIL now):"
+curl -m 3 -I http://72.61.79.12:8484 | head -n 1 || echo "OK: ferme (bind loopback)"
