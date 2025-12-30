@@ -1,1 +1,60 @@
-bash -lc 'echo "=== META ===";date;hostname;echo;echo "=== WG ===";ip -br a show wg0 || true;wg show || true;echo;echo "=== UFW ===";ufw status verbose || true;echo;echo "=== NGINX ===";nginx -v;nginx -t 2>&1 | tail -n +1;echo;echo "=== LISTEN ===";ss -lntp | egrep ":(443|8443)\b" || true'
+sudo bash -lc '
+set -euo pipefail
+APP=/opt/neuroneone-private
+WWW=$APP/www
+CRT=$APP/tls
+SITE=/etc/nginx/sites-available/neuroneone-wg
+LN=/etc/nginx/sites-enabled/neuroneone-wg
+WG_IP=10.66.66.1
+PORT=8443
+
+mkdir -p "$WWW" "$CRT"
+# 1) Mets ton fichier NEURONEONE ici:
+#    - soit tu fais un scp: scp neuroneone.html root@VPS:$WWW/index.html
+#    - soit tu colles via nano: nano $WWW/index.html
+if [ ! -f "$WWW/index.html" ]; then
+  cat >"$WWW/index.html" <<EOF
+<!doctype html><meta charset="utf-8"><title>NEURONEONE</title><body style="font-family:system-ui;background:#0b1020;color:#e7f0ff;padding:16px">Upload ton fichier NEURONEONE ici: <code>$WWW/index.html</code></body>
+EOF
+fi
+
+# 2) TLS self-signed (privé wg)
+if [ ! -f "$CRT/neuroneone.key" ]; then
+  openssl req -x509 -newkey rsa:2048 -sha256 -days 3650 -nodes \
+    -keyout "$CRT/neuroneone.key" -out "$CRT/neuroneone.crt" \
+    -subj "/CN=neuroneone-wg"
+fi
+
+# 3) Nginx vhost bind wg0 uniquement
+cat >"$SITE" <<EOF
+server {
+  listen $WG_IP:$PORT ssl;
+  server_name _;
+  ssl_certificate     $CRT/neuroneone.crt;
+  ssl_certificate_key $CRT/neuroneone.key;
+
+  add_header X-Frame-Options "SAMEORIGIN" always;
+  add_header X-Content-Type-Options "nosniff" always;
+  add_header Referrer-Policy "no-referrer" always;
+  add_header Cache-Control "no-store" always;
+
+  root $WWW;
+  index index.html;
+
+  location / {
+    try_files \$uri \$uri/ /index.html;
+  }
+}
+EOF
+
+ln -sf "$SITE" "$LN"
+nginx -t
+systemctl reload nginx
+
+# 4) UFW: autoriser 8443 UNIQUEMENT sur wg0 (pas au monde)
+ufw allow in on wg0 to any port $PORT proto tcp || true
+
+echo
+echo "OK: NEURONEONE privé -> https://$WG_IP:$PORT"
+echo "Fichier: $WWW/index.html"
+'
