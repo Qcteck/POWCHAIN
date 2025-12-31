@@ -1,32 +1,58 @@
 sudo bash -lc '
 set -euo pipefail
-echo "[1] show duplicates (if any)"
-grep -RnsE "server_name .*fireinners\.online" /etc/nginx/sites-enabled /etc/nginx/sites-available || true
+AV=/etc/nginx/sites-available/fireinners.online-ssl
+EN=/etc/nginx/sites-enabled/fireinners.online-ssl
+SN=/etc/nginx/snippets/probe_location.conf
+BK=/root/backup_probe
+mkdir -p "$BK"
 
-echo "[2] list enabled fireinners files"
-ls -la /etc/nginx/sites-enabled | grep -i fireinners || true
+echo "[0] sanity"
+[ -f "$AV" ] || { echo "ERR missing $AV"; exit 1; }
+[ -e "$EN" ] || { echo "ERR missing $EN"; exit 1; }
 
-echo "[3] move BAD enabled backups out (keep only the real vhost link)"
-mkdir -p /root/backup_probe/legacy
-for f in /etc/nginx/sites-enabled/*fireinners*bak* /etc/nginx/sites-enabled/*fireinners*backup* /etc/nginx/sites-enabled/*fireinners*\.bak* /etc/nginx/sites-enabled/*fireinners*probe*; do
-  [ -e "$f" ] && mv "$f" /root/backup_probe/legacy/
-done
+echo "[1] backup current enabled"
+cp -a "$EN" "$BK/fireinners.online-ssl.EN.$(date +%Y%m%d_%H%M%S).bak"
 
-echo "[4] ensure correct symlink exists"
-VHOST_AV="/etc/nginx/sites-available/fireinners.online-ssl"
-VHOST_EN="/etc/nginx/sites-enabled/fireinners.online-ssl"
-[ -f "$VHOST_AV" ] || { echo "ERR missing $VHOST_AV"; exit 1; }
-[ -L "$VHOST_EN" ] || ln -s "$VHOST_AV" "$VHOST_EN"
+echo "[2] force EN -> symlink to AV"
+rm -f "$EN"
+ln -s "$AV" "$EN"
+
+echo "[3] ensure snippet exists (create if missing)"
+if [ ! -f "$SN" ]; then
+cat >"$SN" <<EOF
+location ^~ /probe {
+add_header Cache-Control "no-store, no-cache, max-age=0" always;
+add_header Pragma "no-cache" always;
+add_header Expires "0" always;
+proxy_pass http://127.0.0.1:9696/probe;
+proxy_set_header Host \$host;
+proxy_set_header X-Real-IP \$remote_addr;
+proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+proxy_set_header X-Forwarded-Proto \$scheme;
+}
+EOF
+fi
+
+echo "[4] inject include into AV only if missing"
+if ! grep -q "probe_location\.conf" "$AV"; then
+cp -a "$AV" "$BK/fireinners.online-ssl.AV.$(date +%Y%m%d_%H%M%S).bak"
+awk '"'"'
+BEGIN{done=0}
+{print}
+!done && $0 ~ /server_name[[:space:]].*fireinners\.online/ { print "include /etc/nginx/snippets/probe_location.conf;"; done=1 }
+END{ if(!done){ exit 2 } }
+'"'"' "$AV" > "$AV.tmp" && mv "$AV.tmp" "$AV"
+fi
 
 echo "[5] nginx test + reload"
 nginx -t
 systemctl reload nginx
 echo "OK reloaded"
 
-echo "[6] test backend direct"
+echo "[6] tests"
 TOKEN="$(awk -F= "/^PROBE_TOKEN=/{print \$2}" /opt/probe/probe.env)"
-curl -s -H "X-Probe-Token: $TOKEN" http://127.0.0.1:9696/probe | head -c 240; echo
-
-echo "[7] test nginx routing (bypass CF)"
-curl -sk --resolve fireinners.online:443:127.0.0.1 -H "X-Probe-Token: $TOKEN" https://fireinners.online/probe | head -c 240; echo
+echo "--- backend direct ---"
+curl -s -H "X-Probe-Token: $TOKEN" http://127.0.0.1:9696/probe | head -c 200; echo
+echo "--- nginx routing (bypass CF) ---"
+curl -sk --resolve fireinners.online:443:127.0.0.1 -H "X-Probe-Token: $TOKEN" https://fireinners.online/probe | head -c 200; echo
 '
