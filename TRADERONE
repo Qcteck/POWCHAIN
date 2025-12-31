@@ -1,58 +1,61 @@
 sudo bash -lc '
 set -euo pipefail
-AV=/etc/nginx/sites-available/fireinners.online-ssl
-EN=/etc/nginx/sites-enabled/fireinners.online-ssl
-SN=/etc/nginx/snippets/probe_location.conf
-BK=/root/backup_probe
-mkdir -p "$BK"
+BK=/root/backup_probe;mkdir -p "$BK"
+TS=$(date +%Y%m%d_%H%M%S)
+CONF=/etc/nginx/nginx.conf
 
-echo "[0] sanity"
-[ -f "$AV" ] || { echo "ERR missing $AV"; exit 1; }
-[ -e "$EN" ] || { echo "ERR missing $EN"; exit 1; }
+echo "[0] nginx running?"
+systemctl is-active --quiet nginx && echo "nginx: active" || echo "nginx: NOT active"
 
-echo "[1] backup current enabled"
-cp -a "$EN" "$BK/fireinners.online-ssl.EN.$(date +%Y%m%d_%H%M%S).bak"
+echo "[1] nginx -t (capture)"
+OUT="$(nginx -t 2>&1 || true)"
+echo "$OUT"
 
-echo "[2] force EN -> symlink to AV"
-rm -f "$EN"
-ln -s "$AV" "$EN"
-
-echo "[3] ensure snippet exists (create if missing)"
-if [ ! -f "$SN" ]; then
-cat >"$SN" <<EOF
-location ^~ /probe {
-add_header Cache-Control "no-store, no-cache, max-age=0" always;
-add_header Pragma "no-cache" always;
-add_header Expires "0" always;
-proxy_pass http://127.0.0.1:9696/probe;
-proxy_set_header Host \$host;
-proxy_set_header X-Real-IP \$remote_addr;
-proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-proxy_set_header X-Forwarded-Proto \$scheme;
-}
-EOF
+if echo "$OUT" | grep -q "test is successful"; then
+  echo "OK: no syntax error"; exit 0
 fi
 
-echo "[4] inject include into AV only if missing"
-if ! grep -q "probe_location\.conf" "$AV"; then
-cp -a "$AV" "$BK/fireinners.online-ssl.AV.$(date +%Y%m%d_%H%M%S).bak"
-awk '"'"'
-BEGIN{done=0}
-{print}
-!done && $0 ~ /server_name[[:space:]].*fireinners\.online/ { print "include /etc/nginx/snippets/probe_location.conf;"; done=1 }
-END{ if(!done){ exit 2 } }
-'"'"' "$AV" > "$AV.tmp" && mv "$AV.tmp" "$AV"
+echo "[2] show file:line if present"
+FILE="$(echo "$OUT" | sed -n "s/.* in \\(\\/[^:]*\\):\\([0-9][0-9]*\\).*/\\1/p" | head -n1 || true)"
+LINE="$(echo "$OUT" | sed -n "s/.* in \\(\\/[^:]*\\):\\([0-9][0-9]*\\).*/\\2/p" | head -n1 || true)"
+if [ -n "${FILE:-}" ] && [ -n "${LINE:-}" ] && [ -f "$FILE" ]; then
+  echo "--- context $FILE:$LINE ---"
+  nl -ba "$FILE" | sed -n "$((LINE-30)),$((LINE+10))p" || true
 fi
 
-echo "[5] nginx test + reload"
-nginx -t
-systemctl reload nginx
-echo "OK reloaded"
+echo "[3] if EOF expecting } and nginx.conf is the failing file, try auto-close"
+if echo "$OUT" | grep -q "unexpected end of file" && echo "$OUT" | grep -q "expecting.*}\""; then
+  echo "[3a] backup nginx.conf"
+  cp -a "$CONF" "$BK/nginx.conf.$TS.bak"
 
-echo "[6] tests"
-TOKEN="$(awk -F= "/^PROBE_TOKEN=/{print \$2}" /opt/probe/probe.env)"
-echo "--- backend direct ---"
-curl -s -H "X-Probe-Token: $TOKEN" http://127.0.0.1:9696/probe | head -c 200; echo
-echo "--- nginx routing (bypass CF) ---"
-curl -sk --resolve fireinners.online:443:127.0.0.1 -H "X-Probe-Token: $TOKEN" https://fireinners.online/probe | head -c 200; echo
+  opens=$(grep -o "{" "$CONF" | wc -l || true)
+  closes=$(grep -o "}" "$CONF" | wc -l || true)
+  diff=$((opens-closes))
+  echo "brace diff (opens-closes)=$diff"
+
+  if [ "$diff" -gt 0 ] && [ "$diff" -lt 6 ]; then
+    echo "# AUTO-CLOSE $TS" >> "$CONF"
+    i=0; while [ $i -lt $diff ]; do echo "}" >> "$CONF"; i=$((i+1)); done
+  else
+    echo "Not auto-fixing (diff=$diff). Showing tail:"
+    tail -n 80 "$CONF" || true
+    exit 1
+  fi
+
+  echo "[3b] retest"
+  if nginx -t; then
+    systemctl reload nginx
+    echo "OK: fixed + reloaded"
+    exit 0
+  else
+    echo "FAIL: rollback nginx.conf"
+    cp -a "$BK/nginx.conf.$TS.bak" "$CONF"
+    nginx -t || true
+    exit 1
+  fi
+fi
+
+echo "Not auto-fixing (need exact file/line). Run this and paste output:"
+echo "nginx -t 2>&1 | tail -n 30"
+exit 1
 '
