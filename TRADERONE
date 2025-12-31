@@ -1,1 +1,103 @@
-sudo bash /root/mega_probe.sh
+
+
+
+sudo bash -lc 'set -euo pipefail
+VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
+SNIP="/etc/nginx/snippets/probe_location.conf"
+PORT="9696"
+HOST="127.0.0.1"
+
+echo "== PROBE BATCH =="
+
+echo "[A] preflight"
+[ -f "$VHOST" ] || { echo "ERR vhost not found: $VHOST"; exit 1; }
+command -v nginx >/dev/null || { echo "ERR nginx missing"; exit 1; }
+command -v node >/dev/null || { echo "ERR node missing"; exit 1; }
+mkdir -p /etc/nginx/snippets /opt/probe
+
+echo "[B] ensure probe files"
+if [ ! -f /opt/probe/server.js ]; then
+cat > /opt/probe/server.js <<'"'"'JS'"'"'
+const http=require("http"),url=require("url"),os=require("os"),crypto=require("crypto");
+const PORT=parseInt(process.env.PORT||"9696",10),HOST=process.env.HOST||"127.0.0.1";
+const TOKEN=(process.env.PROBE_TOKEN||"").trim();
+let cache={t:0,data:null};const CACHE_MS=parseInt(process.env.PROBE_CACHE_MS||"8000",10);
+const j=(res,code,obj)=>{const s=JSON.stringify(obj);res.writeHead(code,{"content-type":"application/json; charset=utf-8","cache-control":"no-store"});res.end(s);};
+const bad=(res,code,msg)=>j(res,code,{ok:false,error:String(msg||"error")});
+const ok=(res,obj)=>j(res,200,Object.assign({ok:true},obj));
+const tokenOk=req=>{if(!TOKEN)return true;const got=(req.headers["x-probe-token"]||"").toString().trim()||(url.parse(req.url,true).query.token||"").toString().trim();const a=Buffer.from(got),b=Buffer.from(TOKEN);if(a.length!==b.length)return false;return crypto.timingSafeEqual(a,b);};
+function compute(){return{meta:{ts:Date.now(),iso:new Date().toISOString(),hostname:os.hostname(),node:process.version},system:{uptime:os.uptime(),load:os.loadavg()},mem:{total:os.totalmem(),free:os.freemem()}};}
+http.createServer((req,res)=>{
+  const u=url.parse(req.url,true);
+  if(u.pathname==="/health")return ok(res,{health:"ok"});
+  if(u.pathname!=="/probe")return bad(res,404,"not_found");
+  if(!tokenOk(req))return bad(res,403,"bad_token");
+  const t=Date.now(); if(cache.data && (t-cache.t)<CACHE_MS) return ok(res,{cached:true,probe:cache.data});
+  const data=compute(); cache={t,data}; return ok(res,{cached:false,probe:data});
+}).listen(PORT,HOST,()=>console.log(`[probe] http://${HOST}:${PORT}/probe`));
+JS
+chmod 644 /opt/probe/server.js
+fi
+
+if [ ! -f /opt/probe/probe.env ]; then
+TOKEN="$(openssl rand -hex 24)"
+cat > /opt/probe/probe.env <<EOF
+HOST=$HOST
+PORT=$PORT
+PROBE_TOKEN=$TOKEN
+PROBE_CACHE_MS=8000
+EOF
+chmod 600 /opt/probe/probe.env
+else
+TOKEN="$(awk -F= "/^PROBE_TOKEN=/{print \$2}" /opt/probe/probe.env)"
+fi
+
+echo "[C] systemd service"
+cat > /etc/systemd/system/probe.service <<EOF
+[Unit]
+Description=Read-only Probe (/probe)
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=simple
+EnvironmentFile=/opt/probe/probe.env
+ExecStart=/usr/bin/node /opt/probe/server.js
+Restart=always
+RestartSec=2
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable --now probe.service
+
+echo "[D] nginx snippet"
+cat > "$SNIP" <<EOF
+location /probe {
+  proxy_pass http://$HOST:$PORT/probe;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+}
+EOF
+
+echo "[E] inject include (awk, no sed)"
+cp -a "$VHOST" "$VHOST.bak_probe_batch_$(date +%Y%m%d_%H%M%S)"
+if ! grep -q "probe_location.conf" "$VHOST"; then
+  awk "BEGIN{d=0}{print; if(d==0 && \$0 ~ /^[[:space:]]*server[[:space:]]*\\{/){print \"  include /etc/nginx/snippets/probe_location.conf;\"; d=1}} END{if(d==0) exit 2}" "$VHOST" > "$VHOST.tmp" || { echo "ERR could not find server { in $VHOST"; rm -f "$VHOST.tmp"; exit 2; }
+  mv "$VHOST.tmp" "$VHOST"
+fi
+
+echo "[F] nginx test + reload"
+nginx -t
+systemctl reload nginx
+
+echo "[G] tests"
+echo "TOKEN=$TOKEN"
+echo -n "local: "
+curl -sS "http://$HOST:$PORT/probe?token=$TOKEN" | head -c 180; echo
+echo -n "https: "
+curl -sS -H "X-Probe-Token: $TOKEN" https://fireinners.online/probe | head -c 180; echo
+
+echo "== DONE =="
+'
