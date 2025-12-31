@@ -1,59 +1,80 @@
-cat >/root/neuroneone_private.sh <<'SH'
+cat >/root/MEGA_neuroneone_nginx_wg.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 
+LIB="/opt/fireinners/sentinel/lib/askorupdate.sh"
+WG_IP="10.66.66.1"
+WG_NET="10.66.66.0/24"
+PORT="8088"
 APP_DIR="/opt/neuroneone"
-PORT="9696"
-BIND_IP="10.66.66.1"
-SVC="neuroneone-http"
+AV="/etc/nginx/sites-available/neuroneone-wg"
+EN="/etc/nginx/sites-enabled/neuroneone-wg"
 
-echo "[1/6] Checks"
-command -v python3 >/dev/null
-ip a | grep -q " ${BIND_IP}/" || { echo "ERR: ${BIND_IP} pas présent (wg0?)"; exit 1; }
+echo "=== PREVIEW (ce script va faire) ==="
+echo "1) Vérifier WireGuard IP ${WG_IP} présente"
+echo "2) Créer ${APP_DIR} si absent (ne touche pas ton index si déjà là)"
+echo "3) Créer/mettre à jour vhost nginx: ${AV} (listen ${WG_IP}:${PORT})"
+echo "4) Activer le lien ${EN}"
+echo "5) Ouvrir UFW seulement sur wg0 pour ${PORT} (et deny public)"
+echo "6) nginx -t puis reload"
+echo "==================================="
 
-echo "[2/6] Dossier"
+if [ -f "$LIB" ]; then . "$LIB"; else
+  echo "ERR: askorupdate absent: $LIB"
+  exit 1
+fi
+
+askorupdate_yesno "Continuer?" 0 || { echo "STOP"; exit 0; }
+
+command -v nginx >/dev/null || { echo "ERR: nginx absent"; exit 1; }
+ip a | grep -q " ${WG_IP}/" || { echo "ERR: ${WG_IP} pas présent (wg0 down?)"; exit 1; }
+
 mkdir -p "$APP_DIR"
 if [ ! -f "$APP_DIR/index.html" ]; then
   cat >"$APP_DIR/index.html" <<'HTML'
-<!doctype html><meta charset="utf-8"><title>NeuroneOne</title><body style="font-family:system-ui;padding:20px">index.html manquant: colle ton NeuroneOne ici (/opt/neuroneone/index.html).</body>
+<!doctype html><meta charset="utf-8"><title>NeuroneOne</title><body style="font-family:system-ui;padding:20px">Colle ton NeuroneOne ici: /opt/neuroneone/index.html</body>
 HTML
 fi
 
-echo "[3/6] Systemd service"
-cat >/etc/systemd/system/${SVC}.service <<EOF
-[Unit]
-Description=NeuroneOne private HTTP (WireGuard only)
-After=network-online.target
-Wants=network-online.target
+VHOST_CONTENT=$(cat <<EOF
+server{
+  listen ${WG_IP}:${PORT};
+  server_name _;
+  root ${APP_DIR};
+  index index.html;
 
-[Service]
-Type=simple
-WorkingDirectory=${APP_DIR}
-ExecStart=/usr/bin/python3 -m http.server ${PORT} --bind ${BIND_IP} --directory ${APP_DIR}
-Restart=always
-RestartSec=2
-User=root
+  access_log /var/log/nginx/neuroneone_wg_access.log;
+  error_log  /var/log/nginx/neuroneone_wg_error.log;
 
-[Install]
-WantedBy=multi-user.target
+  # WireGuard only
+  allow ${WG_NET};
+  deny all;
+
+  location / {
+    try_files \$uri \$uri/ =404;
+  }
+}
 EOF
+)
 
-echo "[4/6] Firewall (UFW) - autoriser seulement sur wg0"
+ASKORUPDATE_ASK="${ASKORUPDATE_ASK:-0}"
+ASKORUPDATE_BACKUP="${ASKORUPDATE_BACKUP:-1}"
+ASKORUPDATE_VERBOSE="${ASKORUPDATE_VERBOSE:-1}"
+
+askorupdate_file "$AV" "0644" "root:root" "0" "neuroneone-wg" <<<"$VHOST_CONTENT"
+
+ln -sfn "$AV" "$EN"
+
 if command -v ufw >/dev/null 2>&1; then
   ufw allow in on wg0 to any port ${PORT} proto tcp >/dev/null || true
   ufw deny ${PORT}/tcp >/dev/null || true
 fi
 
-echo "[5/6] Start"
-systemctl daemon-reload
-systemctl enable --now "${SVC}"
-sleep 0.3
+nginx -t
+systemctl reload nginx
 
-echo "[6/6] Verify"
-ss -lntp | grep -E ":${PORT}\b" || true
-curl -sS -I "http://${BIND_IP}:${PORT}/" | head -n 3 || true
-
-echo "OK: NeuroneOne privé -> http://${BIND_IP}:${PORT}/ (via WireGuard)"
+echo "OK: NeuroneOne privé nginx -> http://${WG_IP}:${PORT}/"
+curl -sS -I "http://${WG_IP}:${PORT}/" | head -n 5 || true
 SH
-chmod +x /root/neuroneone_private.sh
-bash /root/neuroneone_private.sh
+chmod +x /root/MEGA_neuroneone_nginx_wg.sh
+bash /root/MEGA_neuroneone_nginx_wg.sh
