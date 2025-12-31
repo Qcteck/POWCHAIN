@@ -1,89 +1,12 @@
-sudo bash -lc 'set -euo pipefail
-systemctl stop probe.service 2>/dev/null || true
-mkdir -p /opt/probe
-cat > /opt/probe/server.js <<'"'"'JS'"'"'
-const http=require("http"),url=require("url"),os=require("os"),crypto=require("crypto"),{execFile}=require("child_process");
-const PORT=parseInt(process.env.PORT||"9696",10),HOST=process.env.HOST||"127.0.0.1";
-const TOKEN=(process.env.PROBE_TOKEN||"").trim();
-const DOMAINS=(process.env.PROBE_DOMAINS||"fireinners.online,bbqfinance.fun").split(",").map(s=>s.trim()).filter(Boolean);
-const CACHE_MS=parseInt(process.env.PROBE_CACHE_MS||"8000",10),TIMEOUT_MS=parseInt(process.env.PROBE_TIMEOUT_MS||"3500",10),RATE_PER_MIN=parseInt(process.env.PROBE_RATE_PER_MIN||"90",10);
-let cache={t:0,data:null};const rate=new Map();const now=()=>Date.now();
-const j=(res,code,obj)=>{const s=JSON.stringify(obj);res.writeHead(code,{"content-type":"application/json; charset=utf-8","cache-control":"no-store"});res.end(s);};
-const bad=(res,code,msg)=>j(res,code,{ok:false,error:String(msg||"error")});
-const ok=(res,obj)=>j(res,200,Object.assign({ok:true},obj));
-const sh=(cmd,args=[])=>new Promise(r=>{execFile(cmd,args,{timeout:TIMEOUT_MS,maxBuffer:1024*1024},(e,so,se)=>r({ok:!e,stdout:String(so||"").trim(),stderr:String(se||"").trim(),err:e?String(e.message||e):""}));});
-const ipFromReq=req=>{const xf=(req.headers["x-forwarded-for"]||"").split(",")[0].trim();return xf||req.socket.remoteAddress||"";};
-const rateLimit=ip=>{const t=Math.floor(now()/60000),k=ip+"|"+t,n=(rate.get(k)||0)+1;rate.set(k,n);if(n>RATE_PER_MIN)return false;if(rate.size>2000){for(const [kk] of rate){if(!kk.endsWith("|"+t))rate.delete(kk);}}return true;};
-const tokenOk=req=>{if(!TOKEN)return true;const got=(req.headers["x-probe-token"]||"").toString().trim()||(url.parse(req.url,true).query.token||"").toString().trim();const a=Buffer.from(got),b=Buffer.from(TOKEN);if(a.length!==b.length)return false;return crypto.timingSafeEqual(a,b);};
-async function getCertEndDate(domain){const host=domain+":443";const script=`set -e;echo | openssl s_client -servername ${domain} -connect ${host} 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null || true`;const r=await sh("bash",["-lc",script]);const m=(r.stdout||"").match(/notAfter=(.*)$/);return m?m[1].trim():"unknown";}
-async function computeProbe(){
-  const t0=now();
-  const meta={ts:Date.now(),iso:new Date().toISOString(),hostname:os.hostname(),node:process.version,platform:process.platform,arch:process.arch};
-  const osrel=await sh("bash",["-lc","(lsb_release -ds 2>/dev/null || cat /etc/os-release 2>/dev/null | grep PRETTY_NAME | cut -d= -f2 | tr -d '\"') | head -n 1"]);
-  const kernel=await sh("uname",["-r"]);
-  const uptime=await sh("uptime",["-p"]);
-  const load=os.loadavg().map(x=>Math.round(x*100)/100);
-  const mem={total:os.totalmem(),free:os.freemem()};
-  const disk=await sh("bash",["-lc","df -P / | tail -n 1 | awk '{print $2\" \"$3\" \"$4\" \"$5\" \"$6}'"]);
-  const who=await sh("id",[]);
-  const ssTcp=await sh("bash",["-lc","ss -ltnpH 2>/dev/null | head -n 200"]);
-  const ssUdp=await sh("bash",["-lc","ss -lunpH 2>/dev/null | head -n 200"]);
-  const ufw=await sh("bash",["-lc","ufw status verbose 2>/dev/null | sed -n '1,140p'"]);
-  const nft=await sh("bash",["-lc","nft list ruleset 2>/dev/null | head -n 140"]);
-  const fail2ban=await sh("bash",["-lc","fail2ban-client status 2>/dev/null | head -n 100"]);
-  const sshdT=await sh("bash",["-lc","sshd -T 2>/dev/null | egrep '^(permitrootlogin|passwordauthentication|pubkeyauthentication|permitemptypasswords|challengeresponseauthentication|kbdinteractiveauthentication) ' || true"]);
-  const nginxV=await sh("bash",["-lc","nginx -v 2>&1 || true"]);
-  const nginxT=await sh("bash",["-lc","nginx -t 2>&1 || true"]);
-  const nodeV=await sh("bash",["-lc","node -v 2>/dev/null || true"]);
-  const npmV=await sh("bash",["-lc","npm -v 2>/dev/null || true"]);
-  const pm2=await sh("bash",["-lc","pm2 -v 2>/dev/null || true"]);
-  const services=["nginx","ssh","ufw","fail2ban","tor@default","amcq.service","fireinners-qplus-wasm.service","security-sentinel.service"];
-  const svcStates={};for(const s of services){const r=await sh("bash",["-lc",`systemctl is-active ${s} 2>/dev/null || true`]);svcStates[s]=r.stdout||"unknown";}
-  const certs={};for(const d of DOMAINS){certs[d]=await getCertEndDate(d);}
-  const summary={riskHints:[(ufw.ok?null:"UFW inaccessible"),(sshdT.ok?null:"sshd -T inaccessible"),(nginxT.stdout&&/test is successful/i.test(nginxT.stdout)?null:"nginx -t non OK/inconnu")].filter(Boolean)};
-  return {meta,system:{os:osrel.stdout||"unknown",kernel:kernel.stdout||"unknown",uptime:uptime.stdout||"unknown",loadavg:load,mem,disk_root:disk.stdout||"unknown",user:who.stdout||"unknown"},network:{listening_tcp:ssTcp.stdout||"",listening_udp:ssUdp.stdout||""},firewall:{ufw:ufw.stdout||"",nft_ruleset:nft.stdout||""},hardening:{sshd_effective:sshdT.stdout||"",fail2ban:fail2ban.stdout||""},stack:{nginx_version:nginxV.stdout||"",nginx_test:nginxT.stdout||"",node:nodeV.stdout||"",npm:npmV.stdout||"",pm2:pm2.stdout||"",services:svcStates},tls:{cert_notAfter:certs},summary,perf:{ms:now()-t0}};
-}
-http.createServer(async(req,res)=>{
-  const u=url.parse(req.url,true),ip=ipFromReq(req);
-  if(!rateLimit(ip))return bad(res,429,"rate_limit");
-  if(u.pathname==="/health")return ok(res,{health:"ok"});
-  if(u.pathname!=="/probe")return bad(res,404,"not_found");
-  if(!tokenOk(req))return bad(res,403,"bad_token");
-  try{
-    const t=now();
-    if(cache.data && (t-cache.t)<CACHE_MS)return ok(res,{cached:true,probe:cache.data});
-    const data=await computeProbe();cache={t,data};
-    return ok(res,{cached:false,probe:data});
-  }catch(e){return bad(res,500,e&&e.message||String(e));}
-}).listen(PORT,HOST,()=>console.log(`[probe] http://${HOST}:${PORT}/probe token=${TOKEN?"ON":"OFF"}`));
-JS
-chmod 644 /opt/probe/server.js
-TOKEN="$(openssl rand -hex 24)"
-cat > /opt/probe/probe.env <<EOF
-HOST=127.0.0.1
-PORT=9696
-PROBE_TOKEN=$TOKEN
-PROBE_DOMAINS=fireinners.online,bbqfinance.fun
-PROBE_CACHE_MS=8000
-PROBE_TIMEOUT_MS=3500
-PROBE_RATE_PER_MIN=90
-EOF
-chmod 600 /opt/probe/probe.env
-cat > /etc/systemd/system/probe.service <<EOF
-[Unit]
-Description=Read-only Probe (/probe)
-After=network-online.target
-Wants=network-online.target
-[Service]
-Type=simple
-EnvironmentFile=/opt/probe/probe.env
-ExecStart=/usr/bin/node /opt/probe/server.js
-Restart=always
-RestartSec=2
-[Install]
-WantedBy=multi-user.target
-EOF
-systemctl daemon-reload
-systemctl enable --now probe.service
-echo "TOKEN=$TOKEN"
-'
+sudo bash /root/mega_probe.sh
+
+
+TOKEN=$(sudo awk -F= '/^PROBE_TOKEN=/{print $2}' /opt/probe/probe.env)
+curl -sS -H "X-Probe-Token: $TOKEN" https://fireinners.online/probe | head -c 220; echo
+
+
+
+
+
+
+sudo nginx -t && sudo systemctl status probe.service --no-pager | sed -n '1,18p'
