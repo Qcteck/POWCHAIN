@@ -1,186 +1,32 @@
-cat >/root/MEGA_PROBE_SAFE.sh <<'SH'
-#!/usr/bin/env bash
+sudo bash -lc '
 set -euo pipefail
+echo "[1] show duplicates (if any)"
+grep -RnsE "server_name .*fireinners\.online" /etc/nginx/sites-enabled /etc/nginx/sites-available || true
 
-DOMAIN="fireinners.online"
-WWW="www.fireinners.online"
-PROBE_PORT_DEFAULT="9696"
+echo "[2] list enabled fireinners files"
+ls -la /etc/nginx/sites-enabled | grep -i fireinners || true
 
-echo "[0] pick vhost file"
-VHOST_AV="/etc/nginx/sites-available/${DOMAIN}-ssl"
-VHOST_EN="/etc/nginx/sites-enabled/${DOMAIN}-ssl"
-if [ -f "$VHOST_AV" ]; then VHOST="$VHOST_AV"
-elif [ -f "$VHOST_EN" ]; then VHOST="$VHOST_EN"
-else
-  echo "ERR: vhost not found: $VHOST_AV or $VHOST_EN"
-  exit 1
-fi
-echo "VHOST=$VHOST"
+echo "[3] move BAD enabled backups out (keep only the real vhost link)"
+mkdir -p /root/backup_probe/legacy
+for f in /etc/nginx/sites-enabled/*fireinners*bak* /etc/nginx/sites-enabled/*fireinners*backup* /etc/nginx/sites-enabled/*fireinners*\.bak* /etc/nginx/sites-enabled/*fireinners*probe*; do
+  [ -e "$f" ] && mv "$f" /root/backup_probe/legacy/
+done
 
-echo "[1] ensure /opt/probe + env"
-mkdir -p /opt/probe /root/backup_probe
-chmod 700 /root/backup_probe
+echo "[4] ensure correct symlink exists"
+VHOST_AV="/etc/nginx/sites-available/fireinners.online-ssl"
+VHOST_EN="/etc/nginx/sites-enabled/fireinners.online-ssl"
+[ -f "$VHOST_AV" ] || { echo "ERR missing $VHOST_AV"; exit 1; }
+[ -L "$VHOST_EN" ] || ln -s "$VHOST_AV" "$VHOST_EN"
 
-ENVF="/opt/probe/probe.env"
-if [ ! -f "$ENVF" ]; then
-  TOK="$(openssl rand -hex 24)"
-  cat >"$ENVF" <<EOF
-HOST=127.0.0.1
-PORT=${PROBE_PORT_DEFAULT}
-PROBE_TOKEN=${TOK}
-PROBE_CACHE_MS=8000
-EOF
-  chmod 600 "$ENVF"
-  echo "created $ENVF"
-else
-  echo "exists  $ENVF (kept)"
-fi
+echo "[5] nginx test + reload"
+nginx -t
+systemctl reload nginx
+echo "OK reloaded"
 
-# read env safely
-HOST="$(awk -F= '/^HOST=/{print $2}' "$ENVF" 2>/dev/null | tail -n1)"
-PORT="$(awk -F= '/^PORT=/{print $2}' "$ENVF" 2>/dev/null | tail -n1)"
-TOKEN="$(awk -F= '/^PROBE_TOKEN=/{print $2}' "$ENVF" 2>/dev/null | tail -n1)"
-HOST="${HOST:-127.0.0.1}"
-PORT="${PORT:-$PROBE_PORT_DEFAULT}"
+echo "[6] test backend direct"
+TOKEN="$(awk -F= "/^PROBE_TOKEN=/{print \$2}" /opt/probe/probe.env)"
+curl -s -H "X-Probe-Token: $TOKEN" http://127.0.0.1:9696/probe | head -c 240; echo
 
-echo "[2] ensure server.js (only if missing)"
-SRV="/opt/probe/server.js"
-if [ ! -f "$SRV" ]; then
-cat >"$SRV" <<'JS'
-const http=require("http"),os=require("os"),{execFile}=require("child_process"),crypto=require("crypto");
-const HOST=process.env.HOST||"127.0.0.1";
-const PORT=parseInt(process.env.PORT||"9696",10);
-const TOKEN=(process.env.PROBE_TOKEN||"").trim();
-const CACHE_MS=parseInt(process.env.PROBE_CACHE_MS||"8000",10);
-let cache={t:0,data:null};
-
-const sh=(cmd,args)=>new Promise(r=>execFile(cmd,args,{timeout:4000,maxBuffer:1024*1024},(e,so,se)=>r((so||se||"").toString().trim())));
-const j=(res,code,obj)=>{const s=JSON.stringify(obj);res.writeHead(code,{"content-type":"application/json","cache-control":"no-store"});res.end(s);};
-
-function tokenOk(req){
-  if(!TOKEN) return true;
-  const got=(req.headers["x-probe-token"]||"").toString();
-  const a=Buffer.from(got),b=Buffer.from(TOKEN);
-  if(a.length!==b.length) return false;
-  return crypto.timingSafeEqual(a,b);
-}
-
-async function compute(){
-  const now=Date.now();
-  if(cache.data && (now-cache.t)<CACHE_MS) return {ok:true,cached:true,probe:cache.data};
-  const meta={ts:now,iso:new Date(now).toISOString(),hostname:os.hostname(),node:process.version};
-  const kernel=await sh("uname",["-r"]);
-  const uptime=await sh("uptime",["-p"]);
-  const ss=await sh("bash",["-lc","ss -ltnpH 2>/dev/null | head -n 80"]);
-  const df=await sh("bash",["-lc","df -h / 2>/dev/null | tail -n 1"]);
-  const mem={total:os.totalmem(),free:os.freemem()};
-  const out={meta,kernel,uptime,df,mem,ss};
-  cache={t:now,data:out};
-  return {ok:true,cached:false,probe:out};
-}
-
-http.createServer(async (req,res)=>{
-  if(req.url==="/health") return j(res,200,{ok:true});
-  if(req.url.startsWith("/probe")){
-    if(!tokenOk(req)) return j(res,403,{ok:false,err:"bad token"});
-    try{ return j(res,200,await compute()); }catch(e){ return j(res,500,{ok:false,err:String(e&&e.message||e)}); }
-  }
-  j(res,404,{ok:false});
-}).listen(PORT,HOST,()=>console.log("probe up",HOST,PORT));
-JS
-  chmod 700 "$SRV"
-  echo "created $SRV"
-else
-  echo "exists  $SRV (kept)"
-fi
-
-echo "[3] systemd probe.service"
-UNIT="/etc/systemd/system/probe.service"
-cat >"$UNIT" <<EOF
-[Unit]
-Description=Probe (local) for ${DOMAIN}
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-EnvironmentFile=${ENVF}
-WorkingDirectory=/opt/probe
-ExecStart=/usr/bin/node ${SRV}
-Restart=always
-RestartSec=2
-User=root
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl daemon-reload
-systemctl enable --now probe.service >/dev/null 2>&1 || true
-systemctl restart probe.service
-
-echo "[4] nginx snippet for /probe"
-SNIP="/etc/nginx/snippets/probe_location.conf"
-cat >"$SNIP" <<EOF
-location /probe {
-  add_header Cache-Control "no-store, no-cache, max-age=0" always;
-  add_header Pragma "no-cache" always;
-  add_header Expires "0" always;
-  proxy_pass http://${HOST}:${PORT}/probe;
-  proxy_set_header Host \$host;
-  proxy_set_header X-Real-IP \$remote_addr;
-  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto \$scheme;
-}
-EOF
-
-echo "[5] backup vhost then inject include (only for ${DOMAIN} server block)"
-TS="$(date +%Y%m%d_%H%M%S)"
-BK="/root/backup_probe/$(basename "$VHOST").${TS}.bak"
-cp -a "$VHOST" "$BK"
-echo "backup: $BK"
-
-INC="include /etc/nginx/snippets/probe_location.conf;"
-if grep -qF "$INC" "$VHOST"; then
-  echo "include already present (kept)"
-else
-  TMP="${VHOST}.tmp"
-  awk -v dom="$DOMAIN" -v www="$WWW" -v inc="$INC" '
-  function countch(s,c,   n,i){n=0;for(i=1;i<=length(s);i++) if(substr(s,i,1)==c) n++; return n}
-  BEGIN{inS=0;depth=0;target=0;done=0}
-  {
-    line=$0
-    if(line ~ /^[ \t]*server[ \t]*\{/){inS=1;depth+=countch(line,"{")-countch(line,"}");target=0;done=0}
-    if(inS && (line ~ /server_name/ ) && (line ~ dom || line ~ www)){target=1}
-    print line
-    if(inS && target && !done && (line ~ /server_name/)){
-      print "  " inc
-      done=1
-    }
-    if(inS){
-      depth+=countch(line,"{")-countch(line,"}")
-      if(depth<=0){inS=0;target=0;done=0;depth=0}
-    }
-  }' "$VHOST" >"$TMP"
-  mv "$TMP" "$VHOST"
-  echo "include injected"
-fi
-
-echo "[6] nginx test then reload (rollback if fail)"
-if nginx -t; then
-  systemctl reload nginx
-  echo "OK: nginx reloaded"
-else
-  echo "ERR: nginx -t failed, restoring backup"
-  cp -a "$BK" "$VHOST"
-  nginx -t || true
-  exit 1
-fi
-
-echo "[7] local test bypass CF + token"
-echo "TOKEN=${TOKEN:0:8}..."
-curl -sk --resolve ${DOMAIN}:443:127.0.0.1 -H "X-Probe-Token: ${TOKEN}" https://${DOMAIN}/probe | head -c 240; echo
-echo "DONE"
-SH
-chmod +x /root/MEGA_PROBE_SAFE.sh
-sudo bash /root/MEGA_PROBE_SAFE.sh
+echo "[7] test nginx routing (bypass CF)"
+curl -sk --resolve fireinners.online:443:127.0.0.1 -H "X-Probe-Token: $TOKEN" https://fireinners.online/probe | head -c 240; echo
+'
