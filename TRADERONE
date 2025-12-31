@@ -1,40 +1,46 @@
-sudo bash -lc '
-set -euo pipefail
-CONF=/etc/nginx/nginx.conf
-TS=$(date +%Y%m%d_%H%M%S)
-BKDIR=/root/backup_probe_fix
-mkdir -p "$BKDIR"
-chattr -i "$CONF" 2>/dev/null || true
-cp -a "$CONF" "$BKDIR/nginx.conf.BEFORE_$TS.bak" 2>/dev/null || true
+set -e
+TS="$(date +%Y%m%d_%H%M%S)"
+BK="/root/backup_nginx_fix_$TS"
+mkdir -p "$BK"
 
-cat >"$CONF" <<'"'"'EOF'"'"'
-user www-data;
-worker_processes auto;
-pid /run/nginx.pid;
-error_log /var/log/nginx/error.log;
-include /etc/nginx/modules-enabled/*.conf;
+echo "[0] Etat FS + attrs"
+mount | grep " on / type " || true
+lsattr /etc/nginx 2>/dev/null || true
+lsattr /etc/nginx/nginx.conf 2>/dev/null || true
 
-events { worker_connections 768; }
+echo "[1] Retire immutable (+i) sur dossier + fichiers nginx"
+chattr -R -i /etc/nginx 2>/dev/null || true
+chattr -i /etc/nginx 2>/dev/null || true
+chattr -i /etc/nginx/nginx.conf 2>/dev/null || true
 
-http {
-  sendfile on;
-  tcp_nopush on;
-  types_hash_max_size 2048;
+echo "[2] Backups"
+cp -a /etc/nginx/nginx.conf "$BK/nginx.conf.bak" 2>/dev/null || true
+cp -a /etc/nginx/sites-enabled/fireinners.online-ssl "$BK/fireinners.online-ssl.bak" 2>/dev/null || true
+cp -a /etc/nginx/sites-available/fireinners.online-ssl "$BK/fireinners.online-ssl.AV.bak" 2>/dev/null || true
 
-  include /etc/nginx/mime.types;
-  default_type application/octet-stream;
-
-  access_log /var/log/nginx/access.log;
-
-  gzip on;
-
-  include /etc/nginx/conf.d/*.conf;
-  include /etc/nginx/sites-enabled/*;
+repair_braces () {
+  F="$1"
+  [ -f "$F" ] || return 0
+  O="$(grep -o "{" "$F" | wc -l | tr -d ' ')"
+  C="$(grep -o "}" "$F" | wc -l | tr -d ' ')"
+  D=$((O-C))
+  echo "   - $F opens=$O closes=$C diff=$D"
+  if [ "$D" -gt 0 ] && [ "$D" -lt 8 ]; then
+    printf "\n" >> "$F"
+    i=0; while [ $i -lt $D ]; do echo "}" >> "$F"; i=$((i+1)); done
+    echo "     -> appended $D brace(s)"
+  fi
 }
-EOF
 
+echo "[3] Répare accolades manquantes (nginx.conf + vhost)"
+repair_braces /etc/nginx/nginx.conf
+repair_braces /etc/nginx/sites-enabled/fireinners.online-ssl
+repair_braces /etc/nginx/sites-available/fireinners.online-ssl
+
+echo "[4] Test nginx"
 nginx -t
+
+echo "[5] Reload nginx"
 systemctl reload nginx
-chattr +i "$CONF" 2>/dev/null || true
-echo "OK: nginx.conf minimal + reload"
-'
+
+echo "OK: nginx test + reload réussi. Backups: $BK"
