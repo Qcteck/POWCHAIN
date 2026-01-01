@@ -1,25 +1,9 @@
-cat >/root/FIREINNERS_SOLRPC_NGINX_FIX_ONLY.sh <<'SH'
+cat >/root/FIREINNERS_SOLRPC_NGINX_FIX_V3.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "[PLAN] Ce script va:"
-echo "  1) Backup /etc/nginx/sites-available/fireinners.online-ssl"
-echo "  2) Enlever tous les blocs/locations liés à /solrpc (anciens patches inclus)"
-echo "  3) Réinsérer un bloc propre au niveau server{}:"
-echo "       - /solrpc  -> 308 /solrpc/  (garde POST)"
-echo "       - /solrpc/ -> proxy vers 127.0.0.1:12703"
-echo "  4) nginx -t && reload, puis chattr +i"
-echo
-
-[ "$(id -u)" -eq 0 ] || { echo "ERR: run as root"; exit 1; }
-
 NG_AV="/etc/nginx/sites-available/fireinners.online-ssl"
-NG_EN="/etc/nginx/sites-enabled/fireinners.online-ssl"
-
-[ -f "$NG_AV" ] || { echo "ERR: missing $NG_AV"; exit 2; }
-
-TS="$(date +%Y%m%d_%H%M%S)"
-BK="/root/backup_fireinners_nginx_${TS}"
+BK="/root/backup_fireinners_nginx_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$BK"
 cp -a "$NG_AV" "$BK/$(basename "$NG_AV").bak"
 
@@ -30,31 +14,79 @@ fi
 python3 - <<'PY'
 import re, pathlib
 
-p = pathlib.Path("/etc/nginx/sites-available/fireinners.online-ssl")
-s = p.read_text(encoding="utf-8", errors="ignore")
+path = pathlib.Path("/etc/nginx/sites-available/fireinners.online-ssl")
+s = path.read_text(encoding="utf-8", errors="ignore")
 
-# 1) remove old FI_SOLRPC block(s) if any
-s = re.sub(r"\s*#\s*FI_SOLRPC_NGINX_V1 BEGIN.*?#\s*FI_SOLRPC_NGINX_V1 END\s*", "\n", s, flags=re.S)
+def find_server_blocks(txt):
+    blocks=[]
+    i=0
+    while True:
+        m=re.search(r'\bserver\s*\{', txt[i:])
+        if not m: break
+        a=i+m.start()
+        j=a+m.end()-a
+        k=a+m.end()
+        depth=1
+        p=k
+        while p < len(txt) and depth>0:
+            c=txt[p]
+            if c=='{': depth+=1
+            elif c=='}': depth-=1
+            p+=1
+        blocks.append((a,p,txt[a:p]))
+        i=p
+    return blocks
 
-# 2) find the server{} that contains fireinners.online in server_name
-m = re.search(r"server\s*\{.*?server_name[^;]*fireinners\.online[^;]*;.*?\}", s, flags=re.S)
-if not m:
+def pick_target(blocks):
+    cand=[]
+    for a,b,blk in blocks:
+        if re.search(r'\bserver_name\b[^;]*fireinners\.online', blk):
+            score=0
+            if re.search(r'listen\s+443', blk): score+=5
+            if 'ssl' in blk or 'certbot' in blk: score+=3
+            if re.search(r'location\s+/\s*\{', blk): score+=1
+            cand.append((score,a,b,blk))
+    if not cand: return None
+    cand.sort(reverse=True, key=lambda x:x[0])
+    return cand[0][1], cand[0][2], cand[0][3]
+
+def remove_location_solrpc(blk):
+    # remove any FI_SOLRPC marker blocks too
+    blk = re.sub(r'\s*#\s*FI_SOLRPC_.*?BEGIN.*?#\s*FI_SOLRPC_.*?END\s*', '\n', blk, flags=re.S)
+
+    # repeatedly find "location ... /solrpc" headers and delete whole brace block
+    pat = re.compile(r'(^[ \t]*location\s+(?:=|\^~)?\s*/solrpc/?\s*\{)', re.M)
+    while True:
+        m = pat.search(blk)
+        if not m: break
+        start = m.start(1)
+        # find first '{' from header
+        brace_pos = blk.find('{', m.end(1)-1)
+        if brace_pos < 0: break
+        depth=0
+        p=brace_pos
+        while p < len(blk):
+            if blk[p]=='{': depth+=1
+            elif blk[p]=='}':
+                depth-=1
+                if depth==0:
+                    p+=1
+                    break
+            p+=1
+        blk = blk[:start] + "\n" + blk[p:]
+    return blk
+
+servers = find_server_blocks(s)
+t = pick_target(servers)
+if not t:
     raise SystemExit("ERR: cannot find server{} with server_name fireinners.online")
 
-block = m.group(0)
+a,b,blk = t
+blk2 = remove_location_solrpc(blk)
 
-# 3) remove any existing /solrpc locations in that server block (to avoid duplicates/nesting)
-#    This removes:
-#      location = /solrpc ...
-#      location = /solrpc/ ...
-#      location /solrpc ...
-#      location /solrpc/ ...
-block = re.sub(r"\n\s*location\s*=?\s*/solrpc/?\s*\{.*?\}\s*\n", "\n", block, flags=re.S)
-block = re.sub(r"\n\s*location\s*\^~\s*/solrpc/?\s*\{.*?\}\s*\n", "\n", block, flags=re.S)
-
-# 4) insert clean block right after server_name line (top-level inside server{})
-ins = r"""
-    # FI_SOLRPC_NGINX_V2 BEGIN
+if "FI_SOLRPC_NGINX_V3 BEGIN" not in blk2:
+    ins = """
+    # FI_SOLRPC_NGINX_V3 BEGIN
     location = /solrpc { return 308 /solrpc/; }
 
     location /solrpc/ {
@@ -67,19 +99,32 @@ ins = r"""
         proxy_read_timeout 60s;
         proxy_send_timeout 60s;
     }
-    # FI_SOLRPC_NGINX_V2 END
-""".strip("\n")
+    # FI_SOLRPC_NGINX_V3 END
+""".rstrip()+"\n"
 
-# put immediately after the first server_name ...;
-block2 = re.sub(r"(server_name[^;]*;\s*)", r"\1\n\n"+ins+"\n\n", block, count=1, flags=re.S)
-if block2 == block:
-    # fallback: insert near top after opening brace
-    block2 = re.sub(r"(server\s*\{\s*)", r"\1\n"+ins+"\n", block, count=1, flags=re.S)
+    # insert right after first server_name ...;
+    m2 = re.search(r'(server_name[^;]*;\s*)', blk2)
+    if m2:
+        blk2 = blk2[:m2.end(1)] + "\n\n" + ins + "\n" + blk2[m2.end(1):]
+    else:
+        # fallback: after "server {"
+        m3 = re.search(r'(server\s*\{\s*)', blk2)
+        if not m3: raise SystemExit("ERR: malformed server block")
+        blk2 = blk2[:m3.end(1)] + "\n" + ins + blk2[m3.end(1):]
 
-s2 = s[:m.start()] + block2 + s[m.end():]
-p.write_text(s2, encoding="utf-8")
-print("OK: patched nginx site")
+s2 = s[:a] + blk2 + s[b:]
+path.write_text(s2, encoding="utf-8")
+
+# quick sanity: count locations left
+txt = s2[a:a+len(blk2)]
+cnt = len(re.findall(r'^\s*location\s+.*?/solrpc', txt, flags=re.M))
+print("OK: patched. solrpc location headers in target server block:", cnt)
 PY
+
+echo
+echo "[DEBUG] Locations /solrpc restantes (doit montrer 2 lignes: = /solrpc et /solrpc/):"
+grep -nE '^\s*location\s+.*?/solrpc' "$NG_AV" || true
+echo
 
 nginx -t
 systemctl reload nginx
@@ -89,13 +134,12 @@ if command -v chattr >/dev/null 2>&1; then
 fi
 
 echo
-echo "[DONE] Backup: $BK"
+echo "DONE. Backup: $BK"
 echo
-echo "[TEST] Doit répondre pong:"
-echo "  curl -fsS https://fireinners.online/solrpc/ping && echo"
-echo
-echo "[TEST] POST JSON-RPC (slash final obligatoire):"
-echo "  curl -sS -H 'content-type: application/json' -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getHealth\"}' https://fireinners.online/solrpc/"
+echo "TEST:"
+echo "  curl -i -sS https://fireinners.online/solrpc | head -n 8"
+echo "  curl -sS https://fireinners.online/solrpc/ping && echo"
+echo "  curl -sS -H 'content-type: application/json' -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getHealth\"}' https://fireinners.online/solrpc/ && echo"
 SH
-chmod +x /root/FIREINNERS_SOLRPC_NGINX_FIX_ONLY.sh
-bash /root/FIREINNERS_SOLRPC_NGINX_FIX_ONLY.sh
+chmod +x /root/FIREINNERS_SOLRPC_NGINX_FIX_V3.sh
+bash /root/FIREINNERS_SOLRPC_NGINX_FIX_V3.sh
