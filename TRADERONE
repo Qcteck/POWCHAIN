@@ -1,11 +1,254 @@
-ADDR="ufii1UUsd1FM8ByD6XyvuamGhGjeJdTM7PAbrj4uZDj";USDC="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1";TOKENPROG="TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";curl -sS -H 'content-type: application/json' --data-binary "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getTokenAccountsByOwner\",\"params\":[\"$ADDR\",{\"programId\":\"$TOKENPROG\"},{\"encoding\":\"jsonParsed\"}]}" https://fireinners.online/solrpc/ | python3 -c "import sys,json;want='$USDC';j=json.load(sys.stdin);tot=0.0;arr=((j.get('result')or{}).get('value')or[]); 
-for it in arr:
- info=it.get('account',{}).get('data',{}).get('parsed',{}).get('info',{})
- if info.get('mint')==want:
-  ta=info.get('tokenAmount',{})
-  v=ta.get('uiAmount')
-  tot+=float(v or 0)
-print('USDC_TOTAL=',tot)"
+bash -lc 'cat > /root/FIREINNERS_WALLET_SOLRPC_MEGA.sh <<'"'"'BASH'"'"'
+#!/usr/bin/env bash
+set -euo pipefail
 
+# ====== CONFIG ======
+NG_AV="/etc/nginx/sites-available/fireinners.online-ssl"
+WALLET_HTML="/opt/fireinners/frontend-react/app/dist/wallet/index.html"
+PROXY_HOST="127.0.0.1"
+PROXY_PORT="12703"
+RPC_PUBLIC="https://fireinners.online/solrpc/"
+USDC_MINT="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1"
+TOKEN_PROG="TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 
-ADDR="ufii1UUsd1FM8ByD6XyvuamGhGjeJdTM7PAbrj4uZDj";USDC="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1";curl -sS -H 'content-type: application/json' --data-binary "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getTokenAccountsByOwner\",\"params\":[\"$ADDR\",{\"mint\":\"$USDC\"},{\"encoding\":\"jsonParsed\"}]}" https://fireinners.online/solrpc/ | head -c 300 && echo
+TS="$(date +%Y%m%d_%H%M%S)"
+BKDIR="/root/backup_fireinners_wallet_solrpc_${TS}"
+mkdir -p "$BKDIR"
+
+say(){ echo "[$(date +%H:%M:%S)] $*"; }
+
+# ====== PRE-FLIGHT ======
+say "PRE-FLIGHT: paths"
+[ -f "$NG_AV" ] || { echo "ERR: nginx site not found: $NG_AV"; exit 2; }
+[ -f "$WALLET_HTML" ] || { echo "ERR: wallet html not found: $WALLET_HTML"; exit 2; }
+
+# ====== BACKUPS ======
+say "Backup nginx + wallet -> $BKDIR"
+cp -a "$NG_AV" "$BKDIR/$(basename "$NG_AV").bak"
+cp -a "$WALLET_HTML" "$BKDIR/$(basename "$WALLET_HTML").bak"
+
+# ====== UNLOCK IMMUTABLE ======
+if command -v chattr >/dev/null 2>&1; then
+  chattr -i /etc/nginx/nginx.conf "$NG_AV" 2>/dev/null || true
+fi
+
+# ====== PATCH NGINX (CLEAN SOLRPC BLOCK) ======
+say "Patch nginx: clean /solrpc blocks + insert canonical block"
+python3 - <<'PY'
+import re, pathlib, sys
+p=pathlib.Path("/etc/nginx/sites-available/fireinners.online-ssl")
+s=p.read_text(encoding="utf-8", errors="ignore")
+
+# 1) Remove our older injected block markers if present
+s=re.sub(r"\n\s*#\s*FI_SOLRPC_NGINX_V1_BEGIN.*?#\s*FI_SOLRPC_NGINX_V1_END\s*\n", "\n", s, flags=re.S)
+
+# 2) Remove ANY existing location blocks for /solrpc and /solrpc/ inside the target server{} for fireinners.online
+m=re.search(r"server\s*\{.*?server_name\s+[^;]*fireinners\.online[^;]*;.*?\}", s, flags=re.S)
+if not m:
+  raise SystemExit("ERR: cannot find server{} with server_name fireinners.online")
+
+block=m.group(0)
+
+# remove location = /solrpc { ... } and location /solrpc { ... } and location ^~ /solrpc/ { ... } etc.
+block2=re.sub(r"\n\s*location\s+(=|\^~|~\*|~)?\s*/solrpc/?\s*\{.*?\}\s*", "\n", block, flags=re.S)
+
+# 3) Build canonical block
+ins = r'''
+    # FI_SOLRPC_NGINX_V1_BEGIN
+    # Keep POST when clients call /solrpc (no trailing slash)
+    location = /solrpc {
+        return 308 /solrpc/;
+    }
+
+    # JSON-RPC proxy (CORS-safe)
+    location ^~ /solrpc/ {
+        # CORS
+        add_header Access-Control-Allow-Origin "*" always;
+        add_header Access-Control-Allow-Methods "POST, OPTIONS" always;
+        add_header Access-Control-Allow-Headers "content-type" always;
+
+        # Preflight
+        if ($request_method = OPTIONS) {
+            return 204;
+        }
+
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+
+        proxy_read_timeout 60s;
+        proxy_connect_timeout 10s;
+
+        proxy_pass http://127.0.0.1:12703/;
+    }
+    # FI_SOLRPC_NGINX_V1_END
+'''
+
+# 4) Insert before end of server block (right before last })
+# Keep indentation consistent
+pos = block2.rfind("}")
+block3 = block2[:pos] + ins + "\n" + block2[pos:]
+
+s = s[:m.start()] + block3 + s[m.end():]
+p.write_text(s, encoding="utf-8")
+print("OK: nginx site patched")
+PY
+
+# test nginx
+say "nginx -t"
+nginx -t
+
+say "Reload nginx"
+systemctl reload nginx
+
+# lock back
+if command -v chattr >/dev/null 2>&1; then
+  chattr +i /etc/nginx/nginx.conf "$NG_AV" 2>/dev/null || true
+fi
+
+# ====== PATCH WALLET HTML (ROBUST OVERRIDE SCRIPT) ======
+say "Patch wallet: add robust SOL+USDC refresh script (json-rpc POST) + placeholders"
+
+python3 - <<'PY'
+import pathlib, re, time
+W=pathlib.Path("/opt/fireinners/frontend-react/app/dist/wallet/index.html")
+s=W.read_text(encoding="utf-8", errors="ignore")
+
+# ensure placeholders exist (ids used by patch)
+if "FI_SOLRPC_PLACEHOLDERS_V2" not in s:
+  ph = r'''<!-- FI_SOLRPC_PLACEHOLDERS_V2 --><div id="fi_placeholders" style="display:none"><span id="addrVal"></span><span id="solVal"></span><span id="usdcVal"></span><pre id="status"></pre></div>'''
+  if "</body>" in s:
+    s = s.replace("</body>", ph + "\n</body>")
+  else:
+    s += ph
+
+# remove older script marker if any
+s = re.sub(r"<!--\s*FI_SOLRPC_PATCH_V2_BEGIN\s*-->.*?<!--\s*FI_SOLRPC_PATCH_V2_END\s*-->\s*", "", s, flags=re.S)
+
+RPC_PUBLIC="https://fireinners.online/solrpc/"
+USDC="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1"
+TPROG="TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+ts=int(time.time())
+
+patch = f"""<!-- FI_SOLRPC_PATCH_V2_BEGIN -->
+<script>
+(()=>{{
+  const RPC="{RPC_PUBLIC}";
+  const USDC="{USDC}";
+  const TPROG="{TPROG}";
+  const $=(q)=>document.querySelector(q);
+  const log=(m)=>{{try{{const el=$("#status")||$("#log")||$("#msgBox");if(el){{el.textContent=(String(el.textContent||"")+m+"\\n");}}}}catch(e){{}}}};
+  const setText=(sel,v)=>{{const el=$(sel);if(el) el.textContent=v;}};
+
+  // find buttons by label (works even if no IDs)
+  const btnByText=(t)=>{{t=t.toLowerCase();return Array.from(document.querySelectorAll("button")).find(b=>String(b.textContent||"").trim().toLowerCase()===t)||null;}};
+  const btnConnect=btnByText("connect");
+  const btnDisconnect=btnByText("disconnect");
+  const btnRefresh=btnByText("refresh");
+
+  const provider = window.solana && window.solana.isPhantom ? window.solana : null;
+
+  async function rpc(method, params){{
+    const body={{jsonrpc:"2.0", id:1, method, params}};
+    const r=await fetch(RPC,{{method:"POST",headers:{{"content-type":"application/json"}},body:JSON.stringify(body)}});
+    const j=await r.json().catch(()=>null);
+    if(!j) throw new Error("RPC: invalid JSON");
+    if(j.error) throw new Error(j.error.message||("RPC error "+j.error.code));
+    return j.result;
+  }}
+
+  function uiAddr(a){{
+    // try multiple spots
+    setText("#addrVal",a||"");
+    const pre = Array.from(document.querySelectorAll("pre,div,span")).find(x=>/Adresse/i.test(String(x.textContent||"")) && String(x.textContent||"").length<200);
+    if(!a) return;
+    // if there is a visible address block, don't overwrite huge text; just ensure placeholders exist
+  }}
+
+  async function refresh(pubkey){{
+    try{{
+      if(!pubkey) throw new Error("no pubkey");
+      log("Refreshing...");
+      // SOL
+      const bal=await rpc("getBalance",[pubkey]);
+      const sol=(bal && typeof bal.value==="number") ? (bal.value/1e9) : 0;
+      setText("#solVal",sol.toFixed(6));
+      // USDC (sum all token accounts, filter mint)
+      const res=await rpc("getTokenAccountsByOwner",[pubkey,{{programId:TPROG}},{{encoding:"jsonParsed"}}]);
+      const arr=(res && res.value)||[];
+      let tot=0;
+      for(const it of arr){{
+        const info=it?.account?.data?.parsed?.info;
+        if(info && info.mint===USDC){{
+          const ui=info?.tokenAmount?.uiAmount;
+          tot += Number(ui||0);
+        }}
+      }}
+      setText("#usdcVal",tot.toFixed(2));
+      log("OK SOL="+sol.toFixed(6)+" USDC="+tot.toFixed(2));
+    }}catch(e){{
+      log("ERR "+(e && e.message ? e.message : e));
+      throw e;
+    }}
+  }}
+
+  async function doConnect(){{
+    try{{
+      if(!provider) throw new Error("Phantom not found");
+      const r=await provider.connect();
+      const pk = (r && r.publicKey) ? String(r.publicKey) : (provider.publicKey ? String(provider.publicKey) : "");
+      uiAddr(pk);
+      log("CONNECTED "+pk);
+      await refresh(pk);
+    }}catch(e){{ log("CONNECT ERR "+(e&&e.message?e.message:e)); }}
+  }}
+
+  async function doDisconnect(){{
+    try{{
+      if(!provider) return;
+      await provider.disconnect();
+      log("DISCONNECTED");
+      setText("#solVal","—"); setText("#usdcVal","—");
+    }}catch(e){{ log("DISCONNECT ERR "+(e&&e.message?e.message:e)); }}
+  }}
+
+  async function doRefresh(){{
+    try{{
+      const pk = provider && provider.publicKey ? String(provider.publicKey) : "";
+      if(!pk) throw new Error("not connected");
+      await refresh(pk);
+    }}catch(e){{ log("REFRESH ERR "+(e&&e.message?e.message:e)); }}
+  }}
+
+  // wire
+  if(btnConnect) btnConnect.addEventListener("click", doConnect);
+  if(btnDisconnect) btnDisconnect.addEventListener("click", doDisconnect);
+  if(btnRefresh) btnRefresh.addEventListener("click", doRefresh);
+
+  // show RPC string somewhere if placeholders exist
+  log("RPC="+RPC);
+}})();
+</script>
+<!-- FI_SOLRPC_PATCH_V2_END -->"""
+
+# insert near end of body
+if "</body>" in s:
+  s = s.replace("</body>", patch + "\n</body>")
+else:
+  s += patch
+
+W.write_text(s, encoding="utf-8")
+print("OK: wallet patched v2")
+PY
+
+# ====== QUICK SERVER TEST ======
+say "Server test: ping + getHealth"
+curl -fsS "${RPC_PUBLIC}ping" && echo
+curl -sS -H 'content-type: application/json' --data-binary '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' "${RPC_PUBLIC}" && echo
+
+say "DONE"
+echo "Open on iPhone (cache-bust): https://fireinners.online/wallet/?v=${TS}"
+echo "Then: Connect -> Refresh (status box should show errors if any)."
+BASH
+bash /root/FIREINNERS_WALLET_SOLRPC_MEGA.sh'
