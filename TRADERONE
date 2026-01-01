@@ -1,19 +1,21 @@
-cat >/root/FIREINNERS_WALLET_SOLRPC_FIXONLY.sh <<'SH'
+cat >/root/FIREINNERS_WALLET_SOLRPC_FIXONLY_v2.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
+
 need_root(){ [ "$(id -u)" = "0" ] || { echo "ERR: run as root"; exit 1; }; }
 need_root
+
 ts(){ date +"%Y%m%d_%H%M%S"; }
-BKDIR="/root/backup_fireinners_wallet_solrpc_fixonly_$(ts)"
+BKDIR="/root/backup_fireinners_wallet_solrpc_fixonly_v2_$(ts)"
 mkdir -p "$BKDIR"
-echo "=== FIREINNERS WALLET SOLRPC FIX-ONLY (no nginx) ==="
+
+echo "=== FIREINNERS WALLET SOLRPC FIXONLY v2 (no nginx) ==="
 echo "Backup dir: $BKDIR"
 
-# locate wallet html
 CANDIDATES=(
   "/opt/fireinners/frontend-react/app/dist/wallet/index.html"
-  "/opt/fireinners/frontend-react/app/dist/wallet.html"
   "/opt/fireinners/frontend-react/app/dist/wallet/index.htm"
+  "/opt/fireinners/frontend-react/app/dist/wallet.html"
 )
 WALLET_HTML=""
 for f in "${CANDIDATES[@]}"; do [ -f "$f" ] && WALLET_HTML="$f" && break; done
@@ -26,65 +28,76 @@ echo "Wallet HTML: $WALLET_HTML"
 
 cp -a "$WALLET_HTML" "$BKDIR/$(basename "$WALLET_HTML").bak"
 
-# marker checks
-if grep -q "__FI_SOLRPC_FETCH_PATCH__" "$WALLET_HTML"; then
-  echo "OK: patch already present, skipping insert."
-else
-  echo "Injecting patch into wallet (forces /solrpc/ + avoids null ids crash)..."
-  python3 - <<'PY'
-import re, pathlib
-p=pathlib.Path("'"$WALLET_HTML"'")
-s=p.read_text(encoding="utf-8", errors="ignore")
+# If immutable, unfreeze temporarily
+IMM="0"
+if command -v lsattr >/dev/null 2>&1; then
+  if lsattr -d "$WALLET_HTML" 2>/dev/null | awk '{print $1}' | grep -q "i"; then
+    IMM="1"
+    chattr -i "$WALLET_HTML" 2>/dev/null || true
+  fi
+fi
 
-placeholders = r'''<!-- __FI_SOLRPC_PLACEHOLDERS__ --><div id="__fi_placeholders" style="display:none">
+# patch only if not already present
+if grep -q "__FI_SOLRPC_FETCH_PATCH__" "$WALLET_HTML"; then
+  echo "OK: patch already present."
+else
+  echo "Injecting patch (forces /solrpc/ and prevents null textContent crashes)..."
+  python3 - "$WALLET_HTML" <<'PY'
+import re, sys, pathlib
+p = pathlib.Path(sys.argv[1])
+s = p.read_text(encoding="utf-8", errors="ignore")
+
+# minimal hidden placeholders to stop "textContent of null" when IDs differ
+placeholders = """<!-- __FI_SOLRPC_PLACEHOLDERS__ --><div id="__fi_placeholders" style="display:none">
 <span id="sol"></span><span id="solVal"></span><span id="solV"></span><span id="solBal"></span><span id="balSol"></span><span id="solBalance"></span>
 <span id="usdc"></span><span id="usdcVal"></span><span id="usdcV"></span><span id="usdcBal"></span><span id="balUsdc"></span><span id="usdcBalance"></span>
 <span id="rpcSol"></span><span id="rpcUSDC"></span><span id="rpcUsdc"></span>
 <pre id="msgBox"></pre><pre id="log"></pre><pre id="status"></pre>
-</div>'''
+</div>"""
 
-patch = r'''<script>/* __FI_SOLRPC_FETCH_PATCH__ */
+patch = r"""<script>/* __FI_SOLRPC_FETCH_PATCH__ */
 (()=>{const FIX=(u)=>{try{u=String(u||"");}catch(e){return u}if(!u)return u;
-u=u.replace(/^https:\/\/fireinners\.online\/solrpc\/?$/,"https://fireinners.online/solrpc/"); /* exact */
-u=u.replace(/^https:\/\/fireinners\.online\/solrpc(?!\/)/,"https://fireinners.online/solrpc/"); /* missing slash */
-u=u.replace(/^\/solrpc\/?$/,"/solrpc/"); /* relative */
-u=u.replace(/^\/solrpc(?!\/)/,"/solrpc/"); /* relative missing slash */
+u=u.replace(/^https:\/\/fireinners\.online\/solrpc\/?$/,"https://fireinners.online/solrpc/");
+u=u.replace(/^https:\/\/fireinners\.online\/solrpc(?!\/)/,"https://fireinners.online/solrpc/");
+u=u.replace(/^\/solrpc\/?$/,"/solrpc/");
+u=u.replace(/^\/solrpc(?!\/)/,"/solrpc/");
 return u};
 const _fetch=window.fetch?window.fetch.bind(window):null;
 if(_fetch){window.fetch=(input,init)=>{try{
 let url=null;
 if(typeof input==="string") url=input;
-else if(input && typeof input==="object" && "url" in input) url=input.url;
+else if(input&&typeof input==="object"&&("url" in input)) url=input.url;
 if(url){const fixed=FIX(url);
 if(fixed!==url){
 if(typeof input==="string") input=fixed;
 else input=new Request(fixed,input);
 }}}catch(e){}
 return _fetch(input,init)}}
-})();</script>'''
+})();</script>"""
 
 # inject right after <body ...>
-m=re.search(r"<body[^>]*>", s, flags=re.I)
+m = re.search(r"<body[^>]*>", s, flags=re.I)
 if not m:
-  raise SystemExit("ERR: <body> not found in wallet html")
+  raise SystemExit("ERR: <body> not found")
 ins = s[:m.end()] + "\n" + placeholders + "\n" + patch + "\n" + s[m.end():]
 p.write_text(ins, encoding="utf-8")
 print("OK: injected placeholders + fetch patch")
 PY
 fi
 
+# re-freeze if it was immutable
+if [ "$IMM" = "1" ]; then
+  chattr +i "$WALLET_HTML" 2>/dev/null || true
+fi
+
 echo "=== TESTS ==="
-echo "[1] Ping (should be pong):"
+echo "[1] ping:"
 curl -fsS https://fireinners.online/solrpc/ping && echo
-
-echo "[2] JSON-RPC getHealth (POST to /solrpc/):"
+echo "[2] getHealth POST (must be /solrpc/ with slash):"
 curl -fsS -H 'content-type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' https://fireinners.online/solrpc/ && echo
-
-echo "[3] Wallet remote grep (solrpc occurrences):"
-curl -fsS "https://fireinners.online/wallet/?v=$(date +%s)" | grep -n "solrpc" | head -n 30 || true
-
+echo "[3] open wallet:"
+echo "https://fireinners.online/wallet/?v=$(date +%s)"
 echo "DONE."
-echo "Open with cache-buster: https://fireinners.online/wallet/?v=$(date +%s)"
 SH
-chmod +x /root/FIREINNERS_WALLET_SOLRPC_FIXONLY.sh
-/root/FIREINNERS_WALLET_SOLRPC_FIXONLY.sh
+chmod +x /root/FIREINNERS_WALLET_SOLRPC_FIXONLY_v2.sh
+/root/FIREINNERS_WALLET_SOLRPC_FIXONLY_v2.sh
