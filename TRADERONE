@@ -1,142 +1,144 @@
-cat >/root/FIREINNERS_WALLET_SOLRPC_MEGA.sh <<'SH'
+cat >/root/FIREINNERS_WALLET_USDC_FIX_MEGA.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 
 DIST="/opt/fireinners/frontend-react/app/dist"
-MAIN_HTML="$DIST/index.html"
 WALLET_DIR="$DIST/wallet"
 WALLET_HTML="$WALLET_DIR/index.html"
 VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
-SNIP="/etc/nginx/snippets/fireinners-solrpc.conf"
-SVC="/etc/systemd/system/fireinners-solrpc-proxy.service"
-APPDIR="/opt/fireinners/solrpc-proxy"
+NGINX_CONF="/etc/nginx/nginx.conf"
+PROXY_DIR="/opt/fireinners/solrpc-proxy"
 PORT="12703"
-MARK_SNIP="FIREINNERS_SOLRPC_SNIPPET_v1"
-MARK_WALLET="FIREINNERS_WALLET_PAGE_v2_SOLRPC"
-BKDIR="/root/backup_fireinners_wallet_solrpc_$(date +%Y%m%d_%H%M%S)"
+UNIT="/etc/systemd/system/fireinners-solrpc-proxy.service"
 
-mkdir -p "$BKDIR"
+ts(){ date +"%Y%m%d_%H%M%S"; }
+die(){ echo "ERR: $*" >&2; exit 1; }
 
-has_i(){ lsattr "$1" 2>/dev/null | awk '{print $1}' | grep -q 'i' || return 1; }
-un_i(){ chattr -i "$1" 2>/dev/null || true; }
-re_i(){ chattr +i "$1" 2>/dev/null || true; }
+echo "=== FIREINNERS WALLET USDC FIX :: MEGA (safe) ==="
 
-echo "=== FIREINNERS WALLET :: SOLRPC MEGA (safe) ==="
 echo "[0] Checks"
-test -d "$DIST" || { echo "ERR dist missing: $DIST"; exit 1; }
-test -f "$MAIN_HTML" || { echo "ERR main index missing: $MAIN_HTML"; exit 1; }
-test -f "$VHOST" || { echo "ERR vhost missing: $VHOST"; exit 1; }
-nginx -t >/dev/null || { echo "ERR nginx -t failed"; exit 1; }
+[ -d "$DIST" ] || die "DIST missing: $DIST"
+[ -f "$DIST/index.html" ] || die "DIST/index.html missing"
+[ -f "$VHOST" ] || die "VHOST missing: $VHOST"
+command -v node >/dev/null 2>&1 || die "node not found"
+command -v nginx >/dev/null 2>&1 || die "nginx not found"
+python3 -V >/dev/null 2>&1 || die "python3 not found"
+
+if ss -lntp 2>/dev/null | grep -q ":$PORT"; then
+  echo "WARN: port $PORT already in use. Will not change it automatically."
+  echo "      Stop the service using it or change PORT in this script."
+  exit 1
+fi
 
 echo "[1] Backup"
-cp -a "$VHOST" "$BKDIR/vhost.bak" || true
-cp -a "$MAIN_HTML" "$BKDIR/index.html.bak" || true
-[ -f "$WALLET_HTML" ] && cp -a "$WALLET_HTML" "$BKDIR/wallet.index.html.bak" || true
-echo "Backup dir: $BKDIR"
+BK="/root/backup_fireinners_wallet_usdcfix_$(ts)"
+mkdir -p "$BK"
+cp -f "$DIST/index.html" "$BK/index.html.bak"
+[ -f "$WALLET_HTML" ] && cp -f "$WALLET_HTML" "$BK/wallet.index.html.bak" || true
+cp -f "$VHOST" "$BK/vhost.bak"
+echo "Backup dir: $BK"
 
-echo "[2] Install proxy app"
-mkdir -p "$APPDIR"
-cat >"$APPDIR/server.js" <<'JS'
+echo "[2] Install SolRPC proxy (no npm)"
+mkdir -p "$PROXY_DIR"
+cat >"$PROXY_DIR/server.js" <<'JS'
 "use strict";
 const http=require("http");
-const {URL}=require("url");
 
 const UPSTREAMS=[
   "https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac",
   "https://api.mainnet-beta.solana.com",
-  "https://solana-rpc.publicnode.com",
-  "https://rpc.ankr.com/solana"
+  "https://rpc.ankr.com/solana",
+  "https://solana-rpc.publicnode.com"
 ];
 
-function readBody(req,limit=2*1024*1024){
+const PORT=parseInt(process.env.PORT||"12703",10);
+const HOST=process.env.HOST||"127.0.0.1";
+
+function send(res,code,body,extraHeaders){
+  const h={
+    "content-type":"application/json; charset=utf-8",
+    "access-control-allow-origin":"*",
+    "access-control-allow-methods":"POST, GET, OPTIONS",
+    "access-control-allow-headers":"content-type, authorization",
+    "cache-control":"no-store"
+  };
+  if(extraHeaders) for(const k of Object.keys(extraHeaders)) h[k]=extraHeaders[k];
+  res.writeHead(code,h);
+  res.end(typeof body==="string"?body:JSON.stringify(body));
+}
+
+function readBody(req){
   return new Promise((resolve,reject)=>{
-    let n=0,buf=[];
-    req.on("data",c=>{ n+=c.length; if(n>limit){reject(new Error("Body too large")); req.destroy(); return;} buf.push(c); });
-    req.on("end",()=>resolve(Buffer.concat(buf).toString("utf8")));
+    let d="";
+    req.on("data",c=>{ d+=c; if(d.length>5e6) { reject(new Error("Body too large")); req.destroy(); } });
+    req.on("end",()=>resolve(d));
     req.on("error",reject);
   });
 }
 
-async function postJSON(url,body,timeoutMs=9000){
-  const ac=new AbortController();
-  const t=setTimeout(()=>ac.abort(),timeoutMs);
-  try{
-    const r=await fetch(url,{method:"POST",headers:{"content-type":"application/json"},body,signal:ac.signal});
-    const txt=await r.text();
-    if(!r.ok) throw new Error("HTTP "+r.status+" "+txt.slice(0,180));
-    return {ok:true,txt};
-  } finally { clearTimeout(t); }
+function shouldFailover(httpStatus, json){
+  if(httpStatus>=500) return true;
+  if(!json || !json.error) return false;
+  const msg=(""+(json.error.message||"")).toLowerCase();
+  if(msg.includes("temporary internal error")) return true;
+  if(msg.includes("timeout")) return true;
+  if(msg.includes("too many requests")) return true;
+  if(msg.includes("rate")) return true;
+  if(msg.includes("overloaded")) return true;
+  return false;
 }
 
-async function handleRPC(body){
-  let lastErr=null;
+async function rpcCall(payload){
+  const bodyStr=typeof payload==="string"?payload:JSON.stringify(payload);
   for(const u of UPSTREAMS){
+    const ac=new AbortController();
+    const t=setTimeout(()=>ac.abort(), 9000);
     try{
-      const r=await postJSON(u,body,9000);
-      return {upstream:u,txt:r.txt};
-    }catch(e){ lastErr=e; }
+      const r=await fetch(u,{method:"POST",headers:{"content-type":"application/json"},body:bodyStr,signal:ac.signal});
+      const txt=await r.text();
+      let j=null; try{ j=JSON.parse(txt); }catch(_){}
+      if(!r.ok || shouldFailover(r.status,j)) { clearTimeout(t); continue; }
+      clearTimeout(t);
+      return {ok:true,status:r.status,txt,upstream:u};
+    }catch(e){
+      clearTimeout(t);
+      continue;
+    }
   }
-  throw lastErr||new Error("Upstreams exhausted");
+  return {ok:false,status:502,txt:JSON.stringify({jsonrpc:"2.0",error:{message:"USDC RPC failover exhausted"},id:null}),upstream:""};
 }
 
-const srv=http.createServer(async (req,res)=>{
+const s=http.createServer(async (req,res)=>{
+  if(req.method==="OPTIONS") return send(res,204,"");
+  if(req.url==="/ping") return send(res,200,JSON.stringify({ok:true,upstreams:UPSTREAMS.length}));
+  if(req.method!=="POST") return send(res,405,JSON.stringify({error:"POST only"}));
   try{
-    if(req.method==="OPTIONS"){
-      res.writeHead(204,{
-        "Access-Control-Allow-Origin":"*",
-        "Access-Control-Allow-Methods":"POST, OPTIONS",
-        "Access-Control-Allow-Headers":"content-type",
-        "Access-Control-Max-Age":"86400"
-      });
-      return res.end();
-    }
-    if(req.method!=="POST"){ res.writeHead(405,{"content-type":"text/plain"}); return res.end("Method Not Allowed"); }
-
-    const body=await readBody(req);
-    // very light validation
-    if(!body || body.length<2){ res.writeHead(400,{"content-type":"text/plain"}); return res.end("Bad body"); }
-
-    const out=await handleRPC(body);
-    res.writeHead(200,{
-      "content-type":"application/json; charset=utf-8",
-      "cache-control":"no-store",
-      "access-control-allow-origin":"*",
-      "x-solrpc-upstream":out.upstream
-    });
-    return res.end(out.txt);
+    const raw=await readBody(req);
+    if(!raw) return send(res,400,JSON.stringify({error:"Empty body"}));
+    const out=await rpcCall(raw);
+    return send(res,out.ok?200:502,out.txt, out.upstream?{"x-solrpc-upstream":out.upstream}:undefined);
   }catch(e){
-    res.writeHead(502,{"content-type":"application/json; charset=utf-8","cache-control":"no-store","access-control-allow-origin":"*"});
-    return res.end(JSON.stringify({jsonrpc:"2.0",id:1,error:{message:String(e&&e.message||e)}}));
+    return send(res,500,JSON.stringify({error:"proxy error",message:""+e}));
   }
 });
 
-const port=process.env.PORT||"12703";
-srv.listen(Number(port),"127.0.0.1",()=>console.log("solrpc proxy on 127.0.0.1:"+port));
+s.listen(PORT,HOST,()=>console.log("solrpc-proxy listening on",HOST+":"+PORT));
 JS
 
-echo "[3] Systemd service (Restart=always)"
-cat >"$SVC" <<EOF
+cat >"$UNIT" <<EOF
 [Unit]
-Description=FireInners Solana JSON-RPC proxy (CORS-safe, failover)
+Description=FireInners Solana RPC Proxy (CORS + Failover)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=$APPDIR
+WorkingDirectory=$PROXY_DIR
+Environment=HOST=127.0.0.1
 Environment=PORT=$PORT
-ExecStart=/usr/bin/node $APPDIR/server.js
+ExecStart=/usr/bin/node $PROXY_DIR/server.js
 Restart=always
 RestartSec=2
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=$APPDIR
-AmbientCapabilities=
-CapabilityBoundingSet=
-LockPersonality=true
-MemoryDenyWriteExecute=false
 
 [Install]
 WantedBy=multi-user.target
@@ -144,91 +146,87 @@ EOF
 
 systemctl daemon-reload
 systemctl enable --now fireinners-solrpc-proxy.service
-systemctl restart fireinners-solrpc-proxy.service
+systemctl --no-pager --full status fireinners-solrpc-proxy.service | sed -n '1,12p' || true
 
-echo "[4] Nginx snippet + inject include into vhost (safe)"
-cat >"$SNIP" <<EOF
-# $MARK_SNIP
-location /solrpc {
-  proxy_pass http://127.0.0.1:$PORT;
-  proxy_http_version 1.1;
-  proxy_set_header Host \$host;
-  proxy_set_header X-Real-IP \$remote_addr;
-  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto \$scheme;
-  proxy_connect_timeout 5s;
-  proxy_send_timeout 15s;
-  proxy_read_timeout 15s;
-  client_max_body_size 2m;
-}
-EOF
+echo "[3] Patch nginx vhost (safe chattr -i/+i)"
+chattr -i "$NGINX_CONF" "$VHOST" 2>/dev/null || true
 
-# inject include only if not present
-python3 - <<'PY'
-import pathlib,re
-v=pathlib.Path("/etc/nginx/sites-available/fireinners.online-ssl")
-s=v.read_text(encoding="utf-8",errors="ignore")
-if "fireinners-solrpc.conf" in s:
-  print("OK include already present")
-  raise SystemExit(0)
-inc='include /etc/nginx/snippets/fireinners-solrpc.conf;'
-# try to insert inside server block near other locations; simplest: before last "}" of file
-m=re.search(r"\n}\s*$",s)
+if ! grep -q "location /solrpc" "$VHOST"; then
+  python3 - <<'PY'
+import re,sys
+p=sys.argv[1]
+s=open(p,'r',encoding='utf-8',errors='ignore').read().splitlines(True)
+
+block = r'''
+    # FIREINNERS_SOLRPC_PROXY_v1
+    location /solrpc {
+        proxy_pass http://127.0.0.1:12703;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        add_header Access-Control-Allow-Origin "*" always;
+        add_header Access-Control-Allow-Methods "GET, POST, OPTIONS" always;
+        add_header Access-Control-Allow-Headers "Content-Type, Authorization" always;
+        if ($request_method = OPTIONS) { return 204; }
+    }
+'''.lstrip("\n")
+
+# Insert before last "}" of the first server block (best-effort)
+out=[]
+server_open=0
+inserted=False
+for i,line in enumerate(s):
+    if re.search(r'^\s*server\s*\{', line): server_open+=1
+    out.append(line)
+# If already inserted nothing to do
+if inserted: pass
+
+txt="".join(out)
+# naive insert near end of first server { ... }
+m=list(re.finditer(r'^\s*server\s*\{', txt, re.M))
 if not m:
-  s+=("\n"+inc+"\n")
-else:
-  s=s[:m.start()]+"\n  "+inc+"\n"+s[m.start():]
-v.write_text(s,encoding="utf-8")
-print("OK injected include")
+    raise SystemExit("No server { found in vhost")
+start=m[0].start()
+# find matching close brace for first server block (simple stack)
+stack=0
+end=None
+for j,ch in enumerate(txt[start:], start):
+    if ch=="{": stack+=1
+    elif ch=="}":
+        stack-=1
+        if stack==0:
+            end=j
+            break
+if end is None:
+    raise SystemExit("No matching } for first server block")
+newtxt = txt[:end] + "\n" + block + "\n" + txt[end:]
+open(p,'w',encoding='utf-8').write(newtxt)
+print("OK inserted /solrpc block")
 PY
+"$VHOST"
+else
+  echo "OK /solrpc already present"
+fi
 
-# handle immutable vhost safely
-WASI="0"
-if has_i "$VHOST"; then WASI="1"; un_i "$VHOST"; fi
 nginx -t
 systemctl reload nginx
-if [ "$WASI" = "1" ]; then re_i "$VHOST"; fi
 
-echo "[5] Patch wallet page to use /solrpc (no browser CORS)"
+chattr +i "$NGINX_CONF" "$VHOST" 2>/dev/null || true
+
+echo "[4] Write wallet page to use /solrpc (same-origin)"
 mkdir -p "$WALLET_DIR"
-TMPW="$(mktemp)"
-cat >"$TMPW" <<'HTML'
-<!doctype html><html lang="fr"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/><title>FireInners • Wallet</title><style>:root{--bg:#070a14;--p:#0b1020;--b:rgba(255,255,255,.14);--t:#e9f1ff;--m:#9fb3d7;--a:#7dd3ff}*{box-sizing:border-box}html,body{height:100%;margin:0;background:radial-gradient(900px 520px at 15% 0%,rgba(64,120,255,.22),transparent 60%),radial-gradient(700px 450px at 85% 20%,rgba(0,240,255,.12),transparent 55%),var(--bg);color:var(--t);font:14px system-ui}a{color:var(--a);text-decoration:none}#wrap{max-width:980px;margin:28px auto;padding:18px}#top{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}h1{margin:0 0 4px 0;font-size:18px;letter-spacing:.2px}p{margin:0;color:var(--m)}#pill a{display:inline-block;border:1px solid var(--b);padding:8px 12px;border-radius:999px;background:rgba(0,0,0,.12)}#row{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}button{cursor:pointer;border:1px solid var(--b);background:rgba(255,255,255,.06);color:var(--t);padding:10px 12px;border-radius:12px;font-weight:700}button:disabled{opacity:.45;cursor:not-allowed}button:hover{border-color:rgba(255,255,255,.28)}#grid{display:grid;grid-template-columns:1.2fr .8fr;gap:12px;margin-top:12px}#card{border:1px solid var(--b);background:linear-gradient(180deg,rgba(255,255,255,.06),rgba(0,0,0,.08));border-radius:16px;padding:14px}#k{display:block;color:var(--m);font-size:12px;margin-bottom:6px}#addr,#rpcSol,#rpcUsdc{font-family:ui-monospace,Menlo,Consolas,monospace;word-break:break-all}#vals{display:grid;grid-template-columns:1fr 1fr;gap:10px}#box{border:1px solid var(--b);border-radius:14px;background:rgba(0,0,0,.10);padding:12px}#box h2{margin:0 0 6px 0;font-size:12px;color:var(--m);font-weight:800;letter-spacing:.4px}#box .v{font-size:18px;font-weight:900}#log{margin-top:12px;height:260px;overflow:auto;white-space:pre-wrap;border:1px solid var(--b);border-radius:14px;background:rgba(0,0,0,.12);padding:12px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}</style></head><body><div id="wrap"><div id="top"><div><h1>FireInners • Wallet</h1><p>Lecture soldes via Phantom + proxy RPC (même origine). Aucun secret, aucune seed, aucun export.</p></div><div id="pill"><a href="/">Retour</a></div></div><div id="row"><button id="btnConnect">Connect</button><button id="btnDisc" disabled>Disconnect</button><button id="btnRefresh" disabled>Refresh</button></div><div id="grid"><div id="card"><div style="display:grid;gap:10px"><div><span id="k">Adresse</span><div id="addr">—</div></div><div><span id="k">RPC (SOL)</span><div id="rpcSol">/solrpc</div></div><div><span id="k">RPC (USDC)</span><div id="rpcUsdc">/solrpc</div></div></div></div><div id="card"><div id="vals"><div id="box"><h2>SOL</h2><div class="v" id="sol">—</div></div><div id="box"><h2>USDC</h2><div class="v" id="usdc">—</div></div></div></div></div><div id="log"></div></div><script src="https://cdnjs.cloudflare.com/ajax/libs/buffer/6.0.3/buffer.min.js"></script><script>window.globalThis=window.globalThis||window;window.global=window.globalThis;window.process=window.process||{env:{}};window.Buffer=window.Buffer||buffer.Buffer;</script><script src="https://unpkg.com/@solana/web3.js@1.98.0/lib/index.iife.min.js"></script><script>(()=>{const RPC="/solrpc";const USDC_MINT="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1";const $=s=>document.querySelector(s);const logEl=$("#log");const log=m=>{const t=String(m||"");logEl.textContent+=(t+(t.endsWith("\n")?"":"\n"));logEl.scrollTop=logEl.scrollHeight};const fmt=(n,d)=>{try{return (Number(n)||0).toLocaleString(undefined,{maximumFractionDigits:d})}catch(e){return String(n)}};const setTxt=(id,v)=>{const el=$(id);if(el)el.textContent=v};let pub=null,conn=null;const sleep=t=>new Promise(r=>setTimeout(r,t));async function rpcPost(method,params){const res=await fetch(RPC,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({jsonrpc:"2.0",id:1,method,params})});const j=await res.json().catch(()=>null);if(!res.ok||!j||j.error)throw new Error((j&&j.error&&j.error.message)||("HTTP "+res.status));return j.result;}async function getUSDC(owner){for(let k=0;k<4;k++){try{const r=await rpcPost("getTokenAccountsByOwner",[owner,{mint:USDC_MINT},{encoding:"jsonParsed"}]);let sum=0;for(const it of (r.value||[])){const ui=it.account?.data?.parsed?.info?.tokenAmount?.uiAmount;sum+=Number(ui||0)}return sum}catch(e){await sleep(250*(k+1))}}throw new Error("USDC proxy retries exhausted")}async function refresh(){if(!pub)return;try{const c=conn||(conn=new solanaWeb3.Connection(RPC,{commitment:"confirmed"}));const lam=await c.getBalance(new solanaWeb3.PublicKey(pub),"confirmed");setTxt("#sol",fmt(lam/1e9,6));}catch(e){log("SOL ERR: "+(e?.message||e));}try{const u=await getUSDC(pub);setTxt("#usdc",fmt(u,2));log("USDC OK");}catch(e){log("USDC ERR: "+(e?.message||e));}}async function connect(){try{const ph=window.solana;if(!ph||!ph.isPhantom){log("Phantom introuvable.");return}const r=await ph.connect();pub=r?.publicKey?.toBase58?.()||String(r?.publicKey||"");if(!pub){log("CONNECT ERR: no pubkey");return}setTxt("#addr",pub);$("#btnDisc").disabled=false;$("#btnRefresh").disabled=false;log("CONNECTED");await refresh();}catch(e){log("CONNECT ERR: "+(e?.message||e));}}async function disconnect(){try{const ph=window.solana;if(ph&&ph.disconnect)await ph.disconnect()}catch(e){}pub=null;conn=null;setTxt("#addr","—");setTxt("#sol","—");setTxt("#usdc","—");$("#btnDisc").disabled=true;$("#btnRefresh").disabled=true;log("DISCONNECTED")}$("#btnConnect").onclick=connect;$("#btnDisc").onclick=disconnect;$("#btnRefresh").onclick=refresh;log("READY");})();</script><!-- FIREINNERS_WALLET_PAGE_v2_SOLRPC --></body></html>
+cat >"$WALLET_HTML" <<'HTML'
+<!doctype html><html lang="fr"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>FireInners • Wallet</title><style>:root{--bg:#070a12;--p:#0c1222;--l:#22324d;--t:#e7f0ff;--m:#9fb3d7;--a:#ff7a18}*{box-sizing:border-box}html,body{margin:0;height:100%;background:radial-gradient(900px 500px at 20% 0%,#0a1328 0%,transparent 60%),radial-gradient(700px 450px at 80% 20%,#101a33 0%,transparent 55%),var(--bg);color:var(--t);font:14px system-ui}#wrap{max-width:1050px;margin:18px auto;padding:0 14px}#top{display:flex;justify-content:space-between;align-items:center;gap:12px}h1{margin:0;font-size:18px;letter-spacing:.3px}#pill a{color:var(--t);text-decoration:none;padding:7px 10px;border:1px solid rgba(255,255,255,.15);border-radius:999px;background:rgba(0,0,0,.18)}#sub{color:var(--m);margin:6px 0 12px 0}#grid{display:grid;grid-template-columns:1.2fr .8fr;gap:12px;margin-top:12px}#card{background:linear-gradient(180deg,rgba(255,255,255,.04),rgba(255,255,255,.02));border:1px solid rgba(255,255,255,.12);border-radius:16px;padding:14px}#row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}button{cursor:pointer;border:1px solid rgba(255,255,255,.16);background:rgba(0,0,0,.18);color:var(--t);padding:9px 12px;border-radius:12px;font:600 13px system-ui}button:hover{border-color:rgba(255,255,255,.28)}.muted{color:var(--m)}.k{display:block;font-size:12px;color:var(--m)}.v{margin-top:2px;font:600 13px ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap;word-break:break-all}#log{margin-top:10px;height:160px;overflow:auto;padding:10px;border:1px solid rgba(255,255,255,.12);border-radius:12px;background:rgba(0,0,0,.22);font:12px ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap}.big{font:700 22px system-ui}#vals{display:grid;gap:12px}#vals .box{display:grid;gap:6px}#vals .box .big{letter-spacing:.2px}@media(max-width:900px){#grid{grid-template-columns:1fr}}</style></head><body><div id="wrap"><div id="top"><div id="mini"><h1>FireInners • Wallet</h1><div id="sub">Lecture soldes via Phantom + proxy RPC (/solrpc). Aucun secret, aucune seed, aucun export.</div></div><div id="pill"><a href="/">Retour</a></div></div><div id="row"><button id="btnConnect">Connect</button><button id="btnDisc" disabled>Disconnect</button><button id="btnRefresh" disabled>Refresh</button></div><div id="grid"><div id="card"><div class="box"><span class="k">Adresse</span><div id="addr" class="v">—</div></div><div style="height:10px"></div><div class="box"><span class="k">RPC (SOL/USDC)</span><div id="rpc" class="v muted">/solrpc</div></div><div style="height:10px"></div><div class="box"><span class="k">Log</span><div id="log"></div></div></div><div id="card"><div id="vals"><div class="box"><span class="k">SOL</span><div id="sol" class="big">—</div></div><div class="box"><span class="k">USDC</span><div id="usdc" class="big">—</div></div></div></div></div></div><script src="https://unpkg.com/@solana/web3.js@1.98.0/lib/index.iife.min.js"></script><script>(()=>{const RPC="/solrpc",USDC_MINT="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1",TOKEN_PROGRAM="TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";const $=s=>document.querySelector(s);const log=(t)=>{const el=$("#log");el.textContent+=(t+(t.endsWith("\n")?"":"\n"));el.scrollTop=el.scrollHeight};const fmt=(n,dp=6)=>{try{const x=Number(n||0);return x.toLocaleString(undefined,{maximumFractionDigits:dp})}catch(_){return ""+n}};let pub=null,conn=null;const mkConn=()=>new solanaWeb3.Connection(RPC,{commitment:"confirmed"});const getUSDC=async(pk)=>{const c=mkConn();const resp=await c.getParsedTokenAccountsByOwner(pk,{mint:new solanaWeb3.PublicKey(USDC_MINT)});let sum=0;for(const it of (resp.value||[])){const a=it.account?.data?.parsed?.info?.tokenAmount;const amt=a?.amount,dec=a?.decimals; if(amt!=null&&dec!=null) sum+=Number(amt)/Math.pow(10,Number(dec));}return sum};const refresh=async()=>{if(!pub) return;$("#sol").textContent="…";$("#usdc").textContent="…";try{conn=mkConn();const lam=await conn.getBalance(pub,"confirmed");$("#sol").textContent=fmt(lam/1e9,6);try{const u=await getUSDC(pub);$("#usdc").textContent=fmt(u,6)}catch(e){$("#usdc").textContent="ERR";log("USDC ERR: "+(e?.message||e))}log("REFRESH OK")}catch(e){log("REFRESH ERR: "+(e?.message||e))}};const connect=async()=>{try{log("READY");const ph=window.solana;if(!ph||!ph.isPhantom){log("Phantom introuvable.");return}const r=await ph.connect();pub=r.publicKey;$("#addr").textContent=pub.toBase58();$("#btnDisc").disabled=false;$("#btnRefresh").disabled=false;log("CONNECTED");await refresh()}catch(e){log("CONNECT ERR: "+(e?.message||e))}};const disconnect=async()=>{try{const ph=window.solana;if(ph&&ph.disconnect) await ph.disconnect()}catch(_){ }pub=null;conn=null;$("#addr").textContent="—";$("#sol").textContent="—";$("#usdc").textContent="—";$("#btnDisc").disabled=true;$("#btnRefresh").disabled=true;log("DISCONNECTED")};$("#btnConnect").onclick=connect;$("#btnDisc").onclick=disconnect;$("#btnRefresh").onclick=refresh;log("READY")})();</script></body></html>
 HTML
 
-# safe write wallet
-WASI2="0"
-if [ -f "$WALLET_HTML" ] && has_i "$WALLET_HTML"; then WASI2="1"; un_i "$WALLET_HTML"; fi
-cp -f "$TMPW" "$WALLET_HTML"
-chmod 0644 "$WALLET_HTML" || true
-if [ "$WASI2" = "1" ]; then re_i "$WALLET_HTML"; fi
-rm -f "$TMPW"
-
-echo "[6] Ensure Wallet button exists on main page"
-python3 - <<'PY'
-import pathlib,re
-p=pathlib.Path("/opt/fireinners/frontend-react/app/dist/index.html")
-s=p.read_text(encoding="utf-8",errors="ignore")
-if "FIREINNERS_WALLET_TAB_v1" in s:
-  print("OK wallet button already present")
-  raise SystemExit(0)
-ins='<!-- FIREINNERS_WALLET_TAB_v1 --><a href="/wallet/" style="position:fixed;right:16px;top:16px;z-index:9999;padding:10px 14px;border-radius:999px;border:1px solid rgba(255,255,255,.18);background:rgba(0,0,0,.22);color:#e9f1ff;font:700 13px system-ui;backdrop-filter:blur(8px);text-decoration:none">Wallet</a>'
-m=re.search(r"</body\s*>",s,flags=re.I)
-s=(s+ins) if not m else (s[:m.start()]+ins+s[m.start():])
-p.write_text(s,encoding="utf-8")
-print("OK injected")
-PY
-
-echo "[7] Reload nginx + verify"
-nginx -t
-systemctl reload nginx
-echo "OK nginx reload"
-
-echo "[8] Local test (proxy)"
-curl -sS -X POST "http://127.0.0.1:$PORT" -H "content-type: application/json" --data '{"jsonrpc":"2.0","id":1,"method":"getHealth","params":[]}' | head -c 200 || true
+echo "[5] Quick verify"
+ls -la "$WALLET_DIR" | head -n 6 || true
+grep -n "FIREINNERS_SOLRPC_PROXY_v1" "$VHOST" || true
+curl -sS -X GET "http://127.0.0.1:$PORT/ping" || true
 echo
 echo "DONE"
-echo "Test: https://fireinners.online/wallet/"
+echo "Test:"
+echo "  https://fireinners.online/wallet/"
+echo "  (Proxy endpoint: https://fireinners.online/solrpc  POST only; ping via localhost)"
 SH
-chmod +x /root/FIREINNERS_WALLET_SOLRPC_MEGA.sh
-bash /root/FIREINNERS_WALLET_SOLRPC_MEGA.sh
+chmod +x /root/FIREINNERS_WALLET_USDC_FIX_MEGA.sh
+bash /root/FIREINNERS_WALLET_USDC_FIX_MEGA.sh
