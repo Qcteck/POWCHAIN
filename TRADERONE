@@ -1,165 +1,86 @@
-cat >/tmp/wolfchain_fix_backend_stats.sh <<'SH'
+cat >/tmp/wolverine_remove_buttons.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 
 ASKLIB="/opt/fireinners/sentinel/lib/askorupdate.sh"
+VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
+ROOT="/opt/fireinners/frontend-react/app/dist"
+
+# try to auto-detect root from nginx vhost
+if [ -f "$VHOST" ]; then
+  R="$(awk 'BEGIN{r=""} /^[ \t]*root[ \t]+/ {gsub(/;$/,"",$2); if(r=="") r=$2} END{print r}' "$VHOST")"
+  [ -n "${R:-}" ] && ROOT="$R"
+fi
+
+WOLV="$ROOT/wolverine/index.html"
+[ -f "$WOLV" ] || { echo "ERR: introuvable $WOLV"; exit 1; }
 
 ts(){ date +"%Y%m%d-%H%M%S"; }
-say(){ echo "== $* =="; }
-die(){ echo "ERR: $*"; exit 1; }
+bk(){ cp -a "$1" "$1.bak.$(ts)" && echo "backup: $1.bak.$(ts)"; }
 
-pid_from_3000(){
-  ss -lntp 2>/dev/null | awk '/:3000[[:space:]]/ && /users:\(\("node"/{
-    if(match($0,/pid=([0-9]+)/,m)){print m[1]; exit}
-  }'
-}
+echo "ROOT=$ROOT"
+echo "WOLV=$WOLV"
 
-cmdline_of(){
-  tr '\0' ' ' </proc/"$1"/cmdline 2>/dev/null || true
-}
+# use askorupdate if available (safe write), else edit in-place
+if [ -f "$ASKLIB" ]; then
+  # shellcheck disable=SC1090
+  source "$ASKLIB"
+  export ASKORUPDATE_ASK=0
+  tmp="/tmp/wolverine.index.patched.$$"
+  cp -a "$WOLV" "$tmp"
+  python3 - "$tmp" <<'PY'
+import re,sys
+p=sys.argv[1]
+s=open(p,"r",encoding="utf-8",errors="ignore").read()
 
-script_from_cmdline(){
-  # return first *.js arg after node
-  echo "$1" | awk '{
-    for(i=1;i<=NF;i++){
-      if($i ~ /node($|\/)/){
-        for(j=i+1;j<=NF;j++){
-          if($j ~ /\.js$/){print $j; exit}
-        }
-      }
-    }
-  }'
-}
+# remove anchors (tiles/buttons) by href
+targets=[r'/',r'/dex/',r'/bridge/',r'/explorer/',r'/mining/']
+for t in targets:
+  # exact "/" only (avoid killing other absolute urls): match href="/" or href="/index.html"
+  if t==r'/':
+    s=re.sub(r'<a\b[^>]*\bhref=["\']/(?:index\.html)?["\'][^>]*>.*?</a>','',s,flags=re.I|re.S)
+    s=re.sub(r'<button\b[^>]*(?:onclick=["\'][^"\']*/(?:index\.html)?[^"\']*["\'])[^>]*>.*?</button>','',s,flags=re.I|re.S)
+  else:
+    s=re.sub(rf'<a\b[^>]*\bhref=["\']{re.escape(t)}["\'][^>]*>.*?</a>','',s,flags=re.I|re.S)
+    # also remove any inline-nav objects containing that href (JS arrays)
+    s=re.sub(rf'\{{[^{{}}]*?(?:href|url)\s*:\s*["\']{re.escape(t)}["\'][^{{}}]*?\}}\s*,?','',s,flags=re.I|re.S)
 
-unit_from_pid(){
-  local PID="$1"
-  # find systemd service whose MainPID == PID
-  systemctl list-units --type=service --all --no-legend 2>/dev/null | awk '{print $1}' | while read -r u; do
-    mp="$(systemctl show -p MainPID --value "$u" 2>/dev/null || true)"
-    if [ "$mp" = "$PID" ]; then echo "$u"; break; fi
-  done
-}
+# clean empty wrappers / double separators
+s=re.sub(r'\n{3,}','\n\n',s)
+s=re.sub(r'>\s+<','><',s)
 
-backup(){
-  local f="$1"
-  [ -f "$f" ] || return 0
-  cp -a "$f" "$f.bak.$(ts)"
-  echo "backup: $f.bak.$(ts)"
-}
-
-patch_file_add_stats(){
-  local f="$1"
-  # if already present, skip
-  if grep -qE "app\.get\(['\"]/stats['\"]" "$f" 2>/dev/null; then
-    echo "already has /stats in $f"
-    return 0
-  fi
-
-  python3 - <<PY
-from pathlib import Path
-p=Path("$f")
-s=p.read_text(encoding="utf-8",errors="ignore")
-
-route = r"""
-// --- WOLFCHAIN_STATS_ROUTE_V1 ---
-try{
-  const _json=(o)=>{ try{return JSON.stringify(o)}catch(e){return '{"ok":true}'} };
-  if(typeof app!=="undefined" && app && app.get){
-    app.get("/stats",(req,res)=>{
-      res.setHeader("Cache-Control","no-store");
-      res.setHeader("Content-Type","application/json; charset=utf-8");
-      res.end(_json({ok:true,service:"WOLFCHAIN",ts:Date.now(),path:req.path,ip:req.ip||null}));
-    });
-  }
-}catch(e){}
-// --- /WOLFCHAIN_STATS_ROUTE_V1 ---
-"""
-
-# insert before app.listen(...) if found, else at end
-import re
-m=re.search(r"\bapp\.listen\s*\(", s)
-if m:
-  i=m.start()
-  out=s[:i].rstrip()+"\n"+route+"\n\n"+s[i:]
-else:
-  out=s.rstrip()+"\n"+route+"\n"
-
-p.write_text(out,encoding="utf-8")
+open(p,"w",encoding="utf-8").write(s)
 print("patched:",p)
 PY
-}
+  bk "$WOLV"
+  askorupdate_file "$WOLV" "$tmp"
+  rm -f "$tmp" 2>/dev/null || true
+else
+  bk "$WOLV"
+  python3 - "$WOLV" <<'PY'
+import re,sys
+p=sys.argv[1]
+s=open(p,"r",encoding="utf-8",errors="ignore").read()
 
-restart_unit_or_pid(){
-  local UNIT="$1" PID="$2"
-  if [ -n "${UNIT:-}" ]; then
-    say "RESTART systemd unit $UNIT"
-    systemctl restart "$UNIT"
-    sleep 1
-    systemctl --no-pager --full status "$UNIT" | sed -n '1,25p' || true
-  else
-    echo "WARN: unit not found for pid=$PID"
-    echo "Try manual restart:"
-    echo "  kill $PID  (if systemd/pm2 will restart it)"
-  fi
-}
+targets=[r'/',r'/dex/',r'/bridge/',r'/explorer/',r'/mining/']
+for t in targets:
+  if t==r'/':
+    s=re.sub(r'<a\b[^>]*\bhref=["\']/(?:index\.html)?["\'][^>]*>.*?</a>','',s,flags=re.I|re.S)
+    s=re.sub(r'<button\b[^>]*(?:onclick=["\'][^"\']*/(?:index\.html)?[^"\']*["\'])[^>]*>.*?</button>','',s,flags=re.I|re.S)
+  else:
+    s=re.sub(rf'<a\b[^>]*\bhref=["\']{re.escape(t)}["\'][^>]*>.*?</a>','',s,flags=re.I|re.S)
+    s=re.sub(rf'\{{[^{{}}]*?(?:href|url)\s*:\s*["\']{re.escape(t)}["\'][^{{}}]*?\}}\s*,?','',s,flags=re.I|re.S)
 
-main(){
-  [ "$(id -u)" -eq 0 ] || die "run as root"
+s=re.sub(r'\n{3,}','\n\n',s)
+s=re.sub(r'>\s+<','><',s)
 
-  say "FIND node PID on :3000"
-  PID="$(pid_from_3000 || true)"
-  [ -n "${PID:-}" ] || die "no node pid found on port 3000"
-  echo "PID=$PID"
+open(p,"w",encoding="utf-8").write(s)
+print("patched:",p)
+PY
+fi
 
-  say "CMDLINE"
-  CMD="$(cmdline_of "$PID")"
-  echo "$CMD"
-  [ -n "${CMD:-}" ] || die "cannot read cmdline for pid $PID"
-
-  say "DETECT script .js"
-  JS="$(script_from_cmdline "$CMD" || true)"
-  [ -n "${JS:-}" ] || die "cannot find *.js in cmdline"
-  # normalize relative path
-  if [ "${JS:0:1}" != "/" ]; then
-    # attempt cwd
-    CWD="$(readlink -f /proc/"$PID"/cwd 2>/dev/null || true)"
-    [ -n "${CWD:-}" ] || CWD="/root"
-    JS="$(readlink -f "$CWD/$JS" 2>/dev/null || echo "$CWD/$JS")"
-  fi
-  echo "JS=$JS"
-  [ -f "$JS" ] || die "script not found: $JS"
-
-  say "FIND systemd unit (optional)"
-  UNIT="$(unit_from_pid "$PID" || true)"
-  echo "UNIT=${UNIT:-none}"
-
-  say "BACKUP script"
-  backup "$JS"
-
-  say "PATCH: add GET /stats"
-  if [ -f "$ASKLIB" ]; then
-    # use askorupdate safe update (no prompts)
-    # shellcheck disable=SC1090
-    source "$ASKLIB"
-    export ASKORUPDATE_ASK=0
-    tmp="/tmp/$(basename "$JS").patched.$$"
-    cp -a "$JS" "$tmp"
-    patch_file_add_stats "$tmp"
-    askorupdate_file "$JS" "$tmp"
-    rm -f "$tmp" 2>/dev/null || true
-  else
-    patch_file_add_stats "$JS"
-  fi
-
-  say "RESTART backend"
-  restart_unit_or_pid "${UNIT:-}" "$PID"
-
-  say "TEST direct backend /stats"
-  curl -sS -i http://127.0.0.1:3000/stats | sed -n '1,25p' || true
-
-  echo
-  echo "DONE"
-}
-main "$@"
+nginx -t
+systemctl reload nginx
+echo "OK: WOLVERINE cleaned (home/dex/bridge/explorer/mining removed)"
 SH
-bash /tmp/wolfchain_fix_backend_stats.sh
+bash /tmp/wolverine_remove_buttons.sh
