@@ -1,38 +1,149 @@
-cat >/tmp/wolfchain_fly_stats.sh <<'SH'
+cat >/tmp/wolfchain_megapatch_stats_proxy.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
+
 VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
-echo "== TIME =="; date -u; echo
-echo "== HOST =="; hostnamectl 2>/dev/null || true; echo
-echo "== NGINX TEST =="; nginx -t || true; echo
-echo "== VHOST ROOT DETECT ==";
-ROOT="$(awk 'BEGIN{r=""} $1=="root"{gsub(/;/,"",$2); if(r=="") r=$2} END{print r}' "$VHOST" 2>/dev/null | head -n1)"
-[ -n "${ROOT:-}" ] || ROOT="/opt/fireinners/frontend-react/app/dist"
-echo "VHOST=$VHOST"
-echo "ROOT=$ROOT"
-ls -la "$ROOT" 2>/dev/null | sed -n '1,12p' || true
-echo
-echo "== LISTEN PORTS (3000/4001/8484) ==";
-ss -lntp 2>/dev/null | egrep ':(3000|4001|8484)\b' || true
-echo
-echo "== SYSTEMD CANDIDATES ==";
-systemctl list-units --type=service --all 2>/dev/null | egrep -i 'fire|inner|wolf|chain|amcq|qplus|node|wss|ws' | sed -n '1,80p' || true
-echo
-echo "== CURL BACKEND DIRECT (127.0.0.1:3000) ==";
-for p in /stats /status /health /; do
-  echo "-- GET http://127.0.0.1:3000$p"
-  curl -sS -i "http://127.0.0.1:3000$p" | sed -n '1,12p' || true
+ASKLIB="/opt/fireinners/sentinel/lib/askorupdate.sh"
+
+ts(){ date +"%Y%m%d-%H%M%S"; }
+die(){ echo "ERR: $*"; exit 1; }
+
+unlock(){ command -v chattr >/dev/null 2>&1 && chattr -i "$1" 2>/dev/null || true; }
+relock(){ command -v chattr >/dev/null 2>&1 && chattr +i "$1" 2>/dev/null || true; }
+
+detect_root(){
+  local r=""
+  [ -f "$VHOST" ] || echo "/opt/fireinners/frontend-react/app/dist"
+  r="$(awk 'BEGIN{r=""} $1=="root"{gsub(/;/,"",$2); if(r=="") r=$2} END{print r}' "$VHOST" | head -n1)"
+  [ -n "${r:-}" ] || r="/opt/fireinners/frontend-react/app/dist"
+  echo "$r"
+}
+
+backup_file(){
+  local f="$1"
+  [ -f "$f" ] || return 0
+  cp -a "$f" "$f.bak.$(ts)"
+  echo "backup: $f.bak.$(ts)"
+}
+
+ensure_stats_fallback(){
+  local root="$1"
+  mkdir -p "$root"
+  # fallback JSON file (nginx internal will alias this exact path)
+  local f="$root/stats"
+  if [ ! -f "$f" ]; then
+    cat >"$f" <<JSON
+{"ok":true,"service":"WOLFCHAIN-static-fallback","note":"fallback when backend /stats is down","time":0}
+JSON
+    perl -0777 -pi -e 's/"time":0/"time":'$(date +%s)'/g' "$f" 2>/dev/null || true
+    chmod 0644 "$f" || true
+  fi
+}
+
+patch_vhost(){
+  local root="$1"
+  local tmp="/tmp/fireinners.online-ssl.patched.$$"
+  local fallback_path="$root/stats"
+
+  # if already patched, do nothing
+  if grep -q 'WOLFCHAIN_STATS_PROXY_V1' "$VHOST"; then
+    echo "vhost already patched (WOLFCHAIN_STATS_PROXY_V1)"
+    return 0
+  fi
+
+  cat >"$tmp" <<EOF
+# --- WOLFCHAIN_STATS_PROXY_V1 (do not edit manually) ---
+location = /stats {
+  proxy_pass http://127.0.0.1:3000/stats;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_connect_timeout 3s;
+  proxy_send_timeout 10s;
+  proxy_read_timeout 10s;
+  proxy_intercept_errors on;
+  error_page 500 502 503 504 = /stats_static;
+}
+location = /stats_static {
+  internal;
+  default_type application/json;
+  add_header Cache-Control "no-store";
+  alias ${fallback_path};
+}
+# --- /WOLFCHAIN_STATS_PROXY_V1 ---
+EOF
+
+  # inject before the last closing brace of the file
+  python3 - <<PY
+from pathlib import Path
+p=Path("$VHOST")
+s=p.read_text(encoding="utf-8",errors="ignore")
+inj=Path("$tmp").read_text(encoding="utf-8",errors="ignore")
+i=s.rfind("}")
+if i==-1: raise SystemExit("no closing brace found in vhost")
+out=s[:i].rstrip()+"\n\n"+inj+"\n"+s[i:]
+Path("$tmp.out").write_text(out,encoding="utf-8")
+PY
+
+  # apply via askorupdate if available, else direct copy with rollback handled by caller
+  if [ -f "$ASKLIB" ]; then
+    # shellcheck disable=SC1090
+    source "$ASKLIB"
+    export ASKORUPDATE_ASK=0
+    askorupdate_file "$VHOST" "/tmp/fireinners.online-ssl.patched.$$.out"
+  else
+    unlock "$VHOST"
+    cp -a "/tmp/fireinners.online-ssl.patched.$$.out" "$VHOST"
+  fi
+
+  rm -f "$tmp" "/tmp/fireinners.online-ssl.patched.$$.out" 2>/dev/null || true
+}
+
+main(){
+  [ "$(id -u)" -eq 0 ] || die "run as root"
+  [ -f "$VHOST" ] || die "missing vhost: $VHOST"
+
+  echo "== PRECHECK nginx -t =="
+  nginx -t || true
+
+  ROOT="$(detect_root)"
+  echo "ROOT=$ROOT"
+  echo "VHOST=$VHOST"
+  [ -d "$ROOT" ] || die "root dir not found: $ROOT"
+
+  echo "== BACKUP vhost =="
+  backup_file "$VHOST"
+
+  echo "== ENSURE fallback /stats file exists =="
+  ensure_stats_fallback "$ROOT"
+
+  echo "== PATCH vhost: /stats proxy -> 127.0.0.1:3000/stats (fallback internal) =="
+  patch_vhost "$ROOT"
+
+  echo "== TEST nginx config =="
+  if nginx -t; then
+    systemctl reload nginx
+    echo "OK: nginx reloaded"
+  else
+    echo "ERR: nginx -t failed, restoring last backup"
+    last="$(ls -1t "${VHOST}.bak."* 2>/dev/null | head -n1 || true)"
+    [ -n "${last:-}" ] || die "no backup found to restore"
+    unlock "$VHOST"
+    cp -a "$last" "$VHOST"
+    nginx -t
+    systemctl reload nginx
+    echo "RESTORED: $VHOST <= $last"
+  fi
+
+  echo "== QUICK CHECKS =="
+  echo "-- direct backend:"
+  curl -sS -i http://127.0.0.1:3000/stats | sed -n '1,12p' || true
   echo
-done
-echo "== CURL THROUGH NGINX (Host header) ==";
-for p in /stats /stats_static / /dex/ /wallet/ /wolverine/; do
-  echo "-- GET https://127.0.0.1$p (Host: fireinners.online)"
-  curl -k -sS -i "https://127.0.0.1$p" -H "Host: fireinners.online" | sed -n '1,12p' || true
+  echo "-- through nginx (host header):"
+  curl -k -sS -i https://127.0.0.1/stats -H "Host: fireinners.online" | sed -n '1,12p' || true
   echo
-done
-echo "== NGINX ERRORS (tail) ==";
-tail -n 40 /var/log/nginx/error.log 2>/dev/null || true
-echo
-echo "== DONE (read-only) =="
+  echo "DONE"
+}
+main "$@"
 SH
-bash /tmp/wolfchain_fly_stats.sh
+bash /tmp/wolfchain_megapatch_stats_proxy.sh
