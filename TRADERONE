@@ -1,1 +1,128 @@
-curl -sS -H 'content-type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' https://fireinners.online/solrpc && echo
+cat > /root/FIREINNERS_WALLET_POSTFIX_MEGA.sh <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+TS="$(date +%Y%m%d_%H%M%S)"
+BK="/root/backup_fireinners_wallet_postfix_${TS}"
+mkdir -p "$BK"
+if [ "$(id -u)" -ne 0 ]; then echo "ERR: run as root"; exit 1; fi
+
+# find wallet file
+TARGET="/opt/fireinners/frontend-react/app/dist/wallet/index.html"
+if [ ! -f "$TARGET" ]; then
+  CAND="$(find /opt/fireinners -maxdepth 7 -type f -path '*/wallet/*index.html' 2>/dev/null | head -n 1 || true)"
+  if [ -n "${CAND:-}" ] && [ -f "$CAND" ]; then TARGET="$CAND"; else
+    echo "ERR: wallet index.html not found under /opt/fireinners"
+    echo "Try: find /opt/fireinners -maxdepth 8 -type f -iname 'index.html' | grep -i wallet | head"
+    exit 1
+  fi
+fi
+
+echo "[0] target: $TARGET"
+cp -a "$TARGET" "$BK/index.html.bak"
+
+TMP="$(mktemp)"
+cat > "$TMP" <<'HTML'
+<!doctype html><html lang="fr"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>FireInners • Wallet</title><style>:root{--bg:#070a12;--p:#0c1222;--b:rgba(255,255,255,.12);--t:#e7f0ff;--m:#9fb3d7;--ok:#b9ffcf;--bad:#ffb3b3;--a:#9ff;--r:16px}*{box-sizing:border-box}html,body{margin:0;height:100%;background:radial-gradient(900px 500px at 20% 0%,#0a1328 0%,transparent 60%),radial-gradient(700px 450px at 80% 20%,#101a33 0%,transparent 55%),var(--bg);color:var(--t);font:14px system-ui}#wrap{max-width:1050px;margin:0 auto;padding:26px 16px 40px}h1{margin:0 0 4px;font-size:28px;letter-spacing:.3px}#sub{color:var(--m);margin:0 0 14px}#top{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:12px 0 18px}button{border:1px solid var(--b);background:rgba(0,0,0,.18);color:var(--t);padding:10px 14px;border-radius:999px;font-weight:700;cursor:pointer}button:hover{border-color:rgba(255,255,255,.2)}button:disabled{opacity:.45;cursor:not-allowed}#grid{display:grid;grid-template-columns:1.4fr .6fr .6fr;gap:14px}#cardA,#cardS,#cardU,#log{border:1px solid var(--b);background:rgba(0,0,0,.14);border-radius:var(--r);padding:14px}#cardS,#cardU{display:flex;flex-direction:column;justify-content:center;min-height:110px}#lab{color:var(--m);font-weight:700;margin-bottom:6px}#addr,#rpcs{word-break:break-all;font-family:ui-monospace,Menlo,Consolas,monospace}#valS,#valU{font-size:26px;font-weight:900}#log{margin-top:14px;min-height:220px;white-space:pre-wrap;font-family:ui-monospace,Menlo,Consolas,monospace}#row2{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-top:8px}a{color:var(--a);text-decoration:none}#ret{margin-left:auto}</style></head><body><div id="wrap"><div id="row2"><div><h1>FireInners • Wallet</h1><div id="sub">Lecture soldes via Phantom + Solana RPC. Aucun secret, aucune seed, aucun export.</div></div><button id="ret" onclick="history.back()">Retour</button></div><div id="top"><button id="btnConnect">Connect</button><button id="btnDisc" disabled>Disconnect</button><button id="btnRef" disabled>Refresh</button></div><div id="grid"><div id="cardA"><div id="lab">Adresse</div><div id="addr">—</div><div style="height:10px"></div><div id="lab">RPC (SOL)</div><div id="rpcs">—</div><div style="height:10px"></div><div id="lab">RPC (USDC)</div><div id="rpcu">—</div></div><div id="cardS"><div id="lab">SOL</div><div id="valS">—</div></div><div id="cardU"><div id="lab">USDC</div><div id="valU">—</div></div></div><div id="log">READY</div></div><script>
+(()=>{"use strict";
+const USDC_MINT="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1";
+const RPC=location.origin+"/solrpc";
+const $=s=>document.querySelector(s);
+const logEl=$("#log"),addrEl=$("#addr"),rpcSolEl=$("#rpcs"),rpcUsdEl=$("#rpcu"),solEl=$("#valS"),usdcEl=$("#valU");
+const bC=$("#btnConnect"),bD=$("#btnDisc"),bR=$("#btnRef");
+let pubkey=null;
+function LOG(s){logEl.textContent=(logEl.textContent?logEl.textContent+"\n":"")+s;}
+function fmt(n,dec=6){if(n==null||Number.isNaN(n))return"—";return Number(n).toLocaleString("fr-CA",{minimumFractionDigits:0,maximumFractionDigits:dec});}
+async function jrpc(method,params){
+  const body=JSON.stringify({jsonrpc:"2.0",id:1,method,params});
+  const r=await fetch(RPC,{method:"POST",headers:{"content-type":"application/json"},body});
+  const t=await r.text();
+  if(!r.ok) throw new Error(r.status+" : "+t.slice(0,180));
+  let j; try{j=JSON.parse(t)}catch(e){throw new Error("BAD JSON : "+t.slice(0,180))}
+  if(j.error) throw new Error((j.error.code||"ERR")+" : "+(j.error.message||JSON.stringify(j.error)));
+  return j.result;
+}
+async function readSOL(){
+  const lam=await jrpc("getBalance",[pubkey,{commitment:"processed"}]);
+  return (lam && typeof lam.value==="number") ? lam.value/1e9 : null;
+}
+async function readUSDC(){
+  const res=await jrpc("getTokenAccountsByOwner",[pubkey,{mint:USDC_MINT},{encoding:"jsonParsed",commitment:"processed"}]);
+  const arr=(res && Array.isArray(res.value))?res.value:[];
+  let sum=0;
+  for(const it of arr){
+    const info=it?.account?.data?.parsed?.info;
+    const ta=info?.tokenAmount;
+    const ui=ta?.uiAmount;
+    if(typeof ui==="number") sum+=ui;
+    else{
+      const amt=ta?.amount; const dec=ta?.decimals;
+      if(amt!=null && dec!=null) sum+=Number(amt)/Math.pow(10,Number(dec));
+    }
+  }
+  return sum;
+}
+async function refresh(){
+  if(!pubkey) return;
+  solEl.textContent="—"; usdcEl.textContent="—";
+  LOG("REFRESH…");
+  try{
+    const [sol,usdc]=await Promise.all([readSOL(),readUSDC()]);
+    solEl.textContent=fmt(sol,6);
+    usdcEl.textContent=fmt(usdc,6);
+    LOG("OK");
+  }catch(e){
+    LOG("SOL/USDC ERR: "+(e?.message||e));
+  }
+}
+async function connect(){
+  try{
+    const p=window.solana;
+    if(!p || !p.isPhantom){LOG("CONNECT ERR: Phantom non détecté (ouvre dans le navigateur Phantom).");return;}
+    const r=await p.connect({onlyIfTrusted:false});
+    pubkey=(r?.publicKey?.toString?.()||p.publicKey?.toString?.()||null);
+    if(!pubkey){LOG("CONNECT ERR: pubkey null");return;}
+    addrEl.textContent=pubkey;
+    rpcSolEl.textContent=RPC;
+    rpcUsdEl.textContent=RPC;
+    bC.disabled=true; bD.disabled=false; bR.disabled=false;
+    LOG("CONNECTED");
+    await refresh();
+  }catch(e){
+    LOG("CONNECT ERR: "+(e?.message||e));
+  }
+}
+async function disconnect(){
+  try{ if(window.solana?.disconnect) await window.solana.disconnect(); }catch(_){}
+  pubkey=null;
+  addrEl.textContent="—"; solEl.textContent="—"; usdcEl.textContent="—";
+  bC.disabled=false; bD.disabled=true; bR.disabled=true;
+  LOG("DISCONNECTED");
+}
+bC.onclick=connect; bD.onclick=disconnect; bR.onclick=refresh;
+rpcSolEl.textContent=RPC; rpcUsdEl.textContent=RPC;
+})();
+</script></body></html>
+HTML
+
+# optional askorupdate
+if [ -f /opt/fireinners/sentinel/lib/askorupdate.sh ]; then
+  # shellcheck disable=SC1091
+  source /opt/fireinners/sentinel/lib/askorupdate.sh || true
+fi
+
+if command -v askorupdate_file >/dev/null 2>&1; then
+  askorupdate_file "$TARGET" "$TMP"
+else
+  cp -f "$TMP" "$TARGET"
+fi
+rm -f "$TMP"
+
+echo "[1] verify ping + health"
+curl -fsS "https://fireinners.online/solrpc/ping" >/dev/null && echo "OK /solrpc/ping"
+curl -fsS -H 'content-type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' "https://fireinners.online/solrpc" >/dev/null && echo "OK getHealth"
+
+echo "[2] done"
+echo "Open: https://fireinners.online/wallet/?v=${TS}"
+SH
+chmod +x /root/FIREINNERS_WALLET_POSTFIX_MEGA.sh
+bash /root/FIREINNERS_WALLET_POSTFIX_MEGA.sh
