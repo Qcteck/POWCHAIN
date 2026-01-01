@@ -1,2 +1,165 @@
-ss -lntp | grep ':3000'
-curl -sS -i http://127.0.0.1:3000/stats | sed -n '1,20p'
+cat >/tmp/wolfchain_fix_backend_stats.sh <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+ASKLIB="/opt/fireinners/sentinel/lib/askorupdate.sh"
+
+ts(){ date +"%Y%m%d-%H%M%S"; }
+say(){ echo "== $* =="; }
+die(){ echo "ERR: $*"; exit 1; }
+
+pid_from_3000(){
+  ss -lntp 2>/dev/null | awk '/:3000[[:space:]]/ && /users:\(\("node"/{
+    if(match($0,/pid=([0-9]+)/,m)){print m[1]; exit}
+  }'
+}
+
+cmdline_of(){
+  tr '\0' ' ' </proc/"$1"/cmdline 2>/dev/null || true
+}
+
+script_from_cmdline(){
+  # return first *.js arg after node
+  echo "$1" | awk '{
+    for(i=1;i<=NF;i++){
+      if($i ~ /node($|\/)/){
+        for(j=i+1;j<=NF;j++){
+          if($j ~ /\.js$/){print $j; exit}
+        }
+      }
+    }
+  }'
+}
+
+unit_from_pid(){
+  local PID="$1"
+  # find systemd service whose MainPID == PID
+  systemctl list-units --type=service --all --no-legend 2>/dev/null | awk '{print $1}' | while read -r u; do
+    mp="$(systemctl show -p MainPID --value "$u" 2>/dev/null || true)"
+    if [ "$mp" = "$PID" ]; then echo "$u"; break; fi
+  done
+}
+
+backup(){
+  local f="$1"
+  [ -f "$f" ] || return 0
+  cp -a "$f" "$f.bak.$(ts)"
+  echo "backup: $f.bak.$(ts)"
+}
+
+patch_file_add_stats(){
+  local f="$1"
+  # if already present, skip
+  if grep -qE "app\.get\(['\"]/stats['\"]" "$f" 2>/dev/null; then
+    echo "already has /stats in $f"
+    return 0
+  fi
+
+  python3 - <<PY
+from pathlib import Path
+p=Path("$f")
+s=p.read_text(encoding="utf-8",errors="ignore")
+
+route = r"""
+// --- WOLFCHAIN_STATS_ROUTE_V1 ---
+try{
+  const _json=(o)=>{ try{return JSON.stringify(o)}catch(e){return '{"ok":true}'} };
+  if(typeof app!=="undefined" && app && app.get){
+    app.get("/stats",(req,res)=>{
+      res.setHeader("Cache-Control","no-store");
+      res.setHeader("Content-Type","application/json; charset=utf-8");
+      res.end(_json({ok:true,service:"WOLFCHAIN",ts:Date.now(),path:req.path,ip:req.ip||null}));
+    });
+  }
+}catch(e){}
+// --- /WOLFCHAIN_STATS_ROUTE_V1 ---
+"""
+
+# insert before app.listen(...) if found, else at end
+import re
+m=re.search(r"\bapp\.listen\s*\(", s)
+if m:
+  i=m.start()
+  out=s[:i].rstrip()+"\n"+route+"\n\n"+s[i:]
+else:
+  out=s.rstrip()+"\n"+route+"\n"
+
+p.write_text(out,encoding="utf-8")
+print("patched:",p)
+PY
+}
+
+restart_unit_or_pid(){
+  local UNIT="$1" PID="$2"
+  if [ -n "${UNIT:-}" ]; then
+    say "RESTART systemd unit $UNIT"
+    systemctl restart "$UNIT"
+    sleep 1
+    systemctl --no-pager --full status "$UNIT" | sed -n '1,25p' || true
+  else
+    echo "WARN: unit not found for pid=$PID"
+    echo "Try manual restart:"
+    echo "  kill $PID  (if systemd/pm2 will restart it)"
+  fi
+}
+
+main(){
+  [ "$(id -u)" -eq 0 ] || die "run as root"
+
+  say "FIND node PID on :3000"
+  PID="$(pid_from_3000 || true)"
+  [ -n "${PID:-}" ] || die "no node pid found on port 3000"
+  echo "PID=$PID"
+
+  say "CMDLINE"
+  CMD="$(cmdline_of "$PID")"
+  echo "$CMD"
+  [ -n "${CMD:-}" ] || die "cannot read cmdline for pid $PID"
+
+  say "DETECT script .js"
+  JS="$(script_from_cmdline "$CMD" || true)"
+  [ -n "${JS:-}" ] || die "cannot find *.js in cmdline"
+  # normalize relative path
+  if [ "${JS:0:1}" != "/" ]; then
+    # attempt cwd
+    CWD="$(readlink -f /proc/"$PID"/cwd 2>/dev/null || true)"
+    [ -n "${CWD:-}" ] || CWD="/root"
+    JS="$(readlink -f "$CWD/$JS" 2>/dev/null || echo "$CWD/$JS")"
+  fi
+  echo "JS=$JS"
+  [ -f "$JS" ] || die "script not found: $JS"
+
+  say "FIND systemd unit (optional)"
+  UNIT="$(unit_from_pid "$PID" || true)"
+  echo "UNIT=${UNIT:-none}"
+
+  say "BACKUP script"
+  backup "$JS"
+
+  say "PATCH: add GET /stats"
+  if [ -f "$ASKLIB" ]; then
+    # use askorupdate safe update (no prompts)
+    # shellcheck disable=SC1090
+    source "$ASKLIB"
+    export ASKORUPDATE_ASK=0
+    tmp="/tmp/$(basename "$JS").patched.$$"
+    cp -a "$JS" "$tmp"
+    patch_file_add_stats "$tmp"
+    askorupdate_file "$JS" "$tmp"
+    rm -f "$tmp" 2>/dev/null || true
+  else
+    patch_file_add_stats "$JS"
+  fi
+
+  say "RESTART backend"
+  restart_unit_or_pid "${UNIT:-}" "$PID"
+
+  say "TEST direct backend /stats"
+  curl -sS -i http://127.0.0.1:3000/stats | sed -n '1,25p' || true
+
+  echo
+  echo "DONE"
+}
+main "$@"
+SH
+bash /tmp/wolfchain_fix_backend_stats.sh
