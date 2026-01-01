@@ -1,147 +1,34 @@
-cat >/root/FIREINNERS_SOLRPC_WALLET_REPAIR_MEGA.sh <<'SH'
+cat >/root/FIREINNERS_PATCH_SOLRPC_NGINX.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 TS="$(date +%Y%m%d_%H%M%S)"
 VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
 NGMAIN="/etc/nginx/nginx.conf"
-APPDIR="/opt/fireinners/solrpc-proxy"
-JS="$APPDIR/server.js"
-PKG="$APPDIR/package.json"
-UNIT="/etc/systemd/system/fireinners-solrpc-proxy.service"
+BK="/root/backup_fireinners_nginx_solrpc_${TS}"
 PORT="12703"
-BK="/root/backup_fireinners_solrpc_wallet_${TS}"
-WALLET_HTML="/opt/fireinners/frontend-react/app/dist/wallet/index.html"
 
 mkdir -p "$BK"
 cp -a "$VHOST" "$BK/fireinners.online-ssl.bak" 2>/dev/null || true
 cp -a "$NGMAIN" "$BK/nginx.conf.bak" 2>/dev/null || true
-[ -f "$WALLET_HTML" ] && cp -a "$WALLET_HTML" "$BK/wallet.index.html.bak" || true
 
-echo "==[0] node check =="
-command -v node >/dev/null || { echo "ERR: node introuvable"; exit 1; }
-NODEV="$(node -v || true)"
-echo "node: $NODEV"
-
-echo "==[1] write proxy app (undici fetch) =="
-mkdir -p "$APPDIR"
-cat >"$PKG" <<'JSON'
-{"name":"fireinners-solrpc-proxy","private":true,"type":"commonjs","dependencies":{"undici":"^6.19.8"}}
-JSON
-
-# npm install seulement dans ce dossier
-cd "$APPDIR"
-if [ ! -d node_modules/undici ]; then
-  npm i --omit=dev --no-audit --no-fund >/dev/null
-fi
-
-cat >"$JS" <<'JS'
-"use strict";
-const http=require("http");
-const {URL}=require("url");
-const {fetch}=require("undici");
-const PORT=process.env.PORT?Number(process.env.PORT):12703;
-const HOST=process.env.HOST||"127.0.0.1";
-const UPSTREAMS=[
-  "https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac",
-  "https://api.mainnet-beta.solana.com",
-  "https://solana-rpc.publicnode.com",
-  "https://rpc.ankr.com/solana"
-];
-function cors(res){
-  res.setHeader("access-control-allow-origin","*");
-  res.setHeader("access-control-allow-methods","POST,OPTIONS,GET");
-  res.setHeader("access-control-allow-headers","content-type");
-}
-async function tryFetch(body,headers){
-  let lastErr=null;
-  for(const u of UPSTREAMS){
-    try{
-      const r=await fetch(u,{method:"POST",headers:{...headers},body});
-      const txt=await r.text();
-      if(r.status>=500){ lastErr=new Error("upstream "+u+" HTTP "+r.status); continue; }
-      return {ok:true,status:r.status,txt,ct:r.headers.get("content-type")||"application/json"};
-    }catch(e){ lastErr=e; }
-  }
-  return {ok:false,err:lastErr||new Error("failover exhausted")};
-}
-http.createServer(async (req,res)=>{
-  cors(res);
-  const u=new URL(req.url,"http://x");
-  if(req.method==="OPTIONS"){res.writeHead(204);return res.end();}
-  if(req.method==="GET" && u.pathname==="/ping"){res.writeHead(200,{"content-type":"text/plain"});return res.end("pong\n");}
-  if(req.method!=="POST"){res.writeHead(405,{"content-type":"text/plain"});return res.end("POST only\n");}
-  let body="";
-  req.on("data",c=>{body+=c; if(body.length>2e6) req.destroy();});
-  req.on("end",async ()=>{
-    if(!body){res.writeHead(400,{"content-type":"text/plain"});return res.end("empty body\n");}
-    const headers={"content-type":req.headers["content-type"]||"application/json"};
-    const out=await tryFetch(body,headers);
-    if(!out.ok){
-      res.writeHead(502,{"content-type":"application/json"});
-      return res.end(JSON.stringify({jsonrpc:"2.0",id:null,error:{code:-32000,message:"solrpc failover exhausted",data:String(out.err&&out.err.message||out.err)}}));
-    }
-    res.writeHead(out.status,{"content-type":out.ct});
-    return res.end(out.txt);
-  });
-}).listen(PORT,HOST,()=>{console.log("solrpc proxy on "+HOST+":"+PORT);});
-JS
-
-echo "==[2] systemd unit =="
-cat >"$UNIT" <<UNIT
-[Unit]
-Description=FireInners Solana JSON-RPC proxy (CORS-safe, failover)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-WorkingDirectory=$APPDIR
-Environment=HOST=127.0.0.1
-Environment=PORT=$PORT
-ExecStart=$(command -v node) $JS
-Restart=always
-RestartSec=2
-NoNewPrivileges=true
-PrivateTmp=true
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-
-systemctl daemon-reload
-systemctl enable --now fireinners-solrpc-proxy.service
-systemctl restart fireinners-solrpc-proxy.service
-sleep 0.7
-
-echo "==[3] local tests =="
-systemctl --no-pager --full status fireinners-solrpc-proxy.service | sed -n '1,18p' || true
-ss -lntp | grep -q ":$PORT" || { echo "ERR: proxy not listening on :$PORT"; journalctl -xeu fireinners-solrpc-proxy.service --no-pager | tail -n 120; exit 1; }
-curl -fsS "http://127.0.0.1:$PORT/ping" >/dev/null && echo "OK local /ping"
-
-echo "==[4] nginx /solrpc patch =="
+# défiger si figé
 chattr -i "$NGMAIN" "$VHOST" 2>/dev/null || true
-# retire l'ancien bloc si présent
+
+# retire l’ancien bloc s’il existe
 perl -0777 -i -pe 's/\n\s*#\s*BEGIN FIREINNERS SOLRPC[\s\S]*?#\s*END FIREINNERS SOLRPC\s*\n/\n/gm' "$VHOST"
-# injecte le bloc dans le server {}
-perl -0777 -i -pe 's/\n}\s*$/\n  # BEGIN FIREINNERS SOLRPC\n  location = \/solrpc { return 301 \/solrpc\/; }\n  location \/solrpc\/ {\n    proxy_http_version 1.1;\n    proxy_set_header Host $host;\n    proxy_set_header X-Real-IP $remote_addr;\n    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n    proxy_set_header X-Forwarded-Proto $scheme;\n    proxy_connect_timeout 10s;\n    proxy_read_timeout 60s;\n    proxy_send_timeout 60s;\n    proxy_pass http:\/\/127.0.0.1:'"$PORT"'\/;\n  }\n  # END FIREINNERS SOLRPC\n}\n/sm' "$VHOST"
+
+# ré-injecte un bloc propre (avec les $ nginx)
+perl -0777 -i -pe 's/\n}\s*$/\n  # BEGIN FIREINNERS SOLRPC\n  location = \/solrpc { return 301 \/solrpc\/; }\n  location \/solrpc\/ {\n    proxy_http_version 1.1;\n    proxy_set_header Host \$host;\n    proxy_set_header X-Real-IP \$remote_addr;\n    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;\n    proxy_set_header X-Forwarded-Proto \$scheme;\n    proxy_connect_timeout 10s;\n    proxy_read_timeout 60s;\n    proxy_send_timeout 60s;\n    proxy_pass http:\/\/127.0.0.1:'"$PORT"'\/;\n  }\n  # END FIREINNERS SOLRPC\n}\n/sm' "$VHOST"
+
 nginx -t
 systemctl reload nginx
+
+# refiger
 chattr +i "$NGMAIN" "$VHOST" 2>/dev/null || true
 
-echo "==[5] remote solrpc tests =="
-curl -fsS "https://fireinners.online/solrpc/ping" >/dev/null && echo "OK https /solrpc/ping"
-curl -fsS -H 'content-type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' "https://fireinners.online/solrpc/" >/dev/null && echo "OK getHealth via /solrpc/"
-
-echo "==[6] write wallet (SOL + USDC via /solrpc) =="
-mkdir -p "$(dirname "$WALLET_HTML")"
-cat >"$WALLET_HTML" <<'HTML'
-<!doctype html><html lang="fr"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>FireInners • Wallet</title><style>:root{--bg:#05060b;--p:#0a0f1e;--l:#1b2a44;--t:#e7f0ff;--m:#9fb3d7}*{box-sizing:border-box}html,body{margin:0;height:100%;background:radial-gradient(900px 500px at 20% 0%,#0a1328 0%,transparent 60%),radial-gradient(700px 450px at 80% 20%,#101a33 0%,transparent 55%),var(--bg);color:var(--t);font:14px system-ui}#wrap{max-width:980px;margin:0 auto;padding:22px}h1{margin:0 0 6px 0;font-size:26px;letter-spacing:.4px}p{margin:0 0 14px 0;color:var(--m)}.row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}.btn{padding:10px 14px;border-radius:12px;border:1px solid rgba(255,255,255,.14);background:rgba(0,0,0,.18);color:var(--t);font-weight:700;cursor:pointer}.btn:disabled{opacity:.45;cursor:not-allowed}.grid{display:grid;grid-template-columns:1fr 160px 160px;gap:12px;align-items:stretch;margin-top:14px} .card{border:1px solid rgba(255,255,255,.14);border-radius:16px;background:rgba(0,0,0,.18);padding:14px;min-height:92px} .mono{font:12px ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap;word-break:break-word} .k{color:var(--m);font-weight:700;margin-bottom:6px} .v{font-weight:800;font-size:22px} #log{margin-top:12px;height:240px;overflow:auto}</style></head><body><div id="wrap"><div class="row" style="justify-content:space-between;gap:10px"><div><h1>FireInners • Wallet</h1><p>Lecture soldes via Phantom + Solana RPC. Aucun secret, aucune seed, aucun export.</p></div><a class="btn" href="/" style="text-decoration:none;display:inline-block">Retour</a></div><div class="row"><button id="bConnect" class="btn">Connect</button><button id="bDisco" class="btn" disabled>Disconnect</button><button id="bRef" class="btn" disabled>Refresh</button></div><div class="grid"><div class="card"><div class="k">Adresse</div><div id="addr" class="mono">—</div><div style="height:10px"></div><div class="k">RPC (SOL)</div><div id="rpcSol" class="mono">https://fireinners.online/solrpc</div><div style="height:10px"></div><div class="k">RPC (USDC)</div><div id="rpcUsdc" class="mono">https://fireinners.online/solrpc</div></div><div class="card"><div class="k">SOL</div><div id="sol" class="v">—</div></div><div class="card"><div class="k">USDC</div><div id="usdc" class="v">—</div></div></div><div id="log" class="card mono"></div></div><script>
-(()=>{const RPC="https://fireinners.online/solrpc/";const USDC="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1";const $=id=>document.getElementById(id);const logEl=$("log");const LOG=s=>{logEl.textContent=(s+"\n"+logEl.textContent).slice(0,9000)};const fmt=n=>{if(!isFinite(n))return"—";return (Math.round(n*1e6)/1e6).toLocaleString("fr-CA",{maximumFractionDigits:6})};const rpc=(method,params)=>fetch(RPC,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({jsonrpc:"2.0",id:1,method,params:params||[]})}).then(r=>r.text().then(t=>({ok:r.ok,st:r.status,t}))).then(x=>{if(!x.ok)throw new Error("HTTP "+x.st+" : "+x.t.slice(0,200));let j;try{j=JSON.parse(x.t)}catch(e){throw new Error("JSON parse: "+x.t.slice(0,200))}if(j.error)throw new Error(j.error.message||JSON.stringify(j.error));return j.result});let pub=null;function setBtns(on){$("bConnect").disabled=on;$("bDisco").disabled=!on;$("bRef").disabled=!on}async function refresh(){try{$("sol").textContent="…";$("usdc").textContent="…";const bal=await rpc("getBalance",[pub,{commitment:"confirmed"}]);$("sol").textContent=fmt((bal.value||0)/1e9);let u=0;const tok=await rpc("getParsedTokenAccountsByOwner",[pub,{mint:USDC},{commitment:"confirmed"}]);const arr=(tok&&tok.value)||[];for(const it of arr){const ui=it.account?.data?.parsed?.info?.tokenAmount?.uiAmount;u+=Number(ui||0)}$("usdc").textContent=fmt(u);LOG("REFRESH OK")}catch(e){$("sol").textContent=$("sol").textContent==="…"?"—":$("sol").textContent;$("usdc").textContent=$("usdc").textContent==="…"?"—":$("usdc").textContent;LOG("ERR: "+(e&&e.message||e))}}async function connect(){try{const prov=window.solana; if(!prov||!prov.isPhantom) throw new Error("Phantom (window.solana) introuvable"); const r=await prov.connect(); pub=(r.publicKey||prov.publicKey).toString(); $("addr").textContent=pub; setBtns(true); LOG("CONNECTED"); await refresh();}catch(e){LOG("CONNECT ERR: "+(e&&e.message||e)); setBtns(false)}}async function disco(){try{const prov=window.solana; if(prov&&prov.disconnect) await prov.disconnect();}catch(_){ } pub=null; $("addr").textContent="—"; $("sol").textContent="—"; $("usdc").textContent="—"; setBtns(false); LOG("DISCONNECTED")}$("bConnect").onclick=connect;$("bDisco").onclick=disco;$("bRef").onclick=refresh;LOG("READY")})();
-</script></body></html>
-HTML
-
-echo "==[7] final =="
-echo "OK. Wallet URL (cache-buster): https://fireinners.online/wallet/?v=$TS"
+echo "OK nginx reloaded"
+echo "TEST: https://fireinners.online/solrpc/ping"
+curl -fsS "https://fireinners.online/solrpc/ping" && echo
 SH
-chmod +x /root/FIREINNERS_SOLRPC_WALLET_REPAIR_MEGA.sh
-bash /root/FIREINNERS_SOLRPC_WALLET_REPAIR_MEGA.sh
+chmod +x /root/FIREINNERS_PATCH_SOLRPC_NGINX.sh
+bash /root/FIREINNERS_PATCH_SOLRPC_NGINX.sh
