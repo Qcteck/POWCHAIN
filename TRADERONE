@@ -1,80 +1,123 @@
-cat >/root/MEGA_neuroneone_nginx_wg.sh <<'SH'
+sudo bash -lc 'set -euo pipefail;mkdir -p /opt/fireinners/sentinel/bin /opt/fireinners/sentinel/reports;cat > /opt/fireinners/sentinel/bin/vps_fly_snapshot.sh <<'"'"'BASH'"'"'
 #!/usr/bin/env bash
 set -euo pipefail
+TS="$(date -u +%Y%m%d_%H%M%S)"
+OUTDIR="/opt/fireinners/sentinel/reports"
+OUT="$OUTDIR/vps_snapshot_${TS}.txt"
+TAR="$OUTDIR/vps_snapshot_${TS}.tgz"
 
-LIB="/opt/fireinners/sentinel/lib/askorupdate.sh"
-WG_IP="10.66.66.1"
-WG_NET="10.66.66.0/24"
-PORT="8088"
-APP_DIR="/opt/neuroneone"
-AV="/etc/nginx/sites-available/neuroneone-wg"
-EN="/etc/nginx/sites-enabled/neuroneone-wg"
+# Helpers
+h(){ printf "\n==================== %s ====================\n" "$1" | tee -a "$OUT"; }
+run(){ local cmd="$1"; printf "\n$ %s\n" "$cmd" | tee -a "$OUT"; bash -lc "$cmd" 2>&1 | tee -a "$OUT" || true; }
+hash_if(){ local f="$1"; if [ -e "$f" ]; then sha256sum "$f" 2>/dev/null || true; else echo "MISSING $f"; fi; }
 
-echo "=== PREVIEW (ce script va faire) ==="
-echo "1) Vérifier WireGuard IP ${WG_IP} présente"
-echo "2) Créer ${APP_DIR} si absent (ne touche pas ton index si déjà là)"
-echo "3) Créer/mettre à jour vhost nginx: ${AV} (listen ${WG_IP}:${PORT})"
-echo "4) Activer le lien ${EN}"
-echo "5) Ouvrir UFW seulement sur wg0 pour ${PORT} (et deny public)"
-echo "6) nginx -t puis reload"
-echo "==================================="
+umask 077
+mkdir -p "$OUTDIR"
+: > "$OUT"
 
-if [ -f "$LIB" ]; then . "$LIB"; else
-  echo "ERR: askorupdate absent: $LIB"
-  exit 1
-fi
+h "META"
+run "date -Is"
+run "date -u -Is"
+run "uptime -p || true"
+run "whoami"
+run "hostname"
+run "hostnamectl || true"
+run "uname -a"
+run "lsb_release -a 2>/dev/null || cat /etc/os-release || true"
 
-askorupdate_yesno "Continuer?" 0 || { echo "STOP"; exit 0; }
+h "CPU/MEM/DISK"
+run "nproc || true"
+run "free -h || true"
+run "df -hT || true"
+run "lsblk -o NAME,SIZE,FSTYPE,TYPE,MOUNTPOINTS,MODEL || true"
 
-command -v nginx >/dev/null || { echo "ERR: nginx absent"; exit 1; }
-ip a | grep -q " ${WG_IP}/" || { echo "ERR: ${WG_IP} pas présent (wg0 down?)"; exit 1; }
+h "NETWORK"
+run "ip -br a || true"
+run "ip route || true"
+run "ss -lntup || true"
+run "resolvectl status 2>/dev/null || true"
+run "cat /etc/resolv.conf || true"
 
-mkdir -p "$APP_DIR"
-if [ ! -f "$APP_DIR/index.html" ]; then
-  cat >"$APP_DIR/index.html" <<'HTML'
-<!doctype html><meta charset="utf-8"><title>NeuroneOne</title><body style="font-family:system-ui;padding:20px">Colle ton NeuroneOne ici: /opt/neuroneone/index.html</body>
-HTML
-fi
+h "FIREWALL"
+run "ufw status verbose 2>/dev/null || true"
+run "nft list ruleset 2>/dev/null | head -n 200 || true"
 
-VHOST_CONTENT=$(cat <<EOF
-server{
-  listen ${WG_IP}:${PORT};
-  server_name _;
-  root ${APP_DIR};
-  index index.html;
+h "SYSTEMD RUNNING SERVICES (TOP)"
+run "systemctl --no-pager --failed || true"
+run "systemctl list-units --type=service --state=running --no-pager | head -n 120 || true"
 
-  access_log /var/log/nginx/neuroneone_wg_access.log;
-  error_log  /var/log/nginx/neuroneone_wg_error.log;
+h "KEY SERVICES STATUS"
+for svc in nginx ufw fail2ban tor@default monarx-agent amcq fireinners-qplus-wasm security-sentinel; do
+  run "systemctl status $svc --no-pager -l 2>/dev/null | sed -n \"1,160p\" || true"
+done
 
-  # WireGuard only
-  allow ${WG_NET};
-  deny all;
+h "NGINX"
+run "nginx -v 2>&1 || true"
+run "nginx -t 2>&1 || true"
+run "ls -la /etc/nginx || true"
+run "ls -la /etc/nginx/sites-available /etc/nginx/sites-enabled 2>/dev/null || true"
+printf "\n-- SHA256 nginx.conf --\n" | tee -a "$OUT"
+hash_if "/etc/nginx/nginx.conf" | tee -a "$OUT"
+for f in /etc/nginx/sites-available/fireinners.online-ssl /etc/nginx/sites-enabled/fireinners.online-ssl; do
+  printf "\n-- SHA256 %s --\n" "$f" | tee -a "$OUT"
+  hash_if "$f" | tee -a "$OUT"
+  printf "\n-- HEAD %s --\n" "$f" | tee -a "$OUT"
+  if [ -e "$f" ]; then sed -n "1,220p" "$f" 2>/dev/null | tee -a "$OUT" || true; fi
+done
 
-  location / {
-    try_files \$uri \$uri/ =404;
-  }
-}
-EOF
-)
+h "CERTBOT"
+run "certbot certificates 2>/dev/null || true"
 
-ASKORUPDATE_ASK="${ASKORUPDATE_ASK:-0}"
-ASKORUPDATE_BACKUP="${ASKORUPDATE_BACKUP:-1}"
-ASKORUPDATE_VERBOSE="${ASKORUPDATE_VERBOSE:-1}"
+h "NODE/NPM/PM2"
+run "command -v node && node -v || true"
+run "command -v npm && npm -v || true"
+run "command -v corepack && corepack -v || true"
+run "command -v pm2 && pm2 ls || true"
+run "command -v pm2 && pm2 jlist | head -n 80 || true"
 
-askorupdate_file "$AV" "0644" "root:root" "0" "neuroneone-wg" <<<"$VHOST_CONTENT"
+h "PROJECT DIRS (SUMMARY)"
+for d in /opt/fireinners /opt/traderone-opt /opt/traderone-opt  /opt/price /opt/fireinners/sentinel /root/qplu; do
+  run "test -d $d && echo \"DIR $d\" && ls -la $d | head -n 120 || echo \"NO_DIR $d\""
+  run "test -d $d && du -sh $d 2>/dev/null || true"
+done
 
-ln -sfn "$AV" "$EN"
+h "GIT (IF PRESENT)"
+for d in /opt/fireinners /opt/traderone-opt /root/qplu; do
+  run "test -d $d/.git && echo \"GIT $d\" && git -C $d rev-parse --short HEAD && git -C $d status -sb || true"
+done
 
-if command -v ufw >/dev/null 2>&1; then
-  ufw allow in on wg0 to any port ${PORT} proto tcp >/dev/null || true
-  ufw deny ${PORT}/tcp >/dev/null || true
-fi
+h "WIREGUARD"
+run "command -v wg && wg show || true"
+run "ip -br link show wg0 2>/dev/null || true"
+printf "\n-- SHA256 wg0.conf (NO CONTENT) --\n" | tee -a "$OUT"
+hash_if "/etc/wireguard/wg0.conf" | tee -a "$OUT"
+run "ls -la /etc/wireguard 2>/dev/null || true"
 
-nginx -t
-systemctl reload nginx
+h "SENSITIVE FILES (HASH ONLY, NO CONTENT)"
+for f in /opt/fireinners/CHARTE_FIREINNERS.md /opt/fireinners/CHARTE_FIREINNERS.sha256 /opt/fireinners/sentinel/telegram.env /etc/nginx/nginx.conf /etc/nginx/sites-available/fireinners.online-ssl; do
+  printf "\n-- %s --\n" "$f" | tee -a "$OUT"
+  run "ls -la $f 2>/dev/null || true"
+  printf "sha256: " | tee -a "$OUT"
+  hash_if "$f" | awk "{print \$1}" | tee -a "$OUT"
+done
 
-echo "OK: NeuroneOne privé nginx -> http://${WG_IP}:${PORT}/"
-curl -sS -I "http://${WG_IP}:${PORT}/" | head -n 5 || true
-SH
-chmod +x /root/MEGA_neuroneone_nginx_wg.sh
-bash /root/MEGA_neuroneone_nginx_wg.sh
+h "JOURNAL WARN/ERROR (LAST 200 LINES)"
+run "journalctl -p warning..alert -n 200 --no-pager || true"
+
+h "DONE"
+printf "\nREPORT: %s\nTAR:    %s\n" "$OUT" "$TAR" | tee -a "$OUT"
+
+# Create tarball (report only)
+tar -C "$OUTDIR" -czf "$TAR" "$(basename "$OUT")" 2>/dev/null || true
+
+# Print last lines for quick copy
+echo
+echo "==================== QUICK SUMMARY ===================="
+tail -n 80 "$OUT" || true
+BASH
+chmod +x /opt/fireinners/sentinel/bin/vps_fly_snapshot.sh
+/opt/fireinners/sentinel/bin/vps_fly_snapshot.sh
+echo
+echo "Fichiers generes:"
+ls -la /opt/fireinners/sentinel/reports | tail -n 5
+'
