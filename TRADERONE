@@ -1,1 +1,290 @@
-curl -sS -H 'content-type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' https://fireinners.online/solrpc/
+cat >/root/FIREINNERS_SOLRPC_FIX_MEGA.sh <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "[PLAN] Ce script va:"
+echo "  1) (Re)installer le proxy Solana JSON-RPC local: 127.0.0.1:12703 (/ping + POST forward + CORS)"
+echo "  2) Patcher nginx fireinners.online-ssl: /solrpc/ -> proxy, et /solrpc -> 308 (garde POST)"
+echo "  3) Patcher le wallet dist pour forcer /solrpc/ (evite 301) + fallback USDC (getTokenAccountsByOwner jsonParsed)"
+echo
+
+[ "$(id -u)" -eq 0 ] || { echo "ERR: run as root"; exit 1; }
+
+PROXY_DIR="/opt/fireinners/solrpc-proxy"
+PROXY_PORT="12703"
+PROXY_HOST="127.0.0.1"
+SERVICE="fireinners-solrpc-proxy.service"
+UNIT="/etc/systemd/system/${SERVICE}"
+
+NG_SITE_AV="/etc/nginx/sites-available/fireinners.online-ssl"
+NG_SITE_EN="/etc/nginx/sites-enabled/fireinners.online-ssl"
+
+ASKORUPDATE="/opt/fireinners/sentinel/lib/askorupdate.sh"
+if [ -f "$ASKORUPDATE" ]; then
+  # shellcheck disable=SC1090
+  source "$ASKORUPDATE" || true
+fi
+
+need_bin(){ command -v "$1" >/dev/null 2>&1 || { echo "ERR: missing $1"; exit 1; }; }
+need_bin node
+need_bin nginx
+need_bin python3
+need_bin systemctl
+need_bin chattr || true
+
+TS="$(date +%Y%m%d_%H%M%S)"
+BK="/root/backup_fireinners_solrpc_${TS}"
+mkdir -p "$BK"
+
+echo "[1/3] Install proxy app -> $PROXY_DIR"
+mkdir -p "$PROXY_DIR"
+
+cat >"$PROXY_DIR/server.js" <<'JS'
+'use strict';
+const http = require('http');
+
+const LISTEN_HOST = process.env.HOST || '127.0.0.1';
+const LISTEN_PORT = parseInt(process.env.PORT || '12703', 10);
+
+const UPSTREAMS = [
+  // prefer user DRPC
+  "https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac",
+  // fallbacks
+  "https://api.mainnet-beta.solana.com",
+  "https://solana-rpc.publicnode.com",
+  "https://rpc.ankr.com/solana"
+];
+
+const cors = (res) => {
+  res.setHeader("access-control-allow-origin", "*");
+  res.setHeader("access-control-allow-methods", "POST,OPTIONS,GET");
+  res.setHeader("access-control-allow-headers", "content-type");
+};
+
+async function readBody(req){
+  return await new Promise((resolve,reject)=>{
+    let d='';
+    req.on('data',c=>d+=c);
+    req.on('end',()=>resolve(d));
+    req.on('error',reject);
+  });
+}
+
+async function forward(bodyText){
+  let lastErr = null;
+  for (const u of UPSTREAMS){
+    try{
+      const r = await fetch(u, {
+        method: "POST",
+        headers: {"content-type":"application/json"},
+        body: bodyText
+      });
+      const txt = await r.text();
+      if (r.status >= 500) { lastErr = new Error("upstream "+u+" HTTP "+r.status); continue; }
+      return {ok:true, status:r.status, txt, ct:(r.headers.get("content-type")||"application/json")};
+    }catch(e){
+      lastErr = e;
+    }
+  }
+  return {ok:false, status:502, txt: JSON.stringify({jsonrpc:"2.0", id:null, error:{code:-32000, message:"upstream failover exhausted", detail:String(lastErr||"unknown")}}), ct:"application/json"};
+}
+
+const srv = http.createServer(async (req,res)=>{
+  cors(res);
+  const url = new URL(req.url, 'http://localhost');
+  if (req.method === "OPTIONS"){ res.statusCode=204; return res.end(); }
+  if (req.method === "GET" && url.pathname === "/ping"){ res.statusCode=200; return res.end("pong"); }
+  if (req.method !== "POST"){ res.statusCode=405; return res.end("POST only"); }
+
+  const body = await readBody(req);
+  const out = await forward(body);
+  res.statusCode = out.status;
+  res.setHeader("content-type", out.ct);
+  return res.end(out.txt);
+});
+
+srv.listen(LISTEN_PORT, LISTEN_HOST, ()=>{
+  console.log("solrpc proxy on "+LISTEN_HOST+":"+LISTEN_PORT);
+});
+JS
+
+cat >"$UNIT" <<EOF
+[Unit]
+Description=FireInners Solana JSON-RPC proxy (CORS-safe, failover)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=${PROXY_DIR}
+Environment=HOST=${PROXY_HOST}
+Environment=PORT=${PROXY_PORT}
+ExecStart=/usr/bin/node ${PROXY_DIR}/server.js
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now "$SERVICE"
+systemctl restart "$SERVICE"
+systemctl --no-pager --full status "$SERVICE" | sed -n '1,12p' || true
+
+echo
+echo "[2/3] Patch nginx for /solrpc/ (proxy) and /solrpc (308 keep POST)"
+
+if [ ! -f "$NG_SITE_AV" ]; then
+  echo "ERR: nginx site not found: $NG_SITE_AV"
+  exit 2
+fi
+
+cp -a "$NG_SITE_AV" "$BK/$(basename "$NG_SITE_AV").bak"
+
+# unfreeze if immutable
+if command -v chattr >/dev/null 2>&1; then
+  chattr -i /etc/nginx/nginx.conf "$NG_SITE_AV" 2>/dev/null || true
+fi
+
+python3 - <<'PY'
+import re, pathlib
+p=pathlib.Path("/etc/nginx/sites-available/fireinners.online-ssl")
+s=p.read_text(encoding="utf-8", errors="ignore")
+
+blk = r"""
+    # FI_SOLRPC_NGINX_V1 BEGIN
+    location = /solrpc { return 308 /solrpc/; }
+
+    location ^~ /solrpc/ {
+        proxy_pass http://127.0.0.1:12703/;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 60s;
+        proxy_send_timeout 60s;
+    }
+    # FI_SOLRPC_NGINX_V1 END
+""".strip("\n")
+
+if "FI_SOLRPC_NGINX_V1 BEGIN" in s:
+    s = re.sub(r"\s*# FI_SOLRPC_NGINX_V1 BEGIN.*?# FI_SOLRPC_NGINX_V1 END\s*", "\n"+blk+"\n", s, flags=re.S)
+else:
+    # insert into the server{} that contains server_name fireinners.online
+    m = re.search(r"server\s*\{", s)
+    if not m:
+        raise SystemExit("No server { found in site file")
+    # find server block that mentions fireinners.online
+    # naive but safe: insert before last '}' if we can't confidently locate
+    sm = re.search(r"server\s*\{.*?server_name[^;]*fireinners\.online.*?\}", s, flags=re.S)
+    if sm:
+        block = sm.group(0)
+        # insert before the last closing brace in that server block
+        i = block.rfind("}")
+        block2 = block[:i] + "\n\n" + blk + "\n" + block[i:]
+        s = s[:sm.start()] + block2 + s[sm.end():]
+    else:
+        # fallback: append near end of file
+        s = s.rstrip() + "\n\n" + blk + "\n"
+
+p.write_text(s, encoding="utf-8")
+print("OK: nginx site patched")
+PY
+
+nginx -t
+systemctl reload nginx
+
+# refreeze
+if command -v chattr >/dev/null 2>&1; then
+  chattr +i /etc/nginx/nginx.conf "$NG_SITE_AV" 2>/dev/null || true
+fi
+
+echo
+echo "[3/3] Patch wallet dist (force /solrpc/ + method fallback)"
+CAND=(
+  "/opt/fireinners/frontend-react/app/dist/wallet/index.html"
+  "/opt/fireinners/frontend-react/app/dist/wallet/index.htm"
+)
+WALLET=""
+for f in "${CAND[@]}"; do [ -f "$f" ] && WALLET="$f" && break; done
+if [ -z "$WALLET" ]; then
+  echo "WARN: wallet dist not found, skipping wallet patch. Tried:"
+  printf " - %s\n" "${CAND[@]}"
+else
+  cp -a "$WALLET" "$BK/$(basename "$WALLET").bak"
+  python3 - <<'PY'
+import re, pathlib
+p=pathlib.Path("/opt/fireinners/frontend-react/app/dist/wallet/index.html")
+s=p.read_text(encoding="utf-8", errors="ignore")
+
+# remove older patches if present
+s = re.sub(r"/\*+\s*FI_SOLRPC.*?\*/", "", s, flags=re.S)
+s = re.sub(r"<!--\s*FI_SOLRPC.*?-->", "", s, flags=re.S)
+
+patch = r"""
+<!-- FI_SOLRPC_WALLET_FETCHPATCH_V2 -->
+<script>
+(()=>{try{
+  const TOKENK="TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+  const _fetch=window.fetch.bind(window);
+  const fixUrl=(u)=>{try{
+    let s=String(u);
+    // force trailing slash to avoid 301 -> POST becomes GET
+    s=s.replace(/https?:\/\/fireinners\.online\/solrpc(?!\/)/g,"https://fireinners.online/solrpc/");
+    s=s.replace(/\/solrpc(?!\/)/g,"/solrpc/");
+    return s;
+  }catch(e){return u}};
+  window.fetch=async (input, init)=>{
+    let url = (typeof input==="string") ? input : (input && input.url) || "";
+    let nurl = fixUrl(url);
+    if(nurl!==url){
+      if(typeof input==="string") input=nurl;
+      else input=new Request(nurl, input);
+      url=nurl;
+    }
+    if(init && init.body && typeof init.body==="string" && /\/solrpc\//.test(String(url))){
+      try{
+        const j=JSON.parse(init.body);
+        if(j && j.method==="getParsedTokenAccountsByOwner"){
+          // fallback: widely supported
+          j.method="getTokenAccountsByOwner";
+          const owner = (j.params && j.params[0]) ? j.params[0] : null;
+          j.params=[owner, {programId:TOKENK}, {encoding:"jsonParsed"}];
+          init={...init, body:JSON.stringify(j)};
+        }
+      }catch(e){}
+    }
+    return _fetch(input, init);
+  };
+}catch(e){} })();
+</script>
+"""
+# insert before </head> if possible, else before </body>, else append
+if "</head>" in s:
+  s = s.replace("</head>", patch+"\n</head>", 1)
+elif "</body>" in s:
+  s = s.replace("</body>", patch+"\n</body>", 1)
+else:
+  s += "\n"+patch+"\n"
+
+p.write_text(s, encoding="utf-8")
+print("OK: wallet patched")
+PY
+fi
+
+echo
+echo "[DONE] Backups: $BK"
+echo
+echo "[TEST] 1) ping:"
+echo "  curl -fsS https://fireinners.online/solrpc/ping && echo"
+echo
+echo "[TEST] 2) JSON-RPC POST (slash final):"
+echo "  curl -sS -H 'content-type: application/json' -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getHealth\"}' https://fireinners.online/solrpc/"
+echo
+echo "[OPEN] Wallet cache-buster:"
+echo "  https://fireinners.online/wallet/?v=$(date +%s)"
+SH
+chmod +x /root/FIREINNERS_SOLRPC_FIX_MEGA.sh
+bash /root/FIREINNERS_SOLRPC_FIX_MEGA.sh
