@@ -1,2 +1,249 @@
-echo "ON-DISK:";grep -n "solrpc" /opt/fireinners/frontend-react/app/dist/wallet/index.html | head -n 5 || echo "NO solrpc in dist wallet"
-echo "REMOTE:";curl -fsS "https://fireinners.online/wallet/?v=$(date +%s)" | grep -n "solrpc" | head -n 5 || echo "NO solrpc in REMOTE html"
+cat >/root/FIREINNERS_WALLET_USDC_SOLRPC_MEGA.sh <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+TS="$(date +%Y%m%d_%H%M%S)"
+BK="/root/backup_fireinners_wallet_usdc_solrpc_${TS}"
+mkdir -p "$BK"
+
+WALLET_HTML="/opt/fireinners/frontend-react/app/dist/wallet/index.html"
+ROOT_HTML="/opt/fireinners/frontend-react/app/dist/index.html"
+VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
+SNIP="/etc/nginx/snippets/fireinners-solrpc-proxy.conf"
+
+PROXY_DIR="/opt/fireinners/solrpc-proxy"
+PROXY_HOST="127.0.0.1"
+PROXY_PORT="12703"
+PROXY_SVC="/etc/systemd/system/fireinners-solrpc-proxy.service"
+
+WF_DIR="/opt/fireinners/solrpc-proxy"
+WF_CANON="$WF_DIR/wallet_v1_solrpc.html"
+WF_SH="$WF_DIR/walletfix.sh"
+WF_SVC="/etc/systemd/system/fireinners-walletfix.service"
+WF_TMR="/etc/systemd/system/fireinners-walletfix.timer"
+
+need_root(){ [ "$(id -u)" = "0" ] || { echo "ERR: run as root"; exit 1; }; }
+have(){ command -v "$1" >/dev/null 2>&1; }
+
+is_immutable(){
+  local f="$1"
+  [ -e "$f" ] || return 1
+  lsattr "$f" 2>/dev/null | awk '{print $1}' | grep -q 'i'
+}
+unlock(){
+  local f="$1"
+  [ -e "$f" ] || return 0
+  if is_immutable "$f"; then chattr -i "$f" 2>/dev/null || true; fi
+}
+lock(){
+  local f="$1"
+  [ -e "$f" ] || return 0
+  chattr +i "$f" 2>/dev/null || true
+}
+
+echo "=== FIREINNERS WALLET USDC SOLRPC :: MEGA (safe) ==="
+need_root
+have node || { echo "ERR: node missing"; exit 1; }
+have nginx || true
+
+echo "[0] Backup"
+[ -f "$WALLET_HTML" ] && cp -a "$WALLET_HTML" "$BK/index.html.wallet.bak" || true
+[ -f "$ROOT_HTML" ] && cp -a "$ROOT_HTML" "$BK/index.html.root.bak" || true
+[ -f "$VHOST" ] && cp -a "$VHOST" "$BK/vhost.bak" || true
+[ -f "$SNIP" ] && cp -a "$SNIP" "$BK/snippet.bak" || true
+
+echo "[1] Install/Update solrpc proxy app"
+mkdir -p "$PROXY_DIR"
+cat >"$PROXY_DIR/server.js" <<'JS'
+"use strict";
+const express=require("express");
+const app=express();
+
+const HOST=process.env.HOST||"127.0.0.1";
+const PORT=parseInt(process.env.PORT||"12703",10);
+const JSON_LIMIT=process.env.JSON_LIMIT||"10mb";
+const TIMEOUT_MS=parseInt(process.env.TIMEOUT_MS||"12000",10);
+
+const UPSTREAMS=(process.env.UPSTREAMS||[
+  "https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac",
+  "https://api.mainnet-beta.solana.com",
+  "https://solana-rpc.publicnode.com",
+  "https://rpc.ankr.com/solana"
+].join(",")).split(",").map(s=>s.trim()).filter(Boolean);
+
+app.use((req,res,next)=>{
+  res.setHeader("Access-Control-Allow-Origin","*");
+  res.setHeader("Access-Control-Allow-Methods","GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers","Content-Type,Authorization");
+  if(req.method==="OPTIONS") return res.status(204).end();
+  next();
+});
+app.use(express.json({limit:JSON_LIMIT}));
+
+app.get("/ping",(req,res)=>res.json({ok:true,ts:Date.now(),upstreams:UPSTREAMS.length}));
+app.post(["/","/rpc"], async (req,res)=>{
+  const body=req.body;
+  const errors=[];
+  for(const u of UPSTREAMS){
+    try{
+      const ctrl=new AbortController();
+      const t=setTimeout(()=>ctrl.abort(), TIMEOUT_MS);
+      const r=await fetch(u,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body),signal:ctrl.signal});
+      clearTimeout(t);
+      const txt=await r.text();
+      if(!r.ok) throw new Error("HTTP "+r.status+" "+txt.slice(0,200));
+      let j;
+      try{ j=JSON.parse(txt); }catch(e){ throw new Error("Bad JSON"); }
+      if(j && j.error){
+        // erreurs fréquentes type "Temporary internal error" -> on failover
+        throw new Error("RPC "+JSON.stringify(j.error).slice(0,240));
+      }
+      res.status(200).type("application/json").send(txt);
+      return;
+    }catch(e){
+      errors.push({upstream:u,err:String(e).slice(0,260)});
+      continue;
+    }
+  }
+  res.status(502).json({ok:false,errors});
+});
+app.use((req,res)=>res.status(404).json({ok:false,err:"not found"}));
+
+app.listen(PORT,HOST,()=>console.log("solrpc proxy on "+HOST+":"+PORT+" upstreams="+UPSTREAMS.length));
+JS
+
+cat >"$PROXY_SVC" <<EOF
+[Unit]
+Description=FireInners Solana JSON-RPC proxy (CORS-safe, failover)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=HOST=${PROXY_HOST}
+Environment=PORT=${PROXY_PORT}
+Environment=JSON_LIMIT=10mb
+Environment=TIMEOUT_MS=12000
+ExecStart=/usr/bin/node ${PROXY_DIR}/server.js
+Restart=always
+RestartSec=2
+User=root
+WorkingDirectory=${PROXY_DIR}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now fireinners-solrpc-proxy.service
+systemctl restart fireinners-solrpc-proxy.service || true
+
+echo "[2] Nginx snippet + include in vhost (handles chattr +i)"
+mkdir -p "$(dirname "$SNIP")"
+cat >"$SNIP" <<EOF
+# FIREINNERS_SOLRPC_SNIPPET_v1
+location /solrpc/ {
+  proxy_pass http://${PROXY_HOST}:${PROXY_PORT}/;
+  proxy_http_version 1.1;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_connect_timeout 15s;
+  proxy_read_timeout 60s;
+}
+EOF
+
+if [ -f "$VHOST" ]; then
+  if ! grep -q "fireinners-solrpc-proxy.conf" "$VHOST"; then
+    unlock "$VHOST"
+    python3 - "$VHOST" "$SNIP" <<'PY'
+import sys, pathlib
+v=pathlib.Path(sys.argv[1])
+snip=sys.argv[2]
+txt=v.read_text()
+inc=f"include {snip};"
+if inc in txt: 
+  sys.exit(0)
+# insère avant la dernière accolade fermante
+i=txt.rfind("}")
+if i<0: 
+  raise SystemExit("ERR: cannot find closing brace in vhost")
+new=txt[:i].rstrip()+"\n\n    "+inc+"\n}\n"
+v.write_text(new)
+PY
+    lock "$VHOST"
+  fi
+fi
+
+nginx -t
+systemctl reload nginx
+
+echo "[3] Write canonical wallet HTML (SOL+USDC via /solrpc only)"
+mkdir -p "$(dirname "$WALLET_HTML")" "$WF_DIR"
+cat >"$WF_CANON" <<'HTML'
+<!doctype html><html lang="fr"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>FireInners • Wallet</title><style>:root{--bg:#050610;--p:#0b1022;--l:rgba(255,255,255,.14);--t:#e7f0ff;--m:#9fb3d7;--a:#7aa6ff}*{box-sizing:border-box}html,body{margin:0;height:100%;background:radial-gradient(900px 500px at 20% 0%,#0a1328 0%,transparent 60%),radial-gradient(700px 450px at 80% 20%,#101a33 0%,transparent 55%),var(--bg);color:var(--t);font:14px system-ui}#wrap{max-width:980px;margin:0 auto;padding:18px}h1{margin:0 0 6px;font-size:26px;letter-spacing:.2px}p{margin:0 0 14px;color:var(--m)}#row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:10px 0 14px}button{cursor:pointer;border:1px solid var(--l);background:rgba(0,0,0,.18);color:var(--t);padding:10px 14px;border-radius:14px;font-weight:700}button:disabled{opacity:.45;cursor:not-allowed}button:hover{border-color:rgba(255,255,255,.25)}#grid{display:grid;grid-template-columns:1.2fr .8fr;gap:12px}#card{background:linear-gradient(180deg,rgba(255,255,255,.06),rgba(255,255,255,.02));border:1px solid var(--l);border-radius:16px;padding:12px}#card h2{margin:0 0 8px;font-size:14px;color:var(--m);font-weight:800;letter-spacing:.2px}#val{font:13px ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap;word-break:break-word}#big{display:grid;grid-template-columns:1fr 1fr;gap:12px}#pill{display:inline-flex;gap:8px;align-items:center}#pill a{color:var(--t);text-decoration:none;border:1px solid var(--l);padding:8px 12px;border-radius:999px;background:rgba(0,0,0,.18)}#pill a:hover{border-color:rgba(255,255,255,.25)}#log{margin-top:12px;height:220px;overflow:auto;border:1px solid var(--l);border-radius:16px;background:rgba(0,0,0,.18);padding:10px;font:12px ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap}</style></head><body><div id="wrap"><div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px"><div><h1>FireInners • Wallet</h1><p>Lecture soldes via Phantom + Solana RPC. Aucun secret, aucune seed, aucun export.</p></div><div id="pill"><a href="/">Retour</a></div></div><div id="row"><button id="btnConnect">Connect</button><button id="btnDisc" disabled>Disconnect</button><button id="btnRefresh" disabled>Refresh</button></div><div id="grid"><div id="card"><h2>Adresse</h2><div id="val"><div id="addr">—</div><div style="height:10px"></div><div>RPC (SOL)</div><div id="rpcSol">—</div><div style="height:8px"></div><div>RPC (USDC)</div><div id="rpcUsdc">—</div></div></div><div id="big"><div id="card"><h2>SOL</h2><div id="val" style="font-size:18px;font-weight:900" id="sol">—</div></div><div id="card"><h2>USDC</h2><div id="val" style="font-size:18px;font-weight:900" id="usdc">—</div></div></div></div><div id="log"></div></div><script src="https://unpkg.com/@solana/web3.js@1.98.0/lib/index.iife.min.js"></script><script>(()=>{const $=s=>document.querySelector(s);const log=m=>{const el=$("#log");el.textContent+=(m+(m.endsWith("\n")?"":"\n"));el.scrollTop=el.scrollHeight};const USDC_MINT="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1";const SOLRPC=location.origin+"/solrpc";$("#rpcSol").textContent=SOLRPC;$("#rpcUsdc").textContent=SOLRPC;let ph=null,pub=null,conn=null;const fmt=(n,d=6)=>{try{return (Number(n)||0).toLocaleString(undefined,{maximumFractionDigits:d})}catch(e){return String(n)}};async function refresh(){if(!pub||!conn){log("REFRESH ERR: not connected");return}try{const lam=await conn.getBalance(pub,"confirmed");$("#sol").textContent=fmt(lam/1e9,6);log("SOL OK")}catch(e){$("#sol").textContent="—";log("SOL ERR: "+(e?.message||e))}try{const r=await conn.getParsedTokenAccountsByOwner(pub,{mint:new solanaWeb3.PublicKey(USDC_MINT)},"confirmed");let sum=0;for(const it of (r?.value||[])){const ui=it?.account?.data?.parsed?.info?.tokenAmount?.uiAmount;sum+=Number(ui||0)}$("#usdc").textContent=fmt(sum,6);log("USDC OK")}catch(e){$("#usdc").textContent="—";log("USDC ERR: "+(e?.message||e))}}async function connect(){try{ph=window.solana;if(!ph||!ph.isPhantom){log("Phantom introuvable (ouvre dans Phantom ou installe l’extension).");return}const r=await ph.connect();pub=r.publicKey;conn=new solanaWeb3.Connection(SOLRPC,{commitment:"confirmed"});$("#addr").textContent=pub.toBase58();$("#btnDisc").disabled=false;$("#btnRefresh").disabled=false;log("CONNECTED");await refresh()}catch(e){log("CONNECT ERR: "+(e?.message||e))}}async function disconnect(){try{if(ph&&ph.disconnect) await ph.disconnect()}catch(e){}pub=null;conn=null;$("#addr").textContent="—";$("#sol").textContent="—";$("#usdc").textContent="—";$("#btnDisc").disabled=true;$("#btnRefresh").disabled=true;log("DISCONNECTED")}$("#btnConnect").onclick=connect;$("#btnDisc").onclick=disconnect;$("#btnRefresh").onclick=refresh;log("READY")})();</script></body></html>
+HTML
+
+mkdir -p "$(dirname "$WALLET_HTML")"
+cp -a "$WF_CANON" "$WALLET_HTML"
+
+echo "[4] Install wallet self-heal (timer) if dist gets overwritten"
+cat >"$WF_SH" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+WALLET_HTML="${WALLET_HTML}"
+CANON="${WF_CANON}"
+[ -f "\$CANON" ] || exit 0
+[ -f "\$WALLET_HTML" ] || { mkdir -p "\$(dirname "\$WALLET_HTML")"; cp -a "\$CANON" "\$WALLET_HTML"; exit 0; }
+if ! grep -q "/solrpc" "\$WALLET_HTML"; then
+  cp -a "\$WALLET_HTML" "\$WALLET_HTML.bak.\$(date +%s)" || true
+  cp -a "\$CANON" "\$WALLET_HTML"
+fi
+EOF
+chmod +x "$WF_SH"
+
+cat >"$WF_SVC" <<EOF
+[Unit]
+Description=FireInners WalletFix (force /solrpc wallet html if overwritten)
+
+[Service]
+Type=oneshot
+ExecStart=${WF_SH}
+EOF
+
+cat >"$WF_TMR" <<EOF
+[Unit]
+Description=FireInners WalletFix timer
+
+[Timer]
+OnBootSec=45
+OnUnitActiveSec=15min
+AccuracySec=30s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now fireinners-walletfix.timer
+systemctl start fireinners-walletfix.service || true
+
+echo "[5] Quick verify"
+echo "PING local:"
+curl -fsS "http://${PROXY_HOST}:${PROXY_PORT}/ping" || true
+echo
+echo "PING public:"
+curl -fsS "https://fireinners.online/solrpc/ping" || true
+echo
+echo "RPC getHealth via /solrpc:"
+curl -fsS -H "content-type: application/json" -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' "https://fireinners.online/solrpc/" || true
+echo
+echo "Wallet contains /solrpc (remote):"
+curl -fsS "https://fireinners.online/wallet/?v=$(date +%s)" | grep -n "/solrpc" | head -n 5 || echo "NO /solrpc found in remote wallet HTML"
+echo
+echo "DONE"
+echo "Test: https://fireinners.online/wallet/?v=${TS}"
+SH
+chmod +x /root/FIREINNERS_WALLET_USDC_SOLRPC_MEGA.sh
+bash /root/FIREINNERS_WALLET_USDC_SOLRPC_MEGA.sh
