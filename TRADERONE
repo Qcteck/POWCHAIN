@@ -1,38 +1,47 @@
-bash -lc 'cat >/tmp/wolverine_patch_status.sh << "SH"
+bash -lc 'cat >/tmp/wolverine_fix_vendor.sh << "SH"
 #!/usr/bin/env bash
 set -euo pipefail
 ROOT="/opt/fireinners/frontend-react/app/dist"
 HTML="$ROOT/wolverine/index.html"
 VEND="$ROOT/wolverine/vendor"
 SOL="$VEND/solanaWeb3.iife.min.js"
+HOST="fireinners.online"
 
 test -f "$HTML" || { echo "ERR: $HTML introuvable"; exit 1; }
 
 ts="$(date -u +%Y%m%d-%H%M%S)"
-cp -a "$HTML" "$HTML.bak.$ts"
+cp -a "$HTML" "$HTML.bakfix.$ts"
+
 mkdir -p "$VEND"
+chmod 755 "$VEND"
 
-# Download local fallback (best effort)
-curl -fsSL "https://cdn.jsdelivr.net/npm/@solana/web3.js@latest/lib/index.iife.min.js" -o "$SOL" || true
+ok=0
+for u in \
+  "https://cdn.jsdelivr.net/npm/@solana/web3.js@latest/lib/index.iife.min.js" \
+  "https://unpkg.com/@solana/web3.js@latest/lib/index.iife.min.js" \
+  "https://esm.sh/@solana/web3.js@latest?bundle"
+do
+  if curl -fsSL "$u" -o "$SOL"; then ok=1; break; fi
+done
 
-# 1) Default placeholders: no more "..."
-perl -0777 -pe "s/API:\\s*\\.\\.\\./API: offline/g; s/Phantom:\\s*\\.\\.\\./Phantom: disconnected/g" -i "$HTML"
+if [ "$ok" -ne 1 ]; then
+  cat >"$SOL" << "JS"
+(()=>{console.error("solana web3 fallback missing (CDN blocked)");window.solanaWeb3=null;})();
+JS
+fi
+chmod 644 "$SOL"
 
-# 2) Add onerror fallback on the jsdelivr script tag (if present)
+# Assure le onerror fallback (si pas déjà présent)
 perl -0777 -pe "s#<script\\s+src=\"https://cdn\\.jsdelivr\\.net/npm/@solana/web3\\.js@latest/lib/index\\.iife\\.min\\.js\"\\s*>#<script src=\"https://cdn.jsdelivr.net/npm/@solana/web3.js@latest/lib/index.iife.min.js\" onerror=\"var s=document.createElement('script');s.src='/wolverine/vendor/solanaWeb3.iife.min.js';document.head.appendChild(s)\">#g" -i "$HTML"
 
-# 3) Add fetch timeout helper + patch ping calls (if patterns exist)
-perl -0777 -pe "s#<script>\\(#<script>(()=>{const __fetchTO=(u,o,ms)=>{try{ms=ms||2500;o=o||{};const c=new AbortController();const t=setTimeout(()=>c.abort(),ms);return fetch(u,Object.assign({},o,{signal:c.signal})).finally(()=>clearTimeout(t))}catch(e){return fetch(u,o||{})}};#g" -i "$HTML"
+bytes="$(stat -c %s "$SOL" 2>/dev/null || echo 0)"
 
-# patch /stats ping
-perl -0777 -pe "s#fetch\\(\"/stats/index\\.json\",\\{cache:\"no-store\"\\}\\)#__fetchTO(\"/stats/index.json\",{cache:\"no-store\"},2500)#g" -i "$HTML"
+echo "OK: vendor fallback ready: $SOL ($bytes bytes)"
+echo "OK: backup html: $HTML.bakfix.$ts"
 
-# patch proxy ping
-perl -0777 -pe "s#fetch\\(p\\.replace\\(/\\\\/\\$\\/\\s*,\\s*\"\"\\)\\+\"/ping\"\\)#__fetchTO(p.replace(/\\/$/,\"\")+\"/ping\",{},2500)#g" -i "$HTML"
-
-echo "OK patch: $HTML"
-echo "Backup: $HTML.bak.$ts"
-echo "Vendor fallback: $SOL ($(wc -c < \"$SOL\" 2>/dev/null || echo 0) bytes)"
+echo "TEST local nginx:"
+echo -n "/wolverine/vendor/solanaWeb3.iife.min.js => "
+curl -k -sS -o /dev/null -w "%{http_code}\n" "https://127.0.0.1/wolverine/vendor/solanaWeb3.iife.min.js" -H "Host: $HOST" || true
 SH
-chmod +x /tmp/wolverine_patch_status.sh
-/tmp/wolverine_patch_status.sh'
+chmod +x /tmp/wolverine_fix_vendor.sh
+/tmp/wolverine_fix_vendor.sh'
