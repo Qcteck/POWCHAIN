@@ -1,1 +1,202 @@
-bash -lc 'source /opt/fireinners/wolverine-telegram/telegram.env; echo "tokenlen=${#TG_TOKEN} chatid=$TG_CHAT_ID"'
+cat >/tmp/WOLVERINE_TG_FIX.sh <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+DIR="/opt/fireinners/wolverine-telegram"
+ENVF="$DIR/telegram.env"
+SERVICE="wolverine-tg-sentinel"
+WOLV="/usr/local/bin/wolv_send"
+
+SUDO=""
+if [ "$(id -u)" -ne 0 ]; then
+  if command -v sudo >/dev/null 2>&1; then SUDO="sudo"
+  else echo "ERREUR: pas root et sudo absent"; exit 1
+  fi
+fi
+
+have(){ command -v "$1" >/dev/null 2>&1; }
+
+say(){ printf "%s\n" "$*"; }
+
+preflight(){
+  say "=== PRE-FLIGHT (read-only) ==="
+  say "whoami: $(whoami)  host: $(hostname)  date: $(date -u +"%F %T UTC")"
+  say "DIR: $DIR"
+  say "ENV: $ENVF"
+  say "SERVICE: $SERVICE"
+  if [ -x "$WOLV" ]; then say "wolv_send: OK ($WOLV)"; else say "wolv_send: ABSENT ($WOLV)"; fi
+  if $SUDO systemctl list-unit-files | grep -q "^${SERVICE}\.service"; then
+    say "systemd unit: OK (${SERVICE}.service)"
+    say "is-active: $($SUDO systemctl is-active "$SERVICE" 2>/dev/null || true)"
+  else
+    say "systemd unit: ABSENT (${SERVICE}.service)"
+  fi
+  say "=============================="
+}
+
+confirm(){
+  local ans=""
+  read -r -p "Continuer et mettre a jour le token Telegram? (y/N) " ans || true
+  case "${ans,,}" in y|yes) return 0;; *) say "Stop."; exit 0;; esac
+}
+
+valid_token(){
+  # format typique: 123456789:AbcDEF_... (alnum/_/-)
+  printf "%s" "$1" | grep -Eq '^[0-9]{6,}:[A-Za-z0-9_-]{20,}$'
+}
+
+py_tg(){
+  # $1 = method, autres args en KEY=VAL
+  local method="$1"; shift || true
+  python3 - "$method" "$@" <<'PY'
+import os,sys,json,urllib.parse,urllib.request
+method=sys.argv[1]
+token=os.environ.get("TG_TOKEN","")
+if not token:
+  print("ERR: TG_TOKEN missing",file=sys.stderr); sys.exit(2)
+qs={}
+for kv in sys.argv[2:]:
+  if "=" in kv:
+    k,v=kv.split("=",1)
+    qs[k]=v
+base=f"https://api.telegram.org/bot{token}/{method}"
+if qs and method!="sendMessage":
+  url=base+"?"+urllib.parse.urlencode(qs)
+  req=urllib.request.Request(url,headers={"User-Agent":"wolverine-tg-fix"})
+  data=None
+elif method=="sendMessage":
+  url=base
+  data=urllib.parse.urlencode(qs).encode()
+  req=urllib.request.Request(url,data=data,headers={"User-Agent":"wolverine-tg-fix"})
+else:
+  url=base
+  req=urllib.request.Request(url,headers={"User-Agent":"wolverine-tg-fix"})
+try:
+  with urllib.request.urlopen(req,timeout=8) as r:
+    raw=r.read().decode("utf-8","replace")
+except Exception as e:
+  print("ERR:",e,file=sys.stderr); sys.exit(3)
+try:
+  j=json.loads(raw)
+except Exception:
+  print(raw[:400]); sys.exit(4)
+if not j.get("ok"):
+  print(json.dumps(j)[:600])
+  sys.exit(5)
+print(json.dumps(j)[:1200])
+PY
+}
+
+curl_tg(){
+  # fallback si python3 absent
+  local method="$1"; shift || true
+  local token="${TG_TOKEN:-}"
+  if [ -z "$token" ]; then echo "ERR: TG_TOKEN missing" >&2; return 2; fi
+  if [ "$method" = "sendMessage" ]; then
+    curl -sS -m 8 -X POST "https://api.telegram.org/bot${token}/sendMessage" \
+      -d "$@" | head -c 1200 || true
+    echo
+  else
+    local qs=""
+    if [ "$#" -gt 0 ]; then qs="?$*"; fi
+    curl -sS -m 8 "https://api.telegram.org/bot${token}/${method}${qs}" | head -c 1200 || true
+    echo
+  fi
+}
+
+tg(){
+  if have python3; then py_tg "$@"; else curl_tg "$@"; fi
+}
+
+detect_chat_id(){
+  # nécessite que tu aies envoyé /start au bot
+  local out cid=""
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    out="$(tg getUpdates "limit=20" 2>/dev/null || true)"
+    cid="$(printf "%s" "$out" | grep -oE '"chat"\s*:\s*\{\s*"id"\s*:\s*-?[0-9]+' | tail -n1 | grep -oE '-?[0-9]+' || true)"
+    if [ -n "$cid" ]; then printf "%s" "$cid"; return 0; fi
+    sleep 2
+  done
+  return 1
+}
+
+write_env(){
+  local tok="$1" cid="$2"
+  $SUDO mkdir -p "$DIR"
+  $SUDO chmod 700 "$DIR"
+  if [ -f "$ENVF" ]; then $SUDO cp -a "$ENVF" "${ENVF}.bak.$(date +%s)" || true; fi
+  ( umask 077; printf "TG_TOKEN=%s\nTG_CHAT_ID=%s\n" "$tok" "$cid" | $SUDO tee "$ENVF" >/dev/null )
+  $SUDO chmod 600 "$ENVF"
+}
+
+main(){
+  preflight
+  confirm
+
+  local TG_TOKEN_INPUT="" TG_CHAT_ID_INPUT=""
+
+  read -r -s -p "Colle le NOUVEAU TG_TOKEN (rien ne s'affiche) puis ENTER: " TG_TOKEN_INPUT
+  echo
+  if ! valid_token "$TG_TOKEN_INPUT"; then
+    say "ERREUR: format token invalide. Il doit ressembler a 123456789:AbcDEF_..."
+    exit 1
+  fi
+
+  read -r -p "TG_CHAT_ID (ENTER pour auto-detect via getUpdates): " TG_CHAT_ID_INPUT || true
+
+  export TG_TOKEN="$TG_TOKEN_INPUT"
+
+  if [ -z "$TG_CHAT_ID_INPUT" ]; then
+    say "Auto-detect chat id:"
+    say "1) Sur Telegram: ouvre le bot WOLVERINE, appuie Start, envoie /start"
+    read -r -p "2) Ensuite appuie ENTER ici pour lancer la detection... " _ || true
+    if ! TG_CHAT_ID_INPUT="$(detect_chat_id)"; then
+      say "ERREUR: impossible de detecter TG_CHAT_ID. Envoie /start au bot puis relance."
+      exit 1
+    fi
+    say "Detecte TG_CHAT_ID=$TG_CHAT_ID_INPUT"
+  fi
+
+  write_env "$TG_TOKEN_INPUT" "$TG_CHAT_ID_INPUT"
+
+  # Charge env proprement pour les tests
+  # shellcheck disable=SC1090
+  set +u
+  source "$ENVF"
+  set -u
+  export TG_TOKEN TG_CHAT_ID
+
+  say "Test getMe..."
+  tg getMe >/tmp/tg_getme.json || true
+  if ! grep -q '"ok"' /tmp/tg_getme.json; then
+    say "ERREUR: getMe a echoue (token invalide/revoked ou reseau)."
+    cat /tmp/tg_getme.json | head -c 500 || true
+    echo
+    exit 1
+  fi
+  cat /tmp/tg_getme.json | head -c 300; echo
+
+  say "Test sendMessage..."
+  tg sendMessage "chat_id=${TG_CHAT_ID}" "text=TEST TG OK (batch)" "disable_web_page_preview=true" >/tmp/tg_send.json || true
+  if ! grep -q '"ok"' /tmp/tg_send.json; then
+    say "ERREUR: sendMessage a echoue (chat_id pas bon ou bot pas demarre)."
+    cat /tmp/tg_send.json | head -c 600 || true
+    echo
+    exit 1
+  fi
+  cat /tmp/tg_send.json | head -c 220; echo
+
+  say "Restart service..."
+  $SUDO systemctl restart "$SERVICE" || true
+  $SUDO systemctl status "$SERVICE" --no-pager -n 25 || true
+
+  if [ -x "$WOLV" ]; then
+    "$WOLV" "WOLVERINE: TG OK (batch)" >/dev/null 2>&1 || true
+  fi
+
+  say "DONE."
+}
+
+main "$@"
+SH
+bash /tmp/WOLVERINE_TG_FIX.sh
