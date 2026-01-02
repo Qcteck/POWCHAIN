@@ -1,60 +1,123 @@
-cat >/tmp/WOLVERINE_TG_SETUP.sh <<'SH'
+cat >/tmp/WOLVERINE_TG_ALLINONE.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
-ENV="/opt/fireinners/wolverine-telegram/telegram.env"
-SEND="/usr/local/bin/wolv_send"
 
-[ -x "$SEND" ] || { echo "wolv_send missing"; exit 1; }
+echo "=== WOLVERINE TG ALL-IN-ONE ==="
+date;hostname;whoami;pwd
 
-read -r -p "TG_TOKEN (BotFather) = " TG_TOKEN
-[ -n "${TG_TOKEN:-}" ] || { echo "token vide"; exit 1; }
+ASK="/opt/fireinners/sentinel/lib/askorupdate.sh"
+if [ -f "$ASK" ]; then
+  # shellcheck disable=SC1090
+  source "$ASK"
+else
+  askorupdate_file(){ local p="$1";mkdir -p "$(dirname "$p")";cp -a "$p" "$p.bak.$(date +%s)" 2>/dev/null||true;cat >"$p"; }
+fi
 
-echo
-echo "1) Ouvre Telegram et écris à @WOLVERINE_V1BOT : /start (en privé)"
-echo "   ou si c'est un groupe: ajoute le bot au groupe, envoie un message, puis relance."
-echo
-read -r -p "Appuie ENTER quand c'est fait..." _
+command -v curl >/dev/null || { echo "curl missing"; exit 1; }
+command -v python3 >/dev/null || { echo "python3 missing"; exit 1; }
 
-echo
-echo "Récupération des derniers updates..."
-JSON="$(curl -sS "https://api.telegram.org/bot${TG_TOKEN}/getUpdates?timeout=10&limit=20")"
+DIR="/opt/fireinners/wolverine-telegram"
+ENV="$DIR/telegram.env"
+SEND="$DIR/send.sh"
+BIN="/usr/local/bin/wolv_send"
 
-python3 - <<PY
-import json,sys
-data=json.loads(sys.argv[1])
-res=data.get("result",[])
-seen=[]
-for u in res:
-  m=u.get("message") or u.get("edited_message") or {}
-  chat=m.get("chat") or {}
-  cid=chat.get("id")
-  title=chat.get("title") or ""
-  uname=(chat.get("username") or "")
-  typ=chat.get("type") or ""
-  text=m.get("text") or ""
-  if cid is None: 
-    continue
-  key=(cid,typ,title,uname)
-  if key in seen: 
-    continue
-  seen.append(key)
-  print(f"CHAT_ID={cid}  type={typ}  title='{title}'  username='{uname}'  last='{text[:60]}'")
-PY "$JSON" || true
+mkdir -p "$DIR"
+chmod 700 "$DIR"
 
 echo
-read -r -p "Choisis TG_CHAT_ID (copie/colle un CHAT_ID affiché) = " TG_CHAT_ID
-[ -n "${TG_CHAT_ID:-}" ] || { echo "chat id vide"; exit 1; }
+echo "TG_TOKEN requis (BotFather)."
+echo "Note: si tu as exposé ton token, fais /revoke dans BotFather et utilise le nouveau."
+echo
 
+read -r -s -p "TG_TOKEN = " TG_TOKEN
+echo
+[ -n "${TG_TOKEN:-}" ] || { echo "TG_TOKEN vide"; exit 1; }
+
+echo "--- install send script + command ---"
+cat >/tmp/_tg_send <<'SH2'
+#!/usr/bin/env bash
+set -euo pipefail
+DIR="/opt/fireinners/wolverine-telegram"
+# shellcheck disable=SC1090
+source "$DIR/telegram.env"
+MSG="${*:-}"
+[ -n "${TG_TOKEN:-}" ] || { echo "TG_TOKEN missing"; exit 1; }
+[ -n "${TG_CHAT_ID:-}" ] || { echo "TG_CHAT_ID missing"; exit 1; }
+[ -n "$MSG" ] || { echo "usage: wolv_send \"message\""; exit 1; }
+curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+  -d "chat_id=${TG_CHAT_ID}" \
+  -d "text=${MSG}" \
+  -d "disable_web_page_preview=true" >/dev/null
+echo "sent"
+SH2
+askorupdate_file "$SEND" </tmp/_tg_send
+rm -f /tmp/_tg_send
+chmod 700 "$SEND"
+
+cat >/tmp/_tg_bin <<'SH3'
+#!/usr/bin/env bash
+exec /opt/fireinners/wolverine-telegram/send.sh "$@"
+SH3
+askorupdate_file "$BIN" </tmp/_tg_bin
+rm -f /tmp/_tg_bin
+chmod 755 "$BIN"
+
+echo "--- write env with token (chat id pending) ---"
 umask 077
 cat >"$ENV" <<EOF
 TG_TOKEN=${TG_TOKEN}
-TG_CHAT_ID=${TG_CHAT_ID}
+TG_CHAT_ID=
 EOF
 chmod 600 "$ENV"
 
 echo
-echo "Test envoi..."
+echo "Action à faire maintenant (Telegram):"
+echo "1) Ouvre @WOLVERINE_V1BOT"
+echo "2) Envoie /start (ou un message si groupe)"
+echo
+read -r -p "Quand c'est fait, ENTER..." _
+
+echo "--- fetch updates & auto-pick last chat_id ---"
+JSON="$(curl -sS "https://api.telegram.org/bot${TG_TOKEN}/getUpdates?timeout=10&limit=50")"
+
+CHAT_ID="$(python3 - <<'PY' "$JSON"
+import json,sys
+d=json.loads(sys.argv[1])
+res=d.get("result",[])
+last=None
+for u in res:
+  m=u.get("message") or u.get("edited_message") or u.get("channel_post") or {}
+  c=m.get("chat") or {}
+  cid=c.get("id")
+  if cid is not None:
+    last=cid
+print("" if last is None else str(last))
+PY
+)"
+
+if [ -z "${CHAT_ID:-}" ]; then
+  echo
+  echo "Aucun chat_id trouvé dans getUpdates."
+  echo "Envoie /start au bot, puis relance:"
+  echo "bash /tmp/WOLVERINE_TG_ALLINONE.sh"
+  exit 2
+fi
+
+echo "Detected TG_CHAT_ID = $CHAT_ID"
+
+# write final env
+umask 077
+cat >"$ENV" <<EOF
+TG_TOKEN=${TG_TOKEN}
+TG_CHAT_ID=${CHAT_ID}
+EOF
+chmod 600 "$ENV"
+
+echo "--- test send ---"
 wolv_send "WOLVERINE_V1BOT OK - test depuis VPS"
-echo "OK."
+
+echo "=== OK: Telegram prêt ==="
+echo "Env: $ENV"
+echo "Cmd: wolv_send \"message\""
 SH
-bash /tmp/WOLVERINE_TG_SETUP.sh
+bash /tmp/WOLVERINE_TG_ALLINONE.sh
