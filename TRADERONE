@@ -1,12 +1,179 @@
-systemctl status wolverine --no-pager -n 40
+cat >/tmp/MEGA_WOLVERINE_CONFIG_AUTODETECT.sh <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
 
+ASKMOD="/opt/fireinners/sentinel/lib/askorupdate.sh"
+if [ -f "$ASKMOD" ]; then . "$ASKMOD"; fi
 
-KEY="$(find /opt/fireinners/wolverine-backend -maxdepth 3 -type f \( -name '*.key' -o -name '*keypair*' -o -name 'traderone*.json' -o -name 'wallet*.json' \) | head -n 1)"; echo "KEY=$KEY"; node -e "const fs=require('fs');const {Keypair}=require('@solana/web3.js');const p=process.env.KEY;const a=JSON.parse(fs.readFileSync(p,'utf8'));const kp=Keypair.fromSecretKey(Uint8Array.from(a));console.log(kp.publicKey.toBase58());"
+say(){ printf "%s\n" "$*"; }
+need(){ command -v "$1" >/dev/null 2>&1 || { say "ERREUR: manque $1"; exit 1; }; }
+askyn(){
+  local q="$1" a=""
+  if command -v askorupdate_yesno >/dev/null 2>&1; then askorupdate_yesno "$q" || exit 0
+  else read -r -p "$q (y/N) " a || true; case "${a,,}" in y|yes) :;; *) say "Stop."; exit 0;; esac
+  fi
+}
 
+NG="/etc/nginx/sites-available/fireinners.online-ssl"
+OUTDIR="/var/lib/wolverine-config"
+OUTJSON="$OUTDIR/public-config.json"
+USDC_MINT="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1"
+TOKEN_PROGRAM="TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+ASSOC_PROGRAM="ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
 
+need grep; need sed; need awk; need ss; need node; need nginx; need curl; need head; need find; need realpath || true
 
+[ -f "$NG" ] || { say "ERREUR: nginx vhost absent: $NG"; exit 1; }
 
+say "=== PRE-FLIGHT (read-only) ==="
+say "NGINX: $NG"
 
+# 1) detect port in nginx for /wolverine/api
+PORT="$(awk '
+  $0 ~ /location[[:space:]]+\/wolverine\/api/ {inloc=1}
+  inloc && $0 ~ /proxy_pass/ {
+    if (match($0,/127\.0\.0\.1:([0-9]+)/,a)) {print a[1]; exit}
+    if (match($0,/localhost:([0-9]+)/,a)) {print a[1]; exit}
+  }
+  inloc && $0 ~ /}/ {inloc=0}
+' "$NG" | head -n1 || true)"
 
+if [ -z "${PORT:-}" ]; then
+  # fallback: any proxy_pass with wolverine/api
+  PORT="$(grep -nE 'location[[:space:]]+/wolverine/api|proxy_pass' "$NG" | awk '
+    /proxy_pass/{
+      if (match($0,/127\.0\.0\.1:([0-9]+)/,a)) {print a[1]; exit}
+      if (match($0,/localhost:([0-9]+)/,a)) {print a[1]; exit}
+    }' | head -n1 || true)"
+fi
 
-KEY="$(find /opt/fireinners/wolverine-backend -maxdepth 3 -type f \( -name '*.key' -o -name '*keypair*' -o -name 'traderone*.json' -o -name 'wallet*.json' \) | head -n 1)"; echo "KEY=$KEY"; node -e "const fs=require('fs');const {Keypair}=require('@solana/web3.js');const p=process.env.KEY;const a=JSON.parse(fs.readFileSync(p,'utf8'));const kp=Keypair.fromSecretKey(Uint8Array.from(a));console.log(kp.publicKey.toBase58());"
+[ -n "${PORT:-}" ] || { say "ERREUR: impossible de détecter le port backend pour /wolverine/api dans nginx"; exit 1; }
+say "BACKEND PORT (nginx): $PORT"
+
+# 2) detect pid listening
+PID="$(ss -ltnp 2>/dev/null | grep -E ":(^|.*)$PORT[[:space:]]" -n || true)"
+PID="$(ss -ltnp 2>/dev/null | grep -E ":$PORT[[:space:]]" | head -n1 | sed -n 's/.*pid=\([0-9]\+\).*/\1/p' || true)"
+[ -n "${PID:-}" ] || { say "ERREUR: aucun process n'écoute sur $PORT"; exit 1; }
+say "PID: $PID"
+
+# 3) detect cwd
+CWD="$(readlink -f "/proc/$PID/cwd" 2>/dev/null || true)"
+[ -n "${CWD:-}" ] || { say "ERREUR: impossible de lire cwd du PID"; exit 1; }
+say "CWD: $CWD"
+
+# 4) find keypair in cwd
+KEY="$(find "$CWD" -maxdepth 4 -type f \( -name '*.json' -o -name '*.key' -o -name '*keypair*' -o -name '*wallet*' \) 2>/dev/null | head -n1 || true)"
+if [ -z "${KEY:-}" ]; then
+  # fallback broader
+  KEY="$(find /opt/fireinners -maxdepth 5 -type f \( -name 'traderone*.json' -o -name '*keypair*.json' -o -name 'wallet*.json' \) 2>/dev/null | head -n1 || true)"
+fi
+[ -n "${KEY:-}" ] || { say "ERREUR: aucune keypair trouvée (cwd=$CWD)"; exit 1; }
+say "KEYPAIR: $KEY"
+
+say "Test health:"
+curl -sS "https://fireinners.online/wolverine/api/health" || true
+echo
+
+askyn "Continuer et créer /wolverine/api/config via NGINX alias (sans toucher au backend)?"
+
+mkdir -p "$OUTDIR"
+chmod 700 "$OUTDIR"
+
+# build config JSON (compute ATA without spl-token)
+node <<'JS'
+const fs=require('fs');
+const path=require('path');
+
+const keyPath=process.env.KEY;
+const outPath=process.env.OUTJSON;
+const usdcMint=process.env.USDC_MINT;
+const tokenProg=process.env.TOKEN_PROGRAM;
+const assocProg=process.env.ASSOC_PROGRAM;
+
+let Web3;
+try{
+  // prefer local install if exists
+  Web3=require('@solana/web3.js');
+}catch(e){
+  console.error("ERR: @solana/web3.js introuvable dans node env");
+  process.exit(1);
+}
+const {PublicKey,Keypair}=Web3;
+
+const raw=fs.readFileSync(keyPath,'utf8').trim();
+let secret;
+try{
+  const j=JSON.parse(raw);
+  if(Array.isArray(j)) secret=Uint8Array.from(j);
+  else if(j && Array.isArray(j.secretKey)) secret=Uint8Array.from(j.secretKey);
+  else throw new Error("format json inconnu");
+}catch(e){
+  console.error("ERR: keypair json invalide:", e.message);
+  process.exit(1);
+}
+
+const kp=Keypair.fromSecretKey(secret);
+const bot=kp.publicKey;
+
+function ata(mint, owner){
+  const mintPk=new PublicKey(mint);
+  const ownerPk=new PublicKey(owner);
+  const tp=new PublicKey(tokenProg);
+  const ap=new PublicKey(assocProg);
+  const [pda]=PublicKey.findProgramAddressSync(
+    [ownerPk.toBuffer(), tp.toBuffer(), mintPk.toBuffer()],
+    ap
+  );
+  return pda;
+}
+
+const botUsdcAta=ata(usdcMint, bot).toBase58();
+
+const payload={
+  ok:true,
+  bot: bot.toBase58(),
+  botUsdcAta,
+  usdcMint,
+  note:"Custodial: send SOL to bot (fees). Send USDC budget to botUsdcAta. /wolverine/api/config served by nginx alias."
+};
+
+fs.writeFileSync(outPath, JSON.stringify(payload,null,2));
+console.log("BOT=",payload.bot);
+console.log("USDC_ATA=",payload.botUsdcAta);
+JS
+
+chmod 644 "$OUTJSON"
+
+# patch nginx: exact match overrides proxy
+TMP="$(mktemp)"
+cp -a "$NG" "$NG.bak.$(date +%s)"
+
+if grep -q 'location = /wolverine/api/config' "$NG"; then
+  say "NGINX: location /wolverine/api/config deja présent."
+else
+  perl -0777 -pe '
+    my $ins = "\n    location = /wolverine/api/config {\n        default_type application/json;\n        alias /var/lib/wolverine-config/public-config.json;\n        add_header Cache-Control \"no-store\";\n    }\n";
+    if (s/(\\n\\s*location\\s+\\/wolverine\\/api[^\\n]*\\{)/$ins$1/s) { }
+    else { s/(\\n\\})/$ins$1/s; }
+  ' "$NG" >"$TMP"
+  mv "$TMP" "$NG"
+  say "NGINX: location /wolverine/api/config ajoutée."
+fi
+
+# reload nginx (handle immutable)
+if lsattr "$NG" 2>/dev/null | grep -q ' i '; then
+  say "NGINX: fichier immutable, unlock temporaire"
+  chattr -i "$NG" || true
+  nginx -t
+  systemctl reload nginx
+  chattr +i "$NG" || true
+else
+  nginx -t
+  systemctl reload nginx
+fi
+
+say "TEST: https://fireinners.online/wolverine/api/config"
+curl -sS https://fireinners.online/wolverine/api/config; echo
+say "DONE."
+SH
+bash /tmp/MEGA_WOLVERINE_CONFIG_AUTODETECT.sh
