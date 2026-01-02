@@ -1,21 +1,38 @@
-bash -lc 'cat >/tmp/wolverine_fly.sh << "SH"
+bash -lc 'cat >/tmp/wolverine_patch_status.sh << "SH"
 #!/usr/bin/env bash
 set -euo pipefail
-HOST="fireinners.online"
 ROOT="/opt/fireinners/frontend-react/app/dist"
-echo "== META =="; date -u; hostname; echo
-echo "== FILES =="; ls -la "$ROOT/wolverine/index.html" "$ROOT/stats/index.json" 2>/dev/null || true; echo
-echo "== NGINX TEST =="; nginx -t || true; echo
-echo "== CURL (local via nginx, with Host) =="
-echo -n "/stats/index.json => "; curl -k -sS -o /dev/null -w "%{http_code}\n" "https://127.0.0.1/stats/index.json" -H "Host: $HOST" || true
-echo -n "/wolverine/ => "; curl -k -sS -o /dev/null -w "%{http_code}\n" "https://127.0.0.1/wolverine/" -H "Host: $HOST" || true
-echo
-echo "== CURL (public) =="
-echo -n "https://$HOST/stats/index.json => "; curl -k -sS -o /dev/null -w "%{http_code}\n" "https://$HOST/stats/index.json" || true
-echo -n "https://$HOST/wolverine/ => "; curl -k -sS -o /dev/null -w "%{http_code}\n" "https://$HOST/wolverine/" || true
-echo
-echo "== CDN check (solana web3) =="
-echo -n "jsdelivr => "; curl -I -sS "https://cdn.jsdelivr.net/npm/@solana/web3.js@latest/lib/index.iife.min.js" | head -n 1 || true
+HTML="$ROOT/wolverine/index.html"
+VEND="$ROOT/wolverine/vendor"
+SOL="$VEND/solanaWeb3.iife.min.js"
+
+test -f "$HTML" || { echo "ERR: $HTML introuvable"; exit 1; }
+
+ts="$(date -u +%Y%m%d-%H%M%S)"
+cp -a "$HTML" "$HTML.bak.$ts"
+mkdir -p "$VEND"
+
+# Download local fallback (best effort)
+curl -fsSL "https://cdn.jsdelivr.net/npm/@solana/web3.js@latest/lib/index.iife.min.js" -o "$SOL" || true
+
+# 1) Default placeholders: no more "..."
+perl -0777 -pe "s/API:\\s*\\.\\.\\./API: offline/g; s/Phantom:\\s*\\.\\.\\./Phantom: disconnected/g" -i "$HTML"
+
+# 2) Add onerror fallback on the jsdelivr script tag (if present)
+perl -0777 -pe "s#<script\\s+src=\"https://cdn\\.jsdelivr\\.net/npm/@solana/web3\\.js@latest/lib/index\\.iife\\.min\\.js\"\\s*>#<script src=\"https://cdn.jsdelivr.net/npm/@solana/web3.js@latest/lib/index.iife.min.js\" onerror=\"var s=document.createElement('script');s.src='/wolverine/vendor/solanaWeb3.iife.min.js';document.head.appendChild(s)\">#g" -i "$HTML"
+
+# 3) Add fetch timeout helper + patch ping calls (if patterns exist)
+perl -0777 -pe "s#<script>\\(#<script>(()=>{const __fetchTO=(u,o,ms)=>{try{ms=ms||2500;o=o||{};const c=new AbortController();const t=setTimeout(()=>c.abort(),ms);return fetch(u,Object.assign({},o,{signal:c.signal})).finally(()=>clearTimeout(t))}catch(e){return fetch(u,o||{})}};#g" -i "$HTML"
+
+# patch /stats ping
+perl -0777 -pe "s#fetch\\(\"/stats/index\\.json\",\\{cache:\"no-store\"\\}\\)#__fetchTO(\"/stats/index.json\",{cache:\"no-store\"},2500)#g" -i "$HTML"
+
+# patch proxy ping
+perl -0777 -pe "s#fetch\\(p\\.replace\\(/\\\\/\\$\\/\\s*,\\s*\"\"\\)\\+\"/ping\"\\)#__fetchTO(p.replace(/\\/$/,\"\")+\"/ping\",{},2500)#g" -i "$HTML"
+
+echo "OK patch: $HTML"
+echo "Backup: $HTML.bak.$ts"
+echo "Vendor fallback: $SOL ($(wc -c < \"$SOL\" 2>/dev/null || echo 0) bytes)"
 SH
-chmod +x /tmp/wolverine_fly.sh
-/tmp/wolverine_fly.sh'
+chmod +x /tmp/wolverine_patch_status.sh
+/tmp/wolverine_patch_status.sh'
