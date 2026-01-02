@@ -1,171 +1,429 @@
-bash -lc 'set -euo pipefail
-TMP=/tmp/MEGA_WOLVERINE_FIX.sh
-cat >"$TMP" <<'"'"'BASH'"'"'
-#!/usr/bin/env bash
+bash -lc 'cat > /tmp/MEGA_WOLVERINE_ALL.sh <<'"'"'BASH'"'"'
 set -euo pipefail
 
 APPDIR="/opt/fireinners/wolverine-api"
-FRONTDIR="/opt/fireinners/frontend-react/app/dist/wolverine"
+WEBDIR="/opt/fireinners/frontend-react/app/dist/wolverine"
 ENVF="$APPDIR/.env"
-SERVICE="wolverine-api"
-NG="/etc/nginx/sites-available/fireinners.online-ssl"
+WALLET_JSON="$APPDIR/custody.keypair.json"
+WALLET_PUB="$APPDIR/custody.pub"
+STATE_DIR="/var/lib/wolverine-api"
+STATE_JSON="$STATE_DIR/state.json"
+
+NG_SITE="/etc/nginx/sites-available/fireinners.online-ssl"
 SNIP="/etc/nginx/snippets/fireinners-wolverine.conf"
+
+SERVICE="wolverine-api"
+PORT_DEFAULT="3050"
+BASE_PATH="/wolverine/api"
+
+RPC_DEFAULT="https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac"
+USDC_MINT="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1"
+WSOL_MINT="So11111111111111111111111111111111111111112"
 
 say(){ printf "%s\n" "$*"; }
 need(){ command -v "$1" >/dev/null 2>&1 || { say "ERREUR: $1 manquant"; exit 1; }; }
 
-need node; need npm; need systemctl; need nginx; need sed; need awk; need grep; need curl; need base64; need chattr
+need bash
+need node
+need npm
+need nginx
+need systemctl
+need curl
+need ss
+need sed
+need awk
+need grep
+need find
 
+if [ ! -f "$NG_SITE" ]; then say "ERREUR: nginx vhost absent: $NG_SITE"; exit 1; fi
+
+say "=== PRE-FLIGHT (read-only) ==="
+say "APPDIR: $APPDIR"
+say "WEBDIR: $WEBDIR"
+say "NG_SITE: $NG_SITE"
+say "SNIP  : $SNIP"
+
+PORT="$(awk -v bp="$BASE_PATH" '
+  $0 ~ "location" && $0 ~ bp { inloc=1 }
+  inloc && $0 ~ "proxy_pass" {
+    if (match($0,/127\.0\.0\.1:([0-9]+)/,a)) { print a[1]; exit }
+    if (match($0,/localhost:([0-9]+)/,a)) { print a[1]; exit }
+  }
+  inloc && $0 ~ "}" { inloc=0 }
+' "$NG_SITE" 2>/dev/null || true)"
+if [ -z "${PORT:-}" ]; then PORT="$PORT_DEFAULT"; fi
+say "BACKEND PORT (nginx->localhost): $PORT"
+
+PID="$(ss -ltnp 2>/dev/null | awk -v p=":$PORT" '$4 ~ p {print $NF}' | head -n1 || true)"
+[ -n "${PID:-}" ] && say "Process listening on $PORT: $PID" || say "No process currently on $PORT (ok si on installe)"
+
+say "=== INSTALL/UPDATE ==="
+mkdir -p "$APPDIR" "$WEBDIR" "$STATE_DIR"
+
+# askorupdate helpers if present
 ASKOR="/opt/fireinners/sentinel/lib/askorupdate.sh"
 if [ -f "$ASKOR" ]; then
   # shellcheck disable=SC1090
-  source "$ASKOR"
+  . "$ASKOR"
 else
+  askorupdate_file(){ local p="$1" n="$2" c="$3"; mkdir -p "$(dirname "$p")"; [ -f "$p" ] && cp -a "$p" "$p.bak.$(date -u +%Y%m%dT%H%M%SZ)" || true; printf "%s" "$c" > "$p"; }
   askorupdate_yesno(){ return 0; }
-  askorupdate_file(){
-    local dst="$1" name="$2" content="$3"
-    mkdir -p "$(dirname "$dst")"
-    [ -f "$dst" ] && cp -a "$dst" "$dst.bak.$(date +%s)" || true
-    chattr -i "$dst" 2>/dev/null || true
-    printf "%s" "$content" >"$dst"
-  }
 fi
 
-say "=== BATCH FLY (read-only) ==="
-say "whoami: $(whoami)"
-say "host: $(hostname)"
-say "node: $(node -v)"
-say "nginx: $(nginx -v 2>&1 | head -n1)"
-[ -f "$NG" ] || { say "ERREUR: vhost absent: $NG"; exit 1; }
+# unlock immutable if needed
+chattr -i "$NG_SITE" 2>/dev/null || true
+chattr -i "$SNIP" 2>/dev/null || true
+chattr -i "$WEBDIR/index.html" 2>/dev/null || true
 
-mkdir -p "$APPDIR" "$FRONTDIR"
-chmod 755 "$APPDIR" "$FRONTDIR" || true
+# env defaults (append missing)
+touch "$ENVF"
+grep -qE "^PORT=" "$ENVF" || echo "PORT=$PORT" >> "$ENVF"
+grep -qE "^BASE_PATH=" "$ENVF" || echo "BASE_PATH=$BASE_PATH" >> "$ENVF"
+grep -qE "^RPC_URL=" "$ENVF" || echo "RPC_URL=$RPC_DEFAULT" >> "$ENVF"
+grep -qE "^USDC_MINT=" "$ENVF" || echo "USDC_MINT=$USDC_MINT" >> "$ENVF"
+grep -qE "^WSOL_MINT=" "$ENVF" || echo "WSOL_MINT=$WSOL_MINT" >> "$ENVF"
+grep -qE "^JUP_QUOTE=" "$ENVF" || echo "JUP_QUOTE=https://quote-api.jup.ag/v6/quote" >> "$ENVF"
+grep -qE "^JUP_SWAP=" "$ENVF" || echo "JUP_SWAP=https://quote-api.jup.ag/v6/swap" >> "$ENVF"
+grep -qE "^MONITOR_URL=" "$ENVF" || echo "MONITOR_URL=https://bbbotrader.paycashnostory.workers.dev/ping" >> "$ENVF"
+grep -qE "^MONITOR_SEC=" "$ENVF" || echo "MONITOR_SEC=10" >> "$ENVF"
+grep -qE "^MONITOR_FAILS=" "$ENVF" || echo "MONITOR_FAILS=3" >> "$ENVF"
+grep -qE "^TG_ALERTS=" "$ENVF" || echo "TG_ALERTS=1" >> "$ENVF"
+grep -qE "^WOLV_SEND=" "$ENVF" || echo "WOLV_SEND=/usr/local/bin/wolv_send" >> "$ENVF"
+grep -qE "^ARM_CODE=" "$ENVF" || echo "ARM_CODE=CHANGE_ME_ARM" >> "$ENVF"
+grep -qE "^CUSTODY_KEYPAIR=" "$ENVF" || echo "CUSTODY_KEYPAIR=$WALLET_JSON" >> "$ENVF"
+grep -qE "^STATE_JSON=" "$ENVF" || echo "STATE_JSON=$STATE_JSON" >> "$ENVF"
 
-# env (ne casse pas ton setup)
-if [ ! -f "$ENVF" ]; then
-  cat >"$ENVF" <<EOF
-PORT=3050
-BASE_PATH=/wolverine
-RPC_URL=https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac
-MONITOR_URL=https://bbbotrader.paycashnostory.workers.dev/ping
-MONITOR_SEC=10
-MONITOR_FAILS=3
-TG_ALERTS=0
-WOLV_SEND=/usr/local/bin/wolv_send
-EOF
-  chmod 600 "$ENVF" || true
+# generate custody keypair if missing
+if [ ! -f "$WALLET_JSON" ]; then
+  say "Generating custody wallet..."
+  node - <<'NODE' > /tmp/_wolv_wallet.json
+const {Keypair}=require("@solana/web3.js");
+const fs=require("fs");
+const kp=Keypair.generate();
+fs.writeFileSync("/tmp/_wolv_wallet.json", JSON.stringify(Array.from(kp.secretKey)));
+fs.writeFileSync("/tmp/_wolv_wallet.pub", kp.publicKey.toBase58());
+NODE
+  mv /tmp/_wolv_wallet.json "$WALLET_JSON"
+  mv /tmp/_wolv_wallet.pub "$WALLET_PUB"
+  chmod 600 "$WALLET_JSON" || true
+  chmod 644 "$WALLET_PUB" || true
 fi
 
-PKG_JSON=$(cat <<'"'"'JSON'"'"'
-{"name":"wolverine-api","private":true,"version":"1.0.0","main":"server.js","type":"commonjs","dependencies":{"dotenv":"^16.4.5","express":"^4.19.2","@solana/web3.js":"^1.95.4"}}
-JSON
-)
-
-SVR_JS=$(cat <<'"'"'JS'"'"'
+# server.js
+SERVER_JS="$(cat <<'JS'
 "use strict";
 require("dotenv").config();
-const fs=require("fs"),path=require("path"),express=require("express");
-const {Connection,Keypair}=require("@solana/web3.js");
+const fs=require("fs");
+const path=require("path");
+const express=require("express");
+const {execFile}=require("child_process");
+const {Connection,PublicKey,Keypair,VersionedTransaction}=require("@solana/web3.js");
+const {getAssociatedTokenAddress,createAssociatedTokenAccountInstruction,createTransferInstruction}=require("@solana/spl-token");
 
 const PORT=parseInt(process.env.PORT||"3050",10);
-const BASE=(process.env.BASE_PATH||"/wolverine").replace(/\/$/,"");
-const RPC_URL=process.env.RPC_URL||"https://api.mainnet-beta.solana.com";
+const BASE_PATH=(process.env.BASE_PATH||"/wolverine/api").replace(/\/+$/,"");
+const RPC_URL=process.env.RPC_URL||"";
+const USDC_MINT=process.env.USDC_MINT||"";
+const WSOL_MINT=process.env.WSOL_MINT||"";
+const JUP_QUOTE=process.env.JUP_QUOTE||"https://quote-api.jup.ag/v6/quote";
+const JUP_SWAP=process.env.JUP_SWAP||"https://quote-api.jup.ag/v6/swap";
 const MONITOR_URL=process.env.MONITOR_URL||"";
-const MONITOR_SEC=Math.max(2,parseInt(process.env.MONITOR_SEC||"10",10));
-const MONITOR_FAILS=Math.max(1,parseInt(process.env.MONITOR_FAILS||"3",10));
+const MONITOR_SEC=parseInt(process.env.MONITOR_SEC||"10",10);
+const MONITOR_FAILS=parseInt(process.env.MONITOR_FAILS||"3",10);
 const TG_ALERTS=(process.env.TG_ALERTS||"0")==="1";
 const WOLV_SEND=process.env.WOLV_SEND||"/usr/local/bin/wolv_send";
+const ARM_CODE=process.env.ARM_CODE||"CHANGE_ME_ARM";
+const KEYPAIR_PATH=process.env.CUSTODY_KEYPAIR||path.join(__dirname,"custody.keypair.json");
+const STATE_JSON=process.env.STATE_JSON||"/var/lib/wolverine-api/state.json";
 
-const WALLET_FILE=path.join(__dirname,"wallet.json");
-const now=()=>new Date().toISOString();
+const app=express();
+app.use(express.json({limit:"256kb"}));
+app.disable("x-powered-by");
 
-function loadOrCreateWallet(){
+const conn=new Connection(RPC_URL,{commitment:"confirmed"});
+function now(){return new Date().toISOString();}
+
+function loadJSON(p,def){try{return JSON.parse(fs.readFileSync(p,"utf8"));}catch(_){return def;}}
+function saveJSON(p,obj){fs.mkdirSync(path.dirname(p),{recursive:true});fs.writeFileSync(p,JSON.stringify(obj,null,2));}
+
+function loadKeypair(){
+  const arr=loadJSON(KEYPAIR_PATH,null);
+  if(!arr||!Array.isArray(arr)||arr.length<32) throw new Error("invalid keypair file");
+  return Keypair.fromSecretKey(Uint8Array.from(arr));
+}
+const KP=loadKeypair();
+const CUSTODY=KP.publicKey.toBase58();
+
+const state=loadJSON(STATE_JSON,{
+  bot:{running:false,mode:"dca_sol",mint:"",budgetTotal:0,spent:0,perTrade:5,withdrawTo:"",userPub:"",last:"",startedAt:""},
+  ping:{effective:"UNKNOWN",fails:0,lastOkAt:"",lastAt:"",latencyMs:0},
+  ui:{lang:"en"}
+});
+saveJSON(STATE_JSON,state);
+
+function armOK(x){return typeof x==="string" && x.length>0 && x===ARM_CODE;}
+
+async function pingOnce(){
+  const t0=Date.now();
+  let ok=false;
   try{
-    const o=JSON.parse(fs.readFileSync(WALLET_FILE,"utf8"));
-    if(o&&Array.isArray(o.secretKey)&&o.secretKey.length>=32){
-      return Keypair.fromSecretKey(Uint8Array.from(o.secretKey));
-    }
+    const ac=new AbortController();
+    const to=setTimeout(()=>ac.abort(),8000);
+    const r=await fetch(MONITOR_URL,{cache:"no-store",signal:ac.signal});
+    clearTimeout(to);
+    const txt=await r.text();
+    ok=r.ok && /pong/i.test(txt);
   }catch(_){}
-  const kp=Keypair.generate();
-  fs.writeFileSync(WALLET_FILE,JSON.stringify({created:now(),pub:kp.publicKey.toBase58(),secretKey:Array.from(kp.secretKey)}));
-  try{fs.chmodSync(WALLET_FILE,0o600);}catch(_){}
-  return kp;
+  const ms=Date.now()-t0;
+  state.ping.lastAt=now();
+  state.ping.latencyMs=ms;
+  if(ok){
+    state.ping.fails=0;
+    state.ping.effective="UP";
+    state.ping.lastOkAt=now();
+  }else{
+    state.ping.fails=(state.ping.fails||0)+1;
+    if(state.ping.fails>=MONITOR_FAILS) state.ping.effective="DOWN";
+  }
+  saveJSON(STATE_JSON,state);
+  return {ok,ms,effective:state.ping.effective,fails:state.ping.fails};
 }
-const CUSTODIAL=loadOrCreateWallet();
-const conn=new Connection(RPC_URL,"confirmed");
 
-let STATE={running:false,mode:"safe",budget_usdc:0,owner_pub:null,last_ping:null,last_ping_ok:null,fails:0,effective:"INIT",started_at:null};
-
-function tgSend(text){
+function tgSend(msg){
   if(!TG_ALERTS) return;
-  try{ require("child_process").execFile(WOLV_SEND,[String(text||"").slice(0,900)],{timeout:8000},()=>{}); }catch(_){}
-}
-
-async function doPingOnce(){
-  if(!MONITOR_URL) return {ok:false,err:"no MONITOR_URL"};
-  try{
-    const r=await fetch(MONITOR_URL,{method:"GET",cache:"no-store",redirect:"follow",signal:AbortSignal.timeout(8000)});
-    const t=await r.text();
-    const ok=r.ok && /pong/i.test(t||"");
-    return {ok,code:r.status,txt:(t||"").slice(0,80)};
-  }catch(e){ return {ok:false,err:String(e&&e.message||e)}; }
+  execFile(WOLV_SEND,[String(msg)],{timeout:12000},()=>{});
 }
 
 let pingTimer=null;
-async function pingTick(){
-  const res=await doPingOnce();
-  STATE.last_ping=now();
-  STATE.last_ping_ok=!!res.ok;
-  if(res.ok) STATE.fails=0; else STATE.fails=(STATE.fails||0)+1;
-  const prev=STATE.effective;
-  STATE.effective=res.ok?"UP":(STATE.fails>=MONITOR_FAILS?"DOWN":"FLAKY");
-  if(prev!==STATE.effective){
-    if(STATE.effective==="UP") tgSend(`WOLVERINE: API UP (recovery) ${now()}`);
-    else if(STATE.effective==="DOWN") tgSend(`WOLVERINE: API DOWN (>=${MONITOR_FAILS} fails) ${now()}`);
-    else tgSend(`WOLVERINE: API STATE ${STATE.effective} ${now()}`);
+function startPingLoop(){
+  if(pingTimer) return;
+  pingTimer=setInterval(async()=>{
+    const prev=state.ping.effective;
+    const r=await pingOnce();
+    if(prev!==state.ping.effective){
+      if(state.ping.effective==="UP") tgSend(`WOLVERINE: API UP (recovery) ${now()}`);
+      if(state.ping.effective==="DOWN") tgSend(`WOLVERINE: API DOWN (>=${MONITOR_FAILS} fails) ${now()}`);
+      if(state.ping.effective!=="UP" && state.ping.effective!=="DOWN") tgSend(`WOLVERINE: STATE ${state.ping.effective} ${now()}`);
+    }
+  },Math.max(2,MONITOR_SEC)*1000);
+}
+function stopPingLoop(){ if(pingTimer){ clearInterval(pingTimer); pingTimer=null; } }
+
+async function getSOL(pub){ return await conn.getBalance(new PublicKey(pub),"confirmed"); }
+async function getUSDC(pub){
+  const owner=new PublicKey(pub);
+  const resp=await conn.getParsedTokenAccountsByOwner(owner,{mint:new PublicKey(USDC_MINT)},"confirmed");
+  let sum=0;
+  for(const a of resp.value){
+    const ui=a.account.data.parsed.info.tokenAmount.uiAmount||0;
+    sum+=ui;
+  }
+  return sum;
+}
+
+async function ensureATA(owner, mint, payer){
+  const ata=await getAssociatedTokenAddress(mint, owner, false);
+  const info=await conn.getAccountInfo(ata,"confirmed");
+  if(info) return {ata,ix:null};
+  const ix=createAssociatedTokenAccountInstruction(payer, ata, owner, mint);
+  return {ata,ix};
+}
+
+async function sendVersionedTx(b64){
+  const tx=VersionedTransaction.deserialize(Buffer.from(b64,"base64"));
+  tx.sign([KP]);
+  const sig=await conn.sendTransaction(tx,{skipPreflight:false,maxRetries:3});
+  await conn.confirmTransaction(sig,"confirmed");
+  return sig;
+}
+
+async function jupSwap({inputMint,outputMint,amountUI,slippageBps,wrapAndUnwrapSol}){
+  const inMint=inputMint, outMint=outputMint;
+  if(!inMint||!outMint) throw new Error("missing mint");
+  const decimals = (inMint===USDC_MINT)?6 : 9; // simplifié
+  const amount=Math.floor(Number(amountUI||0)*10**decimals);
+  if(!Number.isFinite(amount)||amount<=0) throw new Error("bad amount");
+  const url=new URL(JUP_QUOTE);
+  url.searchParams.set("inputMint",inMint);
+  url.searchParams.set("outputMint",outMint);
+  url.searchParams.set("amount",String(amount));
+  url.searchParams.set("slippageBps",String(slippageBps||50));
+  url.searchParams.set("onlyDirectRoutes","false");
+  url.searchParams.set("asLegacyTransaction","false");
+  const qr=await fetch(url.toString(),{cache:"no-store"});
+  const qj=await qr.json();
+  if(!qj||!qj.data||!qj.data[0]) throw new Error("no route");
+  const body={
+    quoteResponse:qj,
+    userPublicKey:CUSTODY,
+    wrapAndUnwrapSol:!!wrapAndUnwrapSol,
+    dynamicComputeUnitLimit:true,
+    prioritizationFeeLamports:"auto"
+  };
+  const sr=await fetch(JUP_SWAP,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});
+  const sj=await sr.json();
+  if(!sj||!sj.swapTransaction) throw new Error("swapTransaction missing");
+  const sig=await sendVersionedTx(sj.swapTransaction);
+  return {sig,route:qj.data[0]};
+}
+
+let botTimer=null;
+async function botTick(){
+  if(!state.bot.running) return;
+  const b=state.bot;
+  if(b.spent>=b.budgetTotal){ b.running=false; saveJSON(STATE_JSON,state); tgSend(`WOLVERINE: Budget reached. STOP ${now()}`); return; }
+
+  const spend=Math.min(b.perTrade, b.budgetTotal-b.spent);
+  const inputMint=USDC_MINT;
+  const outputMint=(b.mode==="dca_sol")?WSOL_MINT:(b.mint||"");
+  if(!outputMint){ b.last="ERR: missing output mint"; saveJSON(STATE_JSON,state); return; }
+
+  try{
+    const bal=await getUSDC(CUSTODY);
+    if(bal+1e-9 < spend){ b.last=`ERR: USDC not enough (have ${bal})`; saveJSON(STATE_JSON,state); return; }
+
+    const r=await jupSwap({inputMint,outputMint,amountUI:spend,slippageBps:60,wrapAndUnwrapSol:true});
+    b.spent=Number((b.spent+spend).toFixed(6));
+    b.last=`OK swap ${spend} USDC tx ${r.sig}`;
+    saveJSON(STATE_JSON,state);
+  }catch(e){
+    b.last=`ERR swap: ${String(e&&e.message||e)}`;
+    saveJSON(STATE_JSON,state);
   }
 }
-function startLoop(){ if(pingTimer) return; pingTimer=setInterval(()=>{pingTick().catch(()=>{});},MONITOR_SEC*1000); pingTick().catch(()=>{}); }
-function stopLoop(){ if(!pingTimer) return; clearInterval(pingTimer); pingTimer=null; }
 
-const app=express();
-app.disable("x-powered-by");
-app.use((req,res,next)=>{ res.setHeader("Cache-Control","no-store, no-cache, must-revalidate, proxy-revalidate"); res.setHeader("Pragma","no-cache"); res.setHeader("Expires","0"); next(); });
-app.use(express.json({limit:"256kb"}));
+function botStart(){
+  if(botTimer) return;
+  botTimer=setInterval(()=>{botTick().catch(()=>{});}, 12000);
+}
+function botStop(){ if(botTimer){ clearInterval(botTimer); botTimer=null; } }
 
-app.get("/",(_req,res)=>res.type("text/plain").send("wolverine-api"));
-app.get("/health",(_req,res)=>res.json({ok:true,uptime:process.uptime(),ts:Date.now()}));
-app.get("/ping",(_req,res)=>res.type("text/plain").send("pong"));
+async function withdrawAllTo(to){
+  const toPub=new PublicKey(to);
+  const from=KP.publicKey;
+  const ixs=[];
 
-app.get("/config",(_req,res)=>res.json({
-  ok:true,base:BASE,api:`${BASE}/api`,rpc:RPC_URL,
-  monitor:{url:MONITOR_URL,sec:MONITOR_SEC,fails:MONITOR_FAILS},
-  tg_alerts:TG_ALERTS?1:0,custodial_pub:CUSTODIAL.publicKey.toBase58(),ts:Date.now()
+  // SOL: garder un peu de frais
+  const solLam=await conn.getBalance(from,"confirmed");
+  const keep=0.01*1e9;
+  const sendLam=Math.max(0, solLam-keep);
+  if(sendLam>5000){
+    const {SystemProgram}=require("@solana/web3.js");
+    ixs.push(SystemProgram.transfer({fromPubkey:from,toPubkey:toPub,lamports:Math.floor(sendLam)}));
+  }
+
+  // USDC
+  const mint=new PublicKey(USDC_MINT);
+  const {ata:fromAta}=await ensureATA(from,mint,from);
+  const {ata:toAta,ix:mk}=await ensureATA(toPub,mint,from);
+  if(mk) ixs.push(mk);
+
+  const fromInfo=await conn.getTokenAccountBalance(fromAta,"confirmed").catch(()=>null);
+  const amt=fromInfo && fromInfo.value && Number(fromInfo.value.amount||"0") || 0;
+  if(amt>0){
+    ixs.push(createTransferInstruction(fromAta,toAta,from,amt));
+  }
+
+  if(ixs.length===0) return {ok:true,tx:null,note:"nothing to withdraw"};
+  const {TransactionMessage,VersionedTransaction}=require("@solana/web3.js");
+  const bh=await conn.getLatestBlockhash("confirmed");
+  const msg=new TransactionMessage({payerKey:from,recentBlockhash:bh.blockhash,instructions:ixs}).compileToV0Message();
+  const tx=new VersionedTransaction(msg);
+  tx.sign([KP]);
+  const sig=await conn.sendTransaction(tx,{skipPreflight:false,maxRetries:3});
+  await conn.confirmTransaction(sig,"confirmed");
+  return {ok:true,tx:sig};
+}
+
+const router=express.Router();
+
+router.get("/",(_req,res)=>res.type("text/plain").send("wolverine-api"));
+router.get("/health",(req,res)=>res.json({ok:true,uptime:process.uptime(),ts:Date.now(),base:BASE_PATH,custody:CUSTODY}));
+router.get("/ping",async(req,res)=>{ const r=await pingOnce(); res.json({ok:r.ok,effective:r.effective,fails:r.fails,ms:r.ms}); });
+router.get("/config",(req,res)=>res.json({
+  ok:true,
+  base:BASE_PATH,
+  custody:CUSTODY,
+  monitorUrl:MONITOR_URL,
+  monitorSec:MONITOR_SEC,
+  monitorFails:MONITOR_FAILS,
+  ui:state.ui,
+  bot:state.bot,
+  mints:{usdc:USDC_MINT,wsol:WSOL_MINT},
+  ts:Date.now()
 }));
-app.get("/wallet",(_req,res)=>res.json({ok:true,pub:CUSTODIAL.publicKey.toBase58(),ts:Date.now()}));
-app.get("/status",(_req,res)=>res.json({ok:true,state:STATE,ts:Date.now()}));
-
-app.post("/start",(req,res)=>{
-  const b=Number(req.body&&req.body.budget_usdc||0);
-  const m=String(req.body&&req.body.mode||"safe");
-  const owner=String(req.body&&req.body.owner_pub||"").trim();
-  if(owner && !/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(owner)) return res.status(400).json({ok:false,error:"bad owner_pub"});
-  STATE.running=true; STATE.started_at=now();
-  STATE.budget_usdc=isFinite(b)&&b>=0?b:0;
-  STATE.mode=m.slice(0,40);
-  STATE.owner_pub=owner||null;
-  startLoop();
-  res.json({ok:true,state:STATE,ts:Date.now()});
+router.get("/wallet",(_req,res)=>res.json({ok:true,custody:CUSTODY,ts:Date.now()}));
+router.get("/status",async(_req,res)=>{
+  const sol=await getSOL(CUSTODY).catch(()=>0);
+  const usdc=await getUSDC(CUSTODY).catch(()=>0);
+  res.json({ok:true,custody:CUSTODY,solLamports:sol,sol:sol/1e9,usdc,bot:state.bot,ping:state.ping,ts:Date.now()});
 });
-app.post("/stop",(_req,res)=>{ STATE.running=false; stopLoop(); res.json({ok:true,state:STATE,ts:Date.now()}); });
 
-app.listen(PORT,"127.0.0.1",()=>{ startLoop(); });
+router.post("/loop/start",(req,res)=>{ if(!armOK(req.body&&req.body.arm)) return res.status(403).json({ok:false,error:"bad_arm"}); startPingLoop(); res.json({ok:true,loop:true}); });
+router.post("/loop/stop",(req,res)=>{ if(!armOK(req.body&&req.body.arm)) return res.status(403).json({ok:false,error:"bad_arm"}); stopPingLoop(); res.json({ok:true,loop:false}); });
+
+router.post("/start",(req,res)=>{
+  const b=req.body||{};
+  if(!armOK(b.arm)) return res.status(403).json({ok:false,error:"bad_arm"});
+  state.bot.userPub=String(b.userPub||"");
+  state.bot.withdrawTo=String(b.withdrawTo||"");
+  state.bot.mode=String(b.mode||"dca_sol");
+  state.bot.mint=String(b.mint||"");
+  state.bot.budgetTotal=Math.max(0,Number(b.budgetTotal||0));
+  state.bot.perTrade=Math.max(0.5,Number(b.perTrade||5));
+  state.bot.spent=0;
+  state.bot.startedAt=now();
+  state.bot.last="START";
+  state.bot.running=true;
+  saveJSON(STATE_JSON,state);
+  botStart();
+  res.json({ok:true,bot:state.bot});
+});
+
+router.post("/stop",(req,res)=>{
+  const b=req.body||{};
+  if(!armOK(b.arm)) return res.status(403).json({ok:false,error:"bad_arm"});
+  state.bot.running=false;
+  state.bot.last="STOP";
+  saveJSON(STATE_JSON,state);
+  botStop();
+  res.json({ok:true,bot:state.bot});
+});
+
+router.post("/withdraw",(req,res)=>{(async()=>{
+  const b=req.body||{};
+  if(!armOK(b.arm)) return res.status(403).json({ok:false,error:"bad_arm"});
+  const to=String(b.to||state.bot.withdrawTo||"");
+  if(!to) return res.status(400).json({ok:false,error:"missing_to"});
+  const r=await withdrawAllTo(to);
+  state.bot.last=`WITHDRAW ${r.tx||"none"}`;
+  saveJSON(STATE_JSON,state);
+  res.json(r);
+})().catch(e=>res.status(500).json({ok:false,error:String(e&&e.message||e)}));});
+
+app.use(BASE_PATH,router);
+// compat (au cas où)
+app.use("/wolverine/api",router);
+app.use("/api",router);
+
+app.use((req,res)=>res.status(404).json({ok:false,error:"not_found",path:req.path,base:BASE_PATH}));
+
+app.listen(PORT,"127.0.0.1",()=>{ console.log(`[${now()}] wolverine-api up on 127.0.0.1:${PORT} base=${BASE_PATH} custody=${CUSTODY}`); });
 JS
-)
+)"
+askorupdate_file "$APPDIR/server.js" "WOLVERINE server.js" "$SERVER_JS"
+chmod 755 "$APPDIR/server.js" || true
 
-UNIT=$(cat <<EOF
+# package.json + deps
+if [ ! -f "$APPDIR/package.json" ]; then
+  (cd "$APPDIR" && npm init -y >/dev/null 2>&1 || true)
+fi
+( cd "$APPDIR" && npm i express dotenv @solana/web3.js @solana/spl-token >/dev/null )
+
+# systemd service
+UNIT="$(cat <<EOF
 [Unit]
-Description=Wolverine API (fireinners.online/wolverine)
+Description=Wolverine API (TraderOne custodial)
 After=network-online.target
 Wants=network-online.target
 
@@ -173,85 +431,347 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=$APPDIR
 EnvironmentFile=$ENVF
-ExecStart=/usr/bin/env node $APPDIR/server.js
+ExecStart=/usr/bin/node $APPDIR/server.js
 Restart=always
 RestartSec=2
 User=root
+NoNewPrivileges=true
 
 [Install]
 WantedBy=multi-user.target
 EOF
-)
-
-# FRONT HTML: nouvelle palette VIOLET/TEAL visible + toggle EN/FR + refresh 2s
-HTML_B64="$(cat <<'"'"'EOF_B64'"'"'
-PCFkb2N0eXBlIGh0bWw+PGh0bWwgbGFuZz0iZW4iPjxoZWFkPjxtZXRhIGNoYXJzZXQ9InV0Zi04Ii8+PG1ldGEgbmFtZT0idmlld3BvcnQiIGNvbnRlbnQ9IndpZHRoPWRldmljZS13aWR0aCxpbml0aWFsLXNjYWxlPTEiLz48dGl0bGU+V09MVkVSSU5FIOKAmCBUcmFkZXJPbmU8L3RpdGxlPjxzdHlsZT46cm9vdHt9Kntib3gtc2l6aW5nOmJvcmRlci1ib3h9aHRtbCxib2R5e21hcmdpbjowO2hlaWdodDoxMDAlYmFja2dyb3VuZDpyYWRpYWwtZ3JhZGllbnQoMTEwMHB4IDY1MHB4IGF0IDIwJSAwJSwjMmQxMDQ1IDAsdHJhbnNwYXJlbnQgNTUlKSxyYWRpYWwtZ3JhZGllbnQoOTAwcHggNjAwcHggYXQgODAlIDIwJSwjMGQyOTQyIDAsdHJhbnNwYXJlbnQgNTUlKSxsaW5lYXItZ3JhZGllbnQoMTgwZGVnLCMwNjA2MGIsIzA1MDUwOCk7Y29sb3I6I2VhZjJmZjtpb250OjE0cHggc3lzdGVtLXVpLC1hcHBsZS1zeXN0ZW0sU2Vnb2UgVUksUm9ib3RvfSN3cmFwe21heC13aWR0aDoxMTAwcHg7bWFyZ2luOjAgYXV0bztwYWRkaW5nOjE4cHh9I3RvcHtkaXNwbGF5OmZsZXg7Z2FwOjEycHg7YWxpZ24taXRlbXM6Y2VudGVyO2p1c3RpZnktY29udGVudDpzcGFjZS1iZXR3ZWVuO21hcmdpbi1ib3R0b206MTJweH0uYnJhbmR7ZGlzcGxheTpmbGV4O2dhcDoxMHB4O2FsaWduLWl0ZW1zOmNlbnRlcn0uYmFkZ2V7d2lkdGg6MzRweDtoZWlnaHQ6MzRweDtib3JkZXItcmFkaXVzOjlweDtiYWNrZ3JvdW5kOmxpbmVhci1ncmFkaWVudCgxMzVkZWcsIzY3ZmZkYywjYjM2N2ZmKTtib3gtc2hhZG93OjAgMCAyMHB4IHJnYmEoMTc5LDEwMywyNTUsLjIpLDAgMCAzOHB4IHJnYmEoMTAzLDI1NSwyMjAsLjE4KX0gaDF7Zm9udC1zaXplOjE2cHg7bWFyZ2luOjA7bGV0dGVyLXNwYWNpbmc6Ljgpxn0uY2FyZHtiYWNrZ3JvdW5kOmxpbmVhci1ncmFkaWVudCgxODBkZWcscmdiYSgxMSwxNiwzNiwuOTIpLHJnYmEoNiw3LDE4LC45MikpO2JvcmRlcjoxcHggc29saWQgcmdiYSgxMDMsMjU1LDIyMCwuMTgpO2JvcmRlci1yYWRpdXM6MTZweDtwYWRkaW5nOjE0cHg7Ym94LXNoYWRvdzowIDAgMThweCByZ2JhKDE3OSwxMDMsMjU1LC4xNSksMCAwIDM4cHggcmdiYSgxMDMsMjU1LDIyMCwuMTIpfS5yb3d7ZGlzcGxheTpncmlkO2dyaWQtdGVtcGxhdGUtY29sdW1uczoxLjFmciAuOWZyO2dhcDoxMnB4fUBtZWRpYShtYXgtd2lkdGg6OTAwcHgpey5yb3d7Z3JpZC10ZW1wbGF0ZS1jb2x1bW5zOjFmcj19bGFiZWx7ZGlzcGxheTpibG9jaztjb2xvcjojOWZiNGRmO2ZvbnQtc2l6ZToxMnB4O21hcmdpbjo4cHggMCA2cHh9aW5wdXQsc2VsZWN0LGJ1dHRvbix0ZXh0YXJlYXt3aWR0aDoxMDAlYm9yZGVyLXJhZGl1czoxMnB4O2JvcmRlcjoxcHggc29saWQgcmdiYSgxMDMsMjU1LDIyMCwuMjIpO2JhY2tncm91bmQ6cmdiYSg2LDcsMTgsLjcpO2NvbG9yOiNlYWYyZmY7cGFkZGluZzoxMHB4IDEycHg7b3V0bGluZTpub25lfWJ1dHRvbntjdXJzb3I6cG9pbnRlcjtiYWNrZ3JvdW5kOmxpbmVhci1ncmFkaWVudCgxMzVkZWcscmdiYSgxNzksMTAzLDI1NSwuMjIpLHJnYmEoMTAzLDI1NSwyMjAsLjE4KSk7Ym9yZGVyOjFweCBzb2xpZCByZ2JhKDE3OSwxMDMsMjU1LC4zMCl9I2xvZ3toZWlnaHQ6MjgwcHg7d2hpdGUtc3BhY2U6cHJlLXdyYXA7Zm9udDoxMnB4IHVpLW1vbm9zcGFjZSxNZW5sbyxDb25zb2xhcztCYWNrZ3JvdW5kOnJnYmEoMCwwLDAsLjM1KX0uZ3JpZDJ7ZGlzcGxheTpncmlkO2dyaWQtdGVtcGxhdGUtY29sdW1uczoxZnIgMWZyO2dhcDoxMHB4fS5waWxse2Rpc3BsYXk6aW5saW5lLWZsZXg7Z2FwOjhweDthbGlnbi1pdGVtczpjZW50ZXI7cGFkZGluZzo3cHggMTBweDtib3JkZXItcmFkaXVzOjk5OXB4O2JvcmRlcjoxcHggc29saWQgcmdiYSgxMDMsMjU1LDIyMCwuMTgpO2JhY2tncm91bmQ6cmdiYSg2LDcsMTgsLjU1KX0uZG90e3dpZHRoOjlweDtoZWlnaHQ6OXB4O2JvcmRlci1yYWRpdXM6NTAlfS5vaytiYWNrZ3JvdW5kOiM1NWZmYjA7fS5iYWR7YmFja2dyb3VuZDojZmY1YjdhfS5taWR7YmFja2dyb3VuZDojYmM4ZmZmfS5zbWFsbHtmb250LXNpemU6MTJweDtjb2xvcjojOWZiNGRmfTwvc3R5bGU+PC9oZWFkPjxib2R5PjxkaXYgaWQ9IndyYXAiPjxkaXYgaWQ9InRvcCI+PGRpdiBjbGFzcz0iYnJhbmQiPjxkaXYgY2xhc3M9ImJhZGdlIj48L2Rpdj48ZGl2PjxoMT5XT0xWRVJJTkU8L2gxPjxkaXYgaWQ9InN1YiIgY2xhc3M9InNtYWxsIj5QaGFudG9tIG9ubHkg4oCiIEN1c3RvZGlhbCBkZXBvc2l0IHdhbGxldCDigKIgQVBJIGxpdmU8L2Rpdj48L2Rpdj48L2Rpdj48ZGl2PjxzcGFuIGNsYXNzPSJwaWxsIiBpZD0iYXBpUGlsbCI+PHNwYW4gY2xhc3M9ImRvdCBtaWQiIGlkPSJhcGlEb3QiPjwvc3Bhbj48c3BhbiBpZD0iYXBpVHh0Ij5BUEk8L3NwYW4+PC9zcGFuPiA8YnV0dG9uIGlkPSJidG5MYW5nIj5GUjw9L2J1dHRvbj48L2Rpdj48L2Rpdj48ZGl2IGNsYXNzPSJyb3ciPjxkaXYgY2xhc3M9ImNhcmQiPjxoMiBpZD0idENvbnRyb2wiPkNvbnRyb2w8L2gyPjxkaXYgY2xhc3M9ImdyaWQyIj48ZGl2PjxsYWJlbCBpZD0idFdhbGxldCI+V2FsbGV0PC9sYWJlbD48YnV0dG9uIGlkPSJidG5Db25uZWN0Ij5Db25uZWN0IFBoYW50b208L2J1dHRvbj48L2Rpdj48ZGl2PjxsYWJlbD4mbmJzcDs8L2xhYmVsPjxidXR0b24gaWQ9ImJ0bkRpc2Nvbm5lY3QiPkRpc2Nvbm5lY3Q8L2J1dHRvbj48L2Rpdj48L2Rpdj48ZGl2IGNsYXNzPSJncmlkMiI+PGRpdj48bGFiZWwgaWQ9InRTb2wiPlNPTDwvbGFiZWw+PGlucHV0IGlkPSJzb2wiIHJlYWRvbmx5IHZhbHVlPSItIi8+PC9kaXY+PGRpdj48bGFiZWwgaWQ9InRVc2RjIj5VU0RDPDwvbGFiZWw+PGlucHV0IGlkPSJ1c2RjIiByZWFkb25seSB2YWx1ZT0iLSIvPjwvZGl2PjwvZGl2PjxsYWJlbCBpZD0idEN1c3QiPlRyYWRlck9uZSBkZXBvc2l0IGFkZHJlc3MgKGN1c3RvZGlhbCk8L2xhYmVsPjxkaXYgY2xhc3M9ImdyaWQyIj48aW5wdXQgaWQ9ImRlcCIgcmVhZG9ubHkgdmFsdWU9ImxvYWRpbmcuLi4iLz48YnV0dG9uIGlkPSJidG5Db3B5Ij5Db3B5PC9idXR0b24+PC9kaXY+PGRpdiBjbGFzcz0ic21hbGwiIGlkPSJkZXBIaW50Ij5Vc2UgUGhhbnRvbSB0byBzZW5kIFNPTC9VU0RDIHRvIHRoaXMgYWRkcmVzcy4gTmV2ZXIgcGFzdGUgcHJpdmF0ZSBrZXlzLjwvZGl2PjxkaXYgY2xhc3M9ImdyaWQyIj48ZGl2PjxsYWJlbCBpZD0idEJ1ZGdldCI+QnVkZ2V0IChVU0RDKTwvbGFiZWw+PGlucHV0IGlkPSJidWRnZXQiIHBsYWNlaG9sZGVyPSJUb3RhbCBidWRnZXQgKFVTREMpIiBpbmZvcm1tb2RlPSJkZWNpbWFsIi8+PC9kaXY+PGRpdj48bGFiZWwgaWQ9InRNb2RlIj5Nb2RlPC9sYWJlbD48c2VsZWN0IGlkPSJtb2RlIj48b3B0aW9uIHZhbHVlPSJzYWZlIj5TYWZlPC9vcHRpb24+PG9wdGlvbiB2YWx1ZT0iZGNhIj5EQ0E8L29wdGlvbj48L3NlbGVjdD48L2Rpdj48L2Rpdj48ZGl2IGNsYXNzPSJncmlkMiI+PGJ1dHRvbiBpZD0iYnRuU3RhcnQiPlN0YXJ0IFdPTFZFUklORTwvYnV0dG9uPjxidXR0b24gaWQ9ImJ0blN0b3AiPlN0b3A8L2J1dHRvbj48L2Rpdj48ZGl2IGNsYXNzPSJzbWFsbCIgaWQ9ImZvb3QiPkF1dG8tcmVmcmVzaDogMnMg4oCiIEVuZHBvaW50OiA8c3BhbiBpZD0iZXAiPjwvc3Bhbj48L2Rpdj48L2Rpdj48ZGl2IGNsYXNzPSJjYXJkIj48aDIgaWQ9InRDb25zb2xlIj5Db25zb2xlPC9oMj48dGV4dGFyZWEgaWQ9ImxvZyIgcmVhZG9ubHk+PC90ZXh0YXJlYT48L2Rpdj48L2Rpdj48L2Rpdj48c2NyaXB0PmNvbnN0IEJBU0U9Ii93b2x2ZXJpbmUiLEFQST1CQVNFKyIvYXBpIjtjb25zdCAkPXM9PmRvY3VtZW50LnF1ZXJ5U2VsZWN0b3IocyksTE9HPaQoIiNsb2ciKTtsZXQgTEFORz1sb2NhbFN0b3JhZ2UuZ2V0SXRlbSgid29sdl9sYW5nIil8fCJlbiI7Y29uc3QgVFhUPXtlbjp7c3ViOiJQaGFudG9tIG9ubHkg4oCiIEN1c3RvZGlhbCBkZXBvc2l0IHdhbGxldCDigKIgQVBJIGxpdmUiLENvbnRyb2w6IkNvbnRyb2wiLFdhbGxldDoiV2FsbGV0IixDT0w6IlNPTCIsVVNEQzoiVVNEQyIsQ3VzdDoiVHJhZGVyT25lIGRlcG9zaXQgYWRkcmVzcyAoY3VzdG9kaWFsKSIsQnVkZ2V0OiJCdWRnZXQgKFVTREMpIixNb2RlOiJNb2RlIixDb25zb2xlOiJDb25zb2xlIixkZXBIaW50OiJVc2UgUGhhbnRvbSB0byBzZW5kIFNPTC9VU0RDIHRvIHRoaXMgYWRkcmVzcy4gTmV2ZXIgcGFzdGUgcHJpdmF0ZSBrZXlzLiIsY29weToiQ29weSIsY29waWVkOiJDb3BpZWQiLHN0YXJ0OiJTdGFydCBXT0xWRVJJTkUiLHN0b3A6IlN0b3AiLGNvbm46IkNvbm5lY3QgUGhhbnRvbSIsZGlzYzoiRGlzY29ubmVjdCJ9LGZyOntzdWI6IlBoYW50b20gc2V1bGVtZW50IOKApiBXYWxsZXQgZMOpcMO0dCBjdXN0b2RpYWwg4oCiIEFQSSBhY3RpdmUiLENvbnRyb2w6IkNvbnRyw7RsZSIsV2FsbGV0OiJXYWxsZXQiLENPTDoiU09MIixVU0RDOiJVU0RDIixDdXN0OiJBZHJlc3NlIGTDqXBvw7QgVHJhZGVyT25lIChjdXN0b2RpYWwpIixCdWRnZXQ6IkJ1ZGdldCAoVVNEQykiLE1vZGU6Ik1vZGUiLENvbnNvbGU6IkNvbnNvbGUiLGRlcEhpbnQ6IkVudm9pZSBTT0wvVVNEQyB2aWEgUGhhbnRvbSB2ZXJzIGNldHRlIGFkcmVzc2UuIE5lIGNvbGxlIGphbWFpcyBkZSBjbMOpIHByaXbDqWUiLGNvcHk6IkNvcGllciIsY29waWVkOiJDb3Bpw6kiLHN0YXJ0OiJTdGFydCBXT0xWRVJJTkUiLHN0b3A6IlN0b3AiLGNvbm46IkNvbm5lY3RlciBQaGFudG9tIixkaXNjOiJEw6ljb25uZWN0ZXIifX07ZnVuY3Rpb24gdHIoayl7cmV0dXJuIChUWFQbTEFOR11bXV18fFRYVC5lbltrXXx8ayk7fWZ1bmN0aW9uIGFwcGx5TGFuZygpeyQoIiNzdWIiKS50ZXh0Q29udGVudD10cigic3ViIik7JCgiI3RDb250cm9sIikudGV4dENvbnRlbnQ9dHIoIkNvbnRyb2wiKTskKCIjdFdhbGxldCIpLnRleHRDb250ZW50PXRyKCJXYWxsZXQiKTskKCIjdFNvbCIpLnRleHRDb250ZW50PSJTT0wiOyQoIiN0VXNkYyIpLnRleHRDb250ZW50PSJVU0RDIjskKCIjdEN1c3QiKS50ZXh0Q29udGVudD10cigiQ3VzdCIpOyQoIiN0QnVkZ2V0IikudGV4dENvbnRlbnQ9dHIoIkJ1ZGdldCIpOyQoIiN0TW9kZSIpLnRleHRDb250ZW50PXRyKCJNb2RlIik7JCgiI3RDb25zb2xlIikudGV4dENvbnRlbnQ9dHIoIkNvbnNvbGUiKTskKCIjZGVwSGludCIpLnRleHRDb250ZW50PXRyKCJkZXBIaW50Iik7JCgiI2J0bkNvcHkiKS50ZXh0Q29udGVudD10cigiY29weSIpOyQoIiNidG5TdGFydCIpLnRleHRDb250ZW50PXRyKCJzdGFydCIpOyQoIiNidG5TdG9wIikudGV4dENvbnRlbnQ9dHIoInN0b3AiKTskKCIjYnRuQ29ubmVjdCIpLnRleHRDb250ZW50PXRyKCJjb25uIik7JCgiI2J0bkRpc2Nvbm5lY3QiKS50ZXh0Q29udGVudD10cigiZGlzYyIpOyQoIiNidG5MYW5nIikudGV4dENvbnRlbnQ9KExBTkc9PT0iZW4iPyJGUiI6IkVOIik7fSQoIiNidG5MYW5nIikub25jbGljaz0oKT0+e0xBTkc9KExBTkc9PT0iZW4iPyJmciI6ImVuIik7bG9jYWxTdG9yYWdlLnNldEl0ZW0oIndvbHZfbGFuZyIsTEFORyk7YXBwbHlMYW5nKCk7fTtmdW5jdGlvbiBsb2cocylyZXR1cm4gTE9HLnZhbHVlKz0ocysoIlxuIikpLGxvZy5zY3JvbGxUb3A9TE9HLnNjcm9sbEhlaWdodH0kKCIjZXAiKS50ZXh0Q29udGVudD1BUEk7YXN5bmMgZnVuY3Rpb24gamdldChwKXtjb25zdHI9YXdhaXQgZmV0Y2goQVBJK3Ase2NhY2hlOiJuby1zdG9yZSJ9KTtyZXR1cm4gYXdhaXQgcj5qc29uKCk7fWFzeW5jIGZ1bmN0aW9uIGpwb3N0KHAseyl7Y29uc3Qgcj1hd2FpdCBmZXRjaChBUEkrcCx7bWV0aG9kOiJQT1NUIixoZWFkZXJzOnsiY29udGVudC10eXBlIjoiYXBwbGljYXRpb24vanNvbiJ9LGJvZHk6SlNPTi5zdHJpbmdpZnkoZXx8e30pfSk7cmV0dXJuIGF3YWl0IHIuanNvbigpO30KZnVuY3Rpb24gc2V0QXBpKG9rKXskKCIjYXBpRG90IikuY2xhc3NOYW1lPSJkb3QgIisorKG9rPyJvayI6ImJhZCIpOyQoIiNhcGlUeHQiKS50ZXh0Q29udGVudD1vaz8iQVBJIE9LIjoiQVBJIERPV04iO30KYXN5bmMgZnVuY3Rpb24gbG9hZENvbmZpZygpe3RyeXtjb25zdCBjPW5hd2FpdCBqZ2V0KCIvY29uZmlnIik7JCgiI2RlcCIpLnZhbHVlPShjJiZjLmN1c3RvZGlhbF9wdWIpfHwiLSI7fWNhdGNoKGUpeyQoIiNkZXAiKS52YWx1ZT0iY29uZmlnIGVycm9yIjt9fQphc3luYyBmdW5jdGlvbiByZWZyZXNoKCl7dHJ5e2NvbnN0IHN0PWF3YWl0IGpnZXQoIi9zdGF0dXMiKTtzZXRBcGkodHJ1ZSk7Y29uc3Qgcz1zdCYmc3Quc3RhdGV8fHt9O0xPRy52YWx1ZSs9bmV3IERhdGUoKS50b0lTT1N0cmluZygpKyIgc3RhdHVzIHJ1bm5pbmc9IisorKHMucnVubmluZz8xOjApKyIgZWZmZWN0aXZlPSIrKHMuZWZmZWN0aXZlfHwiIikrIlxuIjsgTE9HLnNjcm9sbFRvcD1MT0cuc2Nyb2xsSGVpZ2h0O31jYXRjaChlKXtzZXRBcGkoZmFsc2UpO0xPRy52YWx1ZSs9bmV3IERhdGUoKS50b0lTT1N0cmluZygpKyIgQVBJIGVycm9yXG4iO0xPRy5zY3JvbGxUb3A9TE9HLnNjcm9sbEhlaWdodDt9fQokKCIjYnRuQ29weSIpLm9uY2xpY2s9YXN5bmMoKT0+e3RyeXthd2FpdCBuYXZpZ2F0b3IuY2xpcGJvYXJkLndyaXRlVGV4dCgkKCIjZGVwIikudmFsdWV8fCIiKTskKCIjYnRuQ29weSIpLnRleHRDb250ZW50PXRyKCJjb3BpZWQiKTtzZXRUaW1lb3V0KCgpPT4kKCIjYnRuQ29weSIpLnRleHRDb250ZW50PXRyKCJjb3B5IiksOTAwKTt9Y2F0Y2goZSl7fX07CiQoIiNidG5TdGFydCIpLm9uY2xpY2s9YXN5bmMoKT0+e2NvbnN0IGJ1ZGdldD1wYXJzZUZsb2F0KCQoIiNidWRnZXQiKS52YWx1ZXx8IjAiKXx8MDtjb25zdCBtb2RlPSQoIiNtb2RlIikudmFsdWV8fCJzYWZlIjtjb25zdCBvd25lcj0od2luZG93Ll9fUEhBTlRPTV9QVUJ8fCIiKTtjb25zdHI9YXdhaXQganBvc3QoIi9zdGFydCIse2J1ZGdldF91c2RjOmJ1ZGdldCxtb2RlLG93bmVyX3B1Yjpvd25lcn0pO0xPRy52YWx1ZSs9bmV3IERhdGUoKS50b0lTT1N0cmluZygpKyIgc3RhcnQgPT4gIitKU09OLnN0cmluZ2lmeShyKSsiXG4iO0xPRy5zY3JvbGxUb3A9TE9HLnNjcm9sbEhlaWdodDt9OwokKCIjYnRuU3RvcCIpLm9uY2xpY2s9YXN5bmMoKT0+e2NvbnN0IHI9YXdhaXQganBvc3QoIi9zdG9wIix7fSk7TE9HLnZhbHVlKz1uZXcgRGF0ZSgpLnRvSVNPU3RyaW5nKCkrIiBzdG9wID0+ICIrandTT04uc3RyaW5naWZ5KHIpKyJcbiI7TE9HLnNjcm9sbFRvcD1MT0cuc2Nyb2xsSGVpZ2h0O307CmFzeW5jIGZ1bmN0aW9uIHBoYW50b21Db25uZWN0KCl7Y29uc3QgcD13aW5kb3cuc29sYW5hO2lmKCFwfHwhcC5pc1BoYW50b20pe0xPRy52YWx1ZSs9IlBoYW50b20gbm90IGZvdW5kXG4iO3JldHVybjt9Y29uc3Qgcj1hd2FpdCBwLmNvbm5lY3QoKTt3aW5kb3cuX19QSEFOVE9NX1BVQj1yLnB1YmxpY0tleS50b1N0cmluZygpO0xPRy52YWx1ZSs9IlBoYW50b206ICIr d2luZG93Ll9fUEhBTlRPTV9QVUJrKyJcbiI7fQphc3luYyBmdW5jdGlvbiBwaGFudG9tRGlzY29ubmVjdCgpe2NvbnN0IHA9d2luZG93LnNvbGFuYTtpZihwJiZwLmRpc2Nvbm5lY3QpIGF3YWl0IHAuZGlzY29ubmVjdCgpO3dpbmRvdy5fX1BIQU5UT01fUFVCPSIiO0xPRy52YWx1ZSs9IkRpc2Nvbm5lY3RlZFxuIjt9CiQoIiNidG5Db25uZWN0Iikub25jbGljaz1waGFudG9tQ29ubmVjdDskKCIjYnRuRGlzY29ubmVjdCIpLm9uY2xpY2s9cGhhbnRvbURpc2Nvbm5lY3Q7YXBwbHlMYW5nKCk7bG9hZENvbmZpZygpO3JlZnJlc2goKTtzZXRJbnRlcnZhbChyZWZyZXNoLDIwMDApOzwvc2NyaXB0PjwvYm9keT48L2h0bWw+
-EOF_B64
 )"
+askorupdate_file "/etc/systemd/system/$SERVICE.service" "systemd $SERVICE" "$UNIT"
 
-# write files
-askorupdate_file "$APPDIR/package.json" "WOLVERINE package.json" "$PKG_JSON"
-askorupdate_file "$APPDIR/server.js" "WOLVERINE server.js" "$SVR_JS"
-
-# write html safely
-chattr -i "$FRONTDIR/index.html" 2>/dev/null || true
-printf "%s" "$HTML_B64" | base64 -d >"$FRONTDIR/index.html"
-chmod 644 "$FRONTDIR/index.html" || true
-
-# deps
-cd "$APPDIR"
-npm i --omit=dev
-
-# systemd
-askorupdate_file "/etc/systemd/system/$SERVICE.service" "WOLVERINE systemd unit" "$UNIT"
-systemctl daemon-reload
-systemctl enable "$SERVICE" >/dev/null 2>&1 || true
-systemctl restart "$SERVICE"
-
-# nginx: unlock -> write snippet -> ensure include -> test -> reload -> relock
-chattr -i "$SNIP" 2>/dev/null || true
-cat >"$SNIP" <<EOF
-# WOLVERINE (generated) fireinners.online/wolverine
-location = /wolverine { return 301 /wolverine/; }
+# nginx snippet (force no-cache + proxy)
+SNIPPET="$(cat <<EOF
+# Wolverine frontend + API
 location ^~ /wolverine/api/ {
-  proxy_pass http://127.0.0.1:3050/;
+  proxy_pass http://127.0.0.1:$PORT;
   proxy_http_version 1.1;
   proxy_set_header Host \$host;
   proxy_set_header X-Real-IP \$remote_addr;
   proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
   proxy_set_header X-Forwarded-Proto \$scheme;
+  add_header Cache-Control "no-store" always;
 }
 location ^~ /wolverine/ {
-  alias $FRONTDIR/;
+  root /opt/fireinners/frontend-react/app/dist;
   try_files \$uri \$uri/ /wolverine/index.html;
+  add_header Cache-Control "no-store" always;
 }
 EOF
+)"
+askorupdate_file "$SNIP" "nginx snippet wolverine" "$SNIPPET"
 
-chattr -i "$NG" 2>/dev/null || true
-if ! grep -q "snippets/fireinners-wolverine.conf" "$NG"; then
-  awk -v ins="    include /etc/nginx/snippets/fireinners-wolverine.conf;" '
-    BEGIN{done=0}
+# ensure vhost includes snippet (idempotent)
+if ! grep -q "fireinners-wolverine.conf" "$NG_SITE"; then
+  # insert inside server { ... } near other includes
+  awk '
+    BEGIN{ins=0}
+    /server\s*\{/ && ins==0 {print; ins=1; next}
+    ins==1 && /include\s+\/etc\/nginx\/snippets\// && added!=1 {print "  include /etc/nginx/snippets/fireinners-wolverine.conf;"; added=1}
     {print}
-    !done && $0 ~ /^server[[:space:]]*\{/ {print ins; done=1}
-  ' "$NG" >"$NG.tmp" && mv "$NG.tmp" "$NG"
+    END{ if(added!=1) { } }
+  ' "$NG_SITE" > /tmp/_ng_site.tmp || true
+  if [ -s /tmp/_ng_site.tmp ]; then
+    cp -a "$NG_SITE" "$NG_SITE.bak.$(date -u +%Y%m%dT%H%M%SZ)" || true
+    cat /tmp/_ng_site.tmp > "$NG_SITE"
+  fi
+fi
+
+# frontend index.html (new colors + EN/FR + no-cache + faster refresh)
+INDEX_HTML="$(cat <<'HTML'
+<!doctype html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate"/><meta http-equiv="Pragma" content="no-cache"/><meta http-equiv="Expires" content="0"/><title>WOLVERINE • TraderOne</title><style>
+:root{--bg0:#02140d;--bg1:#03251a;--p:#061b14;--p2:#0a2a1f;--b:#1fe39a;--b2:#0fb17a;--t:#eafff6;--m:#a5e9cf;--bad:#ff5f6d;--ok:#1fe39a;--w:#ffd166}
+*{box-sizing:border-box}html,body{height:100%;margin:0;background:radial-gradient(900px 600px at 15% 10%,rgba(31,227,154,.22),transparent 60%),radial-gradient(900px 600px at 85% 15%,rgba(15,177,122,.16),transparent 60%),linear-gradient(180deg,var(--bg0),var(--bg1));color:var(--t);font:14px system-ui}
+#wrap{max-width:1180px;margin:26px auto;padding:0 16px}
+#top{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px}
+#brand{display:flex;align-items:center;gap:10px}
+#dot{width:14px;height:14px;border-radius:50%;background:var(--b);box-shadow:0 0 20px rgba(31,227,154,.55)}
+#title{font-weight:800;letter-spacing:.6px}
+#sub{color:var(--m);font-size:12px;margin-top:2px}
+#bar{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+.btn{background:linear-gradient(180deg,rgba(31,227,154,.12),rgba(15,177,122,.08));border:1px solid rgba(31,227,154,.35);color:var(--t);padding:8px 10px;border-radius:10px;cursor:pointer}
+.btn:hover{border-color:rgba(31,227,154,.7)}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.card{background:linear-gradient(180deg,rgba(6,27,20,.75),rgba(6,27,20,.55));border:1px solid rgba(31,227,154,.22);border-radius:16px;padding:14px;box-shadow:0 14px 40px rgba(0,0,0,.35)}
+.grid{display:grid;grid-template-columns:420px 1fr;gap:14px}
+@media(max-width:980px){.grid{grid-template-columns:1fr}}
+.h{font-weight:800;margin:0 0 10px 0}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+@media(max-width:520px){.row{grid-template-columns:1fr}}
+label{display:block;color:var(--m);font-size:12px;margin:10px 0 6px}
+input,select{width:100%;padding:10px 10px;border-radius:12px;border:1px solid rgba(31,227,154,.25);background:rgba(0,0,0,.18);color:var(--t);outline:none}
+input:focus,select:focus{border-color:rgba(31,227,154,.7);box-shadow:0 0 0 3px rgba(31,227,154,.12)}
+.small{font-size:12px;color:var(--m);line-height:1.35}
+.kv{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:center}
+.pill{padding:6px 10px;border-radius:999px;border:1px solid rgba(31,227,154,.25);background:rgba(0,0,0,.15);color:var(--m);font-size:12px}
+.pill.ok{border-color:rgba(31,227,154,.6);color:var(--ok)}
+.pill.bad{border-color:rgba(255,95,109,.6);color:var(--bad)}
+#log{height:420px;overflow:auto;white-space:pre-wrap;background:rgba(0,0,0,.22);border:1px solid rgba(31,227,154,.18);border-radius:12px;padding:10px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}
+.footer{display:flex;gap:10px;flex-wrap:wrap;align-items:center;justify-content:space-between;margin-top:10px}
+a{color:var(--b)}
+</style></head><body><div id="wrap">
+  <div id="top">
+    <div id="brand"><div id="dot"></div><div><div id="title">WOLVERINE</div><div id="sub">TraderOne • Custody wallet • Faster refresh • TG monitoring</div></div></div>
+    <div id="bar">
+      <button class="btn" id="btnLang">EN</button>
+      <button class="btn" id="btnCfg">Config</button>
+      <button class="btn" id="btnPing">Ping</button>
+      <button class="btn" id="btnLoop">Loop: OFF</button>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h3 class="h" id="hControl">Control</h3>
+
+      <label id="lPh">Wallet (Phantom optional)</label>
+      <div class="row">
+        <button class="btn" id="btnConnect">Connect</button>
+        <button class="btn" id="btnDisconnect" disabled>Disconnect</button>
+      </div>
+
+      <label id="lAddr">User address</label>
+      <div class="kv"><div class="pill" id="userAddr">not connected</div><button class="btn" id="btnCopyUser" disabled>Copy</button></div>
+
+      <label id="lCust">Custody (TraderOne deposit address)</label>
+      <div class="kv"><div class="pill" id="custodyAddr">loading...</div><button class="btn" id="btnCopyCustody">Copy</button></div>
+      <div class="small" id="sDeposit">Send SOL/USDC to this address using Phantom. The server trades from this wallet.</div>
+
+      <div class="row">
+        <div><label id="lSOL">Custody SOL</label><input id="sol" readonly value="-"/></div>
+        <div><label id="lUSDC">Custody USDC</label><input id="usdc" readonly value="-"/></div>
+      </div>
+
+      <div class="row">
+        <div><label id="lBudget">Total budget (USDC)</label><input id="budget" type="number" min="0" step="0.01" value="50"/></div>
+        <div><label id="lPer">Per trade (USDC)</label><input id="perTrade" type="number" min="0.5" step="0.01" value="5"/></div>
+      </div>
+
+      <label id="lMode">Mode</label>
+      <select id="mode">
+        <option value="dca_sol">DCA buy SOL (safe)</option>
+        <option value="dca_mint">DCA buy custom token (mint)</option>
+      </select>
+
+      <label id="lMint">Mint (only for custom token)</label>
+      <input id="mint" placeholder="SPL mint (solana)"/>
+
+      <label id="lWithdraw">Withdraw address (profit return)</label>
+      <input id="withdrawTo" placeholder="your solana address (optional)"/>
+
+      <label id="lArm">ARM code</label>
+      <input id="arm" placeholder="required to start/stop/loop/withdraw"/>
+
+      <div class="row" style="margin-top:10px">
+        <button class="btn" id="btnStart">Start WOLVERINE</button>
+        <button class="btn" id="btnStop" disabled>Stop</button>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button class="btn" id="btnRefresh">Refresh</button>
+        <button class="btn" id="btnWithdraw">Withdraw ALL</button>
+      </div>
+
+      <div class="small" id="sSafe" style="margin-top:10px">
+        Safety: no private keys in browser. Custody key stays on VPS. Start/Stop require ARM. Cache disabled for fast updates.
+      </div>
+      <div class="footer">
+        <div class="pill" id="pillApi">API: ...</div>
+        <div class="pill" id="pillUp">Ping: ...</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3 class="h" id="hConsole">Console</h3>
+      <div id="log"></div>
+      <div class="footer">
+        <div class="small" id="foot">Auto-refresh: <span id="autoS">ON</span> • Latency: <span id="lat">-</span>ms • Errors: <span id="errs">0</span></div>
+        <div class="small"><label style="display:inline;color:var(--m)"><input type="checkbox" id="auto" checked/> auto</label></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+(()=>{const BASE="/wolverine/api";const $=s=>document.querySelector(s);
+const logEl=$("#log");let ERR=0, autoT=null, loopOn=false;
+const dict={en:{Control:"Control",Console:"Console","Wallet (Phantom optional)":"Wallet (Phantom optional)","User address":"User address","Custody (TraderOne deposit address)":"Custody (TraderOne deposit address)","Send SOL/USDC to this address using Phantom. The server trades from this wallet.":"Send SOL/USDC to this address using Phantom. The server trades from this wallet.","Custody SOL":"Custody SOL","Custody USDC":"Custody USDC","Total budget (USDC)":"Total budget (USDC)","Per trade (USDC)":"Per trade (USDC)","Mode":"Mode","Mint (only for custom token)":"Mint (only for custom token)","Withdraw address (profit return)":"Withdraw address (profit return)","ARM code":"ARM code","Start WOLVERINE":"Start WOLVERINE","Stop":"Stop","Refresh":"Refresh","Withdraw ALL":"Withdraw ALL","Safety: no private keys in browser. Custody key stays on VPS. Start/Stop require ARM. Cache disabled for fast updates.":"Safety: no private keys in browser. Custody key stays on VPS. Start/Stop require ARM. Cache disabled for fast updates."},
+fr:{Control:"Contrôle",Console:"Console","Wallet (Phantom optional)":"Wallet (Phantom optionnel)","User address":"Adresse utilisateur","Custody (TraderOne deposit address)":"Custody (adresse dépôt TraderOne)","Send SOL/USDC to this address using Phantom. The server trades from this wallet.":"Envoie SOL/USDC à cette adresse via Phantom. Le serveur trade depuis cette wallet.","Custody SOL":"SOL (Custody)","Custody USDC":"USDC (Custody)","Total budget (USDC)":"Budget total (USDC)","Per trade (USDC)":"Par trade (USDC)","Mode":"Mode","Mint (only for custom token)":"Mint (token custom)","Withdraw address (profit return)":"Adresse retour profit","ARM code":"Code ARM","Start WOLVERINE":"Démarrer WOLVERINE","Stop":"Stop","Refresh":"Rafraîchir","Withdraw ALL":"Retirer TOUT","Safety: no private keys in browser. Custody key stays on VPS. Start/Stop require ARM. Cache disabled for fast updates.":"Sécurité: aucune clé privée dans le navigateur. La clé custody reste sur le VPS. Start/Stop require ARM. Cache désactivé pour updates rapides."}};
+let LANG=localStorage.getItem("wolv_lang")||"en";
+function t(s){return (dict[LANG]&&dict[LANG][s])||s}
+function applyLang(){
+  $("#btnLang").textContent=LANG.toUpperCase();
+  $("#hControl").textContent=t("Control");
+  $("#hConsole").textContent=t("Console");
+  $("#lPh").textContent=t("Wallet (Phantom optional)");
+  $("#lAddr").textContent=t("User address");
+  $("#lCust").textContent=t("Custody (TraderOne deposit address)");
+  $("#sDeposit").textContent=t("Send SOL/USDC to this address using Phantom. The server trades from this wallet.");
+  $("#lSOL").textContent=t("Custody SOL");
+  $("#lUSDC").textContent=t("Custody USDC");
+  $("#lBudget").textContent=t("Total budget (USDC)");
+  $("#lPer").textContent=t("Per trade (USDC)");
+  $("#lMode").textContent=t("Mode");
+  $("#lMint").textContent=t("Mint (only for custom token)");
+  $("#lWithdraw").textContent=t("Withdraw address (profit return)");
+  $("#lArm").textContent=t("ARM code");
+  $("#btnStart").textContent=t("Start WOLVERINE");
+  $("#btnStop").textContent=t("Stop");
+  $("#btnRefresh").textContent=t("Refresh");
+  $("#btnWithdraw").textContent=t("Withdraw ALL");
+  $("#sSafe").textContent=t("Safety: no private keys in browser. Custody key stays on VPS. Start/Stop require ARM. Cache disabled for fast updates.");
+}
+applyLang();
+
+function p(s){logEl.textContent+=`[${new Date().toISOString()}] ${s}\n`;logEl.scrollTop=logEl.scrollHeight}
+async function jget(url){const t0=performance.now();const ac=new AbortController();const to=setTimeout(()=>ac.abort(),8000);
+  try{const r=await fetch(url,{cache:"no-store",signal:ac.signal});clearTimeout(to);const txt=await r.text();const ms=Math.round(performance.now()-t0);
+    $("#lat").textContent=String(ms);return {ok:r.ok,txt,ms};}catch(e){clearTimeout(to);ERR++;$("#errs").textContent=String(ERR);throw e}}
+async function jpost(url,body){const t0=performance.now();const ac=new AbortController();const to=setTimeout(()=>ac.abort(),12000);
+  try{const r=await fetch(url,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body||{}),cache:"no-store",signal:ac.signal});clearTimeout(to);
+    const txt=await r.text();const ms=Math.round(performance.now()-t0);$("#lat").textContent=String(ms);return {ok:r.ok,txt,ms};}catch(e){clearTimeout(to);ERR++;$("#errs").textContent=String(ERR);throw e}}
+
+let provider=null, userPub="";
+function setUser(pub){userPub=pub||"";$("#userAddr").textContent=userPub||"not connected";$("#btnCopyUser").disabled=!userPub}
+function setCustody(pub){$("#custodyAddr").textContent=pub||"-"}
+
+$("#btnLang").onclick=()=>{LANG=(LANG==="en"?"fr":"en");localStorage.setItem("wolv_lang",LANG);applyLang();p("LANG "+LANG)};
+$("#btnCopyCustody").onclick=()=>{navigator.clipboard.writeText($("#custodyAddr").textContent||"");p("copied custody")};
+$("#btnCopyUser").onclick=()=>{navigator.clipboard.writeText(userPub||"");p("copied user")};
+
+$("#btnConnect").onclick=async()=>{
+  try{
+    provider=window.solana;
+    if(!provider||!provider.isPhantom){p("Phantom not found");return}
+    const r=await provider.connect({onlyIfTrusted:false});
+    setUser(r.publicKey.toString());
+    $("#btnDisconnect").disabled=false;
+    p("Phantom connected");
+  }catch(e){p("Connect ERR: "+e)}
+};
+$("#btnDisconnect").onclick=async()=>{try{if(provider) await provider.disconnect();}catch(_){} setUser("");$("#btnDisconnect").disabled=true;p("Phantom disconnected")};
+
+async function refresh(){
+  try{
+    const r=await jget(BASE+"/status");
+    if(!r.ok){p("status ERR "+r.txt);return}
+    const j=JSON.parse(r.txt);
+    $("#sol").value=(j.sol||0).toFixed(6);
+    $("#usdc").value=(j.usdc||0).toFixed(6);
+    $("#pillApi").textContent="API: OK";
+    const eff=(j.ping&&j.ping.effective)||"UNKNOWN";
+    $("#pillUp").textContent="Ping: "+eff;
+    $("#pillUp").className="pill "+(eff==="UP"?"ok":(eff==="DOWN"?"bad":""));
+    const running=j.bot&&j.bot.running;
+    $("#btnStart").disabled=!!running;
+    $("#btnStop").disabled=!running;
+    if(j.bot&&j.bot.last) p(j.bot.last);
+  }catch(e){p("refresh ERR")}
+}
+
+$("#btnRefresh").onclick=refresh;
+
+$("#btnCfg").onclick=async()=>{
+  const r=await jget(BASE+"/config");
+  p("config: "+r.txt);
+};
+
+$("#btnPing").onclick=async()=>{
+  const r=await jget(BASE+"/ping");
+  p("ping: "+r.txt);
+};
+
+$("#btnLoop").onclick=async()=>{
+  const arm=$("#arm").value||"";
+  const url=BASE+(loopOn?"/loop/stop":"/loop/start");
+  const r=await jpost(url,{arm});
+  p("loop: "+r.txt);
+  loopOn=!loopOn;
+  $("#btnLoop").textContent="Loop: "+(loopOn?"ON":"OFF");
+};
+
+$("#btnStart").onclick=async()=>{
+  const arm=$("#arm").value||"";
+  const mode=$("#mode").value;
+  const mint=$("#mint").value.trim();
+  const budgetTotal=parseFloat($("#budget").value||"0");
+  const perTrade=parseFloat($("#perTrade").value||"0");
+  const withdrawTo=$("#withdrawTo").value.trim();
+  const body={arm,userPub,withdrawTo,mode,budgetTotal,perTrade,mint:(mode==="dca_mint"?mint:"")};
+  const r=await jpost(BASE+"/start",body);
+  p("start: "+r.txt);
+  refresh();
+};
+
+$("#btnStop").onclick=async()=>{
+  const arm=$("#arm").value||"";
+  const r=await jpost(BASE+"/stop",{arm});
+  p("stop: "+r.txt);
+  refresh();
+};
+
+$("#btnWithdraw").onclick=async()=>{
+  const arm=$("#arm").value||"";
+  const to=$("#withdrawTo").value.trim()||userPub;
+  if(!to){p("withdraw: missing address");return}
+  const r=await jpost(BASE+"/withdraw",{arm,to});
+  p("withdraw: "+r.txt);
+  refresh();
+};
+
+function auto(on){
+  $("#autoS").textContent=on?"ON":"OFF";
+  if(autoT){clearInterval(autoT);autoT=null}
+  if(on) autoT=setInterval(refresh,3000);
+}
+$("#auto").onchange=()=>auto($("#auto").checked);
+
+(async()=>{
+  try{
+    const w=await jget(BASE+"/wallet");
+    if(w.ok){const j=JSON.parse(w.txt);setCustody(j.custody||"-");$("#pillApi").textContent="API: OK";} else {setCustody("-");}
+  }catch(_){setCustody("-")}
+  auto(true);
+  refresh();
+})();
+})();
+</script></body></html>
+HTML
+)"
+askorupdate_file "$WEBDIR/index.html" "WOLVERINE index.html" "$INDEX_HTML"
+chmod 644 "$WEBDIR/index.html" || true
+
+# systemd reload + start
+systemctl daemon-reload
+systemctl enable --now "$SERVICE.service" >/dev/null 2>&1 || true
+systemctl restart "$SERVICE.service" >/dev/null 2>&1 || true
+
+# nginx include snippet if not already included (fallback safe)
+if ! grep -q "snippets/fireinners-wolverine.conf" "$NG_SITE"; then
+  # add include near top of server block (simple append just before last })
+  cp -a "$NG_SITE" "$NG_SITE.bak.$(date -u +%Y%m%dT%H%M%SZ)" || true
+  sed -i '0,/server\s*{/ s/server\s*{/server{\n  include \/etc\/nginx\/snippets\/fireinners-wolverine.conf;/' "$NG_SITE" || true
 fi
 
 nginx -t
 systemctl reload nginx
 
-# relock (conforme à ta règle)
+# relock (optional)
 chattr +i "$SNIP" 2>/dev/null || true
-chattr +i "$NG" 2>/dev/null || true
+chattr +i "$NG_SITE" 2>/dev/null || true
+chattr +i "$WEBDIR/index.html" 2>/dev/null || true
 
+CUST="$(cat "$WALLET_PUB" 2>/dev/null || true)"
 say "=== DONE ==="
-say "Front :  https://fireinners.online/wolverine/"
-say "Ping  :  https://fireinners.online/wolverine/api/ping"
-say "Health:  https://fireinners.online/wolverine/api/health"
-say "Config:  https://fireinners.online/wolverine/api/config"
-say "Wallet:  https://fireinners.online/wolverine/api/wallet"
-say "Status:  https://fireinners.online/wolverine/api/status"
-say "Deposit address(pub): $(curl -fsS https://fireinners.online/wolverine/api/wallet | sed -n '"'"'s/.*"pub":"\([^"]*\)".*/\1/p'"'"' || true)"
+say "Front : https://fireinners.online/wolverine/"
+say "API   : https://fireinners.online/wolverine/api/"
+say "Health: https://fireinners.online/wolverine/api/health"
+say "Ping  : https://fireinners.online/wolverine/api/ping"
+say "Config: https://fireinners.online/wolverine/api/config"
+say "Wallet: https://fireinners.online/wolverine/api/wallet"
+say "Status: https://fireinners.online/wolverine/api/status"
+say "Deposit address (SOL/USDC): $CUST"
 BASH
-chmod +x "$TMP"
-"$TMP"
-'
+bash /tmp/MEGA_WOLVERINE_ALL.sh'
