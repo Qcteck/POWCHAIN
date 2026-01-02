@@ -1,1 +1,59 @@
+cat >/tmp/fireinners_fix_stats_everywhere.sh <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+TARGET="/opt/fireinners/frontend-react/app/dist/stats/index.json"
+TS="$(date -u +%Y%m%d-%H%M%S)"
+
+[ -f "$TARGET" ] || { echo "ERR missing $TARGET"; exit 1; }
+
+echo "== FIND vhosts containing fireinners.online =="
+mapfile -t CFGS < <(grep -RIl --include='*' 'server_name' /etc/nginx/sites-available 2>/dev/null | xargs -r grep -Il 'fireinners\.online' | sort -u || true)
+if [ "${#CFGS[@]}" -eq 0 ]; then
+  echo "ERR: no vhost in /etc/nginx/sites-available contains fireinners.online"
+  exit 1
+fi
+printf '%s\n' "${CFGS[@]}"
+
+echo "== UNLOCK nginx conf files =="
+chattr -i /etc/nginx/nginx.conf 2>/dev/null || true
+for f in "${CFGS[@]}"; do chattr -i "$f" 2>/dev/null || true; done
+
+echo "== PATCH each vhost (idempotent) =="
+for CFG in "${CFGS[@]}"; do
+  cp -a "$CFG" "$CFG.bak.$TS"
+  perl -0777 -i -pe 's/\n\s*# BEGIN WOLFCHAIN_STATS[\s\S]*?# END WOLFCHAIN_STATS\s*\n/\n/gm' "$CFG"
+  tmp="/tmp/nginx_patch_$TS.$$"
+  awk -v target="$TARGET" '
+    BEGIN{ins=0; inServer=0}
+    {line=$0}
+    /^[[:space:]]*server[[:space:]]*\{/ {inServer=1}
+    {
+      print line
+      if(inServer && !ins && line ~ /server_name/ && line ~ /fireinners\.online/){
+        print "    # BEGIN WOLFCHAIN_STATS"
+        print "    location = /stats/index.json {"
+        print "        default_type application/json;"
+        print "        add_header Cache-Control \"no-store\" always;"
+        print "        alias " target ";"
+        print "    }"
+        print "    # END WOLFCHAIN_STATS"
+        ins=1
+      }
+    }
+    inServer && /^[[:space:]]*\}/ {inServer=0}
+    END{ if(!ins) exit 0 }
+  ' "$CFG" >"$tmp" && mv "$tmp" "$CFG"
+done
+
+echo "== NGINX TEST + RELOAD =="
+nginx -t
+systemctl reload nginx
+
+echo "== LOCK back =="
+chattr +i /etc/nginx/nginx.conf 2>/dev/null || true
+for f in "${CFGS[@]}"; do chattr +i "$f" 2>/dev/null || true; done
+
+echo "== TEST (correct SNI) =="
 curl -k -sS -i --resolve fireinners.online:443:127.0.0.1 https://fireinners.online/stats/index.json | sed -n '1,25p'
+SH
+bash /tmp/fireinners_fix_stats_everywhere.sh
