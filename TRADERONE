@@ -1,257 +1,257 @@
 bash -lc 'set -euo pipefail
-APP="wolverine"
-API_DIR="/opt/fireinners/wolverine-api"
-WEB_DIR="/opt/fireinners/frontend-react/app/dist/wolverine"
+TMP=/tmp/MEGA_WOLVERINE_FIX.sh
+cat >"$TMP" <<'"'"'BASH'"'"'
+#!/usr/bin/env bash
+set -euo pipefail
+
+APPDIR="/opt/fireinners/wolverine-api"
+FRONTDIR="/opt/fireinners/frontend-react/app/dist/wolverine"
+ENVF="$APPDIR/.env"
+SERVICE="wolverine-api"
 NG="/etc/nginx/sites-available/fireinners.online-ssl"
 SNIP="/etc/nginx/snippets/fireinners-wolverine.conf"
-PORT_DEFAULT="3050"
-ASKOR="/opt/fireinners/sentinel/lib/askorupdate.sh"
 
 say(){ printf "%s\n" "$*"; }
 need(){ command -v "$1" >/dev/null 2>&1 || { say "ERREUR: $1 manquant"; exit 1; }; }
 
-need bash; need node; need npm; need systemctl; need nginx; need curl
+need node; need npm; need systemctl; need nginx; need sed; need awk; need grep; need curl; need base64; need chattr
 
-# askorupdate (si dispo)
-if [ -f "$ASKOR" ]; then . "$ASKOR"; else
+ASKOR="/opt/fireinners/sentinel/lib/askorupdate.sh"
+if [ -f "$ASKOR" ]; then
+  # shellcheck disable=SC1090
+  source "$ASKOR"
+else
   askorupdate_yesno(){ return 0; }
-  askorupdate_file(){ local p="$1" _label="${2:-FILE}" c="$3"; mkdir -p "$(dirname "$p")"; local tmp; tmp="$(mktemp)"; printf "%s" "$c" >"$tmp"; if command -v chattr >/dev/null 2>&1; then chattr -i "$p" 2>/dev/null || true; fi; cp -a "$p" "$p.bak.$(date +%s)" 2>/dev/null || true; cat "$tmp" >"$p"; rm -f "$tmp"; if command -v chattr >/dev/null 2>&1; then chattr +i "$p" 2>/dev/null || true; fi; }
+  askorupdate_file(){
+    local dst="$1" name="$2" content="$3"
+    mkdir -p "$(dirname "$dst")"
+    [ -f "$dst" ] && cp -a "$dst" "$dst.bak.$(date +%s)" || true
+    chattr -i "$dst" 2>/dev/null || true
+    printf "%s" "$content" >"$dst"
+  }
 fi
 
-say "=== MEGA WOLVERINE INSTALL ==="
-say "date: $(date -u +%FT%TZ)"
-say "API_DIR: $API_DIR"
-say "WEB_DIR: $WEB_DIR"
-say "NG: $NG"
-say "SNIP: $SNIP"
-say ""
+say "=== BATCH FLY (read-only) ==="
+say "whoami: $(whoami)"
+say "host: $(hostname)"
+say "node: $(node -v)"
+say "nginx: $(nginx -v 2>&1 | head -n1)"
+[ -f "$NG" ] || { say "ERREUR: vhost absent: $NG"; exit 1; }
 
-[ -f "$NG" ] || { say "ERREUR: nginx vhost absent: $NG"; exit 1; }
+mkdir -p "$APPDIR" "$FRONTDIR"
+chmod 755 "$APPDIR" "$FRONTDIR" || true
 
-mkdir -p "$API_DIR" "$WEB_DIR"
-
-# ---------- BACKEND (server.js + package.json + .env) ----------
-SVR_JS=$(cat <<'"'"'JS'"'"'
-"use strict";
-const fs=require("fs");
-const path=require("path");
-const express=require("express");
-const {execFile}=require("child_process");
-
-const VERSION="WOLVERINE+TRADERONE 2026-01-02";
-const app=express();
-app.set("trust proxy",true);
-app.use(express.json({limit:"1mb"}));
-app.use((req,res,next)=>{res.setHeader("Access-Control-Allow-Origin","*");res.setHeader("Access-Control-Allow-Methods","GET,POST,OPTIONS");res.setHeader("Access-Control-Allow-Headers","content-type");res.setHeader("Cache-Control","no-store");if(req.method==="OPTIONS")return res.sendStatus(204);next();});
-
-const ENV=(k,d)=>process.env[k]??d;
-const PORT=parseInt(ENV("PORT","3050"),10)||3050;
-
-const MONITOR_URL=ENV("MONITOR_URL","https://bbbotrader.paycashnostory.workers.dev/ping");
-const MONITOR_SEC=Math.max(0,parseInt(ENV("MONITOR_SEC","10"),10)||10);
-const MONITOR_FAILS=Math.max(1,parseInt(ENV("MONITOR_FAILS","3"),10)||3);
-const TG_ALERTS=String(ENV("TG_ALERTS","0"))==="1";
-const WOLV_SEND=ENV("WOLV_SEND","/usr/local/bin/wolv_send");
-
-let traderOne={running:false,mode:"dca",budgetUSDC:0,spentUSDC:0,tokenMint:"",lastAction:0};
-let mon={enabled:true,lastOk:null,fails:0,effective:"UNKNOWN",lastMsg:0};
-
-function now(){return Date.now();}
-function okjson(res,obj){res.json(Object.assign({ok:true,ts:Date.now(),version:VERSION},obj||{}));}
-function errjson(res,code,msg,extra){res.status(code||400).json(Object.assign({ok:false,error:String(msg||"error"),ts:Date.now(),version:VERSION},extra||{}));}
-
-function tgSend(text){
-  if(!TG_ALERTS) return;
-  if(!text) return;
-  if(!fs.existsSync(WOLV_SEND)) return;
-  execFile(WOLV_SEND,[String(text)],{timeout:8000},()=>{});
-}
-
-async function fetchText(url){
-  const ctrl=new AbortController();
-  const t=setTimeout(()=>ctrl.abort(),8000);
-  try{
-    const r=await fetch(url,{signal:ctrl.signal});
-    const tx=await r.text();
-    return {ok:r.ok,status:r.status,text:tx};
-  }finally{clearTimeout(t);}
-}
-
-async function monitorTick(){
-  if(!mon.enabled) return;
-  const r=await fetchText(MONITOR_URL).catch(e=>({ok:false,status:0,text:String(e&&e.message||e)}));
-  const isOk=r.ok && (String(r.text||"").toLowerCase().includes("pong") || String(r.text||"").toLowerCase().includes("ok"));
-  mon.lastOk=now();
-  if(isOk){ mon.fails=0; if(mon.effective!=="UP"){ mon.effective="UP"; tgSend(`WOLVERINE: API UP (recovery) ${new Date().toISOString()}`); } }
-  else{ mon.fails++; if(mon.fails>=MONITOR_FAILS && mon.effective!=="DOWN"){ mon.effective="DOWN"; tgSend(`WOLVERINE: API DOWN (>=${MONITOR_FAILS} fails) ${new Date().toISOString()}`); } }
-}
-
-if(MONITOR_SEC>0){
-  setInterval(()=>{monitorTick();},MONITOR_SEC*1000).unref();
-  setTimeout(()=>monitorTick(),600).unref();
-}
-
-app.get("/",(req,res)=>res.type("text/plain").send("wolverine-api"));
-app.get("/health",(req,res)=>okjson(res,{uptime:process.uptime(),port:PORT}));
-app.get("/ping",(req,res)=>res.type("text/plain").send("pong"));
-app.get("/config",(req,res)=>okjson(res,{
-  apiBase:"/wolverine/api",
-  jupBase:"/wolverine/api/jup",
-  monitor:{url:MONITOR_URL,sec:MONITOR_SEC,fails:MONITOR_FAILS,tgAlerts:TG_ALERTS,enabled:mon.enabled,effective:mon.effective,failsNow:mon.fails},
-  traderOne:traderOne
-}));
-
-app.get("/monitor/status",(req,res)=>okjson(res,{monitor:mon}));
-app.post("/monitor/start",(req,res)=>{mon.enabled=true; okjson(res,{monitor:mon});});
-app.post("/monitor/stop",(req,res)=>{mon.enabled=false; okjson(res,{monitor:mon});});
-app.post("/monitor/test",(req,res)=>{tgSend(`WOLVERINE: TEST ${new Date().toISOString()}`); okjson(res,{sent:TG_ALERTS && fs.existsSync(WOLV_SEND)});});
-
-app.get("/traderone/status",(req,res)=>okjson(res,{traderOne}));
-app.post("/traderone/start",(req,res)=>{
-  const b=req.body||{};
-  traderOne.running=true;
-  traderOne.mode=String(b.mode||traderOne.mode||"dca");
-  traderOne.budgetUSDC=Number(b.budgetUSDC||traderOne.budgetUSDC||0);
-  traderOne.tokenMint=String(b.tokenMint||traderOne.tokenMint||"");
-  traderOne.lastAction=now();
-  tgSend(`WOLVERINE: START mode=${traderOne.mode} budget=${traderOne.budgetUSDC} ${new Date().toISOString()}`);
-  okjson(res,{traderOne});
-});
-app.post("/traderone/stop",(req,res)=>{
-  traderOne.running=false; traderOne.lastAction=now();
-  tgSend(`WOLVERINE: STOP ${new Date().toISOString()}`);
-  okjson(res,{traderOne});
-});
-
-const JUP_QUOTE="https://quote-api.jup.ag/v6/quote";
-const JUP_SWAP="https://quote-api.jup.ag/v6/swap";
-
-app.get("/jup/quote", async (req,res)=>{
-  try{
-    const q=new URLSearchParams(req.query||{}).toString();
-    const url=JUP_QUOTE+(q?("?"+q):"");
-    const r=await fetch(url,{headers:{"accept":"application/json"}});
-    const t=await r.text();
-    res.status(r.status).type("application/json").send(t);
-  }catch(e){ errjson(res,500,"jup_quote_failed",{detail:String(e&&e.message||e)}); }
-});
-
-app.post("/jup/swap", async (req,res)=>{
-  try{
-    const body=req.body||{};
-    const r=await fetch(JUP_SWAP,{method:"POST",headers:{"content-type":"application/json","accept":"application/json"},body:JSON.stringify(body)});
-    const t=await r.text();
-    res.status(r.status).type("application/json").send(t);
-  }catch(e){ errjson(res,500,"jup_swap_failed",{detail:String(e&&e.message||e)}); }
-});
-
-app.use((req,res)=>errjson(res,404,"not_found",{path:req.path}));
-
-app.listen(PORT, "127.0.0.1", ()=>{ console.log(`[${new Date().toISOString()}] ${VERSION} listening 127.0.0.1:${PORT}`); });
-JS
-)
-
-PKG=$(cat <<'"'"'JSON'"'"'
-{"name":"wolverine-api","version":"1.0.0","private":true,"type":"commonjs","main":"server.js","dependencies":{"express":"^4.19.2"}}
-JSON
-)
-
-ENVF=$(cat <<EOF
-PORT=$PORT_DEFAULT
-# Ping target (ton proxy/worker)
+# env (ne casse pas ton setup)
+if [ ! -f "$ENVF" ]; then
+  cat >"$ENVF" <<EOF
+PORT=3050
+BASE_PATH=/wolverine
+RPC_URL=https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac
 MONITOR_URL=https://bbbotrader.paycashnostory.workers.dev/ping
 MONITOR_SEC=10
 MONITOR_FAILS=3
-# Telegram (si wolv_send existe)
 TG_ALERTS=0
 WOLV_SEND=/usr/local/bin/wolv_send
 EOF
+  chmod 600 "$ENVF" || true
+fi
+
+PKG_JSON=$(cat <<'"'"'JSON'"'"'
+{"name":"wolverine-api","private":true,"version":"1.0.0","main":"server.js","type":"commonjs","dependencies":{"dotenv":"^16.4.5","express":"^4.19.2","@solana/web3.js":"^1.95.4"}}
+JSON
 )
 
-askorupdate_file "$API_DIR/server.js" "WOLVERINE server.js" "$SVR_JS"
-askorupdate_file "$API_DIR/package.json" "WOLVERINE package.json" "$PKG"
-askorupdate_file "$API_DIR/.env" "WOLVERINE .env" "$ENVF"
+SVR_JS=$(cat <<'"'"'JS'"'"'
+"use strict";
+require("dotenv").config();
+const fs=require("fs"),path=require("path"),express=require("express");
+const {Connection,Keypair}=require("@solana/web3.js");
 
-( cd "$API_DIR" && npm i --omit=dev )
+const PORT=parseInt(process.env.PORT||"3050",10);
+const BASE=(process.env.BASE_PATH||"/wolverine").replace(/\/$/,"");
+const RPC_URL=process.env.RPC_URL||"https://api.mainnet-beta.solana.com";
+const MONITOR_URL=process.env.MONITOR_URL||"";
+const MONITOR_SEC=Math.max(2,parseInt(process.env.MONITOR_SEC||"10",10));
+const MONITOR_FAILS=Math.max(1,parseInt(process.env.MONITOR_FAILS||"3",10));
+const TG_ALERTS=(process.env.TG_ALERTS||"0")==="1";
+const WOLV_SEND=process.env.WOLV_SEND||"/usr/local/bin/wolv_send";
+
+const WALLET_FILE=path.join(__dirname,"wallet.json");
+const now=()=>new Date().toISOString();
+
+function loadOrCreateWallet(){
+  try{
+    const o=JSON.parse(fs.readFileSync(WALLET_FILE,"utf8"));
+    if(o&&Array.isArray(o.secretKey)&&o.secretKey.length>=32){
+      return Keypair.fromSecretKey(Uint8Array.from(o.secretKey));
+    }
+  }catch(_){}
+  const kp=Keypair.generate();
+  fs.writeFileSync(WALLET_FILE,JSON.stringify({created:now(),pub:kp.publicKey.toBase58(),secretKey:Array.from(kp.secretKey)}));
+  try{fs.chmodSync(WALLET_FILE,0o600);}catch(_){}
+  return kp;
+}
+const CUSTODIAL=loadOrCreateWallet();
+const conn=new Connection(RPC_URL,"confirmed");
+
+let STATE={running:false,mode:"safe",budget_usdc:0,owner_pub:null,last_ping:null,last_ping_ok:null,fails:0,effective:"INIT",started_at:null};
+
+function tgSend(text){
+  if(!TG_ALERTS) return;
+  try{ require("child_process").execFile(WOLV_SEND,[String(text||"").slice(0,900)],{timeout:8000},()=>{}); }catch(_){}
+}
+
+async function doPingOnce(){
+  if(!MONITOR_URL) return {ok:false,err:"no MONITOR_URL"};
+  try{
+    const r=await fetch(MONITOR_URL,{method:"GET",cache:"no-store",redirect:"follow",signal:AbortSignal.timeout(8000)});
+    const t=await r.text();
+    const ok=r.ok && /pong/i.test(t||"");
+    return {ok,code:r.status,txt:(t||"").slice(0,80)};
+  }catch(e){ return {ok:false,err:String(e&&e.message||e)}; }
+}
+
+let pingTimer=null;
+async function pingTick(){
+  const res=await doPingOnce();
+  STATE.last_ping=now();
+  STATE.last_ping_ok=!!res.ok;
+  if(res.ok) STATE.fails=0; else STATE.fails=(STATE.fails||0)+1;
+  const prev=STATE.effective;
+  STATE.effective=res.ok?"UP":(STATE.fails>=MONITOR_FAILS?"DOWN":"FLAKY");
+  if(prev!==STATE.effective){
+    if(STATE.effective==="UP") tgSend(`WOLVERINE: API UP (recovery) ${now()}`);
+    else if(STATE.effective==="DOWN") tgSend(`WOLVERINE: API DOWN (>=${MONITOR_FAILS} fails) ${now()}`);
+    else tgSend(`WOLVERINE: API STATE ${STATE.effective} ${now()}`);
+  }
+}
+function startLoop(){ if(pingTimer) return; pingTimer=setInterval(()=>{pingTick().catch(()=>{});},MONITOR_SEC*1000); pingTick().catch(()=>{}); }
+function stopLoop(){ if(!pingTimer) return; clearInterval(pingTimer); pingTimer=null; }
+
+const app=express();
+app.disable("x-powered-by");
+app.use((req,res,next)=>{ res.setHeader("Cache-Control","no-store, no-cache, must-revalidate, proxy-revalidate"); res.setHeader("Pragma","no-cache"); res.setHeader("Expires","0"); next(); });
+app.use(express.json({limit:"256kb"}));
+
+app.get("/",(_req,res)=>res.type("text/plain").send("wolverine-api"));
+app.get("/health",(_req,res)=>res.json({ok:true,uptime:process.uptime(),ts:Date.now()}));
+app.get("/ping",(_req,res)=>res.type("text/plain").send("pong"));
+
+app.get("/config",(_req,res)=>res.json({
+  ok:true,base:BASE,api:`${BASE}/api`,rpc:RPC_URL,
+  monitor:{url:MONITOR_URL,sec:MONITOR_SEC,fails:MONITOR_FAILS},
+  tg_alerts:TG_ALERTS?1:0,custodial_pub:CUSTODIAL.publicKey.toBase58(),ts:Date.now()
+}));
+app.get("/wallet",(_req,res)=>res.json({ok:true,pub:CUSTODIAL.publicKey.toBase58(),ts:Date.now()}));
+app.get("/status",(_req,res)=>res.json({ok:true,state:STATE,ts:Date.now()}));
+
+app.post("/start",(req,res)=>{
+  const b=Number(req.body&&req.body.budget_usdc||0);
+  const m=String(req.body&&req.body.mode||"safe");
+  const owner=String(req.body&&req.body.owner_pub||"").trim();
+  if(owner && !/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(owner)) return res.status(400).json({ok:false,error:"bad owner_pub"});
+  STATE.running=true; STATE.started_at=now();
+  STATE.budget_usdc=isFinite(b)&&b>=0?b:0;
+  STATE.mode=m.slice(0,40);
+  STATE.owner_pub=owner||null;
+  startLoop();
+  res.json({ok:true,state:STATE,ts:Date.now()});
+});
+app.post("/stop",(_req,res)=>{ STATE.running=false; stopLoop(); res.json({ok:true,state:STATE,ts:Date.now()}); });
+
+app.listen(PORT,"127.0.0.1",()=>{ startLoop(); });
+JS
+)
 
 UNIT=$(cat <<EOF
 [Unit]
-Description=Wolverine API (TraderOne bridge)
+Description=Wolverine API (fireinners.online/wolverine)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=$API_DIR
-EnvironmentFile=$API_DIR/.env
-ExecStart=/usr/bin/node $API_DIR/server.js
+WorkingDirectory=$APPDIR
+EnvironmentFile=$ENVF
+ExecStart=/usr/bin/env node $APPDIR/server.js
 Restart=always
-RestartSec=1
+RestartSec=2
 User=root
 
 [Install]
 WantedBy=multi-user.target
 EOF
 )
-askorupdate_file "/etc/systemd/system/wolverine-api.service" "wolverine-api.service" "$UNIT"
 
+# FRONT HTML: nouvelle palette VIOLET/TEAL visible + toggle EN/FR + refresh 2s
+HTML_B64="$(cat <<'"'"'EOF_B64'"'"'
+PCFkb2N0eXBlIGh0bWw+PGh0bWwgbGFuZz0iZW4iPjxoZWFkPjxtZXRhIGNoYXJzZXQ9InV0Zi04Ii8+PG1ldGEgbmFtZT0idmlld3BvcnQiIGNvbnRlbnQ9IndpZHRoPWRldmljZS13aWR0aCxpbml0aWFsLXNjYWxlPTEiLz48dGl0bGU+V09MVkVSSU5FIOKAmCBUcmFkZXJPbmU8L3RpdGxlPjxzdHlsZT46cm9vdHt9Kntib3gtc2l6aW5nOmJvcmRlci1ib3h9aHRtbCxib2R5e21hcmdpbjowO2hlaWdodDoxMDAlYmFja2dyb3VuZDpyYWRpYWwtZ3JhZGllbnQoMTEwMHB4IDY1MHB4IGF0IDIwJSAwJSwjMmQxMDQ1IDAsdHJhbnNwYXJlbnQgNTUlKSxyYWRpYWwtZ3JhZGllbnQoOTAwcHggNjAwcHggYXQgODAlIDIwJSwjMGQyOTQyIDAsdHJhbnNwYXJlbnQgNTUlKSxsaW5lYXItZ3JhZGllbnQoMTgwZGVnLCMwNjA2MGIsIzA1MDUwOCk7Y29sb3I6I2VhZjJmZjtpb250OjE0cHggc3lzdGVtLXVpLC1hcHBsZS1zeXN0ZW0sU2Vnb2UgVUksUm9ib3RvfSN3cmFwe21heC13aWR0aDoxMTAwcHg7bWFyZ2luOjAgYXV0bztwYWRkaW5nOjE4cHh9I3RvcHtkaXNwbGF5OmZsZXg7Z2FwOjEycHg7YWxpZ24taXRlbXM6Y2VudGVyO2p1c3RpZnktY29udGVudDpzcGFjZS1iZXR3ZWVuO21hcmdpbi1ib3R0b206MTJweH0uYnJhbmR7ZGlzcGxheTpmbGV4O2dhcDoxMHB4O2FsaWduLWl0ZW1zOmNlbnRlcn0uYmFkZ2V7d2lkdGg6MzRweDtoZWlnaHQ6MzRweDtib3JkZXItcmFkaXVzOjlweDtiYWNrZ3JvdW5kOmxpbmVhci1ncmFkaWVudCgxMzVkZWcsIzY3ZmZkYywjYjM2N2ZmKTtib3gtc2hhZG93OjAgMCAyMHB4IHJnYmEoMTc5LDEwMywyNTUsLjIpLDAgMCAzOHB4IHJnYmEoMTAzLDI1NSwyMjAsLjE4KX0gaDF7Zm9udC1zaXplOjE2cHg7bWFyZ2luOjA7bGV0dGVyLXNwYWNpbmc6Ljgpxn0uY2FyZHtiYWNrZ3JvdW5kOmxpbmVhci1ncmFkaWVudCgxODBkZWcscmdiYSgxMSwxNiwzNiwuOTIpLHJnYmEoNiw3LDE4LC45MikpO2JvcmRlcjoxcHggc29saWQgcmdiYSgxMDMsMjU1LDIyMCwuMTgpO2JvcmRlci1yYWRpdXM6MTZweDtwYWRkaW5nOjE0cHg7Ym94LXNoYWRvdzowIDAgMThweCByZ2JhKDE3OSwxMDMsMjU1LC4xNSksMCAwIDM4cHggcmdiYSgxMDMsMjU1LDIyMCwuMTIpfS5yb3d7ZGlzcGxheTpncmlkO2dyaWQtdGVtcGxhdGUtY29sdW1uczoxLjFmciAuOWZyO2dhcDoxMnB4fUBtZWRpYShtYXgtd2lkdGg6OTAwcHgpey5yb3d7Z3JpZC10ZW1wbGF0ZS1jb2x1bW5zOjFmcj19bGFiZWx7ZGlzcGxheTpibG9jaztjb2xvcjojOWZiNGRmO2ZvbnQtc2l6ZToxMnB4O21hcmdpbjo4cHggMCA2cHh9aW5wdXQsc2VsZWN0LGJ1dHRvbix0ZXh0YXJlYXt3aWR0aDoxMDAlYm9yZGVyLXJhZGl1czoxMnB4O2JvcmRlcjoxcHggc29saWQgcmdiYSgxMDMsMjU1LDIyMCwuMjIpO2JhY2tncm91bmQ6cmdiYSg2LDcsMTgsLjcpO2NvbG9yOiNlYWYyZmY7cGFkZGluZzoxMHB4IDEycHg7b3V0bGluZTpub25lfWJ1dHRvbntjdXJzb3I6cG9pbnRlcjtiYWNrZ3JvdW5kOmxpbmVhci1ncmFkaWVudCgxMzVkZWcscmdiYSgxNzksMTAzLDI1NSwuMjIpLHJnYmEoMTAzLDI1NSwyMjAsLjE4KSk7Ym9yZGVyOjFweCBzb2xpZCByZ2JhKDE3OSwxMDMsMjU1LC4zMCl9I2xvZ3toZWlnaHQ6MjgwcHg7d2hpdGUtc3BhY2U6cHJlLXdyYXA7Zm9udDoxMnB4IHVpLW1vbm9zcGFjZSxNZW5sbyxDb25zb2xhcztCYWNrZ3JvdW5kOnJnYmEoMCwwLDAsLjM1KX0uZ3JpZDJ7ZGlzcGxheTpncmlkO2dyaWQtdGVtcGxhdGUtY29sdW1uczoxZnIgMWZyO2dhcDoxMHB4fS5waWxse2Rpc3BsYXk6aW5saW5lLWZsZXg7Z2FwOjhweDthbGlnbi1pdGVtczpjZW50ZXI7cGFkZGluZzo3cHggMTBweDtib3JkZXItcmFkaXVzOjk5OXB4O2JvcmRlcjoxcHggc29saWQgcmdiYSgxMDMsMjU1LDIyMCwuMTgpO2JhY2tncm91bmQ6cmdiYSg2LDcsMTgsLjU1KX0uZG90e3dpZHRoOjlweDtoZWlnaHQ6OXB4O2JvcmRlci1yYWRpdXM6NTAlfS5vaytiYWNrZ3JvdW5kOiM1NWZmYjA7fS5iYWR7YmFja2dyb3VuZDojZmY1YjdhfS5taWR7YmFja2dyb3VuZDojYmM4ZmZmfS5zbWFsbHtmb250LXNpemU6MTJweDtjb2xvcjojOWZiNGRmfTwvc3R5bGU+PC9oZWFkPjxib2R5PjxkaXYgaWQ9IndyYXAiPjxkaXYgaWQ9InRvcCI+PGRpdiBjbGFzcz0iYnJhbmQiPjxkaXYgY2xhc3M9ImJhZGdlIj48L2Rpdj48ZGl2PjxoMT5XT0xWRVJJTkU8L2gxPjxkaXYgaWQ9InN1YiIgY2xhc3M9InNtYWxsIj5QaGFudG9tIG9ubHkg4oCiIEN1c3RvZGlhbCBkZXBvc2l0IHdhbGxldCDigKIgQVBJIGxpdmU8L2Rpdj48L2Rpdj48L2Rpdj48ZGl2PjxzcGFuIGNsYXNzPSJwaWxsIiBpZD0iYXBpUGlsbCI+PHNwYW4gY2xhc3M9ImRvdCBtaWQiIGlkPSJhcGlEb3QiPjwvc3Bhbj48c3BhbiBpZD0iYXBpVHh0Ij5BUEk8L3NwYW4+PC9zcGFuPiA8YnV0dG9uIGlkPSJidG5MYW5nIj5GUjw9L2J1dHRvbj48L2Rpdj48L2Rpdj48ZGl2IGNsYXNzPSJyb3ciPjxkaXYgY2xhc3M9ImNhcmQiPjxoMiBpZD0idENvbnRyb2wiPkNvbnRyb2w8L2gyPjxkaXYgY2xhc3M9ImdyaWQyIj48ZGl2PjxsYWJlbCBpZD0idFdhbGxldCI+V2FsbGV0PC9sYWJlbD48YnV0dG9uIGlkPSJidG5Db25uZWN0Ij5Db25uZWN0IFBoYW50b208L2J1dHRvbj48L2Rpdj48ZGl2PjxsYWJlbD4mbmJzcDs8L2xhYmVsPjxidXR0b24gaWQ9ImJ0bkRpc2Nvbm5lY3QiPkRpc2Nvbm5lY3Q8L2J1dHRvbj48L2Rpdj48L2Rpdj48ZGl2IGNsYXNzPSJncmlkMiI+PGRpdj48bGFiZWwgaWQ9InRTb2wiPlNPTDwvbGFiZWw+PGlucHV0IGlkPSJzb2wiIHJlYWRvbmx5IHZhbHVlPSItIi8+PC9kaXY+PGRpdj48bGFiZWwgaWQ9InRVc2RjIj5VU0RDPDwvbGFiZWw+PGlucHV0IGlkPSJ1c2RjIiByZWFkb25seSB2YWx1ZT0iLSIvPjwvZGl2PjwvZGl2PjxsYWJlbCBpZD0idEN1c3QiPlRyYWRlck9uZSBkZXBvc2l0IGFkZHJlc3MgKGN1c3RvZGlhbCk8L2xhYmVsPjxkaXYgY2xhc3M9ImdyaWQyIj48aW5wdXQgaWQ9ImRlcCIgcmVhZG9ubHkgdmFsdWU9ImxvYWRpbmcuLi4iLz48YnV0dG9uIGlkPSJidG5Db3B5Ij5Db3B5PC9idXR0b24+PC9kaXY+PGRpdiBjbGFzcz0ic21hbGwiIGlkPSJkZXBIaW50Ij5Vc2UgUGhhbnRvbSB0byBzZW5kIFNPTC9VU0RDIHRvIHRoaXMgYWRkcmVzcy4gTmV2ZXIgcGFzdGUgcHJpdmF0ZSBrZXlzLjwvZGl2PjxkaXYgY2xhc3M9ImdyaWQyIj48ZGl2PjxsYWJlbCBpZD0idEJ1ZGdldCI+QnVkZ2V0IChVU0RDKTwvbGFiZWw+PGlucHV0IGlkPSJidWRnZXQiIHBsYWNlaG9sZGVyPSJUb3RhbCBidWRnZXQgKFVTREMpIiBpbmZvcm1tb2RlPSJkZWNpbWFsIi8+PC9kaXY+PGRpdj48bGFiZWwgaWQ9InRNb2RlIj5Nb2RlPC9sYWJlbD48c2VsZWN0IGlkPSJtb2RlIj48b3B0aW9uIHZhbHVlPSJzYWZlIj5TYWZlPC9vcHRpb24+PG9wdGlvbiB2YWx1ZT0iZGNhIj5EQ0E8L29wdGlvbj48L3NlbGVjdD48L2Rpdj48L2Rpdj48ZGl2IGNsYXNzPSJncmlkMiI+PGJ1dHRvbiBpZD0iYnRuU3RhcnQiPlN0YXJ0IFdPTFZFUklORTwvYnV0dG9uPjxidXR0b24gaWQ9ImJ0blN0b3AiPlN0b3A8L2J1dHRvbj48L2Rpdj48ZGl2IGNsYXNzPSJzbWFsbCIgaWQ9ImZvb3QiPkF1dG8tcmVmcmVzaDogMnMg4oCiIEVuZHBvaW50OiA8c3BhbiBpZD0iZXAiPjwvc3Bhbj48L2Rpdj48L2Rpdj48ZGl2IGNsYXNzPSJjYXJkIj48aDIgaWQ9InRDb25zb2xlIj5Db25zb2xlPC9oMj48dGV4dGFyZWEgaWQ9ImxvZyIgcmVhZG9ubHk+PC90ZXh0YXJlYT48L2Rpdj48L2Rpdj48L2Rpdj48c2NyaXB0PmNvbnN0IEJBU0U9Ii93b2x2ZXJpbmUiLEFQST1CQVNFKyIvYXBpIjtjb25zdCAkPXM9PmRvY3VtZW50LnF1ZXJ5U2VsZWN0b3IocyksTE9HPaQoIiNsb2ciKTtsZXQgTEFORz1sb2NhbFN0b3JhZ2UuZ2V0SXRlbSgid29sdl9sYW5nIil8fCJlbiI7Y29uc3QgVFhUPXtlbjp7c3ViOiJQaGFudG9tIG9ubHkg4oCiIEN1c3RvZGlhbCBkZXBvc2l0IHdhbGxldCDigKIgQVBJIGxpdmUiLENvbnRyb2w6IkNvbnRyb2wiLFdhbGxldDoiV2FsbGV0IixDT0w6IlNPTCIsVVNEQzoiVVNEQyIsQ3VzdDoiVHJhZGVyT25lIGRlcG9zaXQgYWRkcmVzcyAoY3VzdG9kaWFsKSIsQnVkZ2V0OiJCdWRnZXQgKFVTREMpIixNb2RlOiJNb2RlIixDb25zb2xlOiJDb25zb2xlIixkZXBIaW50OiJVc2UgUGhhbnRvbSB0byBzZW5kIFNPTC9VU0RDIHRvIHRoaXMgYWRkcmVzcy4gTmV2ZXIgcGFzdGUgcHJpdmF0ZSBrZXlzLiIsY29weToiQ29weSIsY29waWVkOiJDb3BpZWQiLHN0YXJ0OiJTdGFydCBXT0xWRVJJTkUiLHN0b3A6IlN0b3AiLGNvbm46IkNvbm5lY3QgUGhhbnRvbSIsZGlzYzoiRGlzY29ubmVjdCJ9LGZyOntzdWI6IlBoYW50b20gc2V1bGVtZW50IOKApiBXYWxsZXQgZMOpcMO0dCBjdXN0b2RpYWwg4oCiIEFQSSBhY3RpdmUiLENvbnRyb2w6IkNvbnRyw7RsZSIsV2FsbGV0OiJXYWxsZXQiLENPTDoiU09MIixVU0RDOiJVU0RDIixDdXN0OiJBZHJlc3NlIGTDqXBvw7QgVHJhZGVyT25lIChjdXN0b2RpYWwpIixCdWRnZXQ6IkJ1ZGdldCAoVVNEQykiLE1vZGU6Ik1vZGUiLENvbnNvbGU6IkNvbnNvbGUiLGRlcEhpbnQ6IkVudm9pZSBTT0wvVVNEQyB2aWEgUGhhbnRvbSB2ZXJzIGNldHRlIGFkcmVzc2UuIE5lIGNvbGxlIGphbWFpcyBkZSBjbMOpIHByaXbDqWUiLGNvcHk6IkNvcGllciIsY29waWVkOiJDb3Bpw6kiLHN0YXJ0OiJTdGFydCBXT0xWRVJJTkUiLHN0b3A6IlN0b3AiLGNvbm46IkNvbm5lY3RlciBQaGFudG9tIixkaXNjOiJEw6ljb25uZWN0ZXIifX07ZnVuY3Rpb24gdHIoayl7cmV0dXJuIChUWFQbTEFOR11bXV18fFRYVC5lbltrXXx8ayk7fWZ1bmN0aW9uIGFwcGx5TGFuZygpeyQoIiNzdWIiKS50ZXh0Q29udGVudD10cigic3ViIik7JCgiI3RDb250cm9sIikudGV4dENvbnRlbnQ9dHIoIkNvbnRyb2wiKTskKCIjdFdhbGxldCIpLnRleHRDb250ZW50PXRyKCJXYWxsZXQiKTskKCIjdFNvbCIpLnRleHRDb250ZW50PSJTT0wiOyQoIiN0VXNkYyIpLnRleHRDb250ZW50PSJVU0RDIjskKCIjdEN1c3QiKS50ZXh0Q29udGVudD10cigiQ3VzdCIpOyQoIiN0QnVkZ2V0IikudGV4dENvbnRlbnQ9dHIoIkJ1ZGdldCIpOyQoIiN0TW9kZSIpLnRleHRDb250ZW50PXRyKCJNb2RlIik7JCgiI3RDb25zb2xlIikudGV4dENvbnRlbnQ9dHIoIkNvbnNvbGUiKTskKCIjZGVwSGludCIpLnRleHRDb250ZW50PXRyKCJkZXBIaW50Iik7JCgiI2J0bkNvcHkiKS50ZXh0Q29udGVudD10cigiY29weSIpOyQoIiNidG5TdGFydCIpLnRleHRDb250ZW50PXRyKCJzdGFydCIpOyQoIiNidG5TdG9wIikudGV4dENvbnRlbnQ9dHIoInN0b3AiKTskKCIjYnRuQ29ubmVjdCIpLnRleHRDb250ZW50PXRyKCJjb25uIik7JCgiI2J0bkRpc2Nvbm5lY3QiKS50ZXh0Q29udGVudD10cigiZGlzYyIpOyQoIiNidG5MYW5nIikudGV4dENvbnRlbnQ9KExBTkc9PT0iZW4iPyJGUiI6IkVOIik7fSQoIiNidG5MYW5nIikub25jbGljaz0oKT0+e0xBTkc9KExBTkc9PT0iZW4iPyJmciI6ImVuIik7bG9jYWxTdG9yYWdlLnNldEl0ZW0oIndvbHZfbGFuZyIsTEFORyk7YXBwbHlMYW5nKCk7fTtmdW5jdGlvbiBsb2cocylyZXR1cm4gTE9HLnZhbHVlKz0ocysoIlxuIikpLGxvZy5zY3JvbGxUb3A9TE9HLnNjcm9sbEhlaWdodH0kKCIjZXAiKS50ZXh0Q29udGVudD1BUEk7YXN5bmMgZnVuY3Rpb24gamdldChwKXtjb25zdHI9YXdhaXQgZmV0Y2goQVBJK3Ase2NhY2hlOiJuby1zdG9yZSJ9KTtyZXR1cm4gYXdhaXQgcj5qc29uKCk7fWFzeW5jIGZ1bmN0aW9uIGpwb3N0KHAseyl7Y29uc3Qgcj1hd2FpdCBmZXRjaChBUEkrcCx7bWV0aG9kOiJQT1NUIixoZWFkZXJzOnsiY29udGVudC10eXBlIjoiYXBwbGljYXRpb24vanNvbiJ9LGJvZHk6SlNPTi5zdHJpbmdpZnkoZXx8e30pfSk7cmV0dXJuIGF3YWl0IHIuanNvbigpO30KZnVuY3Rpb24gc2V0QXBpKG9rKXskKCIjYXBpRG90IikuY2xhc3NOYW1lPSJkb3QgIisorKG9rPyJvayI6ImJhZCIpOyQoIiNhcGlUeHQiKS50ZXh0Q29udGVudD1vaz8iQVBJIE9LIjoiQVBJIERPV04iO30KYXN5bmMgZnVuY3Rpb24gbG9hZENvbmZpZygpe3RyeXtjb25zdCBjPW5hd2FpdCBqZ2V0KCIvY29uZmlnIik7JCgiI2RlcCIpLnZhbHVlPShjJiZjLmN1c3RvZGlhbF9wdWIpfHwiLSI7fWNhdGNoKGUpeyQoIiNkZXAiKS52YWx1ZT0iY29uZmlnIGVycm9yIjt9fQphc3luYyBmdW5jdGlvbiByZWZyZXNoKCl7dHJ5e2NvbnN0IHN0PWF3YWl0IGpnZXQoIi9zdGF0dXMiKTtzZXRBcGkodHJ1ZSk7Y29uc3Qgcz1zdCYmc3Quc3RhdGV8fHt9O0xPRy52YWx1ZSs9bmV3IERhdGUoKS50b0lTT1N0cmluZygpKyIgc3RhdHVzIHJ1bm5pbmc9IisorKHMucnVubmluZz8xOjApKyIgZWZmZWN0aXZlPSIrKHMuZWZmZWN0aXZlfHwiIikrIlxuIjsgTE9HLnNjcm9sbFRvcD1MT0cuc2Nyb2xsSGVpZ2h0O31jYXRjaChlKXtzZXRBcGkoZmFsc2UpO0xPRy52YWx1ZSs9bmV3IERhdGUoKS50b0lTT1N0cmluZygpKyIgQVBJIGVycm9yXG4iO0xPRy5zY3JvbGxUb3A9TE9HLnNjcm9sbEhlaWdodDt9fQokKCIjYnRuQ29weSIpLm9uY2xpY2s9YXN5bmMoKT0+e3RyeXthd2FpdCBuYXZpZ2F0b3IuY2xpcGJvYXJkLndyaXRlVGV4dCgkKCIjZGVwIikudmFsdWV8fCIiKTskKCIjYnRuQ29weSIpLnRleHRDb250ZW50PXRyKCJjb3BpZWQiKTtzZXRUaW1lb3V0KCgpPT4kKCIjYnRuQ29weSIpLnRleHRDb250ZW50PXRyKCJjb3B5IiksOTAwKTt9Y2F0Y2goZSl7fX07CiQoIiNidG5TdGFydCIpLm9uY2xpY2s9YXN5bmMoKT0+e2NvbnN0IGJ1ZGdldD1wYXJzZUZsb2F0KCQoIiNidWRnZXQiKS52YWx1ZXx8IjAiKXx8MDtjb25zdCBtb2RlPSQoIiNtb2RlIikudmFsdWV8fCJzYWZlIjtjb25zdCBvd25lcj0od2luZG93Ll9fUEhBTlRPTV9QVUJ8fCIiKTtjb25zdHI9YXdhaXQganBvc3QoIi9zdGFydCIse2J1ZGdldF91c2RjOmJ1ZGdldCxtb2RlLG93bmVyX3B1Yjpvd25lcn0pO0xPRy52YWx1ZSs9bmV3IERhdGUoKS50b0lTT1N0cmluZygpKyIgc3RhcnQgPT4gIitKU09OLnN0cmluZ2lmeShyKSsiXG4iO0xPRy5zY3JvbGxUb3A9TE9HLnNjcm9sbEhlaWdodDt9OwokKCIjYnRuU3RvcCIpLm9uY2xpY2s9YXN5bmMoKT0+e2NvbnN0IHI9YXdhaXQganBvc3QoIi9zdG9wIix7fSk7TE9HLnZhbHVlKz1uZXcgRGF0ZSgpLnRvSVNPU3RyaW5nKCkrIiBzdG9wID0+ICIrandTT04uc3RyaW5naWZ5KHIpKyJcbiI7TE9HLnNjcm9sbFRvcD1MT0cuc2Nyb2xsSGVpZ2h0O307CmFzeW5jIGZ1bmN0aW9uIHBoYW50b21Db25uZWN0KCl7Y29uc3QgcD13aW5kb3cuc29sYW5hO2lmKCFwfHwhcC5pc1BoYW50b20pe0xPRy52YWx1ZSs9IlBoYW50b20gbm90IGZvdW5kXG4iO3JldHVybjt9Y29uc3Qgcj1hd2FpdCBwLmNvbm5lY3QoKTt3aW5kb3cuX19QSEFOVE9NX1BVQj1yLnB1YmxpY0tleS50b1N0cmluZygpO0xPRy52YWx1ZSs9IlBoYW50b206ICIr d2luZG93Ll9fUEhBTlRPTV9QVUJrKyJcbiI7fQphc3luYyBmdW5jdGlvbiBwaGFudG9tRGlzY29ubmVjdCgpe2NvbnN0IHA9d2luZG93LnNvbGFuYTtpZihwJiZwLmRpc2Nvbm5lY3QpIGF3YWl0IHAuZGlzY29ubmVjdCgpO3dpbmRvdy5fX1BIQU5UT01fUFVCPSIiO0xPRy52YWx1ZSs9IkRpc2Nvbm5lY3RlZFxuIjt9CiQoIiNidG5Db25uZWN0Iikub25jbGljaz1waGFudG9tQ29ubmVjdDskKCIjYnRuRGlzY29ubmVjdCIpLm9uY2xpY2s9cGhhbnRvbURpc2Nvbm5lY3Q7YXBwbHlMYW5nKCk7bG9hZENvbmZpZygpO3JlZnJlc2goKTtzZXRJbnRlcnZhbChyZWZyZXNoLDIwMDApOzwvc2NyaXB0PjwvYm9keT48L2h0bWw+
+EOF_B64
+)"
+
+# write files
+askorupdate_file "$APPDIR/package.json" "WOLVERINE package.json" "$PKG_JSON"
+askorupdate_file "$APPDIR/server.js" "WOLVERINE server.js" "$SVR_JS"
+
+# write html safely
+chattr -i "$FRONTDIR/index.html" 2>/dev/null || true
+printf "%s" "$HTML_B64" | base64 -d >"$FRONTDIR/index.html"
+chmod 644 "$FRONTDIR/index.html" || true
+
+# deps
+cd "$APPDIR"
+npm i --omit=dev
+
+# systemd
+askorupdate_file "/etc/systemd/system/$SERVICE.service" "WOLVERINE systemd unit" "$UNIT"
 systemctl daemon-reload
-systemctl enable wolverine-api >/dev/null 2>&1 || true
-systemctl restart wolverine-api
+systemctl enable "$SERVICE" >/dev/null 2>&1 || true
+systemctl restart "$SERVICE"
 
-# ---------- FRONTEND (index.html) ----------
-HTML=$(cat <<'"'"'HTML'"'"'
-<!doctype html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>WOLVERINE • TraderOne</title><style>:root{--bg:#05070c;--p:#0b1222;--p2:#0a1020;--line:#203354;--t:#eaf2ff;--m:#9fb3d7;--ok:#68ffb0;--bad:#ff6b6b;--a:#47d7ff;--b:#9b7bff}*{box-sizing:border-box}html,body{margin:0;height:100%;background:radial-gradient(900px 520px at 18% 0%,#0b2a3a 0%,transparent 60%),radial-gradient(820px 520px at 82% 22%,#2a1346 0%,transparent 55%),linear-gradient(180deg,#05070c 0%,#05060b 60%,#04050a 100%);color:var(--t);font:14px system-ui}#top{position:sticky;top:0;z-index:9;background:linear-gradient(180deg,rgba(5,7,12,.92),rgba(5,7,12,.60));backdrop-filter:blur(10px);border-bottom:1px solid rgba(32,51,84,.55)}#bar{display:flex;gap:10px;align-items:center;justify-content:space-between;padding:12px 14px;max-width:1200px;margin:0 auto}#brand{display:flex;gap:10px;align-items:center}#dot{width:14px;height:14px;border-radius:4px;background:linear-gradient(135deg,var(--a),var(--b));box-shadow:0 0 18px rgba(71,215,255,.25)}#name{font-weight:800;letter-spacing:.8px}#sub{color:var(--m);font-size:12px}#r{display:flex;gap:8px;align-items:center}button,.btn{border:1px solid rgba(32,51,84,.9);background:linear-gradient(180deg,#0b1222,#070c18);color:var(--t);padding:10px 12px;border-radius:12px;cursor:pointer}button:hover{filter:brightness(1.08)}button:active{transform:translateY(1px)}input,select{width:100%;padding:10px 12px;border-radius:12px;border:1px solid rgba(32,51,84,.85);background:linear-gradient(180deg,#07101f,#060b16);color:var(--t);outline:none}input::placeholder{color:rgba(159,179,215,.7)}.pill{padding:6px 10px;border:1px solid rgba(32,51,84,.8);border-radius:999px;background:rgba(11,18,34,.65);color:var(--m);font-size:12px}.ok{color:var(--ok)}.bad{color:var(--bad)}#wrap{max-width:1200px;margin:0 auto;padding:16px}#grid{display:grid;grid-template-columns:360px 1fr;gap:14px}@media(max-width:980px){#grid{grid-template-columns:1fr}}.card{background:linear-gradient(180deg,rgba(11,18,34,.88),rgba(7,12,24,.72));border:1px solid rgba(32,51,84,.65);border-radius:18px;box-shadow:0 0 24px rgba(0,0,0,.25)}.hd{display:flex;align-items:center;justify-content:space-between;padding:14px 14px 10px;border-bottom:1px solid rgba(32,51,84,.45)}.ttl{font-weight:800}.bd{padding:14px}.row{display:flex;gap:10px}.row>*{flex:1}.lab{color:var(--m);font-size:12px;margin:10px 0 6px}.mini{font-size:12px;color:var(--m)}#log{height:320px;overflow:auto;white-space:pre-wrap;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;background:rgba(0,0,0,.20);border:1px solid rgba(32,51,84,.55);border-radius:14px;padding:10px}#log b{color:var(--a)}.kpi{display:flex;gap:8px;flex-wrap:wrap}.kpi .pill{background:rgba(0,0,0,.16)}</style></head><body><div id="top"><div id="bar"><div id="brand"><div id="dot"></div><div><div id="name">WOLVERINE</div><div id="sub">Phantom only • Jupiter via /wolverine/api/jup • Build 2026-01-02</div></div></div><div id="r"><span class="pill" id="apiPill">API: ...</span><button id="langBtn">EN</button></div></div></div><div id="wrap"><div id="grid"><div class="card"><div class="hd"><div class="ttl" id="tControl">Control</div><div class="pill" id="statePill">Ready</div></div><div class="bd"><div class="lab" id="tWallet">Wallet</div><div class="row"><button id="btnConnect">Connect</button><button id="btnDisconnect">Disconnect</button></div><div class="lab" id="tAddr">Address</div><input id="addr" placeholder="-" readonly/><div class="lab" id="tBalances">Balances</div><div class="row"><input id="sol" placeholder="SOL" readonly/><input id="usdc" placeholder="USDC" readonly/></div><div class="row" style="margin-top:10px"><button id="btnRefresh">Refresh</button><button id="btnConfig">Config</button></div><div class="lab" id="tBudget">Budget (USDC)</div><div class="row"><input id="budget" placeholder="Total budget (USDC)"/><button id="btnSave">Save</button></div><div class="lab" id="tMode">Mode</div><select id="mode"><option value="dca">DCA buy token (safe)</option><option value="manual">Manual only</option></select><div class="lab" id="tToken">Token mint</div><input id="mint" placeholder="SPL mint (outputMint)"/><div class="lab" id="tPerTrade">Per trade (USDC)</div><input id="perTrade" placeholder="ex: 5"/><div class="lab" id="tAuto">Autotrade</div><div class="row"><button id="btnStart">Start WOLVERINE</button><button id="btnStop">Stop</button></div><div class="mini" id="tSafety" style="margin-top:10px">Safety: never spends more than your budget. Each swap requires Phantom signature. No private keys stored.</div></div></div><div class="card"><div class="hd"><div class="ttl" id="tTrades">Trades</div><div class="kpi"><span class="pill" id="kSpent">Spent: 0</span><span class="pill" id="kLeft">Left: 0</span><span class="pill" id="kLoop">Loop: off</span></div></div><div class="bd"><div class="lab" id="tLog">Log</div><div id="log"></div></div></div></div></div><script>/* Buffer polyfill (lite) */(()=>{try{if(!globalThis.globalThis)globalThis.globalThis=globalThis;globalThis.global=globalThis;globalThis.process=globalThis.process||{env:{}};if(!globalThis.Buffer){const b=(s)=>Uint8Array.from(atob(s),c=>c.charCodeAt(0));globalThis.Buffer={from:(a,enc)=>{if(typeof a==="string"){if(enc==="base64")return b(a);return Uint8Array.from(a.split("").map(c=>c.charCodeAt(0)))}return Uint8Array.from(a)},isBuffer:()=>false};}}catch(e){}})();</script><script src="https://unpkg.com/@solana/web3.js@1.95.3/lib/index.iife.min.js"></script><script>(()=>{const $=s=>document.querySelector(s);const logEl=$("#log");const apiPill=$("#apiPill");const statePill=$("#statePill");const kSpent=$("#kSpent"),kLeft=$("#kLeft"),kLoop=$("#kLoop");const LS=(k,v)=>v===undefined?localStorage.getItem(k):localStorage.setItem(k,v);const LSG=(k,d)=>{try{const v=LS(k);return v?JSON.parse(v):d}catch(e){return d}};const LSS=(k,o)=>LS(k,JSON.stringify(o));const API="/wolverine/api";const JUP=API+"/jup";const RPC="https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac";const USDC="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1";let conn=new solanaWeb3.Connection(RPC,"confirmed");let pub=null;let loop=null;let running=false;let spent=Number(LS("w_spent")||"0")||0;let budget=Number(LS("w_budget")||"0")||0;let lang=LS("w_lang")||"en";const I18N={en:{Control:"Control",Wallet:"Wallet",Address:"Address",Balances:"Balances",Budget:"Budget (USDC)",Mode:"Mode",Token:"Token mint",PerTrade:"Per trade (USDC)",Autotrade:"Autotrade",Trades:"Trades",Log:"Log",Safety:"Safety: never spends more than your budget. Each swap requires Phantom signature. No private keys stored.",Ready:"Ready",Starting:"Starting...",Stopping:"Stopping...",Connected:"Connected",Disconnected:"Disconnected",ApiUp:"API UP",ApiDown:"API DOWN",Config:"Config loaded",NeedPhantom:"Phantom not found",NeedWallet:"Connect Phantom first",NeedMint:"Enter token mint",NeedBudget:"Set budget and per trade",BudgetExceeded:"Budget exceeded, stopping",Sign:"Phantom signature required",Sent:"Sent",Confirmed:"Confirmed",Fail:"Fail"},fr:{Control:"Contrôle",Wallet:"Wallet",Address:"Adresse",Balances:"Soldes",Budget:"Budget (USDC)",Mode:"Mode",Token:"Mint du token",PerTrade:"Par achat (USDC)",Autotrade:"Auto-trade",Trades:"Trades",Log:"Journal",Safety:"Sécurité: ne dépense jamais plus que ton budget. Chaque swap demande la signature Phantom. Aucune clé privée stockée.",Ready:"Prêt",Starting:"Démarrage...",Stopping:"Arrêt...",Connected:"Connecté",Disconnected:"Déconnecté",ApiUp:"API OK",ApiDown:"API HS",Config:"Config chargée",NeedPhantom:"Phantom introuvable",NeedWallet:"Connecte Phantom d\'abord",NeedMint:"Entre le mint du token",NeedBudget:"Définis budget et montant",BudgetExceeded:"Budget dépassé, arrêt",Sign:"Signature Phantom requise",Sent:"Envoyé",Confirmed:"Confirmé",Fail:"Erreur"}};function T(k){return (I18N[lang]&&I18N[lang][k])||I18N.en[k]||k}function paint(){ $("#tControl").textContent=T("Control");$("#tWallet").textContent=T("Wallet");$("#tAddr").textContent=T("Address");$("#tBalances").textContent=T("Balances");$("#tBudget").textContent=T("Budget");$("#tMode").textContent=T("Mode");$("#tToken").textContent=T("Token");$("#tPerTrade").textContent=T("PerTrade");$("#tAuto").textContent=T("Autotrade");$("#tTrades").textContent=T("Trades");$("#tLog").textContent=T("Log");$("#tSafety").textContent=T("Safety");statePill.textContent=T("Ready");$("#langBtn").textContent=(lang==="en"?"EN":"FR");}function L(m,ok){const ts=new Date().toISOString().replace("T"," ").replace("Z","");logEl.textContent+=`[${ts}] ${ok===false?"FAIL ":""}${m}\n`;logEl.scrollTop=1e9;}function setKPIs(){kSpent.textContent=`Spent: ${spent.toFixed(2)}`;kLeft.textContent=`Left: ${Math.max(0,budget-spent).toFixed(2)}`;kLoop.textContent=`Loop: ${running?"on":"off"}`;}async function apiPing(){try{const r=await fetch(API+"/ping",{cache:"no-store"});const t=await r.text();const ok=(r.ok&&String(t).includes("pong"));apiPill.textContent=ok?T("ApiUp"):T("ApiDown");apiPill.className="pill "+(ok?"ok":"bad");}catch(e){apiPill.textContent=T("ApiDown");apiPill.className="pill bad";}}async function loadConfig(){try{const r=await fetch(API+"/config",{cache:"no-store"});const j=await r.json();L(T("Config")+" "+JSON.stringify(j).slice(0,300));}catch(e){L(T("Fail")+" config");}}function phantom(){return window.solana&&window.solana.isPhantom?window.solana:null}async function connect(){const p=phantom();if(!p){L(T("NeedPhantom"),false);return;}const r=await p.connect();pub=r.publicKey.toString();$("#addr").value=pub;L(T("Connected")+": "+pub,true);await refresh();}async function disconnect(){const p=phantom();if(p&&p.disconnect)await p.disconnect().catch(()=>{});pub=null;$("#addr").value="-";$("#sol").value="";$("#usdc").value="";L(T("Disconnected"),true);}async function refresh(){if(!pub){L(T("NeedWallet"),false);return;}try{const pk=new solanaWeb3.PublicKey(pub);const lam=await conn.getBalance(pk,{commitment:"confirmed"});$("#sol").value=(lam/1e9).toFixed(6);let us=0;const accts=await conn.getParsedTokenAccountsByOwner(pk,{programId:new solanaWeb3.PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")});for(const a of accts.value){const info=a.account.data.parsed.info;if(info.mint===USDC){const amt=Number(info.tokenAmount.amount||"0")||0;us+=amt/1e6;}}$("#usdc").value=us.toFixed(2);}catch(e){L(T("Fail")+" balances",false);} }async function jupQuote(inputMint,outputMint,amount){const qs=new URLSearchParams({inputMint,outputMint,amount:String(amount),slippageBps:"200"});const r=await fetch(JUP+"/quote?"+qs.toString(),{cache:"no-store"});if(!r.ok)throw new Error("quote");return r.json();}async function jupSwap(quoteResponse,userPublicKey){const body={quoteResponse,userPublicKey,wrapAndUnwrapSol:true,useSharedAccounts:true,prioritizationFeeLamports:"auto"};const r=await fetch(JUP+"/swap",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});if(!r.ok)throw new Error("swap");return r.json();}function b64ToTx(b64){const bytes=Uint8Array.from(atob(b64),c=>c.charCodeAt(0));return solanaWeb3.Transaction.from(bytes);}async function doBuyUSDC(perUSDC,mint){if(!pub){L(T("NeedWallet"),false);return;}const p=phantom();if(!p){L(T("NeedPhantom"),false);return;}const left=budget-spent;if(perUSDC<=0||budget<=0){L(T("NeedBudget"),false);return;}if(left<perUSDC){L(T("BudgetExceeded"));stop();return;}L(`${T("Sign")} | quote ${perUSDC} USDC -> ${mint}`);const amount=Math.floor(perUSDC*1e6);const q=await jupQuote(USDC,mint,amount);const sw=await jupSwap(q,pub);if(!sw||!sw.swapTransaction)throw new Error("no_swap_tx");const tx=b64ToTx(sw.swapTransaction);const sig=await p.signAndSendTransaction(tx);L(`${T("Sent")}: ${sig.signature||sig}`);await conn.confirmTransaction(sig.signature||sig,"confirmed");spent+=perUSDC;LS("w_spent",String(spent));setKPIs();L(T("Confirmed"));}function start(){const mint=$("#mint").value.trim();const per=Number($("#perTrade").value||"0")||0;budget=Number($("#budget").value||"0")||0;LS("w_budget",String(budget));if(!mint){L(T("NeedMint"),false);return;}if(!pub){L(T("NeedWallet"),false);return;}running=true;statePill.textContent=T("Starting");setKPIs();L(`START mode=${$("#mode").value} budget=${budget} per=${per} mint=${mint}`);fetch(API+"/traderone/start",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({mode:$("#mode").value,budgetUSDC:budget,tokenMint:mint})}).catch(()=>{});if(loop)clearInterval(loop);loop=setInterval(async()=>{if(!running)return;try{if($("#mode").value==="manual")return;await doBuyUSDC(per,mint);}catch(e){L(T("Fail")+" trade",false);} },60000);doBuyUSDC(per,mint).catch(e=>L(T("Fail")+" trade",false));statePill.textContent="RUN";}function stop(){running=false;statePill.textContent=T("Stopping");if(loop)clearInterval(loop);loop=null;fetch(API+"/traderone/stop",{method:"POST"}).catch(()=>{});setTimeout(()=>{statePill.textContent=T("Ready");setKPIs();},300);}$("#btnConnect").onclick=connect;$("#btnDisconnect").onclick=disconnect;$("#btnRefresh").onclick=()=>refresh();$("#btnSave").onclick=()=>{budget=Number($("#budget").value||"0")||0;LS("w_budget",String(budget));L("Budget saved: "+budget);setKPIs();};$("#btnStart").onclick=start;$("#btnStop").onclick=stop;$("#btnConfig").onclick=loadConfig;$("#langBtn").onclick=()=>{lang=(lang==="en"?"fr":"en");LS("w_lang",lang);paint();};function init(){paint();$("#budget").value=String(budget||"");$("#perTrade").value=String(Number(LS("w_per")||"5")||5);$("#perTrade").addEventListener("change",()=>LS("w_per",String($("#perTrade").value||"")));setKPIs();apiPing();setInterval(apiPing,5000);}init();})();</script></body></html>
-HTML
-)
-askorupdate_file "$WEB_DIR/index.html" "WOLVERINE index.html" "$HTML"
-
-# ---------- NGINX SNIPPET + INCLUDE ----------
-SNIPTXT=$(cat <<EOF
-# WOLVERINE (auto) - frontend + API proxy
+# nginx: unlock -> write snippet -> ensure include -> test -> reload -> relock
+chattr -i "$SNIP" 2>/dev/null || true
+cat >"$SNIP" <<EOF
+# WOLVERINE (generated) fireinners.online/wolverine
+location = /wolverine { return 301 /wolverine/; }
 location ^~ /wolverine/api/ {
-  proxy_pass http://127.0.0.1:$PORT_DEFAULT/;
+  proxy_pass http://127.0.0.1:3050/;
   proxy_http_version 1.1;
   proxy_set_header Host \$host;
   proxy_set_header X-Real-IP \$remote_addr;
   proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
   proxy_set_header X-Forwarded-Proto \$scheme;
-  add_header Cache-Control "no-store";
 }
 location ^~ /wolverine/ {
-  alias $WEB_DIR/;
+  alias $FRONTDIR/;
   try_files \$uri \$uri/ /wolverine/index.html;
-  add_header Cache-Control "no-store";
 }
 EOF
-)
-askorupdate_file "$SNIP" "fireinners-wolverine nginx snippet" "$SNIPTXT"
 
-# insert include line once
-INC_LINE="include $SNIP;"
-if ! grep -qF "$INC_LINE" "$NG"; then
-  tmp="$(mktemp)"
-  awk -v inc="$INC_LINE" '"'"'{
-    print $0;
-    if($0 ~ /server_name[[:space:]].*fireinners\.online/ && !seen){ print "  " inc; seen=1; }
-  }'"'"' "$NG" >"$tmp"
-  if command -v chattr >/dev/null 2>&1; then chattr -i /etc/nginx/nginx.conf "$NG" 2>/dev/null || true; fi
-  cp -a "$NG" "$NG.bak.$(date +%s)" || true
-  cat "$tmp" >"$NG"
-  rm -f "$tmp"
+chattr -i "$NG" 2>/dev/null || true
+if ! grep -q "snippets/fireinners-wolverine.conf" "$NG"; then
+  awk -v ins="    include /etc/nginx/snippets/fireinners-wolverine.conf;" '
+    BEGIN{done=0}
+    {print}
+    !done && $0 ~ /^server[[:space:]]*\{/ {print ins; done=1}
+  ' "$NG" >"$NG.tmp" && mv "$NG.tmp" "$NG"
 fi
 
 nginx -t
 systemctl reload nginx
 
-if command -v chattr >/dev/null 2>&1; then chattr +i /etc/nginx/nginx.conf "$NG" 2>/dev/null || true; fi
+# relock (conforme à ta règle)
+chattr +i "$SNIP" 2>/dev/null || true
+chattr +i "$NG" 2>/dev/null || true
 
-say ""
 say "=== DONE ==="
-say "Test:"
-say "  curl -sS https://fireinners.online/wolverine/api/health"
-say "  curl -sS https://fireinners.online/wolverine/api/ping"
-say "  curl -sS https://fireinners.online/wolverine/api/config"
-say "Frontend:"
-say "  https://fireinners.online/wolverine/"
+say "Front :  https://fireinners.online/wolverine/"
+say "Ping  :  https://fireinners.online/wolverine/api/ping"
+say "Health:  https://fireinners.online/wolverine/api/health"
+say "Config:  https://fireinners.online/wolverine/api/config"
+say "Wallet:  https://fireinners.online/wolverine/api/wallet"
+say "Status:  https://fireinners.online/wolverine/api/status"
+say "Deposit address(pub): $(curl -fsS https://fireinners.online/wolverine/api/wallet | sed -n '"'"'s/.*"pub":"\([^"]*\)".*/\1/p'"'"' || true)"
+BASH
+chmod +x "$TMP"
+"$TMP"
 '
