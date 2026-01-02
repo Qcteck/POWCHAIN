@@ -1,5 +1,109 @@
-journalctl -u wolverine-tg-sentinel -n 80 --no-pager
+cat >/tmp/WOLVERINE_TG_MONITOR_INSTALL.sh <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
 
-bash -x /opt/fireinners/wolverine-telegram/sentinel.sh 2>&1 | tail -n 80
+DIR="/opt/fireinners/wolverine-telegram"
+ENVF="${DIR}/telegram.env"
+PING_URL="https://fireinners.online/wolverine/api/ping"
 
+say(){ printf "%s\n" "$*"; }
+need(){ command -v "$1" >/dev/null 2>&1 || { say "ERREUR: $1 manquant"; exit 1; }; }
 
+say "=== PRE-FLIGHT (read-only) ==="
+date -u; hostname; whoami
+need curl; need systemctl; need tee
+[ -d "$DIR" ] || { say "ERREUR: dossier absent $DIR"; exit 1; }
+[ -f "$ENVF" ] || { say "ERREUR: env absent $ENVF"; exit 1; }
+[ -x /usr/local/bin/wolv_send ] || say "WARN: /usr/local/bin/wolv_send absent (on utilisera curl direct)"
+say "DIR: $DIR"
+say "ENV: $ENVF"
+say "PING: $PING_URL"
+say "=============================="
+
+install -d -m 700 "$DIR"
+install -d -m 700 /var/lib/wolverine-tg-monitor
+
+cat >"${DIR}/tg_monitor.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+DIR="/opt/fireinners/wolverine-telegram"
+ENVF="${DIR}/telegram.env"
+PING_URL="https://fireinners.online/wolverine/api/ping"
+STATE="/var/lib/wolverine-tg-monitor/state"
+
+log(){ printf "%s %s\n" "$(date -u +%FT%TZ)" "$*"; }
+
+set -a
+# shellcheck disable=SC1090
+source "$ENVF"
+set +a
+
+TG="${TG_TOKEN:-${TG:-}}"
+CID="${TG_CHAT_ID:-${CID:-}}"
+[ -n "${TG:-}" ] || { log "ERR no TG_TOKEN in $ENVF"; exit 1; }
+[ -n "${CID:-}" ] || { log "ERR no TG_CHAT_ID in $ENVF"; exit 1; }
+
+RESP="$(curl -sS --max-time 8 "$PING_URL" 2>&1 || true)"
+if printf '%s' "$RESP" | grep -qi 'pong'; then
+  CUR="OK"
+else
+  CUR="ERR"
+fi
+
+LAST=""
+[ -f "$STATE" ] && LAST="$(cat "$STATE" 2>/dev/null || true)"
+
+if [ "$CUR" != "$LAST" ]; then
+  MSG="WOLVERINE MONITOR: ${CUR} (${PING_URL}) $(date -u +%FT%TZ) resp=$(printf '%s' "$RESP" | tr '\n' ' ' | head -c 140)"
+  if command -v wolv_send >/dev/null 2>&1; then
+    wolv_send "$MSG" >/dev/null 2>&1 || true
+  else
+    curl -sS --max-time 10 -X POST "https://api.telegram.org/bot${TG}/sendMessage" \
+      -d "chat_id=${CID}" -d "text=${MSG}" -d "disable_web_page_preview=true" >/dev/null 2>&1 || true
+  fi
+  log "STATE CHANGE $LAST -> $CUR (TG sent)"
+else
+  log "NO CHANGE ($CUR)"
+fi
+
+printf '%s' "$CUR" >"$STATE"
+EOF
+chmod 700 "${DIR}/tg_monitor.sh"
+
+cat >/etc/systemd/system/wolverine-tg-monitor.service <<'EOF'
+[Unit]
+Description=Wolverine TG Monitor (state-change notifier)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /opt/fireinners/wolverine-telegram/tg_monitor.sh
+User=root
+EOF
+
+cat >/etc/systemd/system/wolverine-tg-monitor.timer <<'EOF'
+[Unit]
+Description=Wolverine TG Monitor timer (every 1 min)
+
+[Timer]
+OnBootSec=20
+OnUnitActiveSec=60
+AccuracySec=10
+Unit=wolverine-tg-monitor.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now wolverine-tg-monitor.timer
+
+say "=== TEST RUN (envoi si changement d'etat) ==="
+systemctl start wolverine-tg-monitor.service || true
+journalctl -u wolverine-tg-monitor.service -n 20 --no-pager || true
+say "=== TIMER STATUS ==="
+systemctl status wolverine-tg-monitor.timer --no-pager -n 12 || true
+SH
+
+bash /tmp/WOLVERINE_TG_MONITOR_INSTALL.sh
