@@ -1,2 +1,109 @@
-nginx -T 2>/dev/null | nl -ba | sed -n '180,260p'
-grep -RIn --line-number "server_name .*fireinners\.online" /etc/nginx | head -n 50
+set -euo pipefail
+TS="$(date +%Y%m%d-%H%M%S)"
+DIST="/opt/fireinners/frontend-react/app/dist"
+EN="/etc/nginx/sites-enabled/fireinners.online-ssl"
+AV="/etc/nginx/sites-available/fireinners.online-ssl"
+SITE="$AV"
+if [ -L "$EN" ]; then SITE="$(readlink -f "$EN")"; fi
+[ -f "$SITE" ] || { echo "ERR: vhost introuvable: $SITE"; exit 1; }
+echo "VHOST: $SITE"
+
+echo "== UNLOCK (if immutable) =="
+chattr -i /etc/nginx/nginx.conf 2>/dev/null || true
+chattr -i "$SITE" 2>/dev/null || true
+
+echo "== BACKUP =="
+cp -a "$SITE" "$SITE.bak.$TS"
+
+echo "== ENSURE stats file exists in dist =="
+mkdir -p "$DIST/stats"
+cat >"$DIST/stats/index.json"<<JSON
+{"ok":true,"service":"wolfchain-ui","ts":"$(date -u +%FT%TZ)"}
+JSON
+chmod 755 "$DIST" "$DIST/stats" 2>/dev/null || true
+chmod 644 "$DIST/stats/index.json" 2>/dev/null || true
+
+echo "== PATCH nginx vhost (replace /ws block + add /stats) =="
+python3 - <<'PY'
+import re,sys,datetime,os
+site=os.environ.get("SITE_PATH")
+dist=os.environ.get("DIST_PATH")
+txt=open(site,"r",encoding="utf-8",errors="ignore").read()
+
+WS_BLOCK = r'''location /ws {
+  proxy_pass http://127.0.0.1:4001;
+  proxy_http_version 1.1;
+  proxy_set_header Upgrade $http_upgrade;
+  proxy_set_header Connection "upgrade";
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_read_timeout 86400;
+}'''
+
+STATS_BLOCK = r'''# forced static /stats (UI healthcheck)
+location = /stats { return 301 /stats/index.json; }
+location = /stats/index.json {
+  default_type application/json;
+  add_header Cache-Control "no-store" always;
+  alias /opt/fireinners/frontend-react/app/dist/stats/index.json;
+}'''
+
+def replace_location(txt, path, new_block):
+    # replace first occurrence of location <path> { ... } with balanced braces
+    m=re.search(r'location\s+%s\s*\{'%re.escape(path),txt)
+    if not m: return txt, False
+    i=m.start()
+    j=m.end()
+    depth=1
+    k=j
+    while k < len(txt) and depth>0:
+        if txt[k]=='{': depth+=1
+        elif txt[k]=='}': depth-=1
+        k+=1
+    return txt[:i]+new_block+txt[k:], True
+
+# 1) Fix/replace /ws block if exists
+txt,changed_ws=replace_location(txt,"/ws",WS_BLOCK)
+
+# 2) Ensure /stats/index.json block exists (insert into the same server that has fireinners.online)
+if "location = /stats/index.json" not in txt:
+    # insert before end of the first server block containing server_name fireinners.online
+    srv=re.search(r'server\s*\{',txt)
+    pos=0
+    inserted=False
+    while srv:
+        s=srv.start()
+        # find end of this server block (balanced)
+        i=srv.end()
+        depth=1
+        k=i
+        has_name=False
+        # quick scan inside server for server_name fireinners.online
+        end=None
+        while k < len(txt) and depth>0:
+            if txt[k]=='{': depth+=1
+            elif txt[k]=='}': depth-=1
+            k+=1
+        end=k
+        block=txt[s:end]
+        if re.search(r'\bserver_name\b[^;]*\bfireinners\.online\b',block):
+            has_name=True
+            # inject before last closing brace of that server
+            inject_at=end-1
+            txt=txt[:inject_at]+"\n"+STATS_BLOCK+"\n"+txt[inject_at:]
+            inserted=True
+            break
+        pos=end
+        srv=re.search(r'server\s*\{',txt[pos:])
+        if srv: srv=re.match(r'.*',txt[pos+srv.start():])  # dummy
+        # redo with absolute search from pos
+        srv=re.search(r'server\s*\{',txt[pos:])
+        if srv: srv=re.search(r'server\s*\{',txt[pos+srv.start():])
+    if not inserted:
+        # fallback: append at end (safe)
+        txt += "\n" + STATS_BLOCK + "\n"
+
+open(site,"w",encoding="utf-8").write(txt)
+print("PATCHED:", site, "ws_replaced:", changed_ws, "stats_added:", ("location = /stats/index.json" in txt))
+PY
+# export env for python
