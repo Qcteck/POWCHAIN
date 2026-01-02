@@ -1,7 +1,7 @@
-cat >/tmp/WOLVERINE_MEGA_FIX.sh <<'SH'
+cat >/tmp/WOLVERINE_NGX_PATCH.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
-echo "=== WOLVERINE MEGA FIX ==="
+echo "=== WOLVERINE NGINX PATCH ==="
 date;hostname;whoami;pwd
 
 ASK="/opt/fireinners/sentinel/lib/askorupdate.sh"
@@ -10,84 +10,75 @@ if [ -f "$ASK" ]; then
   source "$ASK"
 else
   askorupdate_file(){ local p="$1";mkdir -p "$(dirname "$p")";cp -a "$p" "$p.bak.$(date +%s)" 2>/dev/null||true;cat >"$p"; }
-  askorupdate_yesno(){ return 0; }
 fi
 
 VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
 NGX="/etc/nginx/nginx.conf"
-API_DIR="/opt/fireinners/wolverine-api"
-API_JS="$API_DIR/server.js"
-SVC="/etc/systemd/system/wolverine-api.service"
 
 echo "--- unlock nginx files (temp) ---"
 command -v chattr >/dev/null && { chattr -i "$NGX" "$VHOST" 2>/dev/null||true; }
 
-echo "--- write API ---"
-mkdir -p "$API_DIR"
-cat >/tmp/_wolv_api.js <<'JS'
-"use strict";const http=require("http");const {URL}=require("url");const HOST="127.0.0.1",PORT=3050;const j=(res,code,obj)=>{res.writeHead(code,{"content-type":"application/json; charset=utf-8","access-control-allow-origin":"*","cache-control":"no-store"});res.end(JSON.stringify(obj));};const t=(res,code,txt)=>{res.writeHead(code,{"content-type":"text/plain; charset=utf-8","access-control-allow-origin":"*","cache-control":"no-store"});res.end(txt);};http.createServer((req,res)=>{try{const u=new URL(req.url,"http://x");const p=u.pathname;if(req.method==="OPTIONS"){res.writeHead(204,{"access-control-allow-origin":"*","access-control-allow-methods":"GET,POST,OPTIONS","access-control-allow-headers":"*"});return res.end();}if(p==="/ping")return t(res,200,"pong");if(p==="/health")return j(res,200,{ok:true,uptime:process.uptime(),ts:Date.now()});if(p==="/")return t(res,200,"wolverine-api");return j(res,404,{ok:false,error:"not_found",path:p});}catch(e){return j(res,500,{ok:false,error:"exception"});}}).listen(PORT,HOST,()=>console.log("wolverine-api up http://"+HOST+":"+PORT));
-JS
-askorupdate_file "$API_JS" </tmp/_wolv_api.js
-rm -f /tmp/_wolv_api.js
-chown -R www-data:www-data "$API_DIR" 2>/dev/null||true
-chmod 0644 "$API_JS"
+echo "--- show current wolverine/api lines ---"
+grep -n "wolverine/api" "$VHOST" || true
 
-echo "--- write systemd unit ---"
-cat >/tmp/_wolv_svc <<'UNIT'
-[Unit]
-Description=Wolverine API (fireinners)
-After=network.target
+echo "--- rewrite vhost to ensure location inside matching server blocks ---"
+python3 - <<'PY'
+import re,sys,os
+p="/etc/nginx/sites-available/fireinners.online-ssl"
+txt=open(p,"r",encoding="utf-8",errors="ignore").read()
 
-[Service]
-Type=simple
-User=www-data
-WorkingDirectory=/opt/fireinners/wolverine-api
-ExecStart=/usr/bin/node /opt/fireinners/wolverine-api/server.js
-Restart=always
-RestartSec=2
-Environment=NODE_ENV=production
+loc = """  location /wolverine/api/ {
+    proxy_pass http://127.0.0.1:3050/;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  }
+"""
 
-[Install]
-WantedBy=multi-user.target
-UNIT
-askorupdate_file "$SVC" </tmp/_wolv_svc
-rm -f /tmp/_wolv_svc
-chmod 0644 "$SVC"
+def patch_server_blocks(s):
+    out=[]
+    i=0
+    while True:
+        m=re.search(r'(^\s*server\s*\{)',s[i:],re.M)
+        if not m:
+            out.append(s[i:]); break
+        start=i+m.start()
+        out.append(s[i:start])
+        j=start+m.end()-m.start()
+        depth=0
+        k=start
+        # find matching closing brace for this server block
+        for idx,ch in enumerate(s[start:]):
+            if ch=='{': depth+=1
+            elif ch=='}':
+                depth-=1
+                if depth==0:
+                    end=start+idx+1
+                    block=s[start:end]
+                    # only patch blocks that mention fireinners.online somewhere (server_name or cert paths etc.)
+                    if "fireinners.online" in block and "location /wolverine/api/" not in block:
+                        block=re.sub(r'\n(\s*}\s*)$','\n'+loc+r'\n\1',block,flags=re.S)
+                    out.append(block)
+                    i=end
+                    break
+        else:
+            out.append(s[start:]); break
+    return "".join(out)
 
-echo "--- start service ---"
-systemctl daemon-reload
-systemctl enable wolverine-api
-systemctl restart wolverine-api
-sleep 0.4
-ss -lntp 2>/dev/null | grep -E '(:3050\b)' || { echo "ERROR: :3050 not listening"; systemctl --no-pager status wolverine-api; exit 1; }
+new=patch_server_blocks(txt)
 
-echo "--- ensure nginx proxy /wolverine/api/ ---"
-if ! grep -q "location /wolverine/api/" "$VHOST"; then
-  # insert inside first server{} before its closing brace using brace depth
-  awk '
-  function ins(){print "  location /wolverine/api/ {";print "    proxy_pass http://127.0.0.1:3050/;";print "    proxy_http_version 1.1;";print "    proxy_set_header Host $host;";print "    proxy_set_header X-Real-IP $remote_addr;";print "    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;";print "  }";}
-  BEGIN{inS=0;d=0;done=0}
-  {
-    line=$0
-    if(!inS && line ~ /^[[:space:]]*server[[:space:]]*\{/){inS=1}
-    if(inS){
-      # count braces
-      for(i=1;i<=length(line);i++){
-        c=substr(line,i,1)
-        if(c=="{")d++
-        else if(c=="}")d--
-      }
-      if(!done && d==0 && line ~ /^[[:space:]]*\}[[:space:]]*$/){
-        ins();done=1
-      }
-    }
-    print line
-  }' "$VHOST" > /tmp/_vhost_new
-  askorupdate_file "$VHOST" </tmp/_vhost_new
-  rm -f /tmp/_vhost_new
-else
-  echo "nginx: location already exists"
-fi
+if new==txt:
+    # nothing changed; still ensure location exists at least once
+    if "location /wolverine/api/" not in new:
+        sys.stderr.write("ERROR: no matching server{} block found to patch (contains fireinners.online). Aborting.\n")
+        sys.exit(2)
+
+open("/tmp/_vhost_patched","w",encoding="utf-8").write(new)
+PY
+
+askorupdate_file "$VHOST" </tmp/_vhost_patched
+rm -f /tmp/_vhost_patched
 
 echo "--- nginx test + reload ---"
 nginx -t
@@ -96,9 +87,13 @@ systemctl reload nginx
 echo "--- re-lock nginx files ---"
 command -v chattr >/dev/null && { chattr +i "$NGX" "$VHOST" 2>/dev/null||true; }
 
-echo "--- tests ---"
-echo -n "local ping: "; curl -sS -m 3 http://127.0.0.1:3050/ping || true; echo
-echo -n "nginx ping: "; curl -sS -m 5 -H "Host: fireinners.online" http://127.0.0.1/wolverine/api/ping || true; echo
+echo "--- verify vhost contains location ---"
+grep -n "location /wolverine/api/" "$VHOST" || true
+
+echo "--- tests (HTTP + HTTPS) ---"
+echo -n "local: "; curl -sS -m 3 http://127.0.0.1:3050/ping || true; echo
+echo -n "http localhost hostheader: "; curl -sS -m 5 -H "Host: fireinners.online" http://127.0.0.1/wolverine/api/ping || true; echo
+echo -n "https domain: "; curl -k -sS -m 8 https://fireinners.online/wolverine/api/ping || true; echo
 echo "=== DONE ==="
 SH
-bash /tmp/WOLVERINE_MEGA_FIX.sh
+bash /tmp/WOLVERINE_NGX_PATCH.sh
