@@ -1,1 +1,402 @@
-bash -lc 'set -euo pipefail;echo "== WOLVERINE FLY ==";echo "date: $(date -u +%FT%TZ)";echo "host: $(hostname)";echo;echo "[nginx]";test -f /etc/nginx/sites-available/fireinners.online-ssl && echo "vhost OK" || echo "vhost MISSING";echo;echo "[dirs]";ls -ld /opt/fireinners/frontend-react/app/dist/wolverine 2>/dev/null || echo "frontend dir missing";ls -ld /opt/fireinners/wolverine-api 2>/dev/null || echo "api dir missing";echo;echo "[services]";systemctl is-active wolverine-api 2>/dev/null && echo "wolverine-api: active" || echo "wolverine-api: not active";echo;echo "[public]";curl -sS --max-time 8 https://fireinners.online/wolverine/api/health || true;echo;curl -sS --max-time 8 https://fireinners.online/wolverine/api/ping || true;echo;curl -sS --max-time 8 https://fireinners.online/wolverine/api/config || true;echo'
+bash -lc 'set -euo pipefail
+APPDIR="/opt/fireinners/wolverine-api"
+SERVICE="wolverine-api"
+PORT_DEFAULT="3050"
+ASKOR="/opt/fireinners/sentinel/lib/askorupdate.sh"
+say(){ printf "%s\n" "$*"; }
+
+if [ -f "$ASKOR" ]; then . "$ASKOR"; else
+  askorupdate_file(){ local p="$1" n="$2" c="$3"; [ -f "$p" ] && cp -a "$p" "$p.bak.$(date -u +%Y%m%dT%H%M%SZ)" || true; umask 077; cat >"$p" <<<"$c"; }
+  askorupdate_yesno(){ read -r -p "$1 (y/N) " a || true; case "${a,,}" in y|yes) return 0;; *) return 1;; esac; }
+fi
+
+say "== WOLVERINE API MEGA INSTALL =="
+mkdir -p "$APPDIR"
+cd "$APPDIR"
+
+# .env (template)
+if [ ! -f "$APPDIR/.env" ]; then
+  umask 077
+  cat >"$APPDIR/.env" <<EOF
+PORT=$PORT_DEFAULT
+RPC_URL=https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac
+RPC_FALLBACKS=https://api.mainnet-beta.solana.com,https://rpc.ankr.com/solana
+USDC_MINT=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1
+JUP_PROXY_BASE=https://bbtrader-jup.paycashnostory.workers.dev
+PING_URL=https://bbbotrader.paycashnostory.workers.dev/ping
+STATE_FILE=/var/lib/wolverine-api/state.json
+KEYPAIR_PATH=/var/lib/wolverine-api/custody.json
+ALLOW_ORIGIN=*
+EOF
+  say "OK: .env créé"
+else
+  say "OK: .env existe"
+fi
+
+# state dir + keypair dir
+STATE_FILE="$(grep -E "^STATE_FILE=" "$APPDIR/.env"|cut -d= -f2- || true)"
+KEYPAIR_PATH="$(grep -E "^KEYPAIR_PATH=" "$APPDIR/.env"|cut -d= -f2- || true)"
+STATE_DIR="$(dirname "${STATE_FILE:-/var/lib/wolverine-api/state.json}")"
+KEY_DIR="$(dirname "${KEYPAIR_PATH:-/var/lib/wolverine-api/custody.json}")"
+mkdir -p "$STATE_DIR" "$KEY_DIR"
+chmod 700 "$STATE_DIR" "$KEY_DIR"
+
+# generate custody keypair if absent
+if [ ! -f "${KEYPAIR_PATH:-/var/lib/wolverine-api/custody.json}" ]; then
+  node - <<'NODE'
+const fs=require("fs");
+const path=process.env.KEYPAIR_PATH||"/var/lib/wolverine-api/custody.json";
+const {Keypair}=require("@solana/web3.js");
+const kp=Keypair.generate();
+fs.mkdirSync(require("path").dirname(path),{recursive:true});
+fs.writeFileSync(path,JSON.stringify(Array.from(kp.secretKey)),"\n",{mode:0o600});
+console.log("CUSTODY_PUBKEY="+kp.publicKey.toBase58());
+NODE
+  chmod 600 "${KEYPAIR_PATH:-/var/lib/wolverine-api/custody.json}"
+  say "OK: keypair custody générée (voir ligne CUSTODY_PUBKEY ci-dessus)"
+else
+  say "OK: keypair custody existe"
+fi
+
+# package.json
+PKG="$(cat <<'JSON'
+{"name":"wolverine-api","version":"1.0.0","private":true,"type":"commonjs","main":"server.js","scripts":{"start":"node server.js"},"dependencies":{"@solana/web3.js":"^1.95.4","bs58":"^5.0.0","dotenv":"^16.4.5","express":"^4.19.2"}}
+JSON
+)"
+askorupdate_file "$APPDIR/package.json" "package.json" "$PKG"
+
+# server.js
+SVR="$(cat <<'JS'
+"use strict";
+require("dotenv").config();
+const fs=require("fs");
+const path=require("path");
+const express=require("express");
+const bs58=require("bs58");
+const {Connection,PublicKey,Keypair,Transaction,VersionedTransaction}=require("@solana/web3.js");
+
+const PORT=+(process.env.PORT||3050);
+const RPC_URL=process.env.RPC_URL||"https://api.mainnet-beta.solana.com";
+const RPC_FALLBACKS=(process.env.RPC_FALLBACKS||"").split(",").map(s=>s.trim()).filter(Boolean);
+const USDC_MINT=process.env.USDC_MINT||"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1";
+const JUP_PROXY_BASE=(process.env.JUP_PROXY_BASE||"").replace(/\/$/,"");
+const PING_URL=process.env.PING_URL||"";
+const STATE_FILE=process.env.STATE_FILE||"/var/lib/wolverine-api/state.json";
+const KEYPAIR_PATH=process.env.KEYPAIR_PATH||"/var/lib/wolverine-api/custody.json";
+const ALLOW_ORIGIN=process.env.ALLOW_ORIGIN||"*";
+
+const app=express();
+app.use(express.json({limit:"1mb"}));
+app.use((req,res,next)=>{res.setHeader("Access-Control-Allow-Origin",ALLOW_ORIGIN);res.setHeader("Access-Control-Allow-Methods","GET,POST,OPTIONS");res.setHeader("Access-Control-Allow-Headers","content-type");if(req.method==="OPTIONS")return res.status(204).end();next();});
+
+const ENDPOINTS=[RPC_URL,...RPC_FALLBACKS].filter(Boolean);
+let ep_i=0;
+const conn=()=>new Connection(ENDPOINTS[ep_i%ENDPOINTS.length],{commitment:"confirmed"});
+async function withConn(fn){
+  let lastErr=null;
+  for(let k=0;k<Math.min(ENDPOINTS.length,3);k++){
+    const c=conn();
+    try{return await fn(c);}catch(e){lastErr=e;ep_i++; }
+  }
+  throw lastErr||new Error("rpc_failed");
+}
+
+function loadKeypair(){
+  const raw=fs.readFileSync(KEYPAIR_PATH,"utf8").trim();
+  let arr=null;
+  try{arr=JSON.parse(raw);}catch{
+    try{arr=Array.from(bs58.decode(raw));}catch(e){throw new Error("bad_keypair_format");}
+  }
+  if(!Array.isArray(arr)) throw new Error("bad_keypair_json");
+  const sk=Uint8Array.from(arr);
+  return Keypair.fromSecretKey(sk);
+}
+let CUSTODY_KP=null;
+let CUSTODY_PUB=null;
+function ensureKP(){ if(!CUSTODY_KP){ CUSTODY_KP=loadKeypair(); CUSTODY_PUB=CUSTODY_KP.publicKey.toBase58(); } }
+
+function safeReadJSON(p,def){ try{ return JSON.parse(fs.readFileSync(p,"utf8")); }catch{ return def; } }
+function safeWriteJSON(p,obj){
+  fs.mkdirSync(path.dirname(p),{recursive:true});
+  const tmp=p+".tmp."+Date.now();
+  fs.writeFileSync(tmp,JSON.stringify(obj,null,2),{mode:0o600});
+  fs.renameSync(tmp,p);
+}
+const STATE_DEFAULT={running:false,mode:"safe_dca",budget_usdc:0,spent_usdc:0,mint:"",last:{},createdAt:Date.now()};
+let STATE=safeReadJSON(STATE_FILE,STATE_DEFAULT);
+
+function now(){ return Date.now(); }
+function ok(res,obj){ res.json({ok:true,...obj}); }
+function bad(res,msg,extra){ res.status(400).json({ok:false,error:String(msg||"bad_request"),...extra}); }
+
+async function solBalance(pub){
+  return withConn(async c=>{
+    const lam=await c.getBalance(new PublicKey(pub));
+    return lam/1e9;
+  });
+}
+async function usdcBalance(pub){
+  return withConn(async c=>{
+    const owner=new PublicKey(pub);
+    const mint=new PublicKey(USDC_MINT);
+    const accts=await c.getParsedTokenAccountsByOwner(owner,{mint});
+    let sum=0;
+    for(const it of accts.value){
+      const ui=it.account.data.parsed.info.tokenAmount.uiAmount;
+      if(typeof ui==="number") sum+=ui;
+    }
+    return sum;
+  });
+}
+
+async function custodyBalances(){
+  ensureKP();
+  const sol=await solBalance(CUSTODY_PUB);
+  const usdc=await usdcBalance(CUSTODY_PUB);
+  return {sol,usdc};
+}
+
+async function jupQuote({inputMint,outputMint,amount,slippageBps=75}){
+  if(!JUP_PROXY_BASE) throw new Error("JUP_PROXY_BASE_missing");
+  const u=new URL(JUP_PROXY_BASE+"/v6/quote");
+  u.searchParams.set("inputMint",inputMint);
+  u.searchParams.set("outputMint",outputMint);
+  u.searchParams.set("amount",String(amount));
+  u.searchParams.set("slippageBps",String(slippageBps));
+  u.searchParams.set("onlyDirectRoutes","false");
+  const r=await fetch(u.toString(),{method:"GET"});
+  const j=await r.json().catch(()=>null);
+  if(!j) throw new Error("quote_bad_json");
+  if(j.error) throw new Error("quote_"+j.error);
+  return j;
+}
+
+async function jupSwap({quoteResponse}){
+  ensureKP();
+  if(!JUP_PROXY_BASE) throw new Error("JUP_PROXY_BASE_missing");
+  const body={
+    quoteResponse,
+    userPublicKey:CUSTODY_PUB,
+    wrapAndUnwrapSol:true,
+    useSharedAccounts:true,
+    prioritizationFeeLamports:"auto"
+  };
+  const r=await fetch(JUP_PROXY_BASE+"/v6/swap",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});
+  const j=await r.json().catch(()=>null);
+  if(!j) throw new Error("swap_bad_json");
+  if(j.error) throw new Error("swap_"+j.error);
+  if(!j.swapTransaction) throw new Error("swap_missing_tx");
+  return j.swapTransaction;
+}
+
+async function sendSwapTx(b64){
+  ensureKP();
+  const raw=Buffer.from(b64,"base64");
+  let sig=null;
+  // v0
+  try{
+    const vtx=VersionedTransaction.deserialize(raw);
+    vtx.sign([CUSTODY_KP]);
+    sig=await withConn(async c=>c.sendRawTransaction(vtx.serialize(),{skipPreflight:false,maxRetries:3}));
+    await withConn(async c=>c.confirmTransaction(sig,"confirmed"));
+    return sig;
+  }catch(e1){
+    // legacy
+    try{
+      const tx=Transaction.from(raw);
+      tx.partialSign(CUSTODY_KP);
+      sig=await withConn(async c=>c.sendRawTransaction(tx.serialize(),{skipPreflight:false,maxRetries:3}));
+      await withConn(async c=>c.confirmTransaction(sig,"confirmed"));
+      return sig;
+    }catch(e2){
+      throw e1;
+    }
+  }
+}
+
+async function doSwapUSDCtoMint(outMint,usdcUi){
+  const usdcDecimals=6;
+  const amount=Math.floor(usdcUi*Math.pow(10,usdcDecimals));
+  const q=await jupQuote({inputMint:USDC_MINT,outputMint:outMint,amount,slippageBps:75});
+  const best=(q.data&&q.data[0])?q.data[0]:null;
+  if(!best) throw new Error("quote_no_route");
+  const b64=await jupSwap({quoteResponse:best});
+  const sig=await sendSwapTx(b64);
+  return {sig,route:best};
+}
+
+async function pingURL(){
+  if(!PING_URL) return {ok:false,reason:"PING_URL_missing"};
+  const r=await fetch(PING_URL,{method:"GET"});
+  const t=await r.text();
+  return {ok:(t||"").toLowerCase().includes("pong"),text:(t||"").slice(0,200)};
+}
+
+/* ===== API ===== */
+app.get("/health",(req,res)=>ok(res,{uptime:process.uptime(),ts:now()}));
+app.get("/ping",(req,res)=>res.type("text/plain").send("pong"));
+app.get("/config",(req,res)=>{
+  ensureKP();
+  ok(res,{
+    api:"wolverine-api",
+    port:PORT,
+    rpc:ENDPOINTS[ep_i%ENDPOINTS.length],
+    custodyPubkey:CUSTODY_PUB,
+    usdcMint:USDC_MINT,
+    jupProxyBase:JUP_PROXY_BASE||null,
+    pingUrl:PING_URL||null
+  });
+});
+app.get("/status",async(req,res)=>{
+  try{
+    ensureKP();
+    const bal=await custodyBalances().catch(()=>({sol:null,usdc:null}));
+    ok(res,{
+      running:!!STATE.running,
+      mode:STATE.mode,
+      budget_usdc:STATE.budget_usdc,
+      spent_usdc:STATE.spent_usdc,
+      remaining_usdc:Math.max(0,(STATE.budget_usdc||0)-(STATE.spent_usdc||0)),
+      mint:STATE.mint||"",
+      custodyPubkey:CUSTODY_PUB,
+      custody:bal,
+      last:STATE.last||{}
+    });
+  }catch(e){ bad(res,e.message||e); }
+});
+
+app.post("/phantomBalances",async(req,res)=>{
+  try{
+    const pub=String((req.body&&req.body.pub)||"").trim();
+    if(!pub) return bad(res,"missing_pub");
+    const sol=await solBalance(pub);
+    const usdc=await usdcBalance(pub);
+    ok(res,{pub,sol,usdc});
+  }catch(e){ bad(res,e.message||e); }
+});
+
+app.post("/start",async(req,res)=>{
+  try{
+    ensureKP();
+    const budget=+((req.body&&req.body.budget)||0);
+    const mode=String((req.body&&req.body.mode)||"safe_dca");
+    const mint=String((req.body&&req.body.mint)||"").trim();
+    if(!(budget>0)) return bad(res,"budget_invalid");
+    if(!["safe_dca","microcap_radar","manual_token"].includes(mode)) return bad(res,"mode_invalid");
+    if(mode==="manual_token" && !mint) return bad(res,"mint_required");
+    STATE.running=true;
+    STATE.mode=mode;
+    STATE.budget_usdc=budget;
+    STATE.spent_usdc=STATE.spent_usdc||0;
+    STATE.mint=mint;
+    STATE.last={event:"started",ts:now()};
+    safeWriteJSON(STATE_FILE,STATE);
+    ok(res,{note:"started",custodyPubkey:CUSTODY_PUB});
+  }catch(e){ bad(res,e.message||e); }
+});
+
+app.post("/stop",(req,res)=>{
+  STATE.running=false;
+  STATE.last={event:"stopped",ts:now()};
+  safeWriteJSON(STATE_FILE,STATE);
+  ok(res,{note:"stopped"});
+});
+
+/* ===== Trade loop (custodial) ===== */
+let LOOP=null;
+async function tick(){
+  if(!STATE.running) return;
+  try{
+    const remaining=Math.max(0,(STATE.budget_usdc||0)-(STATE.spent_usdc||0));
+    if(remaining<=0){
+      STATE.running=false;
+      STATE.last={event:"budget_done",ts:now()};
+      safeWriteJSON(STATE_FILE,STATE);
+      return;
+    }
+    // chunk: 10% budget, min 1 USDC, max remaining
+    const chunk=Math.max(1,Math.min(remaining,Math.max(1, (STATE.budget_usdc||0)*0.10 )));
+    let outMint=null;
+    if(STATE.mode==="safe_dca"){ outMint="So11111111111111111111111111111111111111112"; } // SOL (wrapped SOL mint)
+    else if(STATE.mode==="manual_token"){ outMint=STATE.mint; }
+    else { // microcap_radar placeholder
+      outMint="So11111111111111111111111111111111111111112";
+    }
+    const before=await custodyBalances().catch(()=>({sol:null,usdc:null}));
+    const sw=await doSwapUSDCtoMint(outMint,chunk);
+    STATE.spent_usdc=(STATE.spent_usdc||0)+chunk;
+    const after=await custodyBalances().catch(()=>({sol:null,usdc:null}));
+    STATE.last={event:"swap",ts:now(),chunk_usdc:chunk,outMint,sig:sw.sig,before,after};
+    safeWriteJSON(STATE_FILE,STATE);
+  }catch(e){
+    STATE.last={event:"error",ts:now(),error:(e&&e.message)?e.message:String(e)};
+    safeWriteJSON(STATE_FILE,STATE);
+  }
+}
+function startLoop(){
+  if(LOOP) return;
+  LOOP=setInterval(()=>{tick().catch(()=>{});},20000); // 20s
+}
+startLoop();
+
+/* ===== 404 ===== */
+app.use((req,res)=>res.status(404).json({ok:false,error:"not_found",path:req.path}));
+
+app.listen(PORT,"127.0.0.1",()=>{ensureKP(); console.log("wolverine-api listening on 127.0.0.1:"+PORT,"custodyPubkey="+CUSTODY_PUB);});
+JS
+)"
+askorupdate_file "$APPDIR/server.js" "server.js" "$SVR"
+
+# npm install
+if [ ! -d "$APPDIR/node_modules" ]; then
+  say "npm install..."
+  npm install --silent
+else
+  say "node_modules existe"
+fi
+
+# systemd service
+SVC_UNIT="$(cat <<EOF
+[Unit]
+Description=Wolverine API (TraderOne custodial)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=$APPDIR
+EnvironmentFile=$APPDIR/.env
+ExecStart=/usr/bin/node $APPDIR/server.js
+Restart=always
+RestartSec=2
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+)"
+askorupdate_file "/etc/systemd/system/$SERVICE.service" "$SERVICE.service" "$SVC_UNIT"
+
+systemctl daemon-reload
+systemctl enable --now "$SERVICE.service" >/dev/null
+systemctl restart "$SERVICE.service" >/dev/null
+
+sleep 0.3
+say "== TEST LOCAL =="
+curl -sS http://127.0.0.1:3050/health || true
+curl -sS http://127.0.0.1:3050/config || true
+
+say "== TEST PUBLIC (nginx) =="
+curl -sS https://fireinners.online/wolverine/api/health || true
+curl -sS https://fireinners.online/wolverine/api/config || true
+
+say "== CUSTODY ADDRESS =="
+node - <<NODE
+const fs=require("fs");const {Keypair}=require("@solana/web3.js");
+const p=process.env.KEYPAIR_PATH||"$KEYPAIR_PATH";
+const a=JSON.parse(fs.readFileSync(p,"utf8"));const kp=Keypair.fromSecretKey(Uint8Array.from(a));
+console.log(kp.publicKey.toBase58());
+NODE
+
+say "DONE."
+'
