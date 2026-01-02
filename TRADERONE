@@ -1,18 +1,22 @@
-cat >/tmp/WOLVERINE_TRADERONE_INJECT.sh <<'SH'
+cat >/tmp/WOLVERINE_TRADERONE_BACKEND_PROXY.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 
 ASKLIB="/opt/fireinners/sentinel/lib/askorupdate.sh"
 if [ -f "$ASKLIB" ]; then . "$ASKLIB"; else
-  askorupdate_file(){ local p="$1"; local content="$2"; mkdir -p "$(dirname "$p")"; printf "%s" "$content" >"$p"; }
   askorupdate_yesno(){ local q="$1"; read -r -p "$q (y/N) " a || true; case "${a,,}" in y|yes) return 0;; *) return 1;; esac; }
+  askorupdate_file(){ local p="$1" c="$2"; mkdir -p "$(dirname "$p")"; printf "%s" "$c" >"$p"; }
 fi
 say(){ printf "%s\n" "$*"; }
 need(){ command -v "$1" >/dev/null 2>&1 || { say "ERREUR: commande manquante: $1"; exit 1; }; }
 
 NGX_SITE="/etc/nginx/sites-available/fireinners.online-ssl"
-DEFAULT_WOLV="/opt/fireinners/frontend-react/app/dist/wolverine"
 TR_DIR="/opt/traderone-opt"
+OUT_WOLV_DEFAULT="/opt/fireinners/frontend-react/app/dist/wolverine"
+PORT_DEFAULT="8585"
+UNIT="traderone.service"
+SNIP="/etc/nginx/snippets/wolverine_traderone_backend.conf"
+MARK="TRADERONE_WOLV_PROXY_V1"
 
 pick_wolverine_outdir(){
   local out=""
@@ -24,85 +28,147 @@ pick_wolverine_outdir(){
       inloc && $0 ~ /}/ {inloc=0}
     ' "$NGX_SITE" 2>/dev/null || true)"
   fi
-  [ -n "${out:-}" ] || out="$DEFAULT_WOLV"
+  [ -n "${out:-}" ] || out="$OUT_WOLV_DEFAULT"
   printf "%s" "$out"
 }
 
-pick_traderone_front(){
-  local c
-  for c in \
-    "$TR_DIR" \
-    "$TR_DIR/dist" \
-    "$TR_DIR/public" \
-    "$TR_DIR/frontend/dist" \
-    "$TR_DIR/frontend/build" \
-    "$TR_DIR/app/dist" \
-    "$TR_DIR/www" \
-    "$TR_DIR/site" \
-    ; do
-    if [ -f "$c/index.html" ]; then printf "%s" "$c"; return 0; fi
-  done
-  local f
-  f="$(find "$TR_DIR" -maxdepth 4 -type f -name index.html 2>/dev/null | head -n 1 || true)"
-  [ -n "${f:-}" ] || return 1
-  dirname "$f"
+detect_port(){
+  local p=""
+  if [ -f "$TR_DIR/.env" ]; then
+    p="$(grep -E '^(PORT|HTTP_PORT)=' "$TR_DIR/.env" | tail -n1 | cut -d= -f2 | tr -d '\r' | tr -cd '0-9' || true)"
+  fi
+  if [ -z "${p:-}" ]; then
+    p="$(grep -R --line-number -E 'listen\(|app\.listen\(|server\.listen\(|PORT\s*[:=]' "$TR_DIR" 2>/dev/null | head -n 1 | sed -E 's/.*[^0-9]([0-9]{2,5}).*/\1/' || true)"
+  fi
+  if [ -z "${p:-}" ] || [ "${#p}" -lt 2 ]; then p="$PORT_DEFAULT"; fi
+  printf "%s" "$p"
+}
+
+detect_entry(){
+  local e=""
+  if [ -f "$TR_DIR/server.js" ]; then e="server.js"; fi
+  if [ -z "${e:-}" ] && [ -f "$TR_DIR/index.js" ]; then e="index.js"; fi
+  if [ -z "${e:-}" ] && [ -f "$TR_DIR/app.js" ]; then e="app.js"; fi
+  if [ -z "${e:-}" ] && [ -f "$TR_DIR/main.js" ]; then e="main.js"; fi
+  if [ -z "${e:-}" ] && [ -f "$TR_DIR/package.json" ]; then
+    e="$(node -e 'try{const p=require(process.argv[1]);if(p.main)process.stdout.write(p.main);}catch(e){}' "$TR_DIR/package.json" 2>/dev/null || true)"
+  fi
+  [ -n "${e:-}" ] || { echo ""; return 1; }
+  [ -f "$TR_DIR/$e" ] || { echo ""; return 1; }
+  printf "%s" "$e"
 }
 
 say "=== BATCH FLY (read-only) ==="
 say "whoami: $(whoami)  host: $(hostname)  date: $(date -u +%FT%TZ)"
-need nginx; need curl; need rsync; need awk; need sed; need grep
+need nginx; need awk; need sed; need grep; need curl; need systemctl
+need node
+
+[ -d "$TR_DIR" ] || { say "ERREUR: dossier TraderOne absent: $TR_DIR"; exit 1; }
+[ -f "$NGX_SITE" ] || { say "ERREUR: nginx site absent: $NGX_SITE"; exit 1; }
 
 OUTDIR="$(pick_wolverine_outdir)"
 say "Wolverine OUTDIR: $OUTDIR"
+[ -d "$OUTDIR" ] || { say "WARN: OUTDIR n'existe pas encore (sera créé si besoin): $OUTDIR"; }
 
-[ -d "$TR_DIR" ] || { say "ERREUR: TraderOne introuvable: $TR_DIR"; exit 1; }
-TR_FRONT="$(pick_traderone_front || true)"
-[ -n "${TR_FRONT:-}" ] || { say "ERREUR: frontend TraderOne (index.html) introuvable dans $TR_DIR"; exit 1; }
-say "TraderOne FRONT: $TR_FRONT"
+PORT="$(detect_port)"
+ENTRY="$(detect_entry || true)"
+[ -n "${ENTRY:-}" ] || { say "ERREUR: impossible de détecter l'entry backend (server.js/app.js/index.js/main.js) dans $TR_DIR"; exit 1; }
+say "TraderOne backend entry: $TR_DIR/$ENTRY"
+say "TraderOne backend PORT (choisi/détecté): $PORT"
 
-IDX="$OUTDIR/index.html"
-[ -f "$IDX" ] || { say "ERREUR: index introuvable: $IDX"; exit 1; }
+EXIST_UNIT="no"
+systemctl cat "$UNIT" >/dev/null 2>&1 && EXIST_UNIT="yes"
+say "systemd unit $UNIT: $EXIST_UNIT"
 
-say "Ping Wolverine:"
-curl -ksS --max-time 5 "https://fireinners.online/wolverine/api/ping" | head -c 120 || true
-echo
+say "Nginx marker présent? $(grep -q "$MARK" "$NGX_SITE" && echo yes || echo no)"
 
 say "Ce script va:"
-say "- copier TraderOne => $OUTDIR/traderone/ (rsync --delete)"
-say "- injecter un bouton TraderOne + modal iframe dans $IDX (sans casser ton UI)"
-say "- reload nginx (après nginx -t)"
+say "- créer/mettre à jour $UNIT (backend TraderOne en localhost:$PORT)"
+say "- créer/mettre à jour snippet nginx: $SNIP"
+say "- patcher $NGX_SITE pour inclure le snippet (si absent)"
+say "- nginx -t + reload + systemd restart TraderOne"
 if ! askorupdate_yesno "Continuer ?"; then say "Stop."; exit 0; fi
 
 say "=== MEGA BATCH (apply) ==="
-mkdir -p "$OUTDIR/traderone"
-rsync -a --delete "$TR_FRONT/." "$OUTDIR/traderone/."
 
-# Injection (idempotent)
-MARK="WOLV_TRADERONE_INJECT_V1"
-if grep -q "$MARK" "$IDX"; then
-  say "Inject déjà présent: OK"
-else
-  cp -a "$IDX" "$IDX.bak.$(date +%s)"
-  INJ='<!-- WOLV_TRADERONE_INJECT_V1 --><style id="wolv_traderone_css">#wolvTO_btn{position:fixed;right:14px;bottom:14px;z-index:99999;border:1px solid rgba(255,255,255,.18);background:rgba(10,18,34,.88);color:#e7f0ff;padding:10px 12px;border-radius:14px;cursor:pointer;font:14px system-ui;backdrop-filter:blur(10px);box-shadow:0 12px 30px rgba(0,0,0,.35)}#wolvTO_btn:hover{filter:brightness(1.08)}#wolvTO_modal{display:none;position:fixed;inset:0;z-index:99998;background:rgba(0,0,0,.72);backdrop-filter:blur(8px)}#wolvTO_card{position:absolute;inset:16px;border-radius:16px;overflow:hidden;border:1px solid rgba(255,255,255,.15);background:#05060b;box-shadow:0 18px 70px rgba(0,0,0,.6)}#wolvTO_ifr{width:100%;height:100%;border:0;background:#05060b}#wolvTO_bar{position:absolute;left:12px;top:12px;right:12px;display:flex;gap:8px;justify-content:flex-end;z-index:2}#wolvTO_bar button{border:1px solid rgba(255,255,255,.18);background:rgba(10,18,34,.88);color:#e7f0ff;padding:8px 10px;border-radius:12px;cursor:pointer;font:13px system-ui}#wolvTO_bar button:hover{filter:brightness(1.08)}</style><div id="wolvTO_modal"><div id="wolvTO_card"><div id="wolvTO_bar"><button id="wolvTO_open">Ouvrir</button><button id="wolvTO_close">Fermer</button></div><iframe id="wolvTO_ifr" src="/wolverine/traderone/"></iframe></div></div><button id="wolvTO_btn">TraderOne</button><script id="wolv_traderone_js">(()=>{const M=document.getElementById("wolvTO_modal"),B=document.getElementById("wolvTO_btn"),C=document.getElementById("wolvTO_close"),O=document.getElementById("wolvTO_open");if(!M||!B||!C||!O)return;const show=()=>{M.style.display="block"};const hide=()=>{M.style.display="none"};B.addEventListener("click",show);C.addEventListener("click",hide);O.addEventListener("click",()=>window.open("/wolverine/traderone/","_blank"));M.addEventListener("click",(e)=>{if(e.target===M)hide()});document.addEventListener("keydown",(e)=>{if(e.key==="Escape")hide()});})();</script>'
-  # insère juste avant </body> (ou à la fin si pas trouvé)
-  if grep -qi '</body>' "$IDX"; then
-    awk -v inj="$INJ" 'BEGIN{IGNORECASE=1} { if($0 ~ /<\/body>/ && !done){print inj; done=1} print } END{ if(!done) print inj }' "$IDX" >"$IDX.tmp"
-    mv "$IDX.tmp" "$IDX"
-  else
-    printf "%s\n" "$INJ" >>"$IDX"
-  fi
-  say "Injection: OK"
+# 1) systemd unit (localhost only)
+UNIT_CONTENT="[Unit]
+Description=TraderOne Backend (localhost)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=$TR_DIR
+Environment=NODE_ENV=production
+Environment=HOST=127.0.0.1
+Environment=PORT=$PORT
+ExecStart=/usr/bin/node $TR_DIR/$ENTRY
+Restart=always
+RestartSec=2
+User=root
+
+[Install]
+WantedBy=multi-user.target
+"
+askorupdate_file "/etc/systemd/system/$UNIT" "$UNIT_CONTENT"
+systemctl daemon-reload
+systemctl enable "$UNIT" >/dev/null 2>&1 || true
+systemctl restart "$UNIT"
+
+# 2) nginx snippet proxy
+SNIP_CONTENT="# $MARK
+# Proxy TraderOne backend under same origin (no CORS)
+location ^~ /wolverine/traderone/api/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+  proxy_set_header Upgrade \$http_upgrade;
+  proxy_set_header Connection \"upgrade\";
+  proxy_read_timeout 120s;
+  proxy_send_timeout 120s;
+  proxy_pass http://127.0.0.1:$PORT/;
+}
+"
+askorupdate_file "$SNIP" "$SNIP_CONTENT"
+
+# 3) include snippet in site config (idempotent)
+if ! grep -q "$MARK" "$NGX_SITE"; then
+  cp -a "$NGX_SITE" "$NGX_SITE.bak.$(date +%s)"
+  # Insert include inside the first matching server block (best effort)
+  awk -v snip="$SNIP" -v mark="$MARK" '
+    BEGIN{ins=0;inserver=0;done=0}
+    {
+      line=$0
+      if(line ~ /^[ \t]*server[ \t]*\{/ && !inserver){inserver=1}
+      if(inserver && !done && line ~ /^[ \t]*\}/){
+        # before closing server block
+        print "    include " snip "; # " mark
+        done=1
+      }
+      print line
+      if(inserver && line ~ /^[ \t]*\}/){inserver=0}
+    }
+  ' "$NGX_SITE" >"$NGX_SITE.tmp"
+  mv "$NGX_SITE.tmp" "$NGX_SITE"
 fi
 
+# nginx safe test/reload
 nginx -t
 systemctl reload nginx
 
-say "Tests:"
-curl -ksS --max-time 6 "https://fireinners.online/wolverine/index.html" | head -c 120 || true
+say "=== TESTS ==="
+say "Backend local check (best effort):"
+curl -sS --max-time 5 "http://127.0.0.1:$PORT/" | head -c 120 || true
 echo
-curl -ksS --max-time 6 "https://fireinners.online/wolverine/traderone/" | head -c 120 || true
+say "Proxy check:"
+curl -ksS --max-time 6 "https://fireinners.online/wolverine/traderone/api/" | head -c 120 || true
 echo
+say "Unit status:"
+systemctl --no-pager -l status "$UNIT" | sed -n '1,20p' || true
+
 say "DONE."
 SH
-chmod +x /tmp/WOLVERINE_TRADERONE_INJECT.sh
-bash /tmp/WOLVERINE_TRADERONE_INJECT.sh
+chmod +x /tmp/WOLVERINE_TRADERONE_BACKEND_PROXY.sh
+bash /tmp/WOLVERINE_TRADERONE_BACKEND_PROXY.sh
