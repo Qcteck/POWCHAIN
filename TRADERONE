@@ -1,162 +1,351 @@
-cat >/tmp/MEGA_WOLVERINE_CONFIG_V2.sh <<'SH'
-#!/usr/bin/env bash
-set -euo pipefail
-ASKMOD="/opt/fireinners/sentinel/lib/askorupdate.sh";[ -f "$ASKMOD" ]&&. "$ASKMOD"||true
-say(){ printf "%s\n" "$*"; }
-need(){ command -v "$1" >/dev/null 2>&1 || { say "ERREUR: manque $1"; exit 1; }; }
-askyn(){ local q="$1" a=""; if command -v askorupdate_yesno >/dev/null 2>&1; then askorupdate_yesno "$q" || exit 0; else read -r -p "$q (y/N) " a||true; case "${a,,}" in y|yes) :;; *) say "Stop."; exit 0;; esac; fi; }
+nano /opt/fireinners/wolverine-api/server.js
 
-NG="/etc/nginx/sites-available/fireinners.online-ssl"
-OUTDIR="/var/lib/wolverine-config"
-OUTJSON="$OUTDIR/public-config.json"
-CUSTDIR="/var/lib/wolverine-custody"
-KEYFILE="$CUSTDIR/solana-keypair.json"
-USDC_MINT="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1"
-TOKEN_PROGRAM="TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
-ASSOC_PROGRAM="ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
 
-need awk; need grep; need sed; need ss; need node; need nginx; need curl; need head; need find; need chmod; need mkdir; need cp; need perl
+const fs=require("fs"),path=require("path"),express=require("express");
+const {Connection,Keypair,PublicKey,SystemProgram,Transaction,LAMPORTS_PER_SOL}=require("@solana/web3.js");
+const {getAssociatedTokenAddress,createAssociatedTokenAccountInstruction,createTransferInstruction,TOKEN_PROGRAM_ID,ASSOCIATED_TOKEN_PROGRAM_ID}=require("@solana/spl-token");
 
-[ -f "$NG" ] || { say "ERREUR: nginx vhost absent: $NG"; exit 1; }
+const PORT=+(process.env.PORT||3050);
+const RPC_URL=process.env.RPC_URL||"https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac";
+const USDC_MINT=new PublicKey(process.env.USDC_MINT||"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1");
+const KEYPAIR_FILE=process.env.KEYPAIR_FILE||"/opt/fireinners/wolverine-api/keypair.json";
+const STATE_FILE=process.env.STATE_FILE||"/var/lib/wolverine/state.json";
+const JUP_QUOTE=process.env.JUP_QUOTE||"https://quote-api.jup.ag/v6/quote";
+const JUP_SWAP=process.env.JUP_SWAP||"https://quote-api.jup.ag/v6/swap";
+const TG_ALERTS=String(process.env.TG_ALERTS||"1")==="1";
+const WOLV_SEND=process.env.WOLV_SEND||"/usr/local/bin/wolv_send";
 
-say "=== PRE-FLIGHT (read-only) ==="
-say "NGINX: $NG"
+const app=express();
+app.use(express.json({limit:"2mb"}));
 
-PORT="$(awk '
-  $0 ~ /location[[:space:]]+\/wolverine\/api/ {inloc=1}
-  inloc && $0 ~ /proxy_pass/ {
-    if (match($0,/127\.0\.0\.1:([0-9]+)/,a)) {print a[1]; exit}
-    if (match($0,/localhost:([0-9]+)/,a)) {print a[1]; exit}
+const conn=new Connection(RPC_URL,{commitment:"confirmed"});
+function mkdirp(p){try{fs.mkdirSync(p,{recursive:true});}catch{}}
+function readJSON(p,def){try{return JSON.parse(fs.readFileSync(p,"utf8"));}catch{return def}}
+function writeJSON(p,obj,mode){mkdirp(path.dirname(p));fs.writeFileSync(p,JSON.stringify(obj,null,2));try{fs.chmodSync(p,mode||0o600);}catch{}}
+function now(){return Date.now()}
+function sh(cmd){try{require("child_process").execSync(cmd,{stdio:"ignore"});return true}catch{return false}}
+function tg(msg){if(!TG_ALERTS) return; if(fs.existsSync(WOLV_SEND)) sh(`${WOLV_SEND} ${JSON.stringify(msg)}`)}
+function b58(x){return new PublicKey(x).toBase58()}
+
+function loadKeypair(){
+  try{
+    if(fs.existsSync(KEYPAIR_FILE)){
+      const a=readJSON(KEYPAIR_FILE,null); if(!a||!Array.isArray(a)) throw new Error("bad keypair");
+      return Keypair.fromSecretKey(Uint8Array.from(a));
+    }
+  }catch(e){}
+  const kp=Keypair.generate();
+  writeJSON(KEYPAIR_FILE,Array.from(kp.secretKey),0o600);
+  tg(`WOLVERINE: KEYPAIR CREATED ${kp.publicKey.toBase58()}`);
+  return kp;
+}
+const BOT_KP=loadKeypair();
+const BOT_PK=BOT_KP.publicKey;
+
+const state=readJSON(STATE_FILE,{users:{},engine:{running:false,mode:"dca_sol_safe",intervalSec:30,owner:"",tokenMint:"",lastTick:0,lastTx:"",startedAt:0}});
+function saveState(){writeJSON(STATE_FILE,state,0o600)}
+
+function getUser(owner){
+  const k=b58(owner);
+  if(!state.users[k]) state.users[k]={credit_usdc:0,credit_sol:0,spent_usdc:0,spent_sol:0,profit_usdc:0,profit_sol:0,lastClaimSig:"",createdAt:now(),updatedAt:now()};
+  state.users[k].updatedAt=now();
+  return state.users[k];
+}
+
+async function getSol(pk){return await conn.getBalance(pk,"confirmed")}
+async function getUsdcAta(ownerPk){
+  const ata=await getAssociatedTokenAddress(USDC_MINT,ownerPk,false,TOKEN_PROGRAM_ID,ASSOCIATED_TOKEN_PROGRAM_ID);
+  return ata;
+}
+async function getTokenBal(ata){
+  try{
+    const r=await conn.getTokenAccountBalance(ata,"confirmed");
+    return BigInt(r.value.amount||"0");
+  }catch{return 0n}
+}
+function uiToBaseUnits(amountUi,decimals){ // string/number -> bigint
+  const s=String(amountUi||"0").trim();
+  if(!/^\d+(\.\d+)?$/.test(s)) return 0n;
+  const [a,b=""]=s.split(".");
+  const frac=(b+"0".repeat(decimals)).slice(0,decimals);
+  return BigInt(a||"0")*BigInt(10**decimals)+BigInt(frac||"0");
+}
+function baseUnitsToUi(bi,decimals){
+  bi=BigInt(bi||0);
+  const sign=bi<0n?"-":"";
+  if(bi<0n) bi=-bi;
+  const p=10n**BigInt(decimals);
+  const i=(bi/p).toString();
+  let f=(bi%p).toString().padStart(decimals,"0").replace(/0+$/,"");
+  return sign+(f?`${i}.${f}`:i);
+}
+
+async function ensureAtaIx(payer,owner,mint){
+  const ata=await getAssociatedTokenAddress(mint,owner,false,TOKEN_PROGRAM_ID,ASSOCIATED_TOKEN_PROGRAM_ID);
+  const info=await conn.getAccountInfo(ata,"confirmed");
+  if(info) return {ata,ix:null};
+  return {ata,ix:createAssociatedTokenAccountInstruction(payer,ata,owner,mint,TOKEN_PROGRAM_ID,ASSOCIATED_TOKEN_PROGRAM_ID)};
+}
+
+async function sendSol(toPk,lamports){
+  const tx=new Transaction().add(SystemProgram.transfer({fromPubkey:BOT_PK,toPubkey:toPk,lamports:Number(lamports)}));
+  const sig=await conn.sendTransaction(tx,[BOT_KP],{skipPreflight:false,maxRetries:3});
+  await conn.confirmTransaction(sig,"confirmed");
+  return sig;
+}
+
+async function sendUsdc(toPk,amountBase){ // amountBase bigint (6 dec)
+  const {ata:fromAta,ix:ixFrom}=await ensureAtaIx(BOT_PK,BOT_PK,USDC_MINT);
+  const {ata:toAta,ix:ixTo}=await ensureAtaIx(BOT_PK,toPk,USDC_MINT);
+  const tx=new Transaction();
+  if(ixFrom) tx.add(ixFrom);
+  if(ixTo) tx.add(ixTo);
+  tx.add(createTransferInstruction(fromAta,toAta,BOT_PK,Number(amountBase),[],TOKEN_PROGRAM_ID));
+  const sig=await conn.sendTransaction(tx,[BOT_KP],{skipPreflight:false,maxRetries:3});
+  await conn.confirmTransaction(sig,"confirmed");
+  return sig;
+}
+
+async function jupSwap(inputMint,outputMint,amountBase,slippageBps=50){
+  const url=JUP_QUOTE+`?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountBase.toString()}&slippageBps=${slippageBps}`;
+  const q=await fetch(url,{headers:{"accept":"application/json"}});
+  if(!q.ok) throw new Error("quote_failed");
+  const quote=await q.json();
+  if(!quote||!quote.routePlan) throw new Error("quote_empty");
+
+  const s=await fetch(JUP_SWAP,{method:"POST",headers:{"content-type":"application/json","accept":"application/json"},body:JSON.stringify({
+    quoteResponse:quote,
+    userPublicKey:BOT_PK.toBase58(),
+    wrapAndUnwrapSol:true,
+    useSharedAccounts:true,
+    dynamicComputeUnitLimit:true,
+    prioritizationFeeLamports:"auto"
+  })});
+  if(!s.ok) throw new Error("swap_failed");
+  const swap=await s.json();
+  if(!swap||!swap.swapTransaction) throw new Error("swap_no_tx");
+
+  const raw=Buffer.from(swap.swapTransaction,"base64");
+  const {VersionedTransaction}=require("@solana/web3.js");
+  const vtx=VersionedTransaction.deserialize(raw);
+  vtx.sign([BOT_KP]);
+  const sig=await conn.sendRawTransaction(vtx.serialize(),{skipPreflight:false,maxRetries:3});
+  await conn.confirmTransaction(sig,"confirmed");
+  return sig;
+}
+
+async function parseClaimTx(sig,ownerStr){
+  const owner=new PublicKey(ownerStr);
+  const tx=await conn.getTransaction(sig,{maxSupportedTransactionVersion:0,commitment:"confirmed"});
+  if(!tx||!tx.transaction) throw new Error("tx_not_found");
+  const msg=tx.transaction.message;
+  const acctKeys=msg.accountKeys.map(k=>k.pubkey?k.pubkey:k); // v0 compat
+  const ownerOk=acctKeys.some(k=>k.toBase58&&k.toBase58()===owner.toBase58()) || acctKeys.some(k=>String(k)===owner.toBase58());
+  const botOk=acctKeys.some(k=>k.toBase58&&k.toBase58()===BOT_PK.toBase58()) || acctKeys.some(k=>String(k)===BOT_PK.toBase58());
+  if(!ownerOk||!botOk) throw new Error("not_related");
+
+  // Detect SOL transfer to BOT (system program)
+  let solToBot=0n;
+  try{
+    const pre=tx.meta?.preBalances||[];
+    const post=tx.meta?.postBalances||[];
+    for(let i=0;i<acctKeys.length;i++){
+      const k=acctKeys[i].toBase58?acctKeys[i].toBase58():String(acctKeys[i]);
+      if(k===BOT_PK.toBase58()){
+        const d=BigInt(post[i]||0)-BigInt(pre[i]||0);
+        if(d>0n) solToBot+=d;
+      }
+    }
+  }catch{}
+
+  // Detect USDC transfer to BOT via token balance deltas on BOT ATA
+  let usdcToBot=0n;
+  try{
+    const botAta=(await getUsdcAta(BOT_PK)).toBase58();
+    const preTB=tx.meta?.preTokenBalances||[];
+    const postTB=tx.meta?.postTokenBalances||[];
+    const preMap=new Map(); const postMap=new Map();
+    for(const b of preTB){ if(b.mint===USDC_MINT.toBase58() && b.owner===BOT_PK.toBase58()) preMap.set(b.accountIndex,BigInt(b.uiTokenAmount?.amount||"0")); }
+    for(const b of postTB){ if(b.mint===USDC_MINT.toBase58() && b.owner===BOT_PK.toBase58()) postMap.set(b.accountIndex,BigInt(b.uiTokenAmount?.amount||"0")); }
+    for(const [idx,postAmt] of postMap){
+      const preAmt=preMap.get(idx)||0n;
+      const d=postAmt-preAmt;
+      if(d>0n) usdcToBot+=d;
+    }
+    // fallback: if token balances arrays not include owner, try by token account in inner instructions (best-effort)
+  }catch{}
+
+  if(solToBot===0n && usdcToBot===0n) throw new Error("no_deposit_detected");
+  return {solToBot,usdcToBot};
+}
+
+const loops=new Map(); // owner -> timer
+async function tick(ownerStr){
+  const owner=b58(ownerStr);
+  const u=getUser(owner);
+  if(!state.engine.running || state.engine.owner!==owner) return;
+
+  const mode=state.engine.mode||"dca_sol_safe";
+  const intervalSec=Math.max(10,+(state.engine.intervalSec||30));
+  state.engine.lastTick=now();
+
+  // sanity: don't trade if credits empty
+  const creditUsdc=BigInt(u.credit_usdc||0);
+  const creditSol=BigInt(u.credit_sol||0);
+
+  try{
+    if(mode==="dca_sol_safe"){
+      // Buy SOL with USDC: spend a small slice each tick (2% of credit, min 1 USDC, max 25 USDC)
+      const slicePct=0.02;
+      let spend=BigInt(Math.floor(Number(creditUsdc)*slicePct));
+      const min=1_000_000n, max=25_000_000n;
+      if(spend<min) spend=min;
+      if(spend>max) spend=max;
+      if(creditUsdc<spend) throw new Error("no_usdc_credit");
+      const sig=await jupSwap(USDC_MINT.toBase58(),"So11111111111111111111111111111111111111112",spend,50);
+      u.credit_usdc=(creditUsdc-spend).toString();
+      u.spent_usdc=(BigInt(u.spent_usdc||0)+spend).toString();
+      state.engine.lastTx=sig;
+      tg(`WOLVERINE: TRADE OK dca_sol_safe spend ${baseUnitsToUi(spend,6)} USDC tx ${sig}`);
+      saveState();
+      return;
+    }
+
+    if(mode==="buy_token"){
+      const mint=String(state.engine.tokenMint||"").trim();
+      if(!mint) throw new Error("missing_tokenMint");
+      // Buy token with USDC: one-shot (all credit up to 50 USDC cap)
+      let spend=BigInt(u.credit_usdc||0);
+      const cap=50_000_000n;
+      if(spend>cap) spend=cap;
+      if(spend<=0n) throw new Error("no_usdc_credit");
+      const sig=await jupSwap(USDC_MINT.toBase58(),mint,spend,75);
+      u.credit_usdc=(BigInt(u.credit_usdc||0)-spend).toString();
+      u.spent_usdc=(BigInt(u.spent_usdc||0)+spend).toString();
+      state.engine.lastTx=sig;
+      tg(`WOLVERINE: TRADE OK buy_token spend ${baseUnitsToUi(spend,6)} USDC mint ${mint} tx ${sig}`);
+      state.engine.running=false; // one-shot stop
+      saveState();
+      return;
+    }
+
+    throw new Error("unknown_mode");
+  }catch(e){
+    tg(`WOLVERINE: TRADE ERR ${String(e&&e.message||e)}`);
+    saveState();
+  }finally{
+    // re-arm next tick
+    if(state.engine.running && state.engine.owner===owner){
+      const t=setTimeout(()=>tick(owner).catch(()=>{}),intervalSec*1000);
+      loops.set(owner,t);
+    }
   }
-  inloc && $0 ~ /}/ {inloc=0}
-' "$NG" | head -n1 || true)"
-[ -n "${PORT:-}" ] || { say "ERREUR: port backend introuvable pour /wolverine/api"; exit 1; }
-say "BACKEND PORT (nginx): $PORT"
-
-PID="$(ss -ltnp 2>/dev/null | grep -E ":$PORT[[:space:]]" | head -n1 | sed -n 's/.*pid=\([0-9]\+\).*/\1/p' || true)"
-[ -n "${PID:-}" ] || { say "ERREUR: aucun process n'écoute sur $PORT"; exit 1; }
-say "PID: $PID"
-
-CWD="$(readlink -f "/proc/$PID/cwd" 2>/dev/null || true)"
-[ -n "${CWD:-}" ] || { say "ERREUR: impossible de lire cwd du PID"; exit 1; }
-say "CWD: $CWD"
-
-say "Test health:"
-curl -sS "https://fireinners.online/wolverine/api/health" || true
-echo
-
-askyn "Continuer (création keypair custodial si absente + création /wolverine/api/config)?"
-
-mkdir -p "$OUTDIR" "$CUSTDIR"
-chmod 700 "$OUTDIR" "$CUSTDIR"
-
-# Trouver keypair existante: priorite KEYFILE, sinon cherche dans CWD
-KEY=""
-if [ -f "$KEYFILE" ]; then KEY="$KEYFILE"; fi
-if [ -z "$KEY" ]; then
-  KEY="$(find "$CWD" -maxdepth 4 -type f \( -name '*keypair*.json' -o -name '*wallet*.json' -o -name '*.key' -o -name '*.json' \) 2>/dev/null | head -n1 || true)"
-fi
-
-# Si pas de key, on en crée une officielle
-if [ -z "${KEY:-}" ] || [ ! -f "${KEY:-/nope}" ]; then
-  say "Aucune keypair trouvée -> création: $KEYFILE"
-  ( cd "$CWD" 2>/dev/null || true
-    node - <<'JS'
-const fs=require('fs');
-let Web3;
-try{ Web3=require('@solana/web3.js'); }catch(e){
-  console.error("ERR: @solana/web3.js introuvable depuis ce dossier. Installe-le dans le backend (npm i @solana/web3.js) ou dis-moi où il est.");
-  process.exit(2);
 }
-const {Keypair}=Web3;
-const kp=Keypair.generate();
-const out=process.env.KEYFILE;
-fs.writeFileSync(out, JSON.stringify(Array.from(kp.secretKey)));
-console.log("CREATED_KEYPAIR", out);
-console.log("BOT", kp.publicKey.toBase58());
-JS
-  ) || true
-  KEY="$KEYFILE"
-fi
 
-[ -f "$KEY" ] || { say "ERREUR: keypair introuvable et création échouée. Dis-moi si @solana/web3.js est installé dans $CWD/node_modules."; exit 1; }
-chmod 600 "$KEY" || true
-say "KEYPAIR: $KEY"
+app.get("/wolverine/api/ping",(req,res)=>res.type("text/plain").send("pong"));
+app.get("/wolverine/api/health",(req,res)=>res.json({ok:true,uptime:process.uptime(),ts:Date.now(),bot:BOT_PK.toBase58()}));
+app.get("/wolverine/api/address",(req,res)=>res.json({ok:true,bot_pubkey:BOT_PK.toBase58(),usdc_mint:USDC_MINT.toBase58(),rpc:RPC_URL}));
+app.get("/wolverine/api/config",(req,res)=>res.json({ok:true,bot_pubkey:BOT_PK.toBase58(),usdc_mint:USDC_MINT.toBase58(),mode:state.engine.mode,intervalSec:state.engine.intervalSec,running:state.engine.running}));
+app.get("/wolverine/api/status",async(req,res)=>{
+  try{
+    const sol=await getSol(BOT_PK);
+    const ata=await getUsdcAta(BOT_PK);
+    const usdc=await getTokenBal(ata);
+    res.json({ok:true,ts:Date.now(),engine:state.engine,bot:{pubkey:BOT_PK.toBase58(),sol,usdc:usdc.toString()}});
+  }catch(e){res.status(500).json({ok:false,error:String(e&&e.message||e)})}
+});
 
-# Générer config json (bot + ATA USDC)
-( cd "$CWD" 2>/dev/null || true
-  KEY="$KEY" OUTJSON="$OUTJSON" USDC_MINT="$USDC_MINT" TOKEN_PROGRAM="$TOKEN_PROGRAM" ASSOC_PROGRAM="$ASSOC_PROGRAM" node - <<'JS'
-const fs=require('fs');
-let Web3;
-try{ Web3=require('@solana/web3.js'); }catch(e){
-  console.error("ERR: @solana/web3.js introuvable depuis ce dossier. Installe-le dans le backend (npm i @solana/web3.js) ou dis-moi où il est.");
-  process.exit(2);
-}
-const {PublicKey,Keypair}=Web3;
-const keyPath=process.env.KEY;
-const outPath=process.env.OUTJSON;
-const usdcMint=process.env.USDC_MINT;
-const tokenProg=process.env.TOKEN_PROGRAM;
-const assocProg=process.env.ASSOC_PROGRAM;
+// compat TraderOne old paths
+app.get("/wolverine/traderone/api/health",(req,res)=>res.redirect(302,"/wolverine/api/health"));
+app.get("/wolverine/traderone/api/status",(req,res)=>res.redirect(302,"/wolverine/api/status"));
 
-const raw=fs.readFileSync(keyPath,'utf8').trim();
-let secret;
-try{ const j=JSON.parse(raw); secret=Uint8Array.from(Array.isArray(j)?j:j.secretKey); }catch(e){ console.error("ERR keypair json:",e.message); process.exit(1); }
-const kp=Keypair.fromSecretKey(secret);
-const bot=kp.publicKey;
+app.get("/wolverine/api/balances",async(req,res)=>{
+  try{
+    const owner=String(req.query.owner||"").trim();
+    const u=owner?getUser(owner):null;
+    const sol=await getSol(BOT_PK);
+    const ata=await getUsdcAta(BOT_PK);
+    const usdc=await getTokenBal(ata);
+    res.json({ok:true,ts:Date.now(),bot:{pubkey:BOT_PK.toBase58(),sol,usdc:usdc.toString()},user:owner?{owner,credit_usdc:String(u.credit_usdc||"0"),credit_sol:String(u.credit_sol||"0"),spent_usdc:String(u.spent_usdc||"0"),spent_sol:String(u.spent_sol||"0")} : null});
+  }catch(e){res.status(500).json({ok:false,error:String(e&&e.message||e)})}
+});
 
-function ata(mint, owner){
-  const mintPk=new PublicKey(mint);
-  const ownerPk=new PublicKey(owner);
-  const tp=new PublicKey(tokenProg);
-  const ap=new PublicKey(assocProg);
-  const [pda]=PublicKey.findProgramAddressSync([ownerPk.toBuffer(), tp.toBuffer(), mintPk.toBuffer()], ap);
-  return pda;
-}
-const botUsdcAta=ata(usdcMint, bot).toBase58();
+app.post("/wolverine/api/claim",async(req,res)=>{
+  try{
+    const owner=String(res.body?.owner||req.body?.owner||"").trim();
+    const sig=String(req.body?.sig||"").trim();
+    if(!owner||!sig) return res.status(400).json({ok:false,error:"missing_owner_or_sig"});
+    const u=getUser(owner);
+    if(u.lastClaimSig===sig) return res.json({ok:true,dup:true,user:u});
+    const {solToBot,usdcToBot}=await parseClaimTx(sig,owner);
+    if(usdcToBot>0n) u.credit_usdc=(BigInt(u.credit_usdc||0)+usdcToBot).toString();
+    if(solToBot>0n) u.credit_sol=(BigInt(u.credit_sol||0)+solToBot).toString();
+    u.lastClaimSig=sig;
+    saveState();
+    tg(`WOLVERINE: DEPOSIT OK owner ${owner.slice(0,6)}… usdc ${baseUnitsToUi(usdcToBot,6)} sol ${Number(solToBot)/LAMPORTS_PER_SOL}`);
+    res.json({ok:true,credited:{usdc:usdcToBot.toString(),sol:solToBot.toString()},user:u});
+  }catch(e){res.status(500).json({ok:false,error:String(e&&e.message||e)})}
+});
 
-const payload={
-  ok:true,
-  bot:bot.toBase58(),
-  botUsdcAta,
-  usdcMint,
-  note:"Custodial: envoyer SOL (fees) à bot. Envoyer USDC budget à botUsdcAta. Utilise /wolverine/api/health pour état."
-};
-fs.writeFileSync(outPath, JSON.stringify(payload,null,2));
-console.log("BOT=",payload.bot);
-console.log("USDC_ATA=",payload.botUsdcAta);
-JS
-)
+app.post("/wolverine/api/start",async(req,res)=>{
+  try{
+    const owner=String(req.body?.owner||"").trim();
+    const mode=String(req.body?.mode||"dca_sol_safe").trim();
+    const intervalSec=Math.max(10,+(req.body?.intervalSec||30));
+    const tokenMint=String(req.body?.tokenMint||"").trim();
+    if(!owner) return res.status(400).json({ok:false,error:"missing_owner"});
+    const u=getUser(owner);
+    if(BigInt(u.credit_usdc||0)===0n && BigInt(u.credit_sol||0)===0n) return res.status(400).json({ok:false,error:"no_credit"});
+    // stop previous
+    for(const [k,t] of loops){clearTimeout(t);loops.delete(k)}
+    state.engine={running:true,mode,intervalSec,owner:b58(owner),tokenMint,lastTick:0,lastTx:"",startedAt:Date.now()};
+    saveState();
+    tg(`WOLVERINE: START owner ${owner.slice(0,6)}… mode ${mode} interval ${intervalSec}s`);
+    tick(owner).catch(()=>{});
+    res.json({ok:true,engine:state.engine});
+  }catch(e){res.status(500).json({ok:false,error:String(e&&e.message||e)})}
+});
 
-chmod 644 "$OUTJSON"
+app.post("/wolverine/api/stop",(req,res)=>{
+  try{
+    for(const [k,t] of loops){clearTimeout(t);loops.delete(k)}
+    state.engine.running=false;
+    saveState();
+    tg(`WOLVERINE: STOP`);
+    res.json({ok:true,engine:state.engine});
+  }catch(e){res.status(500).json({ok:false,error:String(e&&e.message||e)})}
+});
 
-# Patch nginx (alias exact /wolverine/api/config) - gérer immutable avant écriture
-IMM=0
-lsattr "$NG" 2>/dev/null | grep -q ' i ' && IMM=1 || true
-[ "$IMM" = "1" ] && { say "NGINX immutable -> unlock temporaire"; chattr -i "$NG" || true; }
+app.post("/wolverine/api/withdraw",async(req,res)=>{
+  try{
+    const owner=String(req.body?.owner||"").trim();
+    const token=String(req.body?.token||"USDC").trim().toUpperCase();
+    const amount=String(req.body?.amount||"0").trim(); // UI amount
+    if(!owner) return res.status(400).json({ok:false,error:"missing_owner"});
+    const u=getUser(owner);
+    const toPk=new PublicKey(owner);
+    if(token==="SOL"){
+      const lamports=uiToBaseUnits(amount,9);
+      if(lamports<=0n) return res.status(400).json({ok:false,error:"bad_amount"});
+      const credit=BigInt(u.credit_sol||0);
+      if(credit<lamports) return res.status(400).json({ok:false,error:"insufficient_credit"});
+      const sig=await sendSol(toPk,lamports);
+      u.credit_sol=(credit-lamports).toString();
+      saveState();
+      tg(`WOLVERINE: WITHDRAW SOL ${Number(lamports)/LAMPORTS_PER_SOL} to ${owner.slice(0,6)}… tx ${sig}`);
+      return res.json({ok:true,sig});
+    }else{
+      const amt=uiToBaseUnits(amount,6);
+      if(amt<=0n) return res.status(400).json({ok:false,error:"bad_amount"});
+      const credit=BigInt(u.credit_usdc||0);
+      if(credit<amt) return res.status(400).json({ok:false,error:"insufficient_credit"});
+      const sig=await sendUsdc(toPk,amt);
+      u.credit_usdc=(credit-amt).toString();
+      saveState();
+      tg(`WOLVERINE: WITHDRAW USDC ${baseUnitsToUi(amt,6)} to ${owner.slice(0,6)}… tx ${sig}`);
+      return res.json({ok:true,sig});
+    }
+  }catch(e){res.status(500).json({ok:false,error:String(e&&e.message||e)})}
+});
 
-cp -a "$NG" "$NG.bak.$(date +%s)"
-
-if grep -q 'location = /wolverine/api/config' "$NG"; then
-  say "NGINX: location /wolverine/api/config déjà présent."
-else
-  TMP="$(mktemp)"
-  perl -0777 -pe '
-    my $ins = "\n    location = /wolverine/api/config {\n        default_type application/json;\n        alias /var/lib/wolverine-config/public-config.json;\n        add_header Cache-Control \"no-store\";\n    }\n";
-    if (s/(\\n\\s*location\\s+\\/wolverine\\/api[^\\n]*\\{)/$ins$1/s) { }
-    else { s/(\\n\\})/$ins$1/s; }
-  ' "$NG" >"$TMP"
-  mv "$TMP" "$NG"
-  say "NGINX: location /wolverine/api/config ajoutée."
-fi
-
-nginx -t
-systemctl reload nginx
-
-[ "$IMM" = "1" ] && { say "NGINX re-lock"; chattr +i "$NG" || true; }
-
-say "TEST CONFIG:"
-curl -sS https://fireinners.online/wolverine/api/config; echo
-say "DONE."
-SH
-bash /tmp/MEGA_WOLVERINE_CONFIG_V2.sh
+app.listen(PORT,"127.0.0.1",()=>{console.log("wolverine-api listening",PORT,"bot",BOT_PK.toBase58());});
