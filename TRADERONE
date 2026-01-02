@@ -1,1 +1,110 @@
-journalctl -u wolverine-tg-sentinel -n 50 --no-pager
+cat >/tmp/WOLVERINE_TG_HARDEN.sh <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+echo "=== WOLVERINE TG HARDEN ==="
+date;hostname;whoami;pwd
+
+ASK="/opt/fireinners/sentinel/lib/askorupdate.sh"
+if [ -f "$ASK" ]; then
+  # shellcheck disable=SC1090
+  source "$ASK"
+else
+  askorupdate_file(){ local p="$1";mkdir -p "$(dirname "$p")";cp -a "$p" "$p.bak.$(date +%s)" 2>/dev/null||true;cat >"$p"; }
+fi
+
+DIR="/opt/fireinners/wolverine-telegram"
+ENV="$DIR/telegram.env"
+SEND="$DIR/send.sh"
+SENT="$DIR/sentinel.sh"
+SVC="/etc/systemd/system/wolverine-tg-sentinel.service"
+
+[ -f "$ENV" ] || { echo "Missing $ENV"; exit 1; }
+
+echo "--- stop sentinel ---"
+systemctl stop wolverine-tg-sentinel 2>/dev/null || true
+
+echo "--- rewrite send.sh (no token in process args / minimal output) ---"
+cat >/tmp/_send <<'S'
+#!/usr/bin/env bash
+set -euo pipefail
+ENV="/opt/fireinners/wolverine-telegram/telegram.env"
+# shellcheck disable=SC1090
+source "$ENV"
+MSG="${*:-}"
+[ -n "${TG_TOKEN:-}" ] || exit 1
+[ -n "${TG_CHAT_ID:-}" ] || exit 1
+[ -n "$MSG" ] || exit 1
+# Use curl silent; never echo token; discard output
+curl -sS -o /dev/null -m 8 -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+  -d "chat_id=${TG_CHAT_ID}" \
+  --data-urlencode "text=${MSG}" \
+  -d "disable_web_page_preview=true" >/dev/null 2>&1 || true
+exit 0
+S
+askorupdate_file "$SEND" </tmp/_send
+rm -f /tmp/_send
+chmod 700 "$SEND"
+
+echo "--- rewrite sentinel.sh (no verbose, no leaking) ---"
+cat >/tmp/_sent <<'S2'
+#!/usr/bin/env bash
+set -euo pipefail
+PING_URL="https://fireinners.online/wolverine/api/ping"
+STATE="/opt/fireinners/wolverine-telegram/.api_state"
+INTERVAL=20
+send(){ /opt/fireinners/wolverine-telegram/send.sh "$1" >/dev/null 2>&1 || true; }
+last="unknown"; [ -f "$STATE" ] && last="$(cat "$STATE" 2>/dev/null || echo unknown)"
+while true; do
+  ok=0
+  out="$(curl -k -sS -m 5 "$PING_URL" 2>/dev/null || true)"
+  echo "$out" | grep -qi "pong" && ok=1 || true
+  if [ "$ok" = "1" ] && [ "$last" != "online" ]; then
+    send "WOLVERINE API: RECOVERED (pong)"
+    last="online"; echo "$last" >"$STATE"
+  elif [ "$ok" = "0" ] && [ "$last" != "offline" ]; then
+    send "WOLVERINE API: OFFLINE (no pong)"
+    last="offline"; echo "$last" >"$STATE"
+  fi
+  sleep "$INTERVAL"
+done
+S2
+askorupdate_file "$SENT" </tmp/_sent
+rm -f /tmp/_sent
+chmod 700 "$SENT"
+
+echo "--- rewrite systemd unit (mute stdout/stderr) ---"
+cat >/tmp/_svc <<'UNIT'
+[Unit]
+Description=Wolverine Telegram Sentinel (API ping -> TG)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/fireinners/wolverine-telegram
+ExecStart=/bin/bash /opt/fireinners/wolverine-telegram/sentinel.sh
+Restart=always
+RestartSec=2
+StandardOutput=null
+StandardError=null
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+askorupdate_file "$SVC" </tmp/_svc
+rm -f /tmp/_svc
+chmod 0644 "$SVC"
+
+systemctl daemon-reload
+systemctl enable wolverine-tg-sentinel
+systemctl restart wolverine-tg-sentinel
+sleep 0.4
+
+echo "--- status (should NOT show token now) ---"
+systemctl --no-pager --full status wolverine-tg-sentinel | sed -n '1,12p' || true
+
+echo "=== DONE ==="
+echo "Optional: clear old logs to remove exposed token history:"
+echo "journalctl --rotate && journalctl --vacuum-time=1s"
+SH
+bash /tmp/WOLVERINE_TG_HARDEN.sh
