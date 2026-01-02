@@ -1,4 +1,4 @@
-cat >/tmp/WOLVERINE_ONEURL_NGX.sh <<'SH'
+cat >/tmp/MEGA_WOLVERINE_INSTALL.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 ASKLIB="/opt/fireinners/sentinel/lib/askorupdate.sh"
@@ -7,127 +7,243 @@ if [ -f "$ASKLIB" ]; then . "$ASKLIB"; else
   askorupdate_file(){ local p="$1" c="$2"; mkdir -p "$(dirname "$p")"; printf "%s" "$c" >"$p"; }
 fi
 say(){ printf "%s\n" "$*"; }
-need(){ command -v "$1" >/dev/null 2>&1 || { say "ERREUR: commande manquante: $1"; exit 1; }; }
 
 SITE="/etc/nginx/sites-available/fireinners.online-ssl"
-SNIP="/etc/nginx/snippets/wolverine_oneurl.conf"
-MARK="WOLVERINE_ONEURL_V1"
+SNIP="/etc/nginx/snippets/wolverine.conf"
+MARK="WOLVERINE_V1"
+PORT="9697"
+BACK_DIR="/opt/fireinners/wolverine-backend"
+FRONT_DIR="/opt/fireinners/frontend-react/app/dist/wolverine"
+ENV_FILE="$BACK_DIR/.env"
 
-WOLV_ROOT="/opt/fireinners/frontend-react/app/dist/wolverine"
-TR_DIR="/opt/traderone-opt"
-
-need nginx; need awk; need sed; need grep; need find; need systemctl; need curl; need chattr
+command -v node >/dev/null || { say "ERREUR: node absent"; exit 1; }
+command -v nginx >/dev/null || { say "ERREUR: nginx absent"; exit 1; }
+[ -f "$SITE" ] || { say "ERREUR: $SITE absent"; exit 1; }
 
 say "=== BATCH FLY (read-only) ==="
-say "host: $(hostname)  date: $(date -u +%FT%TZ)"
-[ -f "$SITE" ] || { say "ERREUR: nginx site absent: $SITE"; exit 1; }
-[ -d "$WOLV_ROOT" ] || { say "ERREUR: Wolverine frontend absent: $WOLV_ROOT"; exit 1; }
-[ -f "$WOLV_ROOT/index.html" ] || { say "ERREUR: Wolverine index.html absent: $WOLV_ROOT/index.html"; exit 1; }
-
-# detect TraderOne frontend (optional)
-TR_FRONT=""
-for p in \
-  "$TR_DIR/app/dist" \
-  "$TR_DIR/dist" \
-  "$TR_DIR/frontend/dist" \
-  "$TR_DIR/frontend-react/app/dist" \
-  "$TR_DIR/frontend/app/dist" \
-  "$TR_DIR/build" \
-; do
-  if [ -f "$p/index.html" ]; then TR_FRONT="$p"; break; fi
-done
-
-# detect TraderOne port (from systemd env if exists)
-TR_PORT="8585"
-if systemctl list-unit-files | grep -q '^traderone\.service'; then
-  envs="$(systemctl show -p Environment traderone.service 2>/dev/null | sed 's/^Environment=//')"
-  p="$(echo "$envs" | tr ' ' '\n' | sed -nE 's/^PORT=([0-9]{2,5})$/\1/p' | head -n1)"
-  [ -n "${p:-}" ] && TR_PORT="$p"
-fi
-
-say "Wolverine root: $WOLV_ROOT"
-say "TraderOne dir:  $TR_DIR"
-say "TraderOne front: ${TR_FRONT:-ABSENT (OK si tu veux juste l’API)}"
-say "TraderOne port:  $TR_PORT"
-say "nginx marker present? $(grep -q "$MARK" "$SITE" && echo yes || echo no)"
-
-say "Ce script va:"
-say "- ajouter proxy API TraderOne: /wolverine/traderone/api/ -> 127.0.0.1:$TR_PORT"
-say "- (option) servir TraderOne UI: /wolverine/traderone/ -> ${TR_FRONT:-NONE}"
-say "- ne touche PAS /wolverine/api/ (ton ping Telegram reste intact)"
-say "- patch nginx (include snippet) + nginx -t + reload + re-lock chattr"
+say "Backend dir: $BACK_DIR"
+say "Frontend dir: $FRONT_DIR"
+say "Nginx site: $SITE"
+say "Port backend (localhost): $PORT"
+say "Ce batch va:"
+say "- créer backend express (localhost:$PORT) + systemd wolverine.service"
+say "- créer frontend /wolverine/ (index.html)"
+say "- proxifier /wolverine/api/* -> localhost:$PORT"
+say "- forcer /wolverine/ à servir ce frontend (pas le React index global)"
+say "- nginx -t + reload + re-lock chattr"
 if ! askorupdate_yesno "Continuer ?"; then say "Stop."; exit 0; fi
 
-say "=== APPLY ==="
+mkdir -p "$BACK_DIR" "$FRONT_DIR"
+chmod 700 "$BACK_DIR" || true
 
+# .env (minimal)
+if [ ! -f "$ENV_FILE" ]; then
+  cat >"$ENV_FILE" <<EOF
+PORT=$PORT
+# Telegram alerts via existing wolv_send (optional)
+WOLV_SEND=/usr/local/bin/wolv_send
+TG_ALERTS=1
+# Monitoring target (proxy ping)
+MONITOR_URL=https://bbbotrader.paycashnostory.workers.dev/ping
+# 0=off, else seconds
+MONITOR_EVERY=20
+EOF
+  chmod 600 "$ENV_FILE" || true
+fi
+
+# backend server.js
+cat >"$BACK_DIR/server.js" <<'JS'
+import http from "http";
+import express from "express";
+import { execFile } from "child_process";
+
+const app=express();
+app.use(express.json({limit:"1mb"}));
+
+const ENV=(k,d)=>process.env[k]??d;
+const state={
+  boot:new Date().toISOString(),
+  running:false,
+  cfg:{budgetUSDC:0,mode:"safe",mint:"",wallet:""},
+  spentUSDC:0,
+  lastSwap:null,
+  monitor:{url:ENV("MONITOR_URL",""),every:+ENV("MONITOR_EVERY","0")||0,last:null,ok:null,failStreak:0,effective:"INIT"}
+};
+
+function now(){return new Date().toISOString();}
+function j(o){return JSON.stringify(o);}
+function sendTG(msg){
+  if((ENV("TG_ALERTS","1")==="0")) return;
+  const p=ENV("WOLV_SEND","/usr/local/bin/wolv_send");
+  execFile(p,[String(msg)],{timeout:8000},()=>{});
+}
+async function ping(url){
+  const t=Date.now();
+  try{
+    const r=await fetch(url,{method:"GET",redirect:"follow",signal:AbortSignal.timeout(8000)});
+    const tx=await r.text();
+    const ok=(r.ok && /pong/i.test(tx));
+    return {ok,code:r.status,ms:Date.now()-t,body:tx.slice(0,120)};
+  }catch(e){
+    return {ok:false,code:0,ms:Date.now()-t,body:String(e).slice(0,120)};
+  }
+}
+
+app.get("/health",(req,res)=>res.json({ok:true,service:"wolverine",now:now()}));
+app.get("/ping",(req,res)=>res.type("text/plain").send("pong"));
+app.get("/status",(req,res)=>res.json({ok:true,now:now(),state}));
+app.get("/traderone/status",(req,res)=>res.json({ok:true,now:now(),running:state.running,cfg:state.cfg,spentUSDC:state.spentUSDC,lastSwap:state.lastSwap,monitor:state.monitor}));
+
+app.post("/traderone/start",(req,res)=>{
+  const {budgetUSDC,mode,mint,wallet}=req.body||{};
+  const b=+budgetUSDC||0;
+  if(b<=0) return res.status(400).json({ok:false,error:"budgetUSDC invalid"});
+  state.running=true;
+  state.cfg={budgetUSDC:b,mode:String(mode||"safe"),mint:String(mint||""),wallet:String(wallet||"")};
+  state.spentUSDC=0;
+  sendTG(`WOLVERINE: START budget=${b} mode=${state.cfg.mode} ${now()}`);
+  res.json({ok:true,now:now(),state});
+});
+
+app.post("/traderone/stop",(req,res)=>{
+  state.running=false;
+  sendTG(`WOLVERINE: STOP ${now()}`);
+  res.json({ok:true,now:now(),state});
+});
+
+app.post("/log",(req,res)=>{
+  const ev=req.body||{};
+  if(ev && typeof ev==="object"){
+    if(ev.type==="swap"){
+      const amt=+ev.usdc||0;
+      if(amt>0){ state.spentUSDC=Math.min(state.cfg.budgetUSDC,state.spentUSDC+amt); }
+      state.lastSwap={...ev,ts:now()};
+    }
+  }
+  res.json({ok:true});
+});
+
+function monitorTick(){
+  const url=state.monitor.url;
+  if(!url || !state.monitor.every) return;
+  ping(url).then(r=>{
+    state.monitor.last={...r,ts:now()};
+    if(r.ok){
+      state.monitor.failStreak=0;
+      if(state.monitor.effective!=="UP"){
+        state.monitor.effective="UP";
+        sendTG(`WOLVERINE: API UP (recovery) ${now()}`);
+      }
+    }else{
+      state.monitor.failStreak++;
+      if(state.monitor.failStreak>=3 && state.monitor.effective!=="DOWN"){
+        state.monitor.effective="DOWN";
+        sendTG(`WOLVERINE: API DOWN (>=3 fails) ${now()}`);
+      }
+    }
+  }).catch(()=>{});
+}
+
+setInterval(monitorTick, 1000);
+setInterval(()=>{ if(state.monitor.every){ /* coarse gating */ } }, 1000);
+
+let lastRun=0;
+setInterval(()=>{
+  if(!state.monitor.every) return;
+  const t=Date.now();
+  if(t-lastRun >= state.monitor.every*1000){ lastRun=t; monitorTick(); }
+},1000);
+
+const port=+ENV("PORT","9697")||9697;
+const srv=http.createServer(app);
+srv.listen(port,"127.0.0.1",()=>{ console.log(`wolverine backend on 127.0.0.1:${port}`); });
+JS
+
+# package.json
+cat >"$BACK_DIR/package.json" <<'JSON'
+{"name":"wolverine-backend","type":"module","private":true,"dependencies":{"express":"^4.19.2"}}
+JSON
+
+cd "$BACK_DIR"
+if [ ! -d node_modules ]; then
+  npm i --omit=dev
+fi
+
+# systemd service
+cat >/etc/systemd/system/wolverine.service <<EOF
+[Unit]
+Description=WOLVERINE Backend (local API)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=$BACK_DIR
+EnvironmentFile=$ENV_FILE
+ExecStart=/usr/bin/node $BACK_DIR/server.js
+Restart=always
+RestartSec=2
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now wolverine.service
+
+# frontend index.html (SAFE Phantom mode)
+cat >"$FRONT_DIR/index.html" <<'HTML'
+<!doctype html><html lang="fr"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>WOLVERINE • TraderOne</title><style>:root{--bg:#05060b;--p:#0a0f1e;--l:#1b2a44;--t:#e7f0ff;--m:#9fb3d7;--a:#00e5ff;--ok:#b9ffcf;--bad:#ffb3b3}*{box-sizing:border-box}html,body{margin:0;height:100%;background:radial-gradient(900px 500px at 20% 0%,#0a1328 0%,transparent 60%),radial-gradient(700px 450px at 80% 20%,#101a33 0%,transparent 55%),var(--bg);color:var(--t);font:14px system-ui}a{color:var(--a);text-decoration:none}#wrap{max-width:1180px;margin:24px auto;padding:0 14px}#card{background:rgba(10,15,30,.72);border:1px solid rgba(27,42,68,.7);border-radius:18px;box-shadow:0 10px 40px rgba(0,0,0,.45);overflow:hidden}#top{padding:16px 18px;border-bottom:1px solid rgba(27,42,68,.6);display:flex;gap:14px;align-items:center}#dot{width:34px;height:34px;border-radius:10px;background:linear-gradient(135deg,#00e5ff,#6d5cff)}#title{font-weight:800;letter-spacing:.4px}#sub{color:var(--m);font-size:12px;margin-top:2px}#grid{display:grid;grid-template-columns:1.1fr .9fr;gap:14px;padding:14px}#box{background:rgba(7,10,20,.55);border:1px solid rgba(27,42,68,.55);border-radius:14px;padding:14px}h3{margin:0 0 10px 0;font-size:13px;letter-spacing:.4px;color:#d7e6ff;text-transform:uppercase}label{display:block;color:var(--m);font-size:12px;margin:10px 0 6px}input,select,button{width:100%;background:rgba(5,6,11,.55);border:1px solid rgba(27,42,68,.8);color:var(--t);border-radius:12px;padding:10px 12px;outline:none}button{cursor:pointer;font-weight:700}button:hover{border-color:rgba(0,229,255,.8)}.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}.row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px}.pill{display:inline-block;padding:4px 8px;border-radius:999px;border:1px solid rgba(27,42,68,.8);color:var(--m);font-size:12px}#log{height:330px;overflow:auto;white-space:pre-wrap;font-family:ui-monospace,Menlo,Consolas,monospace;background:rgba(0,0,0,.35);border-radius:12px;border:1px solid rgba(27,42,68,.6);padding:10px}#ok{color:var(--ok)}#bad{color:var(--bad)}.small{font-size:12px;color:var(--m)}@media(max-width:980px){#grid{grid-template-columns:1fr}}</style></head><body><div id="wrap"><div id="card"><div id="top"><div id="dot"></div><div><div id="title">WOLVERINE</div><div id="sub">Phantom only • Jupiter swaps • Budget protected • Monitoring TG</div></div><div style="margin-left:auto;display:flex;gap:10px;align-items:center"><span class="pill" id="api">API: ?</span><span class="pill" id="mon">MON: ?</span></div></div><div id="grid"><div id="box"><h3>Control</h3><div class="row"><button id="btnConn">Connect</button><button id="btnDisc">Disconnect</button></div><label>Balances</label><div class="row"><input id="sol" placeholder="SOL" disabled><input id="usdc" placeholder="USDC" disabled></div><label>Budget (USDC) — total autorisé pour WOLVERINE</label><div class="row"><input id="budget" placeholder="Total budget (USDC)" inputmode="decimal"><button id="btnSave">Save</button></div><label>Token mint (SPL) à acheter</label><input id="mint" placeholder="ex: AhSGcUDN... (mint)"><label>Chunk (USDC) — montant par achat (ouvrira Phantom à chaque swap)</label><input id="chunk" placeholder="ex: 5" inputmode="decimal"><label>Mode</label><select id="mode"><option value="safe">SAFE (Phantom signe chaque swap)</option></select><label>Autotrade</label><div class="row"><button id="btnStart">Start WOLVERINE</button><button id="btnStop">Stop</button></div><div class="small" style="margin-top:10px">Sécurité: aucune clé privée dans la page. Chaque swap demande la signature Phantom. Budget appliqué côté UI + log backend.</div><div class="small" style="margin-top:6px" id="statusLine">Ready.</div></div><div id="box"><h3>Trades / Log</h3><div class="row3"><button id="btnHealth">GET health</button><button id="btnStatus">GET status</button><button id="btnPing">GET ping</button></div><div style="height:10px"></div><div id="log"></div></div></div></div></div><script>/* Buffer polyfill minimal */(()=>{try{if(!globalThis.global)globalThis.global=globalThis;if(!globalThis.process)globalThis.process={env:{}};if(!globalThis.Buffer){const B={from:(u)=>u,alloc:(n)=>new Uint8Array(n)};globalThis.Buffer=B;globalThis.global.Buffer=B;}}catch(e){}})();</script><script src="https://cdn.jsdelivr.net/npm/@solana/web3.js@1.95.3/lib/index.iife.min.js"></script><script>(()=>{const $=s=>document.querySelector(s);const logEl=$("#log");const apiP=$("#api"),monP=$("#mon"),st=$("#statusLine");const SOL=$("#sol"),USDC=$("#usdc"),BUD=$("#budget"),CH=$("#chunk"),MINT=$("#mint"),MODE=$("#mode");const btnConn=$("#btnConn"),btnDisc=$("#btnDisc"),btnSave=$("#btnSave"),btnStart=$("#btnStart"),btnStop=$("#btnStop");const btnHealth=$("#btnHealth"),btnStatus=$("#btnStatus"),btnPing=$("#btnPing");const RPC="https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac";const USDC_MINT="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1";const PROXY_BASE="https://bbtrader-jup.paycashnostory.workers.dev";const API_BASE="/wolverine/api";let conn=null,wallet=null,autoon=false,spent=0;const LS=(k,v)=>v===undefined?localStorage.getItem(k):localStorage.setItem(k,v);const j=(o)=>JSON.stringify(o);const sleep=(ms)=>new Promise(r=>setTimeout(r,ms));function L(x,cls){const t=new Date().toISOString();logEl.textContent+=`[${t}] ${x}\n`;logEl.scrollTop=1e9;if(cls){}}function setLine(x){st.textContent=x;}async function api(path,opts){const r=await fetch(API_BASE+path,{...opts,headers:{...(opts&&opts.headers||{}),"content-type":"application/json"}});const tx=await r.text();let jsn=null;try{jsn=JSON.parse(tx);}catch(e){}return {ok:r.ok,code:r.status,text:tx,json:jsn};}function hasPhantom(){return !!(window.solana&&window.solana.isPhantom);}async function connect(){if(!hasPhantom()){L("Phantom absent","bad");setLine("Phantom absent.");return;}wallet=(await window.solana.connect({onlyIfTrusted:false})).publicKey;L("Connected: "+wallet.toBase58(),"ok");setLine("Connected.");await refresh();}async function disconnect(){try{await window.solana.disconnect();}catch(e){}wallet=null;L("Disconnected");setLine("Disconnected.");SOL.value="";USDC.value="";}async function refresh(){if(!wallet)return;conn=new solanaWeb3.Connection(RPC,"confirmed");const lam=await conn.getBalance(wallet,"confirmed");SOL.value=(lam/1e9).toFixed(4);let us=0;try{const owner=wallet;const resp=await conn.getParsedTokenAccountsByOwner(owner,{programId:new solanaWeb3.PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")});for(const it of resp.value){const info=it.account.data.parsed.info;const mint=info.mint;const amt=+info.tokenAmount.uiAmount||0;if(mint===USDC_MINT)us+=amt;} }catch(e){L("USDC fetch err: "+e,"bad");}USDC.value=us.toFixed(2);}function budget(){return Math.max(0,+(LS("WOLV_BUDGET")||BUD.value||0));}function chunk(){return Math.max(0.01,+(LS("WOLV_CHUNK")||CH.value||1));}function mint(){return (LS("WOLV_MINT")||MINT.value||"").trim();}function mode(){return MODE.value||"safe";}btnSave.onclick=()=>{LS("WOLV_BUDGET",String(+BUD.value||0));LS("WOLV_CHUNK",String(+CH.value||1));LS("WOLV_MINT",String(MINT.value||""));L("Saved settings");setLine("Saved.");};btnConn.onclick=connect;btnDisc.onclick=disconnect;btnHealth.onclick=async()=>{const r=await api("/health",{method:"GET"});L("health "+r.code+" "+(r.json?j(r.json):r.text.slice(0,120)));};btnStatus.onclick=async()=>{const r=await api("/status",{method:"GET"});L("status "+r.code+" "+(r.json?j(r.json.state||r.json):r.text.slice(0,120)));};btnPing.onclick=async()=>{const r=await api("/ping",{method:"GET"});L("ping "+r.code+" "+r.text.trim());};async function jupQuote(inMint,outMint,amount){const u=`${PROXY_BASE}/v6/quote?inputMint=${inMint}&outputMint=${outMint}&amount=${amount}&slippageBps=100&onlyDirectRoutes=false`;const r=await fetch(u,{method:"GET"});if(!r.ok)throw new Error("quote "+r.status);return await r.json();}async function jupSwap(q){const r=await fetch(`${PROXY_BASE}/v6/swap`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({quoteResponse:q,userPublicKey:wallet.toBase58(),wrapAndUnwrapSol:true,useSharedAccounts:true,prioritizationFeeLamports:"auto"})});if(!r.ok)throw new Error("swap "+r.status);return await r.json();}async function signSend(swapTxB64){const b=Uint8Array.from(atob(swapTxB64),c=>c.charCodeAt(0));let tx=null;try{if(solanaWeb3.VersionedTransaction){tx=solanaWeb3.VersionedTransaction.deserialize(b);}else{tx=solanaWeb3.Transaction.from(b);} }catch(e){tx=solanaWeb3.Transaction.from(b);}if(window.solana.signAndSendTransaction){const sig=await window.solana.signAndSendTransaction(tx,{skipPreflight:false,maxRetries:3});return sig.signature||sig;}const signed=await window.solana.signTransaction(tx);const sig=await conn.sendRawTransaction(signed.serialize(),{skipPreflight:false,maxRetries:3});return sig;}async function buyOnce(usdcAmt){if(!wallet)throw new Error("no wallet");const m=mint();if(!m)throw new Error("no mint");const amt=Math.floor(usdcAmt*1e6);if(amt<=0)throw new Error("amt<=0");L(`Quote USDC->TOKEN amt=${usdcAmt}`);const q=await jupQuote(USDC_MINT,m,amt);if(!q||!q.routePlan)throw new Error("no route");const sw=await jupSwap(q);if(!sw||!sw.swapTransaction)throw new Error("no swapTransaction");L("Open Phantom to sign...");const sig=await signSend(sw.swapTransaction);L("Sent tx: "+sig,"ok");await api("/log",{method:"POST",body:j({type:"swap",usdc:usdcAmt,signature:sig,mint:m,wallet:wallet.toBase58()})});return sig;}async function loop(){const b=budget();if(b<=0){L("Budget invalid","bad");return;}if(!wallet){L("Connect Phantom first","bad");return;}spent=0;const cfg={budgetUSDC:b,mode:mode(),mint:mint(),wallet:wallet.toBase58()};const r=await api("/traderone/start",{method:"POST",body:j(cfg)});L("Backend start: "+r.code+" "+(r.json?j(r.json.ok):r.text.slice(0,60)));autoon=true;setLine("Running...");while(autoon){await refresh();const remain=Math.max(0,b-spent);apiP.textContent="API: OK";const c=Math.min(chunk(),remain);if(c<=0.0001){L("Budget reached. Stop.","ok");break;}try{await buyOnce(c);spent+=c;L(`Spent ${spent.toFixed(2)} / ${b.toFixed(2)} USDC`);setLine(`Spent ${spent.toFixed(2)} / ${b.toFixed(2)} USDC`);}catch(e){L("Buy error: "+e,"bad");setLine("Buy error. Waiting...");await sleep(5000);}await sleep(2500);}autoon=false;await api("/traderone/stop",{method:"POST",body:j({wallet:wallet?wallet.toBase58():""})});setLine("Stopped.");}btnStart.onclick=()=>{try{loop();}catch(e){L(String(e),"bad");}};btnStop.onclick=()=>{autoon=false;L("Stop requested");};(async()=>{BUD.value=LS("WOLV_BUDGET")||"";CH.value=LS("WOLV_CHUNK")||"5";MINT.value=LS("WOLV_MINT")||"";try{const r=await api("/health",{method:"GET"});apiP.textContent="API: "+(r.ok?"OK":"ERR");}catch(e){apiP.textContent="API: ERR";}setInterval(async()=>{try{const r=await api("/status",{method:"GET"});const eff=r.json&&r.json.state&&r.json.state.monitor&&r.json.state.monitor.effective;monP.textContent="MON: "+(eff||"?");}catch(e){monP.textContent="MON: ?";}},5000);})();})();</script></body></html>
+HTML
+
+# nginx snippet for /wolverine
 SNIP_CONTENT="# $MARK
-# TraderOne API sous Wolverine
-location ^~ /wolverine/traderone/api/ {
+location = /wolverine { return 301 /wolverine/; }
+
+location ^~ /wolverine/api/ {
   proxy_http_version 1.1;
   proxy_set_header Host \$host;
   proxy_set_header X-Real-IP \$remote_addr;
   proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
   proxy_set_header X-Forwarded-Proto \$scheme;
-  proxy_set_header Upgrade \$http_upgrade;
-  proxy_set_header Connection \"upgrade\";
   proxy_read_timeout 120s;
   proxy_send_timeout 120s;
-  proxy_pass http://127.0.0.1:$TR_PORT/;
+  proxy_redirect off;
+  rewrite ^/wolverine/api/?(.*)$ /\$1 break;
+  proxy_pass http://127.0.0.1:$PORT;
 }
-"
-# add TraderOne UI serving only if TR_FRONT detected
-if [ -n "${TR_FRONT:-}" ]; then
-SNIP_CONTENT="$SNIP_CONTENT
-# TraderOne UI (optionnel) sous Wolverine
-location = /wolverine/traderone { return 301 /wolverine/traderone/; }
-location ^~ /wolverine/traderone/ {
-  alias $TR_FRONT/;
-  try_files \$uri \$uri/ /wolverine/traderone/index.html;
-}
-"
-fi
 
+location ^~ /wolverine/ {
+  alias $FRONT_DIR/;
+  try_files \$uri \$uri/ /wolverine/index.html;
+}
+"
 askorupdate_file "$SNIP" "$SNIP_CONTENT"
 
-# safe nginx edit (per ta procédure)
+# Inject include in vhost if missing
 chattr -i /etc/nginx/nginx.conf "$SITE" 2>/dev/null || true
-
+cp -a "$SITE" "$SITE.bak.$(date +%s)"
 if ! grep -q "$MARK" "$SITE"; then
-  cp -a "$SITE" "$SITE.bak.$(date +%s)"
   awk -v snip="$SNIP" -v mark="$MARK" '
-    BEGIN{inserver=0;done=0}
-    {
-      line=$0
-      if(line ~ /^[ \t]*server[ \t]*\{/ && !inserver){inserver=1}
-      if(inserver && !done && line ~ /^[ \t]*\}/){
-        print "    include " snip "; # " mark
-        done=1
-      }
-      print line
-      if(inserver && line ~ /^[ \t]*\}/){inserver=0}
-    }
-  ' "$SITE" >"$SITE.tmp"
-  mv "$SITE.tmp" "$SITE"
+    BEGIN{done=0}
+    {print}
+    (!done && $0 ~ /server_name/ && $0 ~ /fireinners\.online/){ print "    include " snip "; # " mark; done=1 }
+  ' "$SITE" >"$SITE.tmp" && mv "$SITE.tmp" "$SITE"
 fi
 
 nginx -t
 systemctl reload nginx
-
 chattr +i /etc/nginx/nginx.conf "$SITE" 2>/dev/null || true
 
 say "=== TESTS ==="
-say "UI Wolverine:"
-curl -ksS --max-time 6 "https://fireinners.online/wolverine/" | head -c 120 || true
-echo
-say "API TraderOne (proxy) (peut retourner 404 si pas de route /):"
-curl -ksS --max-time 6 "https://fireinners.online/wolverine/traderone/api/" | head -c 160 || true
-echo
-if [ -n "${TR_FRONT:-}" ]; then
-  say "UI TraderOne:"
-  curl -ksS --max-time 6 "https://fireinners.online/wolverine/traderone/" | head -c 120 || true
-  echo
-fi
+say "Backend local:"
+curl -sS --max-time 3 http://127.0.0.1:$PORT/health || true; echo
+say "Public ping:"
+curl -ksS --max-time 5 https://fireinners.online/wolverine/api/ping || true; echo
+say "Open:"
+say "https://fireinners.online/wolverine/"
 say "DONE."
 SH
-chmod +x /tmp/WOLVERINE_ONEURL_NGX.sh
-bash /tmp/WOLVERINE_ONEURL_NGX.sh
+chmod +x /tmp/MEGA_WOLVERINE_INSTALL.sh
+bash /tmp/MEGA_WOLVERINE_INSTALL.sh
