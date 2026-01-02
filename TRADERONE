@@ -1,54 +1,162 @@
-cat >/tmp/TRADERONE_FULLSTACK_WOLVERINE.sh <<'SH'
+cat >/tmp/TRADERONE_WOLVERINE_FULL.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-TR_DIR="/opt/traderone-opt"
-PORT="8585"
+# ====== CONFIG ======
+DOMAIN="fireinners.online"
+PING_WOLV="https://fireinners.online/wolverine/api/ping"
 
-WEB_ROOT="/opt/fireinners/frontend-react/app/dist/wolverine"
-TO_PUBLIC="$WEB_ROOT/traderone"        # front statique servi par nginx
-TO_BACK="$TR_DIR/backend"             # backend node ici (tu peux changer)
+TR_DIR="/opt/traderone-opt"                    # code backend ici
+TR_PUBLIC_DIR="$TR_DIR/public"                 # front source (sera copié)
+BACK_ENTRY="$TR_DIR/server.js"
+
+# dossier web où /wolverine est servi (par défaut)
+WOLV_WEB="/opt/fireinners/frontend-react/app/dist/wolverine"
+TO_WEB="$WOLV_WEB/traderone"
+
+PORT="8585"
+HOST="127.0.0.1"
 
 NGX_SITE="/etc/nginx/sites-available/fireinners.online-ssl"
 SNIP="/etc/nginx/snippets/wolverine_traderone_backend.conf"
 MARK="TRADERONE_WOLV_PROXY_V1"
 
+# injection optionnelle dans l’UI existante
+INJECT_MARK="WOLV_TRADERONE_INJECT_V1"
+
 say(){ printf "%s\n" "$*"; }
 need(){ command -v "$1" >/dev/null 2>&1 || { say "ERREUR: $1 manquant"; exit 1; }; }
 
-need nginx; need systemctl; need node; need npm; need curl; need awk; need sed; need grep; need mkdir; need cp
+need bash
+need nginx
+need systemctl
+need node
+need npm
+need curl
+need awk
+need sed
+need grep
+need rsync
+need find
 
 say "=== PRE-FLIGHT ==="
 say "host=$(hostname) user=$(whoami) date=$(date -u +%FT%TZ)"
 say "TR_DIR=$TR_DIR"
-say "WEB_ROOT=$WEB_ROOT"
-say "PORT=$PORT"
-say "==============="
+say "WOLV_WEB=$WOLV_WEB"
+say "PORT=$PORT HOST=$HOST"
+[ -f "$NGX_SITE" ] || { say "ERREUR: nginx site absent: $NGX_SITE"; exit 1; }
+mkdir -p "$TR_DIR" "$TR_PUBLIC_DIR" "$TO_WEB" "$WOLV_WEB"
 
-mkdir -p "$TR_DIR" "$TO_BACK" "$TO_PUBLIC"
+# ====== 1) BACKEND FILES ======
+say "=== WRITE BACKEND FILES ==="
 
-# ---------- FRONT (HTML) ----------
-cat >"$TO_PUBLIC/index.html" <<'HTML'
+cat >"$TR_DIR/package.json" <<'JSON'
+{
+  "name": "traderone-backend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "dependencies": {
+    "express": "^4.19.2",
+    "ws": "^8.18.0"
+  }
+}
+JSON
+
+cat >"$TR_DIR/.env" <<EOF
+HOST=$HOST
+PORT=$PORT
+MODE=paper
+NETWORK=solana
+EOF
+
+cat >"$BACK_ENTRY" <<'JS'
+'use strict';
+
+const express = require('express');
+const http = require('http');
+const path = require('path');
+
+const { WebSocketServer } = require('ws');
+
+const app = express();
+app.disable('x-powered-by');
+app.use(express.json({ limit: '2mb' }));
+
+// ===== Static front (public/) =====
+const PUBLIC_DIR = path.join(__dirname, 'public');
+app.use('/', express.static(PUBLIC_DIR, { maxAge: '1h', etag: true }));
+
+// ===== API =====
+app.get('/health', (req, res) => res.status(200).send('ok'));
+
+app.get('/api/health', (req, res) => {
+  res.json({ ok: true, service: 'traderone', ts: new Date().toISOString() });
+});
+
+app.get('/api/status', (req, res) => {
+  res.json({
+    ok: true,
+    mode: process.env.MODE || 'paper',
+    network: process.env.NETWORK || 'solana',
+    ts: new Date().toISOString()
+  });
+});
+
+// Stubs (remplace par tes vraies fonctions)
+app.post('/api/start', (req, res) => res.json({ ok: true, started: true, params: req.body || {} }));
+app.post('/api/stop',  (req, res) => res.json({ ok: true, stopped: true }));
+app.post('/api/swap',  (req, res) => res.json({ ok: true, simulated: true, request: req.body || {} }));
+
+// SPA fallback
+app.get('*', (req, res) => res.sendFile(path.join(PUBLIC_DIR, 'index.html')));
+
+const HOST = process.env.HOST || '127.0.0.1';
+const PORT = parseInt(process.env.PORT || '8585', 10);
+
+const server = http.createServer(app);
+
+// ===== WebSocket (optionnel) =====
+const wss = new WebSocketServer({ server, path: '/ws' });
+wss.on('connection', (ws) => {
+  ws.send(JSON.stringify({ type: 'hello', ts: new Date().toISOString() }));
+  ws.on('message', (msg) => {
+    ws.send(JSON.stringify({ type: 'echo', msg: msg.toString() }));
+  });
+});
+
+server.listen(PORT, HOST, () => {
+  console.log(`[TraderOne] listening on http://${HOST}:${PORT}`);
+});
+JS
+
+# ====== 2) FRONT FILES (public/) ======
+say "=== WRITE FRONT FILES ==="
+
+cat >"$TR_PUBLIC_DIR/index.html" <<'HTML'
 <!doctype html>
 <html lang="fr">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>TraderOne • FireInners</title>
+  <title>TraderOne</title>
   <style>
-    :root{--bg:#070a12;--p:#0c1222;--l:#1b2a44;--t:#e7f0ff;--m:#9fb3d7;--a:#9ff}
+    :root{--bg:#070a12;--p:#0c1222;--l:#1b2a44;--t:#e7f0ff;--m:#9fb3d7;--a:#9ff;--ok:#b9ffcf;--bad:#ffb3b3}
     *{box-sizing:border-box}
     html,body{margin:0;height:100%;background:var(--bg);color:var(--t);font:14px system-ui}
-    header{padding:14px;border-bottom:1px solid rgba(27,42,68,.7);background:#070a12cc;backdrop-filter:blur(10px);position:sticky;top:0}
+    header{position:sticky;top:0;background:#070a12cc;backdrop-filter:blur(10px);border-bottom:1px solid rgba(27,42,68,.7);padding:14px}
+    main{padding:14px}
     .wrap{max-width:1100px;margin:0 auto}
     .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;justify-content:space-between}
+    .card{background:linear-gradient(180deg,rgba(12,18,34,.85),rgba(7,10,20,.75));border:1px solid rgba(27,42,68,.7);border-radius:16px;padding:14px}
     .pill{display:inline-flex;gap:8px;align-items:center;padding:8px 10px;border-radius:999px;border:1px solid rgba(27,42,68,.7);background:rgba(12,18,34,.55)}
     button{border:1px solid rgba(27,42,68,.85);background:#0b1222;color:var(--t);padding:10px 12px;border-radius:12px;cursor:pointer}
     button:hover{filter:brightness(1.08)}
+    input{background:#05060b;color:var(--t);border:1px solid rgba(27,42,68,.85);border-radius:12px;padding:10px 12px}
+    pre{white-space:pre-wrap;background:#060812;border:1px solid rgba(27,42,68,.65);border-radius:12px;padding:10px;min-height:120px;color:#cfe0ff}
     a{color:var(--a);text-decoration:none} a:hover{text-decoration:underline}
-    main{padding:14px}
-    .card{border:1px solid rgba(27,42,68,.7);border-radius:16px;padding:14px;background:linear-gradient(180deg,rgba(12,18,34,.85),rgba(7,10,20,.75))}
-    pre{white-space:pre-wrap;background:#060812;border:1px solid rgba(27,42,68,.65);border-radius:12px;padding:10px;min-height:90px}
   </style>
 </head>
 <body>
@@ -59,13 +167,20 @@ cat >"$TO_PUBLIC/index.html" <<'HTML'
           <div style="font-weight:850;letter-spacing:.6px">TraderOne</div>
           <div style="color:var(--m);font-size:12px">Front: /wolverine/traderone • API: /wolverine/traderone/api</div>
         </div>
-        <div class="pill">API Status: <b id="st">?</b></div>
+        <div class="pill">API: <b id="st">?</b></div>
       </div>
+
       <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
-        <button id="bHealth">GET /api/health</button>
-        <button id="bInfo">GET /api/info</button>
-        <button id="bTrades">GET /api/trades</button>
-        <button id="bPingW">GET /wolverine/api/ping</button>
+        <button id="bHealth">GET health</button>
+        <button id="bStatus">GET status</button>
+        <button id="bStart">POST start</button>
+        <button id="bStop">POST stop</button>
+        <button id="bPingW">GET wolverine ping</button>
+      </div>
+
+      <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
+        <input id="budget" placeholder="Budget USDC (ex: 50)" />
+        <input id="mode" placeholder="Mode (safe/dca/...)" />
       </div>
     </div>
   </header>
@@ -81,111 +196,65 @@ cat >"$TO_PUBLIC/index.html" <<'HTML'
     </div>
   </main>
 
-<script>
-(() => {
-  const $ = s => document.querySelector(s);
-  const log = $("#log");
-  const st = $("#st");
-
-  const api = (p) => `/wolverine/traderone/api${p}`;
-  const wolverinePing = `/wolverine/api/ping`;
-
-  function write(line){
-    log.textContent = (new Date().toISOString()+"  "+line+"\n"+log.textContent).slice(0,8000);
-  }
-  function setStatus(ok){ st.textContent = ok ? "UP" : "DOWN"; st.style.color = ok ? "#b9ffcf" : "#ffb3b3"; }
-
-  async function req(url){
-    try{
-      const r = await fetch(url,{cache:"no-store"});
-      const t = await r.text();
-      write(`${r.status} ${url} :: ${t.slice(0,240)}`);
-      setStatus(r.ok);
-    }catch(e){
-      write(`ERR ${url} :: ${String(e).slice(0,240)}`);
-      setStatus(false);
-    }
-  }
-
-  $("#bHealth").onclick = () => req(api("/health"));
-  $("#bInfo").onclick   = () => req(api("/info"));
-  $("#bTrades").onclick = () => req(api("/trades"));
-  $("#bPingW").onclick  = () => req(wolverinePing);
-
-  // auto-check
-  req(api("/health"));
-})();
-</script>
+<script src="./app.js"></script>
 </body>
 </html>
 HTML
 
-# ---------- BACKEND (Node/Express) ----------
-cat >"$TO_BACK/package.json" <<'JSON'
-{
-  "name": "traderone-backend",
-  "version": "1.0.0",
-  "private": true,
-  "type": "commonjs",
-  "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  },
-  "dependencies": {
-    "express": "^4.19.2",
-    "cors": "^2.8.5"
+cat >"$TR_PUBLIC_DIR/app.js" <<'JS'
+// IMPORTANT: derrière nginx => même domaine => pas de CORS.
+// BASE = /wolverine/traderone/api  (proxifié vers localhost)
+const BASE = "/wolverine/traderone/api";
+
+const logEl = document.getElementById("log");
+const stEl = document.getElementById("st");
+const log = (t) => {
+  logEl.textContent = (new Date().toISOString()+"  "+t+"\n"+logEl.textContent).slice(0, 12000);
+};
+const setStatus = (ok) => {
+  stEl.textContent = ok ? "UP" : "DOWN";
+  stEl.style.color = ok ? "#b9ffcf" : "#ffb3b3";
+};
+
+async function req(method, url, body){
+  try{
+    const r = await fetch(url, {
+      method,
+      headers: body ? { "content-type": "application/json" } : undefined,
+      body: body ? JSON.stringify(body) : undefined,
+      cache: "no-store"
+    });
+    const txt = await r.text();
+    let out = txt;
+    try { out = JSON.stringify(JSON.parse(txt)); } catch {}
+    log(`${r.status} ${method} ${url} :: ${out.slice(0, 260)}`);
+    setStatus(r.ok);
+  }catch(e){
+    log(`ERR ${method} ${url} :: ${String(e).slice(0, 260)}`);
+    setStatus(false);
   }
 }
-JSON
 
-cat >"$TO_BACK/server.js" <<'JS'
-const express = require("express");
-const cors = require("cors");
+document.getElementById("bHealth").onclick = () => req("GET",  `${BASE}/health`);
+document.getElementById("bStatus").onclick = () => req("GET",  `${BASE}/status`);
+document.getElementById("bStart").onclick  = () => {
+  const budget = document.getElementById("budget").value || "0";
+  const mode   = document.getElementById("mode").value || "safe";
+  return req("POST", `${BASE}/start`, { budget, mode });
+};
+document.getElementById("bStop").onclick   = () => req("POST", `${BASE}/stop`, {});
+document.getElementById("bPingW").onclick  = () => req("GET",  `/wolverine/api/ping`);
 
-const app = express();
-
-// IMPORTANT: on est derrière nginx sur le même domaine, donc CORS pas nécessaire.
-// Je le laisse permissif au cas où tu testes en local.
-app.use(cors());
-app.use(express.json({ limit: "1mb" }));
-
-// Health check
-app.get("/health", (req, res) => res.status(200).send("ok"));
-
-// Info
-app.get("/info", (req, res) => {
-  res.json({
-    name: "TraderOne Backend",
-    ok: true,
-    time: new Date().toISOString()
-  });
-});
-
-// Exemple trades (stub) — remplace par ta logique réelle
-app.get("/trades", (req, res) => {
-  res.json({
-    ok: true,
-    items: [],
-    note: "stub endpoint - branche ta DB/engine ici"
-  });
-});
-
-// 404
-app.use((req, res) => res.status(404).json({ ok: false, error: "not_found", path: req.path }));
-
-const HOST = process.env.HOST || "127.0.0.1";
-const PORT = parseInt(process.env.PORT || "8585", 10);
-
-app.listen(PORT, HOST, () => {
-  console.log(`[TraderOne] listening on http://${HOST}:${PORT}`);
-});
+req("GET", `${BASE}/health`);
 JS
 
-# install deps
-cd "$TO_BACK"
+# ====== 3) NPM INSTALL ======
+say "=== NPM INSTALL (backend deps) ==="
+cd "$TR_DIR"
 npm install --omit=dev
 
-# ---------- SYSTEMD ----------
+# ====== 4) SYSTEMD SERVICE ======
+say "=== SYSTEMD traderone.service ==="
 cat >/etc/systemd/system/traderone.service <<EOF
 [Unit]
 Description=TraderOne Backend (localhost)
@@ -193,11 +262,9 @@ After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=$TO_BACK
-Environment=NODE_ENV=production
-Environment=HOST=127.0.0.1
-Environment=PORT=$PORT
-ExecStart=/usr/bin/node $TO_BACK/server.js
+WorkingDirectory=$TR_DIR
+EnvironmentFile=$TR_DIR/.env
+ExecStart=/usr/bin/node $BACK_ENTRY
 Restart=always
 RestartSec=2
 User=root
@@ -210,7 +277,13 @@ systemctl daemon-reload
 systemctl enable --now traderone.service
 systemctl restart traderone.service
 
-# ---------- NGINX SNIPPET (proxy API) ----------
+# ====== 5) COPY FRONT => /wolverine/traderone/ ======
+say "=== COPY FRONT => $TO_WEB ==="
+mkdir -p "$TO_WEB"
+rsync -a --delete "$TR_PUBLIC_DIR/." "$TO_WEB/."
+
+# ====== 6) NGINX PROXY SNIPPET ======
+say "=== NGINX SNIPPET + INCLUDE ==="
 cat >"$SNIP" <<EOF
 # $MARK
 location ^~ /wolverine/traderone/api/ {
@@ -219,16 +292,17 @@ location ^~ /wolverine/traderone/api/ {
   proxy_set_header X-Real-IP \$remote_addr;
   proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
   proxy_set_header X-Forwarded-Proto \$scheme;
+  proxy_set_header Upgrade \$http_upgrade;
+  proxy_set_header Connection "upgrade";
   proxy_read_timeout 120s;
   proxy_send_timeout 120s;
 
-  # /wolverine/traderone/api/*  ---> http://127.0.0.1:$PORT/*
+  # strip prefix so /wolverine/traderone/api/x -> http://127.0.0.1:$PORT/x
   rewrite ^/wolverine/traderone/api/?(.*)$ /\$1 break;
-  proxy_pass http://127.0.0.1:$PORT;
+  proxy_pass http://$HOST:$PORT;
 }
 EOF
 
-# include snippet in site config (idempotent)
 if ! grep -q "$MARK" "$NGX_SITE"; then
   cp -a "$NGX_SITE" "$NGX_SITE.bak.$(date +%s)"
   awk -v snip="$SNIP" -v mark="$MARK" '
@@ -249,13 +323,43 @@ fi
 nginx -t
 systemctl reload nginx
 
+# ====== 7) OPTIONAL INJECT BUTTON INTO /wolverine/index.html ======
+IDX="$WOLV_WEB/index.html"
+if [ -f "$IDX" ]; then
+  if grep -q "$INJECT_MARK" "$IDX"; then
+    say "Inject button déjà présent: OK"
+  else
+    say "Inject button TraderOne into $IDX"
+    cp -a "$IDX" "$IDX.bak.$(date +%s)"
+    INJ='<!-- WOLV_TRADERONE_INJECT_V1 --><style id="wolv_traderone_css">#wolvTO_btn{position:fixed;right:14px;bottom:14px;z-index:99999;border:1px solid rgba(255,255,255,.18);background:rgba(10,18,34,.88);color:#e7f0ff;padding:10px 12px;border-radius:14px;cursor:pointer;font:14px system-ui;backdrop-filter:blur(10px);box-shadow:0 12px 30px rgba(0,0,0,.35)}#wolvTO_btn:hover{filter:brightness(1.08)}#wolvTO_modal{display:none;position:fixed;inset:0;z-index:99998;background:rgba(0,0,0,.72);backdrop-filter:blur(8px)}#wolvTO_card{position:absolute;inset:16px;border-radius:16px;overflow:hidden;border:1px solid rgba(255,255,255,.15);background:#05060b;box-shadow:0 18px 70px rgba(0,0,0,.6)}#wolvTO_ifr{width:100%;height:100%;border:0;background:#05060b}#wolvTO_bar{position:absolute;left:12px;top:12px;right:12px;display:flex;gap:8px;justify-content:flex-end;z-index:2}#wolvTO_bar button{border:1px solid rgba(255,255,255,.18);background:rgba(10,18,34,.88);color:#e7f0ff;padding:8px 10px;border-radius:12px;cursor:pointer;font:13px system-ui}#wolvTO_bar button:hover{filter:brightness(1.08)}</style><div id="wolvTO_modal"><div id="wolvTO_card"><div id="wolvTO_bar"><button id="wolvTO_open">Ouvrir</button><button id="wolvTO_close">Fermer</button></div><iframe id="wolvTO_ifr" src="/wolverine/traderone/"></iframe></div></div><button id="wolvTO_btn">TraderOne</button><script id="wolv_traderone_js">(()=>{const M=document.getElementById("wolvTO_modal"),B=document.getElementById("wolvTO_btn"),C=document.getElementById("wolvTO_close"),O=document.getElementById("wolvTO_open");if(!M||!B||!C||!O)return;const show=()=>{M.style.display="block"};const hide=()=>{M.style.display="none"};B.addEventListener("click",show);C.addEventListener("click",hide);O.addEventListener("click",()=>window.open("/wolverine/traderone/","_blank"));M.addEventListener("click",(e)=>{if(e.target===M)hide()});document.addEventListener("keydown",(e)=>{if(e.key==="Escape")hide()});})();</script>'
+    if grep -qi '</body>' "$IDX"; then
+      awk -v inj="$INJ" 'BEGIN{IGNORECASE=1} { if($0 ~ /<\/body>/ && !done){print inj; done=1} print } END{ if(!done) print inj }' "$IDX" >"$IDX.tmp"
+      mv "$IDX.tmp" "$IDX"
+    else
+      printf "%s\n" "$INJ" >>"$IDX"
+    fi
+  fi
+else
+  say "INFO: pas de $IDX => pas d’injection bouton (OK)"
+fi
+
+# ====== 8) TESTS ======
 say "=== TESTS ==="
-say "local backend:"
-curl -sS --max-time 5 "http://127.0.0.1:$PORT/health" ; echo
-say "public proxy:"
-curl -ksS --max-time 6 "https://fireinners.online/wolverine/traderone/api/health" ; echo
-say "front:"
-curl -ksS --max-time 6 "https://fireinners.online/wolverine/traderone/" | head -c 80 ; echo
-say "DONE."
+say "[local backend] http://$HOST:$PORT/api/health"
+curl -sS --max-time 5 "http://$HOST:$PORT/api/health" ; echo
+
+say "[public proxy] https://$DOMAIN/wolverine/traderone/api/health"
+curl -ksS --max-time 6 "https://$DOMAIN/wolverine/traderone/api/health" ; echo
+
+say "[front] https://$DOMAIN/wolverine/traderone/"
+curl -ksS --max-time 6 "https://$DOMAIN/wolverine/traderone/" | head -c 80 ; echo
+
+say "[wolverine ping] $PING_WOLV"
+curl -ksS --max-time 6 "$PING_WOLV" | head -c 80 ; echo
+
+say "=== DONE ==="
+say "Service: systemctl status traderone.service --no-pager"
+say "Logs:    journalctl -u traderone.service -f --no-pager"
 SH
-bash /tmp/TRADERONE_FULLSTACK_WOLVERINE.sh
+
+bash /tmp/TRADERONE_WOLVERINE_FULL.sh
