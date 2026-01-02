@@ -1,1 +1,68 @@
-nginx -t 2>&1 | sed -n '1,120p'
+set -euo pipefail
+VHOST=/etc/nginx/sites-available/fireinners.online-ssl
+ROOT=/opt/fireinners/frontend-react/app/dist
+TS="$(date +%Y%m%d-%H%M%S)"
+echo "VHOST=$VHOST"
+echo "ROOT=$ROOT"
+
+echo "== unlock (if immutable) =="
+chattr -i /etc/nginx/nginx.conf "$VHOST" 2>/dev/null || true
+
+echo "== save current vhost (broken copy) =="
+cp -a "$VHOST" "/root/fireinners.online-ssl.current.$TS" 2>/dev/null || true
+
+echo "== find backups =="
+mapfile -t BAKS < <(ls -1t "${VHOST}.bak."* 2>/dev/null || true)
+if [ "${#BAKS[@]}" -eq 0 ]; then
+  echo "ERR: no backups found at ${VHOST}.bak.*"
+  exit 1
+fi
+printf "Found %s backups\n" "${#BAKS[@]}"
+echo "Newest: ${BAKS[0]}"
+
+echo "== try restore backups until nginx -t OK =="
+OK=0
+for b in "${BAKS[@]}"; do
+  echo "-- trying: $b"
+  cp -a "$b" "$VHOST"
+  if nginx -t >/dev/null 2>&1; then
+    echo "OK: nginx -t passed with $b"
+    OK=1
+    break
+  else
+    echo "fail with $b"
+  fi
+done
+
+if [ "$OK" -ne 1 ]; then
+  echo "ERR: none of the backups fixed nginx -t"
+  echo "nginx -t output:"
+  nginx -t 2>&1 | sed -n '1,120p' || true
+  echo "restoring original current copy..."
+  cp -a "/root/fireinners.online-ssl.current.$TS" "$VHOST" 2>/dev/null || true
+  chattr +i /etc/nginx/nginx.conf "$VHOST" 2>/dev/null || true
+  exit 1
+fi
+
+echo "== ensure vhost enabled (symlink) =="
+ln -sf "$VHOST" /etc/nginx/sites-enabled/fireinners.online-ssl
+
+echo "== create /stats/index.json (static) =="
+mkdir -p "$ROOT/stats"
+cat >"$ROOT/stats/index.json"<<JSON
+{"ok":true,"service":"wolfchain-ui","ts":"$(date -u +%FT%TZ)"}
+JSON
+chmod 755 "$ROOT" "$ROOT/stats" 2>/dev/null || true
+chmod 644 "$ROOT/stats/index.json" 2>/dev/null || true
+
+echo "== reload nginx =="
+nginx -t
+systemctl reload nginx
+
+echo "== test =="
+curl -k -sS -i https://127.0.0.1/stats/index.json -H 'Host: fireinners.online' | sed -n '1,25p'
+
+echo "== re-lock =="
+chattr +i /etc/nginx/nginx.conf "$VHOST" 2>/dev/null || true
+
+echo "DONE"
