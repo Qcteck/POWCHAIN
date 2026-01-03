@@ -1,42 +1,58 @@
-cat >/tmp/WOLVERINE_REBUILD_WEB3_OK.sh <<'SH'
+cat >/tmp/WOLVERINE_FIX_STATIC_WOLVERINE_NGINX.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 
+DOMAIN="fireinners.online"
 DOCROOT="/var/www/fireinners/wolverine"
-WORKDIR="/opt/traderone-opt"
+CONF="/etc/nginx/sites-available/fireinners.online"
 TS="$(date +%s)"
 
-mkdir -p "$DOCROOT"
-cd "$WORKDIR"
+echo "== 0) Sanity =="
+[ -d "$DOCROOT" ] || { echo "ERROR: DOCROOT missing: $DOCROOT"; exit 1; }
+[ -f "$DOCROOT/solana-web3.min.js" ] || { echo "ERROR: missing $DOCROOT/solana-web3.min.js"; exit 1; }
+[ -f "$CONF" ] || { echo "ERROR: missing nginx conf: $CONF"; exit 1; }
 
-# deps
-[ -f package.json ] || npm init -y >/dev/null
-npm i @solana/web3.js >/dev/null
-command -v esbuild >/dev/null 2>&1 || npm i -g esbuild >/dev/null
+echo "== 1) Quick local file check (first bytes) =="
+head -c 40 "$DOCROOT/solana-web3.min.js"; echo
+echo
 
-# entry INSIDE node_modules scope
-mkdir -p "$WORKDIR/build"
-cat >"$WORKDIR/build/solana-web3.entry.js" <<'JS'
-export * as solanaWeb3 from "@solana/web3.js";
-JS
+echo "== 2) Backup nginx conf =="
+cp -a "$CONF" "$CONF.bak.$TS"
 
-# build -> DOCROOT
-esbuild "$WORKDIR/build/solana-web3.entry.js" \
-  --bundle --minify --platform=browser \
-  --format=iife --global-name=solanaWeb3 \
-  --outfile="$DOCROOT/solana-web3.min.js"
+echo "== 3) Ensure /wolverine is served as STATIC (try_files) =="
+# On ajoute un bloc server minimal si besoin et un location /wolverine/ avec alias + try_files.
+# (On évite les regex: on append un bloc commenté si absent)
 
-chmod 644 "$DOCROOT/solana-web3.min.js"
+if ! grep -q "WOLVERINE_STATIC_BEGIN" "$CONF"; then
+cat >>"$CONF" <<NGINX
 
-echo "First bytes (must not start with '<'):"
-head -c 30 "$DOCROOT/solana-web3.min.js"; echo
-echo "OK -> $DOCROOT/solana-web3.min.js"
+  # WOLVERINE_STATIC_BEGIN
+  # Force static files under /wolverine/ (no proxy)
+  location ^~ /wolverine/ {
+    alias $DOCROOT/;
+    try_files \$uri \$uri/ =404;
+    add_header Cache-Control "no-store" always;
+  }
+  # WOLVERINE_STATIC_END
 
-nginx -t && systemctl reload nginx
+NGINX
+else
+  echo "WOLVERINE static block already present, skip append."
+fi
 
-echo "Test remote (must not return HTML):"
-curl -ksS "https://fireinners.online/wolverine/solana-web3.min.js?v=$TS" | head -c 30; echo
-echo "Open: https://fireinners.online/wolverine/?v=$TS"
+echo "== 4) Test nginx + reload =="
+nginx -t
+systemctl reload nginx
+
+echo
+echo "== 5) Remote tests (NO FLOOD) =="
+echo "-- headers:"
+curl -ksSI "https://${DOMAIN}/wolverine/solana-web3.min.js?v=$TS" | sed -n '1,25p'
+echo
+echo "-- first 60 bytes (must NOT start with '<'):"
+curl -ksS "https://${DOMAIN}/wolverine/solana-web3.min.js?v=$TS" | head -c 60; echo
+echo
+echo "DONE ✅ open: https://${DOMAIN}/wolverine/?v=$TS"
 SH
 
-bash /tmp/WOLVERINE_REBUILD_WEB3_OK.sh
+bash /tmp/WOLVERINE_FIX_STATIC_WOLVERINE_NGINX.sh
