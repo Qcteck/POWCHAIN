@@ -1,58 +1,63 @@
-cat >/tmp/WOLVERINE_FIX_STATIC_WOLVERINE_NGINX.sh <<'SH'
+cat >/tmp/WOLVERINE_NGINX_PERMISSION_FIX.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-DOMAIN="fireinners.online"
-DOCROOT="/var/www/fireinners/wolverine"
 CONF="/etc/nginx/sites-available/fireinners.online"
 TS="$(date +%s)"
 
-echo "== 0) Sanity =="
-[ -d "$DOCROOT" ] || { echo "ERROR: DOCROOT missing: $DOCROOT"; exit 1; }
-[ -f "$DOCROOT/solana-web3.min.js" ] || { echo "ERROR: missing $DOCROOT/solana-web3.min.js"; exit 1; }
-[ -f "$CONF" ] || { echo "ERROR: missing nginx conf: $CONF"; exit 1; }
-
-echo "== 1) Quick local file check (first bytes) =="
-head -c 40 "$DOCROOT/solana-web3.min.js"; echo
+echo "== WHOAMI / PERMS =="
+whoami || true
+id || true
 echo
 
-echo "== 2) Backup nginx conf =="
-cp -a "$CONF" "$CONF.bak.$TS"
+echo "== FILE PERMS =="
+ls -lah "$CONF" || { echo "MISSING: $CONF"; exit 1; }
+echo
 
-echo "== 3) Ensure /wolverine is served as STATIC (try_files) =="
-# On ajoute un bloc server minimal si besoin et un location /wolverine/ avec alias + try_files.
-# (On évite les regex: on append un bloc commenté si absent)
+echo "== IMMUTABLE ATTR? (lsattr) =="
+if command -v lsattr >/dev/null 2>&1; then
+  lsattr "$CONF" || true
+else
+  echo "lsattr not installed"
+fi
+echo
 
-if ! grep -q "WOLVERINE_STATIC_BEGIN" "$CONF"; then
-cat >>"$CONF" <<NGINX
+echo "== FS READ-ONLY? =="
+mount | grep -E ' on /(etc|) ' || true
+mount | grep -E ' on / ' || true
+echo
+
+echo "== TRY: remove immutable if present =="
+if command -v chattr >/dev/null 2>&1; then
+  chattr -i "$CONF" 2>/dev/null || true
+fi
+
+echo "== TRY BACKUP =="
+cp -a "$CONF" "$CONF.bak.$TS" || { echo "BACKUP FAILED (still permission issue)"; exit 2; }
+
+echo "== APPEND STATIC BLOCK (inside same conf file) =="
+if grep -q "WOLVERINE_STATIC_BEGIN" "$CONF"; then
+  echo "Static block already present -> OK"
+else
+  cat >>"$CONF" <<'NGINX'
 
   # WOLVERINE_STATIC_BEGIN
   # Force static files under /wolverine/ (no proxy)
   location ^~ /wolverine/ {
-    alias $DOCROOT/;
-    try_files \$uri \$uri/ =404;
+    alias /var/www/fireinners/wolverine/;
+    try_files $uri $uri/ =404;
     add_header Cache-Control "no-store" always;
   }
   # WOLVERINE_STATIC_END
 
 NGINX
-else
-  echo "WOLVERINE static block already present, skip append."
 fi
 
-echo "== 4) Test nginx + reload =="
+echo "== NGINX TEST + RELOAD =="
 nginx -t
 systemctl reload nginx
 
-echo
-echo "== 5) Remote tests (NO FLOOD) =="
-echo "-- headers:"
-curl -ksSI "https://${DOMAIN}/wolverine/solana-web3.min.js?v=$TS" | sed -n '1,25p'
-echo
-echo "-- first 60 bytes (must NOT start with '<'):"
-curl -ksS "https://${DOMAIN}/wolverine/solana-web3.min.js?v=$TS" | head -c 60; echo
-echo
-echo "DONE ✅ open: https://${DOMAIN}/wolverine/?v=$TS"
+echo "DONE ✅"
 SH
 
-bash /tmp/WOLVERINE_FIX_STATIC_WOLVERINE_NGINX.sh
+bash /tmp/WOLVERINE_NGINX_PERMISSION_FIX.sh
