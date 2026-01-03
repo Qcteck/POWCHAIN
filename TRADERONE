@@ -1,66 +1,46 @@
-cat >/tmp/WOLVERINE_PATCH_SERVERJS_SAFE.js <<'JS'
-const fs = require("fs");
+cat >/tmp/WOLVERINE_WHY_8585_NOT_LISTENING.sh <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
 
-const FILE = "/opt/traderone-opt/server.js";
-let s = fs.readFileSync(FILE, "utf8");
+SVC="traderone.service"
+FILE="/opt/traderone-opt/server.js"
 
-const bak = FILE + ".bak." + Date.now();
-fs.copyFileSync(FILE, bak);
-console.log("Backup:", bak);
+echo "== 1) MainPID + cmdline =="
+PID="$(systemctl show -p MainPID --value "$SVC")"
+echo "MainPID=$PID"
+[ "$PID" != "0" ] || { echo "Service pas démarré (MainPID=0)"; exit 1; }
+tr '\0' ' ' < "/proc/$PID/cmdline"; echo
+echo
 
-// 1) Rewrite interne: /wolverine/traderone/api/* -> /api/*
-if (!s.includes("WOLVERINE_REWRITE_BEGIN")) {
-  const block =
-`\n// WOLVERINE_REWRITE_BEGIN
-app.use("/wolverine/traderone/api", (req, res, next) => {
-  // ici req.url = "/balances2?wallet=..." => on préfixe /api
-  req.url = "/api" + req.url;
-  next();
-});
-// WOLVERINE_REWRITE_END\n`;
+echo "== 2) LISTEN (8585/9696) global =="
+ss -lntp | egrep ':(8585|9696)\s' || true
+echo
 
-  // inject après express.json si possible, sinon après const app = express()
-  const idxJson = s.search(/app\.use\(\s*express\.json\([^;]*\)\s*\)\s*;\s*/m);
-  if (idxJson !== -1) {
-    const m = s.match(/app\.use\(\s*express\.json\([^;]*\)\s*\)\s*;\s*/m)[0];
-    s = s.replace(m, m + block);
-    console.log("Injected rewrite after express.json()");
-  } else {
-    const idxApp = s.search(/const\s+app\s*=\s*express\(\)\s*;/m);
-    if (idxApp !== -1) {
-      const m2 = s.match(/const\s+app\s*=\s*express\(\)\s*;/m)[0];
-      s = s.replace(m2, m2 + block);
-      console.log("Injected rewrite after const app = express()");
-    } else {
-      throw new Error("Impossible de trouver express.json() ou const app=express()");
-    }
-  }
-} else {
-  console.log("Rewrite block already present -> skip");
-}
+echo "== 3) LISTEN du process node (très fiable) =="
+lsof -p "$PID" -a -iTCP -sTCP:LISTEN -nP || echo "AUCUN socket LISTEN pour ce PID"
+echo
 
-// 2) Fix catch-all: app.get('*', ...) ne doit PAS capturer /api/*
-if (s.includes("app.get('*'")) {
-  // on remplace uniquement la version app.get('*', ...
-  s = s.replace(/app\.get\(\s*'\*'\s*,/g, "app.get(/^\\/(?!api\\/).*/,");
-  console.log("Patched app.get('*', ...) -> regex excludes /api/");
-} else {
-  console.log("No app.get('*', ...) found (maybe already changed) -> skip");
-}
+echo "== 4) Variables d'environnement du service (PORT/HOST/BIND) =="
+systemctl show "$SVC" -p Environment --no-pager | sed -n '1,3p' || true
+echo
 
-fs.writeFileSync(FILE, s, "utf8");
-console.log("Patched:", FILE);
-JS
+echo "== 5) Extrait server.js (PORT + listen host) =="
+grep -nE 'process\.env\.PORT|PORT[[:space:]]*=|app\.listen\(|listen\(' "$FILE" || true
+echo
 
-node /tmp/WOLVERINE_PATCH_SERVERJS_SAFE.js
+echo "== 6) Logs récents (si crash avant listen) =="
+journalctl -u "$SVC" -n 80 --no-pager || true
+echo
 
-systemctl restart traderone.service
-systemctl status traderone.service --no-pager -l | sed -n '1,25p'
-
+echo "== 7) Test multi-IP (au cas où ça écoute sur une autre IP) =="
 WALLET="2uHgvSM6vrm7Ye7ntMFUA1RHiqAinGjeCx17dozsLx1z"
+for H in 127.0.0.1 0.0.0.0 10.66.66.1; do
+  echo "--- curl http://$H:8585/api/health"
+  curl -sS -m 2 -D- "http://$H:8585/health" 2>/dev/null | head -n 6 || echo "(no response)"
+done
+echo
 
-echo "== TEST A (doit etre JSON) /api/balances2 =="
-curl -sS -D- "http://127.0.0.1:8585/api/balances2?wallet=$WALLET" | head -c 260; echo; echo
+echo "DONE ✅"
+SH
 
-echo "== TEST B (doit etre JSON) /wolverine/traderone/api/balances2 =="
-curl -sS -D- "http://127.0.0.1:8585/wolverine/traderone/api/balances2?wallet=$WALLET" | head -c 260; echo
+bash /tmp/WOLVERINE_WHY_8585_NOT_LISTENING.sh
