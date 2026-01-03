@@ -1,104 +1,47 @@
-cat >/tmp/WOLVERINE_FIX_BALANCES2_500_AND_ALIAS.sh <<'SH'
+cat >/tmp/WOLVERINE_WAIT_8585_AND_RETEST.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 
 SVC="traderone.service"
-FILE="/opt/traderone-opt/server.js"
-TS="$(date +%s)"
 WALLET="2uHgvSM6vrm7Ye7ntMFUA1RHiqAinGjeCx17dozsLx1z"
 
-echo "== 0) Logs (pour voir l'erreur exacte du 500) =="
-journalctl -u "$SVC" -n 60 --no-pager | tail -n 60
-echo
-
-echo "== 1) Backup server.js =="
-cp -a "$FILE" "$FILE.bak.$TS"
-echo "Backup: $FILE.bak.$TS"
-echo
-
-echo "== 2) Patch server.js (node script safe) =="
-cat >/tmp/_patch_balances2.js <<'JS'
-const fs = require("fs");
-
-const FILE="/opt/traderone-opt/server.js";
-let s = fs.readFileSync(FILE,"utf8");
-
-// 1) Ensure a Solana connection exists (common cause of 'connection is not defined')
-if (!/\bconst\s+connection\s*=/.test(s) && !/\bvar\s+connection\s*=/.test(s)) {
-  // inject after require('@solana/web3.js') OR near top
-  const connBlock = `
-/* WOLVERINE_CONN_BEGIN */
-let solanaWeb3;
-try { solanaWeb3 = require("@solana/web3.js"); } catch(e) { solanaWeb3 = null; }
-const SOLANA_RPC = process.env.SOLANA_RPC || (solanaWeb3?.clusterApiUrl ? solanaWeb3.clusterApiUrl("mainnet-beta") : "https://api.mainnet-beta.solana.com");
-const connection = solanaWeb3 ? new solanaWeb3.Connection(SOLANA_RPC, "confirmed") : null;
-/* WOLVERINE_CONN_END */
-`;
-  if (s.includes('require("@solana/web3.js")') || s.includes("require('@solana/web3.js')")) {
-    s = s.replace(/(require\((["'])@solana\/web3\.js\2\)\s*;)/, `$1\n${connBlock}`);
-    console.log("Injected connection after @solana/web3.js require");
-  } else {
-    // inject after first "const app = express();"
-    const m = s.match(/const\s+app\s*=\s*express\(\)\s*;\s*/);
-    if (!m) throw new Error("Cannot find const app = express(); to inject connection");
-    s = s.replace(m[0], m[0] + connBlock);
-    console.log("Injected connection after const app = express()");
-  }
-} else {
-  console.log("connection already present -> skip");
-}
-
-// 2) Add explicit alias route for /wolverine/traderone/api/balances2 -> /api/balances2
-// (Some setups won't honor the earlier rewrite middleware reliably.)
-if (!s.includes("WOLVERINE_ALIAS_BALANCES2_BEGIN")) {
-  const aliasBlock = `
-/* WOLVERINE_ALIAS_BALANCES2_BEGIN */
-app.get("/wolverine/traderone/api/balances2", (req, res, next) => {
-  // forward to the same handler as /api/balances2 by rewriting url + calling next()
-  req.url = "/api/balances2" + (req._parsedUrl?.search || "");
-  next();
-});
-/* WOLVERINE_ALIAS_BALANCES2_END */
-`;
-  // inject just BEFORE the /api/balances2 route if it exists, else after rewrite blocks/express.json
-  const idx = s.indexOf('app.get("/api/balances2"');
-  if (idx !== -1) {
-    s = s.slice(0, idx) + aliasBlock + "\n" + s.slice(idx);
-    console.log("Injected alias block before /api/balances2 route");
-  } else {
-    // fallback: after express.json
-    const m2 = s.match(/app\.use\(\s*express\.json\([^;]*\)\s*\)\s*;\s*/m);
-    if (!m2) throw new Error("Cannot find express.json() to inject alias block");
-    s = s.replace(m2[0], m2[0] + aliasBlock);
-    console.log("Injected alias block after express.json()");
-  }
-} else {
-  console.log("alias block already present -> skip");
-}
-
-fs.writeFileSync(FILE, s, "utf8");
-console.log("Patched:", FILE);
-JS
-
-node /tmp/_patch_balances2.js
-echo
-
-echo "== 3) Restart service =="
+echo "== Restart $SVC =="
 systemctl restart "$SVC"
-systemctl status "$SVC" --no-pager -l | sed -n '1,25p'
+
+echo "== Wait for 8585 to LISTEN (max 15s) =="
+ok=0
+for i in $(seq 1 30); do
+  if ss -lntp | grep -qE '127\.0\.0\.1:8585|0\.0\.0\.0:8585'; then
+    ok=1
+    break
+  fi
+  sleep 0.5
+done
+
+echo
+ss -lntp | egrep ':(8585|9696)\s' || true
 echo
 
-echo "== 4) Re-test (A) /api/balances2 (B) /wolverine/traderone/api/balances2 =="
+if [ "$ok" -ne 1 ]; then
+  echo "❌ 8585 ne LISTEN pas après attente."
+  echo "== Status + logs =="
+  systemctl status "$SVC" --no-pager -l | sed -n '1,45p' || true
+  echo
+  journalctl -u "$SVC" -n 120 --no-pager || true
+  exit 1
+fi
+
+echo "== Re-test balances2 (A) /api (B) /wolverine/... =="
 for URL in \
   "http://127.0.0.1:8585/api/balances2?wallet=$WALLET" \
   "http://127.0.0.1:8585/wolverine/traderone/api/balances2?wallet=$WALLET"
 do
   echo "=== $URL ==="
-  curl -sS -D- "$URL" | head -c 300
+  curl -sS -D- "$URL" | head -c 320 || true
   echo; echo
 done
 
 echo "DONE ✅"
 SH
 
-bash /tmp/WOLVERINE_FIX_BALANCES2_500_AND_ALIAS.sh
+bash /tmp/WOLVERINE_WAIT_8585_AND_RETEST.sh
