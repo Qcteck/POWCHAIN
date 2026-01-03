@@ -1,70 +1,201 @@
-cat >/tmp/MEGA_WOLVERINE_FRONT_PATCH.sh <<'BASH'
+cat >/tmp/MEGA_WOLVERINE_PATCH.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
+set +H 2>/dev/null || true
+
 [ "$(id -u)" = "0" ] || { echo "ERREUR: lance en root"; exit 1; }
 
-WEB="/opt/fireinners/frontend-react/app/dist/wolverine/index.html"
-[ -f "$WEB" ] || { echo "ERREUR: introuvable: $WEB"; exit 1; }
+APPDIR="/opt/fireinners/wolverine-api"
+WEBDIST="/opt/fireinners/frontend-react/app/dist"
+WEBDIR="${WEBDIST}/wolverine"
+SENVF="${APPDIR}/.env"
+SERVICE="wolverine-api"
+UNIT="/etc/systemd/system/${SERVICE}.service"
+SNIP="/etc/nginx/snippets/fireinners-wolverine.conf"
+SITE="/etc/nginx/sites-available/fireinners.online-ssl"
+ASKOR="/opt/fireinners/sentinel/lib/askorupdate.sh"
 
-cp -a "$WEB" "$WEB.bak.$(date -u +%Y%m%d%H%M%S)"
+need(){ command -v "$1" >/dev/null 2>&1 || { echo "ERREUR: '$1' manquant"; exit 1; }; }
+need node; need npm; need systemctl; need nginx; need curl; need perl; need chattr
 
-# retire ancien patch si présent
-perl -0777 -i -pe 's/\n<!--WOLV_PATCH_V1-->.*?<!--\/WOLV_PATCH_V1-->\n//sg' "$WEB"
+echo "=== PRE-FLY (read-only) ==="
+echo "Node: $(node -v) / Npm: $(npm -v)"
+nginx -t >/dev/null
+echo "NGINX OK"
+echo "Dirs: APPDIR=$APPDIR WEBDIR=$WEBDIR"
 
-# inject CSS + barre + i18n (EN par défaut)
-perl -0777 -i -pe '
-my $patch = qq{\n<!--WOLV_PATCH_V1-->\n<style id="wolvPatchCss">
-html,body{background:radial-gradient(900px 520px at 20% 0%,rgba(170,0,255,.22) 0%,transparent 60%),radial-gradient(700px 460px at 85% 20%,rgba(0,190,255,.16) 0%,transparent 55%),#040512!important}
-#wolvPatchBar{position:fixed;top:10px;right:10px;z-index:2147483647;display:flex;gap:8px;align-items:center;padding:8px 10px;border-radius:12px;border:1px solid rgba(255,255,255,.18);background:rgba(10,12,25,.72);backdrop-filter:blur(8px);color:#eaf1ff;font:12px system-ui;box-shadow:0 10px 30px rgba(0,0,0,.35)}
-#wolvPatchBar b{letter-spacing:.4px}
-#wolvLangBtn{cursor:pointer;user-select:none;padding:6px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.22);background:rgba(120,160,255,.14);color:#eaf1ff}
-</style>
-<div id="wolvPatchBar"><b>PATCH OK</b><span id="wolvPatchVer">2026-01-03</span><button id="wolvLangBtn" type="button">EN</button></div>
-<script id="wolvPatchJs">
-(()=>{const K="WOLV_LANG";const btn=()=>document.getElementById("wolvLangBtn");
-const mapFR2EN=new Map([
-["Adresse Phantom","Phantom address"],["non connecté","not connected"],["Connecté","Connected"],
-["Budget (USDC)","Budget (USDC)"],["Mode","Mode"],["Mint (si Manual token)","Mint (manual token)"],
-["Console","Console"],["Control","Control"],["Wallet (Phantom)","Wallet (Phantom)"],
-["Important si tu actives le mode custodial côté backend, l\\x27API utilisera la clé du serveur. Le frontend ici n\\x27envoie pas de clé privée par défaut. Dépôt: envoie SOL/USDC vers l\\x27adresse \\x22Custody\\x22 affichée (si dispo).",
-"Important: if you enable custodial mode server-side, the API uses the server key. This frontend does not send a private key by default. Deposit: send SOL/USDC to the displayed \"Custody\" address (if available)."]
-]);
-const mapEN2FR=new Map(Array.from(mapFR2EN,([k,v])=>[v,k]));
-function walkAndReplace(root,dict){
-const tree=document.createTreeWalker(root,NodeFilter.SHOW_TEXT,null,false);
-let n; while((n=tree.nextNode())){
-const t=(n.nodeValue||"").trim();
-if(!t) continue;
-if(dict.has(t)) n.nodeValue=n.nodeValue.replace(t,dict.get(t));
+mkdir -p "$APPDIR" "$WEBDIR" "/etc/nginx/snippets" "${APPDIR}/state"
+
+# askorupdate (si dispo)
+if [ -f "$ASKOR" ]; then
+  # shellcheck disable=SC1090
+  . "$ASKOR"
+else
+  askorupdate_file(){ local p="$1" n="$2" cvar="$3"; mkdir -p "$(dirname "$p")"; chattr -i "$p" 2>/dev/null || true; printf "%s" "${!cvar}" >"$p"; }
+  askorupdate_yesno(){ return 0; }
+fi
+
+echo "=== MEGA PATCH ==="
+
+# .env defaults (append missing)
+touch "$SENVF"
+grep -qE '^PORT=' "$SENVF" || echo 'PORT=3050' >>"$SENVF"
+grep -qE '^HOST=' "$SENVF" || echo 'HOST=127.0.0.1' >>"$SENVF"
+grep -qE '^BASE_PATH=' "$SENVF" || echo 'BASE_PATH=/wolverine' >>"$SENVF"
+grep -qE '^RPC_URL=' "$SENVF" || echo 'RPC_URL=https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac' >>"$SENVF"
+grep -qE '^USDC_MINT=' "$SENVF" || echo 'USDC_MINT=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1' >>"$SENVF"
+grep -qE '^WSOL_MINT=' "$SENVF" || echo 'WSOL_MINT=So11111111111111111111111111111111111111112' >>"$SENVF"
+grep -qE '^MONITOR_URI=' "$SENVF" || echo 'MONITOR_URI=https://bbbotrader.paycashnostory.workers.dev/ping' >>"$SENVF"
+grep -qE '^MONITOR_SEC=' "$SENVF" || echo 'MONITOR_SEC=10' >>"$SENVF"
+grep -qE '^MONITOR_FAILS=' "$SENVF" || echo 'MONITOR_FAILS=3' >>"$SENVF"
+grep -qE '^TG_ALERTS=' "$SENVF" || echo 'TG_ALERTS=0' >>"$SENVF"
+grep -qE '^WOLV_SEND=' "$SENVF" || echo 'WOLV_SEND=/usr/local/bin/wolv_send' >>"$SENVF"
+
+# server.js (API stable)
+read -r -d '' SERVER_JS <<'JS'
+"use strict";
+require("dotenv").config();
+const fs=require("fs");
+const path=require("path");
+const express=require("express");
+const {execFile}=require("child_process");
+
+const {Keypair,PublicKey,Connection}=require("@solana/web3.js");
+
+const HOST=process.env.HOST||"127.0.0.1";
+const PORT=parseInt(process.env.PORT||"3050",10);
+const BASE_PATH=process.env.BASE_PATH||"/wolverine";
+const RPC_URL=process.env.RPC_URL||"";
+const MONITOR_URI=process.env.MONITOR_URI||"";
+const MONITOR_SEC=Math.max(3,parseInt(process.env.MONITOR_SEC||"10",10));
+const MONITOR_FAILS=Math.max(1,parseInt(process.env.MONITOR_FAILS||"3",10));
+const TG_ALERTS=String(process.env.TG_ALERTS||"0")==="1";
+const WOLV_SEND=process.env.WOLV_SEND||"";
+
+const STATE_DIR=path.join(__dirname,"state");
+const WALLET_JSON=path.join(STATE_DIR,"custody_wallet.json");
+const WALLET_PUB=path.join(STATE_DIR,"custody_wallet.pub");
+
+function ensureDir(p){ try{ fs.mkdirSync(p,{recursive:true}); }catch(_){} }
+ensureDir(STATE_DIR);
+
+function loadOrCreateCustody(){
+  try{
+    if(fs.existsSync(WALLET_JSON)&&fs.existsSync(WALLET_PUB)){
+      const pub=String(fs.readFileSync(WALLET_PUB,"utf8")).trim();
+      const raw=JSON.parse(String(fs.readFileSync(WALLET_JSON,"utf8")));
+      if(pub && Array.isArray(raw) && raw.length===64) return {pub, raw};
+    }
+  }catch(_){}
+  const kp=Keypair.generate();
+  const raw=Array.from(kp.secretKey);
+  const pub=kp.publicKey.toBase58();
+  fs.writeFileSync(WALLET_JSON,JSON.stringify(raw));
+  fs.writeFileSync(WALLET_PUB,pub);
+  try{ fs.chmodSync(WALLET_JSON,0o600); }catch(_){}
+  try{ fs.chmodSync(WALLET_PUB,0o644); }catch(_){}
+  return {pub, raw};
 }
+
+const custody=loadOrCreateCustody();
+
+let running=false;
+let loopOn=false;
+let loopTimer=null;
+let lastMonitor={ts:null, ok:null, status:null, body:null, fails:0};
+let lastStart=null;
+
+function nowISO(){ return new Date().toISOString(); }
+
+function tgSend(msg){
+  if(!TG_ALERTS) return;
+  if(!WOLV_SEND) return;
+  try{
+    execFile(WOLV_SEND,[String(msg).slice(0,3500)],{timeout:8000},()=>{});
+  }catch(_){}
 }
-function apply(lang){
-try{localStorage.setItem(K,lang);}catch(_){}
-btn().textContent=lang;
-const dict = (lang==="FR")?mapEN2FR:mapFR2EN;
-walkAndReplace(document.body,dict);
+
+async function monitorTick(){
+  const ts=nowISO();
+  if(!MONITOR_URI){
+    lastMonitor={ts, ok:true, status:200, body:"no MONITOR_URI", fails:0};
+    return;
+  }
+  try{
+    const r=await fetch(MONITOR_URI,{method:"GET"});
+    const tx=await r.text();
+    const ok=r.ok && /pong/i.test(tx);
+    lastMonitor={ts, ok, status:r.status, body:tx.slice(0,200), fails: ok?0: (lastMonitor.fails+1)};
+    if(!ok && lastMonitor.fails>=MONITOR_FAILS){
+      tgSend(`WOLVERINE MONITOR: ERR (${MONITOR_URI}) ${ts} status=${r.status} body=${tx.slice(0,120)}`);
+      lastMonitor.fails=0;
+    }
+  }catch(e){
+    lastMonitor={ts, ok:false, status:0, body:String(e&&e.message||e).slice(0,200), fails:lastMonitor.fails+1};
+    if(lastMonitor.fails>=MONITOR_FAILS){
+      tgSend(`WOLVERINE MONITOR: OFFLINE ${ts} err=${lastMonitor.body}`);
+      lastMonitor.fails=0;
+    }
+  }
 }
-function init(){
-const saved=((()=>{try{return localStorage.getItem(K)||""}catch(_){return""}})());
-const lang = saved==="FR"?"FR":"EN";
-btn().onclick=()=>apply(btn().textContent==="EN"?"FR":"EN");
-apply(lang);
+
+function loopStart(){
+  if(loopOn) return;
+  loopOn=true;
+  monitorTick().catch(()=>{});
+  loopTimer=setInterval(()=>{ monitorTick().catch(()=>{}); }, MONITOR_SEC*1000);
 }
-if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",init); else init();
-})();
-</script>
-<!--/WOLV_PATCH_V1-->\n};
+function loopStop(){
+  loopOn=false;
+  if(loopTimer){ clearInterval(loopTimer); loopTimer=null; }
+}
 
-# inject juste avant </body> si possible, sinon à la fin
-if($_ =~ /<\/body>/i){ $_ =~ s/<\/body>/$patch<\/body>/i; }
-else { $_ .= $patch; }
-' "$WEB"
+const app=express();
+app.disable("x-powered-by");
+app.use(express.json({limit:"256kb"}));
 
-chmod 644 "$WEB" || true
+app.get("/",(req,res)=>res.json({ok:true, service:"wolverine-api", ts:nowISO()}));
+app.get("/ping",(req,res)=>res.type("text/plain").send("pong"));
+app.get("/health",(req,res)=>res.json({ok:true, ts:nowISO(), uptime:process.uptime()}));
+app.get("/config",(req,res)=>res.json({
+  ok:true,
+  ts:nowISO(),
+  basePath:BASE_PATH,
+  apiBase:`${BASE_PATH}/api`,
+  host:HOST, port:PORT,
+  custodyPubkey:custody.pub,
+  monitor:{uri:MONITOR_URI, sec:MONITOR_SEC, fails:MONITOR_FAILS, enabled:loopOn}
+}));
+app.get("/wallet",(req,res)=>res.json({ok:true, custodyPubkey:custody.pub}));
+app.get("/status",(req,res)=>res.json({
+  ok:true, ts:nowISO(),
+  running, loop:loopOn,
+  custodyPubkey:custody.pub,
+  lastStart,
+  lastMonitor
+}));
 
-nginx -t >/dev/null 2>&1 && systemctl reload nginx || true
+app.post("/start",(req,res)=>{
+  const body=req.body||{};
+  running=true;
+  lastStart={ts:nowISO(), budget:body.budget||null, mode:body.mode||null, mint:body.mint||null, phantomPubkey:body.phantomPubkey||null};
+  res.json({ok:true, running, lastStart});
+});
+app.post("/stop",(req,res)=>{ running=false; res.json({ok:true, running}); });
 
-echo "OK: patch appliqué => $WEB"
-echo "Ouvre: https://fireinners.online/wolverine/?v=$(date +%s)"
-BASH
-bash /tmp/MEGA_WOLVERINE_FRONT_PATCH.sh
+app.post("/loop/start",(req,res)=>{ loopStart(); res.json({ok:true, loop:true, monitor:lastMonitor}); });
+app.post("/loop/stop",(req,res)=>{ loopStop(); res.json({ok:true, loop:false}); });
+
+const server=app.listen(PORT,HOST,()=>{ console.log(`[wolverine-api] listening http://${HOST}:${PORT} base=${BASE_PATH}`); });
+
+process.on("SIGTERM",()=>{ try{loopStop();}catch(_){}; server.close(()=>process.exit(0)); });
+process.on("SIGINT",()=>{ try{loopStop();}catch(_){}; server.close(()=>process.exit(0)); });
+JS
+
+askorupdate_file "${APPDIR}/server.js" "WOLVERINE server.js" SERVER_JS
+chmod 644 "${APPDIR}/server.js" || true
+
+# package deps (install only if missing)
+cd "$APPDIR"
+if [ ! -f package.json ]; then npm init -y >/dev/null 2>&1 || true; fi
+node -e "require('express');
