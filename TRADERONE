@@ -1,47 +1,62 @@
-cat >/tmp/WOLVERINE_WAIT_8585_AND_RETEST.sh <<'SH'
+cat >/tmp/WOLVERINE_MAP_WOLVERINE_API_TO_API.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 
 SVC="traderone.service"
+FILE="/opt/traderone-opt/server.js"
+TS="$(date +%s)"
 WALLET="2uHgvSM6vrm7Ye7ntMFUA1RHiqAinGjeCx17dozsLx1z"
 
-echo "== Restart $SVC =="
+cp -a "$FILE" "$FILE.bak.$TS"
+echo "Backup: $FILE.bak.$TS"
+
+node - <<'JS'
+const fs = require("fs");
+const FILE="/opt/traderone-opt/server.js";
+let s = fs.readFileSync(FILE,"utf8");
+
+// inject SUPER tôt: juste après "const app = express();"
+if (!s.includes("WOLVERINE_MAP_BEGIN")) {
+  const m = s.match(/const\s+app\s*=\s*express\(\)\s*;\s*/m);
+  if (!m) throw new Error("Cannot find: const app = express();");
+
+  const block = `
+/* WOLVERINE_MAP_BEGIN */
+// Map /wolverine/traderone/api/* -> /api/* (must be BEFORE routes)
+app.use("/wolverine/traderone/api", (req, res, next) => {
+  // req.url here is "/balances2?wallet=..." etc.
+  req.url = "/api" + req.url;
+  next();
+});
+/* WOLVERINE_MAP_END */
+
+`;
+  s = s.replace(m[0], m[0] + block);
+  console.log("Injected WOLVERINE_MAP after const app = express();");
+} else {
+  console.log("WOLVERINE_MAP already present -> skip");
+}
+
+fs.writeFileSync(FILE, s, "utf8");
+console.log("Patched:", FILE);
+JS
+
+echo "== restart =="
 systemctl restart "$SVC"
 
-echo "== Wait for 8585 to LISTEN (max 15s) =="
-ok=0
-for i in $(seq 1 30); do
-  if ss -lntp | grep -qE '127\.0\.0\.1:8585|0\.0\.0\.0:8585'; then
-    ok=1
-    break
-  fi
+echo "== wait listen 8585 (max 10s) =="
+for i in $(seq 1 20); do
+  ss -lntp | grep -q ':8585' && break
   sleep 0.5
 done
-
-echo
-ss -lntp | egrep ':(8585|9696)\s' || true
+ss -lntp | egrep ':(8585)\s' || true
 echo
 
-if [ "$ok" -ne 1 ]; then
-  echo "❌ 8585 ne LISTEN pas après attente."
-  echo "== Status + logs =="
-  systemctl status "$SVC" --no-pager -l | sed -n '1,45p' || true
-  echo
-  journalctl -u "$SVC" -n 120 --no-pager || true
-  exit 1
-fi
+echo "== TEST /api/balances2 =="
+curl -sS -D- "http://127.0.0.1:8585/api/balances2?wallet=$WALLET" | head -c 260; echo; echo
 
-echo "== Re-test balances2 (A) /api (B) /wolverine/... =="
-for URL in \
-  "http://127.0.0.1:8585/api/balances2?wallet=$WALLET" \
-  "http://127.0.0.1:8585/wolverine/traderone/api/balances2?wallet=$WALLET"
-do
-  echo "=== $URL ==="
-  curl -sS -D- "$URL" | head -c 320 || true
-  echo; echo
-done
-
-echo "DONE ✅"
+echo "== TEST /wolverine/traderone/api/balances2 (DOIT etre pareil) =="
+curl -sS -D- "http://127.0.0.1:8585/wolverine/traderone/api/balances2?wallet=$WALLET" | head -c 260; echo
 SH
 
-bash /tmp/WOLVERINE_WAIT_8585_AND_RETEST.sh
+bash /tmp/WOLVERINE_MAP_WOLVERINE_API_TO_API.sh
