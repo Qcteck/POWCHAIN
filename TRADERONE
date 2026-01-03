@@ -1,26 +1,208 @@
-cat >/tmp/WOLVERINE_PATCH_REAL_DOCROOT.sh <<'SH'
+cat >/tmp/WOLVERINE_DEPOSIT_THEN_START.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 
 DOMAIN="fireinners.online"
 DOCROOT="/var/www/fireinners/wolverine"
-INDEX="$DOCROOT/index.html"
-APPJS="$DOCROOT/app.js"
-TS="$(date +%s)"
+SERVER_JS="/opt/traderone-opt/server.js"
+PORT="8585"
 
+# USDC mainnet mint
+USDC_MINT="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+
+# Où stocker la clé TraderOne (dépôt)
+KEYDIR="/opt/traderone-opt/keys"
+KEYFILE="$KEYDIR/traderone_deposit.json"
+
+echo "== 0) Pre-req: node / npm / esbuild =="
+node -v
+npm -v || true
+if ! command -v esbuild >/dev/null 2>&1; then
+  npm i -g esbuild
+fi
+
+echo "== 1) Installer @solana/web3.js dans /opt/traderone-opt =="
+cd /opt/traderone-opt
+if [ ! -f package.json ]; then
+  npm init -y >/dev/null 2>&1
+fi
+npm i @solana/web3.js >/dev/null
+
+echo "== 2) Générer l'adresse dépôt TraderOne (si absente) =="
+mkdir -p "$KEYDIR"
+chmod 700 "$KEYDIR"
+if [ ! -f "$KEYFILE" ]; then
+  node - <<'NODE'
+const fs = require("fs");
+const path = require("path");
+const { Keypair } = require("@solana/web3.js");
+const keydir = "/opt/traderone-opt/keys";
+const keyfile = path.join(keydir, "traderone_deposit.json");
+const kp = Keypair.generate();
+fs.writeFileSync(keyfile, JSON.stringify(Array.from(kp.secretKey)));
+console.log("CREATED", keyfile);
+console.log("PUBKEY", kp.publicKey.toBase58());
+NODE
+  chmod 600 "$KEYFILE"
+else
+  node - <<'NODE'
+const fs = require("fs");
+const { Keypair } = require("@solana/web3.js");
+const secret = Uint8Array.from(JSON.parse(fs.readFileSync("/opt/traderone-opt/keys/traderone_deposit.json","utf8")));
+const kp = Keypair.fromSecretKey(secret);
+console.log("EXISTS", "/opt/traderone-opt/keys/traderone_deposit.json");
+console.log("PUBKEY", kp.publicKey.toBase58());
+NODE
+fi
+
+TRADERONE_ADDR="$(node - <<'NODE'
+const fs = require("fs");
+const { Keypair } = require("@solana/web3.js");
+const secret = Uint8Array.from(JSON.parse(fs.readFileSync("/opt/traderone-opt/keys/traderone_deposit.json","utf8")));
+const kp = Keypair.fromSecretKey(secret);
+process.stdout.write(kp.publicKey.toBase58());
+NODE
+)"
+echo "TraderOne deposit address: $TRADERONE_ADDR"
+echo
+
+echo "== 3) Patch backend server.js: deposit-address + build-deposit-tx + confirm =="
+cp -a "$SERVER_JS" "$SERVER_JS.bak.$(date +%s)"
+
+# On ajoute en tête des constantes ENV (si pas déjà présentes) + routes robustes.
+perl -0777 -i -pe '
+BEGIN {
+  $ins = "const USDC_MINT = process.env.USDC_MINT || \"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v\";\n".
+         "const TRADERONE_DEPOSIT_KEYFILE = process.env.TRADERONE_DEPOSIT_KEYFILE || \"/opt/traderone-opt/keys/traderone_deposit.json\";\n";
+}
+if ($_ !~ /TRADERONE_DEPOSIT_KEYFILE/) { $_ = $ins . $_; }
+
+# helper: load keypair (inject if missing)
+if ($_ !~ /function\s+loadTraderOneKeypair\s*\(/) {
+  $_ =~ s/(const\s+\{\s*PublicKey[^;]*;\s*\n)/$1
+function loadTraderOneKeypair() {
+  const fs = require(\"fs\");
+  const secret = Uint8Array.from(JSON.parse(fs.readFileSync(TRADERONE_DEPOSIT_KEYFILE, \"utf8\")));
+  return Keypair.fromSecretKey(secret);
+}\n\n/s;
+}
+
+# Route: GET /api/deposit-address
+if ($_ !~ /\/api\/deposit-address/) {
+  $_ =~ s/(app\.get\(\s*["\047]\/api\/health["\047].*?\);\s*\n)/$1
+app.get(\"\/api\/deposit-address\", (req,res) => {
+  try{
+    const kp = loadTraderOneKeypair();
+    return res.json({ address: kp.publicKey.toBase58() });
+  }catch(e){
+    return res.status(500).json({ error: e?.message || String(e) });
+  }
+});\n\n/s;
+}
+
+# Route: POST /api/build-deposit-tx  {from, token:"SOL"|"USDC", amount}
+# Retour: {txBase64, to, token, amount}
+# (backend fetch blockhash, construit tx prête à signer)
+$_ =~ s/app\.post\(\s*["\047]\/api\/build-deposit-tx["\047].*?\);\s*\n//gms;
+
+$_ =~ s/(app\.get\(\s*["\047]\/api\/deposit-address["\047][\s\S]*?\);\s*\n)/$1
+app.post(\"\/api\/build-deposit-tx\", async (req,res) => {
+  try{
+    const from = (req.body?.from || \"\").toString().trim();
+    const token = (req.body?.token || \"SOL\").toString().toUpperCase();
+    const amount = Number(req.body?.amount || 0);
+
+    if(!from) return res.status(400).json({ error: \"from missing\" });
+    if(!Number.isFinite(amount) || amount <= 0) return res.status(400).json({ error: \"amount invalid\" });
+
+    const fromPk = new PublicKey(from);
+    const toKp = loadTraderOneKeypair();
+    const toPk = toKp.publicKey;
+
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash(\"confirmed\");
+    const tx = new Transaction({ feePayer: fromPk, recentBlockhash: blockhash });
+
+    if(token === \"SOL\") {
+      const lamports = Math.round(amount * 1e9);
+      tx.add(SystemProgram.transfer({ fromPubkey: fromPk, toPubkey: toPk, lamports }));
+    } else if(token === \"USDC\") {
+      // SPL: transferChecked from ATA(from) -> ATA(to)
+      const { getAssociatedTokenAddress, createAssociatedTokenAccountInstruction, createTransferCheckedInstruction } = require(\"@solana/spl-token\");
+      const mint = new PublicKey(USDC_MINT);
+
+      const fromAta = await getAssociatedTokenAddress(mint, fromPk);
+      const toAta   = await getAssociatedTokenAddress(mint, toPk);
+
+      // Create ATA(to) if missing
+      const toInfo = await connection.getAccountInfo(toAta, \"confirmed\");
+      if(!toInfo){
+        tx.add(createAssociatedTokenAccountInstruction(fromPk, toAta, toPk, mint));
+      }
+
+      // amount in base units (USDC decimals 6)
+      const base = Math.round(amount * 1e6);
+      tx.add(createTransferCheckedInstruction(fromAta, mint, toAta, fromPk, base, 6));
+    } else {
+      return res.status(400).json({ error: \"token must be SOL or USDC\" });
+    }
+
+    const ser = tx.serialize({ requireAllSignatures:false, verifySignatures:false });
+    return res.json({
+      txBase64: Buffer.from(ser).toString(\"base64\"),
+      to: toPk.toBase58(),
+      token,
+      amount,
+      blockhash,
+      lastValidBlockHeight
+    });
+  }catch(e){
+    return res.status(500).json({ error: e?.message || String(e) });
+  }
+});\n\n/s;
+
+# Route: GET /api/confirm?sig=...
+if ($_ !~ /\/api\/confirm/) {
+  $_ =~ s/(app\.post\(\s*["\047]\/api\/build-deposit-tx["\047][\s\S]*?\);\s*\n)/$1
+app.get(\"\/api\/confirm\", async (req,res) => {
+  try{
+    const sig = (req.query.sig || \"\").toString().trim();
+    if(!sig) return res.status(400).json({ error:\"sig missing\" });
+    const st = await connection.getSignatureStatus(sig, { searchTransactionHistory: true });
+    const v = st?.value;
+    if(!v) return res.json({ ok:false, status:\"not_found\" });
+    if(v.err) return res.json({ ok:false, status:\"failed\", err:v.err });
+    return res.json({ ok:true, status:v.confirmationStatus || \"confirmed\" });
+  }catch(e){
+    return res.status(500).json({ error: e?.message || String(e) });
+  }
+});\n\n/s;
+}
+' "$SERVER_JS"
+
+# spl-token requis pour USDC
+npm i @solana/spl-token >/dev/null
+
+echo "== 4) Redémarrer traderone =="
+systemctl restart traderone.service
+sleep 1
+systemctl status traderone.service --no-pager -l | sed -n '1,35p' || true
+echo
+
+echo "== 5) Bundle solana web3 en local pour le front (pas de CDN) =="
 mkdir -p "$DOCROOT"
-echo "DOCROOT=$DOCROOT"
-echo "INDEX=$INDEX"
-echo "APPJS=$APPJS"
-echo
+cat >"$DOCROOT/solana-web3.entry.js" <<'JS'
+export * as solanaWeb3 from "@solana/web3.js";
+JS
+esbuild "$DOCROOT/solana-web3.entry.js" --bundle --minify --format=iife --global-name=solanaWeb3 --outfile="$DOCROOT/solana-web3.min.js"
+rm -f "$DOCROOT/solana-web3.entry.js"
+chmod 644 "$DOCROOT/solana-web3.min.js"
 
-echo "== Backup =="
-[ -f "$INDEX" ] && cp -a "$INDEX" "$INDEX.bak.$TS" || true
-[ -f "$APPJS" ] && cp -a "$APPJS" "$APPJS.bak.$TS" || true
-echo
+echo "== 6) Écrire index.html + app.js (Start = deposit + confirm + start) =="
+TS="$(date +%s)"
+cp -a "$DOCROOT/index.html" "$DOCROOT/index.html.bak.$TS" 2>/dev/null || true
+cp -a "$DOCROOT/app.js" "$DOCROOT/app.js.bak.$TS" 2>/dev/null || true
 
-echo "== Write index.html (WOLVERINE Phantom UI) =="
-cat >"$INDEX" <<'HTML'
+cat >"$DOCROOT/index.html" <<'HTML'
 <!doctype html>
 <html lang="fr">
 <head>
@@ -30,7 +212,7 @@ cat >"$INDEX" <<'HTML'
   <style>
     :root { --bg:#0b0f14; --card:#121826; --b:#223049; --mut:#9fb0c7; --ok:#22c55e; --err:#ef4444; --btn:#3b82f6; }
     body { margin:0; font-family:system-ui, Arial; background:var(--bg); color:#e8eef6; }
-    .wrap { max-width:520px; margin:42px auto; padding:18px; }
+    .wrap { max-width:560px; margin:42px auto; padding:18px; }
     .card { background:var(--card); border:1px solid var(--b); border-radius:16px; padding:16px; }
     h1 { margin:0 0 12px; font-size:22px; }
     .row { display:flex; justify-content:space-between; gap:10px; align-items:center; margin:10px 0; }
@@ -40,10 +222,11 @@ cat >"$INDEX" <<'HTML'
     button { width:100%; padding:12px 14px; border:0; border-radius:12px; background:var(--btn); color:white; font-weight:800; cursor:pointer; }
     button.secondary { background:#1f2937; border:1px solid #2b3a55; }
     button:disabled { opacity:.55; cursor:not-allowed; }
-    input { width:100%; padding:12px 14px; border-radius:12px; border:1px solid #2b3a55; background:#0f1624; color:#e8eef6; outline:none; }
+    input, select { width:100%; padding:12px 14px; border-radius:12px; border:1px solid #2b3a55; background:#0f1624; color:#e8eef6; outline:none; }
     .hidden { display:none; }
     .ok { color:var(--ok); }
     .err { color:var(--err); }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px; word-break:break-all; }
   </style>
 </head>
 <body>
@@ -58,11 +241,11 @@ cat >"$INDEX" <<'HTML'
 
       <div class="row">
         <div>
-          <div class="muted">SOL</div>
+          <div class="muted">SOL (wallet)</div>
           <div class="value" id="solBal">—</div>
         </div>
         <div style="text-align:right;">
-          <div class="muted">USDC</div>
+          <div class="muted">USDC (wallet)</div>
           <div class="value" id="usdcBal">—</div>
         </div>
       </div>
@@ -70,54 +253,90 @@ cat >"$INDEX" <<'HTML'
       <button id="btnConnect">Connect Wallet (Phantom)</button>
 
       <div id="afterConnect" class="hidden" style="margin-top:14px;">
-        <div class="muted" style="margin:8px 0;">Budget</div>
+        <div class="muted" style="margin:10px 0 6px;">Adresse dépôt TraderOne</div>
+        <div class="mono" id="depositAddr">—</div>
+
+        <div class="row" style="margin-top:12px;">
+          <div style="flex:1">
+            <div class="muted">Token</div>
+            <select id="token">
+              <option value="USDC">USDC</option>
+              <option value="SOL">SOL</option>
+            </select>
+          </div>
+          <div style="flex:1">
+            <div class="muted">Montant à envoyer</div>
+            <input id="amount" type="number" inputmode="decimal" placeholder="Ex: 1" min="0" step="0.000001" />
+          </div>
+        </div>
+
+        <div class="muted" style="margin-top:10px;">Budget (param start)</div>
         <input id="budget" type="number" inputmode="decimal" placeholder="Ex: 50" min="0" step="0.01" />
 
         <div style="margin-top:12px;">
           <button id="btnStart" disabled>START WOLVERINE (TraderOne)</button>
         </div>
 
+        <button id="btnRefresh" class="secondary" style="margin-top:10px;">Refresh balances</button>
+
         <div class="row" style="margin-top:12px;">
           <span class="muted">Status</span>
           <span id="statusText" class="muted">—</span>
         </div>
-
-        <button id="btnRefresh" class="secondary" style="margin-top:10px;">Refresh balances</button>
       </div>
     </div>
   </div>
 
+  <script src="./solana-web3.min.js?v=__TS__"></script>
   <script src="./app.js?v=__TS__"></script>
 </body>
 </html>
 HTML
-sed -i "s/__TS__/$TS/g" "$INDEX"
-echo
+sed -i "s/__TS__/$TS/g" "$DOCROOT/index.html"
 
-echo "== Write app.js (backend-only, no solanaWeb3) =="
-cat >"$APPJS" <<'JS'
-const API_START = "/wolverine/traderone/api/start";
-const API_BALANCES = "/wolverine/traderone/api/balances";
+cat >"$DOCROOT/app.js" <<'JS'
+const API_DEPOSIT_ADDR = "/wolverine/traderone/api/deposit-address";
+const API_BUILD_TX     = "/wolverine/traderone/api/build-deposit-tx";
+const API_CONFIRM      = "/wolverine/traderone/api/confirm";
+const API_BALANCES     = "/wolverine/traderone/api/balances";
+const API_START        = "/wolverine/traderone/api/start";
 
 const btnConnect=document.getElementById("btnConnect");
 const btnStart=document.getElementById("btnStart");
 const btnRefresh=document.getElementById("btnRefresh");
 const afterConnect=document.getElementById("afterConnect");
 const walletPill=document.getElementById("walletPill");
+const depositAddrEl=document.getElementById("depositAddr");
 const solBalEl=document.getElementById("solBal");
 const usdcBalEl=document.getElementById("usdcBal");
+const tokenEl=document.getElementById("token");
+const amountEl=document.getElementById("amount");
 const budgetEl=document.getElementById("budget");
 const statusText=document.getElementById("statusText");
 
 let pubkey=null;
+let depositAddr=null;
 
 function shortPk(pk){ const s=pk.toString(); return s.slice(0,4)+"…"+s.slice(-4); }
 function setStatus(t,cls="muted"){ statusText.className=cls; statusText.textContent=t; }
-function canStart(){ const v=Number(budgetEl.value); return pubkey && Number.isFinite(v) && v>0; }
+function n(x){ const v=Number(x); return Number.isFinite(v)?v:0; }
+function canStart(){
+  const amt=n(amountEl.value);
+  const bud=n(budgetEl.value);
+  return pubkey && depositAddr && amt>0 && bud>0;
+}
+
+async function fetchDepositAddress(){
+  const r = await fetch(API_DEPOSIT_ADDR, {cache:"no-store"});
+  const d = await r.json().catch(()=>({}));
+  if(!r.ok) throw new Error(d?.error || ("HTTP "+r.status));
+  depositAddr = d.address;
+  depositAddrEl.textContent = depositAddr;
+}
 
 async function refreshBalances(){
   if(!pubkey) return;
-  setStatus("Lecture des soldes…");
+  setStatus("Lecture des soldes wallet…");
   try{
     const r = await fetch(`${API_BALANCES}?wallet=${encodeURIComponent(pubkey.toString())}`, { cache: "no-store" });
     const data = await r.json().catch(()=> ({}));
@@ -128,6 +347,17 @@ async function refreshBalances(){
   }catch(e){
     setStatus("Balances error: " + (e?.message || e), "err");
   }
+}
+
+async function confirmSig(sig, tries=25){
+  // ~25 * 1s max
+  for(let i=0;i<tries;i++){
+    const r = await fetch(`${API_CONFIRM}?sig=${encodeURIComponent(sig)}`, {cache:"no-store"});
+    const d = await r.json().catch(()=>({}));
+    if(d?.ok) return true;
+    await new Promise(res=>setTimeout(res, 1000));
+  }
+  return false;
 }
 
 btnConnect.onclick=async ()=>{
@@ -143,51 +373,93 @@ btnConnect.onclick=async ()=>{
     afterConnect.classList.remove("hidden");
     btnConnect.textContent="Wallet connecté";
     btnConnect.disabled=true;
+
+    setStatus("Chargement adresse dépôt…");
+    await fetchDepositAddress();
     await refreshBalances();
+
     btnStart.disabled=!canStart();
   }catch(e){
     setStatus("Connexion refusée: " + (e?.message||e),"err");
   }
 };
 
+amountEl.oninput=()=>{ btnStart.disabled=!canStart(); };
 budgetEl.oninput=()=>{ btnStart.disabled=!canStart(); };
+tokenEl.onchange=()=>{ btnStart.disabled=!canStart(); };
 btnRefresh.onclick=refreshBalances;
 
 btnStart.onclick=async ()=>{
   if(!canStart()) return;
-  const budget=Number(budgetEl.value);
-  setStatus("Démarrage…");
+
+  const token = tokenEl.value;
+  const amount = n(amountEl.value);
+  const budget = n(budgetEl.value);
+
+  // 1) confirmation user
+  const ok = confirm(`Envoyer ${amount} ${token} vers TraderOne:\n${depositAddr}\n\nPuis démarrer WOLVERINE ?`);
+  if(!ok) return;
+
   btnStart.disabled=true;
+  setStatus("Préparation transaction…");
 
   try{
-    const res=await fetch(API_START,{
+    // 2) backend builds tx (blockhash, USDC ATA, etc.)
+    const build = await fetch(API_BUILD_TX,{
       method:"POST",
       headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({wallet:pubkey.toString(),budget})
+      body: JSON.stringify({ from: pubkey.toString(), token, amount })
     });
-    const data=await res.json().catch(()=>({}));
-    if(!res.ok){ setStatus(data?.error||"Start failed","err"); btnStart.disabled=false; return; }
-    setStatus("WOLVERINE démarré ✅","ok");
+    const bd = await build.json().catch(()=>({}));
+    if(!build.ok) throw new Error(bd?.error || ("HTTP "+build.status));
+
+    // 3) Phantom signs + sends
+    const txBytes = Uint8Array.from(atob(bd.txBase64), c => c.charCodeAt(0));
+    const tx = solanaWeb3.Transaction.from(txBytes);
+
+    setStatus("Signature + envoi…");
+    const { signature } = await window.solana.signAndSendTransaction(tx);
+
+    setStatus("Confirmation on-chain…");
+    const confirmed = await confirmSig(signature);
+
+    if(!confirmed){
+      setStatus("Tx envoyée mais non confirmée (réessaie refresh). Sig: "+signature, "err");
+      btnStart.disabled=false;
+      return;
+    }
+
+    // 4) start wolverine
+    setStatus("Tx confirmée ✅ Démarrage…","ok");
+    const st = await fetch(API_START,{
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ wallet: pubkey.toString(), budget, depositSig: signature, token, amount })
+    });
+    const sd = await st.json().catch(()=>({}));
+    if(!st.ok) throw new Error(sd?.error || ("HTTP "+st.status));
+
+    setStatus("WOLVERINE démarré ✅", "ok");
+    await refreshBalances();
   }catch(e){
-    setStatus("Erreur API: " + (e?.message||e),"err");
+    setStatus("Erreur: " + (e?.message || e), "err");
     btnStart.disabled=false;
   }
 };
 JS
 
-chmod 644 "$INDEX" "$APPJS"
+chmod 644 "$DOCROOT/index.html" "$DOCROOT/app.js" "$DOCROOT/solana-web3.min.js"
 
-echo "== Reload nginx =="
+echo "== 7) Reload nginx =="
 nginx -t && systemctl reload nginx
-echo
 
-echo "== Preuves live =="
-echo "--- scripts ---"
+echo "== 8) Preuves =="
+echo "--- deposit address (backend) ---"
+curl -ks "https://${DOMAIN}/wolverine/traderone/api/deposit-address" ; echo
+echo "--- scripts served ---"
 curl -ks "https://${DOMAIN}/wolverine/" | grep -n "<script" || true
-echo "--- old TraderOne buttons should be gone ---"
-curl -ks "https://${DOMAIN}/wolverine/" | grep -nE 'id="bHealth"|id="bStatus"|id="bStart"|id="bStop"|Budget USDC|Mode \(safe' && echo "BAD" || echo "OK ✅"
-echo "--- app.js should not contain solanaWeb3 ---"
-curl -ks "https://${DOMAIN}/wolverine/app.js" | grep -n "solanaWeb3" && echo "BAD" || echo "OK ✅"
+echo
+echo "DONE ✅ -> ouvre /wolverine en navigation privée"
 SH
 
-bash /tmp/WOLVERINE_PATCH_REAL_DOCROOT.sh
+bash /tmp/WOLVERINE_DEPOSIT_THEN_START.sh
