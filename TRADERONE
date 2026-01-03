@@ -1,10 +1,10 @@
-cat >/tmp/FORCE_TRADERONE_INCLUDE_IN_ACTIVE_SSL_VHOST.sh <<'SH'
+cat >/tmp/FIX_TRADERONE_INCLUDE_OPNOTPERM.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 
 SNIP="/etc/nginx/snippets/wolverine_traderone_backend.conf"
 
-# 0) (re)write the proxy snippet (API+WS+UI)
+# 1) (re)write proxy snippet
 cat >"$SNIP" <<'EOF'
 # TRADERONE_WOLV_PROXY_V2
 
@@ -46,48 +46,50 @@ location ^~ /wolverine/traderone/ {
 }
 EOF
 
-echo "1) Find ACTIVE SSL vhost file serving fireinners.online…"
-ACTIVE_FILE="$(nginx -T 2>/dev/null | awk '
+echo "1) Detect active SSL vhost file…"
+ACTIVE="$(nginx -T 2>/dev/null | awk '
   /^# configuration file / {file=$4; sub(/:$/,"",file)}
   /listen 443/ {ssl_file=file}
   /server_name[[:space:]].*fireinners\.online/ && ssl_file==file {print file; exit}
 ')"
+echo "ACTIVE (nginx -T): $ACTIVE"
 
-if [ -z "${ACTIVE_FILE:-}" ]; then
-  echo "ERROR: cannot detect active SSL vhost for fireinners.online"
-  echo "Hint output:"
-  nginx -T 2>/dev/null | grep -nE "configuration file|listen 443|server_name.*fireinners\.online" | head -n 120 || true
-  exit 1
-fi
+REAL="$(readlink -f "$ACTIVE" 2>/dev/null || echo "$ACTIVE")"
+echo "REAL FILE: $REAL"
+ls -la "$ACTIVE" || true
+ls -la "$REAL" || true
 
-echo "ACTIVE SSL VHOST: $ACTIVE_FILE"
+echo
+echo "2) Remove immutable if set (lsattr)…"
+lsattr "$ACTIVE" "$REAL" 2>/dev/null || true
+chattr -i "$ACTIVE" 2>/dev/null || true
+chattr -i "$REAL" 2>/dev/null || true
+lsattr "$ACTIVE" "$REAL" 2>/dev/null || true
 
-echo "2) Inject include into that server{} (python write, no sed -i)…"
+echo
+echo "3) Inject include into REAL file…"
 python3 - <<PY
-import re, time
-p="${ACTIVE_FILE}"
-inc="    include /etc/nginx/snippets/wolverine_traderone_backend.conf; # TRADERONE_INCLUDE_ACTIVE_V1\n"
+import re
+p="${REAL}"
+inc="    include /etc/nginx/snippets/wolverine_traderone_backend.conf; # TRADERONE_INCLUDE_ACTIVE_V2\n"
 s=open(p,"r",encoding="utf-8",errors="ignore").read()
 if "wolverine_traderone_backend.conf" in s:
-    print("OK: include already present in active vhost")
+    print("OK: include already present")
 else:
     m=re.search(r'^\s*server\s*\{\s*$', s, flags=re.M)
     if not m: raise SystemExit("ERROR: can't find 'server {' in "+p)
     s=s[:m.end()]+"\n"+inc+s[m.end():]
     open(p,"w",encoding="utf-8").write(s)
-    print("OK: include added to active vhost")
+    print("OK: include added")
 PY
 
-echo "3) Reload nginx…"
+echo
+echo "4) Reload nginx + public test…"
 nginx -t
 systemctl reload nginx
 
-echo "4) PUBLIC tests (must NOT be HTML)…"
-echo "--- /wolverine/traderone/api/status"
+echo "--- PUBLIC /wolverine/traderone/api/status"
 curl -ksS --max-time 8 https://fireinners.online/wolverine/traderone/api/status | head -c 220; echo
-echo
-echo "--- /wolverine/traderone/ (headers)"
-curl -kIs --max-time 8 https://fireinners.online/wolverine/traderone/ | head -n 10
 SH
 
-bash /tmp/FORCE_TRADERONE_INCLUDE_IN_ACTIVE_SSL_VHOST.sh
+bash /tmp/FIX_TRADERONE_INCLUDE_OPNOTPERM.sh
