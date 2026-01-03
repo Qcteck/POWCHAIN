@@ -1,15 +1,108 @@
+cat >/tmp/APPLY_WOLVERINE_SNIPPET_CLEAN.sh <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+LINK="/etc/nginx/sites-enabled/fireinners.online-ssl"
+VHOST="$(readlink -f "$LINK" 2>/dev/null || echo "$LINK")"
 SNIP="/etc/nginx/snippets/fireinners-wolverine.conf"
 
-echo "== ATTRS BEFORE ==" 
-lsattr -a "$SNIP" || true
+echo "== rewrite snippet =="
+cat >"$SNIP" <<'EOF'
+# FIREINNERS_WOLVERINE_SNIP_V1  (single-source of truth)
 
-echo "== REMOVE immutable/append flags ==" 
-chattr -i -a "$SNIP" 2>/dev/null || true
+# --- FRONT (ONE) ---
+location ^~ /wolverine/ {
+  add_header Cache-Control "no-store, no-cache, must-revalidate, proxy-revalidate" always;
+  add_header Pragma "no-cache" always;
+  add_header Expires "0" always;
 
-echo "== ATTRS AFTER ==" 
-lsattr -a "$SNIP" || true
+  alias /var/www/fireinners/wolverine/;
+  try_files $uri $uri/ /wolverine/index.html;
+}
 
-echo "== TEST WRITE ==" 
-echo "# WRITE_TEST $(date -Is)" >> "$SNIP"
+# --- UNIFIED API (ONE) : /wolverine/api/* -> TraderOne /api/* ---
+location ^~ /wolverine/api/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  proxy_read_timeout 120s;
+  proxy_send_timeout 120s;
+  proxy_pass http://127.0.0.1:8585/api/;
+}
 
-echo "OK: write succeeded"
+# --- TRADERONE (UI + native api + ws) ---
+location ^~ /wolverine/traderone/api/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  proxy_read_timeout 120s;
+  proxy_send_timeout 120s;
+  proxy_pass http://127.0.0.1:8585/api/;
+}
+
+location ^~ /wolverine/traderone/ws {
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  proxy_read_timeout 3600s;
+  proxy_send_timeout 3600s;
+  proxy_set_header Upgrade $http_upgrade;
+  proxy_set_header Connection "upgrade";
+  proxy_pass http://127.0.0.1:8585/ws;
+}
+
+location ^~ /wolverine/traderone/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  proxy_read_timeout 120s;
+  proxy_send_timeout 120s;
+  proxy_set_header Upgrade $http_upgrade;
+  proxy_set_header Connection "upgrade";
+  proxy_pass http://127.0.0.1:8585/;
+}
+EOF
+
+echo "== ensure include once in vhost =="
+python3 - <<PY
+import re
+p="${VHOST}"
+s=open(p,"r",encoding="utf-8",errors="ignore").read()
+
+# remove any duplicate includes of wolverine snippets
+s=re.sub(r'^\s*include\s+/etc/nginx/snippets/fireinners-wolverine\.conf;.*\n','',s,flags=re.M)
+s=re.sub(r'^\s*include\s+/etc/nginx/snippets/wolverine_.*\.conf;.*\n','',s,flags=re.M)
+
+inc='    include /etc/nginx/snippets/fireinners-wolverine.conf; # FIREINNERS_WOLVERINE_INCLUDE\n'
+m=re.search(r'^\s*server\s*\{\s*$', s, flags=re.M)
+if not m:
+    raise SystemExit("ERROR: can't find 'server {' in vhost: "+p)
+s = s[:m.end()] + "\n" + inc + s[m.end():]
+open(p,"w",encoding="utf-8").write(s)
+print("OK include set in", p)
+PY
+
+echo "== nginx test + reload =="
+nginx -t
+systemctl reload nginx
+
+echo "== quick tests =="
+echo "--- /wolverine/ ---"
+curl -ksS --max-time 8 https://fireinners.online/wolverine/ | head -n 6
+echo
+echo "--- /wolverine/api/health ---"
+curl -ksS --max-time 8 https://fireinners.online/wolverine/api/health | head -c 220; echo
+echo
+echo "--- /wolverine/traderone/api/status ---"
+curl -ksS --max-time 8 https://fireinners.online/wolverine/traderone/api/status | head -c 220; echo
+SH
+
+bash /tmp/APPLY_WOLVERINE_SNIPPET_CLEAN.sh
