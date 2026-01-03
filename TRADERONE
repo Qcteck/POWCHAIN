@@ -1,2 +1,82 @@
-curl -sS "http://127.0.0.1:8585/api/balances?wallet=TON_WALLET"
-curl -sS https://api.mainnet-beta.solana.com -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"getBalance","params":["TON_WALLET"]}'
+cat >/tmp/WOLVERINE_FIX_BALANCES_NO_PROMPT.sh <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+export SYSTEMD_PAGER=cat PAGER=cat
+
+DOMAIN="fireinners.online"
+WOLV_PATH="/wolverine"
+DOCROOT="/var/www/wolverine"
+SERVER_JS="/opt/traderone-opt/server.js"
+PORT="8585"
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# COLLE ICI TON PUBLICKEY PHANTOM COMPLET (sans "Wallet:", sans espaces)
+WALLET="COLLE_TON_PUBLICKEY_COMPLET_ICI"
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+
+if [ -z "${WALLET:-}" ] || [[ "$WALLET" == *" "* ]] || [[ "$WALLET" == COLLE_* ]]; then
+  echo "ERROR: WALLET invalide. Mets ton publickey complet dans WALLET=..."
+  exit 1
+fi
+
+echo "== 0) Status traderone + ports =="
+systemctl status traderone.service --no-pager -l | sed -n '1,70p' || true
+ss -ltnp | egrep "(node|:${PORT})" || true
+echo
+
+echo "== 1) Tests API (avant patch) =="
+curl -sS "http://127.0.0.1:${PORT}/api/balances?wallet=$WALLET" ; echo
+curl -ks "https://${DOMAIN}${WOLV_PATH}/traderone/api/balances?wallet=$WALLET" ; echo
+echo
+
+echo "== 2) Patch backend USDC = somme de tous les token accounts =="
+[ -f "$SERVER_JS" ] || { echo "ERROR: server.js introuvable: $SERVER_JS"; exit 1; }
+cp -a "$SERVER_JS" "$SERVER_JS.bak.$(date +%s)"
+
+perl -0777 -i -pe '
+s/let usdc = 0;\s*const v = \(tokRes && tokRes\.value\) \|\| \[\];\s*if \(v\.length\) \{\s*usdc = v\[0\]\?\.\s*account\?\.\s*data\?\.\s*parsed\?\.\s*info\?\.\s*tokenAmount\?\.\s*uiAmount\s*\?\?\s*0;\s*\}\s*/let usdc = 0;\n    const v = (tokRes && tokRes.value) || [];\n    for (const a of v) {\n      const amt = a?.account?.data?.parsed?.info?.tokenAmount?.uiAmount ?? 0;\n      usdc += Number(amt) || 0;\n    }\n/sm
+' "$SERVER_JS" || true
+
+systemctl restart traderone.service
+sleep 1
+echo "OK backend restarted"
+echo
+
+echo "== 3) Tests API (après patch backend) =="
+curl -sS "http://127.0.0.1:${PORT}/api/balances?wallet=$WALLET" ; echo
+curl -ks "https://${DOMAIN}${WOLV_PATH}/traderone/api/balances?wallet=$WALLET" ; echo
+echo
+
+echo "== 4) Patch front precision + cache-bust =="
+APPJS="$DOCROOT/app.js"
+INDEX="$DOCROOT/index.html"
+
+if [ -f "$APPJS" ]; then
+  cp -a "$APPJS" "$APPJS.bak.$(date +%s)"
+  sed -i 's/toFixed(4)/toFixed(6)/g; s/toFixed(2)/toFixed(4)/g' "$APPJS"
+  echo "app.js precision patched"
+else
+  echo "WARN: $APPJS introuvable"
+fi
+
+TS="$(date +%s)"
+if [ -f "$INDEX" ]; then
+  cp -a "$INDEX" "$INDEX.bak.$TS"
+  sed -i -E "s|(app\.js)(\?v=[0-9]+)?|\\1?v=$TS|g" "$INDEX" || true
+  echo "index.html cache-bust v=$TS"
+else
+  echo "WARN: $INDEX introuvable"
+fi
+
+nginx -t && systemctl reload nginx
+echo "nginx reloaded"
+echo
+
+echo "== 5) Preuves live =="
+curl -ks "https://${DOMAIN}${WOLV_PATH}/app.js" | grep -n "solanaWeb3" && echo "BAD solanaWeb3" || echo "OK ✅ no solanaWeb3"
+curl -ks "https://${DOMAIN}${WOLV_PATH}/traderone/api/balances?wallet=$WALLET" ; echo
+echo
+echo "DONE ✅ -> ouvre /wolverine en navigation privée, Connect Phantom, Refresh balances"
+SH
+
+bash /tmp/WOLVERINE_FIX_BALANCES_NO_PROMPT.sh
