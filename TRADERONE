@@ -1,73 +1,60 @@
-cat >/tmp/RESET_TRADERONE_SYSTEMD_CLEAN_ROOT.sh <<'SH'
+cat >/tmp/DIAG_TRADERONE_RESTARTS_ROOT.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "== 0) stop loops =="
-systemctl stop traderone-watchdog.timer traderone-watchdog.service 2>/dev/null || true
-systemctl stop traderone.service 2>/dev/null || true
-systemctl reset-failed traderone.service 2>/dev/null || true
+export SYSTEMD_PAGER=cat
+export PAGER=cat
 
-echo "== 1) show what systemd thinks (before) =="
-systemctl cat traderone.service || true
+echo "== 1) Health LOCAL vs NGINX =="
+curl -sS  -o /dev/null -w "LOCAL  http_code=%{http_code}\n" http://127.0.0.1:8585/api/health || true
+curl -ksS -o /dev/null -w "NGINX  http_code=%{http_code}\n" https://fireinners.online/wolverine/traderone/api/health || true
+echo
 
-echo "== 2) remove ALL overrides (common culprit) =="
-rm -rf /etc/systemd/system/traderone.service.d 2>/dev/null || true
-rm -rf /run/systemd/system/traderone.service.d 2>/dev/null || true
+echo "== 2) Derniers (stop/start) traderone avec détails (qui déclenche) =="
+journalctl -u traderone.service -n 200 --no-pager -o short-precise | egrep -i 'Starting|Started|Stopping|Stopped|Failed|exit-code|Main process' || true
+echo
 
-echo "== 3) ensure required files exist =="
-mkdir -p /opt/traderone-opt
-[ -f /opt/traderone-opt/state.json ] || echo '{}' > /opt/traderone-opt/state.json
-[ -f /opt/traderone-opt/trades.log ] || : > /opt/traderone-opt/trades.log
-chown -R root:root /opt/traderone-opt
-chmod 644 /opt/traderone-opt/state.json /opt/traderone-opt/trades.log
+echo "== 3) Logs watchdog (voit-il des fails / restarts) =="
+journalctl -u traderone-watchdog.service -n 120 --no-pager -o short-precise || true
+echo
 
-echo "== 4) write CLEAN unit (NO backup script) =="
-cp -a /etc/systemd/system/traderone.service "/root/traderone.service.bak.$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
+echo "== 4) Timers actifs liés à traderone =="
+systemctl list-timers --all | egrep -i 'traderone|watchdog' || true
+echo
 
-cat >/etc/systemd/system/traderone.service <<'EOF'
-[Unit]
-Description=TraderOne Backend (Wolverine)
-After=network-online.target nginx.service
-Wants=network-online.target
-StartLimitIntervalSec=60
-StartLimitBurst=10
-
-[Service]
-Type=simple
-User=root
-WorkingDirectory=/opt/traderone-opt
-Environment=NODE_ENV=production
-Restart=always
-RestartSec=3
-
-ExecStartPre=/bin/bash -lc 'mkdir -p /opt/traderone-opt; [ -f /opt/traderone-opt/state.json ] || echo "{}" > /opt/traderone-opt/state.json; [ -f /opt/traderone-opt/trades.log ] || : > /opt/traderone-opt/trades.log; chown -R root:root /opt/traderone-opt; chmod 644 /opt/traderone-opt/state.json /opt/traderone-opt/trades.log'
-ExecStart=/usr/bin/node /opt/traderone-opt/server.js
-
-KillSignal=SIGINT
-TimeoutStopSec=20
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-echo "== 5) reload + start =="
-systemctl daemon-reload
-systemctl enable traderone.service >/dev/null 2>&1 || true
-systemctl restart traderone.service
-sleep 2
-
-echo "== 6) PROOF (after): must NOT show 'Sauvegarde...' anymore =="
-systemctl cat traderone.service | sed -n '1,160p'
-journalctl -u traderone.service -n 60 --no-pager || true
-
-echo "== 7) local health =="
-curl -sS -o /dev/null -w "LOCAL http_code=%{http_code}\n" http://127.0.0.1:8585/api/health || true
-
-echo "== 8) re-enable watchdog timer (optional) =="
-systemctl start traderone-watchdog.timer 2>/dev/null || true
-systemctl status traderone-watchdog.timer --no-pager 2>/dev/null || true
+echo "== 5) Cherche d'autres restarts (cron/systemd) =="
+grep -RIn --color=never -E 'traderone|8585|traderone_watchdog' /etc/cron* /etc/systemd/system 2>/dev/null | head -n 120 || true
 SH
 
-bash /tmp/RESET_TRADERONE_SYSTEMD_CLEAN_ROOT.sh
+bash /tmp/DIAG_TRADERONE_RESTARTS_ROOT.sh
+
+
+
+cat >/usr/local/bin/traderone_watchdog.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+URL="http://127.0.0.1:8585/api/health"
+STATE="/run/traderone_watchdog_failcount"
+
+code="$(curl -sS --max-time 6 -o /dev/null -w "%{http_code}" "$URL" || echo 000)"
+
+if [ "$code" = "200" ]; then
+  rm -f "$STATE"
+  exit 0
+fi
+
+n=0; [ -f "$STATE" ] && n="$(cat "$STATE" 2>/dev/null || echo 0)"
+n=$((n+1)); echo "$n" > "$STATE"
+
+logger -t traderone_watchdog "health=$code failcount=$n"
+
+if [ "$n" -ge 3 ]; then
+  rm -f "$STATE"
+  logger -t traderone_watchdog "RESTART traderone.service (3 fails)"
+  systemctl restart traderone.service
+fi
+EOF
+
+chmod +x /usr/local/bin/traderone_watchdog.sh
+systemctl daemon-reload
+
