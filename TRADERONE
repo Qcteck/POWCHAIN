@@ -1,194 +1,91 @@
-cat >/tmp/PATCH_TRADERONE_BALANCES_API.sh <<'SH'
+cat >/tmp/ROOT_FIX_AND_FIND_TRADERONE_PORT.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 export SYSTEMD_PAGER=cat PAGER=cat
 
-# Trouver server.js depuis le unit systemd
-UNIT="$(systemctl cat traderone.service 2>/dev/null || true)"
-SERVER_JS="$(printf "%s\n" "$UNIT" | sed -n 's/.*ExecStart=.*node[[:space:]]\+\([^[:space:]]*server\.js\).*/\1/p' | head -n1)"
-[ -n "${SERVER_JS:-}" ] || SERVER_JS="/opt/traderone-opt/server.js"
-[ -f "$SERVER_JS" ] || { echo "server.js introuvable: $SERVER_JS"; exit 1; }
+SERVER_JS="/opt/traderone-opt/server.js"
 
-echo "SERVER_JS=$SERVER_JS"
-cp -a "$SERVER_JS" "$SERVER_JS.bak.$(date +%s)"
+echo "== 0) Versions / status =="
+node -v || true
+systemctl status traderone.service --no-pager -l | sed -n '1,80p' || true
+echo
 
-# Ne patch pas 2 fois
-if grep -q "WOLVERINE_BALANCES_API" "$SERVER_JS"; then
-  echo "Déjà patché ✅"
-else
-  # Insert avant le listen si possible, sinon à la fin
-  python3 - <<'PY'
-import re,sys,io,os
-path=os.environ.get("SERVER_JS","/opt/traderone-opt/server.js")
-s=open(path,"r",encoding="utf-8",errors="ignore").read()
+echo "== 1) Derniers logs (cherchez: fetch is not defined / crash) =="
+journalctl -u traderone.service -n 120 --no-pager || true
+echo
 
-snippet = r'''
-// ===== WOLVERINE_BALANCES_API (server-side RPC, avoids browser CORS/403) =====
-const SOLANA_RPCS = [
-  "https://api.mainnet-beta.solana.com",
-  "https://solana-mainnet.g.alchemy.com/v2/demo",
-];
+echo "== 2) Port(s) node en écoute (avant fix) =="
+ss -ltnp | grep -E 'node|:8585' || true
+echo
 
-async function solanaRpc(method, params) {
-  let lastErr = null;
-  for (const url of SOLANA_RPCS) {
-    try {
-      const r = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
-      });
-      const data = await r.json().catch(() => ({}));
-      if (!r.ok || data.error) throw new Error((data.error && data.error.message) || ("HTTP " + r.status));
-      return data.result;
-    } catch (e) { lastErr = e; }
-  }
-  throw lastErr || new Error("RPC failed");
+echo "== 3) If Node < 18 => add fetch polyfill + install node-fetch =="
+if [ -f "$SERVER_JS" ]; then
+  if ! node -p 'process.versions.node.split(".")[0] >= 18' >/dev/null 2>&1; then
+    echo "Node <18 detected -> applying polyfill"
+    if ! grep -q "WOLVERINE_FETCH_POLYFILL" "$SERVER_JS"; then
+      cp -a "$SERVER_JS" "$SERVER_JS.bak.$(date +%s)"
+      python3 - <<'PY'
+import re
+p="/opt/traderone-opt/server.js"
+s=open(p,"r",encoding="utf-8",errors="ignore").read()
+poly = r'''
+// ===== WOLVERINE_FETCH_POLYFILL =====
+// Node <18 n'a pas fetch. Polyfill sans casser Node 18+.
+let _fetch = global.fetch;
+if (!_fetch) {
+  _fetch = (...args) => import("node-fetch").then(m => m.default(...args));
 }
-
-// GET /api/balances?wallet=PUBLICKEY
-app.get("/api/balances", async (req, res) => {
-  try {
-    const wallet = String(req.query.wallet || "").trim();
-    if (!wallet) return res.status(400).json({ error: "missing wallet" });
-
-    const solRes = await solanaRpc("getBalance", [wallet]);
-    const sol = (solRes && solRes.value ? (solRes.value / 1_000_000_000) : 0);
-
-    const usdcMint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-    const tokRes = await solanaRpc("getTokenAccountsByOwner", [
-      wallet,
-      { mint: usdcMint },
-      { encoding: "jsonParsed" }
-    ]);
-
-    let usdc = 0;
-    const v = (tokRes && tokRes.value) || [];
-    if (v.length) {
-      usdc = v[0]?.account?.data?.parsed?.info?.tokenAmount?.uiAmount ?? 0;
-    }
-
-    res.json({ wallet, sol, usdc });
-  } catch (e) {
-    res.status(500).json({ error: String(e && e.message ? e.message : e) });
-  }
-});
-// ===== /WOLVERINE_BALANCES_API =====
+// ===== /WOLVERINE_FETCH_POLYFILL =====
 '''.lstrip("\n")
 
-# Try insert before app.listen(...)
-m = re.search(r'\bapp\.listen\s*\(', s)
+m=re.search(r'^[\'"]use strict[\'"];\s*', s, flags=re.M)
 if m:
-  s2 = s[:m.start()] + snippet + "\n" + s[m.start():]
+  s = s[:m.end()] + "\n" + poly + "\n" + s[m.end():]
 else:
-  s2 = s + "\n\n" + snippet + "\n"
+  s = poly + "\n" + s
 
-open(path,"w",encoding="utf-8").write(s2)
-print("patched")
+open(p,"w",encoding="utf-8").write(s)
+print("polyfill inserted")
 PY
+    fi
+
+    # Remplacer fetch() -> _fetch() uniquement dans le snippet balances (si présent)
+    perl -0777 -i -pe 's/(WOLVERINE_BALANCES_API[\s\S]*?)\bfetch\(/\1_fetch(/g' "$SERVER_JS" || true
+
+    cd /opt/traderone-opt
+    if [ ! -d node_modules/node-fetch ]; then
+      npm i node-fetch@3 --silent
+    fi
+  else
+    echo "Node >=18 -> polyfill not needed"
+  fi
+else
+  echo "server.js introuvable: $SERVER_JS"
 fi
+echo
 
-# Restart service
-systemctl daemon-reload
+echo "== 4) Restart traderone =="
 systemctl restart traderone.service
+sleep 1
+systemctl status traderone.service --no-pager -l | sed -n '1,60p' || true
+echo
 
-echo "== quick test local balances endpoint =="
-curl -sS "http://127.0.0.1:8585/api/balances?wallet=11111111111111111111111111111111" | head -c 200; echo
+echo "== 5) Détecter le vrai port traderone (node listen) =="
+PORTS="$(ss -ltnp | awk '/node/ {print $4}' | sed 's/.*://g' | sort -nu | tr '\n' ' ')"
+echo "NODE_PORTS=$PORTS"
+echo
+
+echo "== 6) Test /api/health + /api/balances sur chaque port trouvé =="
+WALLET_TEST="11111111111111111111111111111111"
+for p in $PORTS 8585 3000 8080; do
+  echo "--- port $p ---"
+  curl -sS --max-time 2 "http://127.0.0.1:$p/api/health" 2>/dev/null && echo || echo "health: no"
+  curl -sS --max-time 3 "http://127.0.0.1:$p/api/balances?wallet=$WALLET_TEST" 2>/dev/null | head -c 200; echo
+done
+
+echo
+echo "== 7) Si aucun port ne répond: logs maintenant =="
+journalctl -u traderone.service -n 120 --no-pager || true
 SH
 
-bash /tmp/PATCH_TRADERONE_BALANCES_API.sh
-
-
-
-APPJS="$(grep -RIl --exclude-dir=node_modules --exclude-dir=.git 'API_START = "/wolverine/traderone/api/start"' /var/www /usr/share/nginx /opt 2>/dev/null | head -n 1)"
-echo "APPJS=$APPJS"
-[ -n "$APPJS" ] || { echo "app.js introuvable"; exit 1; }
-
-cp -a "$APPJS" "$APPJS.bak.$(date +%s)"
-
-cat > "$APPJS" <<'JS'
-const API_START = "/wolverine/traderone/api/start";
-const API_BALANCES = "/wolverine/api/balances";
-
-const btnConnect=document.getElementById("btnConnect");
-const btnStart=document.getElementById("btnStart");
-const btnRefresh=document.getElementById("btnRefresh");
-const afterConnect=document.getElementById("afterConnect");
-const walletPill=document.getElementById("walletPill");
-const solBalEl=document.getElementById("solBal");
-const usdcBalEl=document.getElementById("usdcBal");
-const budgetEl=document.getElementById("budget");
-const statusText=document.getElementById("statusText");
-
-let pubkey=null;
-
-function shortPk(pk){ const s=pk.toString(); return s.slice(0,4)+"…"+s.slice(-4); }
-function setStatus(t,cls="muted"){ statusText.className=cls; statusText.textContent=t; }
-function canStart(){ const v=Number(budgetEl.value); return pubkey && Number.isFinite(v) && v>0; }
-
-async function refreshBalances(){
-  if(!pubkey) return;
-  setStatus("Lecture des soldes…");
-  try{
-    const r = await fetch(`${API_BALANCES}?wallet=${encodeURIComponent(pubkey.toString())}`, { cache: "no-store" });
-    const data = await r.json().catch(()=> ({}));
-    if(!r.ok) throw new Error(data?.error || ("HTTP "+r.status));
-
-    solBalEl.textContent = Number(data.sol ?? 0).toFixed(4);
-    usdcBalEl.textContent = Number(data.usdc ?? 0).toFixed(2);
-    setStatus("OK", "ok");
-  }catch(e){
-    setStatus("Balances error: " + (e?.message || e), "err");
-  }
-}
-
-btnConnect.onclick=async ()=>{
-  if(!window.solana?.isPhantom){
-    setStatus("Phantom non détecté","err");
-    window.open("https://phantom.app/","_blank");
-    return;
-  }
-  try{
-    const r=await window.solana.connect();
-    pubkey=r.publicKey;
-    walletPill.textContent="Wallet: "+shortPk(pubkey);
-    afterConnect.classList.remove("hidden");
-    btnConnect.textContent="Wallet connecté";
-    btnConnect.disabled=true;
-
-    await refreshBalances();
-    btnStart.disabled=!canStart();
-  }catch(e){
-    setStatus("Connexion refusée: " + (e?.message||e),"err");
-  }
-};
-
-budgetEl.oninput=()=>{ btnStart.disabled=!canStart(); };
-btnRefresh.onclick=refreshBalances;
-
-btnStart.onclick=async ()=>{
-  if(!canStart()) return;
-  const budget=Number(budgetEl.value);
-  setStatus("Démarrage…");
-  btnStart.disabled=true;
-
-  try{
-    const res=await fetch(API_START,{
-      method:"POST",
-      headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({wallet:pubkey.toString(),budget})
-    });
-    const data=await res.json().catch(()=>({}));
-    if(!res.ok){ setStatus(data?.error||"Start failed","err"); btnStart.disabled=false; return; }
-    setStatus("WOLVERINE démarré ✅","ok");
-  }catch(e){
-    setStatus("Erreur API: " + (e?.message||e),"err");
-    btnStart.disabled=false;
-  }
-};
-JS
-
-nginx -t && systemctl reload nginx
-echo "OK. Ctrl+F5 sur /wolverine/"
-
-
+bash /tmp/ROOT_FIX_AND_FIND_TRADERONE_PORT.sh
