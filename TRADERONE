@@ -1,9 +1,86 @@
-WALLET="2uHgvSM6vrm7Ye7ntMFUA1RHiqAinGjeCx17dozsLx1z"
+cat >/tmp/WOLVERINE_FIX_WOLVERINE_STATIC_NGINX.sh <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
 
-echo "== Test homepage HTTPS =="
-curl -ksSI https://fireinners.online/ | sed -n '1,12p'
+DOMAIN="fireinners.online"
+
+echo "== 1) Vérifie ce que renvoie /wolverine/app.js (doit être JS, pas HTML) =="
+echo "--- HEADERS:"
+curl -ksSI "https://$DOMAIN/wolverine/app.js" | sed -n '1,25p' || true
+echo
+echo "--- FIRST BYTES:"
+curl -ksS "https://$DOMAIN/wolverine/app.js" | head -c 80; echo
 echo
 
-echo "== Test balances2 HTTPS (doit renvoyer du JSON) =="
-curl -ksS "https://fireinners.online/wolverine/traderone/api/balances2?wallet=$WALLET" | head -c 250
+echo "== 2) Trouver le dossier wolverine sur disque (index.html/app.js/config.json) =="
+BASE=""
+for d in \
+  /var/www/fireinners/wolverine \
+  /var/www/html/wolverine \
+  /var/www/wolverine \
+  /opt/traderone-opt/wolverine \
+  /opt/traderone-opt/public/wolverine \
+  /opt/traderone-opt/public \
+  /opt/traderone-opt/static \
+  /opt/traderone-opt/dist \
+; do
+  if [ -f "$d/index.html" ] && [ -f "$d/app.js" -o -f "$d/js/app.js" ] ; then
+    BASE="$d"
+    break
+  fi
+done
+
+if [ -z "$BASE" ]; then
+  echo "WARN: pas trouvé dans les chemins standards. Recherche rapide sous /var/www et /opt..."
+  CAND="$(find /var/www /opt -maxdepth 5 -type f -name 'index.html' -path '*wolverine*' 2>/dev/null | head -n 1 || true)"
+  if [ -n "$CAND" ]; then BASE="$(dirname "$CAND")"; fi
+fi
+
+echo "WOLVERINE_DIR=$BASE"
+[ -n "$BASE" ] || { echo "❌ Impossible de trouver le dossier wolverine. Donne-moi le résultat de: find /var/www /opt -maxdepth 6 -type f -path '*wolverine*' | head"; exit 1; }
 echo
+
+echo "== 3) Patch nginx: servir /wolverine/ en statique (et garder proxy ailleurs) =="
+CONF="/etc/nginx/sites-enabled/fireinners"
+[ -f "$CONF" ] || { echo "❌ Conf nginx introuvable: $CONF"; exit 2; }
+
+TS="$(date +%s)"
+cp -a "$CONF" "$CONF.bak.$TS"
+
+if grep -q "WOLVERINE_STATIC_BEGIN" "$CONF"; then
+  echo "Block statique déjà présent -> skip"
+else
+  awk -v dir="$BASE" '
+  BEGIN{in_server=0; done=0}
+  {
+    line=$0
+    if ($0 ~ /^[[:space:]]*server[[:space:]]*\{/){ in_server=1 }
+
+    if (in_server && $0 ~ /^[[:space:]]*location[[:space:]]+\/[[:space:]]*\{/ && done==0){
+      print "  # WOLVERINE_STATIC_BEGIN"
+      print "  location ^~ /wolverine/ {"
+      print "    alias " dir "/;"
+      print "    try_files $uri $uri/ /wolverine/index.html;"
+      print "    add_header Cache-Control \"no-store\" always;"
+      print "  }"
+      print "  # WOLVERINE_STATIC_END"
+      print ""
+      done=1
+    }
+
+    print line
+  }' "$CONF.bak.$TS" > "$CONF"
+fi
+
+nginx -t
+systemctl reload nginx
+echo
+
+echo "== 4) Re-test /wolverine/app.js (doit NE PLUS commencer par '<') =="
+curl -ksSI "https://$DOMAIN/wolverine/app.js" | sed -n '1,20p'
+echo
+curl -ksS "https://$DOMAIN/wolverine/app.js" | head -c 60; echo
+echo "DONE ✅"
+SH
+
+bash /tmp/WOLVERINE_FIX_WOLVERINE_STATIC_NGINX.sh
