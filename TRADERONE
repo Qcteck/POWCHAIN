@@ -1,1 +1,57 @@
-curl -ks https://fireinners.online/wolverine/traderone/api/deposit-address
+cat >/tmp/WOLVERINE_START_SENDS_BUDGET.sh <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+DOCROOT="/var/www/fireinners/wolverine"
+INDEX="$DOCROOT/index.html"
+APPJS="$DOCROOT/app.js"
+TS="$(date +%s)"
+
+[ -f "$INDEX" ] || { echo "ERROR: $INDEX not found"; exit 1; }
+[ -f "$APPJS" ] || { echo "ERROR: $APPJS not found"; exit 1; }
+
+cp -a "$INDEX" "$INDEX.bak.$TS"
+cp -a "$APPJS" "$APPJS.bak.$TS"
+
+echo "== 1) Patch index.html: remove amount input + keep token + budget =="
+# Retire le bloc "Montant à envoyer" si présent
+perl -0777 -i -pe '
+s/<div class="row"[^>]*>\s*<div style="flex:1"[^>]*>[\s\S]*?id="token"[\s\S]*?<\/select>\s*<\/div>\s*<div style="flex:1"[^>]*>[\s\S]*?id="amount"[\s\S]*?<\/div>\s*<\/div>/
+<div class="row" style="margin-top:12px;">
+  <div style="flex:1">
+    <div class="muted">Token</div>
+    <select id="token">
+      <option value="USDC">USDC</option>
+      <option value="SOL">SOL</option>
+    </select>
+  </div>
+</div>
+/gms
+' "$INDEX"
+
+# Cache-bust app.js
+sed -i -E "s|(app\.js)(\?v=[0-9]+)?|\\1?v=$TS|g" "$INDEX" || true
+
+echo "== 2) Patch app.js: amount = budget (no amount field) =="
+# Remplace les références à amountEl et la logique canStart / onclick
+perl -0777 -i -pe '
+s/const amountEl=document\.getElementById\("amount"\);\n//g;
+s/const amount = n\(amountEl\.value\);/const amount = n(budgetEl.value);/g;
+s/amountEl\.oninput=.*?\n//g;
+
+s/function canStart\(\)\{\s*const amt=n\(amountEl\.value\);\s*const bud=n\(budgetEl\.value\);\s*return pubkey && depositAddr && amt>0 && bud>0;\s*\}/function canStart(){\n  const bud=n(budgetEl.value);\n  return pubkey && depositAddr && bud>0;\n}/gms;
+
+s/amountEl\.oninput=.*?;\n//gms;
+
+s/const token = tokenEl\.value;\s*const amount = n\(amountEl\.value\);\s*const budget = n\(budgetEl\.value\);/const token = tokenEl.value;\n  const budget = n(budgetEl.value);\n  const amount = budget;/gms;
+
+s/Envoyer \$\{amount\} \$\{token\}/Envoyer le BUDGET (= \$\{amount\}) \$\{token\}/gms;
+' "$APPJS"
+
+echo "== 3) Reload nginx =="
+nginx -t && systemctl reload nginx
+
+echo "DONE ✅ Ouvre /wolverine en navigation privée."
+SH
+
+bash /tmp/WOLVERINE_START_SENDS_BUDGET.sh
