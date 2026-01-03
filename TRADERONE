@@ -1,8 +1,7 @@
-cat >/tmp/MEGA_WOLVERINE_PATCH.sh <<'BASH'
+cat >/tmp/MEGA_WOLVERINE_PATCH_v2.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 set +H 2>/dev/null || true
-
 [ "$(id -u)" = "0" ] || { echo "ERREUR: lance en root"; exit 1; }
 
 APPDIR="/opt/fireinners/wolverine-api"
@@ -14,6 +13,7 @@ UNIT="/etc/systemd/system/${SERVICE}.service"
 SNIP="/etc/nginx/snippets/fireinners-wolverine.conf"
 SITE="/etc/nginx/sites-available/fireinners.online-ssl"
 ASKOR="/opt/fireinners/sentinel/lib/askorupdate.sh"
+NGC="/etc/nginx/nginx.conf"
 
 need(){ command -v "$1" >/dev/null 2>&1 || { echo "ERREUR: '$1' manquant"; exit 1; }; }
 need node; need npm; need systemctl; need nginx; need curl; need perl; need chattr
@@ -22,11 +22,12 @@ echo "=== PRE-FLY (read-only) ==="
 echo "Node: $(node -v) / Npm: $(npm -v)"
 nginx -t >/dev/null
 echo "NGINX OK"
-echo "Dirs: APPDIR=$APPDIR WEBDIR=$WEBDIR"
+echo "APPDIR=$APPDIR"
+echo "WEBDIR=$WEBDIR"
 
-mkdir -p "$APPDIR" "$WEBDIR" "/etc/nginx/snippets" "${APPDIR}/state"
+mkdir -p "$APPDIR" "$WEBDIR" "${APPDIR}/state" /etc/nginx/snippets
 
-# askorupdate (si dispo)
+# askorupdate si dispo
 if [ -f "$ASKOR" ]; then
   # shellcheck disable=SC1090
   . "$ASKOR"
@@ -35,12 +36,17 @@ else
   askorupdate_yesno(){ return 0; }
 fi
 
-echo "=== MEGA PATCH ==="
+echo "=== UNLOCK (safe) ==="
+chattr -i "$SNIP" 2>/dev/null || true
+chattr -i "$SITE" 2>/dev/null || true
+chattr -i "$NGC" 2>/dev/null || true
+chattr -i "$SENVF" 2>/dev/null || true
+chattr -i "$WEBDIR/index.html" 2>/dev/null || true
 
 # .env defaults (append missing)
 touch "$SENVF"
-grep -qE '^PORT=' "$SENVF" || echo 'PORT=3050' >>"$SENVF"
 grep -qE '^HOST=' "$SENVF" || echo 'HOST=127.0.0.1' >>"$SENVF"
+grep -qE '^PORT=' "$SENVF" || echo 'PORT=3050' >>"$SENVF"
 grep -qE '^BASE_PATH=' "$SENVF" || echo 'BASE_PATH=/wolverine' >>"$SENVF"
 grep -qE '^RPC_URL=' "$SENVF" || echo 'RPC_URL=https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac' >>"$SENVF"
 grep -qE '^USDC_MINT=' "$SENVF" || echo 'USDC_MINT=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1' >>"$SENVF"
@@ -51,151 +57,112 @@ grep -qE '^MONITOR_FAILS=' "$SENVF" || echo 'MONITOR_FAILS=3' >>"$SENVF"
 grep -qE '^TG_ALERTS=' "$SENVF" || echo 'TG_ALERTS=0' >>"$SENVF"
 grep -qE '^WOLV_SEND=' "$SENVF" || echo 'WOLV_SEND=/usr/local/bin/wolv_send' >>"$SENVF"
 
-# server.js (API stable)
 read -r -d '' SERVER_JS <<'JS'
-"use strict";
-require("dotenv").config();
-const fs=require("fs");
-const path=require("path");
-const express=require("express");
-const {execFile}=require("child_process");
-
-const {Keypair,PublicKey,Connection}=require("@solana/web3.js");
-
-const HOST=process.env.HOST||"127.0.0.1";
-const PORT=parseInt(process.env.PORT||"3050",10);
-const BASE_PATH=process.env.BASE_PATH||"/wolverine";
-const RPC_URL=process.env.RPC_URL||"";
-const MONITOR_URI=process.env.MONITOR_URI||"";
-const MONITOR_SEC=Math.max(3,parseInt(process.env.MONITOR_SEC||"10",10));
-const MONITOR_FAILS=Math.max(1,parseInt(process.env.MONITOR_FAILS||"3",10));
-const TG_ALERTS=String(process.env.TG_ALERTS||"0")==="1";
-const WOLV_SEND=process.env.WOLV_SEND||"";
-
-const STATE_DIR=path.join(__dirname,"state");
-const WALLET_JSON=path.join(STATE_DIR,"custody_wallet.json");
-const WALLET_PUB=path.join(STATE_DIR,"custody_wallet.pub");
-
-function ensureDir(p){ try{ fs.mkdirSync(p,{recursive:true}); }catch(_){} }
-ensureDir(STATE_DIR);
-
-function loadOrCreateCustody(){
-  try{
-    if(fs.existsSync(WALLET_JSON)&&fs.existsSync(WALLET_PUB)){
-      const pub=String(fs.readFileSync(WALLET_PUB,"utf8")).trim();
-      const raw=JSON.parse(String(fs.readFileSync(WALLET_JSON,"utf8")));
-      if(pub && Array.isArray(raw) && raw.length===64) return {pub, raw};
-    }
-  }catch(_){}
-  const kp=Keypair.generate();
-  const raw=Array.from(kp.secretKey);
-  const pub=kp.publicKey.toBase58();
-  fs.writeFileSync(WALLET_JSON,JSON.stringify(raw));
-  fs.writeFileSync(WALLET_PUB,pub);
-  try{ fs.chmodSync(WALLET_JSON,0o600); }catch(_){}
-  try{ fs.chmodSync(WALLET_PUB,0o644); }catch(_){}
-  return {pub, raw};
-}
-
-const custody=loadOrCreateCustody();
-
-let running=false;
-let loopOn=false;
-let loopTimer=null;
-let lastMonitor={ts:null, ok:null, status:null, body:null, fails:0};
-let lastStart=null;
-
-function nowISO(){ return new Date().toISOString(); }
-
-function tgSend(msg){
-  if(!TG_ALERTS) return;
-  if(!WOLV_SEND) return;
-  try{
-    execFile(WOLV_SEND,[String(msg).slice(0,3500)],{timeout:8000},()=>{});
-  }catch(_){}
-}
-
-async function monitorTick(){
-  const ts=nowISO();
-  if(!MONITOR_URI){
-    lastMonitor={ts, ok:true, status:200, body:"no MONITOR_URI", fails:0};
-    return;
-  }
-  try{
-    const r=await fetch(MONITOR_URI,{method:"GET"});
-    const tx=await r.text();
-    const ok=r.ok && /pong/i.test(tx);
-    lastMonitor={ts, ok, status:r.status, body:tx.slice(0,200), fails: ok?0: (lastMonitor.fails+1)};
-    if(!ok && lastMonitor.fails>=MONITOR_FAILS){
-      tgSend(`WOLVERINE MONITOR: ERR (${MONITOR_URI}) ${ts} status=${r.status} body=${tx.slice(0,120)}`);
-      lastMonitor.fails=0;
-    }
-  }catch(e){
-    lastMonitor={ts, ok:false, status:0, body:String(e&&e.message||e).slice(0,200), fails:lastMonitor.fails+1};
-    if(lastMonitor.fails>=MONITOR_FAILS){
-      tgSend(`WOLVERINE MONITOR: OFFLINE ${ts} err=${lastMonitor.body}`);
-      lastMonitor.fails=0;
-    }
-  }
-}
-
-function loopStart(){
-  if(loopOn) return;
-  loopOn=true;
-  monitorTick().catch(()=>{});
-  loopTimer=setInterval(()=>{ monitorTick().catch(()=>{}); }, MONITOR_SEC*1000);
-}
-function loopStop(){
-  loopOn=false;
-  if(loopTimer){ clearInterval(loopTimer); loopTimer=null; }
-}
-
-const app=express();
-app.disable("x-powered-by");
-app.use(express.json({limit:"256kb"}));
-
-app.get("/",(req,res)=>res.json({ok:true, service:"wolverine-api", ts:nowISO()}));
+"use strict";require("dotenv").config();const fs=require("fs"),path=require("path"),express=require("express"),{execFile}=require("child_process"),{Keypair}=require("@solana/web3.js");
+const HOST=process.env.HOST||"127.0.0.1",PORT=parseInt(process.env.PORT||"3050",10),BASE_PATH=process.env.BASE_PATH||"/wolverine",MONITOR_URI=process.env.MONITOR_URI||"",MONITOR_SEC=Math.max(3,parseInt(process.env.MONITOR_SEC||"10",10)),MONITOR_FAILS=Math.max(1,parseInt(process.env.MONITOR_FAILS||"3",10)),TG_ALERTS=String(process.env.TG_ALERTS||"0")==="1",WOLV_SEND=process.env.WOLV_SEND||"";
+const STATE_DIR=path.join(__dirname,"state"),WALLET_JSON=path.join(STATE_DIR,"custody_wallet.json"),WALLET_PUB=path.join(STATE_DIR,"custody_wallet.pub");try{fs.mkdirSync(STATE_DIR,{recursive:true});}catch(_){}
+function loadOrCreate(){try{if(fs.existsSync(WALLET_JSON)&&fs.existsSync(WALLET_PUB)){const pub=String(fs.readFileSync(WALLET_PUB,"utf8")).trim();const raw=JSON.parse(String(fs.readFileSync(WALLET_JSON,"utf8")));if(pub&&Array.isArray(raw)&&raw.length===64)return{pub,raw};}}catch(_){}const kp=Keypair.generate();const raw=Array.from(kp.secretKey);const pub=kp.publicKey.toBase58();fs.writeFileSync(WALLET_JSON,JSON.stringify(raw));fs.writeFileSync(WALLET_PUB,pub);try{fs.chmodSync(WALLET_JSON,0o600);}catch(_){}try{fs.chmodSync(WALLET_PUB,0o644);}catch(_){}return{pub,raw};}
+const custody=loadOrCreate();let running=false,loopOn=false,loopTimer=null,lastMonitor={ts:null,ok:null,status:null,body:null,fails:0},lastStart=null;
+const nowISO=()=>new Date().toISOString();
+function tgSend(msg){if(!TG_ALERTS||!WOLV_SEND)return;try{execFile(WOLV_SEND,[String(msg).slice(0,3500)],{timeout:8000},()=>{});}catch(_){}}
+async function monitorTick(){const ts=nowISO();if(!MONITOR_URI){lastMonitor={ts,ok:true,status:200,body:"no MONITOR_URI",fails:0};return;}try{const r=await fetch(MONITOR_URI,{method:"GET"});const tx=await r.text();const ok=r.ok&&/pong/i.test(tx);lastMonitor={ts,ok,status:r.status,body:tx.slice(0,200),fails:ok?0:(lastMonitor.fails+1)};if(!ok&&lastMonitor.fails>=MONITOR_FAILS){tgSend(`WOLVERINE MONITOR: ERR (${MONITOR_URI}) ${ts} status=${r.status} body=${tx.slice(0,120)}`);lastMonitor.fails=0;}}catch(e){lastMonitor={ts,ok:false,status:0,body:String(e&&e.message||e).slice(0,200),fails:lastMonitor.fails+1};if(lastMonitor.fails>=MONITOR_FAILS){tgSend(`WOLVERINE MONITOR: OFFLINE ${ts} err=${lastMonitor.body}`);lastMonitor.fails=0;}}}
+function loopStart(){if(loopOn)return;loopOn=true;monitorTick().catch(()=>{});loopTimer=setInterval(()=>{monitorTick().catch(()=>{});},MONITOR_SEC*1000);}
+function loopStop(){loopOn=false;if(loopTimer){clearInterval(loopTimer);loopTimer=null;}}
+const app=express();app.disable("x-powered-by");app.use(express.json({limit:"256kb"}));
+app.get("/",(req,res)=>res.json({ok:true,service:"wolverine-api",ts:nowISO()}));
 app.get("/ping",(req,res)=>res.type("text/plain").send("pong"));
-app.get("/health",(req,res)=>res.json({ok:true, ts:nowISO(), uptime:process.uptime()}));
-app.get("/config",(req,res)=>res.json({
-  ok:true,
-  ts:nowISO(),
-  basePath:BASE_PATH,
-  apiBase:`${BASE_PATH}/api`,
-  host:HOST, port:PORT,
-  custodyPubkey:custody.pub,
-  monitor:{uri:MONITOR_URI, sec:MONITOR_SEC, fails:MONITOR_FAILS, enabled:loopOn}
-}));
-app.get("/wallet",(req,res)=>res.json({ok:true, custodyPubkey:custody.pub}));
-app.get("/status",(req,res)=>res.json({
-  ok:true, ts:nowISO(),
-  running, loop:loopOn,
-  custodyPubkey:custody.pub,
-  lastStart,
-  lastMonitor
-}));
-
-app.post("/start",(req,res)=>{
-  const body=req.body||{};
-  running=true;
-  lastStart={ts:nowISO(), budget:body.budget||null, mode:body.mode||null, mint:body.mint||null, phantomPubkey:body.phantomPubkey||null};
-  res.json({ok:true, running, lastStart});
-});
-app.post("/stop",(req,res)=>{ running=false; res.json({ok:true, running}); });
-
-app.post("/loop/start",(req,res)=>{ loopStart(); res.json({ok:true, loop:true, monitor:lastMonitor}); });
-app.post("/loop/stop",(req,res)=>{ loopStop(); res.json({ok:true, loop:false}); });
-
-const server=app.listen(PORT,HOST,()=>{ console.log(`[wolverine-api] listening http://${HOST}:${PORT} base=${BASE_PATH}`); });
-
-process.on("SIGTERM",()=>{ try{loopStop();}catch(_){}; server.close(()=>process.exit(0)); });
-process.on("SIGINT",()=>{ try{loopStop();}catch(_){}; server.close(()=>process.exit(0)); });
+app.get("/health",(req,res)=>res.json({ok:true,ts:nowISO(),uptime:process.uptime()}));
+app.get("/config",(req,res)=>res.json({ok:true,ts:nowISO(),basePath:BASE_PATH,apiBase:`${BASE_PATH}/api`,host:HOST,port:PORT,custodyPubkey:custody.pub,monitor:{uri:MONITOR_URI,sec:MONITOR_SEC,fails:MONITOR_FAILS,enabled:loopOn}}));
+app.get("/wallet",(req,res)=>res.json({ok:true,custodyPubkey:custody.pub}));
+app.get("/status",(req,res)=>res.json({ok:true,ts:nowISO(),running,loop:loopOn,custodyPubkey:custody.pub,lastStart,lastMonitor}));
+app.post("/start",(req,res)=>{const b=req.body||{};running=true;lastStart={ts:nowISO(),budget:b.budget||null,mode:b.mode||null,mint:b.mint||null,phantomPubkey:b.phantomPubkey||null};res.json({ok:true,running,lastStart});});
+app.post("/stop",(req,res)=>{running=false;res.json({ok:true,running});});
+app.post("/loop/start",(req,res)=>{loopStart();res.json({ok:true,loop:true,monitor:lastMonitor});});
+app.post("/loop/stop",(req,res)=>{loopStop();res.json({ok:true,loop:false});});
+const server=app.listen(PORT,HOST,()=>{console.log(`[wolverine-api] listening http://${HOST}:${PORT} base=${BASE_PATH}`);});
+process.on("SIGTERM",()=>{try{loopStop();}catch(_){};server.close(()=>process.exit(0));});
+process.on("SIGINT",()=>{try{loopStop();}catch(_){};server.close(()=>process.exit(0));});
 JS
-
 askorupdate_file "${APPDIR}/server.js" "WOLVERINE server.js" SERVER_JS
 chmod 644 "${APPDIR}/server.js" || true
 
-# package deps (install only if missing)
+# npm deps
 cd "$APPDIR"
 if [ ! -f package.json ]; then npm init -y >/dev/null 2>&1 || true; fi
-node -e "require('express');
+node -e "require('express');require('dotenv');require('@solana/web3.js')" >/dev/null 2>&1 || {
+  echo "Installing npm deps..."
+  npm i --omit=dev express dotenv @solana/web3.js >/dev/null
+}
+
+# systemd unit
+read -r -d '' UNIT_TXT <<EOF
+[Unit]
+Description=WOLVERINE API
+After=network.target
+[Service]
+Type=simple
+WorkingDirectory=${APPDIR}
+EnvironmentFile=${SENVF}
+ExecStart=/usr/bin/node ${APPDIR}/server.js
+Restart=always
+RestartSec=2
+User=root
+[Install]
+WantedBy=multi-user.target
+EOF
+askorupdate_file "$UNIT" "WOLVERINE systemd unit" UNIT_TXT
+
+systemctl daemon-reload
+systemctl enable --now "$SERVICE" >/dev/null 2>&1 || true
+systemctl restart "$SERVICE" >/dev/null 2>&1 || true
+
+# nginx snippet
+read -r -d '' SNIP_TXT <<'NG'
+location = /wolverine { return 301 /wolverine/; }
+location ^~ /wolverine/api/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  proxy_read_timeout 60s;
+  proxy_connect_timeout 10s;
+  proxy_send_timeout 60s;
+  proxy_pass http://127.0.0.1:3050/;
+}
+location ^~ /wolverine/ {
+  root /opt/fireinners/frontend-react/app/dist;
+  try_files $uri $uri/ /wolverine/index.html;
+  add_header Cache-Control "no-store, max-age=0" always;
+}
+NG
+askorupdate_file "$SNIP" "WOLVERINE nginx snippet" SNIP_TXT
+
+# ensure include in vhost after first server_name
+if ! grep -q "snippets/fireinners-wolverine.conf" "$SITE"; then
+  perl -0777 -i -pe 's/(server_name\s+[^;]+;\s*)/$1    include \/etc\/nginx\/snippets\/fireinners-wolverine\.conf;\n/s if $_!~m/snippets\/fireinners-wolverine\.conf/' "$SITE"
+fi
+
+# frontend (EN default + FR toggle + visible color change)
+read -r -d '' INDEX_HTML <<'HTML'
+<!doctype html><html lang="en"><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>WOLVERINE</title><style>:root{--bg:#070816;--p:#0a1230;--p2:#070b22;--l:#203a66;--t:#e9f2ff;--m:#a9bfe6;--ok:#b9ffcf;--bad:#ffb3b3;--a:#b18cff}*{box-sizing:border-box}html,body{margin:0;height:100%;background:radial-gradient(900px 520px at 20% 0%,#1b0a3a 0%,transparent 60%),radial-gradient(700px 480px at 82% 22%,#0c2b6b 0%,transparent 55%),var(--bg);color:var(--t);font:14px system-ui}#top{position:sticky;top:0;z-index:9;padding:14px 16px;border-bottom:1px solid rgba(255,255,255,.08);background:linear-gradient(180deg,rgba(10,18,48,.92),rgba(7,8,22,.65));backdrop-filter:blur(10px)}.row{display:flex;gap:12px;align-items:center;justify-content:space-between}.brand{display:flex;gap:12px;align-items:center}.dot{width:28px;height:28px;border-radius:10px;background:radial-gradient(circle at 30% 25%,#fff,rgba(255,255,255,.1) 35%),linear-gradient(135deg,#7a5cff,#29b3ff);box-shadow:0 0 20px rgba(145,120,255,.25)}.ttl{font-weight:800;letter-spacing:.5px}.sub{color:var(--m);font-size:12px;margin-top:2px}button,input,select{font:inherit;color:var(--t)}.btn{border:1px solid rgba(255,255,255,.14);background:linear-gradient(180deg,rgba(255,255,255,.10),rgba(255,255,255,.04));padding:9px 12px;border-radius:12px;cursor:pointer}.btn:hover{border-color:rgba(255,255,255,.22)}.btnP{background:linear-gradient(180deg,rgba(177,140,255,.35),rgba(41,179,255,.18));border-color:rgba(177,140,255,.35)}.btnD{background:linear-gradient(180deg,rgba(255,179,179,.22),rgba(255,255,255,.04));border-color:rgba(255,179,179,.35)}.wrap{max-width:1100px;margin:0 auto;padding:16px}.grid{display:grid;grid-template-columns:420px 1fr;gap:16px}@media(max-width:980px){.grid{grid-template-columns:1fr}}.card{border:1px solid rgba(255,255,255,.12);background:linear-gradient(180deg,rgba(10,18,48,.72),rgba(7,11,34,.42));border-radius:16px;padding:14px;box-shadow:0 0 0 1px rgba(0,0,0,.25),0 20px 60px rgba(0,0,0,.35)}.h{font-weight:700;margin:0 0 10px 0;color:#d9e8ff}.cols{display:grid;grid-template-columns:1fr 1fr;gap:10px}.lbl{color:var(--m);font-size:12px;margin-bottom:6px}.inp,select{width:100%;padding:10px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.14);background:rgba(0,0,0,.18);outline:none}.inp:focus,select:focus{border-color:rgba(177,140,255,.55)}.hr{height:1px;background:rgba(255,255,255,.10);margin:12px 0}.log{height:340px;overflow:auto;border-radius:12px;border:1px solid rgba(255,255,255,.10);background:rgba(0,0,0,.18);padding:10px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;white-space:pre-wrap}.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:#ffd79a}</style><body><div id="top"><div class="row"><div class="brand"><div class="dot"></div><div><div class="ttl">WOLVERINE</div><div class="sub" id="sub">TraderOne • API • Adaptive Refresh • TG Monitor</div></div></div><div class="row" style="gap:8px"><button class="btn" id="lang">EN</button><button class="btn" id="btnAPI">API</button><button class="btn" id="btnPing">Ping</button><button class="btn" id="btnLoop">Loop</button></div></div></div><div class="wrap"><div class="grid"><div class="card"><div class="h" id="hCtrl">Control</div><div class="cols"><div><div class="lbl" id="lPh">Wallet (Phantom)</div><div style="display:flex;gap:8px"><button class="btn btnP" id="btnConnect">Connect</button><button class="btn" id="btnDisconnect">Disconnect</button></div></div><div><div class="lbl" id="lAddr">Phantom address</div><input class="inp" id="phPub" placeholder="not connected" readonly></div><div><div class="lbl">SOL</div><input class="inp" id="solBal" placeholder="-" readonly></div><div><div class="lbl">USDC</div><input class="inp" id="usdcBal" placeholder="-" readonly></div><div><div class="lbl">Custody (TraderOne)</div><input class="inp" id="custody" placeholder="-" readonly></div></div><div class="hr"></div><div class="cols"><div><div class="lbl" id="lBudget">Budget (USDC)</div><input class="inp" id="budget" inputmode="decimal" placeholder="ex: 50"></div><div><div class="lbl" id="lMode">Mode</div><select id="mode"><option value="safe_dca">DCA buy SOL (safe)</option><option value="microcap_radar">Microcap radar (risk)</option><option value="manual_token">Manual token</option></select></div><div><div class="lbl" id="lMint">Mint (manual token)</div><input class="inp" id="mint" placeholder="SPL mint (solana)"></div><div><div class="lbl">&nbsp;</div><div style="display:flex;gap:8px"><button class="btn btnP" id="btnStart">Start WOLVERINE</button><button class="btn btnD" id="btnStop">Stop</button><button class="btn" id="btnRefresh">Refresh</button><button class="btn" id="btnPing2">Ping</button></div></div></div><div class="hr"></div><div class="sub" id="note">Important: custodial mode uses server key. Frontend sends no private key by default. Deposit sends SOL/USDC to displayed Custody address.</div></div><div class="card"><div class="h">Console</div><div class="log" id="log"></div><div class="sub" style="margin-top:10px">Last refresh: <span id="lastTs">-</span> • Errors: <span id="errCnt">0</span> • <span id="loopState">-</span></div></div></div></div><script>(()=>{const S={apiBase:"/wolverine/api",pollFails:0,loop:false,err:0,lang:"en"};const T={en:{sub:"TraderOne • API • Adaptive Refresh • TG Monitor",hCtrl:"Control",lPh:"Wallet (Phantom)",lAddr:"Phantom address",lBudget:"Budget (USDC)",lMode:"Mode",lMint:"Mint (manual token)",note:"Important: custodial mode uses server key. Frontend sends no private key by default. Deposit sends SOL/USDC to displayed Custody address.",connect:"Connect",disconnect:"Disconnect",start:"Start WOLVERINE",stop:"Stop",refresh:"Refresh",ping:"Ping"},fr:{sub:"TraderOne • API • Refresh adaptatif • Monitoring TG",hCtrl:"Contrôle",lPh:"Wallet (Phantom)",lAddr:"Adresse Phantom",lBudget:"Budget (USDC)",lMode:"Mode",lMint:"Mint (token manuel)",note:"Important: si tu actives le mode custodial côté backend, l’API utilise la clé du serveur. Le frontend n’envoie pas de clé privée. Dépôt: envoie SOL/USDC vers l’adresse Custody affichée.",connect:"Connect",disconnect:"Disconnect",start:"Start WOLVERINE",stop:"Stop",refresh:"Refresh",ping:"Ping"}};const $=s=>document.querySelector(s);const log=(m,c)=>{const el=$("#log");const p=document.createElement("div");p.textContent=m;p.className=c||"";el.appendChild(p);el.scrollTop=el.scrollHeight};const setTxt=()=>{const d=T[S.lang];$("#sub").textContent=d.sub;$("#hCtrl").textContent=d.hCtrl;$("#lPh").textContent=d.lPh;$("#lAddr").textContent=d.lAddr;$("#lBudget").textContent=d.lBudget;$("#lMode").textContent=d.lMode;$("#lMint").textContent=d.lMint;$("#note").textContent=d.note;$("#btnConnect").textContent=d.connect;$("#btnDisconnect").textContent=d.disconnect;$("#btnStart").textContent=d.start;$("#btnStop").textContent=d.stop;$("#btnRefresh").textContent=d.refresh;$("#btnPing2").textContent=d.ping};const safeJson=async r=>{const tx=await r.text();try{return JSON.parse(tx)}catch(_){return{ok:false,error:"bad_json",raw:tx.slice(0,200)}}};const get=async p=>{try{const r=await fetch(S.apiBase+p,{cache:"no-store"});return await safeJson(r)}catch(e){return{ok:false,error:e&&e.message||String(e)}}};const post=async(p,b)=>{try{const r=await fetch(S.apiBase+p,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(b||{}),cache:"no-store"});return await safeJson(r)}catch(e){return{ok:false,error:e&&e.message||String(e)}}};async function refresh(){const c=await get("/config");if(c.ok){$("#custody").value=c.custodyPubkey||"-";log("config ok","ok")}else{S.err++;$("#errCnt").textContent=String(S.err);log("config err: "+(c.error||"ERR"),"bad")}const st=await get("/status");if(st.ok){$("#lastTs").textContent=st.ts||"-";$("#loopState").textContent=st.loop?"LOOP: ON":"LOOP: OFF";}else{S.err++;$("#errCnt").textContent=String(S.err);log("status err: "+(st.error||"ERR"),"bad")}}async function ping(){const r=await fetch(S.apiBase+"/ping",{cache:"no-store"}).then(x=>x.text()).catch(e=>"ERR:"+String(e&&e.message||e));const ok=String(r).toLowerCase().includes("pong");log("ping: "+String(r).slice(0,80),ok?"ok":"bad");return ok}async function api(){const h=await get("/health");log("health: "+(h.ok?"ok":"ERR")+" "+(h.ts||h.error||""),h.ok?"ok":"bad")}async function loopToggle(){if(!S.loop){const r=await post("/loop/start");S.loop=!!r.ok;log("loop start: "+(r.ok?"ok":"ERR"),r.ok?"ok":"bad")}else{const r=await post("/loop/stop");S.loop=false;log("loop stop: "+(r.ok?"ok":"ERR"),r.ok?"ok":"bad")}await refresh()}$("#btnAPI").onclick=api;$("#btnPing").onclick=ping;$("#btnPing2").onclick=ping;$("#btnLoop").onclick=loopToggle;$("#btnRefresh").onclick=refresh;$("#btnStart").onclick=async()=>{const budget=parseFloat($("#budget").value||"0")||0;const mode=$("#mode").value;const mint=$("#mint").value.trim();const phantomPubkey=$("#phPub").value.trim();if(budget<=0){log("Budget invalid","bad");return}const r=await post("/start",{budget,mode,mint,phantomPubkey});log("start: "+(r.ok?"ok":"ERR")+" "+(r.ok?JSON.stringify(r.lastStart):r.error||""),r.ok?"ok":"bad");await refresh()};$("#btnStop").onclick=async()=>{const r=await post("/stop");log("stop: "+(r.ok?"ok":"ERR"),r.ok?"ok":"bad");await refresh()};$("#lang").onclick=()=>{S.lang=(S.lang==="en"?"fr":"en");localStorage.setItem("wolv_lang",S.lang);$("#lang").textContent=S.lang.toUpperCase();setTxt()};S.lang=localStorage.getItem("wolv_lang")==="fr"?"fr":"en";$("#lang").textContent=S.lang.toUpperCase();setTxt();refresh();})();</script></body></html>
+HTML
+askorupdate_file "$WEBDIR/index.html" "WOLVERINE index.html" INDEX_HTML
+chmod 644 "$WEBDIR/index.html" || true
+
+echo "=== RELOAD NGINX (safe) ==="
+nginx -t
+systemctl reload nginx
+
+echo "=== TESTS ==="
+echo "- local upstream:"
+curl -fsS "http://127.0.0.1:3050/ping" && echo
+echo "- public ping:"
+curl -fsS "https://fireinners.online/wolverine/api/ping" && echo
+echo "- public config:"
+curl -fsS "https://fireinners.online/wolverine/api/config" | head -c 200; echo
+echo "- public status:"
+curl -fsS "https://fireinners.online/wolverine/api/status" | head -c 200; echo
+echo "DONE: https://fireinners.online/wolverine/"
+BASH
+bash /tmp/MEGA_WOLVERINE_PATCH_v2.sh
