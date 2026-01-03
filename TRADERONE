@@ -1,18 +1,25 @@
-cat >/tmp/FIX_TRADERONE_STATE_AND_SERVICE_ROOT.sh <<'SH'
+cat >/tmp/FIX_TRADERONE_SERVICE_REAL_ROOT.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "== 0) stop watchdog (avoid restart loops) =="
+echo "== 0) stop loops =="
 systemctl stop traderone-watchdog.timer traderone-watchdog.service 2>/dev/null || true
+systemctl stop traderone.service 2>/dev/null || true
 
-echo "== 1) ensure state files exist =="
+echo "== 1) show current unit (what systemd REALLY runs) =="
+systemctl cat traderone.service || true
+echo
+echo "== 2) remove any drop-in overrides (often the culprit) =="
+rm -rf /etc/systemd/system/traderone.service.d || true
+
+echo "== 3) ensure required files exist =="
 mkdir -p /opt/traderone-opt
 [ -f /opt/traderone-opt/state.json ] || echo '{}' > /opt/traderone-opt/state.json
 [ -f /opt/traderone-opt/trades.log ] || : > /opt/traderone-opt/trades.log
 chown -R root:root /opt/traderone-opt
 chmod 644 /opt/traderone-opt/state.json /opt/traderone-opt/trades.log
 
-echo "== 2) enforce systemd unit (no crashing backup script) =="
+echo "== 4) write CLEAN traderone.service (NO backup script) =="
 cat >/etc/systemd/system/traderone.service <<'EOF'
 [Unit]
 Description=TraderOne Backend (Wolverine)
@@ -29,9 +36,7 @@ Environment=NODE_ENV=production
 Restart=always
 RestartSec=3
 
-# always create required files before start
 ExecStartPre=/bin/bash -lc 'mkdir -p /opt/traderone-opt; [ -f /opt/traderone-opt/state.json ] || echo "{}" > /opt/traderone-opt/state.json; [ -f /opt/traderone-opt/trades.log ] || : > /opt/traderone-opt/trades.log; chown -R root:root /opt/traderone-opt; chmod 644 /opt/traderone-opt/state.json /opt/traderone-opt/trades.log'
-
 ExecStart=/usr/bin/node /opt/traderone-opt/server.js
 
 KillSignal=SIGINT
@@ -43,17 +48,19 @@ StandardError=journal
 WantedBy=multi-user.target
 EOF
 
+echo "== 5) reload + start =="
 systemctl daemon-reload
 systemctl restart traderone.service
 sleep 2
 
-echo "== 3) health checks =="
-echo "--- LOCAL ---"
+echo "== 6) health (local) =="
 curl -sS -o /dev/null -w "LOCAL http_code=%{http_code}\n" http://127.0.0.1:8585/api/health || true
-echo "--- NGINX ---"
-curl -ksS -o /dev/null -w "NGINX http_code=%{http_code}\n" https://fireinners.online/wolverine/traderone/api/health || true
 
-echo "== 4) install SAFE watchdog (local check + 2 fails) and start timer =="
+echo "== 7) show final unit + last logs =="
+systemctl cat traderone.service | sed -n '1,140p'
+journalctl -u traderone.service -n 60 --no-pager || true
+
+echo "== 8) re-enable SAFE watchdog (local check) =="
 cat >/usr/local/bin/traderone_watchdog.sh <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -61,17 +68,10 @@ URL="http://127.0.0.1:8585/api/health"
 STATE="/run/traderone_watchdog_failcount"
 
 code="$(curl -sS --max-time 4 -o /dev/null -w "%{http_code}" "$URL" || echo 000)"
-if [ "$code" = "200" ]; then
-  rm -f "$STATE"
-  exit 0
-fi
-
+if [ "$code" = "200" ]; then rm -f "$STATE"; exit 0; fi
 n=0; [ -f "$STATE" ] && n="$(cat "$STATE" 2>/dev/null || echo 0)"
 n=$((n+1)); echo "$n" > "$STATE"
-if [ "$n" -ge 2 ]; then
-  rm -f "$STATE"
-  systemctl restart traderone.service
-fi
+if [ "$n" -ge 2 ]; then rm -f "$STATE"; systemctl restart traderone.service; fi
 EOF
 chmod +x /usr/local/bin/traderone_watchdog.sh
 
@@ -80,7 +80,6 @@ cat >/etc/systemd/system/traderone-watchdog.service <<'EOF'
 Description=TraderOne Watchdog (local healthcheck -> restart)
 After=network-online.target
 Wants=network-online.target
-
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/traderone_watchdog.sh
@@ -89,24 +88,17 @@ EOF
 cat >/etc/systemd/system/traderone-watchdog.timer <<'EOF'
 [Unit]
 Description=Run TraderOne watchdog every 60s
-
 [Timer]
 OnBootSec=60
 OnUnitActiveSec=60
 AccuracySec=5s
-
 [Install]
 WantedBy=timers.target
 EOF
 
 systemctl daemon-reload
 systemctl enable --now traderone-watchdog.timer
-
-echo "== 5) statuses =="
-systemctl status traderone.service --no-pager || true
 systemctl status traderone-watchdog.timer --no-pager || true
-echo "== last logs =="
-journalctl -u traderone.service -n 40 --no-pager || true
 SH
 
-bash /tmp/FIX_TRADERONE_STATE_AND_SERVICE_ROOT.sh
+bash /tmp/FIX_TRADERONE_SERVICE_REAL_ROOT.sh
