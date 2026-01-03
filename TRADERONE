@@ -1,47 +1,64 @@
-cat >/tmp/WOLVERINE_CHECK_WALLET_AND_BALANCES2.sh <<'SH'
+cat >/tmp/WOLVERINE_FIX_SOLANA_WEB3_FILE.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "=== 1) Colle TON adresse Phantom (public key) ==="
-read -r -p "WALLET_PHANTOM = " WALLET
-WALLET="$(echo -n "$WALLET" | tr -d '[:space:]')"
+DOMAIN="fireinners.online"
+DOCROOT="/var/www/fireinners/wolverine"
+TS="$(date +%s)"
 
-echo
-echo "WALLET=$WALLET"
-echo -n "len="; echo -n "$WALLET" | wc -c
-
-echo
-echo "=== 2) Vérif format Solana (PublicKey) ==="
-node - <<'NODE' "$WALLET"
-const { PublicKey } = require("@solana/web3.js");
-const w = process.argv[1];
-try {
-  console.log("OK:", new PublicKey(w).toBase58());
-} catch (e) {
-  console.error("INVALID WALLET:", e.message);
-  process.exit(2);
-}
-NODE
-
-echo
-echo "=== 3) SOL balance MAINNET (RPC officiel) ==="
-curl -sS https://api.mainnet-beta.solana.com \
-  -H 'Content-Type: application/json' \
-  --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getBalance\",\"params\":[\"$WALLET\"]}"
+echo "== 1) Check what is served (headers) =="
+curl -ksSI "https://${DOMAIN}/wolverine/solana-web3.min.js?v=$TS" | sed -n '1,20p' || true
 echo
 
-echo
-echo "=== 4) Ton backend balances2 (local VPS) ==="
-curl -sS "http://127.0.0.1:8585/api/balances2?wallet=$WALLET"
-echo
-
-echo
-echo "=== 5) (optionnel) balances2 via domaine (si exposé) ==="
-curl -ksS "https://fireinners.online/wolverine/traderone/api/balances2?wallet=$WALLET" || true
+echo "== 2) Ensure file exists locally =="
+mkdir -p "$DOCROOT"
+ls -lah "$DOCROOT" | sed -n '1,120p'
 echo
 
+echo "== 3) (Re)build solana-web3.min.js locally (no CDN) =="
+cd /opt/traderone-opt
+
+# deps
+if [ ! -f package.json ]; then
+  npm init -y >/dev/null
+fi
+npm i @solana/web3.js >/dev/null
+if ! command -v esbuild >/dev/null 2>&1; then
+  npm i -g esbuild
+fi
+
+# build in DOCROOT
+cat >"$DOCROOT/solana-web3.entry.js" <<'JS'
+export * as solanaWeb3 from "@solana/web3.js";
+JS
+
+esbuild "$DOCROOT/solana-web3.entry.js" \
+  --bundle --minify --format=iife --global-name=solanaWeb3 \
+  --outfile="$DOCROOT/solana-web3.min.js"
+
+rm -f "$DOCROOT/solana-web3.entry.js"
+chmod 644 "$DOCROOT/solana-web3.min.js"
+
+echo "== 4) Quick local sanity (first bytes must NOT be '<') =="
+head -c 40 "$DOCROOT/solana-web3.min.js"; echo
 echo
-echo "DONE ✅"
+
+echo "== 5) Ensure index.html references the local file =="
+# Remplace toute référence existante à solana-web3.min.js par ./solana-web3.min.js?v=TS
+if [ -f "$DOCROOT/index.html" ]; then
+  cp -a "$DOCROOT/index.html" "$DOCROOT/index.html.bak.$TS"
+  perl -0777 -i -pe 's|<script\s+src="[^"]*solana-web3\.min\.js[^"]*"\s*></script>|<script src="./solana-web3.min.js?v='"$TS"'"></script>|g' "$DOCROOT/index.html"
+else
+  echo "WARN: $DOCROOT/index.html not found (skip)"
+fi
+
+echo "== 6) Reload nginx =="
+nginx -t && systemctl reload nginx
+
+echo "== 7) Verify remote now returns JS (not HTML) =="
+curl -ksS "https://${DOMAIN}/wolverine/solana-web3.min.js?v=$TS" | head -c 40; echo
+echo
+echo "DONE ✅ -> ouvre: https://${DOMAIN}/wolverine/?v=$TS"
 SH
 
-bash /tmp/WOLVERINE_CHECK_WALLET_AND_BALANCES2.sh
+bash /tmp/WOLVERINE_FIX_SOLANA_WEB3_FILE.sh
