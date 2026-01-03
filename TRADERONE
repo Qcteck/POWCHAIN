@@ -1,6 +1,5 @@
 bash <<'BASH'
 set -euo pipefail
-
 APPDIR="/opt/fireinners/wolverine-api"
 WEBDIR="/opt/fireinners/frontend-react/app/dist/wolverine"
 ENVF="$APPDIR/.env"
@@ -8,29 +7,22 @@ STATE_DIR="/var/lib/wolverine-api"
 STATE_JSON="$STATE_DIR/state.json"
 WALLET_JSON="$APPDIR/custody.keypair.json"
 WALLET_PUB="$APPDIR/custody.pub"
-
 NG_SITE="/etc/nginx/sites-available/fireinners.online-ssl"
 SNIP="/etc/nginx/snippets/fireinners-wolverine.conf"
-
 SERVICE="wolverine-api"
 PORT="3050"
 BASE_PATH="/wolverine/api"
-
 RPC_DEFAULT="https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac"
 USDC_MINT="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1"
 WSOL_MINT="So11111111111111111111111111111111111111112"
-
 say(){ printf "%s\n" "$*"; }
 need(){ command -v "$1" >/dev/null 2>&1 || { say "ERREUR: $1 manquant"; exit 1; }; }
 
-need node; need npm; need nginx; need systemctl; need awk; need grep; need curl; need ss; need chattr || true
-
+need node; need npm; need nginx; need systemctl; need awk; need grep; need curl
 [ -f "$NG_SITE" ] || { say "ERREUR: vhost nginx absent: $NG_SITE"; exit 1; }
 
 mkdir -p "$APPDIR" "$WEBDIR" "$STATE_DIR"
 touch "$ENVF"
-
-# unlock immutables if any
 chattr -i "$NG_SITE" 2>/dev/null || true
 chattr -i "$SNIP" 2>/dev/null || true
 chattr -i "$WEBDIR/index.html" 2>/dev/null || true
@@ -50,35 +42,41 @@ grep -qE "^ARM_CODE=" "$ENVF" || echo "ARM_CODE=CHANGE_ME_ARM" >> "$ENVF"
 grep -qE "^CUSTODY_KEYPAIR=" "$ENVF" || echo "CUSTODY_KEYPAIR=$WALLET_JSON" >> "$ENVF"
 grep -qE "^STATE_JSON=" "$ENVF" || echo "STATE_JSON=$STATE_JSON" >> "$ENVF"
 
-# ensure deps
+# deps
 if [ ! -f "$APPDIR/package.json" ]; then (cd "$APPDIR" && npm init -y >/dev/null 2>&1 || true); fi
 ( cd "$APPDIR" && npm i express dotenv @solana/web3.js @solana/spl-token >/dev/null )
 
-# generate custody wallet if missing
-if [ ! -f "$WALLET_JSON" ]; then
-  say "Generating custody wallet..."
-  node - <<'NODE' > "$WALLET_JSON"
-const {Keypair}=require("@solana/web3.js");
+# FIX wallet generation (write to files, not stdin)
+gen_wallet(){
+  say "Generating custody wallet (FIX)..."
+  OUT="$WALLET_JSON" PUB="$WALLET_PUB" node - <<'NODE'
 const fs=require("fs");
+const {Keypair}=require("@solana/web3.js");
+const out=process.env.OUT, pub=process.env.PUB;
 const kp=Keypair.generate();
-fs.writeFileSync(0, JSON.stringify(Array.from(kp.secretKey)));
-fs.writeFileSync(process.env.WALLET_PUB_PATH||"/opt/fireinners/wolverine-api/custody.pub", kp.publicKey.toBase58());
+fs.writeFileSync(out, JSON.stringify(Array.from(kp.secretKey)));
+fs.writeFileSync(pub, kp.publicKey.toBase58());
+process.stdout.write(kp.publicKey.toBase58());
 NODE
+  echo
+  chmod 600 "$WALLET_JSON" 2>/dev/null || true
+  chmod 644 "$WALLET_PUB" 2>/dev/null || true
+}
+if [ ! -s "$WALLET_JSON" ] || ! node -e "try{const a=JSON.parse(require('fs').readFileSync('$WALLET_JSON','utf8'));process.exit(Array.isArray(a)&&a.length>=32?0:1)}catch(e){process.exit(1)}"; then
+  gen_wallet
 fi
-# ensure pub exists
-if [ ! -f "$WALLET_PUB" ]; then
-  node - <<'NODE'
+if [ ! -s "$WALLET_PUB" ]; then
+  # reconstruct pub from keypair if missing
+  node - <<NODE
 const fs=require("fs");
 const {Keypair}=require("@solana/web3.js");
-const arr=JSON.parse(fs.readFileSync("/opt/fireinners/wolverine-api/custody.keypair.json","utf8"));
+const arr=JSON.parse(fs.readFileSync("$WALLET_JSON","utf8"));
 const kp=Keypair.fromSecretKey(Uint8Array.from(arr));
-fs.writeFileSync("/opt/fireinners/wolverine-api/custody.pub", kp.publicKey.toBase58());
+fs.writeFileSync("$WALLET_PUB", kp.publicKey.toBase58());
 NODE
 fi
-chmod 600 "$WALLET_JSON" 2>/dev/null || true
-chmod 644 "$WALLET_PUB" 2>/dev/null || true
 
-# write server.js (config route included)
+# write server.js (with /config + loop)
 cat > "$APPDIR/server.js" <<'JS'
 "use strict";
 require("dotenv").config();
@@ -144,184 +142,4 @@ async function pingOnce(){
   }catch(_){}
   const ms=Date.now()-t0;
   state.ping.lastAt=now(); state.ping.latencyMs=ms;
-  if(ok){ state.ping.fails=0; state.ping.effective="UP"; state.ping.lastOkAt=now(); }
-  else { state.ping.fails=(state.ping.fails||0)+1; if(state.ping.fails>=MONITOR_FAILS) state.ping.effective="DOWN"; }
-  saveJSON(STATE_JSON,state);
-  return {ok,ms,effective:state.ping.effective,fails:state.ping.fails};
-}
-
-let pingTimer=null;
-function startPingLoop(){
-  if(pingTimer) return;
-  pingTimer=setInterval(async()=>{
-    const prev=state.ping.effective;
-    await pingOnce();
-    if(prev!==state.ping.effective){
-      if(state.ping.effective==="UP") tgSend(`WOLVERINE: API UP ${now()}`);
-      if(state.ping.effective==="DOWN") tgSend(`WOLVERINE: API DOWN ${now()}`);
-    }
-  },Math.max(2,MONITOR_SEC)*1000);
-}
-function stopPingLoop(){ if(pingTimer){ clearInterval(pingTimer); pingTimer=null; } }
-
-const router=express.Router();
-router.get("/",(_q,res)=>res.type("text/plain").send("wolverine-api"));
-router.get("/health",(_q,res)=>res.json({ok:true,uptime:process.uptime(),ts:Date.now(),base:BASE_PATH,custody:CUSTODY}));
-router.get("/ping",async(_q,res)=>{ const r=await pingOnce(); res.json({ok:r.ok,effective:r.effective,fails:r.fails,ms:r.ms}); });
-router.get("/wallet",(_q,res)=>res.json({ok:true,custody:CUSTODY,ts:Date.now()}));
-router.get("/config",(_q,res)=>res.json({
-  ok:true, base:BASE_PATH, custody:CUSTODY,
-  monitorUrl:MONITOR_URL, monitorSec:MONITOR_SEC, monitorFails:MONITOR_FAILS,
-  ui:state.ui, bot:state.bot, mints:{usdc:USDC_MINT,wsol:WSOL_MINT}, ts:Date.now()
-}));
-router.get("/status",async(_q,res)=>{
-  const sol=await getSOL(CUSTODY).catch(()=>0);
-  const usdc=await getUSDC(CUSTODY).catch(()=>0);
-  res.json({ok:true,custody:CUSTODY,solLamports:sol,sol:sol/1e9,usdc,bot:state.bot,ping:state.ping,ts:Date.now()});
-});
-router.post("/loop/start",(req,res)=>{ if(!armOK(req.body&&req.body.arm)) return res.status(403).json({ok:false,error:"bad_arm"}); startPingLoop(); res.json({ok:true,loop:true}); });
-router.post("/loop/stop",(req,res)=>{ if(!armOK(req.body&&req.body.arm)) return res.status(403).json({ok:false,error:"bad_arm"}); stopPingLoop(); res.json({ok:true,loop:false}); });
-
-app.use(BASE_PATH,router);
-app.use("/wolverine/api",router);
-app.use((req,res)=>res.status(404).json({ok:false,error:"not_found",path:req.path,base:BASE_PATH}));
-
-app.listen(PORT,"127.0.0.1",()=>console.log(`[${now()}] wolverine-api on 127.0.0.1:${PORT} base=${BASE_PATH}`));
-JS
-chmod 755 "$APPDIR/server.js"
-
-# systemd unit
-cat > "/etc/systemd/system/$SERVICE.service" <<EOF
-[Unit]
-Description=Wolverine API (TraderOne custodial)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-WorkingDirectory=$APPDIR
-EnvironmentFile=$ENVF
-ExecStart=/usr/bin/node $APPDIR/server.js
-Restart=always
-RestartSec=2
-User=root
-NoNewPrivileges=true
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-# nginx snippet
-cat > "$SNIP" <<EOF
-location ^~ /wolverine/api/ {
-  proxy_pass http://127.0.0.1:$PORT;
-  proxy_http_version 1.1;
-  proxy_set_header Host \$host;
-  proxy_set_header X-Real-IP \$remote_addr;
-  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto \$scheme;
-  add_header Cache-Control "no-store" always;
-}
-location ^~ /wolverine/ {
-  root /opt/fireinners/frontend-react/app/dist;
-  try_files \$uri \$uri/ /wolverine/index.html;
-  add_header Cache-Control "no-store" always;
-}
-EOF
-
-# inject include into vhost safely (awk, no sed)
-if ! grep -q "snippets/fireinners-wolverine.conf" "$NG_SITE"; then
-  cp -a "$NG_SITE" "$NG_SITE.bak.$(date -u +%Y%m%dT%H%M%SZ)" || true
-  awk '
-    BEGIN{added=0}
-    {print}
-    added==0 && $0 ~ /^[[:space:]]*server[[:space:]]*\{/ {
-      print "  include /etc/nginx/snippets/fireinners-wolverine.conf;";
-      added=1
-    }
-  ' "$NG_SITE" > /tmp/ng_site.tmp
-  cat /tmp/ng_site.tmp > "$NG_SITE"
-fi
-
-# frontend (couleur différente + EN/FR button)
-cat > "$WEBDIR/index.html" <<'HTML'
-<!doctype html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate"/><meta http-equiv="Pragma" content="no-cache"/><meta http-equiv="Expires" content="0"/><title>WOLVERINE</title><style>
-:root{--bg0:#02140d;--bg1:#03251a;--p:#061b14;--b:#1fe39a;--t:#eafff6;--m:#a5e9cf;--bad:#ff5f6d;--ok:#1fe39a}
-*{box-sizing:border-box}html,body{height:100%;margin:0;background:radial-gradient(900px 600px at 15% 10%,rgba(31,227,154,.22),transparent 60%),linear-gradient(180deg,var(--bg0),var(--bg1));color:var(--t);font:14px system-ui}
-#wrap{max-width:1180px;margin:26px auto;padding:0 16px}
-#top{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px}
-#brand{display:flex;align-items:center;gap:10px}
-#dot{width:14px;height:14px;border-radius:50%;background:var(--b);box-shadow:0 0 20px rgba(31,227,154,.55)}
-.btn{background:rgba(0,0,0,.18);border:1px solid rgba(31,227,154,.35);color:var(--t);padding:8px 10px;border-radius:10px;cursor:pointer}
-.btn:hover{border-color:rgba(31,227,154,.7)}.btn:disabled{opacity:.5;cursor:not-allowed}
-.card{background:rgba(0,0,0,.20);border:1px solid rgba(31,227,154,.22);border-radius:16px;padding:14px;box-shadow:0 14px 40px rgba(0,0,0,.35)}
-.grid{display:grid;grid-template-columns:420px 1fr;gap:14px}@media(max-width:980px){.grid{grid-template-columns:1fr}}
-label{display:block;color:var(--m);font-size:12px;margin:10px 0 6px}
-input,select{width:100%;padding:10px;border-radius:12px;border:1px solid rgba(31,227,154,.25);background:rgba(0,0,0,.18);color:var(--t)}
-#log{height:420px;overflow:auto;white-space:pre-wrap;background:rgba(0,0,0,.22);border:1px solid rgba(31,227,154,.18);border-radius:12px;padding:10px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}
-.pill{padding:6px 10px;border-radius:999px;border:1px solid rgba(31,227,154,.25);background:rgba(0,0,0,.15);color:var(--m);font-size:12px}
-.pill.ok{border-color:rgba(31,227,154,.6);color:var(--ok)}.pill.bad{border-color:rgba(255,95,109,.6);color:var(--bad)}
-</style></head><body><div id="wrap">
-<div id="top"><div id="brand"><div id="dot"></div><div><div style="font-weight:800;letter-spacing:.6px">WOLVERINE</div><div style="color:var(--m);font-size:12px">fireinners.online/wolverine</div></div></div>
-<div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end"><button class="btn" id="btnLang">EN</button><button class="btn" id="btnCfg">Config</button><button class="btn" id="btnPing">Ping</button><button class="btn" id="btnLoop">Loop: OFF</button></div></div>
-
-<div class="grid">
-  <div class="card">
-    <div style="font-weight:800;margin-bottom:8px" id="hControl">Control</div>
-    <label id="lCust">Custody</label><div class="pill" id="custodyAddr">loading...</div>
-    <label id="lSOL">Custody SOL</label><input id="sol" readonly value="-"/>
-    <label id="lUSDC">Custody USDC</label><input id="usdc" readonly value="-"/>
-    <label id="lArm">ARM</label><input id="arm" placeholder="required for loop"/>
-    <div style="display:flex;gap:10px;margin-top:10px;flex-wrap:wrap"><button class="btn" id="btnRefresh">Refresh</button><div class="pill" id="pillUp">Ping: ...</div></div>
-  </div>
-  <div class="card">
-    <div style="font-weight:800;margin-bottom:8px" id="hConsole">Console</div>
-    <div id="log"></div>
-  </div>
-</div></div>
-
-<script>
-(()=>{const BASE="/wolverine/api",L={en:{Control:"Control",Console:"Console",Custody:"Custody","Custody SOL":"Custody SOL","Custody USDC":"Custody USDC",ARM:"ARM"},fr:{Control:"Contrôle",Console:"Console",Custody:"Custody","Custody SOL":"SOL (Custody)","Custody USDC":"USDC (Custody)",ARM:"ARM"}};
-let lang=localStorage.getItem("wolv_lang")||"en";const $=s=>document.querySelector(s),logEl=$("#log");let loopOn=false;
-const t=s=>(L[lang]&&L[lang][s])||s;const p=s=>{logEl.textContent+=`[${new Date().toISOString()}] ${s}\n`;logEl.scrollTop=logEl.scrollHeight};
-function apply(){ $("#btnLang").textContent=lang.toUpperCase(); $("#hControl").textContent=t("Control"); $("#hConsole").textContent=t("Console"); $("#lCust").textContent=t("Custody"); $("#lSOL").textContent=t("Custody SOL"); $("#lUSDC").textContent=t("Custody USDC"); $("#lArm").textContent=t("ARM"); }
-apply();
-async function jget(u){const r=await fetch(u,{cache:"no-store"});const txt=await r.text();return {ok:r.ok,txt};}
-async function jpost(u,b){const r=await fetch(u,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(b||{}),cache:"no-store"});const txt=await r.text();return {ok:r.ok,txt};}
-async function refresh(){try{const s=await jget(BASE+"/status"); if(!s.ok){p("status ERR "+s.txt);return;} const j=JSON.parse(s.txt);
-$("#custodyAddr").textContent=j.custody||"-"; $("#sol").value=(j.sol||0).toFixed(6); $("#usdc").value=(j.usdc||0).toFixed(6);
-const eff=j.ping&&j.ping.effective||"UNKNOWN"; $("#pillUp").textContent="Ping: "+eff; $("#pillUp").className="pill "+(eff==="UP"?"ok":(eff==="DOWN"?"bad":""));
-}catch(e){p("refresh ERR")}}
-$("#btnLang").onclick=()=>{lang=(lang==="en"?"fr":"en");localStorage.setItem("wolv_lang",lang);apply();p("LANG "+lang);};
-$("#btnCfg").onclick=async()=>{const r=await jget(BASE+"/config");p("config: "+r.txt);};
-$("#btnPing").onclick=async()=>{const r=await jget(BASE+"/ping");p("ping: "+r.txt);};
-$("#btnLoop").onclick=async()=>{const arm=$("#arm").value||"";const r=await jpost(BASE+(loopOn?"/loop/stop":"/loop/start"),{arm});p("loop: "+r.txt);loopOn=!loopOn;$("#btnLoop").textContent="Loop: "+(loopOn?"ON":"OFF");};
-$("#btnRefresh").onclick=refresh;
-refresh();
-})();
-</script></body></html>
-HTML
-chmod 644 "$WEBDIR/index.html" || true
-
-# restart services
-systemctl daemon-reload
-systemctl enable --now "$SERVICE.service" >/dev/null 2>&1 || true
-systemctl restart "$SERVICE.service"
-
-nginx -t
-systemctl reload nginx
-
-# relock
-chattr +i "$SNIP" 2>/dev/null || true
-chattr +i "$NG_SITE" 2>/dev/null || true
-chattr +i "$WEBDIR/index.html" 2>/dev/null || true
-
-CUST="$(cat "$WALLET_PUB" 2>/dev/null || true)"
-say "DONE"
-say "Front : https://fireinners.online/wolverine/"
-say "Health: https://fireinners.online/wolverine/api/health"
-say "Ping  : https://fireinners.online/wolverine/api/ping"
-say "Config: https://fireinners.online/wolverine/api/config"
-say "Status: https://fireinners.online/wolverine/api/status"
-say "Deposit (SOL/USDC): $CUST"
-BASH
+ 
