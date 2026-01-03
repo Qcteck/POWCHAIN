@@ -1,26 +1,138 @@
-cat >/tmp/WOLV_FIX_UI_QUOTES.sh <<'BASH'
+cat >/tmp/MEGA_WOLVERINE_FULL_PATCH.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
+set +H 2>/dev/null || true
 [ "$(id -u)" = "0" ] || { echo "ERREUR: lance en root"; exit 1; }
 
-WEBDIR="/opt/fireinners/frontend-react/app/dist/wolverine"
-FILE="$WEBDIR/index.html"
+need(){ command -v "$1" >/dev/null 2>&1 || { echo "ERREUR: $1 manquant"; exit 1; }; }
+need nginx; need curl; need perl; need systemctl; need ss; need grep; need awk; need sed; need date
 
-[ -f "$FILE" ] || { echo "ERREUR: introuvable: $FILE"; exit 1; }
+APPDIR="/opt/fireinners/wolverine-api"
+WEBDIST="/opt/fireinners/frontend-react/app/dist"
+WEBDIR="${WEBDIST}/wolverine"
+INDEX="${WEBDIR}/index.html"
+SNIP="/etc/nginx/snippets/fireinners-wolverine.conf"
+SITE="/etc/nginx/sites-available/fireinners.online-ssl"
+ASKOR="/opt/fireinners/sentinel/lib/askorupdate.sh"
 
-BK="$FILE.bak.$(date -u +%Y%m%d%H%M%S)"
-cp -a "$FILE" "$BK"
+# askorupdate si dispo (sinon fallback safe)
+if [ -f "$ASKOR" ]; then
+  # shellcheck disable=SC1090
+  . "$ASKOR"
+else
+  askorupdate_file(){ local p="$1" n="$2" c="$3"; mkdir -p "$(dirname "$p")"; [ -f "$p" ] && cp -a "$p" "$p.bak.$(date -u +%Y%m%d%H%M%S)" || true; cat >"$p"; }
+  askorupdate_yesno(){ return 0; }
+fi
 
-# Fix typique: apostrophes FR qui cassent des strings JS entre '...'
+echo "=== PRE-FLY (read-only) ==="
+echo "date: $(date -u +%F_%T) UTC"
+echo "SITE=$SITE"
+echo "SNIP=$SNIP"
+echo "INDEX=$INDEX"
+nginx -t >/dev/null && echo "NGINX: OK"
+
+echo
+echo "=== UNLOCK (safe) ==="
+chattr -i "$SNIP" 2>/dev/null || true
+chattr -i "$SITE" 2>/dev/null || true
+chattr -i "$INDEX" 2>/dev/null || true
+
+echo
+echo "=== ENSURE PATHS ==="
+mkdir -p "$APPDIR" "$WEBDIR" /etc/nginx/snippets
+
+echo
+echo "=== PATCH FRONT (SyntaxError apostrophes) ==="
+if [ ! -f "$INDEX" ]; then
+  echo "ERREUR: index introuvable: $INDEX"
+  exit 1
+fi
+cp -a "$INDEX" "$INDEX.bak.$(date -u +%Y%m%d%H%M%S)"
+# Remplace les apostrophes ASCII dans les phrases FR qui cassent les strings JS minifiées
 perl -pi -e '
-s/l\x27adresse/l’adresse/g;
-s/n\x27envoie/n’envoie/g;
-s/j\x27en/j’en/g;
-s/d\x27aujourd\x27hui/d’aujourd’hui/g;
-' "$FILE"
+s/\bl'\''adresse\b/l’adresse/g;
+s/\bn'\''envoie\b/n’envoie/g;
+s/\bd'\''ici\b/d’ici/g;
+s/\bj'\''en\b/j’en/g;
+s/\bc'\''est\b/c’est/g;
+s/\bqu'\''il\b/qu’il/g;
+s/\bqu'\''avec\b/qu’avec/g;
+s/\bs'\''il\b/s’il/g;
+' "$INDEX"
 
-echo "OK: patch appliqué"
-echo "Backup: $BK"
-echo "Teste maintenant: Ctrl+F5 sur https://fireinners.online/wolverine/ puis ouvre Console"
+# Sanity: plus de "l'adresse" / "n'envoie"
+( grep -n "l'adresse\|n'envoie\|d'ici\|j'en\|c'est\|qu'il\|s'il" "$INDEX" >/dev/null 2>&1 && echo "WARN: encore des apostrophes ASCII trouvées dans INDEX" ) || true
+echo "FRONT: patched OK"
+
+echo
+echo "=== NGINX SNIPPET (canonical wolverine) ==="
+SNIP_PAYLOAD="$(cat <<'EOF'
+# WOLVERINE (canon)
+location ^~ /wolverine/api/ {
+  proxy_pass http://127.0.0.1:3050/;
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  add_header Cache-Control "no-store, max-age=0" always;
+}
+location = /wolverine/ {
+  try_files /wolverine/index.html =404;
+  add_header Cache-Control "no-store, max-age=0" always;
+}
+location ^~ /wolverine/ {
+  try_files $uri $uri/ /wolverine/index.html;
+  add_header Cache-Control "no-store, max-age=0" always;
+}
+EOF
+)"
+askorupdate_file "$SNIP" "WOLVERINE nginx snippet" "$SNIP_PAYLOAD" <<<"$SNIP_PAYLOAD"
+
+echo
+echo "=== ENSURE SNIPPET INCLUDED (no duplicates) ==="
+cp -a "$SITE" "$SITE.bak.$(date -u +%Y%m%d%H%M%S)" || true
+# remove duplicate include lines (keep first)
+perl -pi -e 'if(/include\s+snippets\/fireinners-wolverine\.conf;/){$c++;$_="" if $c>1}' "$SITE"
+# add include if missing (before last closing brace)
+if ! grep -q "include snippets/fireinners-wolverine.conf;" "$SITE"; then
+  perl -0777 -pi -e 's/\n}\s*$/\n    include snippets\/fireinners-wolverine.conf;\n}\n/s' "$SITE"
+fi
+
+echo
+echo "=== RESTART API (wolverine-api) ==="
+systemctl enable --now wolverine-api >/dev/null 2>&1 || true
+systemctl restart wolverine-api
+# wait listen 3050
+for i in $(seq 1 40); do ss -lntp 2>/dev/null | grep -q ":3050" && break || sleep 0.25; done
+systemctl --no-pager --full status wolverine-api | sed -n '1,12p' || true
+ss -lntp 2>/dev/null | grep ":3050" || true
+
+echo
+echo "=== NGINX TEST + RELOAD ==="
+nginx -t
+systemctl reload nginx
+
+echo
+echo "=== TESTS (local + public) ==="
+echo "-- local ping --"
+curl -sS -D- "http://127.0.0.1:3050/ping" | head -n 12
+echo
+echo "-- public ping --"
+curl -sS -D- "https://fireinners.online/wolverine/api/ping" | head -n 12
+echo
+echo "-- public front (head) --"
+curl -sS "https://fireinners.online/wolverine/" | head -c 300; echo
+
+echo
+echo "=== RELock (optional) ==="
+chattr +i "$SNIP" 2>/dev/null || true
+chattr +i "$SITE" 2>/dev/null || true
+# (index.html: à locker seulement si tu veux figer le front)
+# chattr +i "$INDEX" 2>/dev/null || true
+
+echo
+echo "DONE"
+echo "Hard refresh navigateur: Ctrl+F5 (ou vider cache du site) puis https://fireinners.online/wolverine/"
 BASH
-bash /tmp/WOLV_FIX_UI_QUOTES.sh
+bash /tmp/MEGA_WOLVERINE_FULL_PATCH.sh
