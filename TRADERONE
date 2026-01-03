@@ -1,72 +1,505 @@
-bash <<'BASH'
+bash -lc 'set -euo pipefail;set +H;TMP=/tmp/MEGA_WOLVERINE_BOOT.sh;cat >"$TMP"<<'"'"'BASH'"'"'
+#!/usr/bin/env bash
 set -euo pipefail
-APPDIR="/opt/fireinners/wolverine-api"
-ENVF="$APPDIR/.env"
-WALLET_JSON="$APPDIR/custody.keypair.json"
-WALLET_PUB="$APPDIR/custody.pub"
-SERVICE="wolverine-api"
+export LC_ALL=C
 say(){ printf "%s\n" "$*"; }
 
-# unlock if immutable
-chattr -i "$WALLET_JSON" 2>/dev/null || true
-chattr -i "$WALLET_PUB" 2>/dev/null || true
-chattr -i "/etc/systemd/system/$SERVICE.service" 2>/dev/null || true
+APPDIR="/opt/fireinners/wolverine-api"
+WEBDIR="/opt/fireinners/frontend-react/app/dist/wolverine"
+STATE="$APPDIR/state"
+ENVF="$APPDIR/.env"
+SVC="wolverine-api"
+SVCF="/etc/systemd/system/${SVC}.service"
+NG="/etc/nginx/sites-available/fireinners.online-ssl"
+SNIP="/etc/nginx/snippets/fireinners-wolverine.conf"
 
-mkdir -p "$APPDIR"
+ASKOR="/opt/fireinners/sentinel/lib/askorupdate.sh"
+if [ -f "$ASKOR" ]; then . "$ASKOR"; else
+  askorupdate_file(){ local p="$1" n="$2" c="$3"; install -d "$(dirname "$p")"; if [ -f "$p" ]; then cp -a "$p" "$p.bak.$(date -u +%Y%m%d%H%M%S)" || true; fi; printf "%s" "$c" >"$p"; }
+  askorupdate_yesno(){ return 0; }
+fi
+
+need(){ command -v "$1" >/dev/null 2>&1 || { say "ERREUR: '$1' manquant"; exit 1; }; }
+need node; need npm; need systemctl; need nginx; need curl; need awk; need sed; need grep; need ss; need chattr
+
+say "=== BATCH FLY (read-only) ==="
+[ -f "$NG" ] || { say "ERREUR: vhost nginx absent: $NG"; exit 1; }
+say "Nginx vhost: $NG"
+say "Node: $(node -v)  Npm: $(npm -v)"
+say "On va servir: https://fireinners.online/wolverine/ et API: /wolverine/api/*"
+askorupdate_yesno "Proceed?" || exit 0
+
+say "=== MEGA APPLY ==="
+install -d "$APPDIR" "$STATE" "$WEBDIR"
+
+# .env defaults (append if missing)
 touch "$ENVF"
+grep -qE "^PORT=" "$ENVF" || echo "PORT=3050" >>"$ENVF"
+grep -qE "^BASE_PATH=" "$ENVF" || echo "BASE_PATH=/wolverine" >>"$ENVF"
+grep -qE "^RPC_URL=" "$ENVF" || echo "RPC_URL=https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac" >>"$ENVF"
+grep -qE "^USDC_MINT=" "$ENVF" || echo "USDC_MINT=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1" >>"$ENVF"
+grep -qE "^WSOL_MINT=" "$ENVF" || echo "WSOL_MINT=So11111111111111111111111111111111111111112" >>"$ENVF"
+grep -qE "^JUP_BASE=" "$ENVF" || echo "JUP_BASE=https://quote-api.jup.ag" >>"$ENVF"
+grep -qE "^SLIPPAGE_BPS=" "$ENVF" || echo "SLIPPAGE_BPS=150" >>"$ENVF"
+grep -qE "^ARM_PHRASE=" "$ENVF" || echo "ARM_PHRASE=WOLVERINE" >>"$ENVF"
+grep -qE "^MONITOR_URL=" "$ENVF" || echo "MONITOR_URL=https://bbbotrader.paycashnostory.workers.dev/ping" >>"$ENVF"
+grep -qE "^MONITOR_SEC=" "$ENVF" || echo "MONITOR_SEC=10" >>"$ENVF"
+grep -qE "^MONITOR_FAILS=" "$ENVF" || echo "MONITOR_FAILS=3" >>"$ENVF"
+grep -qE "^TG_ALERTS=" "$ENVF" || echo "TG_ALERTS=0" >>"$ENVF"
+grep -qE "^WOLV_SEND=" "$ENVF" || echo "WOLV_SEND=/usr/local/bin/wolv_send" >>"$ENVF"
 
-# ensure env points to the keypair
-grep -qE "^CUSTODY_KEYPAIR=" "$ENVF" || echo "CUSTODY_KEYPAIR=$WALLET_JSON" >> "$ENVF"
+chmod 600 "$ENVF" || true
 
-is_valid_keypair(){
-  node -e "const fs=require('fs');try{const s=fs.readFileSync('$WALLET_JSON','utf8');const a=JSON.parse(s);process.exit(Array.isArray(a)&&a.length>=32?0:1)}catch(e){process.exit(1)}"
+# package.json
+PKG='{"name":"wolverine-api","version":"1.0.0","type":"commonjs","main":"server.js","license":"UNLICENSED","dependencies":{"express":"^4.19.2","dotenv":"^16.4.5","bs58":"^5.0.0","@solana/web3.js":"^1.98.0","@solana/spl-token":"^0.4.9"}}'
+askorupdate_file "$APPDIR/package.json" "WOLVERINE package.json" "$PKG"
+
+# server.js
+read -r -d "" SVR <<'"'"'JS'"'"'
+"use strict";
+require("dotenv").config();
+const fs=require("fs");
+const path=require("path");
+const express=require("express");
+const bs58=require("bs58");
+const {Connection,Keypair,PublicKey,VersionedTransaction,LAMPORTS_PER_SOL}=require("@solana/web3.js");
+const spl=require("@solana/spl-token");
+
+const PORT=+(process.env.PORT||3050);
+const BASE_PATH=process.env.BASE_PATH||"/wolverine";
+const RPC_URL=process.env.RPC_URL||"https://api.mainnet-beta.solana.com";
+const USDC_MINT=new PublicKey(process.env.USDC_MINT||"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1");
+const WSOL_MINT=new PublicKey(process.env.WSOL_MINT||"So11111111111111111111111111111111111111112");
+const JUP_BASE=process.env.JUP_BASE||"https://quote-api.jup.ag";
+const SLIPPAGE_BPS=+(process.env.SLIPPAGE_BPS||150);
+const ARM_PHRASE=process.env.ARM_PHRASE||"WOLVERINE";
+
+const MONITOR_URL=process.env.MONITOR_URL||"";
+const MONITOR_SEC=+(process.env.MONITOR_SEC||0);
+const MONITOR_FAILS=+(process.env.MONITOR_FAILS||3);
+const TG_ALERTS=+(process.env.TG_ALERTS||0);
+const WOLV_SEND=process.env.WOLV_SEND||"";
+
+const APPDIR=__dirname;
+const STATE=path.join(APPDIR,"state");
+const WALLET_JSON=path.join(STATE,"custody.json");
+const WALLET_PUB=path.join(STATE,"custody.pub");
+const SESS_JSON=path.join(STATE,"session.json");
+
+fs.mkdirSync(STATE,{recursive:true});
+
+function now(){return new Date().toISOString();}
+function jread(p,def){try{return JSON.parse(fs.readFileSync(p,"utf8"));}catch{return def;}}
+function jwrite(p,obj){fs.writeFileSync(p,JSON.stringify(obj,null,2));}
+function sendTG(txt){
+  if(!TG_ALERTS) return;
+  if(!WOLV_SEND) return;
+  try{require("child_process").execFileSync(WOLV_SEND,[txt],{stdio:"ignore"});}catch{}
 }
 
-gen_keypair(){
-  say "REGEN custody keypair..."
-  node - <<NODE
-const fs=require("fs");
-const {Keypair}=require("@solana/web3.js");
-const kp=Keypair.generate();
-fs.writeFileSync("$WALLET_JSON", JSON.stringify(Array.from(kp.secretKey)));
-fs.writeFileSync("$WALLET_PUB", kp.publicKey.toBase58());
-process.stdout.write(kp.publicKey.toBase58());
-NODE
-  echo
-  chmod 600 "$WALLET_JSON" 2>/dev/null || true
-  chmod 644 "$WALLET_PUB" 2>/dev/null || true
+function loadOrGenKeypair(){
+  try{
+    const a=jread(WALLET_JSON,null);
+    if(a && Array.isArray(a) && a.length===64){
+      const kp=Keypair.fromSecretKey(Uint8Array.from(a));
+      fs.writeFileSync(WALLET_PUB,kp.publicKey.toBase58());
+      return kp;
+    }
+  }catch{}
+  const kp=Keypair.generate();
+  jwrite(WALLET_JSON,Array.from(kp.secretKey));
+  fs.chmodSync(WALLET_JSON,0o600);
+  fs.writeFileSync(WALLET_PUB,kp.publicKey.toBase58());
+  return kp;
 }
 
-# validate or regenerate
-if [ ! -s "$WALLET_JSON" ]; then
-  gen_keypair
-else
-  if ! is_valid_keypair; then
-    say "Keypair invalid -> reset"
-    rm -f "$WALLET_JSON" "$WALLET_PUB" || true
-    gen_keypair
-  fi
-fi
+const custody=loadOrGenKeypair();
+const conn=new Connection(RPC_URL,{commitment:"confirmed"});
 
-# ensure custody.pub exists and matches
-if [ ! -s "$WALLET_PUB" ]; then
-  node - <<NODE
-const fs=require("fs");
-const {Keypair}=require("@solana/web3.js");
-const arr=JSON.parse(fs.readFileSync("$WALLET_JSON","utf8"));
-const kp=Keypair.fromSecretKey(Uint8Array.from(arr));
-fs.writeFileSync("$WALLET_PUB", kp.publicKey.toBase58());
-NODE
-  chmod 644 "$WALLET_PUB" 2>/dev/null || true
-fi
+let session=jread(SESS_JSON,{
+  active:false,
+  ownerPubkey:"",
+  tokenMint:"",
+  budgetUSDC:0,
+  perTradeUSDC:5,
+  intervalSec:30,
+  spentUSDC:0,
+  mode:"DCA",
+  startedAt:"",
+  lastSig:"",
+  lastErr:"",
+  trades:[]
+});
 
-# restart service
+function saveSession(){ try{ jwrite(SESS_JSON,session); }catch{} }
+
+let cached={ts:0,data:null};
+async function getBalances(tokenMintStr){
+  const t=Date.now();
+  if(cached.data && (t-cached.ts)<2500) return cached.data;
+  let sol=0,usdc=0,tok=0;
+  try{ sol=await conn.getBalance(custody.publicKey); }catch{}
+  try{
+    const atas=await conn.getParsedTokenAccountsByOwner(custody.publicKey,{mint:USDC_MINT});
+    for(const it of atas.value){
+      const ui=it.account.data.parsed.info.tokenAmount.uiAmount||0;
+      usdc+=ui;
+    }
+  }catch{}
+  if(tokenMintStr){
+    try{
+      const mint=new PublicKey(tokenMintStr);
+      const atas=await conn.getParsedTokenAccountsByOwner(custody.publicKey,{mint});
+      for(const it of atas.value){
+        const ui=it.account.data.parsed.info.tokenAmount.uiAmount||0;
+        tok+=ui;
+      }
+    }catch{}
+  }
+  cached={ts:t,data:{solLamports:sol,sol:sol/LAMPORTS_PER_SOL,usdc,token:tok}};
+  return cached.data;
+}
+
+async function jupQuote(inputMint,outputMint,amountRaw){
+  const url=new URL(JUP_BASE.replace(/\/$/,"")+"/v6/quote");
+  url.searchParams.set("inputMint",inputMint.toBase58());
+  url.searchParams.set("outputMint",outputMint.toBase58());
+  url.searchParams.set("amount",String(amountRaw));
+  url.searchParams.set("slippageBps",String(SLIPPAGE_BPS));
+  url.searchParams.set("swapMode","ExactIn");
+  const r=await fetch(url,{headers:{"accept":"application/json"},cache:"no-store"});
+  if(!r.ok) throw new Error("quote_http_"+r.status);
+  return await r.json();
+}
+async function jupSwap(quote,wrapUnwrapSOL=true){
+  const url=JUP_BASE.replace(/\/$/,"")+"/v6/swap";
+  const body={
+    quoteResponse:quote,
+    userPublicKey:custody.publicKey.toBase58(),
+    wrapAndUnwrapSol:wrapUnwrapSOL,
+    dynamicComputeUnitLimit:true,
+    prioritizationFeeLamports:"auto"
+  };
+  const r=await fetch(url,{method:"POST",headers:{"content-type":"application/json","accept":"application/json"},body:JSON.stringify(body),cache:"no-store"});
+  if(!r.ok) throw new Error("swap_http_"+r.status);
+  return await r.json();
+}
+
+async function signSendBase64Tx(b64){
+  const buf=Buffer.from(b64,"base64");
+  const tx=VersionedTransaction.deserialize(buf);
+  tx.sign([custody]);
+  const sig=await conn.sendRawTransaction(tx.serialize(),{skipPreflight:false,maxRetries:3});
+  await conn.confirmTransaction(sig,"confirmed");
+  return sig;
+}
+
+async function buyUSDCToToken(usdcAmountUi, tokenMintStr){
+  const mint=new PublicKey(tokenMintStr);
+  const amountRaw=Math.floor(Number(usdcAmountUi)*1e6); // USDC 6 decimals
+  if(amountRaw<=0) throw new Error("amount_zero");
+  const quote=await jupQuote(USDC_MINT,mint,amountRaw);
+  const sw=await jupSwap(quote,true);
+  if(!sw || !sw.swapTransaction) throw new Error("no_swap_tx");
+  const sig=await signSendBase64Tx(sw.swapTransaction);
+  return sig;
+}
+
+async function sendUSDC(toPubkeyStr, amountUi){
+  const to=new PublicKey(toPubkeyStr);
+  const ataFrom=await spl.getAssociatedTokenAddress(USDC_MINT,custody.publicKey,false,spl.TOKEN_PROGRAM_ID,spl.ASSOCIATED_TOKEN_PROGRAM_ID);
+  const ataTo=await spl.getAssociatedTokenAddress(USDC_MINT,to,false,spl.TOKEN_PROGRAM_ID,spl.ASSOCIATED_TOKEN_PROGRAM_ID);
+  const ix=[];
+  const info=await conn.getAccountInfo(ataTo);
+  if(!info) ix.push(spl.createAssociatedTokenAccountInstruction(custody.publicKey,to,ataTo,USDC_MINT,spl.TOKEN_PROGRAM_ID,spl.ASSOCIATED_TOKEN_PROGRAM_ID));
+  const amt=Math.floor(Number(amountUi)*1e6);
+  ix.push(spl.createTransferInstruction(ataFrom,ataTo,custody.publicKey,amt,[],spl.TOKEN_PROGRAM_ID));
+  const {TransactionMessage,VersionedTransaction}=require("@solana/web3.js");
+  const bh=await conn.getLatestBlockhash("confirmed");
+  const msg=new TransactionMessage({payerKey:custody.publicKey, recentBlockhash:bh.blockhash, instructions:ix}).compileToV0Message();
+  const tx=new VersionedTransaction(msg);
+  tx.sign([custody]);
+  const sig=await conn.sendRawTransaction(tx.serialize(),{skipPreflight:false,maxRetries:3});
+  await conn.confirmTransaction(sig,"confirmed");
+  return sig;
+}
+
+function requireArm(req){
+  const arm=(req.headers["x-arm"]||"").toString();
+  if(arm!==ARM_PHRASE) throw new Error("ARM_REQUIRED");
+}
+
+const app=express();
+app.disable("x-powered-by");
+app.use(express.json({limit:"256kb"}));
+app.use((req,res,next)=>{
+  res.setHeader("cache-control","no-store, max-age=0");
+  res.setHeader("access-control-allow-origin","*");
+  res.setHeader("access-control-allow-methods","GET,POST,OPTIONS");
+  res.setHeader("access-control-allow-headers","content-type,x-arm");
+  if(req.method==="OPTIONS") return res.status(204).end();
+  next();
+});
+
+app.get("/",(req,res)=>res.type("text/plain").send("wolverine-api"));
+app.get("/health",(req,res)=>res.json({ok:true,uptime:process.uptime(),ts:Date.now()}));
+app.get("/ping",(req,res)=>res.type("text/plain").send("pong"));
+app.get("/wallet",(req,res)=>res.json({ok:true,custody:custody.publicKey.toBase58()}));
+app.get("/config",(req,res)=>res.json({
+  ok:true,
+  basePath:BASE_PATH,
+  apiBase:BASE_PATH+"/api",
+  rpc:RPC_URL,
+  usdcMint:USDC_MINT.toBase58(),
+  custody:custody.publicKey.toBase58(),
+  monitor:{url:MONITOR_URL,sec:MONITOR_SEC,fails:MONITOR_FAILS},
+  armRequired:true
+}));
+
+app.get("/status",async(req,res)=>{
+  const bal=await getBalances(session.tokenMint);
+  res.json({ok:true,ts:Date.now(),custody:custody.publicKey.toBase58(),balances:bal,session});
+});
+
+app.post("/start",async(req,res)=>{
+  try{
+    requireArm(req);
+    const b=Number(req.body?.budgetUSDC||0);
+    const p=Number(req.body?.perTradeUSDC||5);
+    const mint=(req.body?.tokenMint||"").toString().trim();
+    const owner=(req.body?.ownerPubkey||"").toString().trim();
+    const intervalSec=Math.max(10,Number(req.body?.intervalSec||30));
+    if(!owner) throw new Error("owner_required");
+    if(!mint) throw new Error("tokenMint_required");
+    if(!(b>0)) throw new Error("budget_required");
+    if(!(p>0)) throw new Error("perTrade_required");
+    session.active=true;
+    session.ownerPubkey=owner;
+    session.tokenMint=mint;
+    session.budgetUSDC=b;
+    session.perTradeUSDC=p;
+    session.intervalSec=intervalSec;
+    session.mode="DCA";
+    session.startedAt=now();
+    session.lastErr="";
+    saveSession();
+    res.json({ok:true,session});
+  }catch(e){
+    res.status(400).json({ok:false,error:String(e.message||e)});
+  }
+});
+
+app.post("/stop",(req,res)=>{
+  try{
+    requireArm(req);
+    session.active=false;
+    saveSession();
+    res.json({ok:true,session});
+  }catch(e){
+    res.status(400).json({ok:false,error:String(e.message||e)});
+  }
+});
+
+app.post("/buy",async(req,res)=>{
+  try{
+    requireArm(req);
+    const amt=Number(req.body?.usdc||0);
+    const mint=(req.body?.tokenMint||session.tokenMint||"").toString().trim();
+    if(!mint) throw new Error("tokenMint_required");
+    if(!(amt>0)) throw new Error("usdc_required");
+    const sig=await buyUSDCToToken(amt,mint);
+    session.lastSig=sig;
+    session.trades.unshift({ts:Date.now(),type:"BUY",usdc:amt,mint,sig});
+    saveSession();
+    res.json({ok:true,sig});
+  }catch(e){
+    session.lastErr=String(e.message||e);
+    saveSession();
+    res.status(400).json({ok:false,error:String(e.message||e)});
+  }
+});
+
+app.post("/payout",async(req,res)=>{
+  try{
+    requireArm(req);
+    const to=(req.body?.to||session.ownerPubkey||"").toString().trim();
+    const amt=Number(req.body?.usdc||0);
+    if(!to) throw new Error("to_required");
+    if(!(amt>0)) throw new Error("usdc_required");
+    const sig=await sendUSDC(to,amt);
+    session.trades.unshift({ts:Date.now(),type:"PAYOUT_USDC",usdc:amt,to,sig});
+    saveSession();
+    res.json({ok:true,sig});
+  }catch(e){
+    session.lastErr=String(e.message||e);
+    saveSession();
+    res.status(400).json({ok:false,error:String(e.message||e)});
+  }
+});
+
+let tradeTimer=null;
+async function tradeTick(){
+  if(!session.active) return;
+  try{
+    const bal=await getBalances(session.tokenMint);
+    const remain=session.budgetUSDC-session.spentUSDC;
+    if(remain<=0){ session.active=false; session.lastErr="budget_reached"; saveSession(); return; }
+    const doAmt=Math.min(session.perTradeUSDC,remain,bal.usdc);
+    if(doAmt<=0) return;
+    const sig=await buyUSDCToToken(doAmt,session.tokenMint);
+    session.spentUSDC=+(session.spentUSDC+doAmt).toFixed(6);
+    session.lastSig=sig;
+    session.trades.unshift({ts:Date.now(),type:"DCA_BUY",usdc:doAmt,mint:session.tokenMint,sig});
+    saveSession();
+  }catch(e){
+    session.lastErr=String(e.message||e);
+    saveSession();
+  }
+}
+function ensureTradeLoop(){
+  if(tradeTimer) clearInterval(tradeTimer);
+  tradeTimer=setInterval(()=>tradeTick(),Math.max(10,session.intervalSec)*1000);
+}
+ensureTradeLoop();
+
+let monTimer=null,monFails=0;
+async function monTick(){
+  if(!MONITOR_URL) return;
+  try{
+    const r=await fetch(MONITOR_URL,{cache:"no-store"});
+    const txt=await r.text();
+    if(!r.ok) throw new Error("http_"+r.status);
+    monFails=0;
+  }catch(e){
+    monFails++;
+    if(monFails>=MONITOR_FAILS){
+      sendTG("WOLVERINE MONITOR: ERR ("+MONITOR_URL+") "+now()+" fails="+monFails);
+      monFails=0;
+    }
+  }
+}
+if(MONITOR_SEC>0 && MONITOR_URL){
+  monTimer=setInterval(()=>monTick(),MONITOR_SEC*1000);
+  monTick().catch(()=>{});
+}
+
+process.on("SIGTERM",()=>process.exit(0));
+app.listen(PORT,"127.0.0.1",()=>{ console.log("wolverine-api listening 127.0.0.1:"+PORT); console.log("custody "+custody.publicKey.toBase58()); });
+JS
+askorupdate_file "$APPDIR/server.js" "WOLVERINE server.js" "$SVR"
+
+# install deps
+cd "$APPDIR"
+if [ ! -d node_modules ]; then npm i --omit=dev; else npm i --omit=dev; fi
+
+# systemd service
+read -r -d "" UNIT <<EOF
+[Unit]
+Description=Wolverine API (custodial TraderOne)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=$APPDIR
+EnvironmentFile=$ENVF
+ExecStart=/usr/bin/node $APPDIR/server.js
+Restart=always
+RestartSec=2
+User=root
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+EOF
+askorupdate_file "$SVCF" "WOLVERINE systemd" "$UNIT"
+
 systemctl daemon-reload
-systemctl restart "$SERVICE.service" || true
+systemctl enable --now "$SVC"
+systemctl restart "$SVC" || true
 
-# show deposit address + quick health
-CUST="$(cat "$WALLET_PUB" 2>/dev/null || true)"
-say "Deposit (SOL/USDC): $CUST"
-curl -fsS "https://fireinners.online/wolverine/api/health" || true
-echo
+# Frontend index.html (color changed + EN/FR toggle)
+read -r -d "" INDEX <<'"'"'HTML'"'"'
+<!doctype html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>WOLVERINE • TraderOne (Custodial)</title><style>:root{--bg:#05030a;--p:#0e0620;--p2:#140a2b;--l:#3b1a66;--t:#fff2ff;--m:#cbb6ff;--a:#ff6a00;--ok:#3dff9a;--bad:#ff3d6e}*{box-sizing:border-box}html,body{height:100%;margin:0;background:radial-gradient(900px 500px at 15% 0%,#1b0b3a 0%,transparent 62%),radial-gradient(800px 520px at 85% 20%,#2a0b18 0%,transparent 58%),var(--bg);color:var(--t);font:14px system-ui}#top{position:sticky;top:0;z-index:9;background:linear-gradient(180deg,rgba(20,10,43,.95),rgba(5,3,10,.75));backdrop-filter:blur(8px);border-bottom:1px solid rgba(255,106,0,.25)}#bar{max-width:1100px;margin:0 auto;padding:10px 12px;display:flex;gap:10px;align-items:center;justify-content:space-between}#brand{display:flex;gap:10px;align-items:center}#dot{width:10px;height:10px;border-radius:50%;background:var(--bad);box-shadow:0 0 12px rgba(255,61,110,.7)}#ttl{font-weight:800;letter-spacing:.6px}#sub{color:var(--m);font-size:12px;margin-top:1px}#btns{display:flex;gap:8px;flex-wrap:wrap;align-items:center}button{cursor:pointer;border:1px solid rgba(255,106,0,.35);background:linear-gradient(180deg,rgba(255,106,0,.20),rgba(255,106,0,.08));color:var(--t);padding:8px 10px;border-radius:10px;font-weight:700}button:hover{filter:brightness(1.08)}button.secondary{border-color:rgba(203,182,255,.28);background:linear-gradient(180deg,rgba(203,182,255,.12),rgba(203,182,255,.06));color:var(--t)}#wrap{max-width:1100px;margin:14px auto;padding:0 12px;display:grid;grid-template-columns:420px 1fr;gap:12px}#card,#console{background:linear-gradient(180deg,rgba(14,6,32,.85),rgba(5,3,10,.65));border:1px solid rgba(255,106,0,.18);border-radius:14px;box-shadow:0 10px 30px rgba(0,0,0,.35)}#card{padding:12px}#console{padding:12px;min-height:420px;display:flex;flex-direction:column}h3{margin:0 0 10px 0;font-size:13px;color:var(--m);text-transform:uppercase;letter-spacing:.12em}label{display:block;color:var(--m);font-size:12px;margin:10px 0 6px}input,select{width:100%;padding:10px 10px;border-radius:10px;border:1px solid rgba(203,182,255,.22);background:rgba(0,0,0,.25);color:var(--t);outline:none}input:focus,select:focus{border-color:rgba(255,106,0,.55);box-shadow:0 0 0 3px rgba(255,106,0,.15)}.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}.pill{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.k{color:var(--m)}.v{font-weight:800}.ok{color:var(--ok)}.bad{color:var(--bad)}#log{flex:1;white-space:pre-wrap;background:rgba(0,0,0,.25);border:1px solid rgba(203,182,255,.18);border-radius:12px;padding:10px;overflow:auto}#foot{display:flex;justify-content:space-between;gap:10px;color:var(--m);font-size:12px;margin-top:10px}code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}@media (max-width:980px){#wrap{grid-template-columns:1fr}#console{min-height:320px}}</style></head><body><div id="top"><div id="bar"><div id="brand"><div id="dot"></div><div><div id="ttl">WOLVERINE</div><div id="sub">TraderOne • Custodial API • Live</div></div></div><div id="btns"><button id="langBtn" class="secondary">EN</button><button id="apiBtn" class="secondary">API</button><button id="pingBtn" class="secondary">Ping</button><button id="loopBtn" class="secondary">Loop</button></div></div></div><div id="wrap"><div id="card"><h3 id="hControl">Control</h3><div class="pill"><div><span class="k" id="kPh">Phantom:</span> <span class="v" id="phAddr">not connected</span></div></div><div class="pill" style="margin-top:10px"><button id="connectBtn">Connect</button><button id="discBtn" class="secondary">Disconnect</button><button id="refreshBtn" class="secondary">Refresh</button></div><div class="row"><div><label id="lSol">SOL (custody)</label><input id="sol" disabled value="-"/></div><div><label id="lUsdc">USDC (custody)</label><input id="usdc" disabled value="-"/></div></div><label id="lCust">Custody (TraderOne deposit address)</label><input id="cust" disabled value="-"/><div class="pill" style="margin-top:8px"><button id="copyCust" class="secondary">Copy</button><button id="openStatus" class="secondary">Status</button></div><label id="lMint">Token mint (Solana)</label><input id="mint" value=""/><div class="row"><div><label id="lBudget">Budget (USDC)</label><input id="budget" type="number" step="0.01" value="50"/></div><div><label id="lPer">Per-trade (USDC)</label><input id="per" type="number" step="0.01" value="5"/></div></div><div class="row"><div><label id="lInt">Interval (sec)</label><input id="interval" type="number" step="1" value="30"/></div><div><label id="lArm">ARM (required)</label><input id="arm" value="WOLVERINE"/></div></div><div class="pill" style="margin-top:10px"><button id="startBtn">Start WOLVERINE</button><button id="stopBtn" class="secondary">Stop</button><button id="buyBtn" class="secondary">Buy once</button><button id="payoutBtn" class="secondary">Payout USDC</button></div><div style="margin-top:10px;color:var(--m);font-size:12px" id="note">Custodial: user sends SOL/USDC to the custody address. The server signs swaps internally. Phantom is only used to read your public address (for payout).</div></div><div id="console"><h3>Console</h3><div id="log"></div><div id="foot"><div><span id="sRefresh">Last refresh</span>: <span id="last">-</span></div><div><span id="sLatency">Latency</span>: <span id="lat">-</span> | <span id="sErr">Errors</span>: <span id="err">0</span></div></div></div></div><script>
+(()=>{const $=s=>document.querySelector(s),logEl=$("#log"),dot=$("#dot");let lang=localStorage.getItem("wolv_lang")||"en";let errs=0;const I18N={en:{Control:"Control",Connect:"Connect",Disconnect:"Disconnect",Refresh:"Refresh","Token mint (Solana)":"Token mint (Solana)","Budget (USDC)":"Budget (USDC)","Per-trade (USDC)":"Per-trade (USDC)","Interval (sec)":"Interval (sec)","ARM (required)":"ARM (required)","Custody (TraderOne deposit address)":"Custody (TraderOne deposit address)","SOL (custody)":"SOL (custody)","USDC (custody)":"USDC (custody)","Last refresh":"Last refresh","Latency":"Latency","Errors":"Errors","Start WOLVERINE":"Start WOLVERINE","Buy once":"Buy once","Payout USDC":"Payout USDC","Copy":"Copy","Status":"Status",note:"Custodial: user sends SOL/USDC to the custody address. The server signs swaps internally. Phantom is only used to read your public address (for payout).",ph:"Phantom:"},fr:{Control:"Contrôle",Connect:"Connecter",Disconnect:"Déconnecter",Refresh:"Rafraîchir","Token mint (Solana)":"Mint du token (Solana)","Budget (USDC)":"Budget (USDC)","Per-trade (USDC)":"Par trade (USDC)","Interval (sec)":"Intervalle (sec)","ARM (required)":"ARM (requis)","Custody (TraderOne deposit address)":"Adresse dépôt Custody (TraderOne)","SOL (custody)":"SOL (custody)","USDC (custody)":"USDC (custody)","Last refresh":"Dernier refresh","Latency":"Latence","Errors":"Erreurs","Start WOLVERINE":"Start WOLVERINE","Buy once":"Achat unique","Payout USDC":"Retour USDC","Copy":"Copier","Status":"Statut",note:"Custodial: l’utilisateur envoie SOL/USDC à l’adresse custody. Le serveur signe les swaps en interne. Phantom sert seulement à lire ta pubkey (pour payout).",ph:"Phantom:"}};function t(k){return (I18N[lang]&&I18N[lang][k])||k;}function applyLang(){ $("#hControl").textContent=t("Control"); $("#connectBtn").textContent=t("Connect"); $("#discBtn").textContent=t("Disconnect"); $("#refreshBtn").textContent=t("Refresh"); $("#lMint").textContent=t("Token mint (Solana)"); $("#lBudget").textContent=t("Budget (USDC)"); $("#lPer").textContent=t("Per-trade (USDC)"); $("#lInt").textContent=t("Interval (sec)"); $("#lArm").textContent=t("ARM (required)"); $("#lCust").textContent=t("Custody (TraderOne deposit address)"); $("#lSol").textContent=t("SOL (custody)"); $("#lUsdc").textContent=t("USDC (custody)"); $("#sRefresh").textContent=t("Last refresh"); $("#sLatency").textContent=t("Latency"); $("#sErr").textContent=t("Errors"); $("#startBtn").textContent=t("Start WOLVERINE"); $("#buyBtn").textContent=t("Buy once"); $("#payoutBtn").textContent=t("Payout USDC"); $("#copyCust").textContent=t("Copy"); $("#openStatus").textContent=t("Status"); $("#note").textContent=t("note"); $("#kPh").textContent=t("ph"); $("#langBtn").textContent=lang.toUpperCase();}applyLang();
+function wlog(s){const ts=new Date().toISOString().slice(11,19);logEl.textContent=`[${ts}] ${s}\n`+logEl.textContent;}
+async function api(path,opt){const t0=performance.now();const r=await fetch(`/wolverine/api/${path}?_=${Date.now()}`,Object.assign({cache:"no-store"},opt||{}));const ms=Math.round(performance.now()-t0);$("#lat").textContent=ms+"ms";return r;}
+function setApi(ok){dot.style.background=ok?"var(--ok)":"var(--bad)";dot.style.boxShadow=ok?"0 0 12px rgba(61,255,154,.7)":"0 0 12px rgba(255,61,110,.7)";}
+function setErr(){errs++;$("#err").textContent=String(errs);}
+let phantomPub="";async function connect(){try{if(!window.solana||!window.solana.isPhantom){wlog("Phantom not found");return;}const resp=await window.solana.connect();phantomPub=(resp.publicKey||window.solana.publicKey).toString();$("#phAddr").textContent=phantomPub;wlog("Phantom connected "+phantomPub);}catch(e){wlog("Connect err "+e);setErr();}}
+async function disconnect(){try{if(window.solana&&window.solana.isPhantom)await window.solana.disconnect();phantomPub="";$("#phAddr").textContent="not connected";wlog("Phantom disconnected");}catch(e){wlog("Disconnect err "+e);setErr();}}
+async function refresh(){try{const r=await api("status");if(!r.ok){setApi(false);wlog("status http "+r.status);setErr();return;}setApi(true);const j=await r.json();$("#cust").value=j.custody||"-";$("#sol").value=(j.balances?.sol??"-");$("#usdc").value=(j.balances?.usdc??"-");$("#last").textContent=new Date().toLocaleTimeString();wlog("status ok sol="+$("#sol").value+" usdc="+$("#usdc").value);}catch(e){setApi(false);wlog("refresh err "+e);setErr();}}
+async function ping(){try{const r=await api("ping");const txt=await r.text();setApi(r.ok&&txt.trim()=="pong");wlog("ping "+r.status+" "+txt.trim());if(!r.ok) setErr();}catch(e){setApi(false);wlog("ping err "+e);setErr();}}
+let autoT=null;function loopToggle(){if(autoT){clearInterval(autoT);autoT=null;wlog("loop OFF");}else{autoT=setInterval(refresh,5000);wlog("loop ON (5s)");refresh();}}
+async function start(){try{const arm=$("#arm").value.trim();const body={ownerPubkey:phantomPub||"",tokenMint:$("#mint").value.trim(),budgetUSDC:+$("#budget").value,perTradeUSDC:+$("#per").value,intervalSec:+$("#interval").value};const r=await api("start",{method:"POST",headers:{"content-type":"application/json","x-arm":arm},body:JSON.stringify(body)});const j=await r.json().catch(()=>({}));wlog("start "+r.status+" "+JSON.stringify(j));if(!r.ok){setErr();}else{refresh();}}catch(e){wlog("start err "+e);setErr();}}
+async function stop(){try{const arm=$("#arm").value.trim();const r=await api("stop",{method:"POST",headers:{"content-type":"application/json","x-arm":arm},body:"{}"});wlog("stop "+r.status+" "+await r.text());if(!r.ok)setErr();else refresh();}catch(e){wlog("stop err "+e);setErr();}}
+async function buyOnce(){try{const arm=$("#arm").value.trim();const body={tokenMint:$("#mint").value.trim(),usdc:+$("#per").value};const r=await api("buy",{method:"POST",headers:{"content-type":"application/json","x-arm":arm},body:JSON.stringify(body)});const j=await r.json().catch(()=>({}));wlog("buy "+r.status+" "+JSON.stringify(j));if(!r.ok)setErr();else refresh();}catch(e){wlog("buy err "+e);setErr();}}
+async function payout(){try{const arm=$("#arm").value.trim();const to=phantomPub||prompt("to pubkey?")||"";const amt=+prompt("USDC amount to send back?","1")||0;const r=await api("payout",{method:"POST",headers:{"content-type":"application/json","x-arm":arm},body:JSON.stringify({to,usdc:amt})});const j=await r.json().catch(()=>({}));wlog("payout "+r.status+" "+JSON.stringify(j));if(!r.ok)setErr();else refresh();}catch(e){wlog("payout err "+e);setErr();}}
+$("#connectBtn").onclick=connect;$("#discBtn").onclick=disconnect;$("#refreshBtn").onclick=refresh;$("#pingBtn").onclick=ping;$("#loopBtn").onclick=loopToggle;$("#startBtn").onclick=start;$("#stopBtn").onclick=stop;$("#buyBtn").onclick=buyOnce;$("#payoutBtn").onclick=payout;$("#apiBtn").onclick=async()=>{const r=await api("config");wlog("config "+r.status+" "+await r.text());};$("#copyCust").onclick=()=>{navigator.clipboard.writeText($("#cust").value||"");wlog("custody copied");};$("#openStatus").onclick=()=>window.open("/wolverine/api/status","_blank");$("#langBtn").onclick=()=>{lang=(lang==="en"?"fr":"en");localStorage.setItem("wolv_lang",lang);applyLang();wlog("lang "+lang);};
+refresh();})();
+</script></body></html>
+HTML
+askorupdate_file "$WEBDIR/index.html" "WOLVERINE index.html" "$INDEX"
+chmod 644 "$WEBDIR/index.html" || true
+chmod 755 "$WEBDIR" || true
+
+# nginx snippet (serve /wolverine/ + proxy /wolverine/api/)
+read -r -d "" NGSNIP <<EOF
+location ^~ /wolverine/api/ {
+  proxy_pass http://127.0.0.1:3050/;
+  proxy_http_version 1.1;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+  add_header Cache-Control "no-store, max-age=0" always;
+}
+location ^~ /wolverine/ {
+  alias $WEBDIR/;
+  try_files \$uri \$uri/ /wolverine/index.html;
+  add_header Cache-Control "no-store, max-age=0" always;
+}
+EOF
+askorupdate_file "$SNIP" "WOLVERINE nginx snippet" "$NGSNIP"
+
+# include snippet into vhost if missing (safe insert before last } in server block)
+chattr -i "$NG" 2>/dev/null || true
+if ! grep -q "snippets/fireinners-wolverine.conf" "$NG"; then
+  cp -a "$NG" "$NG.bak.$(date -u +%Y%m%d%H%M%S)" || true
+  awk -v ins="    include snippets/fireinners-wolverine.conf;" '
+    BEGIN{added=0}
+    {lines[NR]=$0}
+    END{
+      # insert include before the last "}" of file (good enough for single server block)
+      for(i=1;i<=NR;i++){
+        if(i==NR && !added){
+          # try to insert before last }
+        }
+      }
+      last=NR
+      for(i=NR;i>=1;i--){ if(lines[i] ~ /^[[:space:]]*}[[:space:]]*$/){ last=i; break; } }
+      for(i=1;i<=NR;i++){
+        if(i==last && !added){ print ins; added=1; }
+        print lines[i]
+      }
+    }' "$NG" >"$NG.tmp"
+  mv "$NG.tmp" "$NG"
+fi
+
+nginx -t
+systemctl reload nginx
+chattr +i "$SNIP" 2>/dev/null || true
+chattr +i "$NG" 2>/dev/null || true
+
+say "=== DONE ==="
+say "Front : https://fireinners.online/wolverine/"
+say "API   : https://fireinners.online/wolverine/api/"
+say "Health: https://fireinners.online/wolverine/api/health"
+say "Ping  : https://fireinners.online/wolverine/api/ping"
+say "Config: https://fireinners.online/wolverine/api/config"
+say "Status: https://fireinners.online/wolverine/api/status"
+say "Wallet: https://fireinners.online/wolverine/api/wallet"
+say "Deposit address (SOL/USDC): $(cat "$WALLET_PUB" 2>/dev/null || true)"
 BASH
+bash "$TMP"
+'
