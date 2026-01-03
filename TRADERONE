@@ -1,4 +1,274 @@
-systemctl is-active traderone.service && \
-ss -lntp | grep ':8585' && \
-curl -sS -o /dev/null -w "LOCAL %{http_code}\n" http://127.0.0.1:8585/api/health && \
-curl -ksS -o /dev/null -w "NGINX %{http_code}\n" https://fireinners.online/wolverine/traderone/api/health
+cat >/tmp/DEPLOY_WOLVERINE_FRONT_OVERWRITE.sh <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+# -------- CONFIG (front) --------
+RPC="https://api.mainnet-beta.solana.com"
+USDC_MINT="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+API_START="/wolverine/traderone/api/start"
+
+# -------- find nginx docroot for /wolverine (best effort) --------
+export SYSTEMD_PAGER=cat PAGER=cat
+NGX="$(nginx -T 2>/dev/null || true)"
+
+DOCROOT=""
+# try to detect an "alias" inside location /wolverine
+DOCROOT="$(printf "%s\n" "$NGX" | awk '
+  BEGIN{inloc=0}
+  /location[[:space:]]+\/wolverine\/?[[:space:]]*\{/ {inloc=1}
+  inloc && /alias[[:space:]]+/ {
+    gsub(/;$/,"",$2); print $2; exit
+  }
+  inloc && /\}/ {inloc=0}
+')"
+
+# if no alias, try to detect "root" (server-level) and then append /wolverine if needed
+if [ -z "${DOCROOT:-}" ]; then
+  BASE="$(printf "%s\n" "$NGX" | awk '
+    /server_name[[:space:]].*fireinners\.online/ {insrv=1}
+    insrv && /^[[:space:]]*root[[:space:]]+/ {gsub(/;$/,"",$2); print $2; exit}
+    insrv && /^[[:space:]]*server[[:space:]]*\{/ { } 
+    insrv && /^[[:space:]]*\}/ {insrv=0}
+  ')"
+  if [ -n "${BASE:-}" ]; then
+    # common patterns: /var/www/html; we want /var/www/html/wolverine
+    DOCROOT="${BASE%/}/wolverine"
+  fi
+fi
+
+# fallbacks
+if [ -z "${DOCROOT:-}" ]; then
+  if [ -d /var/www/wolverine ]; then DOCROOT="/var/www/wolverine"; fi
+fi
+if [ -z "${DOCROOT:-}" ]; then
+  DOCROOT="/var/www/wolverine"
+fi
+
+echo "== Deploy to: $DOCROOT =="
+
+mkdir -p "$DOCROOT"
+
+# -------- write index.html (OVERWRITE) --------
+cat >"$DOCROOT/index.html" <<'HTML'
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>WOLVERINE</title>
+  <style>
+    :root { --bg:#0b0f14; --card:#121826; --b:#223049; --mut:#9fb0c7; --ok:#22c55e; --err:#ef4444; --btn:#3b82f6; }
+    body { margin:0; font-family:system-ui, Arial; background:var(--bg); color:#e8eef6; }
+    .wrap { max-width:520px; margin:42px auto; padding:18px; }
+    .card { background:var(--card); border:1px solid var(--b); border-radius:16px; padding:16px; }
+    h1 { margin:0 0 12px; font-size:22px; }
+    .row { display:flex; justify-content:space-between; gap:10px; align-items:center; margin:10px 0; }
+    .muted { color:var(--mut); font-size:13px; }
+    .value { font-weight:800; font-size:18px; }
+    .pill { padding:4px 10px; border:1px solid var(--b); border-radius:999px; font-size:12px; color:var(--mut); }
+    button {
+      width:100%; padding:12px 14px; border:0; border-radius:12px;
+      background:var(--btn); color:white; font-weight:800; cursor:pointer;
+    }
+    button.secondary { background:#1f2937; border:1px solid #2b3a55; }
+    button:disabled { opacity:.55; cursor:not-allowed; }
+    input {
+      width:100%; padding:12px 14px; border-radius:12px;
+      border:1px solid #2b3a55; background:#0f1624; color:#e8eef6; outline:none;
+    }
+    .hidden { display:none; }
+    .ok { color:var(--ok); }
+    .err { color:var(--err); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>WOLVERINE</h1>
+
+      <div class="row">
+        <span class="pill">Solana</span>
+        <span class="pill" id="walletPill">Wallet: non connecté</span>
+      </div>
+
+      <div class="row">
+        <div>
+          <div class="muted">SOL</div>
+          <div class="value" id="solBal">—</div>
+        </div>
+        <div style="text-align:right;">
+          <div class="muted">USDC</div>
+          <div class="value" id="usdcBal">—</div>
+        </div>
+      </div>
+
+      <button id="btnConnect">Connect Wallet (Phantom)</button>
+
+      <div id="afterConnect" class="hidden" style="margin-top:14px;">
+        <div class="muted" style="margin:8px 0;">Budget</div>
+        <input id="budget" type="number" inputmode="decimal" placeholder="Ex: 50" min="0" step="0.01" />
+
+        <div style="margin-top:12px;">
+          <button id="btnStart" disabled>START WOLVERINE (TraderOne)</button>
+        </div>
+
+        <div class="row" style="margin-top:12px;">
+          <span class="muted">Status</span>
+          <span id="statusText" class="muted">—</span>
+        </div>
+
+        <button id="btnRefresh" class="secondary" style="margin-top:10px;">Refresh balances</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/@solana/web3.js@latest/lib/index.iife.min.js"></script>
+  <script src="./app.js"></script>
+</body>
+</html>
+HTML
+
+# -------- write app.js (OVERWRITE) --------
+cat >"$DOCROOT/app.js" <<JS
+// ===== CONFIG =====
+const RPC = "${RPC}";
+const USDC_MINT = "${USDC_MINT}";
+const API_START = "${API_START}";
+
+// ===== DOM =====
+const btnConnect = document.getElementById("btnConnect");
+const btnStart = document.getElementById("btnStart");
+const btnRefresh = document.getElementById("btnRefresh");
+const afterConnect = document.getElementById("afterConnect");
+const walletPill = document.getElementById("walletPill");
+const solBalEl = document.getElementById("solBal");
+const usdcBalEl = document.getElementById("usdcBal");
+const budgetEl = document.getElementById("budget");
+const statusText = document.getElementById("statusText");
+
+// ===== STATE =====
+let provider = null;
+let pubkey = null;
+const connection = new solanaWeb3.Connection(RPC, "confirmed");
+
+function shortPk(pk) {
+  const s = pk.toString();
+  return s.slice(0, 4) + "…" + s.slice(-4);
+}
+
+function setStatus(text, kind = "muted") {
+  statusText.className = kind;
+  statusText.textContent = text;
+}
+
+function getProvider() {
+  if ("solana" in window) {
+    const p = window.solana;
+    if (p?.isPhantom) return p;
+  }
+  return null;
+}
+
+async function getSolBalance(pk) {
+  const lamports = await connection.getBalance(pk);
+  return lamports / solanaWeb3.LAMPORTS_PER_SOL;
+}
+
+async function getUsdcBalance(pk) {
+  const mint = new solanaWeb3.PublicKey(USDC_MINT);
+  const resp = await connection.getParsedTokenAccountsByOwner(pk, { mint });
+  const first = resp.value?.[0];
+  if (!first) return 0;
+  const ui = first.account.data.parsed.info.tokenAmount.uiAmount;
+  return ui ?? 0;
+}
+
+async function refreshBalances() {
+  if (!pubkey) return;
+  try {
+    setStatus("Lecture des soldes…");
+    const [sol, usdc] = await Promise.all([getSolBalance(pubkey), getUsdcBalance(pubkey)]);
+    solBalEl.textContent = sol.toFixed(4);
+    usdcBalEl.textContent = usdc.toFixed(2);
+    setStatus("OK", "ok");
+  } catch (e) {
+    setStatus("Erreur balances", "err");
+  }
+}
+
+function canStart() {
+  const v = Number(budgetEl.value);
+  return pubkey && Number.isFinite(v) && v > 0;
+}
+
+btnConnect.addEventListener("click", async () => {
+  provider = getProvider();
+  if (!provider) {
+    setStatus("Phantom non détecté", "err");
+    window.open("https://phantom.app/", "_blank");
+    return;
+  }
+
+  try {
+    const res = await provider.connect();
+    pubkey = res.publicKey;
+
+    walletPill.textContent = "Wallet: " + shortPk(pubkey);
+    afterConnect.classList.remove("hidden");
+    btnConnect.textContent = "Wallet connecté";
+    btnConnect.disabled = true;
+
+    await refreshBalances();
+    btnStart.disabled = !canStart();
+  } catch (e) {
+    setStatus("Connexion refusée", "err");
+  }
+});
+
+budgetEl.addEventListener("input", () => {
+  btnStart.disabled = !canStart();
+});
+
+btnRefresh.addEventListener("click", refreshBalances);
+
+btnStart.addEventListener("click", async () => {
+  if (!canStart()) return;
+  const budget = Number(budgetEl.value);
+
+  try {
+    setStatus("Démarrage…");
+    btnStart.disabled = true;
+
+    const r = await fetch(API_START, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ wallet: pubkey.toString(), budget }),
+    });
+
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      setStatus(data?.error || "Start failed", "err");
+      btnStart.disabled = false;
+      return;
+    }
+    setStatus("WOLVERINE démarré ✅", "ok");
+  } catch (e) {
+    setStatus("Erreur réseau/API", "err");
+    btnStart.disabled = false;
+  }
+});
+JS
+
+chmod 644 "$DOCROOT/index.html" "$DOCROOT/app.js"
+chown -R root:root "$DOCROOT"
+
+echo "== nginx test + reload =="
+nginx -t
+systemctl reload nginx
+
+echo "== quick checks =="
+ls -la "$DOCROOT" | egrep 'index\.html|app\.js' || true
+echo "Try: https://fireinners.online/wolverine/"
+SH
+
+bash /tmp/DEPLOY_WOLVERINE_FRONT_OVERWRITE.sh
