@@ -1,30 +1,102 @@
-cat >/tmp/CLEANUP_WOLVERINE_OLD_FILES.sh <<'SH'
+cat >/tmp/SETUP_TRADERONE_SYSTEMD_WATCHDOG.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
-ts(){ date +%Y%m%d_%H%M%S; }
-T="$(ts)"
-BK="/root/cleanup_wolverine_${T}"
-mkdir -p "$BK/snippets" "$BK/sites-enabled"
 
-echo "== Archive old wolverine snippets (keep fireinners-wolverine.conf) =="
-for f in /etc/nginx/snippets/wolverine_unified.conf /etc/nginx/snippets/wolverine_static_tryfiles.conf; do
-  if [ -f "$f" ]; then
-    echo "ARCHIVE: $f -> $BK/snippets/"
-    mv "$f" "$BK/snippets/"
-  fi
-done
+# --- detect a start script (best effort) ---
+START=""
+if [ -x /root/restart_traderone.sh ]; then
+  START="/root/restart_traderone.sh"
+elif [ -x /root/traderone-auto.sh ]; then
+  START="/root/traderone-auto.sh"
+elif [ -x /root/launch_traderone_safe.sh ]; then
+  START="/root/launch_traderone_safe.sh"
+elif [ -f /root/package.json ]; then
+  START="/usr/bin/npm start"
+else
+  echo "ERROR: je ne trouve pas de script de lancement (restart_traderone.sh / traderone-auto.sh / launch_traderone_safe.sh) ni package.json dans /root"
+  exit 1
+fi
 
-echo "== Archive disabled vhosts (optional) =="
-for f in /etc/nginx/sites-enabled/*.DISABLED.*; do
-  [ -e "$f" ] || continue
-  echo "ARCHIVE: $f -> $BK/sites-enabled/"
-  mv "$f" "$BK/sites-enabled/"
-done
+echo "Using START=$START"
 
-echo "== nginx sanity check =="
-nginx -t
-systemctl reload nginx
-echo "OK ✅ cleanup done in $BK"
+# --- systemd service ---
+cat >/etc/systemd/system/traderone.service <<EOF
+[Unit]
+Description=TraderOne Backend (Wolverine)
+After=network-online.target nginx.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root
+Environment=NODE_ENV=production
+Restart=always
+RestartSec=2
+StartLimitIntervalSec=0
+ExecStart=/bin/bash -lc '$START'
+KillSignal=SIGINT
+TimeoutStopSec=20
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# --- watchdog: if health not 200 => restart service ---
+cat >/usr/local/bin/traderone_watchdog.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+URL="https://fireinners.online/wolverine/traderone/api/health"
+if curl -ksS --max-time 5 -o /dev/null -w "%{http_code}" "$URL" | grep -q '^200$'; then
+  exit 0
+fi
+systemctl restart traderone.service
+EOF
+chmod +x /usr/local/bin/traderone_watchdog.sh
+
+cat >/etc/systemd/system/traderone-watchdog.service <<'EOF'
+[Unit]
+Description=TraderOne Watchdog (healthcheck -> restart)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/traderone_watchdog.sh
+EOF
+
+cat >/etc/systemd/system/traderone-watchdog.timer <<'EOF'
+[Unit]
+Description=Run TraderOne watchdog every 30s
+
+[Timer]
+OnBootSec=30
+OnUnitActiveSec=30
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now traderone.service
+systemctl enable --now traderone-watchdog.timer
+
+echo
+echo "OK ✅ Installed:"
+echo " - systemctl status traderone.service"
+echo " - systemctl status traderone-watchdog.timer"
+echo "Logs: journalctl -u traderone.service -n 100 --no-pager"
 SH
 
-bash /tmp/CLEANUP_WOLVERINE_OLD_FILES.sh
+bash /tmp/SETUP_TRADERONE_SYSTEMD_WATCHDOG.sh
+
+
+
+
+systemctl status traderone.service --no-pager
+systemctl status traderone-watchdog.timer --no-pager
+curl -ksS https://fireinners.online/wolverine/traderone/api/health ; echo
+
