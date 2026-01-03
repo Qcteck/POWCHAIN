@@ -1,1 +1,65 @@
-systemctl status wolverine-api --no-pager;echo;ss -lntp | grep ':3050' || echo "3050 not listening";echo;curl -sS -m 2 http://127.0.0.1:3050/ping || echo "curl local failed";echo;curl -sS -m 5 https://fireinners.online/wolverine/api/ping || echo "curl public failed"
+cat >/tmp/WOLVERINE_FIX_RUNTIME.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+[ "$(id -u)" = "0" ] || { echo "ERREUR: lance en root"; exit 1; }
+
+APPDIR="/opt/fireinners/wolverine-api"
+SENV="${APPDIR}/.env"
+UNIT="/etc/systemd/system/wolverine-api.service"
+NGX="/etc/nginx/sites-available/fireinners.online-ssl"
+
+echo "== PRECHECK =="
+systemctl is-enabled nginx >/dev/null 2>&1 || true
+mkdir -p "$APPDIR"
+
+echo "== ENV (.env) =="
+touch "$SENV"
+grep -qE '^HOST=' "$SENV" || echo 'HOST=127.0.0.1' >>"$SENV"
+grep -qE '^PORT=' "$SENV" || echo 'PORT=3050' >>"$SENV"
+grep -qE '^BASE_PATH=' "$SENV" || echo 'BASE_PATH=/wolverine' >>"$SENV"
+
+echo "== SYSTEMD unit (Restart always) =="
+cat >"$UNIT" <<EOF
+[Unit]
+Description=WOLVERINE API
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=${APPDIR}
+EnvironmentFile=${SENV}
+ExecStart=/usr/bin/node ${APPDIR}/server.js
+Restart=always
+RestartSec=2
+KillSignal=SIGINT
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now wolverine-api >/dev/null 2>&1 || true
+systemctl restart wolverine-api
+
+echo "== WAIT LISTEN =="
+for i in $(seq 1 30); do
+  if ss -lntp | grep -q ':3050'; then break; fi
+  sleep 0.2
+done
+
+echo "== LOCAL PING =="
+curl -sS -m 2 http://127.0.0.1:3050/ping || true
+echo
+
+echo "== NGINX TEST/RELOAD =="
+nginx -t
+systemctl reload nginx
+
+echo "== PUBLIC PING =="
+curl -sS -m 5 https://fireinners.online/wolverine/api/ping || true
+echo
+echo "DONE"
+BASH
+bash /tmp/WOLVERINE_FIX_RUNTIME.sh
