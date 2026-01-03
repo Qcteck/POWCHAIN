@@ -1,30 +1,93 @@
-cat >/tmp/RELANCE_TRADERONE_AND_TEST.sh <<'SH'
+cat >/tmp/FORCE_TRADERONE_INCLUDE_IN_ACTIVE_SSL_VHOST.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
-hr(){ echo; echo "=========== $* ==========="; }
 
-hr "1) Restart TraderOne"
-systemctl daemon-reload || true
-systemctl restart traderone.service
-sleep 1
-systemctl status traderone.service --no-pager -n 25 || true
+SNIP="/etc/nginx/snippets/wolverine_traderone_backend.conf"
 
-hr "2) Check port 8585"
-ss -lntp | grep -E '(:8585)\b' || echo "!! 8585 NOT LISTENING"
+# 0) (re)write the proxy snippet (API+WS+UI)
+cat >"$SNIP" <<'EOF'
+# TRADERONE_WOLV_PROXY_V2
 
-hr "3) Local API test (must NOT be HTML wolverine)"
-curl -sS --max-time 6 http://127.0.0.1:8585/api/status | head -c 200; echo
+location ^~ /wolverine/traderone/api/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  proxy_read_timeout 120s;
+  proxy_send_timeout 120s;
+  proxy_pass http://127.0.0.1:8585/api/;
+}
 
-hr "4) Reload nginx + public tests"
+location ^~ /wolverine/traderone/ws {
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  proxy_read_timeout 3600s;
+  proxy_send_timeout 3600s;
+  proxy_set_header Upgrade $http_upgrade;
+  proxy_set_header Connection "upgrade";
+  proxy_pass http://127.0.0.1:8585/ws;
+}
+
+location ^~ /wolverine/traderone/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  proxy_read_timeout 120s;
+  proxy_send_timeout 120s;
+  proxy_set_header Upgrade $http_upgrade;
+  proxy_set_header Connection "upgrade";
+  proxy_pass http://127.0.0.1:8585/;
+}
+EOF
+
+echo "1) Find ACTIVE SSL vhost file serving fireinners.online…"
+ACTIVE_FILE="$(nginx -T 2>/dev/null | awk '
+  /^# configuration file / {file=$4; sub(/:$/,"",file)}
+  /listen 443/ {ssl_file=file}
+  /server_name[[:space:]].*fireinners\.online/ && ssl_file==file {print file; exit}
+')"
+
+if [ -z "${ACTIVE_FILE:-}" ]; then
+  echo "ERROR: cannot detect active SSL vhost for fireinners.online"
+  echo "Hint output:"
+  nginx -T 2>/dev/null | grep -nE "configuration file|listen 443|server_name.*fireinners\.online" | head -n 120 || true
+  exit 1
+fi
+
+echo "ACTIVE SSL VHOST: $ACTIVE_FILE"
+
+echo "2) Inject include into that server{} (python write, no sed -i)…"
+python3 - <<PY
+import re, time
+p="${ACTIVE_FILE}"
+inc="    include /etc/nginx/snippets/wolverine_traderone_backend.conf; # TRADERONE_INCLUDE_ACTIVE_V1\n"
+s=open(p,"r",encoding="utf-8",errors="ignore").read()
+if "wolverine_traderone_backend.conf" in s:
+    print("OK: include already present in active vhost")
+else:
+    m=re.search(r'^\s*server\s*\{\s*$', s, flags=re.M)
+    if not m: raise SystemExit("ERROR: can't find 'server {' in "+p)
+    s=s[:m.end()]+"\n"+inc+s[m.end():]
+    open(p,"w",encoding="utf-8").write(s)
+    print("OK: include added to active vhost")
+PY
+
+echo "3) Reload nginx…"
 nginx -t
 systemctl reload nginx
 
-echo "--- PUBLIC: /wolverine/traderone/ (headers)"
-curl -kIs --max-time 8 https://fireinners.online/wolverine/traderone/ | head -n 10
-
-echo "--- PUBLIC: /wolverine/traderone/api/status (body head)"
+echo "4) PUBLIC tests (must NOT be HTML)…"
+echo "--- /wolverine/traderone/api/status"
 curl -ksS --max-time 8 https://fireinners.online/wolverine/traderone/api/status | head -c 220; echo
-
+echo
+echo "--- /wolverine/traderone/ (headers)"
+curl -kIs --max-time 8 https://fireinners.online/wolverine/traderone/ | head -n 10
 SH
 
-bash /tmp/RELANCE_TRADERONE_AND_TEST.sh
+bash /tmp/FORCE_TRADERONE_INCLUDE_IN_ACTIVE_SSL_VHOST.sh
