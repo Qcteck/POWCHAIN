@@ -1,1 +1,85 @@
-systemctl status wolverine-api --no-pager;echo;sudo ss -lntp | grep ':3050' || true;echo;curl -sS -i https://fireinners.online/wolverine/api/ping | head -n 20
+cat >/tmp/MEGA_WOLVERINE_NGX_FIX.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+[ "$(id -u)" = "0" ] || { echo "ERREUR: lance en root"; exit 1; }
+
+SITE="/etc/nginx/sites-available/fireinners.online-ssl"
+SNIP="/etc/nginx/snippets/fireinners-wolverine.conf"
+NGC="/etc/nginx/nginx.conf"
+ASKOR="/opt/fireinners/sentinel/lib/askorupdate.sh"
+
+need(){ command -v "$1" >/dev/null 2>&1 || { echo "ERREUR: '$1' manquant"; exit 1; }; }
+need nginx; need grep; need perl; need sed; need awk; need systemctl; need chattr || true
+
+# askorupdate si dispo
+if [ -f "$ASKOR" ]; then . "$ASKOR"; else
+  askorupdate_file(){ local p="$1" n="$2" c="$3"; mkdir -p "$(dirname "$p")"; cat >"$p"; }
+  askorupdate_yesno(){ return 0; }
+fi
+
+echo "=== PRE-FLY (read-only) ==="
+echo "SITE: $SITE"
+echo "SNIP: $SNIP"
+nginx -t >/dev/null && echo "NGINX: syntax OK" || echo "NGINX: syntax FAIL (on va corriger)"
+echo
+echo "Occurrences 'location /wolverine/api/':"
+( nginx -T 2>/dev/null || true ) | grep -n "location */wolverine/api/" || true
+echo
+
+echo "=== UNLOCK (safe) ==="
+chattr -i "$SITE" 2>/dev/null || true
+chattr -i "$SNIP" 2>/dev/null || true
+chattr -i "$NGC"  2>/dev/null || true
+
+# 1) Assurer que le snippet existe (ne crée pas de doublon, juste un fichier canonique)
+if [ ! -f "$SNIP" ]; then
+  askorupdate_file "$SNIP" "WOLVERINE nginx snippet" "WOLV_SNIP" <<'EOF'
+# WOLVERINE (canon)
+location ^~ /wolverine/api/ {
+  proxy_pass http://127.0.0.1:3050/;
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  add_header Cache-Control "no-store, max-age=0" always;
+}
+location = /wolverine/ { try_files /wolverine/index.html =404; add_header Cache-Control "no-store, max-age=0" always; }
+location ^~ /wolverine/ { try_files $uri $uri/ /wolverine/index.html; add_header Cache-Control "no-store, max-age=0" always; }
+EOF
+fi
+
+# 2) Dans le vhost: enlever les doublons d'include snippet (garder 1 seule ligne)
+if [ -f "$SITE" ]; then
+  # a) retirer toutes les lignes include du snippet, puis en remettre 1 avant la dernière "}"
+  perl -0777 -pe 's/^\s*include\s+snippets\/fireinners-wolverine\.conf\s*;\s*\n//mg' -i "$SITE"
+  # b) insérer 1 include dans le 1er server { ... } (avant la dernière } du bloc)
+  perl -0777 -pe 's/(server\s*\{[\s\S]*?)(\n\})/$1\n  include snippets\/fireinners-wolverine.conf;\n$2/s' -i "$SITE" || true
+fi
+
+# 3) Dans le vhost: si un location /wolverine/api/ est inline, le supprimer (le snippet est canonique)
+if [ -f "$SITE" ]; then
+  perl -0777 -pe 's/\n\s*location\s+\^~?\s*\/wolverine\/api\/\s*\{[\s\S]*?\n\s*\}\s*\n/\n/gs' -i "$SITE" || true
+  perl -0777 -pe 's/\n\s*location\s+\/wolverine\/api\/\s*\{[\s\S]*?\n\s*\}\s*\n/\n/gs' -i "$SITE" || true
+fi
+
+echo "=== TEST + RELOAD ==="
+nginx -t
+systemctl reload nginx
+
+echo "=== POST-CHECK ==="
+echo "Count locations after fix:"
+( nginx -T 2>/dev/null || true ) | grep -c "location */wolverine/api/" || true
+echo
+echo "Try ping (should be pong):"
+curl -fsS -m 5 "https://fireinners.online/wolverine/api/ping" || true
+echo
+
+echo "=== RELOCK (optional) ==="
+chattr +i "$SNIP" 2>/dev/null || true
+chattr +i "$SITE" 2>/dev/null || true
+
+echo "DONE."
+BASH
+chmod +x /tmp/MEGA_WOLVERINE_NGX_FIX.sh
+bash /tmp/MEGA_WOLVERINE_NGX_FIX.sh
