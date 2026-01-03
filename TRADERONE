@@ -1,26 +1,260 @@
-cat >/tmp/WOLVERINE_FINAL_TESTS_NO_FLOOD.sh <<'SH'
+cat >/tmp/WOLVERINE_FORCE_FRONT_2_BALANCES_INDEX_APP.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
+
+DOCROOT="/var/www/fireinners/wolverine"
 TS="$(date +%s)"
-DOMAIN="fireinners.online"
 
-echo "== 1) JS headers =="
-curl -ksSI "https://$DOMAIN/wolverine/solana-web3.min.js?v=$TS" | sed -n '1,25p'
-echo
+mkdir -p "$DOCROOT"
+cp -a "$DOCROOT/index.html" "$DOCROOT/index.html.bak.$TS" 2>/dev/null || true
+cp -a "$DOCROOT/app.js" "$DOCROOT/app.js.bak.$TS" 2>/dev/null || true
 
-echo "== 2) JS first bytes (no flood) =="
-curl -ksS "https://$DOMAIN/wolverine/solana-web3.min.js?v=$TS" | head -c 80 >/tmp/first80.txt || true
-cat /tmp/first80.txt; echo
-echo
+cat >"$DOCROOT/index.html" <<HTML
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>WOLVERINE</title>
+  <style>
+    :root { --bg:#0b0f14; --card:#121826; --b:#223049; --mut:#9fb0c7; --ok:#22c55e; --err:#ef4444; --btn:#3b82f6; }
+    body { margin:0; font-family:system-ui, Arial; background:var(--bg); color:#e8eef6; }
+    .wrap { max-width:720px; margin:42px auto; padding:18px; }
+    .card { background:var(--card); border:1px solid var(--b); border-radius:16px; padding:16px; }
+    h1 { margin:0 0 12px; font-size:22px; }
+    .row { display:flex; justify-content:space-between; gap:12px; align-items:center; margin:10px 0; }
+    .muted { color:var(--mut); font-size:13px; }
+    .value { font-weight:900; font-size:18px; }
+    .pill { padding:4px 10px; border:1px solid var(--b); border-radius:999px; font-size:12px; color:var(--mut); }
+    button { width:100%; padding:12px 14px; border:0; border-radius:12px; background:var(--btn); color:white; font-weight:900; cursor:pointer; }
+    button.secondary { background:#1f2937; border:1px solid #2b3a55; }
+    button:disabled { opacity:.55; cursor:not-allowed; }
+    input, select { width:100%; padding:12px 14px; border-radius:12px; border:1px solid #2b3a55; background:#0f1624; color:#e8eef6; outline:none; }
+    .hidden { display:none; }
+    .ok { color:var(--ok); }
+    .err { color:var(--err); }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px; word-break:break-all; }
+    .grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+    .mini { border:1px solid var(--b); border-radius:14px; padding:12px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>WOLVERINE</h1>
 
-echo "== 3) Make browser bypass cache =="
-echo "Open: https://$DOMAIN/wolverine/?v=$TS"
+      <div class="row">
+        <span class="pill">Solana</span>
+        <span class="pill" id="walletPill">Wallet: non connecté</span>
+      </div>
+
+      <div class="grid">
+        <div class="mini">
+          <div class="muted">Wallet utilisateur (Phantom)</div>
+          <div class="row">
+            <div>
+              <div class="muted">SOL</div>
+              <div class="value" id="uSol">—</div>
+            </div>
+            <div style="text-align:right;">
+              <div class="muted">USDC</div>
+              <div class="value" id="uUsdc">—</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="mini">
+          <div class="muted">Wallet TraderOne (bot)</div>
+          <div class="mono" id="tAddr" style="margin-top:6px;">—</div>
+          <div class="row" style="margin-top:10px;">
+            <div>
+              <div class="muted">SOL</div>
+              <div class="value" id="tSol">—</div>
+            </div>
+            <div style="text-align:right;">
+              <div class="muted">USDC</div>
+              <div class="value" id="tUsdc">—</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <button id="btnConnect" style="margin-top:12px;">Connect Wallet (Phantom)</button>
+
+      <div id="afterConnect" class="hidden" style="margin-top:14px;">
+        <div class="muted" style="margin-top:8px;">Token</div>
+        <select id="token">
+          <option value="USDC">USDC</option>
+          <option value="SOL">SOL</option>
+        </select>
+
+        <div class="muted" style="margin-top:10px;">Budget (sera ENVOYÉ à TraderOne)</div>
+        <input id="budget" type="number" inputmode="decimal" placeholder="Ex: 1" min="0" step="0.000001" />
+
+        <div style="margin-top:12px;">
+          <button id="btnStart" disabled>START WOLVERINE (TraderOne)</button>
+        </div>
+
+        <button id="btnRefresh" class="secondary" style="margin-top:10px;">Refresh soldes</button>
+
+        <div class="row" style="margin-top:12px;">
+          <span class="muted">Status</span>
+          <span id="statusText" class="muted">—</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- IMPORTANT: solanaWeb3 global -->
+  <script src="./solana-web3.min.js?v=$TS"></script>
+  <script src="./app.js?v=$TS"></script>
+</body>
+</html>
+HTML
+
+cat >"$DOCROOT/app.js" <<'JS'
+const API_BALANCES2 = "/wolverine/traderone/api/balances2";
+const API_BUILD_TX  = "/wolverine/traderone/api/build-deposit-tx";
+const API_CONFIRM   = "/wolverine/traderone/api/confirm";
+const API_START     = "/wolverine/traderone/api/start";
+
+const btnConnect=document.getElementById("btnConnect");
+const btnStart=document.getElementById("btnStart");
+const btnRefresh=document.getElementById("btnRefresh");
+const afterConnect=document.getElementById("afterConnect");
+const walletPill=document.getElementById("walletPill");
+
+const uSol=document.getElementById("uSol");
+const uUsdc=document.getElementById("uUsdc");
+const tSol=document.getElementById("tSol");
+const tUsdc=document.getElementById("tUsdc");
+const tAddr=document.getElementById("tAddr");
+
+const tokenEl=document.getElementById("token");
+const budgetEl=document.getElementById("budget");
+const statusText=document.getElementById("statusText");
+
+let pubkey=null;
+let traderWallet=null;
+
+function shortPk(pk){ const s=pk.toString(); return s.slice(0,4)+"…"+s.slice(-4); }
+function setStatus(t,cls="muted"){ statusText.className=cls; statusText.textContent=t; }
+function n(x){ const v=Number(x); return Number.isFinite(v)?v:0; }
+function canStart(){ return pubkey && traderWallet && n(budgetEl.value)>0; }
+
+async function refreshBoth(){
+  if(!pubkey) return;
+  setStatus("Lecture des soldes…");
+  try{
+    const r = await fetch(`${API_BALANCES2}?wallet=${encodeURIComponent(pubkey.toString())}`, { cache:"no-store" });
+    const d = await r.json().catch(()=>({}));
+    if(!r.ok) throw new Error(d?.error || ("HTTP "+r.status));
+
+    traderWallet = d.traderWallet || null;
+    tAddr.textContent = traderWallet || "—";
+
+    uSol.textContent  = Number(d.user?.sol ?? 0).toFixed(6);
+    uUsdc.textContent = Number(d.user?.usdc ?? 0).toFixed(4);
+    tSol.textContent  = Number(d.trader?.sol ?? 0).toFixed(6);
+    tUsdc.textContent = Number(d.trader?.usdc ?? 0).toFixed(4);
+
+    setStatus("OK", "ok");
+    btnStart.disabled = !canStart();
+  }catch(e){
+    setStatus("Balances error: " + (e?.message || e), "err");
+  }
+}
+
+async function confirmSig(sig, tries=25){
+  for(let i=0;i<tries;i++){
+    const r = await fetch(`${API_CONFIRM}?sig=${encodeURIComponent(sig)}`, {cache:"no-store"});
+    const d = await r.json().catch(()=>({}));
+    if(d?.ok) return true;
+    await new Promise(res=>setTimeout(res, 1000));
+  }
+  return false;
+}
+
+btnConnect.onclick=async ()=>{
+  if(!window.solana?.isPhantom){
+    setStatus("Phantom non détecté","err");
+    return;
+  }
+  try{
+    const r=await window.solana.connect();
+    pubkey=r.publicKey;
+    walletPill.textContent="Wallet: "+shortPk(pubkey);
+    afterConnect.classList.remove("hidden");
+    btnConnect.textContent="Wallet connecté";
+    btnConnect.disabled=true;
+    await refreshBoth();
+  }catch(e){
+    setStatus("Connexion refusée: " + (e?.message||e),"err");
+  }
+};
+
+budgetEl.oninput=()=>{ btnStart.disabled=!canStart(); };
+tokenEl.onchange=()=>{ btnStart.disabled=!canStart(); };
+btnRefresh.onclick=refreshBoth;
+
+btnStart.onclick=async ()=>{
+  if(!canStart()) return;
+
+  const token  = tokenEl.value;
+  const budget = n(budgetEl.value);
+  const amount = budget;
+
+  const ok = confirm(`Envoyer ${amount} ${token} vers TraderOne:\n${traderWallet}\n\nPuis démarrer WOLVERINE ?`);
+  if(!ok) return;
+
+  btnStart.disabled=true;
+  setStatus("Préparation transaction…");
+
+  try{
+    const build = await fetch(API_BUILD_TX,{
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ from: pubkey.toString(), token, amount })
+    });
+    const bd = await build.json().catch(()=>({}));
+    if(!build.ok) throw new Error(bd?.error || ("HTTP "+build.status));
+
+    const txBytes = Uint8Array.from(atob(bd.txBase64), c => c.charCodeAt(0));
+    const tx = solanaWeb3.Transaction.from(txBytes);
+
+    setStatus("Signature + envoi…");
+    const { signature } = await window.solana.signAndSendTransaction(tx);
+
+    setStatus("Confirmation on-chain…");
+    const confirmed = await confirmSig(signature);
+    if(!confirmed){
+      setStatus("Tx envoyée mais non confirmée. Sig: "+signature, "err");
+      btnStart.disabled=false;
+      return;
+    }
+
+    setStatus("Tx confirmée ✅ Démarrage…","ok");
+    const st = await fetch(API_START,{
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ wallet: pubkey.toString(), budget, depositSig: signature, token, amount })
+    });
+    const sd = await st.json().catch(()=>({}));
+    if(!st.ok) throw new Error(sd?.error || ("HTTP "+st.status));
+
+    setStatus("WOLVERINE démarré ✅", "ok");
+    await refreshBoth();
+  }catch(e){
+    setStatus("Erreur: " + (e?.message || e), "err");
+    btnStart.disabled=false;
+  }
+};
+JS
+
+chmod 644 "$DOCROOT/index.html" "$DOCROOT/app.js"
+nginx -t && systemctl reload nginx
+
+echo "DONE ✅ Ouvre: https://fireinners.online/wolverine/?v=$TS"
 SH
 
-bash /tmp/WOLVERINE_FINAL_TESTS_NO_FLOOD.sh
-
-
-
-
-curl -sS "http://127.0.0.1:8585/api/balances2?wallet=TON_WALLET"
-
+bash /tmp/WOLVERINE_FORCE_FRONT_2_BALANCES_INDEX_APP.sh
