@@ -1,34 +1,58 @@
-cat >/tmp/DISABLE_RESTART_TRADERONE_PARASITE.sh <<'SH'
+cat >/tmp/FIX_8585_NOT_LISTENING.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
-export SYSTEMD_PAGER=cat
-export PAGER=cat
+export SYSTEMD_PAGER=cat PAGER=cat
 
-echo "== 1) Stop/disable the parasite service/timer if present =="
-systemctl stop restart-traderone.timer restart-traderone.service 2>/dev/null || true
-systemctl disable restart-traderone.timer restart-traderone.service 2>/dev/null || true
+echo "== 1) status + last logs traderone =="
+systemctl status traderone.service --no-pager || true
+echo
+journalctl -u traderone.service -n 120 --no-pager || true
+echo
 
-echo "== 2) Mask it (prevents ANY start, even manual/dep) =="
-systemctl mask restart-traderone.service 2>/dev/null || true
-systemctl mask restart-traderone.timer 2>/dev/null || true
+echo "== 2) what is listening on 8585 (or not) =="
+ss -lntp | egrep '(:8585\s|Local Address:Port)' || true
+echo
 
-echo "== 3) Remove wants symlink if still there =="
-rm -f /etc/systemd/system/multi-user.target.wants/restart-traderone.service 2>/dev/null || true
+echo "== 3) show node process (args) if any =="
+pgrep -af "node .*server\.js" || true
+echo
 
-echo "== 4) Reload systemd =="
-systemctl daemon-reload
+echo "== 4) if 8585 NOT listening, force PORT/HOST in systemd and restart =="
+if ! ss -lntp | grep -q ':8585'; then
+  echo "-> 8585 not listening: patching unit Environment=PORT=8585 HOST=127.0.0.1"
+  # add or replace Environment lines (keeps NODE_ENV)
+  sed -i '/^Environment=PORT=/d;/^Environment=HOST=/d' /etc/systemd/system/traderone.service
+  awk '
+    {print}
+    /^\[Service\]$/{
+      print "Environment=PORT=8585"
+      print "Environment=HOST=127.0.0.1"
+    }
+  ' /etc/systemd/system/traderone.service > /tmp/traderone.service.new
+  mv /tmp/traderone.service.new /etc/systemd/system/traderone.service
 
-echo "== 5) Proof: it must show masked/disabled =="
-systemctl status restart-traderone.service --no-pager || true
-systemctl list-timers --all | grep -i restart-traderone || true
+  systemctl daemon-reload
+  systemctl restart traderone.service
+  sleep 2
+fi
 
-echo "== 6) Keep ONLY the good service running =="
-systemctl restart traderone.service
-systemctl status traderone.service --no-pager
+echo "== 5) wait up to 10s for 8585 to listen =="
+for i in $(seq 1 10); do
+  if ss -lntp | grep -q ':8585'; then
+    echo "OK: 8585 is listening"
+    break
+  fi
+  sleep 1
+done
 
-echo "== 7) Health checks =="
-curl -sS  -o /dev/null -w "LOCAL  http_code=%{http_code}\n" http://127.0.0.1:8585/api/health || true
+echo "== 6) health checks =="
+echo "--- LOCAL ---"
+curl -sS -o /dev/null -w "LOCAL  http_code=%{http_code}\n" http://127.0.0.1:8585/api/health || true
+echo "--- NGINX ---"
 curl -ksS -o /dev/null -w "NGINX  http_code=%{http_code}\n" https://fireinners.online/wolverine/traderone/api/health || true
+
+echo "== 7) show listeners now =="
+ss -lntp | egrep ':8585|:858' || true
 SH
 
-bash /tmp/DISABLE_RESTART_TRADERONE_PARASITE.sh
+bash /tmp/FIX_8585_NOT_LISTENING.sh
