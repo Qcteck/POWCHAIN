@@ -1,25 +1,35 @@
-cat >/tmp/WOLV_OVERLAY_FIX.sh <<'SH'
+cat >/tmp/WOLV_RESTORE_CLEAN_AND_ADD_OVERLAY.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 
 DIR="/opt/fireinners/frontend-react/app/dist/wolverine"
 IDX="$DIR/index.html"
-JS="$DIR/traderone_overlay.js"
 MARK="WOLV_TRADERONE_OVERLAY_V1"
 
-[ -f "$IDX" ] || { echo "ERREUR: $IDX introuvable"; exit 1; }
+cd "$DIR"
 
-cp -a "$IDX" "$IDX.fixbak.$(date +%s)"
+echo "1) Cherche un backup CLEAN (sans marker)…"
+CLEAN=""
+for f in $(ls -1t index.html.bak.* index.html.fixbak.* 2>/dev/null || true); do
+  if ! grep -q "$MARK" "$f"; then
+    CLEAN="$f"
+    break
+  fi
+done
 
-# 1) Enlever l'ancien inject (tout le bloc marker -> fin du script inject)
-# (best-effort, idempotent)
-perl -0777 -pi -e '
-s/<!--\s*WOLV_TRADERONE_OVERLAY_V1\s*-->.*?<script>.*?<\/script>\s*//s;
-s/<!--\s*WOLV_TRADERONE_OVERLAY_V1\s*-->.*$//s;
-' "$IDX"
+if [ -z "$CLEAN" ]; then
+  echo "ERREUR: aucun backup clean trouvé."
+  echo "Liste backups:"
+  ls -1t index.html.bak.* index.html.fixbak.* 2>/dev/null || true
+  exit 1
+fi
 
-# 2) Créer un overlay JS propre (DOM injection, pas de <style> brut dans le HTML)
-cat >"$JS" <<'EOF'
+echo "=> RESTORE: $CLEAN -> $IDX"
+cp -a "$IDX" "$IDX.broken.$(date +%s)" || true
+cp -a "$CLEAN" "$IDX"
+
+echo "2) (Re)crée traderone_overlay.js (overlay propre)"
+cat >"$DIR/traderone_overlay.js" <<'EOF'
 (()=> {
   if (window.__WOLV_TO_OVERLAY__) return;
   window.__WOLV_TO_OVERLAY__ = true;
@@ -38,7 +48,6 @@ cat >"$JS" <<'EOF'
     padding:8px 10px;border-radius:12px;cursor:pointer;font:13px system-ui}
   #to_bar button:hover{filter:brightness(1.08)}
   `;
-
   const style = document.createElement("style");
   style.textContent = css;
   document.head.appendChild(style);
@@ -78,26 +87,27 @@ cat >"$JS" <<'EOF'
   document.addEventListener("keydown", (e)=>{ if (e.key === "Escape") hide(); });
 })();
 EOF
-chmod 644 "$JS"
+chmod 644 "$DIR/traderone_overlay.js"
 
-# 3) Inclure le JS proprement dans index.html
+echo "3) Injecte juste un <script src=...> (si absent)"
 if ! grep -q "traderone_overlay.js" "$IDX"; then
   if grep -qi '</body>' "$IDX"; then
     awk 'BEGIN{IGNORECASE=1}
-      /<\/body>/ && !done { print "  <script src=\"/wolverine/traderone_overlay.js?v=1\"></script>"; done=1 }
+      /<\/body>/ && !done { print "  <script src=\"/wolverine/traderone_overlay.js?v=2\"></script>"; done=1 }
       { print }
     ' "$IDX" >"$IDX.tmp" && mv "$IDX.tmp" "$IDX"
   else
-    printf '\n<script src="/wolverine/traderone_overlay.js?v=1"></script>\n' >>"$IDX"
+    printf '\n<script src="/wolverine/traderone_overlay.js?v=2"></script>\n' >>"$IDX"
   fi
 fi
 
+echo "4) Reload nginx"
 nginx -t && systemctl reload nginx
 
-echo "OK. Tests:"
+echo "5) Tests rapides"
 curl -ksS --max-time 6 https://fireinners.online/wolverine/ | head -c 120; echo
 curl -ksS --max-time 6 https://fireinners.online/wolverine/traderone/ | head -c 120; echo
-echo "DONE."
+echo "DONE"
 SH
 
-bash /tmp/WOLV_OVERLAY_FIX.sh
+bash /tmp/WOLV_RESTORE_CLEAN_AND_ADD_OVERLAY.sh
