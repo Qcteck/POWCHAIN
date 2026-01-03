@@ -1,3 +1,206 @@
-curl -sS -i https://fireinners.online/wolverine/api/ping | head -n 30
-curl -sS -i -X POST https://fireinners.online/wolverine/api/start -H "content-type: application/json" -d '{"phantomPubkey":"TEST","budgetUSDC":1,"mode":"microcap"}' | head -n 80
-curl -sS -i https://fireinners.online/wolverine/api/status | head -n 80
+cat >/tmp/WOLVERINE_TRADERONE_BACKEND_PROXY_SMART.sh <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+ASKLIB="/opt/fireinners/sentinel/lib/askorupdate.sh"
+if [ -f "$ASKLIB" ]; then . "$ASKLIB"; else
+  askorupdate_yesno(){ local q="$1"; read -r -p "$q (y/N) " a || true; case "${a,,}" in y|yes) return 0;; *) return 1;; esac; }
+  askorupdate_file(){ local p="$1" c="$2"; mkdir -p "$(dirname "$p")"; printf "%s" "$c" >"$p"; }
+fi
+say(){ printf "%s\n" "$*"; }
+need(){ command -v "$1" >/dev/null 2>&1 || { say "ERREUR: commande manquante: $1"; exit 1; }; }
+
+TR_DIR="/opt/traderone-opt"
+NGX_SITE="/etc/nginx/sites-available/fireinners.online-ssl"
+UNIT="traderone.service"
+SNIP="/etc/nginx/snippets/wolverine_traderone_backend.conf"
+MARK="TRADERONE_WOLV_PROXY_V1"
+PORT_DEFAULT="8585"
+
+json_get(){ node -e 'try{const p=require(process.argv[1]);const k=process.argv[2];let v=p;for(const s of k.split(".")){v=v&&v[s]} if(typeof v==="string")process.stdout.write(v)}catch(e){}' "$1" "$2" 2>/dev/null || true; }
+
+detect_port(){
+  local p=""
+  if [ -f "$TR_DIR/.env" ]; then
+    p="$(grep -E '^(PORT|HTTP_PORT)=' "$TR_DIR/.env" | tail -n1 | cut -d= -f2 | tr -d '\r' | tr -cd '0-9' || true)"
+  fi
+  if [ -z "${p:-}" ] && [ -f "$TR_DIR/package.json" ]; then
+    local s; s="$(json_get "$TR_DIR/package.json" "scripts.start")"
+    if echo "$s" | grep -Eq '([Pp][Oo][Rr][Tt])='; then
+      p="$(echo "$s" | sed -nE 's/.*PORT=([0-9]{2,5}).*/\1/p' | head -n1 || true)"
+    fi
+  fi
+  if [ -z "${p:-}" ]; then p="$PORT_DEFAULT"; fi
+  printf "%s" "$p"
+}
+
+score_file(){
+  local f="$1" sc=0
+  grep -Eq 'express\(' "$f" 2>/dev/null && sc=$((sc+50))
+  grep -Eq 'fastify\(' "$f" 2>/dev/null && sc=$((sc+50))
+  grep -Eq 'createServer\(' "$f" 2>/dev/null && sc=$((sc+20))
+  grep -Eq '\.listen\(' "$f" 2>/dev/null && sc=$((sc+20))
+  grep -Eq 'import .*express|require\(["'\'']express["'\'']\)' "$f" 2>/dev/null && sc=$((sc+10))
+  grep -Eq 'process\.env\.PORT|process\.env\.HTTP_PORT' "$f" 2>/dev/null && sc=$((sc+5))
+  printf "%s" "$sc"
+}
+
+detect_entry_file(){
+  local candidates tmp bestf bests
+  tmp="$(mktemp)"
+  # candidats “connus”
+  find "$TR_DIR" -maxdepth 4 -type f \( \
+    -name 'server.js' -o -name 'app.js' -o -name 'index.js' -o -name 'main.js' -o \
+    -name 'api.js' -o -name 'backend.js' -o -name 'start.js' \
+  \) 2>/dev/null >"$tmp" || true
+
+  # si rien, on prend aussi les .js qui contiennent listen/express/fastify (mais limité)
+  if [ ! -s "$tmp" ]; then
+    find "$TR_DIR" -maxdepth 4 -type f -name '*.js' 2>/dev/null | head -n 300 >"$tmp" || true
+  fi
+
+  bestf=""; bests="-1"
+  while IFS= read -r f; do
+    [ -f "$f" ] || continue
+    # ignore obvious frontend bundles
+    echo "$f" | grep -Eq '/(node_modules|dist/assets|build/static)/' && continue
+    local sc; sc="$(score_file "$f")"
+    # bonus si chemin backend
+    echo "$f" | grep -Eq '/(backend|api|server)/' && sc=$((sc+15))
+    echo "$f" | grep -Eq '/src/' && sc=$((sc+5))
+    if [ "$sc" -gt "$bests" ]; then bests="$sc"; bestf="$f"; fi
+  done <"$tmp"
+  rm -f "$tmp"
+  [ -n "$bestf" ] && [ "$bests" -ge 20 ] && { printf "%s" "$bestf"; return 0; }
+  return 1
+}
+
+detect_entry_pkg(){
+  [ -f "$TR_DIR/package.json" ] || return 1
+  local main start
+  main="$(json_get "$TR_DIR/package.json" "main")"
+  if [ -n "${main:-}" ] && [ -f "$TR_DIR/$main" ]; then printf "%s" "$TR_DIR/$main"; return 0; fi
+  start="$(json_get "$TR_DIR/package.json" "scripts.start")"
+  if [ -n "${start:-}" ] && echo "$start" | grep -Eq '\bnode\b'; then
+    # extrait "node path.js"
+    local rel
+    rel="$(echo "$start" | sed -nE 's/.*\bnode\b[[:space:]]+([^[:space:]]+).*/\1/p' | head -n1 | tr -d '"'\''')"
+    [ -n "${rel:-}" ] && [ -f "$TR_DIR/$rel" ] && { printf "%s" "$TR_DIR/$rel"; return 0; }
+  fi
+  return 1
+}
+
+say "=== BATCH FLY (read-only) ==="
+say "whoami: $(whoami)  host: $(hostname)  date: $(date -u +%FT%TZ)"
+need nginx; need awk; need sed; need grep; need curl; need systemctl; need node
+
+[ -d "$TR_DIR" ] || { say "ERREUR: dossier TraderOne absent: $TR_DIR"; exit 1; }
+[ -f "$NGX_SITE" ] || { say "ERREUR: nginx site absent: $NGX_SITE"; exit 1; }
+
+say "TraderOne dir: $TR_DIR"
+ls -la "$TR_DIR" | head -n 40 || true
+
+PORT="$(detect_port)"
+say "PORT détecté/choisi: $PORT"
+
+ENTRY=""
+ENTRY_MODE="file"
+if ENTRY="$(detect_entry_pkg)"; then :; else
+  if ENTRY="$(detect_entry_file)"; then :; else ENTRY=""; fi
+fi
+
+if [ -z "${ENTRY:-}" ]; then
+  say "ERREUR: impossible de détecter l'entry backend."
+  say "Debug rapide (fichiers candidats):"
+  find "$TR_DIR" -maxdepth 4 -type f -name '*.js' 2>/dev/null | head -n 80 || true
+  say "Si TraderOne est un backend Node, il doit avoir un point d'entrée (ex: server.js) ou package.json scripts.start."
+  exit 1
+fi
+
+say "Entry backend détectée: $ENTRY"
+say "Nginx marker présent? $(grep -q "$MARK" "$NGX_SITE" && echo yes || echo no)"
+say "Ce script va:"
+say "- créer/mettre à jour $UNIT (backend TraderOne en localhost:$PORT)"
+say "- créer/mettre à jour snippet nginx: $SNIP"
+say "- patcher $NGX_SITE pour inclure le snippet (si absent)"
+say "- nginx -t + reload + systemd restart TraderOne"
+if ! askorupdate_yesno "Continuer ?"; then say "Stop."; exit 0; fi
+
+say "=== MEGA BATCH (apply) ==="
+
+# systemd unit
+UNIT_CONTENT="[Unit]
+Description=TraderOne Backend (localhost)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=$TR_DIR
+Environment=NODE_ENV=production
+Environment=HOST=127.0.0.1
+Environment=PORT=$PORT
+ExecStart=/usr/bin/node $ENTRY
+Restart=always
+RestartSec=2
+User=root
+
+[Install]
+WantedBy=multi-user.target
+"
+askorupdate_file "/etc/systemd/system/$UNIT" "$UNIT_CONTENT"
+systemctl daemon-reload
+systemctl enable "$UNIT" >/dev/null 2>&1 || true
+systemctl restart "$UNIT"
+
+# nginx snippet proxy
+SNIP_CONTENT="# $MARK
+location ^~ /wolverine/traderone/api/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+  proxy_set_header Upgrade \$http_upgrade;
+  proxy_set_header Connection \"upgrade\";
+  proxy_read_timeout 120s;
+  proxy_send_timeout 120s;
+  proxy_pass http://127.0.0.1:$PORT/;
+}
+"
+askorupdate_file "$SNIP" "$SNIP_CONTENT"
+
+# include snippet in site config (idempotent)
+if ! grep -q "$MARK" "$NGX_SITE"; then
+  cp -a "$NGX_SITE" "$NGX_SITE.bak.$(date +%s)"
+  awk -v snip="$SNIP" -v mark="$MARK" '
+    BEGIN{inserver=0;done=0}
+    {
+      line=$0
+      if(line ~ /^[ \t]*server[ \t]*\{/ && !inserver){inserver=1}
+      if(inserver && !done && line ~ /^[ \t]*\}/){
+        print "    include " snip "; # " mark
+        done=1
+      }
+      print line
+      if(inserver && line ~ /^[ \t]*\}/){inserver=0}
+    }
+  ' "$NGX_SITE" >"$NGX_SITE.tmp"
+  mv "$NGX_SITE.tmp" "$NGX_SITE"
+fi
+
+nginx -t
+systemctl reload nginx
+
+say "=== TESTS ==="
+say "Backend local:"
+curl -sS --max-time 5 "http://127.0.0.1:$PORT/" | head -c 160 || true
+echo
+say "Proxy HTTPS:"
+curl -ksS --max-time 6 "https://fireinners.online/wolverine/traderone/api/" | head -c 160 || true
+echo
+say "Unit status:"
+systemctl --no-pager -l status "$UNIT" | sed -n '1,26p' || true
+say "DONE."
+SH
+chmod +x /tmp/WOLVERINE_TRADERONE_BACKEND_PROXY_SMART.sh
+bash /tmp/WOLVERINE_TRADERONE_BACKEND_PROXY_SMART.sh
