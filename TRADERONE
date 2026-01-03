@@ -1,46 +1,66 @@
-cat >/tmp/WOLVERINE_FIX_SERVERJS_API_AND_REWRITE.sh <<'SH'
-#!/usr/bin/env bash
-set -euo pipefail
+cat >/tmp/WOLVERINE_PATCH_SERVERJS_SAFE.js <<'JS'
+const fs = require("fs");
 
-SVC="traderone.service"
-FILE="/opt/traderone-opt/server.js"
-TS="$(date +%s)"
+const FILE = "/opt/traderone-opt/server.js";
+let s = fs.readFileSync(FILE, "utf8");
+
+const bak = FILE + ".bak." + Date.now();
+fs.copyFileSync(FILE, bak);
+console.log("Backup:", bak);
+
+// 1) Rewrite interne: /wolverine/traderone/api/* -> /api/*
+if (!s.includes("WOLVERINE_REWRITE_BEGIN")) {
+  const block =
+`\n// WOLVERINE_REWRITE_BEGIN
+app.use("/wolverine/traderone/api", (req, res, next) => {
+  // ici req.url = "/balances2?wallet=..." => on préfixe /api
+  req.url = "/api" + req.url;
+  next();
+});
+// WOLVERINE_REWRITE_END\n`;
+
+  // inject après express.json si possible, sinon après const app = express()
+  const idxJson = s.search(/app\.use\(\s*express\.json\([^;]*\)\s*\)\s*;\s*/m);
+  if (idxJson !== -1) {
+    const m = s.match(/app\.use\(\s*express\.json\([^;]*\)\s*\)\s*;\s*/m)[0];
+    s = s.replace(m, m + block);
+    console.log("Injected rewrite after express.json()");
+  } else {
+    const idxApp = s.search(/const\s+app\s*=\s*express\(\)\s*;/m);
+    if (idxApp !== -1) {
+      const m2 = s.match(/const\s+app\s*=\s*express\(\)\s*;/m)[0];
+      s = s.replace(m2, m2 + block);
+      console.log("Injected rewrite after const app = express()");
+    } else {
+      throw new Error("Impossible de trouver express.json() ou const app=express()");
+    }
+  }
+} else {
+  console.log("Rewrite block already present -> skip");
+}
+
+// 2) Fix catch-all: app.get('*', ...) ne doit PAS capturer /api/*
+if (s.includes("app.get('*'")) {
+  // on remplace uniquement la version app.get('*', ...
+  s = s.replace(/app\.get\(\s*'\*'\s*,/g, "app.get(/^\\/(?!api\\/).*/,");
+  console.log("Patched app.get('*', ...) -> regex excludes /api/");
+} else {
+  console.log("No app.get('*', ...) found (maybe already changed) -> skip");
+}
+
+fs.writeFileSync(FILE, s, "utf8");
+console.log("Patched:", FILE);
+JS
+
+node /tmp/WOLVERINE_PATCH_SERVERJS_SAFE.js
+
+systemctl restart traderone.service
+systemctl status traderone.service --no-pager -l | sed -n '1,25p'
+
 WALLET="2uHgvSM6vrm7Ye7ntMFUA1RHiqAinGjeCx17dozsLx1z"
 
-echo "== 1) Backup =="
-cp -a "$FILE" "$FILE.bak.$TS"
+echo "== TEST A (doit etre JSON) /api/balances2 =="
+curl -sS -D- "http://127.0.0.1:8585/api/balances2?wallet=$WALLET" | head -c 260; echo; echo
 
-echo "== 2) Patch catch-all '*' pour NE PAS capturer /api/* =="
-# remplace: app.get('*', ... )  ->  app.get(/^\/(?!api\/).*/, ... )
-# (ça laisse passer /api/... vers les vraies routes)
-perl -0777 -i -pe 's/app\.get\(\s*'\''\*'\''\s*,/app.get(/^\\\/(?!api\\\/).*/,/g' "$FILE"
-
-echo "== 3) Ajoute rewrite interne: /wolverine/traderone/api/* -> /api/* (si absent) =="
-if ! grep -q "WOLVERINE_REWRITE_BEGIN" "$FILE"; then
-  # inject juste après express.json (ou sinon après la 1ère ligne "const app = express()")
-  perl -0777 -i -pe 's/(app\.use\(\s*express\.json\([^;]*\)\s*\);\s*)/\1\n\/\/ WOLVERINE_REWRITE_BEGIN\napp.use(\"\/wolverine\/traderone\/api\", (req, res, next) => {\n  \/\/ quand on est monté ici, req.url = \"\/balances2?...\" -> on préfixe \/api\n  req.url = \"\/api\" + req.url;\n  next();\n});\n\/\/ WOLVERINE_REWRITE_END\n\n/s' "$FILE" || true
-
-  # fallback si express.json non trouvé
-  if ! grep -q "WOLVERINE_REWRITE_BEGIN" "$FILE"; then
-    perl -0777 -i -pe 's/(const\s+app\s*=\s*express\(\)\s*;\s*)/\1\n\/\/ WOLVERINE_REWRITE_BEGIN\napp.use(\"\/wolverine\/traderone\/api\", (req, res, next) => {\n  req.url = \"\/api\" + req.url;\n  next();\n});\n\/\/ WOLVERINE_REWRITE_END\n\n/s' "$FILE"
-  fi
-fi
-
-echo "== 4) Restart service =="
-systemctl restart "$SVC"
-systemctl status "$SVC" --no-pager -l | sed -n '1,25p'
-echo
-
-echo "== 5) Tests (doivent commencer par { ) =="
-echo "--- (A) /api/balances2 (JSON attendu)"
-curl -sS -D- "http://127.0.0.1:8585/api/balances2?wallet=$WALLET" | head -c 260 || true
-echo -e "\n"
-
-echo "--- (B) /wolverine/traderone/api/balances2 (JSON attendu)"
-curl -sS -D- "http://127.0.0.1:8585/wolverine/traderone/api/balances2?wallet=$WALLET" | head -c 260 || true
-echo -e "\n"
-
-echo "DONE ✅"
-SH
-
-bash /tmp/WOLVERINE_FIX_SERVERJS_API_AND_REWRITE.sh
+echo "== TEST B (doit etre JSON) /wolverine/traderone/api/balances2 =="
+curl -sS -D- "http://127.0.0.1:8585/wolverine/traderone/api/balances2?wallet=$WALLET" | head -c 260; echo
