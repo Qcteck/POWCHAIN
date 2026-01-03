@@ -1,155 +1,61 @@
-cat >/tmp/MEGA_PATCH_WOLVERINE_START.sh <<'BASH'
+cat >/tmp/MEGA_WOLVERINE_FRONT_FIX.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
-TS="$(date +%Y%m%d_%H%M%S)"
-log(){ echo "[$(date -u +'%F %T UTC')] $*"; }
 
 FRONT_DIR="/opt/fireinners/frontend-react/app/dist/wolverine"
-NG_FILES=()
+FRONT_FILE="$FRONT_DIR/index.html"
+ASK="/opt/fireinners/sentinel/lib/askorupdate.sh"
 
-log "PRE-FLY: locate nginx location for /wolverine/api"
-while IFS= read -r f; do NG_FILES+=("$f"); done < <(grep -RIl --include='*' -e "/wolverine/api" /etc/nginx 2>/dev/null || true)
-if [ "${#NG_FILES[@]}" -eq 0 ]; then
-  log "ERR: cannot find nginx config containing /wolverine/api in /etc/nginx"
-  exit 1
-fi
-NG_FILE="${NG_FILES[0]}"
-log "nginx file: $NG_FILE"
+say(){ printf '%s\n' "$*"; }
 
-PROXY_PASS="$(awk '
-  BEGIN{inloc=0}
-  /location[^{]*\/wolverine\/api/ {inloc=1}
-  inloc && /proxy_pass[ \t]+/ {print; exit}
-  inloc && /}/ {inloc=0}
-' "$NG_FILE" | sed -E 's/.*proxy_pass[ \t]+([^;]+);.*/\1/' | tr -d '\r' )"
-
-if [ -z "${PROXY_PASS:-}" ]; then
-  log "ERR: proxy_pass not found inside the /wolverine/api location in $NG_FILE"
-  log "Hint: your location block might be in an included file. Grep showed this file first; try searching other hits:"
-  printf '%s\n' "${NG_FILES[@]}" | sed 's/^/ - /'
-  exit 1
-fi
-
-log "proxy_pass: $PROXY_PASS"
-
-PORT="$(echo "$PROXY_PASS" | sed -nE 's#^http://(127\.0\.0\.1|localhost):([0-9]+).*#\2#p')"
-if [ -z "${PORT:-}" ]; then
-  log "ERR: proxy_pass is not http://127.0.0.1:PORT or http://localhost:PORT (got: $PROXY_PASS)"
-  exit 1
-fi
-log "upstream port: $PORT"
-
-PID="$(ss -ltnp 2>/dev/null | grep -E "LISTEN.+:$PORT\b" | grep -oE 'pid=[0-9]+' | head -n1 | cut -d= -f2 || true)"
-if [ -z "${PID:-}" ]; then
-  log "ERR: cannot find a listening PID on port $PORT"
-  ss -ltnp | grep -E ":$PORT\b" || true
-  exit 1
-fi
-log "node pid: $PID"
-
-UNIT="$(ps -p "$PID" -o unit= 2>/dev/null | tr -d ' ' || true)"
-if [ -n "$UNIT" ]; then log "systemd unit: $UNIT"; else log "systemd unit: (not found via ps)"; fi
-
-CMDLINE="$(tr '\0' ' ' < "/proc/$PID/cmdline" || true)"
-log "cmdline: $CMDLINE"
-
-JSFILE="$(echo "$CMDLINE" | tr ' ' '\n' | grep -E '\.js$' | head -n1 || true)"
-if [ -z "${JSFILE:-}" ]; then
-  log "ERR: cannot detect .js entrypoint from cmdline"
-  exit 1
-fi
-if [ ! -f "$JSFILE" ]; then
-  log "ERR: detected js file does not exist: $JSFILE"
-  exit 1
-fi
-log "entry js: $JSFILE"
-
-if grep -q "WOLVERINE_COMPAT_ROUTES" "$JSFILE"; then
-  log "OK: patch marker already present (no change)."
+# --- askorupdate fallback (si le module n'est pas là) ---
+if [ -f "$ASK" ]; then
+  # shellcheck disable=SC1090
+  source "$ASK"
 else
-  log "BACKUP: $JSFILE -> ${JSFILE}.bak_$TS"
-  cp -a "$JSFILE" "${JSFILE}.bak_$TS"
-
-  PATCH_BLOCK="$(cat <<'JS'
-/* WOLVERINE_COMPAT_ROUTES (auto) */
-(()=>{try{
-  const __g=globalThis;
-  __g.__WOLV_STATE__=__g.__WOLV_STATE__||{loop:false,last:null,lastTs:0,fails:0,startedAt:0,stoppedAt:0};
-  const st=__g.__WOLV_STATE__;
-  const setLast=(o)=>{st.last=o;st.lastTs=Date.now();};
-  const j=(res,obj)=>{try{res.set&&res.set('cache-control','no-store');}catch(_){};res.json?res.json(obj):res.end(JSON.stringify(obj));};
-  const hPing=(req,res)=>{try{res.type&&res.type('text/plain');}catch(_){};res.send?res.send('pong'):res.end('pong');};
-  const hStatus=(req,res)=>j(res,{ok:true,loop:!!st.loop,last:st.last||null,ts:Date.now(),fails:st.fails||0});
-  const hStart=(req,res)=>{st.loop=true;st.startedAt=Date.now();setLast({event:'start',body:req.body||null,ip:req.ip||null,ua:(req.headers&&req.headers['user-agent'])||null});j(res,{ok:true,started:true,ts:Date.now()});};
-  const hStop =(req,res)=>{st.loop=false;st.stoppedAt=Date.now();setLast({event:'stop', body:req.body||null,ip:req.ip||null});j(res,{ok:true,stopped:true,ts:Date.now()});};
-
-  const starts=['/start','/api/start','/wolverine/api/start','/wolverine/start'];
-  const stops =['/stop','/api/stop','/wolverine/api/stop','/wolverine/stop'];
-  const pings =['/ping','/api/ping','/wolverine/api/ping','/wolverine/ping'];
-  const stats =['/status','/api/status','/wolverine/api/status','/wolverine/status'];
-
-  if(typeof app!=='undefined' && app && app.get && app.post){
-    const reg=(m,arr,fn)=>arr.forEach(p=>{try{(m==='GET'?app.get:app.post).call(app,p,fn);}catch(_){}});
-
-    reg('GET',pings,hPing);
-    reg('GET',stats,hStatus);
-
-    reg('POST',starts,hStart);
-    reg('POST',stops,hStop);
-
-    // helpful 405s if someone GETs start/stop
-    starts.forEach(p=>{try{app.get(p,(req,res)=>j(res,{ok:false,error:'POST required',path:p}));}catch(_){}}); 
-    stops.forEach(p=>{try{app.get(p,(req,res)=>j(res,{ok:false,error:'POST required',path:p}));}catch(_){}}); 
+  askorupdate_file(){
+    local src="$1" dst="$2"
+    install -d "$(dirname "$dst")"
+    [ -f "$dst" ] && cp -a "$dst" "$dst.bak.$(date +%Y%m%d_%H%M%S)" || true
+    cp -a "$src" "$dst"
   }
-}catch(e){try{console.error('WOLVERINE_COMPAT_ROUTES error',e);}catch(_){}}})();
-JS
-)"
-
-  TMP="$(mktemp)"
-  awk -v INS="$PATCH_BLOCK" '
-    BEGIN{inserted=0}
-    /WOLVERINE_COMPAT_ROUTES/ {print; inserted=1; next}
-    # insert right before app.listen / server.listen / createServer.listen
-    (!inserted && ($0 ~ /app\.listen\(/ || $0 ~ /server\.listen\(/ || $0 ~ /createServer\(/)) { print INS; inserted=1 }
-    {print}
-    END{ if(!inserted){ print INS } }
-  ' "$JSFILE" > "$TMP"
-  mv "$TMP" "$JSFILE"
-  log "PATCHED: injected compat routes into $JSFILE"
 fi
 
-if [ -n "${UNIT:-}" ] && systemctl list-units --type=service --all | grep -qF "$UNIT"; then
-  log "RESTART: $UNIT"
-  systemctl restart "$UNIT"
-else
-  # fallback: try to find a service that uses this js file
-  CAND="$(systemctl list-units --type=service --all --no-pager | awk '{print $1}' | grep -E '\.service$' | xargs -r -n1 systemctl cat 2>/dev/null | awk -v js="$JSFILE" '
-    $0 ~ /^# \/etc\/systemd\/system\/.*\.service/ {svc=$2}
-    $0 ~ js {print svc; exit}
-  ' || true)"
-  if [ -n "${CAND:-}" ]; then
-    log "RESTART (fallback detected): $CAND"
-    systemctl restart "$CAND"
-  else
-    log "WARN: could not reliably detect systemd unit to restart. Patch is on disk but process may still run old code."
-    log "If needed: reboot service manually or tell me the unit name."
-  fi
-fi
+say "=== BATCH FLY (read-only) ==="
+say "[1] Host: $(hostname)  Date: $(date -u +'%F %T UTC')"
+say "[2] Front dir: $FRONT_DIR"
+[ -d "$FRONT_DIR" ] && say "    OK: dir exists" || say "    NOTE: dir missing (will create)"
+say "[3] Nginx test:"
+nginx -t >/dev/null && say "    OK: nginx -t" || { say "    FAIL: nginx -t"; exit 1; }
 
-log "TESTS (public via nginx)"
-set +e
-echo "--- ping"
-curl -sS https://fireinners.online/wolverine/api/ping ; echo
-echo "--- status"
-curl -sS https://fireinners.online/wolverine/api/status ; echo
-echo "--- start"
-curl -sS -X POST https://fireinners.online/wolverine/api/start -H "content-type: application/json" --data '{"budget":1,"mode":"test","phantomPubkey":"TEST"}' ; echo
-echo "--- status(after)"
-curl -sS https://fireinners.online/wolverine/api/status ; echo
-set -e
+say "[4] Public checks:"
+curl -sS -m 5 -I "https://fireinners.online/wolverine/" | head -n 5 || true
+curl -sS -m 5 "https://fireinners.online/wolverine/api/ping" | head -n 2 || true
 
-log "DONE"
-log "Open: https://fireinners.online/wolverine/"
-BASH
-chmod +x /tmp/MEGA_PATCH_WOLVERINE_START.sh
-bash /tmp/MEGA_PATCH_WOLVERINE_START.sh
+say "=== MEGA PATCH: write FRONT ==="
+install -d "$FRONT_DIR"
+
+TMP="$(mktemp)"
+cat >"$TMP" <<'HTML'
+<!doctype html><html lang="fr"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>WOLVERINE</title><style>:root{--bg:#061027;--p:#0a1b3e;--p2:#0a2a66;--b:#1e4ea8;--t:#e8f2ff;--m:#9fb7e6;--ok:#86ffd0;--bad:#ff7b7b}*{box-sizing:border-box}html,body{height:100%;margin:0;background:radial-gradient(1100px 600px at 20% 0%,#0a2a66 0%,transparent 60%),radial-gradient(900px 500px at 80% 25%,#0c1f4b 0%,transparent 55%),var(--bg);color:var(--t);font:14px system-ui,-apple-system,Segoe UI,Roboto}#wrap{max-width:1200px;margin:18px auto;padding:0 14px}#top{display:flex;align-items:center;gap:12px;padding:14px 16px;border-radius:16px;background:linear-gradient(180deg,rgba(26,140,255,.22),rgba(10,27,62,.55));border:1px solid rgba(180,210,255,.18);box-shadow:0 12px 40px rgba(0,0,0,.25)}#badge{width:36px;height:36px;border-radius:10px;background:linear-gradient(180deg,#1a7cff,#0a2a66)}#title{font-weight:800;letter-spacing:.6px}#sub{color:var(--m);font-size:12px;margin-top:2px}#topBtns{margin-left:auto;display:flex;gap:8px;flex-wrap:wrap}.pill{padding:8px 10px;border-radius:999px;background:rgba(10,27,62,.55);border:1px solid rgba(180,210,255,.18);color:var(--t);cursor:pointer;user-select:none}button.pill{outline:none}button.pill:disabled{opacity:.5;cursor:not-allowed}.pill.ok{border-color:rgba(134,255,208,.35)}.pill.bad{border-color:rgba(255,123,123,.35)}#grid{display:grid;grid-template-columns:1.1fr .9fr;gap:12px;margin-top:12px}#panelL,#panelR{border-radius:16px;background:linear-gradient(180deg,rgba(10,27,62,.78),rgba(10,27,62,.48));border:1px solid rgba(180,210,255,.16);box-shadow:0 12px 40px rgba(0,0,0,.22)}#panelL{padding:14px}#panelR{padding:0}h3{margin:0 0 10px 0;font-size:14px;letter-spacing:.4px}label{display:block;color:var(--m);font-size:12px;margin:10px 0 6px}.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}.row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px}.box{background:rgba(0,0,0,.14);border:1px solid rgba(180,210,255,.16);border-radius:12px;padding:10px;min-height:40px}input,select{width:100%;padding:10px 12px;border-radius:12px;border:1px solid rgba(180,210,255,.18);background:rgba(0,0,0,.12);color:var(--t);outline:none}input::placeholder{color:rgba(232,242,255,.45)}#warn{margin-top:10px;color:#cfe1ff;background:rgba(0,0,0,.14);border:1px solid rgba(180,210,255,.16);border-radius:12px;padding:10px;font-size:12px;line-height:1.35}#console{height:560px;overflow:auto;padding:14px 14px 40px 14px}pre{margin:0;white-space:pre-wrap;word-break:break-word;color:#eaf3ff}#foot{position:sticky;bottom:0;background:linear-gradient(180deg,transparent,rgba(6,16,39,.95));padding:10px 14px;border-top:1px solid rgba(180,210,255,.12);display:flex;gap:14px;align-items:center;color:var(--m);font-size:12px}#dot{width:8px;height:8px;border-radius:50%;background:var(--bad);box-shadow:0 0 12px rgba(255,123,123,.55)}@media(max-width:980px){#grid{grid-template-columns:1fr}#console{height:420px}}</style></head><body><div id="wrap"><div id="top"><div id="badge"></div><div><div id="title">WOLVERINE</div><div id="sub">TraderOne • API • Refresh adaptatif • Monitoring TG</div></div><div id="topBtns"><button class="pill" id="bApi">API</button><button class="pill" id="bPing">Ping</button><button class="pill" id="bRefresh">Refresh</button><button class="pill ok" id="bStart">Start</button><button class="pill bad" id="bStop">Stop</button></div></div><div id="grid"><div id="panelL"><h3>Control</h3><div class="row"><div><label>Wallet (Phantom)</label><div class="row"><button class="pill" id="bConnect">Connect</button><button class="pill" id="bDisconnect">Disconnect</button></div></div><div><label>Adresse Phantom</label><input id="addr" placeholder="-" readonly/></div></div><div class="row3" style="margin-top:10px"><div><label>SOL</label><div class="box" id="sol">-</div></div><div><label>USDC</label><div class="box" id="usdc">-</div></div><div><label>Custody (TraderOne)</label><div class="box" id="cust">-</div></div></div><div class="row" style="margin-top:10px"><div><label>Budget (USDC)</label><input id="budget" inputmode="decimal" placeholder="ex: 50" value="1"/></div><div><label>Mode</label><select id="mode"><option value="microcap">Microcap radar (risk)</option><option value="dca">DCA buy SOL (safe)</option></select></div></div><div class="row" style="margin-top:10px"><div><label>Mint (si Manual token)</label><input id="mint" placeholder="SPL mint (solana)"/></div><div><label>Auto refresh</label><select id="autoref"><option value="on">ON</option><option value="off">OFF</option></select></div></div><div id="warn">Important: si tu actives le mode custodial côté backend, l’API utilisera la clé du serveur. Le frontend ici n’envoie pas de clé privée par défaut. Dépôt: envoie SOL/USDC vers l’adresse “Custody” affichée (si dispo).</div></div><div id="panelR"><div id="console"><pre id="log"></pre></div><div id="foot"><span id="dot"></span><span id="apiState">API: ?</span><span id="last">Dernier refresh: -</span><span id="errs">Erreurs: 0</span><span id="lat">Latence: -</span></div></div></div></div><script>(function(){try{if(!globalThis.global)globalThis.global=globalThis;if(!globalThis.process)globalThis.process={env:{}};if(!globalThis.Buffer)globalThis.Buffer={};}catch(e){}})();</script><script src="https://unpkg.com/buffer@6.0.3/index.min.js"></script><script>(function(){try{if(globalThis.buffer&&globalThis.buffer.Buffer)globalThis.Buffer=globalThis.buffer.Buffer; if(typeof globalThis.Buffer==="undefined")globalThis.Buffer={};}catch(e){if(!globalThis.Buffer)globalThis.Buffer={};}})();</script><script src="https://unpkg.com/@solana/web3.js@1.98.0/lib/index.iife.min.js"></script><script>(function(){window.__WOLV__=window.__WOLV__||{};window.__WOLV__.S=window.__WOLV__.S||{fails:0,last:null,loop:false,ok:null,ts:0,err:null,code:null,body:null,started:false};})();</script><script>(function(){const $=s=>document.querySelector(s),logEl=$("#log"),dot=$("#dot"),apiState=$("#apiState"),last=$("#last"),errs=$("#errs"),lat=$("#lat"),solEl=$("#sol"),usdcEl=$("#usdc"),custEl=$("#cust"),addrEl=$("#addr"),bApi=$("#bApi"),bPing=$("#bPing"),bRefresh=$("#bRefresh"),bStart=$("#bStart"),bStop=$("#bStop"),bConnect=$("#bConnect"),bDisconnect=$("#bDisconnect"),budgetEl=$("#budget"),modeEl=$("#mode"),mintEl=$("#mint"),autorefEl=$("#autoref");const RPC="https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac",USDC="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1",TOKENPROG="TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";const API_BASE=(()=>{try{let u=new URL("./api/",location.href);return u.toString().replace(/\/$/,"");}catch(e){return location.origin+"/wolverine/api";}})();let provider=null,phantomPub=null,conn=null;const T=()=>new Date().toISOString().replace("T"," ").replace("Z"," UTC");const j=(o)=>{try{return JSON.stringify(o)}catch(e){return String(o)}};const push=(s)=>{logEl.textContent+=s+"\n";logEl.parentElement.scrollTop=logEl.parentElement.scrollHeight};const setAPI=(ok,ms)=>{apiState.textContent="API: "+(ok?"pong":"off");dot.style.background=ok?"var(--ok)":"var(--bad)";lat.textContent="Latence: "+(ms!=null?ms+"ms":"-")};const setErrs=(n)=>{errs.textContent="Erreurs: "+n};const setLast=()=>{last.textContent="Dernier refresh: "+T()};const sleep=(ms)=>new Promise(r=>setTimeout(r,ms));async function apiFetch(path,opt={},timeoutMs=8000){const ac=new AbortController();const t=setTimeout(()=>ac.abort("timeout"),timeoutMs);const t0=performance.now();try{const r=await fetch(API_BASE+path,{...opt,signal:ac.signal,headers:{...(opt.headers||{}),...(opt.body?{"content-type":"application/json"}:{})}});const ms=Math.round(performance.now()-t0);clearTimeout(t);return {ok:r.ok,status:r.status,ms,txt:await r.text()};}catch(e){clearTimeout(t);return {ok:false,status:0,ms:null,txt:String(e&&e.message||e)}}}async function ping(){const r=await apiFetch("/ping",{method:"GET"},5000);push("["+T()+"] ping: "+(r.ok?r.txt.trim():"ERR "+r.txt));setAPI(r.ok,r.ms);return r.ok}async function status(){const r=await apiFetch("/status",{method:"GET"},8000);let out=r.txt;try{out=j(JSON.parse(r.txt))}catch(e){}push("["+T()+"] status:\n"+out);return r}async function start(){if(!phantomPub){push("["+T()+"] start: Phantom non connecté");window.__WOLV__.S.fails++;setErrs(window.__WOLV__.S.fails);return}const budget=Math.max(0,Number(budgetEl.value||0));const mode=modeEl.value||"microcap";const mint=(mintEl.value||"").trim();const body={budgetUSDC:budget,mode,mint,phantomPubKey:phantomPub,autoRefresh:(autorefEl.value==="on")};const r=await apiFetch("/start",{method:"POST",body:JSON.stringify(body)},12000);let out=r.txt;try{out=j(JSON.parse(r.txt))}catch(e){}push("["+T()+"] start:\n"+out);if(!r.ok){window.__WOLV__.S.fails++;setErrs(window.__WOLV__.S.fails)}return r}async function stop(){const r=await apiFetch("/stop",{method:"POST",body:JSON.stringify({phantomPubKey:phantomPub||null})},12000);push("["+T()+"] stop: "+(r.ok?r.txt.trim():"ERR "+r.txt));if(!r.ok){window.__WOLV__.S.fails++;setErrs(window.__WOLV__.S.fails)}return r}function fmt(n,dec=4){if(!isFinite(n))return "-";return Number(n).toFixed(dec).replace(/\.?0+$/,"")}async function refreshBalances(){if(!phantomPub){solEl.textContent="-";usdcEl.textContent="-";return}try{conn=conn||new solanaWeb3.Connection(RPC,{commitment:"confirmed"});const pk=new solanaWeb3.PublicKey(phantomPub);const lam=await conn.getBalance(pk);const sol=lam/1e9;let usdc=0;const accts=await conn.getParsedTokenAccountsByOwner(pk,{programId:new solanaWeb3.PublicKey(TOKENPROG)});for(const a of accts.value){const info=a.account.data.parsed.info; if(info&&info.mint===USDC){const amt=info.tokenAmount&&("uiAmountString"in info.tokenAmount?Number(info.tokenAmount.uiAmountString):Number(info.tokenAmount.uiAmount||0)); usdc+=isFinite(amt)?amt:0;}}solEl.textContent=fmt(sol,4);usdcEl.textContent=fmt(usdc,2);}catch(e){push("["+T()+"] balances error: "+String(e&&e.message||e));}}function detectProvider(){provider=(window.solana&&window.solana.isPhantom)?window.solana:null;bConnect.disabled=!provider;bDisconnect.disabled=!provider;bStart.disabled=!provider; if(!provider)push("["+T()+"] Phantom non détecté (desktop/iOS: ouvrir dans Phantom)")}async function connect(){detectProvider();if(!provider)return;try{const res=await provider.connect({onlyIfTrusted:false});phantomPub=(res&&res.publicKey&&res.publicKey.toString)?res.publicKey.toString():(provider.publicKey?provider.publicKey.toString():null);addrEl.value=phantomPub||"-";push("["+T()+"] Phantom connecté");bStart.disabled=!phantomPub;await refreshBalances();}catch(e){push("["+T()+"] Phantom connect error: "+String(e&&e.message||e));}}async function disconnect(){if(!provider)return;try{await provider.disconnect();}catch(e){}phantomPub=null;addrEl.value="-";solEl.textContent="-";usdcEl.textContent="-";push("["+T()+"] Phantom déconnecté");bStart.disabled=true;}async function doRefresh(){const ok=await ping();await status();if(ok)await refreshBalances();setLast();}let timer=null;function setAuto(on){if(timer){clearInterval(timer);timer=null}if(on){timer=setInterval(()=>{doRefresh().catch(()=>{})},20000)}}bApi.onclick=()=>push("["+T()+"] api: "+API_BASE);bPing.onclick=()=>ping();bRefresh.onclick=()=>doRefresh();bStart.onclick=()=>start();bStop.onclick=()=>stop();bConnect.onclick=()=>connect();bDisconnect.onclick=()=>disconnect();autorefEl.onchange=()=>setAuto(autorefEl.value==="on");window.addEventListener("load",async()=>{push("["+T()+"] front ready");detectProvider();bStart.disabled=true;await doRefresh();setAuto(autorefEl.value==="on")});window.addEventListener("focus",()=>{detectProvider();});})();
+</script></body></html>
+HTML
+
+askorupdate_file "$TMP" "$FRONT_FILE"
+rm -f "$TMP"
+
+say "[OK] Front updated: $FRONT_FILE"
+say "=== NGINX TEST/RELOAD ==="
+nginx -t >/dev/null && systemctl reload nginx && say "[OK] nginx reloaded"
+
+say "=== TESTS (public) ==="
+say "-- ping --"
+curl -sS -m 8 "https://fireinners.online/wolverine/api/ping" | head -n 2 || true
+say "-- status --"
+curl -sS -m 8 "https://fireinners.online/wolverine/api/status" | head -n 20 || true
+
+say "=== DONE ==="
+say "Open: https://fireinners.online/wolverine/"
+SH
+
+bash /tmp/MEGA_WOLVERINE_FRONT_FIX.sh
