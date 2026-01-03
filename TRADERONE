@@ -1,1 +1,155 @@
-curl -i -sS -X POST "https://fireinners.online/wolverine/api/start" -H "content-type: application/json" -d '{"budgetUsdc":1,"mode":"DCA_SOL_SAFE","phantomPubkey":"TEST","mint":"","autoRefresh":true}' | head -n 60
+cat >/tmp/MEGA_PATCH_WOLVERINE_START.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+TS="$(date +%Y%m%d_%H%M%S)"
+log(){ echo "[$(date -u +'%F %T UTC')] $*"; }
+
+FRONT_DIR="/opt/fireinners/frontend-react/app/dist/wolverine"
+NG_FILES=()
+
+log "PRE-FLY: locate nginx location for /wolverine/api"
+while IFS= read -r f; do NG_FILES+=("$f"); done < <(grep -RIl --include='*' -e "/wolverine/api" /etc/nginx 2>/dev/null || true)
+if [ "${#NG_FILES[@]}" -eq 0 ]; then
+  log "ERR: cannot find nginx config containing /wolverine/api in /etc/nginx"
+  exit 1
+fi
+NG_FILE="${NG_FILES[0]}"
+log "nginx file: $NG_FILE"
+
+PROXY_PASS="$(awk '
+  BEGIN{inloc=0}
+  /location[^{]*\/wolverine\/api/ {inloc=1}
+  inloc && /proxy_pass[ \t]+/ {print; exit}
+  inloc && /}/ {inloc=0}
+' "$NG_FILE" | sed -E 's/.*proxy_pass[ \t]+([^;]+);.*/\1/' | tr -d '\r' )"
+
+if [ -z "${PROXY_PASS:-}" ]; then
+  log "ERR: proxy_pass not found inside the /wolverine/api location in $NG_FILE"
+  log "Hint: your location block might be in an included file. Grep showed this file first; try searching other hits:"
+  printf '%s\n' "${NG_FILES[@]}" | sed 's/^/ - /'
+  exit 1
+fi
+
+log "proxy_pass: $PROXY_PASS"
+
+PORT="$(echo "$PROXY_PASS" | sed -nE 's#^http://(127\.0\.0\.1|localhost):([0-9]+).*#\2#p')"
+if [ -z "${PORT:-}" ]; then
+  log "ERR: proxy_pass is not http://127.0.0.1:PORT or http://localhost:PORT (got: $PROXY_PASS)"
+  exit 1
+fi
+log "upstream port: $PORT"
+
+PID="$(ss -ltnp 2>/dev/null | grep -E "LISTEN.+:$PORT\b" | grep -oE 'pid=[0-9]+' | head -n1 | cut -d= -f2 || true)"
+if [ -z "${PID:-}" ]; then
+  log "ERR: cannot find a listening PID on port $PORT"
+  ss -ltnp | grep -E ":$PORT\b" || true
+  exit 1
+fi
+log "node pid: $PID"
+
+UNIT="$(ps -p "$PID" -o unit= 2>/dev/null | tr -d ' ' || true)"
+if [ -n "$UNIT" ]; then log "systemd unit: $UNIT"; else log "systemd unit: (not found via ps)"; fi
+
+CMDLINE="$(tr '\0' ' ' < "/proc/$PID/cmdline" || true)"
+log "cmdline: $CMDLINE"
+
+JSFILE="$(echo "$CMDLINE" | tr ' ' '\n' | grep -E '\.js$' | head -n1 || true)"
+if [ -z "${JSFILE:-}" ]; then
+  log "ERR: cannot detect .js entrypoint from cmdline"
+  exit 1
+fi
+if [ ! -f "$JSFILE" ]; then
+  log "ERR: detected js file does not exist: $JSFILE"
+  exit 1
+fi
+log "entry js: $JSFILE"
+
+if grep -q "WOLVERINE_COMPAT_ROUTES" "$JSFILE"; then
+  log "OK: patch marker already present (no change)."
+else
+  log "BACKUP: $JSFILE -> ${JSFILE}.bak_$TS"
+  cp -a "$JSFILE" "${JSFILE}.bak_$TS"
+
+  PATCH_BLOCK="$(cat <<'JS'
+/* WOLVERINE_COMPAT_ROUTES (auto) */
+(()=>{try{
+  const __g=globalThis;
+  __g.__WOLV_STATE__=__g.__WOLV_STATE__||{loop:false,last:null,lastTs:0,fails:0,startedAt:0,stoppedAt:0};
+  const st=__g.__WOLV_STATE__;
+  const setLast=(o)=>{st.last=o;st.lastTs=Date.now();};
+  const j=(res,obj)=>{try{res.set&&res.set('cache-control','no-store');}catch(_){};res.json?res.json(obj):res.end(JSON.stringify(obj));};
+  const hPing=(req,res)=>{try{res.type&&res.type('text/plain');}catch(_){};res.send?res.send('pong'):res.end('pong');};
+  const hStatus=(req,res)=>j(res,{ok:true,loop:!!st.loop,last:st.last||null,ts:Date.now(),fails:st.fails||0});
+  const hStart=(req,res)=>{st.loop=true;st.startedAt=Date.now();setLast({event:'start',body:req.body||null,ip:req.ip||null,ua:(req.headers&&req.headers['user-agent'])||null});j(res,{ok:true,started:true,ts:Date.now()});};
+  const hStop =(req,res)=>{st.loop=false;st.stoppedAt=Date.now();setLast({event:'stop', body:req.body||null,ip:req.ip||null});j(res,{ok:true,stopped:true,ts:Date.now()});};
+
+  const starts=['/start','/api/start','/wolverine/api/start','/wolverine/start'];
+  const stops =['/stop','/api/stop','/wolverine/api/stop','/wolverine/stop'];
+  const pings =['/ping','/api/ping','/wolverine/api/ping','/wolverine/ping'];
+  const stats =['/status','/api/status','/wolverine/api/status','/wolverine/status'];
+
+  if(typeof app!=='undefined' && app && app.get && app.post){
+    const reg=(m,arr,fn)=>arr.forEach(p=>{try{(m==='GET'?app.get:app.post).call(app,p,fn);}catch(_){}});
+
+    reg('GET',pings,hPing);
+    reg('GET',stats,hStatus);
+
+    reg('POST',starts,hStart);
+    reg('POST',stops,hStop);
+
+    // helpful 405s if someone GETs start/stop
+    starts.forEach(p=>{try{app.get(p,(req,res)=>j(res,{ok:false,error:'POST required',path:p}));}catch(_){}}); 
+    stops.forEach(p=>{try{app.get(p,(req,res)=>j(res,{ok:false,error:'POST required',path:p}));}catch(_){}}); 
+  }
+}catch(e){try{console.error('WOLVERINE_COMPAT_ROUTES error',e);}catch(_){}}})();
+JS
+)"
+
+  TMP="$(mktemp)"
+  awk -v INS="$PATCH_BLOCK" '
+    BEGIN{inserted=0}
+    /WOLVERINE_COMPAT_ROUTES/ {print; inserted=1; next}
+    # insert right before app.listen / server.listen / createServer.listen
+    (!inserted && ($0 ~ /app\.listen\(/ || $0 ~ /server\.listen\(/ || $0 ~ /createServer\(/)) { print INS; inserted=1 }
+    {print}
+    END{ if(!inserted){ print INS } }
+  ' "$JSFILE" > "$TMP"
+  mv "$TMP" "$JSFILE"
+  log "PATCHED: injected compat routes into $JSFILE"
+fi
+
+if [ -n "${UNIT:-}" ] && systemctl list-units --type=service --all | grep -qF "$UNIT"; then
+  log "RESTART: $UNIT"
+  systemctl restart "$UNIT"
+else
+  # fallback: try to find a service that uses this js file
+  CAND="$(systemctl list-units --type=service --all --no-pager | awk '{print $1}' | grep -E '\.service$' | xargs -r -n1 systemctl cat 2>/dev/null | awk -v js="$JSFILE" '
+    $0 ~ /^# \/etc\/systemd\/system\/.*\.service/ {svc=$2}
+    $0 ~ js {print svc; exit}
+  ' || true)"
+  if [ -n "${CAND:-}" ]; then
+    log "RESTART (fallback detected): $CAND"
+    systemctl restart "$CAND"
+  else
+    log "WARN: could not reliably detect systemd unit to restart. Patch is on disk but process may still run old code."
+    log "If needed: reboot service manually or tell me the unit name."
+  fi
+fi
+
+log "TESTS (public via nginx)"
+set +e
+echo "--- ping"
+curl -sS https://fireinners.online/wolverine/api/ping ; echo
+echo "--- status"
+curl -sS https://fireinners.online/wolverine/api/status ; echo
+echo "--- start"
+curl -sS -X POST https://fireinners.online/wolverine/api/start -H "content-type: application/json" --data '{"budget":1,"mode":"test","phantomPubkey":"TEST"}' ; echo
+echo "--- status(after)"
+curl -sS https://fireinners.online/wolverine/api/status ; echo
+set -e
+
+log "DONE"
+log "Open: https://fireinners.online/wolverine/"
+BASH
+chmod +x /tmp/MEGA_PATCH_WOLVERINE_START.sh
+bash /tmp/MEGA_PATCH_WOLVERINE_START.sh
