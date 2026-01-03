@@ -1,38 +1,39 @@
-cat >/tmp/WOLVERINE_FIX_NGINX_PROXY_TRADERONE_API.sh <<'SH'
+cat >/tmp/WOLVERINE_NGINX_FORCE_PROXY_TRADERONE_API.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 
 DOMAIN="fireinners.online"
 TS="$(date +%s)"
 
-# essaie de trouver le bon vhost
+echo "== 1) Detect nginx conf file that contains server_name $DOMAIN =="
 CONF="$(nginx -T 2>/dev/null | awk '
-  $0 ~ /server_name/ && $0 ~ /fireinners\.online/ {in=1}
-  in && $0 ~ /include \/etc\/nginx\/sites-enabled\// {gsub(";","",$2); print $2; exit}
-' || true)"
+  BEGIN{file=""}
+  /^# configuration file / {file=$4; sub(":$","",file)}
+  $0 ~ "server_name " && $0 ~ "'"$DOMAIN"'" {print file; exit}
+')"
 
-# fallback classique
-[ -n "${CONF:-}" ] || CONF="/etc/nginx/sites-available/fireinners.online"
-
-echo "Using CONF=$CONF"
+[ -n "${CONF:-}" ] || { echo "ERROR: cannot detect conf for $DOMAIN"; exit 1; }
+echo "CONF=$CONF"
 [ -f "$CONF" ] || { echo "ERROR: conf not found: $CONF"; exit 1; }
 
+echo "== 2) Backup =="
 cp -a "$CONF" "$CONF.bak.$TS"
 
-# Injecte un bloc PROXY bien spécifique dans le server { } du bon domaine
+echo "== 3) Ensure API proxy location exists (and wins) =="
+# Insert the proxy location inside the correct server{} (server_name DOMAIN)
 awk -v domain="$DOMAIN" '
-BEGIN{in_server=0; has_domain=0; inserted=0}
+BEGIN{in_server=0; has_domain=0; done=0}
 {
   line=$0
 
   if ($0 ~ /^[[:space:]]*server[[:space:]]*\{/){ in_server=1; has_domain=0 }
+
   if (in_server && $0 ~ /server_name/ && $0 ~ domain){ has_domain=1 }
 
-  # avant la fin du server{} cible, on injecte si pas déjà présent
-  if (in_server && has_domain && $0 ~ /^[[:space:]]*\}[[:space:]]*$/ && inserted==0){
+  # before closing brace of the target server{}, inject if not already present
+  if (in_server && has_domain && $0 ~ /^[[:space:]]*\}[[:space:]]*$/ && done==0){
     print ""
     print "  # WOLVERINE_TRADERONE_API_BEGIN"
-    print "  # Proxy /wolverine/traderone/api/*  ->  http://127.0.0.1:8585/api/*"
     print "  location ^~ /wolverine/traderone/api/ {"
     print "    proxy_http_version 1.1;"
     print "    proxy_set_header Host $host;"
@@ -43,7 +44,7 @@ BEGIN{in_server=0; has_domain=0; inserted=0}
     print "  }"
     print "  # WOLVERINE_TRADERONE_API_END"
     print ""
-    inserted=1
+    done=1
   }
 
   print line
@@ -52,21 +53,30 @@ BEGIN{in_server=0; has_domain=0; inserted=0}
 }
 ' "$CONF.bak.$TS" > "$CONF"
 
+echo "== 4) If you have regex location ~ ^/wolverine/ , convert to ^~ (recommended) =="
+# This avoids regex taking priority over prefixes
+sed -i 's/location[[:space:]]\+~[[:space:]]\+\^\/wolverine\/[[:space:]]\+{/location ^~ \/wolverine\/ {/g' "$CONF" || true
+
+echo "== 5) nginx test + reload =="
 nginx -t
 systemctl reload nginx
 
 echo
-echo "== TEST: should be JSON (NOT HTML) =="
+echo "== 6) TEST (should be JSON, not HTML) =="
 read -r -p "PHANTOM WALLET = " WALLET
 WALLET="$(echo -n "$WALLET" | tr -d '[:space:]')"
 
-echo "-- headers:"
+echo "-- local backend (must be JSON):"
+curl -sS "http://127.0.0.1:8585/api/balances2?wallet=$WALLET" | head -c 180; echo
+echo
+
+echo "-- via domain (must start with { ):"
 curl -ksSI "https://${DOMAIN}/wolverine/traderone/api/balances2?wallet=$WALLET" | sed -n '1,25p'
 echo
-echo "-- first bytes:"
-curl -ksS "https://${DOMAIN}/wolverine/traderone/api/balances2?wallet=$WALLET" | head -c 120; echo
+curl -ksS "https://${DOMAIN}/wolverine/traderone/api/balances2?wallet=$WALLET" | head -c 180; echo
 echo
+
 echo "DONE ✅"
 SH
 
-bash /tmp/WOLVERINE_FIX_NGINX_PROXY_TRADERONE_API.sh
+bash /tmp/WOLVERINE_NGINX_FORCE_PROXY_TRADERONE_API.sh
