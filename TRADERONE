@@ -1,132 +1,23 @@
-cat >/tmp/FIX_APPJS_SOLANAWEB3_UNDEFINED.sh <<'SH'
-#!/usr/bin/env bash
-set -euo pipefail
+WALLET="2uHq...Lx1z"   # mets le vrai
+echo "== local traderone ==" 
+curl -sS "http://127.0.0.1:8585/api/balances?wallet=$WALLET" ; echo
 
-echo "== 1) Trouver le docroot réel de /wolverine dans nginx =="
-DOCROOT="$(nginx -T 2>/dev/null | awk '
-  $0 ~ /location \^~ \/wolverine\/|location \/wolverine/ {inloc=1}
-  inloc && $1=="root"  {gsub(";","",$2); print $2; exit}
-  inloc && $1=="alias" {gsub(";","",$2); print $2; exit}
-  inloc && $0 ~ /\}/ {inloc=0}
-' || true)"
+echo "== via nginx =="
+curl -ks "https://fireinners.online/wolverine/traderone/api/balances?wallet=$WALLET" ; echo
 
-if [ -z "${DOCROOT:-}" ]; then
-  # fallback si nginx parsing rate: essayer /var/www/wolverine
-  DOCROOT="/var/www/wolverine"
-fi
 
-INDEX="$DOCROOT/index.html"
+
+
+DOCROOT="/var/www/wolverine"
 APPJS="$DOCROOT/app.js"
+cp -a "$APPJS" "$APPJS.bak.$(date +%s)"
 
-echo "DOCROOT=$DOCROOT"
-echo "INDEX=$INDEX"
-echo "APPJS=$APPJS"
-mkdir -p "$DOCROOT"
-echo
+# SOL: 4 -> 6 décimales ; USDC: 2 -> 4 décimales
+sed -i 's/toFixed(4)/toFixed(6)/g; s/toFixed(2)/toFixed(4)/g' "$APPJS"
 
-echo "== 2) Backup =="
-[ -f "$INDEX" ] && cp -a "$INDEX" "$INDEX.bak.$(date +%s)" || true
-[ -f "$APPJS" ] && cp -a "$APPJS" "$APPJS.bak.$(date +%s)" || true
-echo
-
-echo "== 3) Overwrite app.js (ZÉRO solanaWeb3, balances via VPS) =="
-cat >"$APPJS" <<'JS'
-const API_START = "/wolverine/traderone/api/start";
-const API_BALANCES = "/wolverine/traderone/api/balances";
-
-const btnConnect=document.getElementById("btnConnect");
-const btnStart=document.getElementById("btnStart");
-const btnRefresh=document.getElementById("btnRefresh");
-const afterConnect=document.getElementById("afterConnect");
-const walletPill=document.getElementById("walletPill");
-const solBalEl=document.getElementById("solBal");
-const usdcBalEl=document.getElementById("usdcBal");
-const budgetEl=document.getElementById("budget");
-const statusText=document.getElementById("statusText");
-
-let pubkey=null;
-
-function shortPk(pk){ const s=pk.toString(); return s.slice(0,4)+"…"+s.slice(-4); }
-function setStatus(t,cls="muted"){ statusText.className=cls; statusText.textContent=t; }
-function canStart(){ const v=Number(budgetEl.value); return pubkey && Number.isFinite(v) && v>0; }
-
-async function refreshBalances(){
-  if(!pubkey) return;
-  setStatus("Lecture des soldes…");
-  try{
-    const r = await fetch(`${API_BALANCES}?wallet=${encodeURIComponent(pubkey.toString())}`, { cache: "no-store" });
-    const data = await r.json().catch(()=> ({}));
-    if(!r.ok) throw new Error(data?.error || ("HTTP "+r.status));
-    solBalEl.textContent = Number(data.sol ?? 0).toFixed(4);
-    usdcBalEl.textContent = Number(data.usdc ?? 0).toFixed(2);
-    setStatus("OK", "ok");
-  }catch(e){
-    setStatus("Balances error: " + (e?.message || e), "err");
-  }
-}
-
-btnConnect.onclick=async ()=>{
-  if(!window.solana?.isPhantom){
-    setStatus("Phantom non détecté","err");
-    window.open("https://phantom.app/","_blank");
-    return;
-  }
-  try{
-    const r=await window.solana.connect();
-    pubkey=r.publicKey;
-    walletPill.textContent="Wallet: "+shortPk(pubkey);
-    afterConnect.classList.remove("hidden");
-    btnConnect.textContent="Wallet connecté";
-    btnConnect.disabled=true;
-    await refreshBalances();
-    btnStart.disabled=!canStart();
-  }catch(e){
-    setStatus("Connexion refusée: " + (e?.message||e),"err");
-  }
-};
-
-budgetEl.oninput=()=>{ btnStart.disabled=!canStart(); };
-btnRefresh.onclick=refreshBalances;
-
-btnStart.onclick=async ()=>{
-  if(!canStart()) return;
-  const budget=Number(budgetEl.value);
-  setStatus("Démarrage…");
-  btnStart.disabled=true;
-
-  try{
-    const res=await fetch(API_START,{
-      method:"POST",
-      headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({wallet:pubkey.toString(),budget})
-    });
-    const data=await res.json().catch(()=>({}));
-    if(!res.ok){ setStatus(data?.error||"Start failed","err"); btnStart.disabled=false; return; }
-    setStatus("WOLVERINE démarré ✅","ok");
-  }catch(e){
-    setStatus("Erreur API: " + (e?.message||e),"err");
-    btnStart.disabled=false;
-  }
-};
-JS
-chmod 644 "$APPJS"
-echo
-
-echo "== 4) Cache-bust index.html (app.js?v=TIMESTAMP) =="
+# cache-bust
 TS="$(date +%s)"
-if [ -f "$INDEX" ]; then
-  # remplace ou ajoute le v=
-  sed -i -E "s|(app\.js)(\?v=[0-9]+)?|\\1?v=$TS|g" "$INDEX" || true
-fi
+sed -i -E "s|(app\.js)(\?v=[0-9]+)?|\\1?v=$TS|g" "$DOCROOT/index.html" 2>/dev/null || true
 
 nginx -t && systemctl reload nginx
-echo
-
-echo "== 5) PREUVE (live) : app.js ne doit plus contenir solanaWeb3 / mainnet-beta =="
-curl -ks https://fireinners.online/wolverine/app.js | grep -n "solanaWeb3" && echo "BAD" || echo "OK ✅ (no solanaWeb3)"
-curl -ks https://fireinners.online/wolverine/app.js | grep -n "mainnet-beta" && echo "BAD" || echo "OK ✅ (no mainnet-beta)"
-echo
-echo "=> Ouvre /wolverine en NAVIGATION PRIVÉE puis Connect Phantom + Refresh balances."
-SH
-
-bash /tmp/FIX_APPJS_SOLANAWEB3_UNDEFINED.sh
+echo "OK -> ouvre /wolverine en navigation privée"
