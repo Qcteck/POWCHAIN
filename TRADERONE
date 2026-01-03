@@ -1,2 +1,69 @@
+cat >/tmp/FIX_DUP_WOLVERINE_INCLUDE_OR_SNIP.sh <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+ts(){ date +%Y%m%d_%H%M%S; }
+T="$(ts)"
+
+SNIP="/etc/nginx/snippets/fireinners-wolverine.conf"
+
+echo "=== A) Vérifie si le snippet contient 2 locations /wolverine/ ==="
+nl -ba "$SNIP" | sed -n '1,120p'
+echo
+echo "--- locations in snippet ---"
+grep -nE '^\s*location\s+(\^~\s+)?/wolverine/' "$SNIP" || true
+
+echo
+echo "=== B) Trouve TOUS les includes du snippet dans /etc/nginx ==="
+grep -RIn --color=never 'include\s\+/etc/nginx/snippets/fireinners-wolverine\.conf;' /etc/nginx || true
+
+echo
+echo "=== C) Si plusieurs includes: on commente tous sauf le 1er (backup avant) ==="
+mkdir -p "/root/backup_wolv_$T"
+python3 - <<PY
+import re, pathlib, shutil
+
+root = pathlib.Path("/etc/nginx")
+pat = re.compile(r'^(\s*)include\s+/etc/nginx/snippets/fireinners-wolverine\.conf;\s*(#.*)?$')
+hits=[]
+for p in root.rglob("*.conf"):
+    try:
+        txt=p.read_text(encoding="utf-8", errors="ignore").splitlines(True)
+    except Exception:
+        continue
+    for i,line in enumerate(txt):
+        if pat.match(line.strip("\n")):
+            hits.append((p,i,line))
+
+if len(hits) <= 1:
+    print("OK: 0/1 include trouvé -> pas de doublon d'include.")
+    raise SystemExit(0)
+
+print("INFO: includes trouvés:", len(hits))
+# backup tous les fichiers touchés
+bkdir = pathlib.Path("/root/backup_wolv_" + "${T}")
+bkdir.mkdir(parents=True, exist_ok=True)
+
+# garder le 1er, commenter les autres
+for idx,(p,i,line) in enumerate(hits):
+    if idx == 0:
+        continue
+    shutil.copy2(p, bkdir / (p.name + ".bak"))
+    txt=p.read_text(encoding="utf-8", errors="ignore").splitlines(True)
+    if not txt[i].lstrip().startswith("#"):
+        txt[i] = "# " + txt[i]
+        p.write_text("".join(txt), encoding="utf-8")
+        print("COMMENTED:", p, "line", i+1)
+print("DONE: doublons d'include commentés (backup dans", bkdir, ")")
+PY
+
+echo
+echo "=== D) Re-test nginx ==="
 nginx -t
-nginx -T 2>/dev/null | grep -nE 'location[^\n]*/wolverine' | head -n 200
+systemctl reload nginx
+
+echo
+echo "=== E) Vérif final: où est /wolverine/ ==="
+nginx -T 2>/dev/null | grep -nE 'location[^\n]*/wolverine/' | head -n 120 || true
+SH
+
+bash /tmp/FIX_DUP_WOLVERINE_INCLUDE_OR_SNIP.sh
