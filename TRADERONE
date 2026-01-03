@@ -1,72 +1,55 @@
 bash <<'BASH'
 set -euo pipefail
 APPDIR="/opt/fireinners/wolverine-api"
-WEBDIR="/opt/fireinners/frontend-react/app/dist/wolverine"
 ENVF="$APPDIR/.env"
-STATE_DIR="/var/lib/wolverine-api"
-STATE_JSON="$STATE_DIR/state.json"
 WALLET_JSON="$APPDIR/custody.keypair.json"
 WALLET_PUB="$APPDIR/custody.pub"
-NG_SITE="/etc/nginx/sites-available/fireinners.online-ssl"
-SNIP="/etc/nginx/snippets/fireinners-wolverine.conf"
 SERVICE="wolverine-api"
-PORT="3050"
-BASE_PATH="/wolverine/api"
-RPC_DEFAULT="https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac"
-USDC_MINT="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1"
-WSOL_MINT="So11111111111111111111111111111111111111112"
 say(){ printf "%s\n" "$*"; }
-need(){ command -v "$1" >/dev/null 2>&1 || { say "ERREUR: $1 manquant"; exit 1; }; }
 
-need node; need npm; need nginx; need systemctl; need awk; need grep; need curl
-[ -f "$NG_SITE" ] || { say "ERREUR: vhost nginx absent: $NG_SITE"; exit 1; }
+# unlock if immutable
+chattr -i "$WALLET_JSON" 2>/dev/null || true
+chattr -i "$WALLET_PUB" 2>/dev/null || true
+chattr -i "/etc/systemd/system/$SERVICE.service" 2>/dev/null || true
 
-mkdir -p "$APPDIR" "$WEBDIR" "$STATE_DIR"
+mkdir -p "$APPDIR"
 touch "$ENVF"
-chattr -i "$NG_SITE" 2>/dev/null || true
-chattr -i "$SNIP" 2>/dev/null || true
-chattr -i "$WEBDIR/index.html" 2>/dev/null || true
 
-# env defaults (append missing)
-grep -qE "^PORT=" "$ENVF" || echo "PORT=$PORT" >> "$ENVF"
-grep -qE "^BASE_PATH=" "$ENVF" || echo "BASE_PATH=$BASE_PATH" >> "$ENVF"
-grep -qE "^RPC_URL=" "$ENVF" || echo "RPC_URL=$RPC_DEFAULT" >> "$ENVF"
-grep -qE "^USDC_MINT=" "$ENVF" || echo "USDC_MINT=$USDC_MINT" >> "$ENVF"
-grep -qE "^WSOL_MINT=" "$ENVF" || echo "WSOL_MINT=$WSOL_MINT" >> "$ENVF"
-grep -qE "^MONITOR_URL=" "$ENVF" || echo "MONITOR_URL=https://bbbotrader.paycashnostory.workers.dev/ping" >> "$ENVF"
-grep -qE "^MONITOR_SEC=" "$ENVF" || echo "MONITOR_SEC=10" >> "$ENVF"
-grep -qE "^MONITOR_FAILS=" "$ENVF" || echo "MONITOR_FAILS=3" >> "$ENVF"
-grep -qE "^TG_ALERTS=" "$ENVF" || echo "TG_ALERTS=0" >> "$ENVF"
-grep -qE "^WOLV_SEND=" "$ENVF" || echo "WOLV_SEND=/usr/local/bin/wolv_send" >> "$ENVF"
-grep -qE "^ARM_CODE=" "$ENVF" || echo "ARM_CODE=CHANGE_ME_ARM" >> "$ENVF"
+# ensure env points to the keypair
 grep -qE "^CUSTODY_KEYPAIR=" "$ENVF" || echo "CUSTODY_KEYPAIR=$WALLET_JSON" >> "$ENVF"
-grep -qE "^STATE_JSON=" "$ENVF" || echo "STATE_JSON=$STATE_JSON" >> "$ENVF"
 
-# deps
-if [ ! -f "$APPDIR/package.json" ]; then (cd "$APPDIR" && npm init -y >/dev/null 2>&1 || true); fi
-( cd "$APPDIR" && npm i express dotenv @solana/web3.js @solana/spl-token >/dev/null )
+is_valid_keypair(){
+  node -e "const fs=require('fs');try{const s=fs.readFileSync('$WALLET_JSON','utf8');const a=JSON.parse(s);process.exit(Array.isArray(a)&&a.length>=32?0:1)}catch(e){process.exit(1)}"
+}
 
-# FIX wallet generation (write to files, not stdin)
-gen_wallet(){
-  say "Generating custody wallet (FIX)..."
-  OUT="$WALLET_JSON" PUB="$WALLET_PUB" node - <<'NODE'
+gen_keypair(){
+  say "REGEN custody keypair..."
+  node - <<NODE
 const fs=require("fs");
 const {Keypair}=require("@solana/web3.js");
-const out=process.env.OUT, pub=process.env.PUB;
 const kp=Keypair.generate();
-fs.writeFileSync(out, JSON.stringify(Array.from(kp.secretKey)));
-fs.writeFileSync(pub, kp.publicKey.toBase58());
+fs.writeFileSync("$WALLET_JSON", JSON.stringify(Array.from(kp.secretKey)));
+fs.writeFileSync("$WALLET_PUB", kp.publicKey.toBase58());
 process.stdout.write(kp.publicKey.toBase58());
 NODE
   echo
   chmod 600 "$WALLET_JSON" 2>/dev/null || true
   chmod 644 "$WALLET_PUB" 2>/dev/null || true
 }
-if [ ! -s "$WALLET_JSON" ] || ! node -e "try{const a=JSON.parse(require('fs').readFileSync('$WALLET_JSON','utf8'));process.exit(Array.isArray(a)&&a.length>=32?0:1)}catch(e){process.exit(1)}"; then
-  gen_wallet
+
+# validate or regenerate
+if [ ! -s "$WALLET_JSON" ]; then
+  gen_keypair
+else
+  if ! is_valid_keypair; then
+    say "Keypair invalid -> reset"
+    rm -f "$WALLET_JSON" "$WALLET_PUB" || true
+    gen_keypair
+  fi
 fi
+
+# ensure custody.pub exists and matches
 if [ ! -s "$WALLET_PUB" ]; then
-  # reconstruct pub from keypair if missing
   node - <<NODE
 const fs=require("fs");
 const {Keypair}=require("@solana/web3.js");
@@ -74,72 +57,16 @@ const arr=JSON.parse(fs.readFileSync("$WALLET_JSON","utf8"));
 const kp=Keypair.fromSecretKey(Uint8Array.from(arr));
 fs.writeFileSync("$WALLET_PUB", kp.publicKey.toBase58());
 NODE
+  chmod 644 "$WALLET_PUB" 2>/dev/null || true
 fi
 
-# write server.js (with /config + loop)
-cat > "$APPDIR/server.js" <<'JS'
-"use strict";
-require("dotenv").config();
-const fs=require("fs"), path=require("path");
-const express=require("express");
-const {execFile}=require("child_process");
-const {Connection,PublicKey,Keypair}=require("@solana/web3.js");
+# restart service
+systemctl daemon-reload
+systemctl restart "$SERVICE.service" || true
 
-const PORT=parseInt(process.env.PORT||"3050",10);
-const BASE_PATH=(process.env.BASE_PATH||"/wolverine/api").replace(/\/+$/,"");
-const RPC_URL=process.env.RPC_URL||"";
-const USDC_MINT=process.env.USDC_MINT||"";
-const WSOL_MINT=process.env.WSOL_MINT||"";
-const MONITOR_URL=process.env.MONITOR_URL||"";
-const MONITOR_SEC=parseInt(process.env.MONITOR_SEC||"10",10);
-const MONITOR_FAILS=parseInt(process.env.MONITOR_FAILS||"3",10);
-const TG_ALERTS=(process.env.TG_ALERTS||"0")==="1";
-const WOLV_SEND=process.env.WOLV_SEND||"/usr/local/bin/wolv_send";
-const ARM_CODE=process.env.ARM_CODE||"CHANGE_ME_ARM";
-const KEYPAIR_PATH=process.env.CUSTODY_KEYPAIR||path.join(__dirname,"custody.keypair.json");
-const STATE_JSON=process.env.STATE_JSON||"/var/lib/wolverine-api/state.json";
-
-const app=express();
-app.use(express.json({limit:"256kb"}));
-app.disable("x-powered-by");
-
-const conn=new Connection(RPC_URL,{commitment:"confirmed"});
-const now=()=>new Date().toISOString();
-const loadJSON=(p,d)=>{try{return JSON.parse(fs.readFileSync(p,"utf8"));}catch(_){return d;}};
-const saveJSON=(p,o)=>{fs.mkdirSync(path.dirname(p),{recursive:true});fs.writeFileSync(p,JSON.stringify(o,null,2));};
-
-const arr=loadJSON(KEYPAIR_PATH,null);
-if(!arr||!Array.isArray(arr)||arr.length<32) throw new Error("invalid custody keypair");
-const KP=Keypair.fromSecretKey(Uint8Array.from(arr));
-const CUSTODY=KP.publicKey.toBase58();
-
-const state=loadJSON(STATE_JSON,{
-  bot:{running:false,mode:"dca_sol",mint:"",budgetTotal:0,spent:0,perTrade:5,withdrawTo:"",userPub:"",last:"",startedAt:""},
-  ping:{effective:"UNKNOWN",fails:0,lastOkAt:"",lastAt:"",latencyMs:0},
-  ui:{lang:"en"}
-});
-saveJSON(STATE_JSON,state);
-
-const armOK=x=>typeof x==="string"&&x===ARM_CODE;
-const tgSend=msg=>{ if(TG_ALERTS) execFile(WOLV_SEND,[String(msg)],{timeout:12000},()=>{}); };
-
-async function getSOL(pub){ return await conn.getBalance(new PublicKey(pub),"confirmed"); }
-async function getUSDC(pub){
-  const owner=new PublicKey(pub);
-  const resp=await conn.getParsedTokenAccountsByOwner(owner,{mint:new PublicKey(USDC_MINT)},"confirmed");
-  let sum=0; for(const a of resp.value){ sum+=(a.account.data.parsed.info.tokenAmount.uiAmount||0); }
-  return sum;
-}
-
-async function pingOnce(){
-  const t0=Date.now(); let ok=false;
-  try{
-    const ac=new AbortController(); const to=setTimeout(()=>ac.abort(),8000);
-    const r=await fetch(MONITOR_URL,{cache:"no-store",signal:ac.signal});
-    clearTimeout(to);
-    const txt=await r.text();
-    ok=r.ok && /pong/i.test(txt);
-  }catch(_){}
-  const ms=Date.now()-t0;
-  state.ping.lastAt=now(); state.ping.latencyMs=ms;
- 
+# show deposit address + quick health
+CUST="$(cat "$WALLET_PUB" 2>/dev/null || true)"
+say "Deposit (SOL/USDC): $CUST"
+curl -fsS "https://fireinners.online/wolverine/api/health" || true
+echo
+BASH
