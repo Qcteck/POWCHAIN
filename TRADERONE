@@ -1,91 +1,20 @@
-cat >/tmp/ROOT_FIX_AND_FIND_TRADERONE_PORT.sh <<'SH'
-#!/usr/bin/env bash
-set -euo pipefail
-export SYSTEMD_PAGER=cat PAGER=cat
+WALLET="11111111111111111111111111111111"
+curl -sS "http://127.0.0.1:8585/api/balances?wallet=$WALLET" ; echo
 
-SERVER_JS="/opt/traderone-opt/server.js"
 
-echo "== 0) Versions / status =="
-node -v || true
-systemctl status traderone.service --no-pager -l | sed -n '1,80p' || true
-echo
+WALLET="11111111111111111111111111111111"
+curl -ks "https://fireinners.online/wolverine/traderone/api/balances?wallet=$WALLET" ; echo
 
-echo "== 1) Derniers logs (cherchez: fetch is not defined / crash) =="
-journalctl -u traderone.service -n 120 --no-pager || true
-echo
 
-echo "== 2) Port(s) node en écoute (avant fix) =="
-ss -ltnp | grep -E 'node|:8585' || true
-echo
 
-echo "== 3) If Node < 18 => add fetch polyfill + install node-fetch =="
-if [ -f "$SERVER_JS" ]; then
-  if ! node -p 'process.versions.node.split(".")[0] >= 18' >/dev/null 2>&1; then
-    echo "Node <18 detected -> applying polyfill"
-    if ! grep -q "WOLVERINE_FETCH_POLYFILL" "$SERVER_JS"; then
-      cp -a "$SERVER_JS" "$SERVER_JS.bak.$(date +%s)"
-      python3 - <<'PY'
-import re
-p="/opt/traderone-opt/server.js"
-s=open(p,"r",encoding="utf-8",errors="ignore").read()
-poly = r'''
-// ===== WOLVERINE_FETCH_POLYFILL =====
-// Node <18 n'a pas fetch. Polyfill sans casser Node 18+.
-let _fetch = global.fetch;
-if (!_fetch) {
-  _fetch = (...args) => import("node-fetch").then(m => m.default(...args));
-}
-// ===== /WOLVERINE_FETCH_POLYFILL =====
-'''.lstrip("\n")
+APPJS="$(grep -RIl --exclude-dir=node_modules --exclude-dir=.git 'API_BALANCES' /var/www /usr/share/nginx /opt 2>/dev/null | head -n 1)"
+echo "APPJS=$APPJS"
+[ -n "$APPJS" ] || { echo "app.js introuvable"; exit 1; }
 
-m=re.search(r'^[\'"]use strict[\'"];\s*', s, flags=re.M)
-if m:
-  s = s[:m.end()] + "\n" + poly + "\n" + s[m.end():]
-else:
-  s = poly + "\n" + s
+cp -a "$APPJS" "$APPJS.bak.$(date +%s)"
 
-open(p,"w",encoding="utf-8").write(s)
-print("polyfill inserted")
-PY
-    fi
+# remplace /wolverine/api/balances -> /wolverine/traderone/api/balances
+sed -i 's|/wolverine/api/balances|/wolverine/traderone/api/balances|g' "$APPJS"
 
-    # Remplacer fetch() -> _fetch() uniquement dans le snippet balances (si présent)
-    perl -0777 -i -pe 's/(WOLVERINE_BALANCES_API[\s\S]*?)\bfetch\(/\1_fetch(/g' "$SERVER_JS" || true
-
-    cd /opt/traderone-opt
-    if [ ! -d node_modules/node-fetch ]; then
-      npm i node-fetch@3 --silent
-    fi
-  else
-    echo "Node >=18 -> polyfill not needed"
-  fi
-else
-  echo "server.js introuvable: $SERVER_JS"
-fi
-echo
-
-echo "== 4) Restart traderone =="
-systemctl restart traderone.service
-sleep 1
-systemctl status traderone.service --no-pager -l | sed -n '1,60p' || true
-echo
-
-echo "== 5) Détecter le vrai port traderone (node listen) =="
-PORTS="$(ss -ltnp | awk '/node/ {print $4}' | sed 's/.*://g' | sort -nu | tr '\n' ' ')"
-echo "NODE_PORTS=$PORTS"
-echo
-
-echo "== 6) Test /api/health + /api/balances sur chaque port trouvé =="
-WALLET_TEST="11111111111111111111111111111111"
-for p in $PORTS 8585 3000 8080; do
-  echo "--- port $p ---"
-  curl -sS --max-time 2 "http://127.0.0.1:$p/api/health" 2>/dev/null && echo || echo "health: no"
-  curl -sS --max-time 3 "http://127.0.0.1:$p/api/balances?wallet=$WALLET_TEST" 2>/dev/null | head -c 200; echo
-done
-
-echo
-echo "== 7) Si aucun port ne répond: logs maintenant =="
-journalctl -u traderone.service -n 120 --no-pager || true
-SH
-
-bash /tmp/ROOT_FIX_AND_FIND_TRADERONE_PORT.sh
+nginx -t && systemctl reload nginx
+echo "OK. Ctrl+F5 sur /wolverine/"
