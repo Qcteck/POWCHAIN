@@ -1,26 +1,33 @@
-cat >/tmp/FORCE_WOLVERINE_NO_SOLANA_RPC.sh <<'SH'
+cat >/tmp/FIX_WOLVERINE_STILL_CALLS_SOLANA_RPC.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "== 0) Trouve le vrai DOCROOT /wolverine (index.html) =="
+echo "== 1) Trouver le DOCROOT NGINX de /wolverine =="
+CFG="$(nginx -T 2>/dev/null | sed -n '/server {/,/}/p' | grep -nE 'location /wolverine|root |alias ' -n || true)"
+echo "$CFG" | head -n 80 || true
+echo
+
+# Heuristique: chercher un index WOLVERINE existant
 INDEX="$(grep -RIl --exclude-dir=node_modules --exclude-dir=.git '<title>WOLVERINE</title>' /var/www /usr/share/nginx /opt 2>/dev/null | head -n 1 || true)"
 if [ -z "${INDEX:-}" ]; then
-  echo "ERROR: index.html WOLVERINE introuvable."
-  echo "Donne: grep -RIl '<title>WOLVERINE</title>' /var/www /usr/share/nginx /opt"
-  exit 1
+  # fallback: premier index.html dans /var/www/wolverine
+  INDEX="/var/www/wolverine/index.html"
 fi
 DOCROOT="$(dirname "$INDEX")"
 APPJS="$DOCROOT/app.js"
+
 echo "INDEX=$INDEX"
 echo "DOCROOT=$DOCROOT"
+echo "APPJS=$APPJS"
+mkdir -p "$DOCROOT"
 echo
 
-echo "== 1) Backup =="
-cp -a "$INDEX" "$INDEX.bak.$(date +%s)"
+echo "== 2) Backup =="
+[ -f "$INDEX" ] && cp -a "$INDEX" "$INDEX.bak.$(date +%s)" || true
 [ -f "$APPJS" ] && cp -a "$APPJS" "$APPJS.bak.$(date +%s)" || true
 echo
 
-echo "== 2) Écrase index.html SANS solana web3 (plus de index.iife.min.js) =="
+echo "== 3) Overwrite index.html (SANS solana web3) =="
 cat >"$INDEX" <<'HTML'
 <!doctype html>
 <html lang="fr">
@@ -88,12 +95,16 @@ cat >"$INDEX" <<'HTML'
     </div>
   </div>
 
-  <script src="./app.js?v=1"></script>
+  <script src="./app.js?v=__TS__"></script>
 </body>
 </html>
 HTML
 
-echo "== 3) Écrase app.js (balances via VPS uniquement, ZÉRO RPC Solana) =="
+TS="$(date +%s)"
+sed -i "s/__TS__/$TS/g" "$INDEX"
+echo
+
+echo "== 4) Overwrite app.js (backend-only, ZERO solanaWeb3) =="
 cat >"$APPJS" <<'JS'
 const API_START = "/wolverine/traderone/api/start";
 const API_BALANCES = "/wolverine/traderone/api/balances";
@@ -175,23 +186,47 @@ btnStart.onclick=async ()=>{
 JS
 
 chmod 644 "$INDEX" "$APPJS"
+echo
 
-echo "== 4) Cache-bust index.html => app.js?v=TIMESTAMP =="
-TS="$(date +%s)"
-sed -i "s|app.js?v=[0-9]*|app.js?v=$TS|g" "$INDEX" || true
+echo "== 5) NGINX: no-cache sur /wolverine/app.js (optionnel mais utile) =="
+SNIP="/etc/nginx/snippets/wolverine_nocache.conf"
+cat >"$SNIP" <<'NG'
+location = /wolverine/app.js {
+  add_header Cache-Control "no-store, no-cache, must-revalidate, proxy-revalidate" always;
+  add_header Pragma "no-cache" always;
+  add_header Expires "0" always;
+}
+NG
+
+# Injecter le include dans le bon server{} si pas déjà présent
+if ! nginx -T 2>/dev/null | grep -q "wolverine_nocache.conf"; then
+  CONF="$(nginx -T 2>/dev/null | awk '/server_name[[:space:]]+fireinners\.online/ {print prev} {prev=$0}' | head -n1 || true)"
+  # fallback: premier site-enabled
+  [ -z "${CONF:-}" ] && CONF="$(ls -1 /etc/nginx/sites-enabled/* 2>/dev/null | head -n1 || true)"
+  if [ -n "${CONF:-}" ] && [ -f "$CONF" ]; then
+    cp -a "$CONF" "$CONF.bak.$(date +%s)"
+    # ajoute include juste après 'server {' si possible
+    awk '
+      BEGIN{done=0}
+      /server[[:space:]]*\{/ && done==0 {print; print "  include /etc/nginx/snippets/wolverine_nocache.conf;"; done=1; next}
+      {print}
+    ' "$CONF" >"$CONF.tmp" && mv "$CONF.tmp" "$CONF"
+  fi
+fi
 
 nginx -t && systemctl reload nginx
-
 echo
-echo "== 5) PREUVE (remote) : plus de solana web3, plus de mainnet-beta dans app.js =="
-echo "--- index.html must NOT contain unpkg/@solana/web3.js ---"
-curl -ks https://fireinners.online/wolverine/ | grep -n "solana/web3" && echo "BAD" || echo "OK ✅"
-echo "--- app.js must NOT contain mainnet-beta ---"
+
+echo "== 6) PREUVES (remote) : plus de solanaWeb3 / mainnet-beta =="
+echo "--- app.js contains solanaWeb3? ---"
+curl -ks https://fireinners.online/wolverine/app.js | grep -n "solanaWeb3" && echo "BAD" || echo "OK ✅"
+echo "--- app.js contains mainnet-beta? ---"
 curl -ks https://fireinners.online/wolverine/app.js | grep -n "mainnet-beta" && echo "BAD" || echo "OK ✅"
+echo "--- index contains solana web3 iife? ---"
+curl -ks https://fireinners.online/wolverine/ | grep -nE "solana/web3|index\.iife\.min\.js|connection\.ts" && echo "BAD" || echo "OK ✅"
 
 echo
-echo "=> Ensuite: ouvre /wolverine en NAVIGATION PRIVÉE (ou Ctrl+F5)."
-echo "Dans Network, tu ne dois plus voir index.iife.min.js ni POST api.mainnet-beta…"
+echo "=> Ouvre /wolverine en NAVIGATION PRIVÉE puis clique Refresh. Tu ne dois plus voir POST api.mainnet-beta 403."
 SH
 
-bash /tmp/FORCE_WOLVERINE_NO_SOLANA_RPC.sh
+bash /tmp/FIX_WOLVERINE_STILL_CALLS_SOLANA_RPC.sh
