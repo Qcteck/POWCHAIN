@@ -1,366 +1,121 @@
-cat >/tmp/WOLVERINE_SHOW_USER_AND_TRADERONE_BALANCES.sh <<'SH'
+cat >/tmp/WOLVERINE_FIX_BALANCES2_NO_REGEX.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-DOCROOT="/var/www/fireinners/wolverine"
 SERVER_JS="/opt/traderone-opt/server.js"
-TS="$(date +%s)"
-DOMAIN="fireinners.online"
-
-# USDC mainnet mint
-USDC_MINT="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 KEYFILE="/opt/traderone-opt/keys/traderone_deposit.json"
+USDC_MINT="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+MARK_BEGIN="/* WOLVERINE_BALANCES2_BEGIN */"
+MARK_END="/* WOLVERINE_BALANCES2_END */"
+TS="$(date +%s)"
 
-echo "== 0) Sanity =="
-[ -f "$SERVER_JS" ] || { echo "ERROR server.js introuvable: $SERVER_JS"; exit 1; }
-[ -f "$KEYFILE" ] || { echo "ERROR keyfile TraderOne introuvable: $KEYFILE"; exit 1; }
-mkdir -p "$DOCROOT"
+echo "== 0) Checks =="
+[ -f "$SERVER_JS" ] || { echo "ERROR: missing $SERVER_JS"; exit 1; }
+[ -f "$KEYFILE" ] || { echo "ERROR: missing $KEYFILE"; exit 1; }
 
-echo "== 1) Patch backend: route /api/balances2 (user + traderone) =="
-cp -a "$SERVER_JS" "$SERVER_JS.bak.$TS"
-
-# Ajoute constantes si manquantes
-grep -q 'USDC_MINT' "$SERVER_JS" || sed -i "1i const USDC_MINT = process.env.USDC_MINT || \"$USDC_MINT\";" "$SERVER_JS"
-grep -q 'TRADERONE_DEPOSIT_KEYFILE' "$SERVER_JS" || sed -i "1i const TRADERONE_DEPOSIT_KEYFILE = process.env.TRADERONE_DEPOSIT_KEYFILE || \"$KEYFILE\";" "$SERVER_JS"
-
-# Ajoute helper loadTraderOneKeypair si manquant
-if ! grep -q "function loadTraderOneKeypair" "$SERVER_JS"; then
-  perl -0777 -i -pe '
-    s/(const\s+\{\s*PublicKey[\s\S]*?\}\s*=\s*require\([^\)]*\);\s*\n)/$1
-function loadTraderOneKeypair() {
-  const fs = require("fs");
-  const { Keypair } = require("@solana/web3.js");
-  const secret = Uint8Array.from(JSON.parse(fs.readFileSync(TRADERONE_DEPOSIT_KEYFILE, "utf8")));
-  return Keypair.fromSecretKey(secret);
-}
-
-async function getUsdcSum(ownerPk) {
-  const tokRes = await connection.getParsedTokenAccountsByOwner(
-    ownerPk,
-    { mint: new PublicKey(USDC_MINT) },
-    "confirmed"
-  );
-  let usdc = 0;
-  for (const a of (tokRes.value || [])) {
-    const ui = a?.account?.data?.parsed?.info?.tokenAmount?.uiAmount;
-    const amtStr = a?.account?.data?.parsed?.info?.tokenAmount?.amount;
-    const dec = a?.account?.data?.parsed?.info?.tokenAmount?.decimals ?? 6;
-    if (ui !== null && ui !== undefined) usdc += Number(ui) || 0;
-    else if (amtStr) usdc += (Number(amtStr) || 0) / (10 ** dec);
-  }
-  return { usdc, accounts: (tokRes.value || []).length };
-}
-
-$/s;
-  ' "$SERVER_JS"
+echo "== 1) Restore last backup (safe) =="
+latest_bak="$(ls -1t /opt/traderone-opt/server.js.bak.* 2>/dev/null | head -n1 || true)"
+if [ -n "${latest_bak:-}" ]; then
+  echo "Restoring: $latest_bak -> $SERVER_JS"
+  cp -a "$latest_bak" "$SERVER_JS"
+else
+  echo "No backup found, keeping current server.js"
 fi
 
-# Supprime une ancienne route balances2 si elle existe déjà
-perl -0777 -i -pe 's/app\.get\(\s*["\047]\/api\/balances2["\047][\s\S]*?\);\s*\n//gms' "$SERVER_JS"
+echo "== 2) Ensure deps =="
+cd /opt/traderone-opt
+[ -f package.json ] || npm init -y >/dev/null
+npm i @solana/web3.js >/dev/null
 
-# Insère la nouvelle route balances2 juste après /api/deposit-address si possible, sinon à la fin
-perl -0777 -i -pe '
-my $route = qq{
-app.get("/api/balances2", async (req, res) => {
+echo "== 3) Add balances2 route (append, no regex) =="
+if grep -qF "$MARK_BEGIN" "$SERVER_JS"; then
+  echo "balances2 already present, skip append."
+else
+  cp -a "$SERVER_JS" "$SERVER_JS.bak.$TS"
+  cat >>"$SERVER_JS" <<'JS'
+
+/* WOLVERINE_BALANCES2_BEGIN */
+(function(){
   try {
-    const wallet = (req.query.wallet || "").toString().trim();
-    if (!wallet) return res.status(400).json({ error: "wallet missing" });
+    // expose constants if not already defined globally
+    const USDC_MINT_LOCAL = process.env.USDC_MINT || "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+    const TRADERONE_DEPOSIT_KEYFILE_LOCAL = process.env.TRADERONE_DEPOSIT_KEYFILE || "/opt/traderone-opt/keys/traderone_deposit.json";
 
-    const userPk = new PublicKey(wallet);
-    const traderKp = loadTraderOneKeypair();
-    const traderPk = traderKp.publicKey;
+    const fs = require("fs");
+    const { PublicKey, Keypair } = require("@solana/web3.js");
 
-    const [userLam, traderLam] = await Promise.all([
-      connection.getBalance(userPk, "confirmed"),
-      connection.getBalance(traderPk, "confirmed"),
-    ]);
-
-    const [userU, traderU] = await Promise.all([
-      getUsdcSum(userPk),
-      getUsdcSum(traderPk),
-    ]);
-
-    return res.json({
-      user:   { sol: userLam / 1e9,   usdc: userU.usdc,   usdcAccounts: userU.accounts },
-      trader: { sol: traderLam / 1e9, usdc: traderU.usdc, usdcAccounts: traderU.accounts },
-      traderWallet: traderPk.toBase58(),
-      usdcMint: USDC_MINT
-    });
-  } catch (e) {
-    return res.status(500).json({ error: (e && e.message) ? e.message : String(e) });
-  }
-});
-};
-
-if ($_ =~ /app\.get\(\s*["\047]\/api\/deposit-address["\047][\s\S]*?\);\s*\n/s) {
-  s/(app\.get\(\s*["\047]\/api\/deposit-address["\047][\s\S]*?\);\s*\n)/$1$route\n/s;
-} else {
-  $_ .= "\n$route\n";
-}
-' "$SERVER_JS"
-
-echo "== 2) Restart traderone =="
-systemctl restart traderone.service
-sleep 1
-systemctl status traderone.service --no-pager -l | sed -n '1,25p' || true
-echo
-
-echo "== 3) Overwrite FRONT (index.html + app.js) =="
-[ -f "$DOCROOT/index.html" ] && cp -a "$DOCROOT/index.html" "$DOCROOT/index.html.bak.$TS" || true
-[ -f "$DOCROOT/app.js" ] && cp -a "$DOCROOT/app.js" "$DOCROOT/app.js.bak.$TS" || true
-
-cat >"$DOCROOT/index.html" <<HTML
-<!doctype html>
-<html lang="fr">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>WOLVERINE</title>
-  <style>
-    :root { --bg:#0b0f14; --card:#121826; --b:#223049; --mut:#9fb0c7; --ok:#22c55e; --err:#ef4444; --btn:#3b82f6; }
-    body { margin:0; font-family:system-ui, Arial; background:var(--bg); color:#e8eef6; }
-    .wrap { max-width:640px; margin:42px auto; padding:18px; }
-    .card { background:var(--card); border:1px solid var(--b); border-radius:16px; padding:16px; }
-    h1 { margin:0 0 12px; font-size:22px; }
-    .row { display:flex; justify-content:space-between; gap:12px; align-items:center; margin:10px 0; }
-    .muted { color:var(--mut); font-size:13px; }
-    .value { font-weight:900; font-size:18px; }
-    .pill { padding:4px 10px; border:1px solid var(--b); border-radius:999px; font-size:12px; color:var(--mut); }
-    button { width:100%; padding:12px 14px; border:0; border-radius:12px; background:var(--btn); color:white; font-weight:900; cursor:pointer; }
-    button.secondary { background:#1f2937; border:1px solid #2b3a55; }
-    button:disabled { opacity:.55; cursor:not-allowed; }
-    input, select { width:100%; padding:12px 14px; border-radius:12px; border:1px solid #2b3a55; background:#0f1624; color:#e8eef6; outline:none; }
-    .hidden { display:none; }
-    .ok { color:var(--ok); }
-    .err { color:var(--err); }
-    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px; word-break:break-all; }
-    .grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
-    .mini { border:1px solid var(--b); border-radius:14px; padding:12px; }
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <div class="card">
-      <h1>WOLVERINE</h1>
-
-      <div class="row">
-        <span class="pill">Solana</span>
-        <span class="pill" id="walletPill">Wallet: non connecté</span>
-      </div>
-
-      <div class="grid">
-        <div class="mini">
-          <div class="muted">Wallet utilisateur (Phantom)</div>
-          <div class="row">
-            <div>
-              <div class="muted">SOL</div>
-              <div class="value" id="uSol">—</div>
-            </div>
-            <div style="text-align:right;">
-              <div class="muted">USDC</div>
-              <div class="value" id="uUsdc">—</div>
-            </div>
-          </div>
-        </div>
-
-        <div class="mini">
-          <div class="muted">Wallet TraderOne (bot)</div>
-          <div class="mono" id="traderAddr" style="margin-top:6px;">—</div>
-          <div class="row" style="margin-top:10px;">
-            <div>
-              <div class="muted">SOL</div>
-              <div class="value" id="tSol">—</div>
-            </div>
-            <div style="text-align:right;">
-              <div class="muted">USDC</div>
-              <div class="value" id="tUsdc">—</div>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <button id="btnConnect" style="margin-top:12px;">Connect Wallet (Phantom)</button>
-
-      <div id="afterConnect" class="hidden" style="margin-top:14px;">
-        <div class="muted" style="margin-top:8px;">Token</div>
-        <select id="token">
-          <option value="USDC">USDC</option>
-          <option value="SOL">SOL</option>
-        </select>
-
-        <div class="muted" style="margin-top:10px;">Budget (sera ENVOYÉ à TraderOne)</div>
-        <input id="budget" type="number" inputmode="decimal" placeholder="Ex: 1" min="0" step="0.000001" />
-
-        <div style="margin-top:12px;">
-          <button id="btnStart" disabled>START WOLVERINE (TraderOne)</button>
-        </div>
-
-        <button id="btnRefresh" class="secondary" style="margin-top:10px;">Refresh soldes</button>
-
-        <div class="row" style="margin-top:12px;">
-          <span class="muted">Status</span>
-          <span id="statusText" class="muted">—</span>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <script src="./solana-web3.min.js?v=$TS"></script>
-  <script src="./app.js?v=$TS"></script>
-</body>
-</html>
-HTML
-
-cat >"$DOCROOT/app.js" <<'JS'
-const API_BALANCES2 = "/wolverine/traderone/api/balances2";
-const API_BUILD_TX  = "/wolverine/traderone/api/build-deposit-tx";
-const API_CONFIRM   = "/wolverine/traderone/api/confirm";
-const API_START     = "/wolverine/traderone/api/start";
-
-const btnConnect=document.getElementById("btnConnect");
-const btnStart=document.getElementById("btnStart");
-const btnRefresh=document.getElementById("btnRefresh");
-const afterConnect=document.getElementById("afterConnect");
-const walletPill=document.getElementById("walletPill");
-const traderAddrEl=document.getElementById("traderAddr");
-
-const uSol=document.getElementById("uSol");
-const uUsdc=document.getElementById("uUsdc");
-const tSol=document.getElementById("tSol");
-const tUsdc=document.getElementById("tUsdc");
-
-const tokenEl=document.getElementById("token");
-const budgetEl=document.getElementById("budget");
-const statusText=document.getElementById("statusText");
-
-let pubkey=null;
-let traderWallet=null;
-
-function shortPk(pk){ const s=pk.toString(); return s.slice(0,4)+"…"+s.slice(-4); }
-function setStatus(t,cls="muted"){ statusText.className=cls; statusText.textContent=t; }
-function n(x){ const v=Number(x); return Number.isFinite(v)?v:0; }
-function canStart(){ return pubkey && traderWallet && n(budgetEl.value)>0; }
-
-async function refreshBoth(){
-  if(!pubkey) return;
-  setStatus("Lecture des soldes…");
-  try{
-    const r = await fetch(`${API_BALANCES2}?wallet=${encodeURIComponent(pubkey.toString())}`, { cache:"no-store" });
-    const d = await r.json().catch(()=>({}));
-    if(!r.ok) throw new Error(d?.error || ("HTTP "+r.status));
-
-    traderWallet = d.traderWallet;
-    traderAddrEl.textContent = traderWallet;
-
-    uSol.textContent  = Number(d.user?.sol ?? 0).toFixed(6);
-    uUsdc.textContent = Number(d.user?.usdc ?? 0).toFixed(4);
-    tSol.textContent  = Number(d.trader?.sol ?? 0).toFixed(6);
-    tUsdc.textContent = Number(d.trader?.usdc ?? 0).toFixed(4);
-
-    setStatus("OK", "ok");
-    btnStart.disabled = !canStart();
-  }catch(e){
-    setStatus("Balances error: " + (e?.message || e), "err");
-  }
-}
-
-async function confirmSig(sig, tries=25){
-  for(let i=0;i<tries;i++){
-    const r = await fetch(`${API_CONFIRM}?sig=${encodeURIComponent(sig)}`, {cache:"no-store"});
-    const d = await r.json().catch(()=>({}));
-    if(d?.ok) return true;
-    await new Promise(res=>setTimeout(res, 1000));
-  }
-  return false;
-}
-
-btnConnect.onclick=async ()=>{
-  if(!window.solana?.isPhantom){
-    setStatus("Phantom non détecté","err");
-    window.open("https://phantom.app/","_blank");
-    return;
-  }
-  try{
-    const r=await window.solana.connect();
-    pubkey=r.publicKey;
-    walletPill.textContent="Wallet: "+shortPk(pubkey);
-    afterConnect.classList.remove("hidden");
-    btnConnect.textContent="Wallet connecté";
-    btnConnect.disabled=true;
-    await refreshBoth();
-  }catch(e){
-    setStatus("Connexion refusée: " + (e?.message||e),"err");
-  }
-};
-
-budgetEl.oninput=()=>{ btnStart.disabled=!canStart(); };
-tokenEl.onchange=()=>{ btnStart.disabled=!canStart(); };
-btnRefresh.onclick=refreshBoth;
-
-btnStart.onclick=async ()=>{
-  if(!canStart()) return;
-
-  const token  = tokenEl.value;
-  const budget = n(budgetEl.value);
-  const amount = budget;
-
-  const ok = confirm(`Envoyer ${amount} ${token} vers TraderOne:\n${traderWallet}\n\nPuis démarrer WOLVERINE ?`);
-  if(!ok) return;
-
-  btnStart.disabled=true;
-  setStatus("Préparation transaction…");
-
-  try{
-    const build = await fetch(API_BUILD_TX,{
-      method:"POST",
-      headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({ from: pubkey.toString(), token, amount })
-    });
-    const bd = await build.json().catch(()=>({}));
-    if(!build.ok) throw new Error(bd?.error || ("HTTP "+build.status));
-
-    const txBytes = Uint8Array.from(atob(bd.txBase64), c => c.charCodeAt(0));
-    const tx = solanaWeb3.Transaction.from(txBytes);
-
-    setStatus("Signature + envoi…");
-    const { signature } = await window.solana.signAndSendTransaction(tx);
-
-    setStatus("Confirmation on-chain…");
-    const confirmed = await confirmSig(signature);
-    if(!confirmed){
-      setStatus("Tx envoyée mais non confirmée. Sig: "+signature, "err");
-      btnStart.disabled=false;
-      return;
+    function loadTraderOneKeypair() {
+      const secret = Uint8Array.from(JSON.parse(fs.readFileSync(TRADERONE_DEPOSIT_KEYFILE_LOCAL, "utf8")));
+      return Keypair.fromSecretKey(secret);
     }
 
-    setStatus("Tx confirmée ✅ Démarrage…","ok");
-    const st = await fetch(API_START,{
-      method:"POST",
-      headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({ wallet: pubkey.toString(), budget, depositSig: signature, token, amount })
+    async function getUsdcSum(ownerPk) {
+      const tokRes = await connection.getParsedTokenAccountsByOwner(
+        ownerPk,
+        { mint: new PublicKey(USDC_MINT_LOCAL) },
+        "confirmed"
+      );
+      let usdc = 0;
+      for (const a of (tokRes.value || [])) {
+        const ui = a?.account?.data?.parsed?.info?.tokenAmount?.uiAmount;
+        const amtStr = a?.account?.data?.parsed?.info?.tokenAmount?.amount;
+        const dec = a?.account?.data?.parsed?.info?.tokenAmount?.decimals ?? 6;
+        if (ui !== null && ui !== undefined) usdc += Number(ui) || 0;
+        else if (amtStr) usdc += (Number(amtStr) || 0) / (10 ** dec);
+      }
+      return { usdc, accounts: (tokRes.value || []).length };
+    }
+
+    // IMPORTANT: app + connection must already exist in your server.js
+    app.get("/api/balances2", async (req, res) => {
+      try {
+        const wallet = (req.query.wallet || "").toString().trim();
+        if (!wallet) return res.status(400).json({ error: "wallet missing" });
+
+        const userPk = new PublicKey(wallet);
+        const traderKp = loadTraderOneKeypair();
+        const traderPk = traderKp.publicKey;
+
+        const [userLam, traderLam] = await Promise.all([
+          connection.getBalance(userPk, "confirmed"),
+          connection.getBalance(traderPk, "confirmed"),
+        ]);
+
+        const [userU, traderU] = await Promise.all([
+          getUsdcSum(userPk),
+          getUsdcSum(traderPk),
+        ]);
+
+        return res.json({
+          user:   { sol: userLam / 1e9,   usdc: userU.usdc,   usdcAccounts: userU.accounts },
+          trader: { sol: traderLam / 1e9, usdc: traderU.usdc, usdcAccounts: traderU.accounts },
+          traderWallet: traderPk.toBase58(),
+          usdcMint: USDC_MINT_LOCAL
+        });
+      } catch (e) {
+        return res.status(500).json({ error: e?.message || String(e) });
+      }
     });
-    const sd = await st.json().catch(()=>({}));
-    if(!st.ok) throw new Error(sd?.error || ("HTTP "+st.status));
 
-    setStatus("WOLVERINE démarré ✅", "ok");
-    await refreshBoth();
-  }catch(e){
-    setStatus("Erreur: " + (e?.message || e), "err");
-    btnStart.disabled=false;
+    console.log("[WOLVERINE] balances2 route ready");
+  } catch (e) {
+    console.log("[WOLVERINE] balances2 init error:", e?.message || String(e));
   }
-};
+})();
+/* WOLVERINE_BALANCES2_END */
+
 JS
+fi
 
-chmod 644 "$DOCROOT/index.html" "$DOCROOT/app.js"
+echo "== 4) Restart traderone =="
+systemctl restart traderone.service
+sleep 1
+systemctl status traderone.service --no-pager -l | sed -n '1,30p' || true
 
-echo "== 4) Reload nginx =="
-nginx -t && systemctl reload nginx
-
-echo "== 5) Proof (API) =="
-echo "API balances2 needs a wallet param, example:"
-echo "curl -sS http://127.0.0.1:8585/api/balances2?wallet=TON_WALLET"
 echo
-echo "DONE ✅ Ouvre https://${DOMAIN}/wolverine/ en navigation privée"
+echo "== 5) Quick test (replace WALLET) =="
+echo "curl -sS 'http://127.0.0.1:8585/api/balances2?wallet=WALLET' | jq ."
+echo "DONE ✅"
 SH
 
-bash /tmp/WOLVERINE_SHOW_USER_AND_TRADERONE_BALANCES.sh
+bash /tmp/WOLVERINE_FIX_BALANCES2_NO_REGEX.sh
