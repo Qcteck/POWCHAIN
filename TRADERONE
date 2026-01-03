@@ -1,5 +1,196 @@
-# 1) Voir QUI sert /wolverine/ (headers)
-curl -kI https://fireinners.online/wolverine/ | sed -n '1,30p'
+cat >/tmp/OVERWRITE_REAL_WOLVERINE_INDEX.sh <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+export SYSTEMD_PAGER=cat PAGER=cat
 
-# 2) Voir le début du HTML servi (pour confirmer si c'est ton index)
-curl -ks https://fireinners.online/wolverine/ | head -n 40
+echo "== 0) What is serving /wolverine (headers) =="
+curl -kI https://fireinners.online/wolverine/ | sed -n '1,40p' || true
+echo
+
+echo "== 1) Find the REAL index.html that contains traderone_overlay.js =="
+TARGET="$(grep -RIl --exclude-dir=node_modules --exclude-dir=.git 'traderone_overlay\.js' \
+  /etc/nginx /var/www /usr/share/nginx /opt 2>/dev/null | head -n 1 || true)"
+
+if [ -z "${TARGET:-}" ]; then
+  echo "ERROR: cannot find an index containing traderone_overlay.js"
+  echo "Run: grep -RIl 'traderone_overlay.js' /etc/nginx /var/www /usr/share/nginx /opt"
+  exit 1
+fi
+
+echo "FOUND: $TARGET"
+cp -a "$TARGET" "$TARGET.bak.$(date +%s)"
+
+DOCROOT="$(dirname "$TARGET")"
+echo "DOCROOT: $DOCROOT"
+echo
+
+echo "== 2) Overwrite index.html + app.js in that exact docroot =="
+cat >"$DOCROOT/index.html" <<'HTML'
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>WOLVERINE</title>
+  <style>
+    :root { --bg:#0b0f14; --card:#121826; --b:#223049; --mut:#9fb0c7; --ok:#22c55e; --err:#ef4444; --btn:#3b82f6; }
+    body { margin:0; font-family:system-ui, Arial; background:var(--bg); color:#e8eef6; }
+    .wrap { max-width:520px; margin:42px auto; padding:18px; }
+    .card { background:var(--card); border:1px solid var(--b); border-radius:16px; padding:16px; }
+    h1 { margin:0 0 12px; font-size:22px; }
+    .row { display:flex; justify-content:space-between; gap:10px; align-items:center; margin:10px 0; }
+    .muted { color:var(--mut); font-size:13px; }
+    .value { font-weight:800; font-size:18px; }
+    .pill { padding:4px 10px; border:1px solid var(--b); border-radius:999px; font-size:12px; color:var(--mut); }
+    button {
+      width:100%; padding:12px 14px; border:0; border-radius:12px;
+      background:var(--btn); color:white; font-weight:800; cursor:pointer;
+    }
+    button.secondary { background:#1f2937; border:1px solid #2b3a55; }
+    button:disabled { opacity:.55; cursor:not-allowed; }
+    input {
+      width:100%; padding:12px 14px; border-radius:12px;
+      border:1px solid #2b3a55; background:#0f1624; color:#e8eef6; outline:none;
+    }
+    .hidden { display:none; }
+    .ok { color:var(--ok); }
+    .err { color:var(--err); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>WOLVERINE</h1>
+
+      <div class="row">
+        <span class="pill">Solana</span>
+        <span class="pill" id="walletPill">Wallet: non connecté</span>
+      </div>
+
+      <div class="row">
+        <div>
+          <div class="muted">SOL</div>
+          <div class="value" id="solBal">—</div>
+        </div>
+        <div style="text-align:right;">
+          <div class="muted">USDC</div>
+          <div class="value" id="usdcBal">—</div>
+        </div>
+      </div>
+
+      <button id="btnConnect">Connect Wallet (Phantom)</button>
+
+      <div id="afterConnect" class="hidden" style="margin-top:14px;">
+        <div class="muted" style="margin:8px 0;">Budget</div>
+        <input id="budget" type="number" inputmode="decimal" placeholder="Ex: 50" min="0" step="0.01" />
+
+        <div style="margin-top:12px;">
+          <button id="btnStart" disabled>START WOLVERINE (TraderOne)</button>
+        </div>
+
+        <div class="row" style="margin-top:12px;">
+          <span class="muted">Status</span>
+          <span id="statusText" class="muted">—</span>
+        </div>
+
+        <button id="btnRefresh" class="secondary" style="margin-top:10px;">Refresh balances</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/@solana/web3.js@latest/lib/index.iife.min.js"></script>
+  <script src="./app.js?v=1"></script>
+</body>
+</html>
+HTML
+
+cat >"$DOCROOT/app.js" <<'JS'
+const RPC="https://api.mainnet-beta.solana.com";
+const USDC_MINT="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+const API_START="/wolverine/traderone/api/start";
+
+const btnConnect=document.getElementById("btnConnect");
+const btnStart=document.getElementById("btnStart");
+const btnRefresh=document.getElementById("btnRefresh");
+const afterConnect=document.getElementById("afterConnect");
+const walletPill=document.getElementById("walletPill");
+const solBalEl=document.getElementById("solBal");
+const usdcBalEl=document.getElementById("usdcBal");
+const budgetEl=document.getElementById("budget");
+const statusText=document.getElementById("statusText");
+
+let pubkey=null;
+const connection=new solanaWeb3.Connection(RPC,"confirmed");
+
+function shortPk(pk){ const s=pk.toString(); return s.slice(0,4)+"…"+s.slice(-4); }
+function setStatus(t,cls="muted"){ statusText.className=cls; statusText.textContent=t; }
+function canStart(){ const v=Number(budgetEl.value); return pubkey && Number.isFinite(v) && v>0; }
+
+async function refreshBalances(){
+  try{
+    setStatus("Lecture des soldes…");
+    const lamports=await connection.getBalance(pubkey);
+    const sol=lamports/solanaWeb3.LAMPORTS_PER_SOL;
+
+    const mint=new solanaWeb3.PublicKey(USDC_MINT);
+    const resp=await connection.getParsedTokenAccountsByOwner(pubkey,{mint});
+    const usdc=resp.value?.[0]?.account?.data?.parsed?.info?.tokenAmount?.uiAmount ?? 0;
+
+    solBalEl.textContent=sol.toFixed(4);
+    usdcBalEl.textContent=Number(usdc).toFixed(2);
+    setStatus("OK","ok");
+  }catch(e){
+    setStatus("Erreur balances","err");
+  }
+}
+
+btnConnect.onclick=async ()=>{
+  if(!window.solana?.isPhantom){ setStatus("Phantom non détecté","err"); window.open("https://phantom.app/","_blank"); return; }
+  try{
+    const r=await window.solana.connect();
+    pubkey=r.publicKey;
+    walletPill.textContent="Wallet: "+shortPk(pubkey);
+    afterConnect.classList.remove("hidden");
+    btnConnect.textContent="Wallet connecté";
+    btnConnect.disabled=true;
+    await refreshBalances();
+    btnStart.disabled=!canStart();
+  }catch(e){
+    setStatus("Connexion refusée","err");
+  }
+};
+
+budgetEl.oninput=()=>{ btnStart.disabled=!canStart(); };
+btnRefresh.onclick=()=>{ if(pubkey) refreshBalances(); };
+
+btnStart.onclick=async ()=>{
+  if(!canStart()) return;
+  const budget=Number(budgetEl.value);
+  setStatus("Démarrage…");
+  btnStart.disabled=true;
+
+  try{
+    const res=await fetch(API_START,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({wallet:pubkey.toString(),budget})});
+    const data=await res.json().catch(()=>({}));
+    if(!res.ok){ setStatus(data?.error||"Start failed","err"); btnStart.disabled=false; return; }
+    setStatus("WOLVERINE démarré ✅","ok");
+  }catch(e){
+    setStatus("Erreur réseau/API","err");
+    btnStart.disabled=false;
+  }
+};
+JS
+
+chmod 644 "$DOCROOT/index.html" "$DOCROOT/app.js"
+
+echo "== 3) nginx test + reload =="
+nginx -t
+systemctl reload nginx
+
+echo
+echo "== 4) PROOF (remote HTML should NOT contain traderone_overlay.js) =="
+curl -ks https://fireinners.online/wolverine/ | grep -n "traderone_overlay" || echo "OK: no traderone_overlay"
+echo "Tip: hard refresh Ctrl+F5 / navigation privée si cache."
+SH
+
+bash /tmp/OVERWRITE_REAL_WOLVERINE_INDEX.sh
