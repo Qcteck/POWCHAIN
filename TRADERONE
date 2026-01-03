@@ -1,98 +1,157 @@
-cat >/tmp/WOLVERINE_FIND_VHOST_BY_WOLVERINE_AND_PATCH.sh <<'SH'
+cat >/tmp/WOLVERINE_PATCH_NODE_8585_PROXY_TO_9696.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-PORT_BACKEND="9696"
-TS="$(date +%s)"
+BACKEND_PORT="9696"
 
-echo "== 1) Trouver les fichiers nginx qui mentionnent wolverine/fireinners =="
-nginx -T 2>/dev/null | awk '
-  /^# configuration file / {file=$4; sub(":$","",file)}
-  /wolverine|fireinners/ {print file ":" $0}
-' | head -n 120 || true
+echo "== 0) Sanity: backend TraderOne doit répondre en JSON sur $BACKEND_PORT =="
+curl -sS "http://127.0.0.1:${BACKEND_PORT}/api/health" 2>/dev/null | head -c 120 || true
+echo
 echo
 
-echo "== 2) Détecter le fichier qui contient l alias wolverine (le plus fiable) =="
-CONF="$(nginx -T 2>/dev/null | awk '
-  /^# configuration file / {file=$4; sub(":$","",file)}
-  /alias[[:space:]]+\/var\/www\/fireinners\/wolverine\// {print file; exit}
-')"
+echo "== 1) Trouver le PID qui écoute 8585 =="
+PID="$(ss -lntp | awk '
+  /:8585[[:space:]]/ {
+    if (match($0,/pid=([0-9]+)/,m)) { print m[1]; exit }
+  }')"
 
-if [ -z "${CONF:-}" ]; then
-  echo "ALIAS not found. Fallback: chercher un location /wolverine/"
-  CONF="$(nginx -T 2>/dev/null | awk '
-    /^# configuration file / {file=$4; sub(":$","",file)}
-    /location[[:space:]]+(\^~[[:space:]]+)?\/wolverine\// {print file; exit}
-  ')"
+if [ -z "${PID:-}" ]; then
+  echo "ERROR: personne n'écoute sur 8585"
+  ss -lntp | head -n 50
+  exit 1
+fi
+echo "PID=$PID"
+echo
+
+echo "== 2) Infos process 8585 =="
+ps -fp "$PID" || true
+echo
+APPDIR="$(readlink -f "/proc/$PID/cwd" || true)"
+echo "CWD=$APPDIR"
+echo "CMDLINE:"
+tr '\0' ' ' < "/proc/$PID/cmdline"; echo
+echo
+
+if [ -z "${APPDIR:-}" ] || [ ! -d "$APPDIR" ]; then
+  echo "ERROR: impossible de déterminer le dossier de l'app 8585"
+  exit 2
 fi
 
-echo "CONF=$CONF"
-[ -n "${CONF:-}" ] && [ -f "$CONF" ] || { echo "ERROR: impossible de trouver le vhost qui sert /wolverine/"; exit 1; }
-echo
+cd "$APPDIR"
 
-echo "== 3) Backup conf =="
-cp -a "$CONF" "$CONF.bak.$TS"
-
-echo "== 4) Inject proxy API DANS le server{} qui contient /wolverine/ =="
-# On injecte dans le server{} qui contient l'alias wolverine (pas besoin de server_name)
-awk -v port="$PORT_BACKEND" '
-BEGIN{
-  in_server=0; has_wolv=0; inserted=0;
-}
-{
-  line=$0;
-
-  if ($0 ~ /^[[:space:]]*server[[:space:]]*\{/){
-    in_server=1; has_wolv=0;
-  }
-
-  if (in_server && ($0 ~ /alias[[:space:]]+\/var\/www\/fireinners\/wolverine\// || $0 ~ /location[[:space:]]+\^~[[:space:]]+\/wolverine\// || $0 ~ /location[[:space:]]+\/wolverine\//)){
-    has_wolv=1;
-  }
-
-  # Avant la fin du bon server{}, inject si pas déjà présent dans le fichier
-  if (in_server && has_wolv && $0 ~ /^[[:space:]]*\}[[:space:]]*$/ && inserted==0){
-    print ""
-    print "  # WOLVERINE_TRADERONE_API_BEGIN"
-    print "  location ^~ /wolverine/traderone/api/ {"
-    print "    proxy_http_version 1.1;"
-    print "    proxy_set_header Host $host;"
-    print "    proxy_set_header X-Real-IP $remote_addr;"
-    print "    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;"
-    print "    proxy_set_header X-Forwarded-Proto $scheme;"
-    print "    proxy_pass http://127.0.0.1:" port "/api/;"
-    print "  }"
-    print "  # WOLVERINE_TRADERONE_API_END"
-    print ""
-    inserted=1;
-  }
-
-  print line;
-
-  if (in_server && $0 ~ /^[[:space:]]*\}[[:space:]]*$/){
-    in_server=0;
-  }
-}
-' "$CONF.bak.$TS" > "$CONF"
-
-echo "== 5) nginx test + reload =="
-nginx -t
-systemctl reload nginx
-echo
-
-echo "== 6) TEST local (trouve un port nginx qui écoute, puis curl avec Host) =="
-TEST_PORT="$(ss -lntp | awk '/nginx/ {split($4,a,":"); p=a[length(a)]; if (p!="") {print p; exit}}')"
-if [ -z "${TEST_PORT:-}" ]; then
-  echo "WARN: je ne vois pas nginx en écoute (ss -lntp). On test quand même 8585 (si c est nginx/proxy)."
-  TEST_PORT="8585"
+echo "== 3) Détecter le fichier principal Express (best effort) =="
+MAIN=""
+# 1) package.json main
+if [ -f package.json ]; then
+  MAIN="$(node -p "try{require('./package.json').main||''}catch(e){''}" 2>/dev/null || true)"
 fi
-echo "TEST_PORT=$TEST_PORT"
+# 2) cmdline: node <file>
+if [ -z "$MAIN" ]; then
+  MAIN="$(tr '\0' ' ' < "/proc/$PID/cmdline" | awk '
+    {
+      for(i=1;i<=NF;i++){
+        if($i ~ /node$/ && (i+1)<=NF && $(i+1) ~ /\.js$/){ print $(i+1); exit }
+      }
+    }')"
+fi
+# 3) fallbacks
+if [ -z "$MAIN" ]; then
+  for f in server.js app.js index.js main.js; do
+    [ -f "$f" ] && MAIN="$f" && break
+  done
+fi
 
+if [ -z "$MAIN" ] || [ ! -f "$MAIN" ]; then
+  echo "WARN: fichier principal non trouvé automatiquement."
+  echo "Je liste les fichiers qui ressemblent à un serveur Express:"
+  grep -RIn --include='*.js' -E "express\(|app\.listen\(|createServer\(" . | head -n 40 || true
+  echo
+  echo "=> Trouve ton fichier principal, puis relance en fixant MAIN_FILE:"
+  echo "   MAIN_FILE=server.js bash /tmp/WOLVERINE_PATCH_NODE_8585_PROXY_TO_9696.sh"
+  exit 3
+fi
+
+# Permet de forcer si tu relances: MAIN_FILE=...
+MAIN="${MAIN_FILE:-$MAIN}"
+echo "MAIN=$MAIN"
+echo
+
+echo "== 4) Installer deps proxy (si node_modules existe) =="
+if [ -f package.json ]; then
+  npm i http-proxy-middleware >/dev/null 2>&1 || true
+fi
+
+echo "== 5) Créer le middleware proxy =="
+cat > proxy-traderone.js <<'JS'
+const { createProxyMiddleware } = require("http-proxy-middleware");
+
+module.exports = function(app){
+  // /wolverine/traderone/api/*  ->  http://127.0.0.1:9696/api/*
+  app.use(
+    "/wolverine/traderone/api",
+    createProxyMiddleware({
+      target: "http://127.0.0.1:9696",
+      changeOrigin: true,
+      pathRewrite: (path) => path.replace(/^\/wolverine\/traderone\/api/, "/api"),
+      logLevel: "silent",
+    })
+  );
+};
+JS
+
+echo "== 6) Injecter require('./proxy-traderone')(app); dans $MAIN (si absent) =="
+if grep -q "proxy-traderone" "$MAIN"; then
+  echo "Déjà présent -> skip"
+else
+  cp -a "$MAIN" "$MAIN.bak.$(date +%s)"
+
+  # On injecte juste après la création de app (const app = express() ou var app = express())
+  awk '
+    BEGIN{done=0}
+    {
+      print $0
+      if(done==0 && ($0 ~ /const[[:space:]]+app[[:space:]]*=[[:space:]]*express\(\)/ || $0 ~ /var[[:space:]]+app[[:space:]]*=[[:space:]]*express\(\)/)){
+        print "require(\"./proxy-traderone\")(app);"
+        done=1
+      }
+    }
+    END{
+      if(done==0){
+        # si on n a pas trouvé, on ne casse pas: on laisse le fichier tel quel
+      }
+    }
+  ' "$MAIN.bak.$(ls -t "$MAIN".bak.* | head -n1 | sed 's/.*bak\.//')" > "$MAIN" 2>/dev/null || true
+
+  # Si l'awk au-dessus n'a pas injecté (cas rare), on met en haut du fichier après requires
+  if ! grep -q "proxy-traderone" "$MAIN"; then
+    echo "WARN: injection auto non trouvée (app=express() introuvable)."
+    echo "Je mets une ligne en début de fichier (à vérifier)."
+    tmp="$(mktemp)"
+    {
+      echo '/* injected */'
+      echo '/* after you define: const app = express(); keep: require("./proxy-traderone")(app); */'
+      cat "$MAIN"
+    } > "$tmp"
+    mv "$tmp" "$MAIN"
+  fi
+fi
+
+echo
+echo "== 7) Test LOCAL sur 8585 (doit renvoyer JSON, pas HTML) =="
 WALLET="2uHgvSM6vrm7Ye7ntMFUA1RHiqAinGjeCx17dozsLx1z"
-curl -sS -D- "http://127.0.0.1:${TEST_PORT}/wolverine/traderone/api/balances2?wallet=$WALLET" \
-  -H "Host: fireinners.online" | head -c 350
+echo "-- (avant restart) -> si c est encore HTML c est normal"
+curl -sS -D- "http://127.0.0.1:8585/wolverine/traderone/api/balances2?wallet=$WALLET" | head -c 220 || true
 echo
-echo "DONE ✅"
+echo
+
+echo "== 8) Comment redémarrer (je te donne les options) =="
+echo "PID actuel 8585: $PID"
+echo "-> Si c'est systemd:  systemctl restart <SERVICE_NAME>"
+echo "-> Si c'est pm2:      pm2 restart all"
+echo "-> Sinon: kill $PID  puis relancer la commande node vue dans CMDLINE"
+echo
+echo "DONE ✅ (proxy ajouté). Redémarre l'app 8585, puis reteste:"
+echo "curl -sS http://127.0.0.1:8585/wolverine/traderone/api/balances2?wallet=$WALLET | head -c 200; echo"
 SH
 
-bash /tmp/WOLVERINE_FIND_VHOST_BY_WOLVERINE_AND_PATCH.sh
+bash /tmp/WOLVERINE_PATCH_NODE_8585_PROXY_TO_9696.sh
