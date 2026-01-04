@@ -1,12 +1,94 @@
+set -euo pipefail
+
 APPJS="/var/www/fireinners/wolverine/app.js"
 TS="$(date +%s)"
 cp -a "$APPJS" "$APPJS.bak.$TS"
 echo "Backup: $APPJS.bak.$TS"
 
-# Remplace la ligne bugguée par une version correcte
-perl -i -pe 's/const msg = j\?\.\s*error\s*\?\s*:\s*txt\.slice\(0,200\);/const msg = (j \&\& j.error) ? String(j.error) : txt.slice(0,200);/g' "$APPJS"
+# Supprime un ancien bloc balances si présent
+perl -0777 -i -pe 's|/\*\s*WOLVERINE_BALANCES_FIX_BEGIN\s*\*/.*?/\*\s*WOLVERINE_BALANCES_FIX_END\s*\*/\s*||sg' "$APPJS" || true
 
-# Vérifie qu’il reste plus de "? :"
-grep -nE '\?\s*:' "$APPJS" | head -n 20 || true
+cat >> "$APPJS" <<'JS'
 
-echo "OK. Maintenant Ctrl+F5 sur /wolverine"
+/* WOLVERINE_BALANCES_FIX_BEGIN */
+(function(){
+  const $ = (id)=>document.getElementById(id);
+
+  const uSol  = $("uSol");
+  const uUsdc = $("uUsdc");
+  const tAddr = $("tAddr");
+  const tSol  = $("tSol");
+  const tUsdc = $("tUsdc");
+
+  const btnRefresh = $("btnRefresh");
+  const statusEl = $("statusText") || $("status");
+
+  function setStatus(t){
+    try { if (statusEl) statusEl.textContent = t; } catch(e){}
+    console.log("[STATUS]", t);
+  }
+
+  // Choisit la pubkey globale peu importe comment elle a été set
+  function getUserWallet(){
+    return (window.pubkey && window.pubkey.toString) ? window.pubkey.toString()
+         : (typeof pubkey !== "undefined" && pubkey && pubkey.toString) ? pubkey.toString()
+         : "";
+  }
+
+  async function fetchBalances(wallet){
+    const r = await fetch(`/wolverine/traderone/api/balances2?wallet=${encodeURIComponent(wallet)}`);
+    const txt = await r.text();
+    if(!r.ok) throw new Error("balances2 HTTP " + r.status + " " + txt.slice(0,160));
+    try { return JSON.parse(txt); } catch(e){ throw new Error("balances2 bad JSON: " + txt.slice(0,160)); }
+  }
+
+  window.refreshBoth = async function refreshBoth(){
+    try{
+      const userWallet = getUserWallet();
+      const botWallet = (tAddr && tAddr.textContent || "").trim();
+
+      if(!botWallet){
+        setStatus("ERR: adresse BOT vide (tAddr)");
+        return;
+      }
+
+      // 1) BOT
+      const bot = await fetchBalances(botWallet);
+      const botSol  = Number(bot?.user?.sol  ?? bot?.sol  ?? 0);
+      const botUsdc = Number(bot?.user?.usdc ?? bot?.usdc ?? 0);
+
+      if (tSol)  tSol.textContent  = botSol.toFixed(6);
+      if (tUsdc) tUsdc.textContent = botUsdc.toFixed(4);
+
+      // 2) USER (si connecté)
+      if(userWallet){
+        const usr = await fetchBalances(userWallet);
+        const usrSol  = Number(usr?.user?.sol  ?? usr?.sol  ?? 0);
+        const usrUsdc = Number(usr?.user?.usdc ?? usr?.usdc ?? 0);
+
+        if (uSol)  uSol.textContent  = usrSol.toFixed(6);
+        if (uUsdc) uUsdc.textContent = usrUsdc.toFixed(4);
+      } else {
+        if (uSol)  uSol.textContent  = "—";
+        if (uUsdc) uUsdc.textContent = "—";
+      }
+
+      setStatus("OK");
+    } catch(e){
+      console.error(e);
+      setStatus("ERR " + (e?.message || e));
+    }
+  };
+
+  if(btnRefresh){
+    btnRefresh.onclick = () => window.refreshBoth();
+  }
+
+  // auto-refresh au load (au moins BOT)
+  window.addEventListener("load", () => { window.refreshBoth(); });
+})();
+/* WOLVERINE_BALANCES_FIX_END */
+
+JS
+
+echo "Patched balances. Fais Ctrl+F5 sur /wolverine"
