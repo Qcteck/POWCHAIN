@@ -2,10 +2,133 @@ set -euo pipefail
 APPJS="/var/www/fireinners/wolverine/app.js"
 TS="$(date +%s)"
 cp -a "$APPJS" "$APPJS.bak.$TS"
-echo "Backup: $APPJS.bak.$TS"
-
-# remplace toutes les occurrences mainnet-beta par un RPC qui accepte le browser
-# (Ankr public RPC)
 sed -i 's#https://api\.mainnet-beta\.solana\.com#https://rpc.ankr.com/solana#g' "$APPJS"
+echo "OK ✅ Ctrl+F5"
 
-echo "DONE ✅ Ctrl+F5 sur /wolverine puis reteste START"
+
+
+set -euo pipefail
+HTML="/var/www/fireinners/wolverine/index.html"
+APPJS="/var/www/fireinners/wolverine/app.js"
+TS="$(date +%s)"
+cp -a "$HTML"  "$HTML.bak.$TS"
+cp -a "$APPJS" "$APPJS.bak.$TS"
+echo "Backups: $HTML.bak.$TS | $APPJS.bak.$TS"
+
+# 1) Ajoute colonnes table (Wallet / SOL / USDC / Gain / % / 24h / 24h% / Cache)
+perl -0777 -i -pe 's#<th>Wallet</th><th>SOL</th><th>USDC</th><th>Cache</th>#<th>Wallet</th><th>SOL</th><th>USDC</th><th>Gain</th><th>%</th><th>24h</th><th>24h%</th><th>Cache</th>#g' "$HTML"
+
+# 2) Patch app.js: ajoute gain store + modifie la row template
+node - <<'JS'
+const fs=require("fs");
+const f="/var/www/fireinners/wolverine/app.js";
+let s=fs.readFileSync(f,"utf8");
+
+// Gain store (append once)
+if(!s.includes("WOLVERINE_GAIN_USDC_V1")){
+  s += `
+
+/* WOLVERINE_GAIN_USDC_V1 */
+(function(){
+  const K_BASE="wolv_usdc_base_v1";
+  const K_HIST="wolv_usdc_hist_v1";
+  const now=()=>Date.now();
+
+  function load(objKey, def){
+    try{ return JSON.parse(localStorage.getItem(objKey)||"") || def; }catch(e){ return def; }
+  }
+  function save(objKey, v){ try{ localStorage.setItem(objKey, JSON.stringify(v)); }catch(e){} }
+
+  function setBaseline(wallet, usdc){
+    const base=load(K_BASE,{});
+    if(base[wallet]===undefined){
+      base[wallet]=Number(usdc||0);
+      save(K_BASE, base);
+    }
+    return base[wallet];
+  }
+
+  function pushHist(wallet, usdc){
+    const hist=load(K_HIST,{});
+    const arr=(hist[wallet]||[]);
+    const t=now();
+    arr.push([t, Number(usdc||0)]);
+    // prune > 26h just to be safe
+    const cutoff=t - 26*60*60*1000;
+    const pruned=arr.filter(([ts,_])=>ts>=cutoff);
+    hist[wallet]=pruned;
+    save(K_HIST, hist);
+  }
+
+  function get24hAgo(wallet){
+    const hist=load(K_HIST,{});
+    const arr=(hist[wallet]||[]);
+    if(!arr.length) return null;
+    const t=now();
+    const target=t - 24*60*60*1000;
+    // pick snapshot closest to target (older-or-equal preferred)
+    let best=null;
+    for(const [ts,val] of arr){
+      if(ts<=target) best=[ts,val];
+    }
+    // if none older, take earliest we have (still gives “since first seen”)
+    return best || arr[0];
+  }
+
+  window.__gainUSDC = function(wallet, currentUsdc){
+    const cur=Number(currentUsdc||0);
+
+    const base=setBaseline(wallet, cur);
+    pushHist(wallet, cur);
+
+    const gain=cur - base;
+    const pct = base>0 ? (gain/base)*100 : 0;
+
+    const snap=get24hAgo(wallet);
+    const prev24 = snap ? Number(snap[1]||0) : cur;
+    const gain24 = cur - prev24;
+    const pct24  = prev24>0 ? (gain24/prev24)*100 : 0;
+
+    return { base, cur, gain, pct, gain24, pct24 };
+  };
+})();
+`;
+}
+
+// Update row template (the one that builds <tr> with 4 tds)
+s = s.replace(
+  /tr\.innerHTML\s*=\s*`<td[^`]+<td>—<\/td>\s*<td>—<\/td>\s*<td>—<\/td>`;/m,
+`tr.innerHTML = \`<td style="font-family:monospace;max-width:280px;overflow:hidden;text-overflow:ellipsis;">\${w}</td>
+                      <td>—</td><td>—</td>
+                      <td>—</td><td>—</td>
+                      <td>—</td><td>—</td>
+                      <td>—</td>\`;`
+);
+
+// After you set SOL/USDC in refreshTable, fill gains cols
+if(!s.includes("WOLV_FILL_GAINS_IN_TABLE")){
+  s = s.replace(
+    /tr\.children$begin:math:display$1$end:math:display$\.textContent\s*=\s*fmt$begin:math:text$sol\,\\s\*6$end:math:text$;\s*\n\s*tr\.children$begin:math:display$2$end:math:display$\.textContent\s*=\s*fmt$begin:math:text$usdc\,\\s\*4$end:math:text$;\s*\n\s*tr\.children$begin:math:display$3$end:math:display$\.textContent\s*=\s*cache\s*\|\|\s*"";/m,
+`tr.children[1].textContent = fmt(sol, 6);
+        tr.children[2].textContent = fmt(usdc, 4);
+
+        // gains USDC (depuis début + 24h)
+        try{
+          const g = window.__gainUSDC ? window.__gainUSDC(w, usdc) : null;
+          if(g){
+            tr.children[3].textContent = (g.gain>=0?"+":"") + g.gain.toFixed(4);
+            tr.children[4].textContent = (g.pct>=0?"+":"") + g.pct.toFixed(2) + "%";
+            tr.children[5].textContent = (g.gain24>=0?"+":"") + g.gain24.toFixed(4);
+            tr.children[6].textContent = (g.pct24>=0?"+":"") + g.pct24.toFixed(2) + "%";
+          }
+        }catch(e){ /* ignore */ }
+
+        tr.children[7].textContent = cache || "";`
+  );
+}
+
+fs.writeFileSync(f,s,"utf8");
+console.log("OK gains USDC patched");
+JS
+
+echo "DONE ✅ Ctrl+F5 sur /wolverine"
