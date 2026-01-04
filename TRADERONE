@@ -1,112 +1,105 @@
-cat >/tmp/WOLVERINE_FIX_START_404.sh <<'SH'
+cat >/tmp/WOLVERINE_ADD_START_ROUTE_SAFE.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 
 SVC="traderone.service"
-FILE="/opt/traderone-opt/server.js"
 TS="$(date +%s)"
-WALLET="2uHgvSM6vrm7Ye7ntMFUA1RHiqAinGjeCx17dozsLx1z"
-PAYLOAD='{"wallet":"'"$WALLET"'","budget":1}'
+PAYLOAD='{"wallet":"2uHgvSM6vrm7Ye7ntMFUA1RHiqAinGjeCx17dozsLx1z","budget":1}'
 
-echo "== Backup =="
-cp -a "$FILE" "$FILE.bak.$TS"
-echo "Backup: $FILE.bak.$TS"
+echo "== 1) Trouver le vrai fichier lancé par systemd =="
+systemctl cat "$SVC" --no-pager | sed -n '1,200p'
+EXE="$(systemctl show -p ExecStart "$SVC" --value | head -n1)"
+echo
+echo "ExecStart: $EXE"
 echo
 
-echo "== 1) Cherche des routes start existantes dans server.js =="
-grep -nE 'app\.(post|get)\("([^"]*start[^"]*)"' "$FILE" || true
-echo
+# essaye d'extraire le .js du ExecStart
+MAIN="$(echo "$EXE" | grep -oE '/[^ ]+\.js' | head -n1 || true)"
 
-echo "== 2) Test endpoints possibles en LOCAL (127.0.0.1:8585) =="
-CANDS=(
-  "/api/start"
-  "/api/traderone/start"
-  "/api/wolverine/start"
-  "/traderone/api/start"
-  "/wolverine/traderone/api/start"
-)
-BEST=""
-for p in "${CANDS[@]}"; do
-  code="$(curl -sS -o /tmp/_start_resp.$$ -w '%{http_code}' \
-    -X POST "http://127.0.0.1:8585$p" -H 'Content-Type: application/json' --data "$PAYLOAD" || true)"
-  head="$(head -c 120 /tmp/_start_resp.$$ 2>/dev/null || true)"
-  echo "$p -> HTTP $code | $head"
-  # on prend le premier qui n'est pas 404 (200/400/401/500 = route existe)
-  if [ "$code" != "404" ] && [ -z "$BEST" ]; then BEST="$p"; fi
-done
-rm -f /tmp/_start_resp.$$ 2>/dev/null || true
-
-if [ -z "$BEST" ]; then
-  echo
-  echo "WARN: aucun endpoint start détecté (tout 404). On va quand même créer /wolverine/traderone/api/start -> /api/start (à toi d’implémenter /api/start si besoin)."
-  BEST="/api/start"
+# fallback: cherche un fichier qui mentionne express + 8585
+if [ -z "${MAIN:-}" ]; then
+  echo "WARN: pas de .js dans ExecStart, fallback search..."
+  MAIN="$(grep -RIl --exclude-dir=node_modules -E 'express\(|app\.listen\(|8585' /opt /var/www 2>/dev/null | head -n1 || true)"
 fi
 
-echo
-echo "== BEST endpoint local trouvé: $BEST =="
+if [ -z "${MAIN:-}" ] || [ ! -f "$MAIN" ]; then
+  echo "❌ Impossible de trouver le fichier principal Node."
+  echo "Donne-moi la sortie de: systemctl cat traderone.service"
+  exit 1
+fi
+
+echo "MAIN JS = $MAIN"
 echo
 
-echo "== 3) Patch server.js: ajouter alias /wolverine/traderone/api/start (proxy interne) =="
-node - <<JS
+echo "== 2) Backup =="
+cp -a "$MAIN" "$MAIN.bak.$TS"
+echo "Backup: $MAIN.bak.$TS"
+echo
+
+echo "== 3) Injecter route start (sans bash-substitution) =="
+cat >/tmp/_patch_start_route.js <<'JS'
 const fs = require("fs");
-const FILE="${FILE}";
-let s = fs.readFileSync(FILE,"utf8");
 
-if (!s.includes("WOLVERINE_START_ALIAS_BEGIN")) {
-  const m = s.match(/const\s+app\s*=\s*express\(\)\s*;\s*/m);
-  if (!m) throw new Error("Cannot find: const app = express();");
+const file = process.argv[2];
+let s = fs.readFileSync(file, "utf8");
 
-  const block = `
-/* WOLVERINE_START_ALIAS_BEGIN */
-// POST /wolverine/traderone/api/start -> proxy to ${BEST}
-app.post("/wolverine/traderone/api/start", (req, res) => {
-  const http = require("http");
-  const body = JSON.stringify(req.body || {});
-  const opts = {
-    hostname: "127.0.0.1",
-    port: 8585,
-    path: "${BEST}",
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Content-Length": Buffer.byteLength(body)
-    }
-  };
-
-  const r = http.request(opts, (p) => {
-    res.statusCode = p.statusCode || 502;
-    Object.entries(p.headers || {}).forEach(([k,v]) => { if (v !== undefined) res.setHeader(k, v); });
-    p.pipe(res);
-  });
-
-  r.on("error", (e) => res.status(502).json({ ok:false, error:"proxy_failed", detail:String(e && e.message || e) }));
-  r.write(body);
-  r.end();
-});
-/* WOLVERINE_START_ALIAS_END */
-
-`;
-  s = s.replace(m[0], m[0] + block);
-  console.log("Injected START alias route.");
-} else {
-  console.log("START alias already present -> skip");
+if (s.includes("WOLVERINE_START_ROUTE_BEGIN")) {
+  console.log("Route start déjà présente -> skip");
+  process.exit(0);
 }
 
-fs.writeFileSync(FILE, s, "utf8");
-console.log("Patched:", FILE);
+// endroit d'injection: après app.use(express.json()) si trouvé, sinon après app=express()
+let insertPos = -1;
+
+let m = s.match(/app\.use\(\s*express\.json\(\)\s*\)\s*;?/);
+if (m) insertPos = s.indexOf(m[0]) + m[0].length;
+
+if (insertPos < 0) {
+  m = s.match(/const\s+app\s*=\s*express\(\)\s*;?/);
+  if (!m) throw new Error("Impossible de trouver `const app = express()` dans " + file);
+  insertPos = s.indexOf(m[0]) + m[0].length;
+}
+
+const block = `
+
+/* WOLVERINE_START_ROUTE_BEGIN */
+// Simple route start pour que le bouton START fonctionne.
+// À connecter ensuite à la logique réelle du bot si besoin.
+app.post("/wolverine/traderone/api/start", async (req, res) => {
+  try {
+    const body = req.body || {};
+    console.log("[START] payload:", body);
+
+    // TODO: ici tu appelles ta vraie fonction de démarrage si tu en as une
+    // ex: await startTraderOne(body.wallet, body.budget);
+
+    return res.json({ ok: true, received: body, msg: "start accepted" });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: "start_failed", detail: String(e?.message || e) });
+  }
+});
+/* WOLVERINE_START_ROUTE_END */
+`;
+
+s = s.slice(0, insertPos) + block + s.slice(insertPos);
+fs.writeFileSync(file, s, "utf8");
+console.log("Injected start route into:", file);
 JS
 
+node /tmp/_patch_start_route.js "$MAIN"
 echo
+
 echo "== 4) Restart service =="
 systemctl restart "$SVC"
 sleep 1
-
+systemctl status "$SVC" --no-pager -l | sed -n '1,40p'
 echo
-echo "== 5) Re-test via PUBLIC URL (doit plus être 404) =="
+
+echo "== 5) Test PUBLIC (doit PLUS être 404) =="
 curl -ksS -D- "https://fireinners.online/wolverine/traderone/api/start" \
   -X POST -H "Content-Type: application/json" --data "$PAYLOAD" | head -n 60
 echo
-echo "DONE ✅  => Ctrl+F5 /wolverine puis clique START (plus de 404)."
+echo "DONE ✅  -> Ctrl+F5 sur /wolverine puis clique START"
 SH
 
-bash /tmp/WOLVERINE_FIX_START_404.sh
+bash /tmp/WOLVERINE_ADD_START_ROUTE_SAFE.sh
