@@ -1,41 +1,79 @@
 set -euo pipefail
+DOMAIN="fireinners.online"
 TS="$(date +%s)"
+BK="/root/nginx_backup_$TS"
+SNIP="/etc/nginx/snippets/wolv_rpc_proxy.conf"
+TMP="/tmp/nginxT.$TS.txt"
 
-echo "== 0) Mettre de côté les backups qui cassent nginx (si nginx include *) =="
-mkdir -p /root/nginx_quarantine_$TS
-for dir in /etc/nginx/sites-enabled /etc/nginx/conf.d; do
-  [ -d "$dir" ] || continue
-  find "$dir" -maxdepth 1 -type f \
-    \( -name "*.bak.*" -o -name "*.bad.*" -o -name "*.old" -o -name "*.tmp" -o -name "*~" \) \
-    -print -exec mv -v {} /root/nginx_quarantine_"$TS"/ \; || true
-done
+mkdir -p "$BK" /etc/nginx/snippets
 
-echo
-echo "== 1) Voir l’erreur exacte (file:line) =="
-nginx -t 2>&1 | tail -n 60 || true
-
-echo
-echo "== 2) Trouver et supprimer TOUTES les lignes proxy_set_header qui ont une valeur manquante =="
-# match: proxy_set_header <NAME> ;
-mapfile -t BADFILES < <(grep -RIl --include='*.conf' -E 'proxy_set_header[[:space:]]+[A-Za-z0-9_-]+[[:space:]]*;' /etc/nginx || true)
-
-if [ "${#BADFILES[@]}" -eq 0 ]; then
-  echo "Aucune ligne cassée trouvée avec ce pattern."
-else
-  printf "Fichiers à corriger:\n"; printf " - %s\n" "${BADFILES[@]}"
-  for f in "${BADFILES[@]}"; do
-    cp -a "$f" "$f.bak.$TS"
-    sed -i -E '/proxy_set_header[[:space:]]+[A-Za-z0-9_-]+[[:space:]]*;/d' "$f"
-    echo "Fixed: $f (backup: $f.bak.$TS)"
-  done
-fi
-
-echo
-echo "== 3) Re-test nginx (DOIT PASSER) =="
+echo "== 1) nginx must be OK =="
 nginx -t
 
-echo
-echo "== 4) Reload nginx =="
+echo "== 2) write RPC proxy snippet (adds proof header) =="
+cat > "$SNIP" <<'EOF'
+# Wolverine: Solana RPC proxy (same-origin)
+resolver 1.1.1.1 8.8.8.8 valid=300s ipv6=off;
+
+location = /wolverine/traderone/api/rpc {
+  add_header X-Wolv-RPC "1" always;
+
+  proxy_pass https://api.mainnet-beta.solana.com;
+  proxy_http_version 1.1;
+
+  proxy_ssl_server_name on;
+  proxy_set_header Host api.mainnet-beta.solana.com;
+
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+}
+EOF
+
+echo "== 3) dump final nginx config =="
+nginx -T > "$TMP" 2>&1
+
+echo "== 4) find candidate conf files that declare $DOMAIN and listen 443 =="
+mapfile -t FILES < <(
+  awk -v d="$DOMAIN" '
+    /^# configuration file /{f=$4; sub(/:$/,"",f)}
+    $0 ~ /server_name/ && $0 ~ d {hit[f]=1}
+    $0 ~ /listen/ && $0 ~ /443/ {ls[f]=1}
+    END{for(k in hit) if(ls[k]) print k}
+  ' "$TMP" | sort -u
+)
+
+echo "Candidates:"
+printf ' - %s\n' "${FILES[@]:-NONE}"
+[ "${#FILES[@]}" -gt 0 ] || { echo "ERR: no candidate files found for $DOMAIN on 443"; exit 1; }
+
+echo "== 5) inject include snippet inside matching server{} blocks (domain + 443) =="
+for f in "${FILES[@]}"; do
+  [ -f "$f" ] || continue
+  cp -a "$f" "$BK/$(basename "$f").$TS"
+  echo "Backup -> $BK/$(basename "$f").$TS"
+
+  # If already included, skip
+  if grep -qF "include $SNIP;" "$f"; then
+    echo "OK include already present in $f"
+    continue
+  fi
+
+  # Inject include inside server blocks that mention domain (best-effort)
+  perl -0777 -i -pe '
+    my $snip = "  include /etc/nginx/snippets/wolv_rpc_proxy.conf;\n";
+    s{
+      (server\s*\{[\s\S]*?server_name[\s\S]*?fireinners\.online[\s\S]*?\n)
+    }{$1$snip}gex;
+  ' "$f"
+
+  echo "Injected include into $f (if matching server_name block found)"
+done
+
+echo "== 6) nginx test + reload =="
+nginx -t
 systemctl reload nginx
 
-echo "OK ✅ nginx reload"
+echo "== 7) TEST (must show X-Wolv-RPC: 1, and not 404) =="
+curl -ksS -i "https://$DOMAIN/wolverine/traderone/api/rpc" \
+  -H 'content-type: application/json' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' | head -n 60
