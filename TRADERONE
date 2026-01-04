@@ -6,10 +6,9 @@ SNIP="/etc/nginx/snippets/wolv_rpc_proxy.conf"
 TS="$(date +%s)"
 DUMP="/tmp/nginxT.$TS.txt"
 
-echo "== 1) Créer le snippet RPC =="
+# (si le snippet existe déjà, pas grave)
 mkdir -p /etc/nginx/snippets
 cat > "$SNIP" <<'EOF'
-# Wolverine: Solana RPC proxy (same-origin)
 resolver 1.1.1.1 8.8.8.8 valid=300s ipv6=off;
 
 location = /wolverine/traderone/api/rpc {
@@ -26,10 +25,10 @@ location = /wolverine/traderone/api/rpc {
 }
 EOF
 
-echo "== 2) Dump config nginx (pour trouver le bon vhost 443) =="
+echo "== Dump nginx -T =="
 nginx -T > "$DUMP" 2>&1
 
-echo "== 3) Trouver le fichier du server{} 443 qui match $DOMAIN =="
+echo "== Find vhost 443 for $DOMAIN =="
 TARGET="$(python3 - <<'PY'
 import re, sys
 p=sys.argv[1]
@@ -48,7 +47,7 @@ while i<len(lines):
             if br==0 and j>i: break
             j+=1
         txt="\n".join(block)
-        if re.search(r'listen\s+443', txt) and re.search(r'server_name\s+.*\bfireinners\.online\b', txt):
+        if ("listen 443" in txt or re.search(r'listen\s+443', txt)) and ("server_name" in txt) and ("fireinners.online" in txt):
             print(cur or "")
             sys.exit(0)
         i=j
@@ -58,11 +57,10 @@ PY
 "$DUMP")"
 
 echo "TARGET=$TARGET"
-[ -n "${TARGET:-}" ] || { echo "ERR: pas trouvé de server 443 pour $DOMAIN"; exit 1; }
-[ -f "$TARGET" ] || { echo "ERR: fichier introuvable: $TARGET"; exit 1; }
+[ -n "${TARGET:-}" ] || { echo "ERR: server 443 pour $DOMAIN introuvable"; exit 1; }
 
-echo "== 4) Injecter include du snippet dans TARGET (si absent) =="
-cp -a "$TARGET" "$TARGET.bak.$TS"
+echo "== Inject include snippet if missing =="
+cp -a "$TARGET" "$TARGET.bak.$TS" || true
 
 python3 - <<'PY'
 import re, sys
@@ -70,7 +68,7 @@ target=sys.argv[1]
 snip='/etc/nginx/snippets/wolv_rpc_proxy.conf'
 s=open(target,'r',errors='ignore').read().splitlines(True)
 
-if any(re.search(r'include\s+'+re.escape(snip)+r'\s*;', line) for line in s):
+if any('include '+snip in line for line in s):
     print("OK: include déjà présent")
     sys.exit(0)
 
@@ -78,7 +76,7 @@ out=[]
 inserted=False
 for line in s:
     out.append(line)
-    if (not inserted) and re.search(r'\bserver_name\b.*\bfireinners\.online\b', line):
+    if (not inserted) and ('server_name' in line) and ('fireinners.online' in line):
         out.append("  include /etc/nginx/snippets/wolv_rpc_proxy.conf;\n")
         inserted=True
 
@@ -87,11 +85,10 @@ print("Injected include into:", target)
 PY
 "$TARGET"
 
-echo "== 5) Test config + reload =="
 nginx -t
 systemctl reload nginx
 
-echo "== 6) TEST RPC (doit montrer X-Wolv-RPC: 1 et PAS 404) =="
+echo "== TEST =="
 curl -ksS -i "https://$DOMAIN/wolverine/traderone/api/rpc" \
   -H 'Content-Type: application/json' \
   --data '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' | head -n 80
