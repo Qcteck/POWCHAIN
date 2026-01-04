@@ -1,10 +1,22 @@
 set -euo pipefail
 
 DOMAIN="fireinners.online"
+BAD="/etc/nginx/snippets/fireinners-wolverine.conf"
 SNIP="/etc/nginx/snippets/wolverine_rpc_proxy.conf"
 
-mkdir -p /etc/nginx/snippets
+echo "== 0) Backup =="
+TS="$(date +%s)"
+[ -f "$BAD" ] && cp -a "$BAD" "$BAD.bak.$TS" && echo "Backup: $BAD.bak.$TS"
 
+echo
+echo "== 1) Remove RPC location from BAD snippet if present (it breaks nginx) =="
+if [ -f "$BAD" ]; then
+  perl -0777 -i -pe 's/location\s*=\s*\/wolverine\/traderone\/api\/rpc\s*\{[\s\S]*?\}\s*//g' "$BAD"
+fi
+
+echo
+echo "== 2) Create proper RPC location snippet =="
+mkdir -p /etc/nginx/snippets
 cat > "$SNIP" <<'EOF'
 # Wolverine: Solana RPC proxy (same-origin)
 resolver 1.1.1.1 8.8.8.8 valid=300s ipv6=off;
@@ -21,24 +33,28 @@ location = /wolverine/traderone/api/rpc {
 }
 EOF
 
-echo "== Find nginx server that serves /wolverine =="
-VHOST="$(grep -RIl --include='*.conf' -E 'location\s+(\^~\s+)?/wolverine|root\s+/var/www/fireinners' /etc/nginx 2>/dev/null | head -n 1 || true)"
+echo
+echo "== 3) Find REAL vhost server file for $DOMAIN (exclude snippets) =="
+VHOST="$(grep -RIl --include='*.conf' "server_name.*$DOMAIN" /etc/nginx/sites-enabled /etc/nginx/conf.d /etc/nginx/sites-available 2>/dev/null | head -n 1 || true)"
 echo "VHOST=$VHOST"
-[ -n "${VHOST:-}" ] || { echo "ERR: impossible de trouver le vhost qui sert /wolverine"; exit 1; }
+[ -n "${VHOST:-}" ] || { echo "ERR: vhost introuvable pour $DOMAIN. Run: nginx -T | grep -n \"server_name.*$DOMAIN\""; exit 1; }
 
-echo "== Inject include snippet into that server (if missing) =="
-if ! grep -q 'include /etc/nginx/snippets/wolverine_rpc_proxy.conf' "$VHOST"; then
-  TS="$(date +%s)"
+echo
+echo "== 4) Inject include into that server{} if missing =="
+if ! grep -q "include /etc/nginx/snippets/wolverine_rpc_proxy.conf" "$VHOST"; then
   cp -a "$VHOST" "$VHOST.bak.$TS"
   echo "Backup vhost: $VHOST.bak.$TS"
   perl -0777 -i -pe 's/(server\s*\{[\s\S]*?)(\n\})/$1\n\n  include \/etc\/nginx\/snippets\/wolverine_rpc_proxy\.conf;\n$2/s' "$VHOST"
 else
-  echo "OK: include déjà présent"
+  echo "OK: include already present"
 fi
 
+echo
+echo "== 5) Reload nginx =="
 nginx -t && systemctl reload nginx
 
-echo "== TEST HTTPS RPC (doit PAS être 404) =="
+echo
+echo "== 6) TEST HTTPS RPC (must NOT be 404) =="
 curl -ksS -i "https://$DOMAIN/wolverine/traderone/api/rpc" \
   -H 'content-type: application/json' \
   --data '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' | head -n 25
