@@ -4,106 +4,55 @@ TS="$(date +%s)"
 cp -a "$APPJS" "$APPJS.bak.$TS"
 echo "Backup: $APPJS.bak.$TS"
 
-# enlève ancien bloc si déjà ajouté
-perl -0777 -i -pe 's|/\*\s*WOLVERINE_FORCE_START_TX_BEGIN\s*\*/.*?/\*\s*WOLVERINE_FORCE_START_TX_END\s*\*/\s*||sg' "$APPJS" || true
+node - <<'JS'
+const fs=require("fs");
+const f="/var/www/fireinners/wolverine/app.js";
+let s=fs.readFileSync(f,"utf8");
 
-cat >> "$APPJS" <<'JS'
+// Inject resolver once
+if(!s.includes("WOLVERINE_SPL_AUTODETECT_V1")){
+  s += `
 
-/* WOLVERINE_FORCE_START_TX_BEGIN */
-(function(){
-  const oldBtn = document.getElementById("btnStart");
-  if(!oldBtn) return;
-
-  // Clone button to REMOVE all previous event listeners (important)
-  const btn = oldBtn.cloneNode(true);
-  oldBtn.parentNode.replaceChild(btn, oldBtn);
-
-  function setStatus(t){
-    try{
-      const el = document.getElementById("statusText") || document.getElementById("status");
-      if(el) el.textContent = t;
-    }catch(e){}
-    console.log("[STATUS]", t);
+/* WOLVERINE_SPL_AUTODETECT_V1 */
+window.__getSPL = function(){
+  const cands = [window.splToken, window.SplToken, window.spl_token, window.SPLToken, window.spltoken];
+  for(const v of cands){
+    if(v && typeof v.getAssociatedTokenAddress==="function") return v;
+    if(v && v.default && typeof v.default.getAssociatedTokenAddress==="function") return v.default;
   }
-  window.setStatus = window.setStatus || setStatus;
-
-  function botAddr(){
-    const s = (document.getElementById("tAddr")?.textContent || "").trim();
-    if(!s || s==="—") throw new Error("Adresse BOT (tAddr) manquante");
-    return s;
-  }
-
-  async function wolverineStartNow(){
-    if(!window.solana || !window.solana.isPhantom) throw new Error("Phantom non détecté");
-    if(!window.pubkey) throw new Error("Wallet non connectée");
-    if(!window.solanaWeb3 || !window.solanaWeb3.PublicKey) throw new Error("web3.js manquant");
-    if(!window.splToken || typeof window.splToken.getAssociatedTokenAddress!=="function")
-      throw new Error("spl-token manquant");
-
-    const budgetEl = document.getElementById("budget");
-    const b = Number(budgetEl?.value);
-    if(!isFinite(b) || b<=0) throw new Error("Budget invalide");
-
-    const connection = new window.solanaWeb3.Connection("https://api.mainnet-beta.solana.com", "confirmed");
-
-    const fromPk = new window.solanaWeb3.PublicKey(window.pubkey.toString());
-    const toPk   = new window.solanaWeb3.PublicKey(botAddr());
-
-    const USDC_MINT = new window.solanaWeb3.PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
-    const DEC = 6;
-    const amt = BigInt(Math.round(b * 10**DEC));
-    if(amt<=0n) throw new Error("Budget USDC invalide");
-
-    const fromAta = await window.splToken.getAssociatedTokenAddress(USDC_MINT, fromPk);
-    const toAta   = await window.splToken.getAssociatedTokenAddress(USDC_MINT, toPk);
-
-    const ix = [];
-    const toInfo = await connection.getAccountInfo(toAta);
-    if(!toInfo){
-      ix.push(window.splToken.createAssociatedTokenAccountInstruction(fromPk, toAta, toPk, USDC_MINT));
+  for(const [k,v] of Object.entries(window)){
+    if(v && typeof v==="object" &&
+       typeof v.getAssociatedTokenAddress==="function" &&
+       typeof v.createTransferCheckedInstruction==="function"){
+      console.log("[SPL] detected window."+k);
+      return v;
     }
-    ix.push(window.splToken.createTransferCheckedInstruction(fromAta, USDC_MINT, toAta, fromPk, amt, DEC));
-
-    const { blockhash } = await connection.getLatestBlockhash("confirmed");
-    const tx = new window.solanaWeb3.Transaction({ recentBlockhash: blockhash, feePayer: fromPk }).add(...ix);
-
-    setStatus("Popup Phantom… (signature tx)");
-    const sent = await window.solana.signAndSendTransaction(tx);
-    const sig = sent?.signature || sent;
-
-    setStatus("Tx envoyée ✅ " + String(sig).slice(0,8) + "… | start…");
-    await connection.confirmTransaction(sig, "confirmed");
-
-    const r = await fetch("/wolverine/traderone/api/start", {
-      method:"POST",
-      headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({ wallet: window.pubkey.toString(), budget: b, fundingSig: String(sig) })
-    });
-    const txt = await r.text();
-    if(!r.ok) throw new Error("START refusé: " + txt.slice(0,200));
-
-    setStatus("START OK ✅");
-  }
-
-  // Always visible; never disabled permanently
-  btn.style.display = "";
-  btn.style.visibility = "visible";
-  btn.disabled = false;
-  btn.style.opacity = "1";
-  btn.style.cursor = "pointer";
-
-  btn.addEventListener("click", async (ev)=>{
-    ev.preventDefault();
-    console.log("[START] FORCE TX handler");
-    try{
-      await wolverineStartNow(); // <-- THIS is what triggers Phantom popup
-    } catch(e){
-      console.error(e);
-      setStatus("ERR " + (e?.message || e));
+    if(v && v.default && typeof v.default==="object" &&
+       typeof v.default.getAssociatedTokenAddress==="function"){
+      console.log("[SPL] detected window."+k+".default");
+      return v.default;
     }
-  }, false);
-})();
- /* WOLVERINE_FORCE_START_TX_END */
+  }
+  return null;
+};
+
+// Compat: si on détecte, on remplit window.splToken pour le reste du code
+try { const x = window.__getSPL(); if(x) window.splToken = x; } catch(e){}
+`;
+}
+
+// Dans le handler FORCE TX, on remplace le check strict window.splToken par l’auto-detect
+s = s.replace(
+  /if\(!window\.splToken\s*\|\|\s*typeof window\.splToken\.getAssociatedTokenAddress!=="function"\)\s*\n?\s*throw new Error\("spl-token manquant"\);/g,
+  `const SPL = (window.__getSPL && window.__getSPL()) || window.splToken;
+    if(!SPL || typeof SPL.getAssociatedTokenAddress!=="function") throw new Error("spl-token manquant");`
+);
+
+// Et on remplace les appels window.splToken.* par SPL.* (dans le bloc FORCE TX)
+s = s.replace(/window\.splToken\./g, "SPL.");
+
+fs.writeFileSync(f,s,"utf8");
+console.log("OK: SPL auto-detect wired into FORCE TX");
 JS
 
-echo "OK ✅ Ctrl+F5 sur /wolverine puis clique START (Phantom doit pop)"
+echo "DONE ✅ Ctrl+F5 sur /wolverine puis clique START (Phantom doit pop)"
