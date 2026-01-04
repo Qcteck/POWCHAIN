@@ -1,2 +1,69 @@
-fetch("/wolverine/vendor/web3.min.js").then(r=>r.status)
-fetch("/wolverine/vendor/spl-token.min.js").then(r=>r.status)
+set -euo pipefail
+APPJS="/var/www/fireinners/wolverine/app.js"
+TS="$(date +%s)"
+cp -a "$APPJS" "$APPJS.bak.$TS"
+echo "Backup: $APPJS.bak.$TS"
+
+node - <<'JS'
+const fs=require("fs");
+const f="/var/www/fireinners/wolverine/app.js";
+let s=fs.readFileSync(f,"utf8");
+
+// 1) Ajouter un cooldown global (anti spam)
+if(!s.includes("window.__RB_LOCK")){
+  s = s.replace(
+    /window\.refreshBoth\s*=\s*async\s*function\s*\(\)\s*\{\s*try\{/,
+`window.__RB_LOCK = window.__RB_LOCK || {inFlight:false,last:0};
+window.refreshBoth = async function(){
+  const now = Date.now();
+  if(window.__RB_LOCK.inFlight) return;
+  if(now - window.__RB_LOCK.last < 4000) { setStatus("Attends 4s (anti 429)…"); return; }
+  window.__RB_LOCK.last = now;
+  window.__RB_LOCK.inFlight = true;
+  try{`
+  );
+  s = s.replace(/}\s*catch\(e\)\s*\{([\s\S]*?)\}\s*;\s*\n?};/,
+`} catch(e){
+$1
+} finally {
+  window.__RB_LOCK.inFlight = false;
+}
+};`);
+}
+
+// 2) Rendre refreshBoth “partiel”: bot d’abord, user séparé (ne casse pas si user 429)
+s = s.replace(
+  /const bot = await balances2\(botPubkey\(\)\.toString\(\)\);([\s\S]*?)if \(window\.pubkey\) \{\s*const usr = await balances2\(window\.pubkey\.toString\(\)\);([\s\S]*?)\}\s*else\s*\{([\s\S]*?)\}\s*setStatus\("OK"\);/m,
+`const bot = await balances2(botPubkey().toString());
+$1
+
+// USER (séparé: si 429 on garde bot OK)
+if (window.pubkey) {
+  try {
+    const usr = await balances2(window.pubkey.toString());
+$2
+  } catch(e) {
+    const msg = String(e?.message||e);
+    console.warn("USER balances failed:", msg);
+    if (el.uSol)  el.uSol.textContent  = "—";
+    if (el.uUsdc) el.uUsdc.textContent = "—";
+    if (msg.includes("429")) {
+      setStatus("RPC 429 (user). Retry dans 6s…");
+      setTimeout(()=>window.refreshBoth(), 6000);
+      return;
+    }
+    setStatus("ERR user balances: " + msg.slice(0,120));
+    return;
+  }
+} else {
+$3
+}
+
+setStatus("OK");`
+);
+
+fs.writeFileSync(f,s,"utf8");
+console.log("Patched refreshBoth (cooldown + user retry on 429).");
+JS
+
+echo "OK ✅ Fais Ctrl+F5 sur /wolverine"
