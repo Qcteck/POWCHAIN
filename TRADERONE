@@ -1,59 +1,85 @@
 set -euo pipefail
+
 DOMAIN="fireinners.online"
+APPJS="/var/www/fireinners/wolverine/app.js"
 
-BAD="/etc/nginx/snippets/fireinners-wolverine.conf"
-SNIP="/etc/nginx/snippets/wolverine_rpc_proxy.conf"
-
-echo "== 0) Cleanup BAD snippet (enlève tout bloc location RPC s'il traîne) =="
-if [ -f "$BAD" ]; then
-  TS="$(date +%s)"
-  cp -a "$BAD" "$BAD.bak.$TS"
-  perl -0777 -i -pe 's/location\s*=\s*\/wolverine\/traderone\/api\/rpc\s*\{[\s\S]*?\}\s*//g' "$BAD"
-  echo "Backup: $BAD.bak.$TS"
-fi
-
-echo "== 1) Create RPC location snippet (location ONLY) =="
-mkdir -p /etc/nginx/snippets
-cat > "$SNIP" <<'EOF'
-# Wolverine: Solana RPC proxy (same-origin)
-resolver 1.1.1.1 8.8.8.8 valid=300s ipv6=off;
-
-location = /wolverine/traderone/api/rpc {
-  proxy_pass https://api.mainnet-beta.solana.com;
-  proxy_http_version 1.1;
-
-  proxy_ssl_server_name on;
-  proxy_set_header Host api.mainnet-beta.solana.com;
-
-  proxy_set_header X-Real-IP $remote_addr;
-  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-}
-EOF
-
-echo "== 2) Find the REAL server conf that includes fireinners-wolverine snippet =="
-VHOST="$(grep -RIl --include='*.conf' 'include\s\+/etc/nginx/snippets/fireinners-wolverine\.conf' \
-  /etc/nginx/sites-enabled /etc/nginx/conf.d /etc/nginx/sites-available 2>/dev/null | head -n 1 || true)"
+echo "== 0) Find REAL nginx vhost for $DOMAIN =="
+VHOST="$(grep -RIl --include='*.conf' "server_name.*$DOMAIN" /etc/nginx/sites-enabled /etc/nginx/conf.d /etc/nginx/sites-available 2>/dev/null | head -n 1 || true)"
 echo "VHOST=$VHOST"
-[ -n "${VHOST:-}" ] || { echo "ERR: impossible de trouver le server{} qui inclut fireinners-wolverine.conf"; exit 1; }
+[ -n "${VHOST:-}" ] || { echo "ERR: vhost introuvable pour $DOMAIN"; exit 1; }
 
-echo "== 3) Inject include RPC snippet RIGHT AFTER that include line (so it's inside server{}) =="
-if ! grep -q 'include /etc/nginx/snippets/wolverine_rpc_proxy.conf' "$VHOST"; then
-  TS="$(date +%s)"
-  cp -a "$VHOST" "$VHOST.bak.$TS"
-  echo "Backup vhost: $VHOST.bak.$TS"
-  perl -i -pe '
-    if(/include\s+\/etc\/nginx\/snippets\/fireinners-wolverine\.conf\s*;/ && !$done++){
-      $_ .= "  include /etc/nginx/snippets/wolverine_rpc_proxy.conf;\n";
-    }
+TS="$(date +%s)"
+cp -a "$VHOST" "$VHOST.bak.$TS"
+echo "Backup vhost: $VHOST.bak.$TS"
+
+echo
+echo "== 1) Remove ANY broken RPC location from snippets (it breaks nginx context) =="
+for f in /etc/nginx/snippets/*.conf; do
+  [ -f "$f" ] || continue
+  cp -a "$f" "$f.bak.$TS" 2>/dev/null || true
+  perl -0777 -i -pe 's/location\s*=\s*\/wolverine\/traderone\/api\/rpc\s*\{[\s\S]*?\}\s*//g' "$f" || true
+done
+
+echo
+echo "== 2) Ensure RPC proxy LOCATION exists INSIDE the real server{} (not snippet) =="
+# If already present, do nothing. Else inject before the closing "}" of the server block.
+if ! grep -qE 'location\s*=\s*/wolverine/traderone/api/rpc' "$VHOST"; then
+  perl -0777 -i -pe '
+    my $loc = qq|
+
+  # Wolverine: Solana RPC proxy (same-origin)
+  resolver 1.1.1.1 8.8.8.8 valid=300s ipv6=off;
+  location = /wolverine/traderone/api/rpc {
+    proxy_pass https://api.mainnet-beta.solana.com;
+    proxy_http_version 1.1;
+
+    proxy_ssl_server_name on;
+    proxy_set_header Host api.mainnet-beta.solana.com;
+
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  }
+|;
+
+    # inject into first server{} found in that vhost
+    s/(server\s*\{[\s\S]*?)\n\}/$1$loc\n}\n/s;
   ' "$VHOST"
 else
-  echo "OK: include RPC déjà présent"
+  echo "OK: RPC location already in vhost"
 fi
 
-echo "== 4) Reload nginx =="
+echo
+echo "== 3) Reload nginx =="
 nginx -t && systemctl reload nginx
 
-echo "== 5) TEST HTTPS RPC (doit PAS être 404) =="
+echo
+echo "== 4) TEST HTTPS RPC (must NOT be 404) =="
 curl -ksS -i "https://$DOMAIN/wolverine/traderone/api/rpc" \
   -H 'content-type: application/json' \
   --data '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' | head -n 25
+
+echo
+echo "== 5) Frontend: make web3 Connection use ABSOLUTE URL (window.location.origin) =="
+cp -a "$APPJS" "$APPJS.bak.$TS"
+echo "Backup app.js: $APPJS.bak.$TS"
+
+node - <<'JS'
+const fs=require("fs");
+const f=process.env.APPJS || "/var/www/fireinners/wolverine/app.js";
+let s=fs.readFileSync(f,"utf8");
+
+// Remplace toute URL RPC hardcodée par une URL absolue basée sur origin
+const abs = 'new URL("/wolverine/traderone/api/rpc", window.location.origin).toString()';
+
+// patterns common
+s = s.replace(/["']https:\/\/[^"']+\/wolverine\/traderone\/api\/rpc["']/g, abs);
+s = s.replace(/["']\/wolverine\/traderone\/api\/rpc["']/g, abs);
+s = s.replace(/["']https:\/\/api\.mainnet-beta\.solana\.com["']/g, abs);
+s = s.replace(/["']https:\/\/rpc\.ankr\.com\/solana["']/g, abs);
+
+fs.writeFileSync(f,s,"utf8");
+console.log("OK: app.js RPC URL => absolute origin proxy");
+JS
+
+echo
+echo "DONE ✅  -> Ctrl+F5 sur https://$DOMAIN/wolverine puis clique START"
