@@ -1,4 +1,149 @@
-systemctl show traderone.service -p Environment | tr ' ' '\n' | grep BALANCES_CACHE_TTL_MS
-BOT="$(systemctl show traderone.service -p Environment --value | tr ' ' '\n' | sed -n 's/^TRADERONE_BOT_WALLET=//p')"
-curl -ksS -D- "https://fireinners.online/wolverine/traderone/api/balances2?wallet=$BOT" -o /dev/null | grep -i x-cache
-curl -ksS -D- "https://fireinners.online/wolverine/traderone/api/balances2?wallet=$BOT" -o /dev/null | grep -i x-cache
+set -euo pipefail
+
+HTML="/var/www/fireinners/wolverine/index.html"
+APPJS="/var/www/fireinners/wolverine/app.js"
+TS="$(date +%s)"
+
+cp -a "$HTML"  "$HTML.bak.$TS"
+cp -a "$APPJS" "$APPJS.bak.$TS"
+echo "Backups: $HTML.bak.$TS | $APPJS.bak.$TS"
+
+# 1) Inject CDN libs (web3 + spl-token) in index.html if missing
+if ! grep -q "solanaWeb3" "$HTML"; then
+  perl -0777 -i -pe 's#</body>#  <script src="https://unpkg.com/@solana/web3.js@latest/lib/index.iife.min.js"></script>\n  <script src="https://unpkg.com/@solana/spl-token@latest/lib/index.iife.min.js"></script>\n</body>#s' "$HTML"
+  echo "Injected Solana libs into index.html"
+fi
+
+# 2) Remove old START handler blocks in app.js
+perl -0777 -i -pe 's|/\*\s*WOLVERINE_START_FIX_BEGIN\s*\*/.*?/\*\s*WOLVERINE_START_FIX_END\s*\*/\s*||sg' "$APPJS" || true
+perl -0777 -i -pe 's|/\*\s*WOLVERINE_START_SEND_USDC_BEGIN\s*\*/.*?/\*\s*WOLVERINE_START_SEND_USDC_END\s*\*/\s*||sg' "$APPJS" || true
+
+# 3) Append new START = send USDC + call /start
+cat >> "$APPJS" <<'JS'
+
+/* WOLVERINE_START_SEND_USDC_BEGIN */
+(function(){
+  const btnStart = document.getElementById("btnStart");
+  const budgetEl = document.getElementById("budget");
+  const tAddrEl  = document.getElementById("tAddr");
+  const statusEl = document.getElementById("statusText") || document.getElementById("status");
+
+  function setStatus(t){
+    try { if(statusEl) statusEl.textContent = t; } catch(e) {}
+    console.log("[STATUS]", t);
+  }
+  window.setStatus = window.setStatus || setStatus;
+
+  // USDC mint mainnet (Solana)
+  const USDC_MINT = new solanaWeb3.PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
+  const USDC_DECIMALS = 6;
+
+  function getUserPubkey(){
+    return (window.pubkey && window.pubkey.toString) ? new solanaWeb3.PublicKey(window.pubkey.toString()) : null;
+  }
+
+  async function getConnection(){
+    // use Phantom's connection if available; else fallback to public RPC (can be rate-limited)
+    const url = "https://api.mainnet-beta.solana.com";
+    return new solanaWeb3.Connection(url, "confirmed");
+  }
+
+  async function sendUsdcToBot({fromPubkey, botPubkey, amountUsdc}){
+    const connection = await getConnection();
+
+    // Convert to integer units
+    const amount = BigInt(Math.round(Number(amountUsdc) * 10**USDC_DECIMALS));
+    if (amount <= 0n) throw new Error("Budget USDC invalide");
+
+    // Derive ATAs
+    const fromAta = await splToken.getAssociatedTokenAddress(USDC_MINT, fromPubkey, false, splToken.TOKEN_PROGRAM_ID, splToken.ASSOCIATED_TOKEN_PROGRAM_ID);
+    const botAta  = await splToken.getAssociatedTokenAddress(USDC_MINT, botPubkey, false, splToken.TOKEN_PROGRAM_ID, splToken.ASSOCIATED_TOKEN_PROGRAM_ID);
+
+    const ix = [];
+
+    // Ensure bot ATA exists (create if missing)
+    const botAtaInfo = await connection.getAccountInfo(botAta);
+    if (!botAtaInfo) {
+      ix.push(
+        splToken.createAssociatedTokenAccountInstruction(
+          fromPubkey,      // payer
+          botAta,          // ata
+          botPubkey,       // owner
+          USDC_MINT,
+          splToken.TOKEN_PROGRAM_ID,
+          splToken.ASSOCIATED_TOKEN_PROGRAM_ID
+        )
+      );
+    }
+
+    // Transfer USDC (checked)
+    ix.push(
+      splToken.createTransferCheckedInstruction(
+        fromAta,
+        USDC_MINT,
+        botAta,
+        fromPubkey,
+        amount,
+        USDC_DECIMALS,
+        [],
+        splToken.TOKEN_PROGRAM_ID
+      )
+    );
+
+    const { blockhash } = await connection.getLatestBlockhash("confirmed");
+    const tx = new solanaWeb3.Transaction({ recentBlockhash: blockhash, feePayer: fromPubkey }).add(...ix);
+
+    if (!window.solana || !window.solana.isPhantom) throw new Error("Phantom non détecté");
+    const sigObj = await window.solana.signAndSendTransaction(tx);
+    const signature = sigObj?.signature || sigObj; // phantom variants
+    await connection.confirmTransaction(signature, "confirmed");
+    return signature;
+  }
+
+  if (!btnStart || !budgetEl || !tAddrEl) return;
+
+  btnStart.onclick = async () => {
+    try {
+      const fromPk = getUserPubkey();
+      if (!fromPk) { setStatus("Connecte d'abord ton wallet"); return; }
+
+      const botAddr = (tAddrEl.textContent || "").trim();
+      if (!botAddr || botAddr === "—") { setStatus("Adresse BOT manquante"); return; }
+      const botPk = new solanaWeb3.PublicKey(botAddr);
+
+      const b = Number(budgetEl.value);
+      if (!isFinite(b) || b <= 0) { setStatus("Budget invalide"); return; }
+
+      setStatus("Envoi USDC au BOT… (popup Phantom)");
+      const sig = await sendUsdcToBot({ fromPubkey: fromPk, botPubkey: botPk, amountUsdc: b });
+
+      setStatus("USDC envoyé ✅ tx=" + String(sig).slice(0,8) + "… | Validation start…");
+
+      // Call backend start with proof
+      const r = await fetch("/wolverine/traderone/api/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ wallet: fromPk.toString(), budget: b, fundingSig: String(sig) })
+      });
+
+      const txt = await r.text();
+      let j=null; try{ j=JSON.parse(txt);}catch(e){}
+      if (!r.ok) {
+        setStatus("START REFUSÉ ❌ " + (j?.error || txt.slice(0,200)));
+        console.log("start refused:", r.status, j || txt);
+        return;
+      }
+
+      setStatus("START OK ✅");
+      if (typeof window.refreshBoth === "function") await window.refreshBoth();
+    } catch (e) {
+      console.error(e);
+      setStatus("ERR " + (e?.message || e));
+    }
+  };
+})();
+/* WOLVERINE_START_SEND_USDC_END */
+
+JS
+
+echo "DONE ✅ -> Ctrl+F5 sur /wolverine puis clique START (ça doit pop Phantom et envoyer USDC)"
