@@ -4,30 +4,296 @@ BASE="/var/www/fireinners/wolverine"
 HTML="$BASE/index.html"
 APPJS="$BASE/app.js"
 VENDOR="$BASE/vendor"
-SERVER="/opt/traderone-opt/server.js"
-SVC="traderone.service"
+TS="$(date +%s)"
 
-echo "== Derniers backups trouvés =="
-ls -1t "$HTML".bak.* 2>/dev/null | head -n 5 || true
-ls -1t "$APPJS".bak.* 2>/dev/null | head -n 5 || true
-ls -1t "$SERVER".bak.* 2>/dev/null | head -n 5 || true
+BOT="$(systemctl show traderone.service -p Environment --value | tr ' ' '\n' | sed -n 's/^TRADERONE_BOT_WALLET=//p')"
+[ -n "${BOT:-}" ] || { echo "ERR: TRADERONE_BOT_WALLET vide"; exit 1; }
+echo "BOT=$BOT"
 
-# prend le plus récent backup pour chaque fichier
-HTML_BAK="$(ls -1t "$HTML".bak.* 2>/dev/null | head -n 1 || true)"
-APP_BAK="$(ls -1t "$APPJS".bak.* 2>/dev/null | head -n 1 || true)"
-SRV_BAK="$(ls -1t "$SERVER".bak.* 2>/dev/null | head -n 1 || true)"
+mkdir -p "$VENDOR"
+cp -a "$HTML"  "$HTML.bak.$TS"
+cp -a "$APPJS" "$APPJS.bak.$TS" 2>/dev/null || true
+echo "Backups: $HTML.bak.$TS | $APPJS.bak.$TS"
 
-[ -n "${HTML_BAK:-}" ] && cp -a "$HTML_BAK" "$HTML"
-[ -n "${APP_BAK:-}" ]  && cp -a "$APP_BAK"  "$APPJS"
-[ -n "${SRV_BAK:-}" ]  && cp -a "$SRV_BAK"  "$SERVER"
+# 1) Vendor libs local (pas CDN)
+curl -L -o "$VENDOR/web3.min.js"      https://cdn.jsdelivr.net/npm/@solana/web3.js@1.95.4/lib/index.iife.min.js
+curl -L -o "$VENDOR/spl-token.min.js" https://cdn.jsdelivr.net/npm/@solana/spl-token@0.4.8/lib/index.iife.min.js
+chmod 644 "$VENDOR/"*.js
 
-# reload services
-nginx -t && systemctl reload nginx
-systemctl restart "$SVC"
+# 2) Fix tAddr (BOT) dans HTML
+perl -i -pe 's|(<span id="tAddr">)(.*?)(</span>)|$1'"$BOT"'$3|g' "$HTML"
 
-echo
-echo "RESTORE OK ✅"
-echo "Restored:"
-echo " - $HTML_BAK -> $HTML"
-echo " - $APP_BAK  -> $APPJS"
-echo " - $SRV_BAK  -> $SERVER"
+# 3) Assure scripts vendor avant app.js + cache-bust
+perl -i -pe 's#\s*<script[^>]+(unpkg|jsdelivr)\.com/[^>]*@solana[^>]*></script>##gi' "$HTML"
+perl -i -pe 's/src="\/wolverine\/app\.js(\?v=\d+)?"/src="\/wolverine\/app.js?v='"$TS"'"/g' "$HTML"
+
+# Inject vendor scripts juste avant app.js si absent
+if ! grep -q "/wolverine/vendor/web3.min.js" "$HTML"; then
+  perl -0777 -i -pe 's#(<script[^>]+src="\/wolverine\/app\.js\?v=[0-9]+"[^>]*></script>)#  <script src="\/wolverine\/vendor\/web3.min.js?v='"$TS"'"><\/script>\n  <script src="\/wolverine\/vendor\/spl-token.min.js?v='"$TS"'"><\/script>\n  $1#s' "$HTML"
+fi
+
+# 4) Ajoute UI "liste de wallets" si pas déjà là
+if ! grep -q 'id="walletList"' "$HTML"; then
+  perl -0777 -i -pe 's#(<div[^>]*id="afterConnect"[^>]*>[\s\S]*?)</div>#\1
+  <hr/>
+  <h3>Wallets à afficher</h3>
+  <p>Colle ici des adresses (1 par ligne). Le wallet connecté + TraderOne sont ajoutés automatiquement.</p>
+  <textarea id="walletList" style="width:100%;min-height:90px;"></textarea>
+  <button id="btnRefreshAll">Refresh tous les soldes</button>
+  <div style="margin-top:10px;overflow:auto;">
+    <table border="1" cellpadding="6" cellspacing="0" style="width:100%;max-width:100%;">
+      <thead><tr><th>Wallet</th><th>SOL</th><th>USDC</th><th>Cache</th></tr></thead>
+      <tbody id="walletTable"></tbody>
+    </table>
+  </div>
+</div>#s' "$HTML"
+fi
+
+# 5) Écrit un app.js stable (multi-wallet + START Phantom)
+cat > "$APPJS" <<'JS'
+(function(){
+  const $ = (id)=>document.getElementById(id);
+
+  const el = {
+    btnConnect: $("btnConnect"),
+    btnStart: $("btnStart"),
+    btnRefresh: $("btnRefresh"),
+    budget: $("budget"),
+    afterConnect: $("afterConnect"),
+    status: $("statusText") || $("status"),
+
+    // legacy UI (bot+user)
+    uSol: $("uSol"), uUsdc: $("uUsdc"),
+    tAddr: $("tAddr"), tSol: $("tSol"), tUsdc: $("tUsdc"),
+
+    // multi-wallet UI
+    walletList: $("walletList"),
+    btnRefreshAll: $("btnRefreshAll"),
+    walletTable: $("walletTable"),
+  };
+
+  function setStatus(t){
+    try { if (el.status) el.status.textContent = t; } catch(e){}
+    console.log("[STATUS]", t);
+  }
+  window.setStatus = setStatus;
+
+  function libsOk(){
+    return !!(window.solanaWeb3 && window.solanaWeb3.PublicKey && window.splToken);
+  }
+
+  function requirePhantom(){
+    if (!window.solana || !window.solana.isPhantom) throw new Error("Phantom non détecté");
+  }
+
+  function botAddr(){
+    const s = (el.tAddr?.textContent || "").trim();
+    if (!s || s === "—") throw new Error("Adresse BOT manquante");
+    return s;
+  }
+
+  async function conn(){
+    return new window.solanaWeb3.Connection("https://api.mainnet-beta.solana.com", "confirmed");
+  }
+
+  async function balances2(wallet){
+    const r = await fetch(`/wolverine/traderone/api/balances2?wallet=${encodeURIComponent(wallet)}`);
+    const cache = r.headers.get("x-cache") || "";
+    const txt = await r.text();
+    if (!r.ok) throw new Error(`balances2 HTTP ${r.status}: ${txt.slice(0,160)}`);
+    return { data: JSON.parse(txt), cache };
+  }
+
+  function fmt(n, d){ const x=Number(n||0); return isFinite(x)? x.toFixed(d) : "0"; }
+
+  function uniq(arr){ return [...new Set(arr.filter(Boolean))]; }
+
+  function getWalletsToShow(){
+    const list = [];
+    // always show bot
+    try { list.push(botAddr()); } catch(e){}
+
+    // show connected user
+    if (window.pubkey?.toString) list.push(window.pubkey.toString());
+
+    // textarea list
+    if (el.walletList) {
+      const lines = el.walletList.value.split("\n").map(s=>s.trim()).filter(Boolean);
+      list.push(...lines);
+    }
+
+    // persist list
+    try { localStorage.setItem("wolverine_wallet_list", (el.walletList?.value||"")); } catch(e){}
+
+    return uniq(list);
+  }
+
+  function loadWalletList(){
+    try {
+      const v = localStorage.getItem("wolverine_wallet_list") || "";
+      if (el.walletList) el.walletList.value = v;
+    } catch(e){}
+  }
+
+  async function refreshTable(){
+    const wallets = getWalletsToShow();
+    if (!el.walletTable) return;
+
+    el.walletTable.innerHTML = "";
+    setStatus("Refresh tous les wallets…");
+
+    for (const w of wallets) {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `<td style="font-family:monospace;max-width:280px;overflow:hidden;text-overflow:ellipsis;">${w}</td>
+                      <td>—</td><td>—</td><td>—</td>`;
+      el.walletTable.appendChild(tr);
+
+      try {
+        const {data, cache} = await balances2(w);
+        const sol  = Number(data?.user?.sol  ?? data?.sol  ?? 0);
+        const usdc = Number(data?.user?.usdc ?? data?.usdc ?? 0);
+        tr.children[1].textContent = fmt(sol, 6);
+        tr.children[2].textContent = fmt(usdc, 4);
+        tr.children[3].textContent = cache || "";
+      } catch(e) {
+        tr.children[3].textContent = "ERR";
+        console.warn("wallet failed", w, e?.message||e);
+      }
+    }
+
+    setStatus("OK");
+  }
+
+  // legacy refresh (fills the old spans too)
+  window.refreshBoth = async function(){
+    try{
+      // BOT
+      const b = await balances2(botAddr());
+      const botSol  = Number(b.data?.user?.sol  ?? b.data?.sol  ?? 0);
+      const botUsdc = Number(b.data?.user?.usdc ?? b.data?.usdc ?? 0);
+      if (el.tSol)  el.tSol.textContent  = fmt(botSol, 6);
+      if (el.tUsdc) el.tUsdc.textContent = fmt(botUsdc, 4);
+
+      // USER
+      if (window.pubkey) {
+        const u = await balances2(window.pubkey.toString());
+        const uSol  = Number(u.data?.user?.sol  ?? u.data?.sol  ?? 0);
+        const uUsdc = Number(u.data?.user?.usdc ?? u.data?.usdc ?? 0);
+        if (el.uSol)  el.uSol.textContent  = fmt(uSol, 6);
+        if (el.uUsdc) el.uUsdc.textContent = fmt(uUsdc, 4);
+      } else {
+        if (el.uSol)  el.uSol.textContent  = "—";
+        if (el.uUsdc) el.uUsdc.textContent = "—";
+      }
+
+      // table
+      await refreshTable();
+
+      setStatus("OK");
+    } catch(e){
+      console.error(e);
+      setStatus("ERR " + (e?.message || e));
+    }
+  };
+
+  async function sendUsdcToBot(amountUsdc){
+    if (!libsOk()) throw new Error("libs Solana manquantes (web3/spl-token)");
+    requirePhantom();
+    if (!window.pubkey) throw new Error("Wallet non connectée");
+
+    const connection = await conn();
+
+    const fromPk = new window.solanaWeb3.PublicKey(window.pubkey.toString());
+    const toPk   = new window.solanaWeb3.PublicKey(botAddr());
+
+    const USDC_MINT = new window.solanaWeb3.PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
+    const DEC = 6;
+
+    const amt = BigInt(Math.round(Number(amountUsdc) * 10**DEC));
+    if (amt <= 0n) throw new Error("Budget invalide");
+
+    const fromAta = await window.splToken.getAssociatedTokenAddress(USDC_MINT, fromPk);
+    const toAta   = await window.splToken.getAssociatedTokenAddress(USDC_MINT, toPk);
+
+    const ix = [];
+    const toInfo = await connection.getAccountInfo(toAta);
+    if (!toInfo) {
+      ix.push(window.splToken.createAssociatedTokenAccountInstruction(fromPk, toAta, toPk, USDC_MINT));
+    }
+
+    ix.push(window.splToken.createTransferCheckedInstruction(fromAta, USDC_MINT, toAta, fromPk, amt, DEC));
+
+    const { blockhash } = await connection.getLatestBlockhash("confirmed");
+    const tx = new window.solanaWeb3.Transaction({ recentBlockhash: blockhash, feePayer: fromPk }).add(...ix);
+
+    const sent = await window.solana.signAndSendTransaction(tx);
+    const sig = sent?.signature || sent;
+    await connection.confirmTransaction(sig, "confirmed");
+    return String(sig);
+  }
+
+  async function startFlow(){
+    try{
+      // bouton toujours visible, juste disable pendant l’action
+      if (el.btnStart) el.btnStart.disabled = true;
+
+      const b = Number(el.budget?.value);
+      if (!isFinite(b) || b <= 0) throw new Error("Budget invalide");
+
+      setStatus("Popup Phantom… (envoi USDC au bot)");
+      const fundingSig = await sendUsdcToBot(b);
+
+      setStatus("USDC envoyé ✅ " + fundingSig.slice(0,8) + "… | start…");
+      const r = await fetch("/wolverine/traderone/api/start", {
+        method: "POST",
+        headers: {"Content-Type":"application/json"},
+        body: JSON.stringify({ wallet: window.pubkey.toString(), budget: b, fundingSig })
+      });
+
+      const txt = await r.text();
+      let j=null; try{ j=JSON.parse(txt);}catch(e){}
+      if (!r.ok) throw new Error(j?.error || txt.slice(0,200));
+
+      setStatus("START OK ✅");
+      await window.refreshBoth();
+    } catch(e){
+      console.error(e);
+      setStatus("ERR " + (e?.message || e));
+    } finally {
+      if (el.btnStart) el.btnStart.disabled = false;
+    }
+  }
+
+  // Bind UI
+  if (el.btnConnect) {
+    el.btnConnect.onclick = async () => {
+      try{
+        requirePhantom();
+        const r = await window.solana.connect();
+        window.pubkey = r.publicKey;
+        if (el.afterConnect) el.afterConnect.style.display = "";
+        setStatus("Wallet connectée ✅ " + window.pubkey.toString());
+        await window.refreshBoth();
+      } catch(e){
+        console.error(e);
+        setStatus("ERR " + (e?.message || e));
+      }
+    };
+  }
+
+  if (el.btnRefresh)    el.btnRefresh.onclick = () => window.refreshBoth();
+  if (el.btnRefreshAll) el.btnRefreshAll.onclick = () => refreshTable();
+  if (el.btnStart)      el.btnStart.onclick = () => startFlow();
+
+  // START toujours visible (jamais display:none)
+  if (el.btnStart) {
+    el.btnStart.style.display = "";
+    el.btnStart.style.visibility = "visible";
+  }
+
+  loadWalletList();
+  setTimeout(()=>window.refreshBoth(), 300);
+})();
+JS
+
+echo "DONE ✅  Ctrl+F5 sur https://fireinners.online/wolverine/"
