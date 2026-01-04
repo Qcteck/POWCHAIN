@@ -6,10 +6,7 @@ SNIP="/etc/nginx/snippets/wolv_rpc_proxy.conf"
 INC="include /etc/nginx/snippets/wolv_rpc_proxy.conf;"
 TS="$(date +%s)"
 
-echo "== 0) Dump nginx (nginx -T est sur STDERR) =="
-nginx -T >/tmp/ngt.txt 2>&1
-
-echo "== 1) Crée/replace le snippet RPC =="
+echo "== 1) Snippet RPC =="
 mkdir -p /etc/nginx/snippets
 cat > "$SNIP" <<'EOF'
 resolver 1.1.1.1 8.8.8.8 valid=300s ipv6=off;
@@ -28,31 +25,20 @@ location = /wolverine/traderone/api/rpc {
 }
 EOF
 
-echo "== 2) Trouver le fichier du DEFAULT 443 (celui qui répond quand server_name match pas) =="
-TARGET="$(
-awk '
-  /^# configuration file / {file=$4; sub(/:$/,"",file)}
-  $0 ~ /^[[:space:]]*listen[[:space:]].*443/ && $0 ~ /default_server/ {print file; exit}
-' /tmp/ngt.txt
-)"
+echo "== 2) Inject include dans TOUS les server 443 =="
+for f in $(grep -RIl --include="*.conf" -E "^\s*listen\s+.*443" /etc/nginx 2>/dev/null | grep -v "/snippets/"); do
+  cp -a "$f" "$f.bak.$TS" || true
+  if ! grep -qF "$INC" "$f"; then
+    # Ajoute l'include juste après la première ligne listen ...443 du fichier
+    sed -i '0,/^[[:space:]]*listen[[:space:]].*443/s//&\n  include \/etc\/nginx\/snippets\/wolv_rpc_proxy.conf;/' "$f" || true
+  fi
+done
 
-echo "TARGET(default_443)=$TARGET"
-[ -n "${TARGET:-}" ] || { echo "ERR: default_server 443 introuvable"; exit 1; }
-[ -f "$TARGET" ] || { echo "ERR: fichier introuvable: $TARGET"; exit 1; }
-
-echo "== 3) Backup + inject include dans le DEFAULT 443 (si absent) =="
-cp -a "$TARGET" "$TARGET.bak.$TS"
-
-if ! grep -qF "$INC" "$TARGET"; then
-  # Ajoute l'include juste après la 1ère ligne "listen ... 443"
-  sed -i '0,/^[[:space:]]*listen[[:space:]].*443/s//&\n  include \/etc\/nginx\/snippets\/wolv_rpc_proxy.conf;/' "$TARGET"
-fi
-
-echo "== 4) Test + reload =="
+echo "== 3) nginx test + reload =="
 nginx -t
 systemctl reload nginx
 
-echo "== 5) TEST LOCAL FORCE (doit montrer X-Wolv-RPC: 1) =="
+echo "== 4) TEST LOCAL FORCE (doit montrer X-Wolv-RPC: 1) =="
 curl -ksS -i --resolve ${DOMAIN}:443:127.0.0.1 \
   "https://${DOMAIN}/wolverine/traderone/api/rpc" \
   -H 'Content-Type: application/json' \
