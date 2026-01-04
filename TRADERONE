@@ -1,23 +1,147 @@
-cat >> /var/www/fireinners/wolverine/app.js <<'JS'
+cat >/tmp/WOLVERINE_FIX_START_BUTTON.sh <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
 
-/* WOLVERINE_CONNECT_FIX_BEGIN */
-btnConnect.onclick = async () => {
-  try {
-    if (!window.solana || !window.solana.isPhantom) {
-      setStatus("Phantom non détecté");
-      return;
+APPJS="/var/www/fireinners/wolverine/app.js"
+SERVER="/opt/traderone-opt/server.js"
+SVC="traderone.service"
+TS="$(date +%s)"
+
+echo "== 0) Backup =="
+cp -a "$APPJS"  "$APPJS.bak.$TS"
+[ -f "$SERVER" ] && cp -a "$SERVER" "$SERVER.bak.$TS" || true
+echo "APPJS backup:  $APPJS.bak.$TS"
+[ -f "$SERVER" ] && echo "SERVER backup: $SERVER.bak.$TS" || echo "SERVER.js not found, skip backup"
+echo
+
+echo "== 1) Cherche routes START dans le backend =="
+if [ -f "$SERVER" ]; then
+  grep -nE 'app\.(post|get)\("(/api/|/wolverine/).*start' "$SERVER" || true
+  echo
+  echo "-- autres mots clés (start/traderone/run/launch) --"
+  grep -nEi 'app\.(post|get)\("(/api/|/wolverine/).*(start|traderone|run|launch)' "$SERVER" | head -n 60 || true
+else
+  echo "WARN: $SERVER absent"
+fi
+echo
+
+echo "== 2) Déduire endpoint START existant (priorité) =="
+START_PATH=""
+if [ -f "$SERVER" ]; then
+  # préférences : /wolverine/traderone/api/start, sinon /api/start, sinon autre /api/*start*
+  if grep -q 'app\.post("/wolverine/traderone/api/start"' "$SERVER"; then
+    START_PATH="/wolverine/traderone/api/start"
+  elif grep -q 'app\.post("/api/start"' "$SERVER"; then
+    START_PATH="/wolverine/traderone/api/start"   # on passe par le proxy nginx déjà en place
+  else
+    # prend le 1er app.post("/api/...start")
+    CAND="$(grep -oP 'app\.post\("\K/api/[^"]*start[^"]*' "$SERVER" | head -n 1 || true)"
+    [ -n "${CAND:-}" ] && START_PATH="/wolverine/traderone${CAND#/api}" || true
+  fi
+fi
+
+# fallback si on n'a rien trouvé
+if [ -z "$START_PATH" ]; then
+  START_PATH="/wolverine/traderone/api/start"
+fi
+
+echo "START_PATH choisi: $START_PATH"
+echo
+
+echo "== 3) Patch app.js : handler béton pour btnStart (POST JSON) =="
+node - <<JS
+const fs = require("fs");
+const file = "${APPJS}";
+let s = fs.readFileSync(file, "utf8");
+
+const START_PATH = "${START_PATH}";
+
+// repère IDs côté front (si différents, on garde les existants)
+function findVar(name, fallback){
+  const m = s.match(new RegExp(String.raw\`const\\s+\${name}\\s*=\\s*document\\.getElementById\\("([^"]+)"\\)\`));
+  return m ? m[1] : fallback;
+}
+
+const idBtnStart   = findVar("btnStart",   "btnStart");
+const idBudgetEl   = findVar("budgetEl",   "budget");
+const idStatusEl   = null;
+
+// ajoute helper setStatus si pas présent
+if (!/function\s+setStatus\s*\(/.test(s)) {
+  s = s.replace(/(^|\n)(const\s+btnConnect=.*)/, (all, p1, line)=> `${p1}function setStatus(t){ try{ const el=document.getElementById("status"); if(el) el.textContent=t; }catch(e){} console.log("[STATUS]",t); }\n${line}`);
+}
+
+// supprime ancien bloc si déjà patché
+s = s.replace(/\/\*\s*WOLVERINE_START_FIX_BEGIN\s*\*\/[\s\S]*?\/\*\s*WOLVERINE_START_FIX_END\s*\*\//g, "");
+
+// inject en fin de fichier (override runtime)
+s += `
+
+/* WOLVERINE_START_FIX_BEGIN */
+(function(){
+  const btnStart = document.getElementById("${idBtnStart}");
+  const budgetEl = document.getElementById("${idBudgetEl}");
+  if(!btnStart || !budgetEl){ console.log("START bind missing elements"); return; }
+
+  btnStart.onclick = async () => {
+    try {
+      if (typeof pubkey === "undefined" || !pubkey) {
+        setStatus("Connecte d'abord ton wallet");
+        return;
+      }
+      const b = Number(budgetEl.value);
+      if (!isFinite(b) || b <= 0) {
+        setStatus("Budget invalide");
+        return;
+      }
+
+      const payload = { wallet: pubkey.toString(), budget: b };
+      setStatus("Envoi au bot...");
+
+      const r = await fetch("${START_PATH}", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+
+      const txt = await r.text();
+      if (!r.ok) throw new Error("HTTP " + r.status + " " + txt.slice(0,200));
+
+      let j;
+      try { j = JSON.parse(txt); } catch(e){ j = { ok:true, raw: txt }; }
+      console.log("START response:", j);
+      setStatus("Bot lancé ✔");
+    } catch (e) {
+      console.error(e);
+      setStatus("ERR " + (e?.message || e));
     }
-    const r = await window.solana.connect();
-    pubkey = r.publicKey;
-    afterConnect.style.display = "block";
-    // si tu as un élément pour afficher l’adresse, adapte l’id ici
-    // ex: document.getElementById("walletAddr").textContent = pubkey.toString();
-    setStatus("Wallet: " + pubkey.toString());
-    await refreshBoth();
-  } catch (e) {
-    setStatus("ERR " + (e?.message || e));
-  }
-};
-/* WOLVERINE_CONNECT_FIX_END */
+  };
+})();
+/* WOLVERINE_START_FIX_END */
+`;
 
+fs.writeFileSync(file, s, "utf8");
+console.log("Patched", file, "START_PATH=", START_PATH);
 JS
+
+echo
+echo "== 4) Test rapide côté nginx : la route START doit proxy vers 8585 (pas servir index.html) =="
+nginx -t >/dev/null 2>&1 && echo "nginx: ok" || (nginx -t && true)
+echo
+
+echo "== 5) Test backend direct (sans navigateur) =="
+echo "-- (A) vérifier que balances2 répond toujours JSON"
+WALLET="2uHgvSM6vrm7Ye7ntMFUA1RHiqAinGjeCx17dozsLx1z"
+curl -ksS -D- "https://fireinners.online/wolverine/traderone/api/balances2?wallet=$WALLET" | head -n 20
+echo
+
+echo "-- (B) ping START endpoint (doit au moins répondre, même si refuse budget) :"
+curl -ksS -D- "https://fireinners.online${START_PATH}" -X POST \
+  -H "Content-Type: application/json" \
+  --data '{"wallet":"'"$WALLET"'","budget":1}' | head -n 30 || true
+
+echo
+echo "DONE ✅  => Fais Ctrl+F5 sur /wolverine puis clique START. Check DevTools > Network > POST start."
+SH
+
+bash /tmp/WOLVERINE_FIX_START_BUTTON.sh
