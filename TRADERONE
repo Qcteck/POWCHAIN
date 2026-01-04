@@ -1,25 +1,19 @@
 set -euo pipefail
 
-DOMAIN="fireinners.online"
 SRV="/opt/traderone-opt/server.js"
-APPJS="/var/www/fireinners/wolverine/app.js"
 SVC="traderone.service"
 TS="$(date +%s)"
 
-echo "== 0) BACKUPS =="
-cp -a "$SRV"  "$SRV.bak.$TS"
-cp -a "$APPJS" "$APPJS.bak.$TS"
-echo "Backups: $SRV.bak.$TS | $APPJS.bak.$TS"
+cp -a "$SRV" "$SRV.bak.$TS"
+echo "Backup: $SRV.bak.$TS"
 
-echo
-echo "== 1) ADD RPC ROUTE (if missing) =="
 node - <<'JS'
 const fs=require("fs");
 const f="/opt/traderone-opt/server.js";
 let s=fs.readFileSync(f,"utf8");
 
-if(s.includes("WOLVERINE_RPC_PROXY_V1")){
-  console.log("OK: rpc route already present");
+if (s.includes('app.post("/wolverine/traderone/api/rpc"')) {
+  console.log("OK: route RPC déjà présente");
   process.exit(0);
 }
 
@@ -45,49 +39,34 @@ app.post("/wolverine/traderone/api/rpc", async (req,res) => {
 /* /WOLVERINE_RPC_PROXY_V1 */
 `;
 
-const idx = s.search(/app\.listen\(/);
-if(idx === -1) throw new Error("app.listen( introuvable dans server.js");
-s = s.slice(0, idx) + insert + "\n" + s.slice(idx);
+// insertion point (supporte plusieurs styles de serveurs)
+let idx = -1;
+const patterns = [
+  /app\.listen\(/,
+  /server\.listen\(/,
+  /httpServer\.listen\(/,
+  /httpsServer\.listen\(/,
+  /\blisten\(\s*process\.env\.PORT\b/,
+  /\bmodule\.exports\b/,
+  /\bexport\s+default\b/
+];
 
-fs.writeFileSync(f,s,"utf8");
-console.log("OK: rpc route injected");
+for (const p of patterns) {
+  const m = s.search(p);
+  if (m !== -1) { idx = m; break; }
+}
+
+if (idx === -1) {
+  // fallback: ajoute à la fin
+  s += "\n" + insert + "\n";
+  console.log("WARN: aucun point d’insertion trouvé → route ajoutée à la fin");
+} else {
+  s = s.slice(0, idx) + insert + "\n" + s.slice(idx);
+  console.log("OK: route RPC injectée avant le bloc de démarrage/export");
+}
+
+fs.writeFileSync(f, s, "utf8");
 JS
 
-echo
-echo "== 2) RESTART BACKEND =="
 systemctl restart "$SVC"
-
-echo
-echo "== 3) AUTO-DETECT BACKEND PORT =="
-PID="$(systemctl show -p MainPID --value "$SVC")"
-PORT="$(ss -ltnp | awk -v pid="pid=$PID" '$0 ~ pid {sub(".*:","",$4); print $4}' | head -n 1)"
-echo "PID=$PID PORT=$PORT"
-[ -n "${PORT:-}" ] || { echo "ERR: port introuvable"; exit 1; }
-
-echo
-echo "== 4) NGINX PROXY for /wolverine/traderone/api/ =="
-cat > /etc/nginx/conf.d/wolverine_traderone_api.conf <<EOF
-location ^~ /wolverine/traderone/api/ {
-  proxy_pass http://127.0.0.1:$PORT;
-  proxy_http_version 1.1;
-  proxy_set_header Host \$host;
-  proxy_set_header X-Real-IP \$remote_addr;
-  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-}
-EOF
-nginx -t && systemctl reload nginx
-
-echo
-echo "== 5) FRONTEND: force RPC URL to ABSOLUTE proxy (web3.js needs http/https) =="
-# met https://DOMAIN/wolverine/traderone/api/rpc partout
-sed -i "s#new solanaWeb3\\.Connection([^,]*,#new solanaWeb3.Connection(\"https://$DOMAIN/wolverine/traderone/api/rpc\",#g" "$APPJS"
-sed -i "s#new window\\.solanaWeb3\\.Connection([^,]*,#new window.solanaWeb3.Connection(\"https://$DOMAIN/wolverine/traderone/api/rpc\",#g" "$APPJS"
-
-echo
-echo "== 6) TEST RPC PROXY (should NOT be 404) =="
-curl -ksS -i "https://$DOMAIN/wolverine/traderone/api/rpc" \
-  -H 'content-type: application/json' \
-  --data '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' | head -n 25
-
-echo
-echo "DONE ✅  -> Ctrl+F5 sur https://$DOMAIN/wolverine puis START"
+echo "Restarted $SVC ✅"
