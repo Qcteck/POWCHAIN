@@ -1,45 +1,115 @@
 set -euo pipefail
 
 DOMAIN="fireinners.online"
+SRV="/opt/traderone-opt/server.js"
 SVC="traderone.service"
 
-echo "== 1) Detect backend port =="
+echo "== A) BACKUP server.js =="
+TS="$(date +%s)"
+cp -a "$SRV" "$SRV.bak.$TS"
+echo "Backup: $SRV.bak.$TS"
+
+echo
+echo "== B) FORCE RPC route EARLY (after app is created) =="
+node - <<'JS'
+const fs=require("fs");
+const f="/opt/traderone-opt/server.js";
+let s=fs.readFileSync(f,"utf8");
+
+// remove old injected block(s) to avoid duplicates
+s = s.replace(/\/\*\s*WOLVERINE_RPC_PROXY_V1[\s\S]*?\/\*\s*\/WOLVERINE_RPC_PROXY_V1\s*\*\/\s*/g, "");
+
+const route = `
+/* WOLVERINE_RPC_PROXY_V1 */
+app.post("/wolverine/traderone/api/rpc", async (req,res) => {
+  try{
+    const upstream = "https://api.mainnet-beta.solana.com";
+    const r = await fetch(upstream, {
+      method: "POST",
+      headers: {"content-type":"application/json"},
+      body: JSON.stringify(req.body || {})
+    });
+    const txt = await r.text();
+    res.status(r.status).set("content-type","application/json").send(txt);
+  }catch(e){
+    res.status(500).json({ok:false,error:String(e?.message||e)});
+  }
+});
+/* /WOLVERINE_RPC_PROXY_V1 */
+`;
+
+function injectAfter(regex){
+  const m = s.match(regex);
+  if(!m) return false;
+  const idx = m.index + m[0].length;
+  s = s.slice(0, idx) + "\n" + route + "\n" + s.slice(idx);
+  return true;
+}
+
+// try best insertion points (EARLY)
+let ok =
+  injectAfter(/const\s+app\s*=\s*express\(\)\s*;?/m) ||
+  injectAfter(/let\s+app\s*=\s*express\(\)\s*;?/m) ||
+  injectAfter(/var\s+app\s*=\s*express\(\)\s*;?/m);
+
+if(!ok){
+  // fallback: inject after json middleware
+  ok = injectAfter(/app\.use\(\s*express\.json\(\)\s*\)\s*;?/m);
+}
+
+if(!ok){
+  // last resort: top of file (still before any 404 handler)
+  s = route + "\n" + s;
+}
+
+fs.writeFileSync(f,s,"utf8");
+console.log("OK: rpc route injected early");
+JS
+
+echo
+echo "== C) RESTART backend =="
+systemctl restart "$SVC"
+
+echo
+echo "== D) Detect backend port =="
 PID="$(systemctl show -p MainPID --value "$SVC")"
 PORT="$(ss -ltnp | awk -v pid="pid=$PID" '$0 ~ pid {sub(".*:","",$4); print $4}' | head -n 1)"
 echo "PID=$PID PORT=$PORT"
 [ -n "${PORT:-}" ] || { echo "ERR: port introuvable"; exit 1; }
 
 echo
-echo "== 2) Test backend DIRECT (must NOT be 404) =="
+echo "== E) TEST backend DIRECT (should NOT be not_found) =="
 curl -sS -i "http://127.0.0.1:$PORT/wolverine/traderone/api/rpc" \
   -H 'content-type: application/json' \
   --data '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' | head -n 25
 
 echo
-echo "== 3) Find nginx vhost file for $DOMAIN =="
-VHOST="$(grep -RIl --include='*.conf' "server_name.*$DOMAIN" /etc/nginx/sites-enabled /etc/nginx/conf.d 2>/dev/null | head -n 1 || true)"
+echo "== F) Find nginx conf that serves /wolverine (root or location) =="
+VHOST="$(grep -RIl --include='*.conf' -E 'root\s+/var/www/fireinners|location\s+\^~\s+/wolverine|location\s+/wolverine' /etc/nginx 2>/dev/null | head -n 1 || true)"
 echo "VHOST=$VHOST"
-[ -n "${VHOST:-}" ] || { echo "ERR: vhost nginx introuvable pour $DOMAIN"; exit 1; }
+[ -n "${VHOST:-}" ] || { echo "ERR: conf nginx introuvable (search root/location)"; exit 1; }
 
 echo
-echo "== 4) Inject location proxy if missing =="
+echo "== G) Inject proxy location into that server block if missing =="
 if ! grep -q "/wolverine/traderone/api/" "$VHOST"; then
-  TS="$(date +%s)"
-  cp -a "$VHOST" "$VHOST.bak.$TS"
-  echo "Backup vhost: $VHOST.bak.$TS"
+  TS2="$(date +%s)"
+  cp -a "$VHOST" "$VHOST.bak.$TS2"
+  echo "Backup vhost: $VHOST.bak.$TS2"
 
-  # inject inside the server { } block (before its closing brace)
-  perl -0777 -i -pe 's/server\s*\{(.*?)\n\}/server{$1\n\n  location ^~ \/wolverine\/traderone\/api\/ {\n    proxy_pass http:\/\/127.0.0.1:'"$PORT"';\n    proxy_http_version 1.1;\n    proxy_set_header Host $host;\n    proxy_set_header X-Real-IP $remote_addr;\n    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n  }\n\n}\n/s' "$VHOST"
+  perl -0777 -i -pe 's/(server\s*\{[\s\S]*?)(\n\})/$1\n\n  location ^~ \/wolverine\/traderone\/api\/ {\n    proxy_pass http:\/\/127.0.0.1:'"$PORT"';\n    proxy_http_version 1.1;\n    proxy_set_header Host $host;\n    proxy_set_header X-Real-IP $remote_addr;\n    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n  }\n$2/s' "$VHOST"
 else
-  echo "OK: location déjà présente dans le vhost"
+  echo "OK: location déjà présente"
 fi
 
 echo
-echo "== 5) Reload nginx =="
+echo "== H) Reload nginx =="
 nginx -t && systemctl reload nginx
 
 echo
-echo "== 6) Test HTTPS proxy route (must NOT be 404) =="
+echo "== I) TEST HTTPS proxy route (must NOT be 404/not_found) =="
 curl -ksS -i "https://$DOMAIN/wolverine/traderone/api/rpc" \
   -H 'content-type: application/json' \
   --data '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' | head -n 25
+
+echo
+echo "DONE ✅  Ctrl+F5 sur https://$DOMAIN/wolverine puis clique START"
