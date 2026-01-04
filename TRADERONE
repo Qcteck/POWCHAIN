@@ -1,18 +1,9 @@
 set -euo pipefail
-DOMAIN="fireinners.online"
-VHOST="/etc/nginx/sites-enabled/fireinners"
-SNIP="/etc/nginx/snippets/wolv_rpc_proxy.conf"
 TS="$(date +%s)"
-QDIR="/root/nginx_quarantine_$TS"
+SNIP="/etc/nginx/snippets/wolv_rpc_proxy.conf"
 
-mkdir -p "$QDIR" /etc/nginx/snippets
-
-echo "== 1) Sortir backups/bad de sites-enabled (sinon nginx les charge) =="
-find /etc/nginx/sites-enabled -maxdepth 1 -type f \
-  \( -name "*.bak.*" -o -name "*.bad.*" -o -name "*.old" -o -name "*.tmp" -o -name "*~" \) \
-  -print -exec mv -v {} "$QDIR"/ \; || true
-
-echo "== 2) Écrire snippet RPC proxy (avec header preuve) =="
+echo "== 0) snippet RPC (preuve header) =="
+mkdir -p /etc/nginx/snippets
 cat > "$SNIP" <<'EOF'
 # Wolverine: Solana RPC proxy (same-origin)
 resolver 1.1.1.1 8.8.8.8 valid=300s ipv6=off;
@@ -31,49 +22,45 @@ location = /wolverine/traderone/api/rpc {
 }
 EOF
 
-echo "== 3) Backup vhost + inject include dans le server{} qui a server_name fireinners.online =="
-[ -f "$VHOST" ] || { echo "ERR: $VHOST introuvable"; exit 1; }
-cp -a "$VHOST" "$VHOST.bak.$TS"
+echo "== 1) Patch tous les vhosts actifs qui écoutent 443 =="
+for f in /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf; do
+  [ -f "$f" ] || continue
+  cp -a "$f" "$f.bak.$TS"
 
-# si déjà présent, on skip
-if grep -qF "include $SNIP;" "$VHOST"; then
-  echo "OK: include déjà présent"
-else
-  awk -v snip="  include /etc/nginx/snippets/wolv_rpc_proxy.conf;" -v dom="$DOMAIN" '
-    function countchr(s, c,   i,n){ n=0; for(i=1;i<=length(s);i++) if(substr(s,i,1)==c) n++; return n }
-    BEGIN{in=0; braces=0; injected=0}
+  awk '
+    function countchr(s,c,  i,n){n=0; for(i=1;i<=length(s);i++) if(substr(s,i,1)==c) n++; return n}
+    BEGIN{in=0;br=0; hasListen443=0; hasInclude=0; done=0}
     {
       line=$0
-      if(line ~ /^[[:space:]]*server[[:space:]]*\{/){ in=1; braces += countchr(line,"{") - countchr(line,"}") }
 
-      if(in && !injected && line ~ /server_name/ && line ~ dom){
-        print line
-        print snip
-        injected=1
-        next
+      if(line ~ /^[[:space:]]*server[[:space:]]*\{/){in=1;br=0;hasListen443=0;hasInclude=0;done=0}
+
+      if(in){
+        if(line ~ /listen[[:space:]]+443/){hasListen443=1}
+        if(line ~ /include[[:space:]]+\/etc\/nginx\/snippets\/wolv_rpc_proxy\.conf/){hasInclude=1}
       }
 
       print line
 
-      if(in){
-        braces += countchr(line,"{") - countchr(line,"}")
-        if(braces<=0){ in=0; braces=0 }
+      # inject juste après la première ligne "listen 443" dans ce server{}
+      if(in && hasListen443 && !hasInclude && !done && line ~ /listen[[:space:]]+443/){
+        print "  include /etc/nginx/snippets/wolv_rpc_proxy.conf;"
+        done=1
       }
-    }
-    END{
-      if(!injected){
-        print "### ERR: server_name " dom " pas trouvé dans " FILENAME > "/dev/stderr"
-        exit 2
-      }
-    }
-  ' "$VHOST" > "/tmp/fireinners.$TS.conf" && mv "/tmp/fireinners.$TS.conf" "$VHOST"
-fi
 
-echo "== 4) nginx test + reload =="
+      if(in){
+        br += countchr(line,"{") - countchr(line,"}")
+        if(br<=0 && line ~ /\}/){in=0}
+      }
+    }
+  ' "$f" > "/tmp/nginxfix.$TS" && mv "/tmp/nginxfix.$TS" "$f"
+done
+
+echo "== 2) nginx test + reload =="
 nginx -t
 systemctl reload nginx
 
-echo "== 5) TEST (doit montrer X-Wolv-RPC: 1 et PAS 404) =="
-curl -ksS -i "https://$DOMAIN/wolverine/traderone/api/rpc" \
+echo "== 3) TEST (DOIT montrer X-Wolv-RPC: 1, sinon on touche pas le bon server) =="
+curl -ksS -i "https://fireinners.online/wolverine/traderone/api/rpc" \
   -H 'content-type: application/json' \
   --data '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' | head -n 60
