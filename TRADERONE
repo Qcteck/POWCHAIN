@@ -1,50 +1,83 @@
 set -euo pipefail
+
+HTML="/var/www/fireinners/wolverine/index.html"
 APPJS="/var/www/fireinners/wolverine/app.js"
 TS="$(date +%s)"
+
+cp -a "$HTML" "$HTML.bak.$TS"
 cp -a "$APPJS" "$APPJS.bak.$TS"
-echo "Backup: $APPJS.bak.$TS"
+echo "Backups: $HTML.bak.$TS | $APPJS.bak.$TS"
 
-# Supprime ancien bloc si déjà ajouté
-perl -0777 -i -pe 's|/\*\s*WOLVERINE_FORCE_USER_UI_BEGIN\s*\*/.*?/\*\s*WOLVERINE_FORCE_USER_UI_END\s*\*/\s*||sg' "$APPJS" || true
+echo "== 1) HTML: btnStart jamais caché =="
+# enlève disabled dans le HTML si présent (on gère en JS)
+perl -i -pe 's/(<button\s+id="btnStart")\s+disabled\b/$1/g' "$HTML"
+# enlève display:none si appliqué directement sur btnStart
+perl -i -pe 's/(id="btnStart"[^>]*style="[^"]*)display\s*:\s*none\s*;?([^"]*")/$1$2/gi' "$HTML"
+# si btnStart est dans un bloc afterConnect caché, on force afterConnect à rester visible
+perl -i -pe 's/(id="afterConnect"[^>]*style="[^"]*)display\s*:\s*none\s*;?([^"]*")/$1$2/gi' "$HTML"
 
-cat >> "$APPJS" <<'JS'
+echo "== 2) JS: on n\'utilise plus display:none, seulement disabled =="
+node - <<'JS'
+const fs=require("fs");
+const f="/var/www/fireinners/wolverine/app.js";
+let s=fs.readFileSync(f,"utf8");
 
-/* WOLVERINE_FORCE_USER_UI_BEGIN */
+// Remplace les hide/show agressifs du bloc afterConnect (si présent)
+s = s.replace(/afterConnect\.style\.display\s*=\s*["']none["'];?/g, "");
+s = s.replace(/afterConnect\.style\.display\s*=\s*["']block["'];?/g, "");
+
+// Ajoute une fonction "setStartEnabled" et force le bouton à rester visible
+if(!s.includes("WOLVERINE_START_VISIBILITY_LOCK")){
+  s += `
+
+/* WOLVERINE_START_VISIBILITY_LOCK */
 (function(){
-  // Override refreshBoth pour MAJ DOM directement (sans dépendre de el.uSol/el.uUsdc)
-  const old = window.refreshBoth;
-  window.refreshBoth = async function(){
-    try {
-      if (old) await old();
-    } catch(e) {
-      console.warn("old refreshBoth failed:", e);
-    }
+  const btnStart = document.getElementById("btnStart");
+  const statusEl = document.getElementById("statusText") || document.getElementById("status");
+  function setStatus(t){ try{ if(statusEl) statusEl.textContent=t; }catch(e){} console.log("[STATUS]",t); }
+  window.setStatus = window.setStatus || setStatus;
 
-    try {
-      if (!window.pubkey) return;
+  function setStartEnabled(on, reason){
+    if(!btnStart) return;
+    // jamais caché
+    btnStart.style.display = "";
+    btnStart.style.visibility = "visible";
+    // juste disable/enable
+    btnStart.disabled = !on;
+    btnStart.style.opacity = on ? "1" : "0.55";
+    btnStart.style.cursor  = on ? "pointer" : "not-allowed";
+    if(!on && reason) setStatus(reason);
+  }
+  window.setStartEnabled = setStartEnabled;
 
-      const r = await fetch(`/wolverine/traderone/api/balances2?wallet=${encodeURIComponent(window.pubkey.toString())}`);
-      const txt = await r.text();
-      if (!r.ok) throw new Error("balances2 user HTTP " + r.status + " " + txt.slice(0,160));
-      const j = JSON.parse(txt);
-
-      const sol  = Number(j?.user?.sol  ?? j?.sol  ?? 0);
-      const usdc = Number(j?.user?.usdc ?? j?.usdc ?? 0);
-
-      const uSol  = document.getElementById("uSol");
-      const uUsdc = document.getElementById("uUsdc");
-      if (uSol)  uSol.textContent  = isFinite(sol)  ? sol.toFixed(6)  : "0.000000";
-      if (uUsdc) uUsdc.textContent = isFinite(usdc) ? usdc.toFixed(4) : "0.0000";
-
-      (window.setStatus||console.log)("OK (user forced)");
-    } catch(e) {
-      console.error(e);
-      (window.setStatus||console.log)("ERR user forced: " + (e?.message||e));
-    }
-  };
+  // état initial: visible mais disabled jusqu'à connect
+  setStartEnabled(!!window.pubkey, !window.pubkey ? "Connecte ton wallet pour activer START" : "");
 })();
- /* WOLVERINE_FORCE_USER_UI_END */
+/* /WOLVERINE_START_VISIBILITY_LOCK */
+`;
+}
 
+// Après connect, on active START (si pubkey existe)
+s = s.replace(/window\.pubkey\s*=\s*r\.publicKey;([\s\S]*?)setStatus\(/m, (m)=>{
+  if(m.includes("window.setStartEnabled")) return m;
+  return m.replace("window.pubkey = r.publicKey;", "window.pubkey = r.publicKey;\n        if(window.setStartEnabled) window.setStartEnabled(true);");
+});
+
+// Si une erreur arrive pendant startFlow, on laisse le bouton visible et on le réactive à la fin
+if(s.includes("async function startFlow")){
+  s = s.replace(/async function startFlow\(\)\{\s*try\{/m, "async function startFlow(){\n    try{\n      if(window.setStartEnabled) window.setStartEnabled(false, \"START en cours…\");");
+  s = s.replace(/}\s*catch\(e\)\s*\{\s*console\.error\(e\);\s*setStatus\("ERR "\s*\+\s*\(e\?\.\s*message\s*\|\|\s*e\)\);\s*\}\s*\n/m,
+`  } catch(e){
+      console.error(e);
+      setStatus("ERR " + (e?.message || e));
+    } finally {
+      if(window.setStartEnabled) window.setStartEnabled(true);
+    }
+`);
+}
+
+fs.writeFileSync(f,s,"utf8");
+console.log("OK patched visibility/disable logic.");
 JS
 
-echo "OK ✅ -> Ctrl+F5 sur /wolverine puis Connect + clique Refresh soldes"
+echo "DONE ✅ -> Ctrl+F5 sur /wolverine"
