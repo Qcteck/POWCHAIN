@@ -1,44 +1,63 @@
 set -euo pipefail
+HTML="/var/www/fireinners/wolverine/index.html"
 APPJS="/var/www/fireinners/wolverine/app.js"
 TS="$(date +%s)"
+
+cp -a "$HTML"  "$HTML.bak.$TS"
 cp -a "$APPJS" "$APPJS.bak.$TS"
-echo "Backup: $APPJS.bak.$TS"
+echo "Backups: $HTML.bak.$TS | $APPJS.bak.$TS"
 
-# enlève ancien bloc si déjà ajouté
-perl -0777 -i -pe 's|/\*\s*WOLVERINE_FORCE_START_CLICKABLE_BEGIN\s*\*/.*?/\*\s*WOLVERINE_FORCE_START_CLICKABLE_END\s*\*/\s*||sg' "$APPJS" || true
+# 1) btnStart en type=button
+perl -i -pe 's/<button([^>]*\sid="btnStart"[^>]*)>/<button type="button"$1>/i' "$HTML"
 
-cat >> "$APPJS" <<'JS'
+# 2) Expose startFlow + force click => window.startWolverine()
+node - <<'JS'
+const fs=require("fs");
+const f="/var/www/fireinners/wolverine/app.js";
+let s=fs.readFileSync(f,"utf8");
 
-/* WOLVERINE_FORCE_START_CLICKABLE_BEGIN */
+// Expose startFlow once
+if(!s.includes("window.startWolverine = startFlow")){
+  s = s.replace(/async function startFlow\(\)\{[\s\S]*?\n\}/m, (m)=>{
+    // ajoute l'export juste après la fonction
+    return m + "\n\n  window.startWolverine = startFlow;\n";
+  });
+}
+
+// Force button click to call window.startWolverine (append-only, safe)
+if(!s.includes("WOLVERINE_FORCE_START_POPUP_V1")){
+  s += `
+
+/* WOLVERINE_FORCE_START_POPUP_V1 */
 (function(){
   const btn = document.getElementById("btnStart");
   if(!btn) return;
 
-  // START toujours visible + cliquable
-  function forceClickable(){
-    btn.style.display = "";
-    btn.style.visibility = "visible";
-    btn.style.pointerEvents = "auto";
-    btn.style.cursor = "pointer";
-    btn.disabled = false;
-    btn.style.opacity = "1";
-  }
-
-  // log pour confirmer que le click est capté
-  btn.addEventListener("click", (ev)=>{
-    console.log("[START] click captured");
-    // si pas connecté, on donne un message clair
-    if(!window.pubkey){
-      (window.setStatus||console.log)("Connecte ton wallet puis START");
+  btn.addEventListener("click", async (ev)=>{
+    ev.preventDefault();
+    ev.stopPropagation();
+    console.log("[START] forcing startWolverine()");
+    try{
+      if(!window.solana || !window.solana.isPhantom){
+        (window.setStatus||console.log)("ERR: Phantom non détecté");
+        return;
+      }
+      if(typeof window.startWolverine !== "function"){
+        (window.setStatus||console.log)("ERR: startWolverine introuvable (app.js pas à jour)");
+        return;
+      }
+      await window.startWolverine();
+    } catch(e){
+      console.error(e);
+      (window.setStatus||console.log)("ERR " + (e?.message||e));
     }
   }, true);
-
-  // garde-fou: si un autre code le re-disable, on le remet on
-  forceClickable();
-  setInterval(forceClickable, 800);
 })();
- /* WOLVERINE_FORCE_START_CLICKABLE_END */
+`;
+}
 
+fs.writeFileSync(f,s,"utf8");
+console.log("OK: startWolverine exposed + start click forced");
 JS
 
-echo "OK ✅ Ctrl+F5 sur /wolverine puis clique START"
+echo "DONE ✅ -> Ctrl+F5 sur /wolverine puis clique START (Phantom doit pop)"
