@@ -1,57 +1,43 @@
 sudo -i
-set -euo pipefail
+nginx -T 2>/tmp/ngt.txt >/dev/null
+grep -nE "server_name|listen 443" /tmp/ngt.txt | grep -n "fireinners\.online" -n | head -n 80
 
-DOMAIN="fireinners.online"
-SNIP="/etc/nginx/snippets/wolv_rpc_proxy.conf"
-INC="include /etc/nginx/snippets/wolv_rpc_proxy.conf;"
-TS="$(date +%s)"
 
-echo "== 1) Write snippet =="
+
+
+sudo -i
+set -e
+
+# 1) snippet (sans heredoc compliqué)
 mkdir -p /etc/nginx/snippets
-cat > "$SNIP" <<'EOF'
-resolver 1.1.1.1 8.8.8.8 valid=300s ipv6=off;
+printf '%s\n' \
+'resolver 1.1.1.1 8.8.8.8 valid=300s ipv6=off;' \
+'' \
+'location = /wolverine/traderone/api/rpc {' \
+'  add_header X-Wolv-RPC "1" always;' \
+'  proxy_pass https://api.mainnet-beta.solana.com;' \
+'  proxy_http_version 1.1;' \
+'  proxy_ssl_server_name on;' \
+'  proxy_set_header Host api.mainnet-beta.solana.com;' \
+'  proxy_set_header X-Real-IP $remote_addr;' \
+'  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;' \
+'}' \
+> /etc/nginx/snippets/wolv_rpc_proxy.conf
 
-location = /wolverine/traderone/api/rpc {
-  add_header X-Wolv-RPC "1" always;
-
-  proxy_pass https://api.mainnet-beta.solana.com;
-  proxy_http_version 1.1;
-
-  proxy_ssl_server_name on;
-  proxy_set_header Host api.mainnet-beta.solana.com;
-
-  proxy_set_header X-Real-IP $remote_addr;
-  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-}
-EOF
-
-echo "== 2) Find candidate vhosts (server_name + listen 443) =="
-CANDS="$(grep -RIl --exclude-dir=snippets --exclude='*.bak*' 'server_name' /etc/nginx 2>/dev/null \
-  | xargs -r grep -l "fireinners\.online" 2>/dev/null \
-  | xargs -r grep -l "listen .*443" 2>/dev/null || true)"
-
-echo "$CANDS" | sed '/^$/d' | nl -ba || true
-[ -n "${CANDS:-}" ] || { echo "ERR: aucun vhost trouvé avec server_name fireinners.online + listen 443"; exit 1; }
-
-echo "== 3) Patch each candidate (backup + inject include after server_name line if missing) =="
-for f in $CANDS; do
-  echo "--- Patching $f"
-  cp -a "$f" "$f.bak.$TS" || true
-
-  if grep -qF "$INC" "$f"; then
-    echo "   OK: include déjà présent"
-    continue
+# 2) inject include dans tous les fichiers nginx qui mentionnent fireinners.online + 443
+TS=$(date +%s)
+for f in $(grep -RIl "fireinners\.online" /etc/nginx | grep -E '\.conf$' || true); do
+  if grep -Eq "listen\s+.*443" "$f"; then
+    cp -a "$f" "$f.bak.$TS" || true
+    if ! grep -qF "include /etc/nginx/snippets/wolv_rpc_proxy.conf;" "$f"; then
+      sed -i '/server_name .*fireinners\.online.*/a\  include /etc/nginx/snippets/wolv_rpc_proxy.conf;' "$f" || true
+    fi
   fi
-
-  # inject juste après la ligne server_name ... fireinners.online ...
-  sed -i "/server_name .*fireinners\.online.*/a\\  $INC" "$f"
 done
 
-echo "== 4) nginx test + reload =="
 nginx -t
 systemctl reload nginx
 
-echo "== 5) TEST (doit afficher X-Wolv-RPC: 1) =="
-curl -ksS -i "https://$DOMAIN/wolverine/traderone/api/rpc" \
+curl -ksS -i "https://fireinners.online/wolverine/traderone/api/rpc" \
   -H 'Content-Type: application/json' \
-  --data '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' | head -n 80
+  --data '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' | head -n 60
