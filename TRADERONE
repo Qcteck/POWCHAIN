@@ -1,32 +1,59 @@
-set -euo pipefail
-
-MAIN="/opt/traderone-opt/server.js"
-SVC="traderone.service"
+APPJS="/var/www/fireinners/wolverine/app.js"
 TS="$(date +%s)"
+cp -a "$APPJS" "$APPJS.bak.$TS"
+echo "Backup: $APPJS.bak.$TS"
 
-cp -a "$MAIN" "$MAIN.bak.$TS"
-echo "Backup: $MAIN.bak.$TS"
+# détecte ids si présents
+BTN_START_ID="$(grep -oP 'const\s+btnStart\s*=\s*document\.getElementById\("\K[^"]+' "$APPJS" | head -n1 || true)"
+BUDGET_ID="$(grep -oP 'const\s+budgetEl\s*=\s*document\.getElementById\("\K[^"]+' "$APPJS" | head -n1 || true)"
+: "${BTN_START_ID:=btnStart}"
+: "${BUDGET_ID:=budget}"
 
-# 1) Supprimer le vieux bloc injecté qui contient PUT_BOT_WALLET_HERE (celui qui redéclare BOT_WALLET)
-perl -0777 -i -pe 's/\n\/\* WOLVERINE_START_PUBLIC_VALIDATE_BEGIN \*\/[\s\S]*?PUT_BOT_WALLET_HERE[\s\S]*?\/\* WOLVERINE_START_PUBLIC_VALIDATE_END \*\/\n/\n/s' "$MAIN" || true
+# enlève ancien bloc start si présent
+perl -0777 -i -pe 's|/\*\s*WOLVERINE_START_FIX_BEGIN\s*\*/.*?/\*\s*WOLVERINE_START_FIX_END\s*\*/\s*||sg' "$APPJS" || true
 
-# 2) Sécurité: si le placeholder reste dans le fichier, on l'enlève quand même
-perl -0777 -i -pe 's/\s*\|\|\s*"PUT_BOT_WALLET_HERE"//g' "$MAIN" || true
+cat >> "$APPJS" <<JS
 
-echo "== Occurrences BOT_WALLET restantes =="
-grep -n "const BOT_WALLET" "$MAIN" || true
+/* WOLVERINE_START_FIX_BEGIN */
+(function(){
+  const btnStart = document.getElementById("${BTN_START_ID}");
+  const budgetEl = document.getElementById("${BUDGET_ID}");
+  if (!btnStart || !budgetEl) return;
 
-# 3) Restart et vérifier que 8585 écoute
-systemctl restart "$SVC"
-sleep 1
-systemctl status "$SVC" --no-pager -l | sed -n '1,40p'
+  btnStart.onclick = async () => {
+    try {
+      if (typeof pubkey === "undefined" || !pubkey) { setStatus("Connecte d'abord ton wallet"); return; }
 
-echo
-echo "== LISTEN 8585 =="
-ss -lntp | grep ':8585' || echo "❌ rien n'écoute sur 8585"
+      const b = Number(budgetEl.value);
+      if (!isFinite(b) || b <= 0) { setStatus("Budget invalide"); return; }
 
-echo
-echo "== TEST LOCAL start (bypass nginx) =="
-curl -sS -D- "http://127.0.0.1:8585/wolverine/traderone/api/start" \
-  -X POST -H "Content-Type: application/json" \
-  --data '{"wallet":"TESTUSER","budget":1}' | head -n 80 || true
+      setStatus("START en cours...");
+      const r = await fetch("/wolverine/traderone/api/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ wallet: pubkey.toString(), budget: b })
+      });
+
+      const txt = await r.text();
+      let j = null;
+      try { j = JSON.parse(txt); } catch(e) {}
+
+      if (!r.ok) {
+        const msg = j?.error ? `${j.error} (botUsdc=${j.botUsdc ?? "?"}, needed=${j.needed ?? b})` : txt.slice(0,200);
+        setStatus("REFUSÉ ❌ " + msg);
+        console.log("START refused:", r.status, j || txt);
+        return;
+      }
+
+      setStatus("START OK ✅");
+      console.log("START ok:", j || txt);
+    } catch (e) {
+      setStatus("ERR " + (e?.message || e));
+    }
+  };
+})();
+/* WOLVERINE_START_FIX_END */
+
+JS
+
+echo "Patched START handler. Now Ctrl+F5 on /wolverine"
