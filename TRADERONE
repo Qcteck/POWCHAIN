@@ -3,10 +3,10 @@ set -euo pipefail
 
 DOMAIN="fireinners.online"
 SNIP="/etc/nginx/snippets/wolv_rpc_proxy.conf"
+INC="include /etc/nginx/snippets/wolv_rpc_proxy.conf;"
 TS="$(date +%s)"
-DUMP="/tmp/nginxT.$TS.txt"
 
-# (si le snippet existe déjà, pas grave)
+echo "== 1) Write snippet =="
 mkdir -p /etc/nginx/snippets
 cat > "$SNIP" <<'EOF'
 resolver 1.1.1.1 8.8.8.8 valid=300s ipv6=off;
@@ -25,70 +25,33 @@ location = /wolverine/traderone/api/rpc {
 }
 EOF
 
-echo "== Dump nginx -T =="
-nginx -T > "$DUMP" 2>&1
+echo "== 2) Find candidate vhosts (server_name + listen 443) =="
+CANDS="$(grep -RIl --exclude-dir=snippets --exclude='*.bak*' 'server_name' /etc/nginx 2>/dev/null \
+  | xargs -r grep -l "fireinners\.online" 2>/dev/null \
+  | xargs -r grep -l "listen .*443" 2>/dev/null || true)"
 
-echo "== Find vhost 443 for $DOMAIN =="
-TARGET="$(python3 - <<'PY'
-import re, sys
-p=sys.argv[1]
-lines=open(p,'r',errors='ignore').read().splitlines()
-cur=None
-i=0
-while i<len(lines):
-    m=re.match(r'^# configuration file (.+):$', lines[i])
-    if m: cur=m.group(1).strip()
-    if re.match(r'^\s*server\s*\{', lines[i]):
-        br=0; j=i; block=[]
-        while j<len(lines):
-            l=lines[j]
-            br += l.count('{') - l.count('}')
-            block.append(l)
-            if br==0 and j>i: break
-            j+=1
-        txt="\n".join(block)
-        if ("listen 443" in txt or re.search(r'listen\s+443', txt)) and ("server_name" in txt) and ("fireinners.online" in txt):
-            print(cur or "")
-            sys.exit(0)
-        i=j
-    i+=1
-print("")
-PY
-"$DUMP")"
+echo "$CANDS" | sed '/^$/d' | nl -ba || true
+[ -n "${CANDS:-}" ] || { echo "ERR: aucun vhost trouvé avec server_name fireinners.online + listen 443"; exit 1; }
 
-echo "TARGET=$TARGET"
-[ -n "${TARGET:-}" ] || { echo "ERR: server 443 pour $DOMAIN introuvable"; exit 1; }
+echo "== 3) Patch each candidate (backup + inject include after server_name line if missing) =="
+for f in $CANDS; do
+  echo "--- Patching $f"
+  cp -a "$f" "$f.bak.$TS" || true
 
-echo "== Inject include snippet if missing =="
-cp -a "$TARGET" "$TARGET.bak.$TS" || true
+  if grep -qF "$INC" "$f"; then
+    echo "   OK: include déjà présent"
+    continue
+  fi
 
-python3 - <<'PY'
-import re, sys
-target=sys.argv[1]
-snip='/etc/nginx/snippets/wolv_rpc_proxy.conf'
-s=open(target,'r',errors='ignore').read().splitlines(True)
+  # inject juste après la ligne server_name ... fireinners.online ...
+  sed -i "/server_name .*fireinners\.online.*/a\\  $INC" "$f"
+done
 
-if any('include '+snip in line for line in s):
-    print("OK: include déjà présent")
-    sys.exit(0)
-
-out=[]
-inserted=False
-for line in s:
-    out.append(line)
-    if (not inserted) and ('server_name' in line) and ('fireinners.online' in line):
-        out.append("  include /etc/nginx/snippets/wolv_rpc_proxy.conf;\n")
-        inserted=True
-
-open(target,'w').write(''.join(out))
-print("Injected include into:", target)
-PY
-"$TARGET"
-
+echo "== 4) nginx test + reload =="
 nginx -t
 systemctl reload nginx
 
-echo "== TEST =="
+echo "== 5) TEST (doit afficher X-Wolv-RPC: 1) =="
 curl -ksS -i "https://$DOMAIN/wolverine/traderone/api/rpc" \
   -H 'Content-Type: application/json' \
   --data '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' | head -n 80
