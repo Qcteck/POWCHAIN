@@ -1,101 +1,22 @@
-cat >/tmp/WOLVERINE_NGINX_ONE_VHOST_SSL_STATIC_PROXY.sh <<'SH'
-#!/usr/bin/env bash
-set -euo pipefail
-
-DOMAIN="fireinners.online"
-SITES_AV="/etc/nginx/sites-available"
-SITES_EN="/etc/nginx/sites-enabled"
-CONF_AV="$SITES_AV/fireinners"
-CONF_EN="$SITES_EN/fireinners"
-
-TS="$(date +%s)"
-
-echo "== 0) Backup current enabled dir listing =="
-ls -lah "$SITES_EN" || true
+echo "== Tous les vhosts qui déclarent fireinners.online =="
+grep -RIn --include='*.conf' --include='*' -E 'server_name\s+.*fireinners\.online' \
+  /etc/nginx/sites-enabled /etc/nginx/sites-available /etc/nginx/conf.d 2>/dev/null || true
 echo
 
-echo "== 1) Désactiver les autres vhosts fireinners* (pour éviter les conflits) =="
-for f in "$SITES_EN"/fireinners*; do
+echo "== Lister sites-enabled =="
+ls -lah /etc/nginx/sites-enabled
+echo
+
+echo "== Désactiver tout sauf /etc/nginx/sites-enabled/fireinners =="
+for f in /etc/nginx/sites-enabled/fireinners*; do
   [ -e "$f" ] || continue
-  if [ "$(readlink -f "$f")" != "$(readlink -f "$CONF_EN" 2>/dev/null || true)" ]; then
-    echo "Disable: $f"
+  if [ "$f" != "/etc/nginx/sites-enabled/fireinners" ]; then
+    echo "REMOVE $f"
     rm -f "$f"
   fi
 done
+
+nginx -t && systemctl reload nginx
 echo
-
-echo "== 2) Backup conf si existante =="
-if [ -f "$CONF_AV" ]; then
-  cp -a "$CONF_AV" "$CONF_AV.bak.$TS"
-  echo "Backup: $CONF_AV.bak.$TS"
-fi
-echo
-
-echo "== 3) Écrire un vhost unique (80->443, 443 ssl, /wolverine statique, proxy -> 8585) =="
-cat > "$CONF_AV" <<EOF
-server {
-  listen 80;
-  listen [::]:80;
-  server_name $DOMAIN;
-
-  location /.well-known/acme-challenge/ { root /var/www/html; }
-  return 301 https://\$host\$request_uri;
-}
-
-server {
-  listen 443 ssl http2;
-  listen [::]:443 ssl http2;
-  server_name $DOMAIN;
-
-  ssl_certificate     /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
-  ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
-  include /etc/letsencrypt/options-ssl-nginx.conf;
-  ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
-
-  # STATIC Wolverine
-  root /var/www/fireinners;
-
-  location ~* ^/wolverine/.*\.(js|css|json|png|jpg|jpeg|svg|ico|woff2?|ttf|map)$ {
-    try_files \$uri =404;
-    add_header Cache-Control "no-store" always;
-  }
-
-  location ^~ /wolverine/ {
-    try_files \$uri \$uri/ /wolverine/index.html;
-    add_header Cache-Control "no-store" always;
-  }
-
-  # PROXY le reste vers node 8585
-  location / {
-    proxy_http_version 1.1;
-    proxy_set_header Host \$host;
-    proxy_set_header X-Real-IP \$remote_addr;
-    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto \$scheme;
-    proxy_pass http://127.0.0.1:8585;
-  }
-}
-EOF
-
-ln -sf "$CONF_AV" "$CONF_EN"
-
-echo "== 4) Test + restart nginx =="
-nginx -t
-systemctl restart nginx
-
-echo "== 5) Vérif LISTEN 80/443 =="
-ss -lntp | egrep ':(80|443)\s' || true
-echo
-
-echo "== 6) Tests rapides (JS + page) =="
-curl -ksSI "https://$DOMAIN/wolverine/app.js" | sed -n '1,15p'
-echo
-curl -ksS "https://$DOMAIN/wolverine/app.js" | head -c 25; echo
-echo
-curl -ksSI "https://$DOMAIN/wolverine/" | sed -n '1,12p'
-echo
-
-echo "DONE ✅"
-SH
-
-bash /tmp/WOLVERINE_NGINX_ONE_VHOST_SSL_STATIC_PROXY.sh
+echo "== Recheck conflicts (doit être vide) =="
+nginx -T 2>&1 | grep -i "conflicting server name" || echo "OK: no conflicts ✅"
