@@ -1,68 +1,58 @@
 set -euo pipefail
 DOMAIN="fireinners.online"
+VHOST="/etc/nginx/sites-enabled/fireinners"
+SNIP="/etc/nginx/snippets/wolv_rpc_proxy.conf"
 TS="$(date +%s)"
-TMP="/tmp/nginxT.$TS.txt"
 
-echo "== 1) nginx OK ? =="
+echo "== 1) Show nginx error (file:line) =="
+nginx -t 2>&1 | tail -n 30 || true
+
+echo "== 2) Restore last backup of vhost (if exists) =="
+LAST_BAK="$(ls -1t ${VHOST}.bak.* 2>/dev/null | head -n 1 || true)"
+if [ -n "${LAST_BAK:-}" ]; then
+  cp -a "$VHOST" "$VHOST.bad.$TS"
+  cp -a "$LAST_BAK" "$VHOST"
+  echo "Restored: $LAST_BAK -> $VHOST (saved broken as $VHOST.bad.$TS)"
+else
+  echo "No backup found for $VHOST (continuing without restore)"
+fi
+
+echo "== 3) Write CLEAN nginx snippet (note the \\$ escapes) =="
+mkdir -p /etc/nginx/snippets
+cat > "$SNIP" <<'EOF'
+# Wolverine: Solana RPC proxy (same-origin)
+resolver 1.1.1.1 8.8.8.8 valid=300s ipv6=off;
+
+location = /wolverine/traderone/api/rpc {
+  add_header X-Wolv-RPC "1" always;
+
+  proxy_pass https://api.mainnet-beta.solana.com;
+  proxy_http_version 1.1;
+
+  proxy_ssl_server_name on;
+  proxy_set_header Host api.mainnet-beta.solana.com;
+
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+}
+EOF
+
+echo "== 4) Ensure snippet is INCLUDED inside server{} of $VHOST =="
+if ! grep -qF "include $SNIP;" "$VHOST"; then
+  cp -a "$VHOST" "$VHOST.bak.$TS"
+
+  # inject include before first server{} closing brace
+  perl -0777 -i -pe 's/(server\s*\{[\s\S]*?)(\n\})/$1\n\n  include \/etc\/nginx\/snippets\/wolv_rpc_proxy\.conf;\n$2/s' "$VHOST"
+  echo "Injected include into $VHOST"
+else
+  echo "OK: include already present"
+fi
+
+echo "== 5) nginx test + reload =="
 nginx -t
+systemctl reload nginx
 
-echo "== 2) Dump nginx -T (config finale) =="
-nginx -T > "$TMP" 2>&1
-echo "Saved: $TMP"
-
-echo "== 3) Trouver les fichiers candidats pour HTTPS (host=$DOMAIN + default 443) =="
-# Fichiers qui mentionnent le domain, ou qui ont listen 443 default_server
-mapfile -t FILES < <(
-  awk '
-    /^# configuration file /{f=$4; sub(/:$/,"",f)}
-    /server_name/ && $0 ~ /fireinners\.online/ {print f}
-    /listen/ && $0 ~ /443/ && $0 ~ /default_server/ {print f}
-  ' "$TMP" | sort -u
-)
-
-echo "Candidates:"
-printf ' - %s\n' "${FILES[@]:-NONE}"
-[ "${#FILES[@]}" -gt 0 ] || { echo "ERR: aucun fichier candidat trouvé. Fais: grep -n \"listen 443\" $TMP | head -n 80"; exit 1; }
-
-echo "== 4) Inject RPC proxy location (avec header de preuve) dans ces fichiers =="
-for f in "${FILES[@]}"; do
-  [ -f "$f" ] || continue
-  cp -a "$f" "$f.bak.$TS"
-  echo "Backup: $f.bak.$TS"
-
-  # Si déjà présent, skip
-  if grep -qE 'location\s*=\s*/wolverine/traderone/api/rpc' "$f"; then
-    echo "OK already has location: $f"
-    continue
-  fi
-
-  perl -0777 -i -pe '
-    my $loc = qq|
-
-  # Wolverine: Solana RPC proxy (same-origin)
-  resolver 1.1.1.1 8.8.8.8 valid=300s ipv6=off;
-  location = /wolverine/traderone/api/rpc {
-    add_header X-Wolv-RPC "1" always;
-    proxy_pass https://api.mainnet-beta.solana.com;
-    proxy_http_version 1.1;
-    proxy_ssl_server_name on;
-    proxy_set_header Host api.mainnet-beta.solana.com;
-    proxy_set_header X-Real-IP $remote_addr;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-  }
-|;
-
-    # inject dans CHAQUE server{} du fichier (safe)
-    s/(server\s*\{[\s\S]*?\n\})/$1$loc\n}\n/sg;
-  ' "$f"
-
-  echo "Injected into: $f"
-done
-
-echo "== 5) Reload nginx =="
-nginx -t && systemctl reload nginx
-
-echo "== 6) TEST (doit PAS être 404 + doit contenir header X-Wolv-RPC: 1) =="
+echo "== 6) TEST (must NOT be 404, must contain X-Wolv-RPC: 1) =="
 curl -ksS -i "https://$DOMAIN/wolverine/traderone/api/rpc" \
   -H 'content-type: application/json' \
   --data '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' | head -n 40
