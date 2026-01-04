@@ -1,3 +1,45 @@
-curl -ksS -i https://fireinners.online/wolverine/traderone/api/rpc \
+set -euo pipefail
+
+DOMAIN="fireinners.online"
+SVC="traderone.service"
+
+echo "== 1) Detect backend port =="
+PID="$(systemctl show -p MainPID --value "$SVC")"
+PORT="$(ss -ltnp | awk -v pid="pid=$PID" '$0 ~ pid {sub(".*:","",$4); print $4}' | head -n 1)"
+echo "PID=$PID PORT=$PORT"
+[ -n "${PORT:-}" ] || { echo "ERR: port introuvable"; exit 1; }
+
+echo
+echo "== 2) Test backend DIRECT (must NOT be 404) =="
+curl -sS -i "http://127.0.0.1:$PORT/wolverine/traderone/api/rpc" \
+  -H 'content-type: application/json' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' | head -n 25
+
+echo
+echo "== 3) Find nginx vhost file for $DOMAIN =="
+VHOST="$(grep -RIl --include='*.conf' "server_name.*$DOMAIN" /etc/nginx/sites-enabled /etc/nginx/conf.d 2>/dev/null | head -n 1 || true)"
+echo "VHOST=$VHOST"
+[ -n "${VHOST:-}" ] || { echo "ERR: vhost nginx introuvable pour $DOMAIN"; exit 1; }
+
+echo
+echo "== 4) Inject location proxy if missing =="
+if ! grep -q "/wolverine/traderone/api/" "$VHOST"; then
+  TS="$(date +%s)"
+  cp -a "$VHOST" "$VHOST.bak.$TS"
+  echo "Backup vhost: $VHOST.bak.$TS"
+
+  # inject inside the server { } block (before its closing brace)
+  perl -0777 -i -pe 's/server\s*\{(.*?)\n\}/server{$1\n\n  location ^~ \/wolverine\/traderone\/api\/ {\n    proxy_pass http:\/\/127.0.0.1:'"$PORT"';\n    proxy_http_version 1.1;\n    proxy_set_header Host $host;\n    proxy_set_header X-Real-IP $remote_addr;\n    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n  }\n\n}\n/s' "$VHOST"
+else
+  echo "OK: location déjà présente dans le vhost"
+fi
+
+echo
+echo "== 5) Reload nginx =="
+nginx -t && systemctl reload nginx
+
+echo
+echo "== 6) Test HTTPS proxy route (must NOT be 404) =="
+curl -ksS -i "https://$DOMAIN/wolverine/traderone/api/rpc" \
   -H 'content-type: application/json' \
   --data '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' | head -n 25
