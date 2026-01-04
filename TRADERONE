@@ -1,23 +1,27 @@
 set -euo pipefail
-DOMAIN="fireinners.online"
-VHOST="/etc/nginx/sites-enabled/fireinners"
-SNIP="/etc/nginx/snippets/wolv_rpc_proxy.conf"
 TS="$(date +%s)"
 
-echo "== 1) Show nginx error (file:line) =="
-nginx -t 2>&1 | tail -n 30 || true
+echo "== 1) Erreur exacte (file:line) =="
+nginx -t 2>&1 | tail -n 60 || true
 
-echo "== 2) Restore last backup of vhost (if exists) =="
-LAST_BAK="$(ls -1t ${VHOST}.bak.* 2>/dev/null | head -n 1 || true)"
-if [ -n "${LAST_BAK:-}" ]; then
-  cp -a "$VHOST" "$VHOST.bad.$TS"
-  cp -a "$LAST_BAK" "$VHOST"
-  echo "Restored: $LAST_BAK -> $VHOST (saved broken as $VHOST.bad.$TS)"
-else
-  echo "No backup found for $VHOST (continuing without restore)"
-fi
+echo
+echo "== 2) Trouver les proxy_set_header CASSÉS (valeur manquante) =="
+# match: proxy_set_header <NAME> ;
+grep -RIn --include='*.conf' -E 'proxy_set_header[[:space:]]+[A-Za-z0-9_-]+[[:space:]]*;' /etc/nginx || true
 
-echo "== 3) Write CLEAN nginx snippet (note the \\$ escapes) =="
+echo
+echo "== 3) Backup + supprimer ces lignes cassées partout =="
+mapfile -t BADFILES < <(grep -RIl --include='*.conf' -E 'proxy_set_header[[:space:]]+[A-Za-z0-9_-]+[[:space:]]*;' /etc/nginx || true)
+for f in "${BADFILES[@]:-}"; do
+  cp -a "$f" "$f.bak.$TS"
+  # delete only the broken "proxy_set_header NAME ;" lines
+  sed -i -E '/proxy_set_header[[:space:]]+[A-Za-z0-9_-]+[[:space:]]*;/d' "$f"
+  echo "Fixed: $f (backup: $f.bak.$TS)"
+done
+
+echo
+echo "== 4) Écrire snippet RPC PROPRE (PAS de \\$) =="
+SNIP="/etc/nginx/snippets/wolv_rpc_proxy.conf"
 mkdir -p /etc/nginx/snippets
 cat > "$SNIP" <<'EOF'
 # Wolverine: Solana RPC proxy (same-origin)
@@ -32,27 +36,18 @@ location = /wolverine/traderone/api/rpc {
   proxy_ssl_server_name on;
   proxy_set_header Host api.mainnet-beta.solana.com;
 
-  proxy_set_header X-Real-IP \$remote_addr;
-  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
 }
 EOF
 
-echo "== 4) Ensure snippet is INCLUDED inside server{} of $VHOST =="
-if ! grep -qF "include $SNIP;" "$VHOST"; then
-  cp -a "$VHOST" "$VHOST.bak.$TS"
-
-  # inject include before first server{} closing brace
-  perl -0777 -i -pe 's/(server\s*\{[\s\S]*?)(\n\})/$1\n\n  include \/etc\/nginx\/snippets\/wolv_rpc_proxy\.conf;\n$2/s' "$VHOST"
-  echo "Injected include into $VHOST"
-else
-  echo "OK: include already present"
-fi
-
+echo
 echo "== 5) nginx test + reload =="
 nginx -t
 systemctl reload nginx
 
-echo "== 6) TEST (must NOT be 404, must contain X-Wolv-RPC: 1) =="
-curl -ksS -i "https://$DOMAIN/wolverine/traderone/api/rpc" \
+echo
+echo "== 6) Test (doit PAS être 404 + doit contenir X-Wolv-RPC: 1) =="
+curl -ksS -i "https://fireinners.online/wolverine/traderone/api/rpc" \
   -H 'content-type: application/json' \
   --data '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' | head -n 40
