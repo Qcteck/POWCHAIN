@@ -1,185 +1,100 @@
-cat >/tmp/WOLVERINE_BEST_FIX_ALL.sh <<'SH'
-#!/usr/bin/env bash
 set -euo pipefail
-
-HTML="/var/www/fireinners/wolverine/index.html"
-APPJS="/var/www/fireinners/wolverine/app.js"
+MAIN="/opt/traderone-opt/server.js"
+SVC="traderone.service"
 TS="$(date +%s)"
 
-BOT="$(systemctl show traderone.service -p Environment --value | tr ' ' '\n' | sed -n 's/^TRADERONE_BOT_WALLET=//p')"
-[ -n "${BOT:-}" ] || { echo "ERR: TRADERONE_BOT_WALLET vide"; exit 1; }
+cp -a "$MAIN" "$MAIN.bak.$TS"
+echo "Backup: $MAIN.bak.$TS"
 
-echo "BOT=$BOT"
+node - <<'JS'
+const fs = require("fs");
+const file = "/opt/traderone-opt/server.js";
+let s = fs.readFileSync(file,"utf8");
 
-cp -a "$HTML"  "$HTML.bak.$TS"
-cp -a "$APPJS" "$APPJS.bak.$TS"
-echo "Backups: $HTML.bak.$TS  |  $APPJS.bak.$TS"
+// 1) Inject cache helpers once
+if (!s.includes("WOLVERINE_BALANCES_CACHE_BEGIN")) {
+  const anchor = s.match(/const\s+app\s*=\s*express\(\)\s*;?/);
+  if (!anchor) throw new Error("Cannot find: const app = express()");
+  const pos = s.indexOf(anchor[0]) + anchor[0].length;
 
-echo
-echo "== 1) Fix tAddr (BOT address) in index.html =="
-perl -i -pe 's|(<span id="tAddr">)(.*?)(</span>)|$1'"$BOT"'$3|g' "$HTML"
-grep -n 'id="tAddr"' "$HTML" | head -n 2 || true
+  const block = `
 
-echo
-echo "== 2) Clean old injected blocks in app.js =="
-perl -0777 -i -pe 's|/\*\s*WOLVERINE_CONNECT_FIX_BEGIN\s*\*/.*?/\*\s*WOLVERINE_CONNECT_FIX_END\s*\*/\s*||sg' "$APPJS" || true
-perl -0777 -i -pe 's|/\*\s*WOLVERINE_BALANCES_FIX_BEGIN\s*\*/.*?/\*\s*WOLVERINE_BALANCES_FIX_END\s*\*/\s*||sg' "$APPJS" || true
-perl -0777 -i -pe 's|/\*\s*WOLVERINE_START_FIX_BEGIN\s*\*/.*?/\*\s*WOLVERINE_START_FIX_END\s*\*/\s*||sg' "$APPJS" || true
+/* WOLVERINE_BALANCES_CACHE_BEGIN */
+// Simple in-memory cache to avoid RPC 429
+const __balCache = new Map(); // key -> {ts, data, code, headers}
+const __balTTLms = Number(process.env.BALANCES_CACHE_TTL_MS || "5000"); // 5s
 
-echo
-echo "== 3) Append BEST front handlers (Connect + Refresh + Start) =="
-cat >> "$APPJS" <<'JS'
+function __cacheGet(key){
+  const it = __balCache.get(key);
+  if (!it) return null;
+  if (Date.now() - it.ts > __balTTLms) { __balCache.delete(key); return null; }
+  return it;
+}
+function __cacheSet(key, payload){
+  __balCache.set(key, { ts: Date.now(), ...payload });
+}
+/* WOLVERINE_BALANCES_CACHE_END */
 
-/* WOLVERINE_CONNECT_FIX_BEGIN */
-(function(){
-  const btn = document.getElementById("btnConnect");
-  const after = document.getElementById("afterConnect");
-  const btnStart = document.getElementById("btnStart");
-  const statusEl = document.getElementById("statusText") || document.getElementById("status");
+`;
+  s = s.slice(0,pos) + block + s.slice(pos);
+  console.log("Injected balances cache helpers");
+}
 
-  function setStatus(t){
-    try { if(statusEl) statusEl.textContent = t; } catch(e) {}
-    console.log("[STATUS]", t);
-  }
-  window.setStatus = window.setStatus || setStatus;
-
-  if(!btn){ console.log("btnConnect not found"); return; }
-
-  btn.onclick = async () => {
-    try {
-      if (!window.solana || !window.solana.isPhantom) { setStatus("Phantom non détecté"); return; }
-      const r = await window.solana.connect();
-      window.pubkey = r.publicKey;
-      if (after) after.style.display = "block";
-      if (btnStart) btnStart.disabled = false;
-      setStatus("Wallet connectée ✅ " + window.pubkey.toString());
-      if (typeof window.refreshBoth === "function") await window.refreshBoth();
-    } catch (e) {
-      console.error(e);
-      setStatus("ERR " + (e?.message || e));
+// 2) Wrap balances2 route with cache if route exists
+// We look for app.get("...balances2") and inject a cache shortcut at top of handler.
+const re = /app\.get\(\s*["']([^"']*balances2[^"']*)["']\s*,\s*async\s*\(\s*req\s*,\s*res\s*\)\s*=>\s*\{/m;
+const m = s.match(re);
+if (!m) {
+  console.log("WARN: balances2 route not found automatically. No route patched.");
+} else {
+  const path = m[1];
+  const idx = s.indexOf(m[0]) + m[0].length;
+  // don't double inject
+  if (!s.includes("WOLVERINE_BALANCES_CACHE_HIT")) {
+    const inject = `
+  // WOLVERINE_BALANCES_CACHE_HIT
+  try {
+    const w = String(req.query.wallet || "");
+    const key = "${path}::" + w;
+    const hit = __cacheGet(key);
+    if (hit) {
+      res.setHeader("X-Cache", "HIT");
+      if (hit.headers) Object.entries(hit.headers).forEach(([k,v])=>{ if(v!==undefined) res.setHeader(k,v); });
+      return res.status(hit.code || 200).send(hit.data);
     }
-  };
-})();
-/* WOLVERINE_CONNECT_FIX_END */
+    res.setHeader("X-Cache", "MISS");
+  } catch(e) {}
+`;
+    s = s.slice(0, idx) + inject + s.slice(idx);
 
-/* WOLVERINE_BALANCES_FIX_BEGIN */
-(function(){
-  const $ = (id)=>document.getElementById(id);
-
-  const uSol  = $("uSol");
-  const uUsdc = $("uUsdc");
-  const tAddr = $("tAddr");
-  const tSol  = $("tSol");
-  const tUsdc = $("tUsdc");
-  const btnRefresh = $("btnRefresh");
-  const statusEl = $("statusText") || $("status");
-
-  function setStatus(t){
-    try { if (statusEl) statusEl.textContent = t; } catch(e){}
-    console.log("[STATUS]", t);
-  }
-  window.setStatus = window.setStatus || setStatus;
-
-  function getUserWallet(){
-    return (window.pubkey && window.pubkey.toString) ? window.pubkey.toString()
-         : (typeof pubkey !== "undefined" && pubkey && pubkey.toString) ? pubkey.toString()
-         : "";
-  }
-
-  async function fetchBalances(wallet){
-    const r = await fetch(`/wolverine/traderone/api/balances2?wallet=${encodeURIComponent(wallet)}`);
-    const txt = await r.text();
-    if(!r.ok) throw new Error("balances2 HTTP " + r.status + " " + txt.slice(0,160));
-    try { return JSON.parse(txt); } catch(e){ throw new Error("balances2 bad JSON: " + txt.slice(0,160)); }
-  }
-
-  window.refreshBoth = async function refreshBoth(){
-    try{
-      const userWallet = getUserWallet();
-      const botWallet = (tAddr && tAddr.textContent || "").trim();
-      if(!botWallet || botWallet === "—") { setStatus("ERR: adresse BOT vide"); return; }
-
-      const bot = await fetchBalances(botWallet);
-      const botSol  = Number(bot?.user?.sol  ?? bot?.sol  ?? 0);
-      const botUsdc = Number(bot?.user?.usdc ?? bot?.usdc ?? 0);
-      if (tSol)  tSol.textContent  = botSol.toFixed(6);
-      if (tUsdc) tUsdc.textContent = botUsdc.toFixed(4);
-
-      if(userWallet){
-        const usr = await fetchBalances(userWallet);
-        const usrSol  = Number(usr?.user?.sol  ?? usr?.sol  ?? 0);
-        const usrUsdc = Number(usr?.user?.usdc ?? usr?.usdc ?? 0);
-        if (uSol)  uSol.textContent  = usrSol.toFixed(6);
-        if (uUsdc) uUsdc.textContent = usrUsdc.toFixed(4);
-      } else {
-        if (uSol)  uSol.textContent  = "—";
-        if (uUsdc) uUsdc.textContent = "—";
-      }
-
-      setStatus("OK");
-    } catch(e){
-      console.error(e);
-      setStatus("ERR " + (e?.message || e));
+    // Also add cacheSet right before successful response send/json where possible
+    // Simple approach: cache JSON responses by intercepting res.json/res.send
+    if (!s.includes("WOLVERINE_BALANCES_CACHE_WRAP")) {
+      s = s.replace(m[0], m[0] + `
+  // WOLVERINE_BALANCES_CACHE_WRAP
+  const __origJson = res.json.bind(res);
+  const __origSend = res.send.bind(res);
+  const __w = String(req.query.wallet || "");
+  const __key = "${path}::" + __w;
+  res.json = (obj) => { try { __cacheSet(__key, { code: res.statusCode || 200, data: JSON.stringify(obj), headers: {"Content-Type":"application/json"} }); } catch(e) {} return __origJson(obj); };
+  res.send = (body) => { try { __cacheSet(__key, { code: res.statusCode || 200, data: body, headers: {"Content-Type": res.getHeader("Content-Type")} }); } catch(e) {} return __origSend(body); };
+`);
+      console.log("Patched balances2 with cache:", path);
     }
-  };
-
-  if(btnRefresh) btnRefresh.onclick = () => window.refreshBoth();
-  window.addEventListener("load", () => { window.refreshBoth(); });
-})();
-/* WOLVERINE_BALANCES_FIX_END */
-
-/* WOLVERINE_START_FIX_BEGIN */
-(function(){
-  const btnStart = document.getElementById("btnStart");
-  const budgetEl = document.getElementById("budget");
-  const statusEl = document.getElementById("statusText") || document.getElementById("status");
-  function setStatus(t){
-    try { if(statusEl) statusEl.textContent = t; } catch(e) {}
-    console.log("[STATUS]", t);
+  } else {
+    console.log("balances2 cache already present -> skip");
   }
-  window.setStatus = window.setStatus || setStatus;
+}
 
-  if (!btnStart || !budgetEl) return;
-
-  btnStart.onclick = async () => {
-    try {
-      if (!window.pubkey) { setStatus("Connecte d'abord ton wallet"); return; }
-      const b = Number(budgetEl.value);
-      if (!isFinite(b) || b <= 0) { setStatus("Budget invalide"); return; }
-
-      setStatus("START en cours...");
-      const r = await fetch("/wolverine/traderone/api/start", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ wallet: window.pubkey.toString(), budget: b })
-      });
-
-      const txt = await r.text();
-      let j = null; try { j = JSON.parse(txt); } catch(e) {}
-
-      if (!r.ok) {
-        const msg = (j && j.error)
-          ? `${j.error} (botUsdc=${j.botUsdc ?? "?"}, needed=${j.needed ?? b})`
-          : txt.slice(0,200);
-        setStatus("REFUSÉ ❌ " + msg);
-        console.log("START refused:", r.status, j || txt);
-        return;
-      }
-
-      setStatus("START OK ✅");
-      console.log("START ok:", j || txt);
-      if (typeof window.refreshBoth === "function") await window.refreshBoth();
-    } catch (e) {
-      setStatus("ERR " + (e?.message || e));
-    }
-  };
-})();
-/* WOLVERINE_START_FIX_END */
-
+fs.writeFileSync(file, s, "utf8");
+console.log("Wrote:", file);
 JS
 
-echo
-echo "DONE ✅ -> Ctrl+F5 sur https://fireinners.online/wolverine/ puis Connect + Refresh + Start"
-SH
+systemctl restart "$SVC"
+sleep 1
 
-bash /tmp/WOLVERINE_BEST_FIX_ALL.sh
+echo
+echo "== quick test (should show X-Cache: MISS then HIT) =="
+BOT="$(systemctl show traderone.service -p Environment --value | tr ' ' '\n' | sed -n 's/^TRADERONE_BOT_WALLET=//p')"
+curl -ksS -D- "https://fireinners.online/wolverine/traderone/api/balances2?wallet=$BOT" -o /dev/null | grep -i x-cache || true
+curl -ksS -D- "https://fireinners.online/wolverine/traderone/api/balances2?wallet=$BOT" -o /dev/null | grep -i x-cache || true
