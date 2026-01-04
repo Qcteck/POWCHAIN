@@ -1,69 +1,84 @@
 set -euo pipefail
-APPJS="/var/www/fireinners/wolverine/app.js"
+
+MAIN="/opt/traderone-opt/server.js"
+SVC="traderone.service"
 TS="$(date +%s)"
-cp -a "$APPJS" "$APPJS.bak.$TS"
-echo "Backup: $APPJS.bak.$TS"
+
+cp -a "$MAIN" "$MAIN.bak.$TS"
+echo "Backup: $MAIN.bak.$TS"
 
 node - <<'JS'
 const fs=require("fs");
-const f="/var/www/fireinners/wolverine/app.js";
+const f="/opt/traderone-opt/server.js";
 let s=fs.readFileSync(f,"utf8");
 
-// 1) Ajouter un cooldown global (anti spam)
-if(!s.includes("window.__RB_LOCK")){
-  s = s.replace(
-    /window\.refreshBoth\s*=\s*async\s*function\s*\(\)\s*\{\s*try\{/,
-`window.__RB_LOCK = window.__RB_LOCK || {inFlight:false,last:0};
-window.refreshBoth = async function(){
-  const now = Date.now();
-  if(window.__RB_LOCK.inFlight) return;
-  if(now - window.__RB_LOCK.last < 4000) { setStatus("Attends 4s (anti 429)…"); return; }
-  window.__RB_LOCK.last = now;
-  window.__RB_LOCK.inFlight = true;
-  try{`
-  );
-  s = s.replace(/}\s*catch\(e\)\s*\{([\s\S]*?)\}\s*;\s*\n?};/,
-`} catch(e){
-$1
-} finally {
-  window.__RB_LOCK.inFlight = false;
-}
-};`);
+const m = s.match(/app\.get\(\s*["']([^"']*balances2[^"']*)["']\s*,\s*async\s*\(\s*req\s*,\s*res\s*\)\s*=>\s*\{/m);
+if(!m) throw new Error("balances2 route introuvable");
+const path = m[1];
+const start = s.indexOf(m[0]) + m[0].length; // position juste après le "{"
+
+if (s.includes("WOLVERINE_BALANCES_STALE_BEGIN")) {
+  console.log("STALE déjà présent, skip");
+  process.exit(0);
 }
 
-// 2) Rendre refreshBoth “partiel”: bot d’abord, user séparé (ne casse pas si user 429)
-s = s.replace(
-  /const bot = await balances2\(botPubkey\(\)\.toString\(\)\);([\s\S]*?)if \(window\.pubkey\) \{\s*const usr = await balances2\(window\.pubkey\.toString\(\)\);([\s\S]*?)\}\s*else\s*\{([\s\S]*?)\}\s*setStatus\("OK"\);/m,
-`const bot = await balances2(botPubkey().toString());
-$1
+// Trouver la fin du handler en comptant les accolades (simple mais suffisant ici)
+let i = start, depth = 1;
+let inS=null, esc=false, inLine=false, inBlock=false;
+for(; i<s.length; i++){
+  const c=s[i], n=s[i+1];
 
-// USER (séparé: si 429 on garde bot OK)
-if (window.pubkey) {
-  try {
-    const usr = await balances2(window.pubkey.toString());
-$2
-  } catch(e) {
-    const msg = String(e?.message||e);
-    console.warn("USER balances failed:", msg);
-    if (el.uSol)  el.uSol.textContent  = "—";
-    if (el.uUsdc) el.uUsdc.textContent = "—";
-    if (msg.includes("429")) {
-      setStatus("RPC 429 (user). Retry dans 6s…");
-      setTimeout(()=>window.refreshBoth(), 6000);
-      return;
-    }
-    setStatus("ERR user balances: " + msg.slice(0,120));
-    return;
+  if(inLine){ if(c==="\n") inLine=false; continue; }
+  if(inBlock){ if(c==="*" && n==="/"){ inBlock=false; i++; } continue; }
+
+  if(inS){
+    if(esc){ esc=false; continue; }
+    if(c==="\\"){ esc=true; continue; }
+    if(c===inS){ inS=null; continue; }
+    continue;
+  } else {
+    if(c==="'"||c==='"'||c==="`"){ inS=c; continue; }
+    if(c==="/" && n==="/"){ inLine=true; i++; continue; }
+    if(c==="/" && n==="*"){ inBlock=true; i++; continue; }
+    if(c==="{") depth++;
+    if(c==="}") { depth--; if(depth===0) break; }
   }
-} else {
-$3
 }
+if(depth!==0) throw new Error("Impossible de fermer le handler balances2");
 
-setStatus("OK");`
-);
+const body = s.slice(start, i); // contenu entre { ... }
+const prefix = `
+/* WOLVERINE_BALANCES_STALE_BEGIN */
+  const __w = String(req.query.wallet || "");
+  const __key = "${path}::" + __w;
+  const __staleAny = __balCache.get(__key); // stale possible même expiré
+  try {
+`;
+const suffix = `
+  } catch (e) {
+    const msg = String(e && (e.message || e) || "");
+    if ((msg.includes("429") || msg.toLowerCase().includes("too many")) && __staleAny) {
+      res.setHeader("X-Cache", "STALE");
+      try { if (__staleAny.headers) Object.entries(__staleAny.headers).forEach(([k,v])=>{ if(v!==undefined) res.setHeader(k,v); }); } catch(_) {}
+      return res.status(__staleAny.code || 200).send(__staleAny.data);
+    }
+    throw e;
+  }
+/* WOLVERINE_BALANCES_STALE_END */
+`;
+
+const newBody = prefix + body + suffix;
+s = s.slice(0,start) + newBody + s.slice(start + body.length);
 
 fs.writeFileSync(f,s,"utf8");
-console.log("Patched refreshBoth (cooldown + user retry on 429).");
+console.log("OK: stale cache ajouté sur balances2:", path);
 JS
 
-echo "OK ✅ Fais Ctrl+F5 sur /wolverine"
+systemctl restart "$SVC"
+sleep 1
+
+echo
+echo "== Test rapide (doit montrer X-Cache: MISS/HIT/STALE) =="
+BOT="$(systemctl show traderone.service -p Environment --value | tr ' ' '\n' | sed -n 's/^TRADERONE_BOT_WALLET=//p')"
+curl -ksS -D- "https://fireinners.online/wolverine/traderone/api/balances2?wallet=$BOT" -o /dev/null | grep -i x-cache || true
+curl -ksS -D- "https://fireinners.online/wolverine/traderone/api/balances2?wallet=$BOT" -o /dev/null | grep -i x-cache || true
