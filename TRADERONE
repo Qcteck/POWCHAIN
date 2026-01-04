@@ -1,23 +1,93 @@
 set -euo pipefail
-APPJS="/var/www/fireinners/wolverine/app.js"
-TS="$(date +%s)"
-cp -a "$APPJS" "$APPJS.bak.$TS"
-echo "Backup: $APPJS.bak.$TS"
 
+DOMAIN="fireinners.online"
+SRV="/opt/traderone-opt/server.js"
+APPJS="/var/www/fireinners/wolverine/app.js"
+SVC="traderone.service"
+TS="$(date +%s)"
+
+echo "== 0) BACKUPS =="
+cp -a "$SRV"  "$SRV.bak.$TS"
+cp -a "$APPJS" "$APPJS.bak.$TS"
+echo "Backups: $SRV.bak.$TS | $APPJS.bak.$TS"
+
+echo
+echo "== 1) ADD RPC ROUTE (if missing) =="
 node - <<'JS'
 const fs=require("fs");
-const f="/var/www/fireinners/wolverine/app.js";
+const f="/opt/traderone-opt/server.js";
 let s=fs.readFileSync(f,"utf8");
 
-// Remplace new Connection("/wolverine/...") par new Connection(new URL("/wolverine/...", location.origin).toString())
-s = s.replace(/new\s+solanaWeb3\.Connection\(\s*["']\/wolverine\/traderone\/api\/rpc["']\s*,/g,
-              'new solanaWeb3.Connection(new URL("/wolverine/traderone/api/rpc", window.location.origin).toString(),');
+if(s.includes("WOLVERINE_RPC_PROXY_V1")){
+  console.log("OK: rpc route already present");
+  process.exit(0);
+}
 
-s = s.replace(/new\s+window\.solanaWeb3\.Connection\(\s*["']\/wolverine\/traderone\/api\/rpc["']\s*,/g,
-              'new window.solanaWeb3.Connection(new URL("/wolverine/traderone/api/rpc", window.location.origin).toString(),');
+const insert = `
+
+/* WOLVERINE_RPC_PROXY_V1 */
+app.post("/wolverine/traderone/api/rpc", async (req,res) => {
+  try{
+    const upstream = "https://api.mainnet-beta.solana.com";
+    const r = await fetch(upstream, {
+      method: "POST",
+      headers: {"content-type":"application/json"},
+      body: JSON.stringify(req.body || {})
+    });
+    const txt = await r.text();
+    res.status(r.status);
+    res.setHeader("content-type","application/json");
+    res.send(txt);
+  }catch(e){
+    res.status(500).json({error: String(e?.message||e)});
+  }
+});
+/* /WOLVERINE_RPC_PROXY_V1 */
+`;
+
+const idx = s.search(/app\.listen\(/);
+if(idx === -1) throw new Error("app.listen( introuvable dans server.js");
+s = s.slice(0, idx) + insert + "\n" + s.slice(idx);
 
 fs.writeFileSync(f,s,"utf8");
-console.log("OK: RPC proxy URL forced absolute");
+console.log("OK: rpc route injected");
 JS
 
-echo "DONE ✅ Ctrl+F5 sur /wolverine puis reteste START"
+echo
+echo "== 2) RESTART BACKEND =="
+systemctl restart "$SVC"
+
+echo
+echo "== 3) AUTO-DETECT BACKEND PORT =="
+PID="$(systemctl show -p MainPID --value "$SVC")"
+PORT="$(ss -ltnp | awk -v pid="pid=$PID" '$0 ~ pid {sub(".*:","",$4); print $4}' | head -n 1)"
+echo "PID=$PID PORT=$PORT"
+[ -n "${PORT:-}" ] || { echo "ERR: port introuvable"; exit 1; }
+
+echo
+echo "== 4) NGINX PROXY for /wolverine/traderone/api/ =="
+cat > /etc/nginx/conf.d/wolverine_traderone_api.conf <<EOF
+location ^~ /wolverine/traderone/api/ {
+  proxy_pass http://127.0.0.1:$PORT;
+  proxy_http_version 1.1;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+}
+EOF
+nginx -t && systemctl reload nginx
+
+echo
+echo "== 5) FRONTEND: force RPC URL to ABSOLUTE proxy (web3.js needs http/https) =="
+# met https://DOMAIN/wolverine/traderone/api/rpc partout
+sed -i "s#new solanaWeb3\\.Connection([^,]*,#new solanaWeb3.Connection(\"https://$DOMAIN/wolverine/traderone/api/rpc\",#g" "$APPJS"
+sed -i "s#new window\\.solanaWeb3\\.Connection([^,]*,#new window.solanaWeb3.Connection(\"https://$DOMAIN/wolverine/traderone/api/rpc\",#g" "$APPJS"
+
+echo
+echo "== 6) TEST RPC PROXY (should NOT be 404) =="
+curl -ksS -i "https://$DOMAIN/wolverine/traderone/api/rpc" \
+  -H 'content-type: application/json' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' | head -n 25
+
+echo
+echo "DONE ✅  -> Ctrl+F5 sur https://$DOMAIN/wolverine puis START"
