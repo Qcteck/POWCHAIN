@@ -1,109 +1,26 @@
-cat >/tmp/WOLVERINE_START_REAL_VALIDATE.sh <<'SH'
-#!/usr/bin/env bash
-set -euo pipefail
+set -e
 
-SVC="traderone.service"
-MAIN="/opt/traderone-opt/server.js"
-TS="$(date +%s)"
-
-cp -a "$MAIN" "$MAIN.bak.$TS"
-echo "Backup: $MAIN.bak.$TS"
-
-node - <<'JS'
-const fs = require("fs");
-const file = "/opt/traderone-opt/server.js";
-let s = fs.readFileSync(file, "utf8");
-
-// 1) Assure express.json()
-if (!/app\.use\(\s*express\.json\(\)\s*\)/.test(s)) {
-  const m = s.match(/const\s+app\s*=\s*express\(\)\s*;?/);
-  if (!m) throw new Error("Cannot find `const app = express()`");
-  const pos = s.indexOf(m[0]) + m[0].length;
-  s = s.slice(0,pos) + "\napp.use(express.json());\n" + s.slice(pos);
-  console.log("Added app.use(express.json())");
-} else {
-  console.log("express.json already present");
-}
-
-// 2) Replace/insert start route between markers if present, else insert new
-const begin = "WOLVERINE_START_ROUTE_BEGIN";
-const end   = "WOLVERINE_START_ROUTE_END";
-
-const newBlock = `
-/* ${begin} */
-const BOT_WALLET = process.env.TRADERONE_BOT_WALLET;
-const MIN_SOL_FEES = Number(process.env.TRADERONE_MIN_SOL_FEES || "0.01");
-
-// Valide que le BOT a assez de SOL (fees) + assez de USDC vs budget demandé
-app.post("/wolverine/traderone/api/start", async (req, res) => {
-  try {
-    const { wallet, budget } = req.body || {};
-    const b = Number(budget);
-
-    if (!wallet || typeof wallet !== "string") return res.status(400).json({ ok:false, error:"bad_wallet" });
-    if (!isFinite(b) || b <= 0) return res.status(400).json({ ok:false, error:"bad_budget" });
-    if (!BOT_WALLET) return res.status(500).json({ ok:false, error:"bot_wallet_not_set" });
-
-    // call balances2 for BOT
-    const http = require("http");
-    const url = "http://127.0.0.1:8585/wolverine/traderone/api/balances2?wallet=" + encodeURIComponent(BOT_WALLET);
-
-    const raw = await new Promise((resolve, reject) => {
-      http.get(url, (r) => {
-        let buf = "";
-        r.on("data", (c) => buf += c);
-        r.on("end", () => resolve({ code: r.statusCode || 0, body: buf }));
-      }).on("error", reject);
-    });
-
-    if (raw.code < 200 || raw.code >= 300) {
-      return res.status(502).json({ ok:false, error:"balances2_failed", detail:String(raw.body).slice(0,200) });
-    }
-
-    let j;
-    try { j = JSON.parse(raw.body); } catch(e) {
-      return res.status(502).json({ ok:false, error:"balances2_bad_json", detail:String(raw.body).slice(0,120) });
-    }
-
-    // your balances2 schema: { user:{sol,usdc,...}, trader:{...} }
-    const botSol  = Number(j?.user?.sol  ?? 0);
-    const botUsdc = Number(j?.user?.usdc ?? 0);
-
-    if (botSol < MIN_SOL_FEES) return res.status(400).json({ ok:false, error:"bot_needs_sol_fees", botSol, min: MIN_SOL_FEES });
-    if (botUsdc < b) return res.status(400).json({ ok:false, error:"insufficient_usdc_on_bot", botUsdc, needed: b });
-
-    return res.json({ ok:true, wallet, budget:b, botSol, botUsdc, msg:"start validated" });
-  } catch (e) {
-    return res.status(500).json({ ok:false, error:"start_failed", detail:String(e?.message || e) });
-  }
-});
-/* ${end} */
-`;
-
-const re = new RegExp(`/\\*\\s*${begin}\\s*\\*/[\\s\\S]*?/\\*\\s*${end}\\s*\\*/`, "m");
-if (re.test(s)) {
-  s = s.replace(re, newBlock);
-  console.log("Replaced existing START block");
-} else {
-  // insert after express.json line
-  const m = s.match(/app\.use\(\s*express\.json\(\)\s*\)\s*;?/);
-  const pos = m ? s.indexOf(m[0]) + m[0].length : 0;
-  s = s.slice(0,pos) + "\n\n" + newBlock + "\n\n" + s.slice(pos);
-  console.log("Inserted new START block");
-}
-
-fs.writeFileSync(file, s, "utf8");
-console.log("Patched:", file);
-JS
-
-systemctl restart "$SVC"
-sleep 1
-
+echo "== 1) Service traderone =="
+systemctl status traderone.service --no-pager -l | sed -n '1,80p'
 echo
-echo "== TEST START (budget=1) : avec ton botUsdc=0.5 ça DOIT répondre 400 insufficient_usdc_on_bot =="
-curl -ksS -D- "https://fireinners.online/wolverine/traderone/api/start" \
-  -X POST -H "Content-Type: application/json" \
-  --data '{"wallet":"TESTUSER","budget":1}' | head -n 120
-SH
 
-bash /tmp/WOLVERINE_START_REAL_VALIDATE.sh
+echo "== 2) Logs (erreur au démarrage / crash JS) =="
+journalctl -u traderone.service -n 120 --no-pager
+echo
+
+echo "== 3) Est-ce que 8585 écoute ? =="
+ss -lntp | grep ':8585' || echo "❌ rien n'écoute sur 8585"
+echo
+
+echo "== 4) Test direct LOCAL (bypass nginx) balances2 puis start =="
+BOT="$(systemctl show traderone.service -p Environment --value | tr ' ' '\n' | sed -n 's/^TRADERONE_BOT_WALLET=//p')"
+echo "BOT=$BOT"
+curl -sS -D- "http://127.0.0.1:8585/wolverine/traderone/api/balances2?wallet=$BOT" | head -n 40 || true
+echo
+curl -sS -D- "http://127.0.0.1:8585/wolverine/traderone/api/start" \
+  -X POST -H "Content-Type: application/json" \
+  --data '{"wallet":"TESTUSER","budget":1}' | head -n 60 || true
+echo
+
+echo "== 5) Nginx errors (si upstream down) =="
+tail -n 80 /var/log/nginx/error.log || true
