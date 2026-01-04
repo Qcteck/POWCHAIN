@@ -1,33 +1,35 @@
 set -euo pipefail
+DOMAIN="fireinners.online"
+TMP="/tmp/nginxT.$(date +%s).txt"
 TS="$(date +%s)"
 
-echo "== 1) Voir l'erreur exacte (avec fichier:ligne) =="
-nginx -t 2>&1 | tail -n 40 || true
+echo "== 1) nginx -T (config finale) =="
+nginx -T > "$TMP" 2>&1
+echo "Saved: $TMP"
 
-echo
-echo "== 2) Trouver tous les fichiers qui contiennent ce location RPC =="
-grep -RIn --include='*.conf' -E 'location\s*=\s*/wolverine/traderone/api/rpc' /etc/nginx || true
+echo "== 2) Find vhost file that serves /wolverine =="
+VHOST="$(awk '
+  /^# configuration file /{f=$4; sub(/:$/,"",f)}
+  /location[^;]*\/wolverine|root\s+\/var\/www\/fireinners/ {print f; exit}
+' "$TMP")"
+echo "VHOST=$VHOST"
+[ -n "${VHOST:-}" ] || { echo "ERR: vhost introuvable. Run: grep -n \"/wolverine\" $TMP | head -n 80"; exit 1; }
 
-echo
-echo "== 3) Backup + supprimer le bloc location RPC PARTOUT (mauvais contexte) =="
-mapfile -t FILES < <(grep -RIl --include='*.conf' -E 'location\s*=\s*/wolverine/traderone/api/rpc' /etc/nginx || true)
-for f in "${FILES[@]:-}"; do
-  cp -a "$f" "$f.bak.$TS"
-  perl -0777 -i -pe 's/location\s*=\s*\/wolverine\/traderone\/api\/rpc\s*\{[\s\S]*?\}\s*//g' "$f"
-  echo "Cleaned: $f (backup: $f.bak.$TS)"
-done
+echo "== 3) Backup + inject RPC proxy location INSIDE server{} =="
+cp -a "$VHOST" "$VHOST.bak.$TS"
+echo "Backup: $VHOST.bak.$TS"
 
-echo
-echo "== 4) Re-test nginx (DOIT PASSER) =="
-nginx -t
+if ! grep -qE 'location\s*=\s*/wolverine/traderone/api/rpc' "$VHOST"; then
+  perl -0777 -i -pe 's/(server\s*\{[\s\S]*?)(\n\})/$1\n\n  # Wolverine: Solana RPC proxy (same-origin)\n  resolver 1.1.1.1 8.8.8.8 valid=300s ipv6=off;\n  location = \/wolverine\/traderone\/api\/rpc {\n    proxy_pass https:\/\/api.mainnet-beta.solana.com;\n    proxy_http_version 1.1;\n    proxy_ssl_server_name on;\n    proxy_set_header Host api.mainnet-beta.solana.com;\n    proxy_set_header X-Real-IP $remote_addr;\n    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n  }\n$2/s' "$VHOST"
+  echo "Injected ✅"
+else
+  echo "OK: already present ✅"
+fi
 
-echo
-echo "== 5) Reload nginx =="
-systemctl reload nginx
+echo "== 4) Reload nginx =="
+nginx -t && systemctl reload nginx
 
-echo "OK ✅ nginx est clean"
-
-
-
-nginx -t 2>&1 | tail -n 20
-
+echo "== 5) TEST HTTPS RPC (must NOT be 404) =="
+curl -ksS -i "https://$DOMAIN/wolverine/traderone/api/rpc" \
+  -H 'content-type: application/json' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' | head -n 30
