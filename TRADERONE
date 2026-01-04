@@ -4,55 +4,147 @@ TS="$(date +%s)"
 cp -a "$APPJS" "$APPJS.bak.$TS"
 echo "Backup: $APPJS.bak.$TS"
 
-node - <<'JS'
-const fs=require("fs");
-const f="/var/www/fireinners/wolverine/app.js";
-let s=fs.readFileSync(f,"utf8");
+# Enlève l’ancien handler FORCE TX si déjà présent
+perl -0777 -i -pe 's|/\*\s*WOLVERINE_FORCE_START_TX_BEGIN\s*\*/.*?/\*\s*WOLVERINE_FORCE_START_TX_END\s*\*/\s*||sg' "$APPJS" || true
 
-// Inject resolver once
-if(!s.includes("WOLVERINE_SPL_AUTODETECT_V1")){
-  s += `
+cat >> "$APPJS" <<'JS'
 
-/* WOLVERINE_SPL_AUTODETECT_V1 */
-window.__getSPL = function(){
-  const cands = [window.splToken, window.SplToken, window.spl_token, window.SPLToken, window.spltoken];
-  for(const v of cands){
-    if(v && typeof v.getAssociatedTokenAddress==="function") return v;
-    if(v && v.default && typeof v.default.getAssociatedTokenAddress==="function") return v.default;
+/* WOLVERINE_FORCE_START_TX_BEGIN */
+(function(){
+  const oldBtn = document.getElementById("btnStart");
+  if(!oldBtn) return;
+
+  // wipe listeners
+  const btn = oldBtn.cloneNode(true);
+  oldBtn.parentNode.replaceChild(btn, oldBtn);
+
+  function setStatus(t){
+    try{
+      const el = document.getElementById("statusText") || document.getElementById("status");
+      if(el) el.textContent = t;
+    }catch(e){}
+    console.log("[STATUS]", t);
   }
-  for(const [k,v] of Object.entries(window)){
-    if(v && typeof v==="object" &&
-       typeof v.getAssociatedTokenAddress==="function" &&
-       typeof v.createTransferCheckedInstruction==="function"){
-      console.log("[SPL] detected window."+k);
-      return v;
-    }
-    if(v && v.default && typeof v.default==="object" &&
-       typeof v.default.getAssociatedTokenAddress==="function"){
-      console.log("[SPL] detected window."+k+".default");
-      return v.default;
-    }
+  window.setStatus = window.setStatus || setStatus;
+
+  function botAddr(){
+    const s = (document.getElementById("tAddr")?.textContent || "").trim();
+    if(!s || s==="—") throw new Error("Adresse BOT (tAddr) manquante");
+    return s;
   }
-  return null;
-};
 
-// Compat: si on détecte, on remplit window.splToken pour le reste du code
-try { const x = window.__getSPL(); if(x) window.splToken = x; } catch(e){}
-`;
-}
+  // --- SPL helpers WITHOUT spl-token lib ---
+  const TOKEN_PROGRAM_ID = new solanaWeb3.PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+  const ATA_PROGRAM_ID   = new solanaWeb3.PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
+  const SYSVAR_RENT      = new solanaWeb3.PublicKey("SysvarRent111111111111111111111111111111111");
 
-// Dans le handler FORCE TX, on remplace le check strict window.splToken par l’auto-detect
-s = s.replace(
-  /if\(!window\.splToken\s*\|\|\s*typeof window\.splToken\.getAssociatedTokenAddress!=="function"\)\s*\n?\s*throw new Error\("spl-token manquant"\);/g,
-  `const SPL = (window.__getSPL && window.__getSPL()) || window.splToken;
-    if(!SPL || typeof SPL.getAssociatedTokenAddress!=="function") throw new Error("spl-token manquant");`
-);
+  function ataAddress(mintPk, ownerPk){
+    return solanaWeb3.PublicKey.findProgramAddressSync(
+      [ownerPk.toBuffer(), TOKEN_PROGRAM_ID.toBuffer(), mintPk.toBuffer()],
+      ATA_PROGRAM_ID
+    )[0];
+  }
 
-// Et on remplace les appels window.splToken.* par SPL.* (dans le bloc FORCE TX)
-s = s.replace(/window\.splToken\./g, "SPL.");
+  function ixCreateATA(payerPk, ataPk, ownerPk, mintPk){
+    return new solanaWeb3.TransactionInstruction({
+      programId: ATA_PROGRAM_ID,
+      keys: [
+        { pubkey: payerPk, isSigner: true,  isWritable: true },
+        { pubkey: ataPk,   isSigner: false, isWritable: true },
+        { pubkey: ownerPk, isSigner: false, isWritable: false },
+        { pubkey: mintPk,  isSigner: false, isWritable: false },
+        { pubkey: solanaWeb3.SystemProgram.programId, isSigner: false, isWritable: false },
+        { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+        { pubkey: SYSVAR_RENT,      isSigner: false, isWritable: false },
+      ],
+      data: Buffer.alloc(0),
+    });
+  }
 
-fs.writeFileSync(f,s,"utf8");
-console.log("OK: SPL auto-detect wired into FORCE TX");
+  function ixTransferChecked(fromAta, mintPk, toAta, ownerPk, amountU64, decimals){
+    // TransferChecked = 12
+    const data = Buffer.alloc(1 + 8 + 1);
+    data.writeUInt8(12, 0);
+
+    let x = BigInt(amountU64);
+    for (let i=0;i<8;i++){ data[1+i] = Number(x & 0xffn); x >>= 8n; }
+    data.writeUInt8(decimals, 1+8);
+
+    return new solanaWeb3.TransactionInstruction({
+      programId: TOKEN_PROGRAM_ID,
+      keys: [
+        { pubkey: fromAta, isSigner: false, isWritable: true },
+        { pubkey: mintPk,  isSigner: false, isWritable: false },
+        { pubkey: toAta,   isSigner: false, isWritable: true },
+        { pubkey: ownerPk, isSigner: true,  isWritable: false },
+      ],
+      data
+    });
+  }
+
+  async function wolverineStartNow(){
+    if(!window.solana || !window.solana.isPhantom) throw new Error("Phantom non détecté");
+    if(!window.pubkey) throw new Error("Wallet non connectée");
+    if(!window.solanaWeb3 || !window.solanaWeb3.PublicKey) throw new Error("web3.js manquant");
+
+    const b = Number(document.getElementById("budget")?.value);
+    if(!isFinite(b) || b<=0) throw new Error("Budget invalide");
+
+    const connection = new solanaWeb3.Connection("https://api.mainnet-beta.solana.com", "confirmed");
+
+    const fromPk = new solanaWeb3.PublicKey(window.pubkey.toString());
+    const toPk   = new solanaWeb3.PublicKey(botAddr());
+
+    const USDC_MINT = new solanaWeb3.PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
+    const DEC = 6;
+    const amt = BigInt(Math.round(b * 10**DEC));
+    if(amt<=0n) throw new Error("Budget USDC invalide");
+
+    const fromAta = ataAddress(USDC_MINT, fromPk);
+    const toAta   = ataAddress(USDC_MINT, toPk);
+
+    const ix = [];
+    if(!(await connection.getAccountInfo(toAta))){
+      ix.push(ixCreateATA(fromPk, toAta, toPk, USDC_MINT));
+    }
+    ix.push(ixTransferChecked(fromAta, USDC_MINT, toAta, fromPk, amt, DEC));
+
+    const { blockhash } = await connection.getLatestBlockhash("confirmed");
+    const tx = new solanaWeb3.Transaction({ recentBlockhash: blockhash, feePayer: fromPk }).add(...ix);
+
+    setStatus("Popup Phantom… (signature tx)");
+    const sent = await window.solana.signAndSendTransaction(tx);
+    const sig = sent?.signature || sent;
+
+    setStatus("Tx envoyée ✅ " + String(sig).slice(0,8) + "… | start…");
+    await connection.confirmTransaction(sig, "confirmed");
+
+    const r = await fetch("/wolverine/traderone/api/start", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ wallet: window.pubkey.toString(), budget: b, fundingSig: String(sig) })
+    });
+    const txt = await r.text();
+    if(!r.ok) throw new Error("START refusé: " + txt.slice(0,200));
+
+    setStatus("START OK ✅");
+  }
+
+  btn.style.display = "";
+  btn.style.visibility = "visible";
+  btn.disabled = false;
+  btn.style.opacity = "1";
+  btn.style.cursor = "pointer";
+
+  btn.addEventListener("click", async (ev)=>{
+    ev.preventDefault();
+    console.log("[START] FORCE TX handler (no spl-token)");
+    try{ await wolverineStartNow(); }
+    catch(e){ console.error(e); setStatus("ERR " + (e?.message || e)); }
+  }, false);
+})();
+ /* WOLVERINE_FORCE_START_TX_END */
+
 JS
 
-echo "DONE ✅ Ctrl+F5 sur /wolverine puis clique START (Phantom doit pop)"
+echo "OK ✅ Ctrl+F5 sur /wolverine puis clique START (Phantom doit pop)"
