@@ -8,18 +8,68 @@ cp -a "$HTML"  "$HTML.bak.$TS"
 cp -a "$APPJS" "$APPJS.bak.$TS"
 echo "Backups: $HTML.bak.$TS | $APPJS.bak.$TS"
 
-# 1) Nettoie les anciens tags solana libs (si présents)
-perl -i -pe 's#\s*<script[^>]+(unpkg|jsdelivr)\.com/@solana/web3\.js[^>]*></script>##gi;
-             s#\s*<script[^>]+(unpkg|jsdelivr)\.com/@solana/spl-token[^>]*></script>##gi' "$HTML"
+echo "== 1) Force les libs AVANT app.js (ordre garanti) =="
 
-# 2) Injecte les libs AVANT app.js (ordre garanti)
-perl -0777 -i -pe 's#(<script[^>]+src="[^"]*app\.js[^"]*"[^>]*></script>)#  <script src="https://cdn.jsdelivr.net/npm/@solana/web3.js@1.95.4/lib/index.iife.min.js"></script>\n  <script src="https://cdn.jsdelivr.net/npm/@solana/spl-token@0.4.8/lib/index.iife.min.js"></script>\n  $1#s' "$HTML"
+awk '
+BEGIN{added=0}
+{
+  if ($0 ~ /app\.js/ && added==0) {
+    print "  <script src=\"https://cdn.jsdelivr.net/npm/@solana/web3.js@1.95.4/lib/index.iife.min.js\"></script>"
+    print "  <script src=\"https://cdn.jsdelivr.net/npm/@solana/spl-token@0.4.8/lib/index.iife.min.js\"></script>"
+    added=1
+  }
+  print
+}
+' "$HTML" > "/tmp/index.html.$TS" && mv "/tmp/index.html.$TS" "$HTML"
 
-# 3) Force app.js à utiliser window.solanaWeb3 + window.splToken (jamais splToken direct)
-perl -i -pe 's/\bsolanaWeb3\./window.solanaWeb3./g; s/\bsplToken\./window.splToken./g' "$APPJS"
+echo "== 2) Patch app.js pour utiliser window.solanaWeb3 + window.splToken (et guard propre) =="
 
-# 4) Ajoute un guard simple (si libs pas là, message clair au lieu de crash)
-perl -0777 -i -pe 's|(\/\*\s*WOLVERINE_START_SEND_USDC_BEGIN\s*\*\/[\s\S]*?\(function\(\)\{\s*)|\1\n  if(!window.solanaWeb3 || !window.solanaWeb3.PublicKey){ console.log(\"ERR web3 missing\"); return; }\n  if(!window.splToken){ console.log(\"ERR splToken missing\"); return; }\n|s' "$APPJS" || true
+node - <<'JS'
+const fs = require("fs");
+const f = "/var/www/fireinners/wolverine/app.js";
+let s = fs.readFileSync(f, "utf8");
 
-echo "OK ✅ Fais Ctrl+F5 sur /wolverine puis teste:"
-echo 'Dans Console: window.solanaWeb3?.PublicKey && window.splToken ? "libs OK" : "libs MISSING"'
+// force accès via window.*
+s = s.replace(/\bsolanaWeb3\./g, "window.solanaWeb3.");
+s = s.replace(/\bsplToken\./g, "window.splToken.");
+
+// ajoute un guard AU DÉBUT du bloc START USDC
+const begin = "/* WOLVERINE_START_SEND_USDC_BEGIN */";
+const idx = s.indexOf(begin);
+if (idx === -1) {
+  console.log("WARN: START USDC block not found, skip guard");
+} else {
+  const insertAt = idx + begin.length;
+  const guard = `
+(function(){
+  if(!window.solanaWeb3 || !window.solanaWeb3.PublicKey){
+    console.log("ERR: solana web3 missing");
+    try { window.setStatus && window.setStatus("ERR: web3.js manquant"); } catch(e){}
+    return;
+  }
+  if(!window.splToken){
+    console.log("ERR: splToken missing");
+    try { window.setStatus && window.setStatus("ERR: spl-token manquant"); } catch(e){}
+    return;
+  }
+`;
+  // si on a déjà ajouté ce guard, on ne le duplique pas
+  if (!s.includes("ERR: solana web3 missing")) {
+    s = s.slice(0, insertAt) + "\n" + guard + s.slice(insertAt);
+    // et on enlève le "(function(){" juste après (sinon double IIFE)
+    s = s.replace(begin + "\n(function(){", begin);
+  }
+}
+
+fs.writeFileSync(f, s, "utf8");
+console.log("OK patched:", f);
+JS
+
+echo
+echo "== 3) Vérif rapide côté serveur (scripts dans index.html) =="
+grep -n "solana/web3.js" -n "$HTML" || true
+grep -n "solana/spl-token" -n "$HTML" || true
+grep -n "app.js" -n "$HTML" | head -n 3 || true
+
+echo
+echo "DONE ✅ -> Ctrl+F5 sur /wolverine"
