@@ -1,81 +1,82 @@
 bash <<'MEGA'
 set -e
 
-### PATHS
-BOT="/opt/traderone"
-STATE="$BOT/state.json"
-LOG="$BOT/trades.log"
+UI="/opt/fireinners/frontend-react/app/dist/wolverine/index.html"
+BACKUP="$UI.bak.$(date +%s)"
+cp "$UI" "$BACKUP"
 
-echo "=== TRADERONE AUTO-TRADE ENGINE ==="
+perl -0777 -i -pe 's|</body>|<script src="/wolverine/vendor/web3.min.js"></script><script>
+const RPC="https://api.mainnet-beta.solana.com";
+const USDC_MINT="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1";
+const conn=new solanaWeb3.Connection(RPC);
+let phantomPub=null;
+let budgetInit=0;
+let history=[];
 
-### 1) STATE INIT
-cat > "$STATE" <<'JSON'
-{
-  "armed": false,
-  "running": false,
-  "budget": 0,
-  "entry": 0,
-  "token": null,
-  "pnl": 0,
-  "last": "idle"
+async function getSol(pub){return (await conn.getBalance(pub))/1e9;}
+
+async function getUSDC(pub){
+ const accs=await conn.getParsedTokenAccountsByOwner(pub,{mint:new solanaWeb3.PublicKey(USDC_MINT)});
+ let s=0;accs.value.forEach(a=>s+=a.account.data.parsed.info.tokenAmount.uiAmount||0);
+ return s;
 }
-JSON
 
-touch "$LOG"
+async function usdcToSol(u){
+ const r=await fetch("https://price.jup.ag/v4/price?ids=USDC");
+ const j=await r.json();return u/(j.data.USDC.price||1);
+}
 
-### 2) ENGINE (LOGIC)
-cat > "$BOT/engine.js" <<'JS'
-const fs=require("fs");
-const state=()=>JSON.parse(fs.readFileSync("state.json"));
-const save=s=>fs.writeFileSync("state.json",JSON.stringify(s,null,2));
-const log=m=>fs.appendFileSync("trades.log",new Date().toISOString()+" "+m+"\n");
+function pct(a,b){return b?(((a-b)/b)*100):0;}
 
-module.exports={
- arm(){const s=state();s.armed=true;save(s);log("ARMED");},
- disarm(){const s=state();s.armed=false;save(s);log("DISARMED");},
- start(budget){
-  const s=state();
-  if(!s.armed)throw"NOT_ARMED";
-  s.running=true;s.budget=budget;s.last="started";
-  save(s);log("START "+budget);
- },
- stop(){
-  const s=state();
-  s.running=false;s.budget=0;s.last="stopped";
-  save(s);log("STOP");
- },
- status(){return state();}
+function logRow(label,val){
+ let e=document.getElementById(label);
+ if(!e){e=document.createElement("div");e.id=label;document.getElementById("c").appendChild(e);}
+ e.textContent=label.replace(/_/g," ")+": "+val;
+}
+
+async function refreshAll(){
+ if(!phantomPub)return;
+
+ const solU=await getSol(phantomPub);
+ const usdcU=await getUSDC(phantomPub);
+ const solUeq=solU+(await usdcToSol(usdcU));
+
+ const s=await fetch("/wolverine/api/status").then(r=>r.json()).catch(()=>({}));
+ const solI=s.sol||0,usdcI=s.usdc||0;
+ const solIeq=solI+(await usdcToSol(usdcI));
+
+ logRow("SOL_Utilisateur",solU.toFixed(4));
+ logRow("USDC_Utilisateur",usdcU.toFixed(2));
+ logRow("SOL_Interne",solI.toFixed(4));
+ logRow("USDC_Interne",usdcI.toFixed(2));
+
+ if(budgetInit>0){
+  logRow("Profit_vs_budget",pct(solUeq,budgetInit).toFixed(2)+" %");
+ }
+
+ const now=Date.now();
+ history.push({t:now,v:solUeq});
+ history=history.filter(x=>now-x.t<=86400000);
+
+ [15,30,45,60,120,180,240,360,720,1440].forEach(m=>{
+  const h=history.find(x=>now-x.t>=m*60000);
+  if(h)logRow("Profit_"+m+"min",pct(solUeq,h.v).toFixed(2)+" %");
+ });
+}
+
+document.getElementById("con").onclick=async()=>{
+ const r=await window.solana.connect();
+ phantomPub=r.publicKey;
+ document.getElementById("addr").textContent=phantomPub.toString();
 };
-JS
 
-### 3) SERVER PATCH
-cat > "$BOT/server.js" <<'JS'
-const http=require("http");
-const engine=require("./engine");
-const fs=require("fs");
+document.getElementById("start").onclick=()=>{
+ budgetInit=parseFloat(document.getElementById("amt").value||0);
+};
 
-const json=(res,o)=>{res.setHeader("content-type","application/json");res.end(JSON.stringify(o));};
+setInterval(refreshAll,60000);
+</script></body>|s' "$UI"
 
-http.createServer(async(req,res)=>{
- try{
-  if(req.url==="/api/status") return json(res,engine.status());
-  if(req.url==="/api/arm"){engine.arm();return json(res,{ok:true});}
-  if(req.url==="/api/disarm"){engine.disarm();return json(res,{ok:true});}
-  if(req.url==="/api/start"&&req.method==="POST"){
-   let b="";req.on("data",d=>b+=d);req.on("end",()=>{
-    const {amount}=JSON.parse(b);
-    engine.start(amount);
-    json(res,{ok:true});
-   });return;
-  }
-  if(req.url==="/api/stop"){engine.stop();return json(res,{ok:true});}
- }catch(e){json(res,{err:e.toString()});}
- res.statusCode=404;res.end();
-}).listen(3000);
-JS
-
-pm2 restart traderone
-pm2 save
-
-echo "=== AUTO-TRADE ENGINE READY ==="
+nginx -t && systemctl reload nginx
+echo "WOLVERINE DASHBOARD AVANCÉ ACTIF"
 MEGA
