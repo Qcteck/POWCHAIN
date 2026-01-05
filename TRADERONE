@@ -1,57 +1,110 @@
 bash <<'EOF'
 set -e
 
-DOMAIN="fireinners.online"
-SUB="www.fireinners.online"
-ROOT_DIR="/opt/fireinners/frontend-react/app/dist"
-NGINX_SSL="/etc/nginx/sites-available/fireinners.online-ssl"
+APP_DIR="/opt/traderone-opt"
+ENV_FILE="$APP_DIR/.env"
+PORT=3000
 
-echo "=== FIREINNERS • HTTPS + WOLVERINE DEPLOY ==="
+echo "=== TRADERONE • WOLVERINE LIVE SETUP ==="
 
-# 1) Installer nginx + certbot si absent
-apt update -y
-apt install -y nginx certbot python3-certbot-nginx
+# 1) Vérifier clé privée interne
+grep -q SOLANA_PRIVATE_KEY_BASE58 "$ENV_FILE" || { echo "[ERR] clé privée interne absente"; exit 1; }
 
-# 2) Démarrer nginx
-systemctl enable nginx
-systemctl start nginx
+# 2) Patch server.js (balances + start)
+cat > "$APP_DIR/server.js" <<'JS'
+import http from "http";
+import bs58 from "bs58";
+import { Connection, Keypair, PublicKey, SystemProgram, Transaction, LAMPORTS_PER_SOL } from "@solana/web3.js";
 
-# 3) Vérifier port 80 ouvert
-ss -lnt | grep -q ':80' || { echo "[ERR] Port 80 fermé"; exit 1; }
+const PORT = 3000;
+const RPC = "https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac";
 
-# 4) Générer certificat SSL
-certbot certonly --nginx -d "$DOMAIN" -d "$SUB" --non-interactive --agree-tos -m admin@$DOMAIN
+const PRIVATE = bs58.decode(process.env.SOLANA_PRIVATE_KEY_BASE58);
+const INTERNAL = Keypair.fromSecretKey(PRIVATE);
+const connection = new Connection(RPC,"confirmed");
 
-# 5) Créer vhost SSL
-cat > "$NGINX_SSL" <<NG
-server {
-    listen 443 ssl;
-    server_name $DOMAIN $SUB;
-
-    ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
-
-    root $ROOT_DIR;
-    index index.html;
-
-    location /wolverine {
-        try_files \$uri \$uri/ /wolverine/index.html;
-    }
+async function sol(pub){
+  return (await connection.getBalance(pub))/LAMPORTS_PER_SOL;
 }
-NG
 
-ln -sf "$NGINX_SSL" /etc/nginx/sites-enabled/fireinners.online-ssl
+const server = http.createServer(async (req,res)=>{
+  if(req.url==="/api/balances"){
+    const phantom = req.headers["x-phantom"];
+    const data = {
+      internal: await sol(INTERNAL.publicKey),
+      phantom: phantom ? await sol(new PublicKey(phantom)) : null
+    };
+    res.end(JSON.stringify(data));
+    return;
+  }
 
-# 6) Reload nginx
-nginx -t
-systemctl reload nginx
+  if(req.url==="/api/start" && req.method==="POST"){
+    let body="";
+    req.on("data",d=>body+=d);
+    req.on("end",async()=>{
+      const {phantom,amount} = JSON.parse(body);
+      const tx = new Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey: new PublicKey(phantom),
+          toPubkey: INTERNAL.publicKey,
+          lamports: Math.floor(amount*LAMPORTS_PER_SOL)
+        })
+      );
+      const sig = await connection.sendRawTransaction(tx.serialize({requireAllSignatures:false}));
+      res.end(JSON.stringify({ok:true,tx:sig}));
+    });
+    return;
+  }
 
-# 7) Vérifier port 443
-ss -lnt | grep -q ':443' || { echo "[ERR] 443 toujours fermé"; exit 1; }
+  res.writeHead(200,{"Content-Type":"text/html"});
+  res.end(`
+<!doctype html><html><body style="background:#111;color:#eee;font-family:Arial">
+<h2>TraderOne • Wolverine LIVE</h2>
+<button onclick="connect()">Connect Phantom</button>
+<p>Wallet Phantom: <span id="p"></span></p>
+<p>Solde Phantom: <span id="ps"></span> SOL</p>
+<p>Wallet Interne:</p>
+<pre>${INTERNAL.publicKey.toBase58()}</pre>
+<p>Solde Interne: <span id="is"></span> SOL</p>
+<input id="amt" value="0.001"/>
+<button onclick="start()">START</button>
+<pre id="out"></pre>
 
-# 8) Test HTTPS réel
-curl -fsSL https://www.fireinners.online/wolverine >/dev/null
+<script>
+let phantom=null;
+async function connect(){
+  const r=await window.solana.connect();
+  phantom=r.publicKey.toString();
+  document.getElementById("p").textContent=phantom;
+  refresh();
+}
+async function refresh(){
+  const r=await fetch("/api/balances",{headers:{"x-phantom":phantom}});
+  const j=await r.json();
+  document.getElementById("ps").textContent=j.phantom;
+  document.getElementById("is").textContent=j.internal;
+}
+async function start(){
+  const amt=parseFloat(document.getElementById("amt").value);
+  const r=await fetch("/api/start",{method:"POST",body:JSON.stringify({phantom,amount:amt})});
+  document.getElementById("out").textContent=await r.text();
+}
+</script>
+</body></html>
+`);
+});
 
-echo "=== SUCCESS ==="
+server.listen(PORT,"0.0.0.0");
+JS
+
+# 3) PM2 restart
+pm2 delete traderone || true
+pm2 start "$APP_DIR/server.js" --name traderone
+pm2 save
+
+# 4) Vérifications locales
+curl -fsSL http://127.0.0.1:3000/api/balances >/dev/null
+
+echo "=== TRADERONE LIVE OK ==="
 echo "URL : https://www.fireinners.online/wolverine"
 EOF
