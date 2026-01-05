@@ -1,3 +1,96 @@
-ss -lntp | grep 3000
-ufw status
-pm2 logs traderone --lines 20
+cat >/root/TRADERONE_BASE58_FIX.sh <<'SH'
+#!/usr/bin/env bash
+set -e
+
+APP="/opt/traderone"
+echo "=== TRADERONE BASE58 FIX ==="
+
+cd "$APP"
+
+# 1) Installer bs58 si absent
+if ! npm list bs58 >/dev/null 2>&1; then
+  echo "[1] Installing bs58"
+  npm install bs58
+else
+  echo "[1] bs58 already installed"
+fi
+
+# 2) Patch server.js (base58 FIX)
+echo "[2] Patching server.js"
+
+cat > server.js <<'JS'
+import http from "http";
+import url from "url";
+import fs from "fs";
+import bs58 from "bs58";
+
+const PORT = process.env.PORT || 3000;
+const WALLET_FILE = "/opt/traderone/wallet.json";
+
+function getPrivateKeyBytes() {
+  const w = JSON.parse(fs.readFileSync(WALLET_FILE,"utf8"));
+  return bs58.decode(w.PRIVATE_KEY_BASE58);
+}
+
+const server = http.createServer(async (req,res)=>{
+  const { pathname } = url.parse(req.url,true);
+
+  if(pathname==="/health"){
+    res.writeHead(200,{"Content-Type":"application/json"});
+    return res.end(JSON.stringify({ok:true}));
+  }
+
+  if(pathname==="/wallet"){
+    const key = getPrivateKeyBytes();
+    res.writeHead(200,{"Content-Type":"application/json"});
+    return res.end(JSON.stringify({
+      publicKeyLength: key.length,
+      status:"wallet loaded"
+    }));
+  }
+
+  if(req.method==="POST" && pathname==="/start"){
+    let body="";
+    req.on("data",c=>body+=c);
+    req.on("end",()=>{
+      res.writeHead(200,{"Content-Type":"application/json"});
+      res.end(JSON.stringify({started:true,body}));
+    });
+    return;
+  }
+
+  res.writeHead(200,{"Content-Type":"text/html"});
+  res.end(`
+  <html><body style="background:#111;color:#eee;font-family:Arial">
+  <h2>TraderOne LIVE</h2>
+  <button onclick="go()">START</button>
+  <pre id="out"></pre>
+  <script>
+  async function go(){
+    const r=await fetch("/start",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"});
+    out.textContent=JSON.stringify(await r.json(),null,2);
+  }
+  </script>
+  </body></html>
+  `);
+});
+
+server.listen(PORT,"0.0.0.0",()=>console.log("TraderOne LIVE on",PORT));
+JS
+
+# 3) Restart PM2
+echo "[3] Restarting TraderOne"
+pm2 delete traderone || true
+pm2 start server.js --name traderone
+pm2 save
+
+# 4) Test
+echo "[4] Local tests"
+curl -fsS http://127.0.0.1:3000/health || echo "health fail"
+curl -fsS http://127.0.0.1:3000/wallet || echo "wallet fail"
+
+echo "=== FIX APPLIED ==="
+SH
+
+chmod +x /root/TRADERONE_BASE58_FIX.sh
+/root/TRADERONE_BASE58_FIX.sh
