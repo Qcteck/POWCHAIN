@@ -1,8 +1,90 @@
-set -euo pipefail;TS=$(date +%s);CANON="/etc/nginx/sites-available/fireinners.online-ssl";chattr -i /etc/nginx/nginx.conf 2>/dev/null||true;chattr -i /etc/nginx/sites-enabled 2>/dev/null||true;chattr -i /etc/nginx/sites-available 2>/dev/null||true;chattr -i /etc/nginx/sites-enabled/* 2>/dev/null||true;chattr -i /etc/nginx/sites-available/* 2>/dev/null||true;chattr -i "$CANON" 2>/dev/null||true;rm -f /etc/nginx/sites-enabled/*fireinners* 2>/dev/null||true;rm -f /etc/nginx/sites-enabled/*.disabled.* /etc/nginx/sites-enabled/*.bak* 2>/dev/null||true;ln -sf "$CANON" /etc/nginx/sites-enabled/$(basename "$CANON");nginx -t;systemctl reload nginx;chattr +i /etc/nginx/nginx.conf 2>/dev/null||true;chattr +i "$CANON" 2>/dev/null||true;echo "OK nginx clean $TS"
+bash -lc 'set -euo pipefail
+VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
+ROOT="/opt/fireinners/frontend-react/app/dist/wolverine"
+UI="$ROOT/index.html"
+[ -f "$VHOST" ] || { echo "ERR: vhost introuvable: $VHOST"; exit 1; }
+mkdir -p "$ROOT"
 
+# 1) Désactiver autres vhosts fireinners.online (stop conflicting server_name)
+CANON="$VHOST"
+for f in /etc/nginx/sites-enabled/*; do
+  [ -e "$f" ] || continue
+  tgt="$f"
+  [ -L "$f" ] && tgt="$(readlink -f "$f" || echo "$f")"
+  if grep -q "server_name .*fireinners\.online" "$tgt" 2>/dev/null; then
+    if [ "$tgt" != "$CANON" ]; then
+      if [ -L "$f" ]; then rm -f "$f"; else mv -f "$f" "$f.disabled.$(date +%s)"; fi
+    fi
+  fi
+done
+ln -sf "$CANON" "/etc/nginx/sites-enabled/$(basename "$CANON")"
 
+# 2) Patch nginx: /wolverine/ (static) + /wolverine/api/ (proxy)
+MARK_BEGIN="# BEGIN WOLVERINE_CANON"
+MARK_END="# END WOLVERINE_CANON"
+BLOCK="$MARK_BEGIN
+location ^~ /wolverine/api/ {
+  rewrite ^/wolverine/api/(.*)\$ /api/\$1 break;
+  proxy_pass http://127.0.0.1:3000;
+  proxy_http_version 1.1;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+  proxy_read_timeout 60s;
+}
+location = /wolverine/ { try_files /wolverine/index.html =404; }
+location ^~ /wolverine/ {
+  root /opt/fireinners/frontend-react/app/dist;
+  add_header Cache-Control \"no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0\" always;
+  expires -1;
+}
+$MARK_END"
 
-set -euo pipefail;TS=$(date +%s);WOLV="/opt/fireinners/frontend-react/app/dist/wolverine";mkdir -p "$WOLV";cat >"$WOLV/index.html"<<'HTML'
-<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Pragma" content="no-cache"><meta http-equiv="Expires" content="0"><title>WOLVERINE</title><style>body{font:14px Arial,system-ui;margin:0;padding:14px;background:#fff}#wrap{max-width:980px;margin:0 auto;border:1px solid #bbb;border-radius:12px;padding:12px}h1{margin:0 0 10px 0;font-size:32px;letter-spacing:.5px}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:10px 0}.mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;word-break:break-all}.box{padding:10px;border:1px solid #bbb;border-radius:10px;background:#f7f7f7}button,select,input{font:inherit;padding:6px 8px}small{color:#444}.ok{color:#060}.bad{color:#a00}</style></head><body><div id="wrap"><h1>WOLVERINE</h1><div class="box"><div class="row"><button id="btnConnect" type="button">Connect Wallet (Phantom)</button><div>Wallet: <span id="pub" class="mono">—</span></div></div><div class="row"><div>Mode:</div><select id="mode"><option value="SAFE">SAFE</option><option value="AUTO">AUTO</option><option value="RR">RR</option><option value="SCALP">SCALP</option></select><button id="btnMode" type="button">Appliquer mode</button><div id="modeMsg" class="mono"></div></div></div><div class="box" style="margin-top:12px"><b>Dépôt manuel (obligatoire)</b><br><small>Envoie depuis ton Phantom vers TraderOne (bot) :</small><div class="mono" id="botAddr" style="margin-top:6px">e8DbBrTJxRetx3HNFb83CsXMySETydHVLwxMzkjcVqh</div><div class="row"><div>Asset</div><select id="asset"><option value="USDC">USDC</option><option value="SOL">SOL</option></select><div>Montant</div><input id="amount" placeholder="ex: 1" inputmode="decimal"><button id="btnConfirm" type="button">CONFIRMER DÉPÔT (on-chain)</button></div><div id="depMsg" class="mono"></div><div class="row"><button id="btnStart" type="button" disabled>Lancer WOLVERINE</button><div id="startMsg" class="mono"></div></div></div><script>(()=>{"use strict";const $=s=>document.querySelector(s),API="/wolverine/api";let PUB="";async function post(p,o){const r=await fetch(API+p,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(o||{})});const t=await r.text();try{return{ok:r.ok,status:r.status,json:JSON.parse(t)}}catch(e){return{ok:false,status:r.status,nonjson:t.slice(0,300)}}}function msg(el,ok,txt){el.innerHTML=(ok?'<span class="ok">':'<span class="bad">')+String(txt).replace(/</g,"&lt;")+"</span>"}$("#btnConnect").onclick=async()=>{try{if(!window.solana||!window.solana.isPhantom)return msg($("#startMsg"),false,"Phantom non détecté");const r=await window.solana.connect({onlyIfTrusted:false});PUB=(r&&r.publicKey)?r.publicKey.toString():"";$("#pub").textContent=PUB||"—";msg($("#startMsg"),true,"Wallet connecté")}catch(e){msg($("#startMsg"),false,e&&e.message||String(e))}};$("#btnMode").onclick=async()=>{const res=await post("/mode",{mode:$("#mode").value,from:PUB});res.ok?msg($("#modeMsg"),true,JSON.stringify(res.json)):msg($("#modeMsg"),false,res.json?JSON.stringify(res.json):("HTTP "+res.status+" "+(res.nonjson||"non-json")))};$("#btnConfirm").onclick=async()=>{const amount=($("#amount").value||"").trim();if(!amount)return msg($("#depMsg"),false,"Montant requis");const res=await post("/confirm_deposit_v2",{asset:$("#asset").value,amount,from:PUB});if(res.ok){msg($("#depMsg"),true,JSON.stringify(res.json));$("#btnStart").disabled=false}else{msg($("#depMsg"),false,res.json?JSON.stringify(res.json):("HTTP "+res.status+" "+(res.nonjson||"non-json")));$("#btnStart").disabled=true}};$("#btnStart").onclick=async()=>{const res=await post("/start",{mode:$("#mode").value,from:PUB});res.ok?msg($("#startMsg"),true,JSON.stringify(res.json)):msg($("#startMsg"),false,res.json?JSON.stringify(res.json):("HTTP "+res.status+" "+(res.nonjson||"non-json")))}})();</script></div></body></html>
-HTML
-echo "OK UI single $TS";echo "URL: https://fireinners.online/wolverine/?v=$TS"
+# retire ancien bloc si existe, puis injecte une fois dans le bon server {}
+tmp="$(mktemp)"
+awk -v b="$MARK_BEGIN" -v e="$MARK_END" '
+BEGIN{skip=0}
+index($0,b){skip=1;next}
+index($0,e){skip=0;next}
+skip==0{print}
+' "$VHOST" > "$tmp"
+
+python3 - <<PY
+import re,sys
+p=open("'"$tmp"'","r",encoding="utf-8").read()
+block="""'"$BLOCK"'"""
+# trouve 1er server { ... } et injecte avant son dernier }
+m=re.search(r"server\\s*\\{",p)
+if not m: 
+  print("ERR: aucun bloc server {} dans vhost"); sys.exit(1)
+# brace counter
+i=m.start()
+depth=0
+end=None
+for k in range(i,len(p)):
+  c=p[k]
+  if c=="{": depth+=1
+  elif c=="}":
+    depth-=1
+    if depth==0:
+      end=k
+      break
+if end is None:
+  print("ERR: server {} non terminé"); sys.exit(1)
+# injecte juste avant la }
+out=p[:end].rstrip()+"\n\n"+block+"\n"+p[end:]
+open("'"$VHOST"'","w",encoding="utf-8").write(out)
+PY
+rm -f "$tmp"
+
+# 3) UI CANON (remplacement total, zéro doublon)
+cat > "$UI" <<'"'"'EOF'"'"'
+<!doctype html><html lang="fr"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><meta http-equiv="Cache-Control" content="no-store"/><meta http-equiv="Pragma" content="no-cache"/><meta http-equiv="Expires" content="0"/><title>WOLVERINE</title><style>body{font:14px Arial,system-ui;margin:0;padding:14px;background:#fff}#wrap{max-width:980px;margin:0 auto;border:1px solid #bbb;border-radius:12px;padding:12px}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:10px 0}.mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;word-break:break-all}.box{padding:10px;border:1px solid #bbb;border-radius:10px;background:#f7f7f7}button,select,input{font:inherit;padding:6px 8px}small{color:#444}.ok{color:#060}.bad{color:#a00}hr{border:none;border-top:1px solid #ddd;margin:12px 0}</style></head><body><div id="wrap"><h1 style="margin:0 0 10px;font-size:32px;letter-spacing:.5px">WOLVERINE</h1><div class="box"><div class="row"><button id="btnConnect" type="button">Connect Wallet (Phantom)</button><div>Wallet: <span id="pub" class="mono">—</span></div></div><div class="row"><div><b>Mode</b> <select id="mode"><option value="SAFE">SAFE</option><option value="AUTO">AUTO</option><option value="RR">RR</option><option value="SCALP">SCALP</option></select></div><button id="btnMode" type="button">Appliquer mode</button><span id="modeMsg" class="mono">—</span></div><hr/><div><b>Dépôt manuel (obligatoire)</b></div><small>Envoie depuis ton Phantom vers TraderOne (bot) :</small><div class="mono" id="botAddr">e8DbBrTJxRetx3HNFb83CsXMySETydHVLwxMzkjcVqh</div><div class="row"><label>Asset <select id="asset"><option value="USDC">USDC</option><option value="SOL">SOL</option></select></label><label>Montant <input id="amount" inputmode="decimal" placeholder="ex: 1" /></label><button id="btnConfirm" type="button">CONFIRMER DÉPÔT (on-chain)</button><span id="depMsg" class="mono">—</span></div><div class="row"><button id="btnStart" type="button" disabled>START WOLVERINE</button><span id="startMsg" class="mono">—</span></div></div></div><script>(()=>{"use strict";const $=s=>document.querySelector(s);const pubEl=$("#pub"),modeEl=$("#mode"),modeMsg=$("#modeMsg"),assetEl=$("#asset"),amtEl=$("#amount"),depMsg=$("#depMsg"),btnStart=$("#btnStart"),startMsg=$("#startMsg");let pub="",depositOK=false;const api=(p,opt)=>fetch("/wolverine/api"+p,Object.assign({headers:{"content-type":"application/json"}},opt||{})).then(async r=>{let t=await r.text();let j=null;try{j=JSON.parse(t)}catch(e){};if(!r.ok)throw new Error((j&&j.error)||("HTTP "+r.status+" "+(t.slice(0,180)||"")));if(!j)throw new Error("non-JSON "+r.status+": "+t.slice(0,180));return j;});$("#btnConnect").onclick=async()=>{try{if(!window.solana||!window.solana.isPhantom)throw new Error("Phantom introuvable");const r=await window.solana.connect();pub=r.publicKey.toString();pubEl.textContent=pub;startMsg.textContent="";}catch(e){startMsg.textContent="ERR: "+e.message;}};$("#btnMode").onclick=async()=>{try{if(!pub)throw new Error("Connect d abord");const m=modeEl.value;const r=await api("/mode",{method:"POST",body:JSON.stringify({pub,mode:m})});modeMsg.textContent="OK: "+(r.mode||m);}catch(e){modeMsg.textContent="ERR: "+e.message;}};$("#btnConfirm").onclick=async()=>{try{if(!pub)throw new Error("Connect d abord");const asset=assetEl.value;const amount=(amtEl.value||"").trim();if(!amount)throw new Error("Montant manquant");const r=await api("/confirm_deposit",{method:"POST",body:JSON.stringify({pub,asset,amount})});depositOK=!!r.ok;btnStart.disabled=!depositOK;depMsg.textContent=(depositOK?"OK dépôt confirmé":"ERR dépôt");}catch(e){depositOK=false;btnStart.disabled=true;depMsg.textContent="ERR: "+e.message;}};$("#btnStart").onclick=async()=>{try{if(!pub)throw new Error("Connect d abord");if(!depositOK)throw new Error("Confirme dépôt");const r=await api("/start",{method:"POST",body:JSON.stringify({pub,mode:modeEl.value})});startMsg.textContent="OK: "+(r.status||"started");}catch(e){startMsg.textContent="ERR: "+e.message;}};})();</script></body></html>
+EOF
+
+nginx -t
+systemctl reload nginx
+echo "OK RESTORE: /wolverine/ + /wolverine/api/* (proxy 3000) + UI sans doublons"
+echo "Ouvre: https://fireinners.online/wolverine/?v=$(date +%s)"
+'
