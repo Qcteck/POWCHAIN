@@ -1,215 +1,87 @@
-cat >/root/WOLV_WIRE_STRATEGY_BACKEND.sh <<'BASH'
+cat >/root/WOLV_FIX_SOLANA_LIB_LOAD.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "=== [1] Locate running Node backend (port -> PID -> cwd) ==="
-PID=""
-# find any node process listening (common ports)
-for p in 3000 3001 8080 8000 5000 5173 4000; do
-  if ss -lptn 2>/dev/null | grep -qE "LISTEN.*:${p}.*users:\(\(\"node\""; then
-    PID="$(ss -lptn 2>/dev/null | awk -v P=":${p}" '$0~P && $0~"node"{print $NF}' | head -n1 | sed -E 's/.*pid=([0-9]+).*/\1/')"
-    [ -n "$PID" ] && break
-  fi
+# 1) Trouver le dossier web /wolverine
+WEB_DIR=""
+for d in \
+  /opt/fireinners/frontend-react/app/dist/wolverine \
+  /var/www/fireinners/wolverine \
+  /var/www/wolverine \
+  /opt/traderone-opt/public/wolverine \
+  /opt/traderone-opt/public
+do
+  if [ -d "$d" ]; then WEB_DIR="$d"; break; fi
 done
+[ -n "$WEB_DIR" ] || { echo "ERR: dossier /wolverine introuvable"; exit 1; }
+echo "WEB_DIR=$WEB_DIR"
 
-if [ -z "$PID" ]; then
-  # fallback: any node listening
-  PID="$(ss -lptn 2>/dev/null | awk '$0~"LISTEN" && $0~"users:" && $0~"node"{print $NF}' | head -n1 | sed -E 's/.*pid=([0-9]+).*/\1/')"
-fi
+HTML="$WEB_DIR/index.html"
+[ -f "$HTML" ] || { echo "ERR: index.html introuvable: $HTML"; exit 1; }
 
-BACK_DIR=""
-if [ -n "${PID:-}" ] && [ -d "/proc/$PID" ]; then
-  BACK_DIR="$(readlink -f /proc/$PID/cwd || true)"
-fi
+mkdir -p "$WEB_DIR/ui"
 
-echo "PID=${PID:-none}"
-echo "BACK_DIR=${BACK_DIR:-none}"
-
-echo "=== [2] If not found, try systemd ExecStart ==="
-SERVICE=""
-if [ -z "${BACK_DIR:-}" ] || [ ! -d "$BACK_DIR" ]; then
-  # find a service running node
-  SERVICE="$(systemctl list-units --type=service --state=running --no-pager 2>/dev/null | awk '{print $1}' | grep -E '\.service$' | head -n 200 | while read -r s; do
-    es="$(systemctl show -p ExecStart --value "$s" 2>/dev/null || true)"
-    if echo "$es" | grep -qi "node"; then echo "$s"; break; fi
-  done || true)"
-
-  if [ -n "$SERVICE" ]; then
-    echo "Found node service: $SERVICE"
-    # try get WorkingDirectory
-    WD="$(systemctl show -p WorkingDirectory --value "$SERVICE" 2>/dev/null || true)"
-    if [ -n "$WD" ] && [ -d "$WD" ]; then BACK_DIR="$WD"; fi
-  fi
-fi
-
-echo "SERVICE=${SERVICE:-none}"
-echo "BACK_DIR=${BACK_DIR:-none}"
-
-echo "=== [3] If still not found, try PM2 ==="
-if [ -z "${BACK_DIR:-}" ] || [ ! -d "$BACK_DIR" ]; then
-  if command -v pm2 >/dev/null 2>&1; then
-    # pick first pm2 app and find its cwd via pid
-    PM2PID="$(pm2 jlist 2>/dev/null | grep -oE '"pid":[0-9]+' | head -n1 | cut -d: -f2 || true)"
-    if [ -n "$PM2PID" ] && [ -d "/proc/$PM2PID" ]; then
-      BACK_DIR="$(readlink -f /proc/$PM2PID/cwd || true)"
-      echo "PM2 PID=$PM2PID -> BACK_DIR=$BACK_DIR"
-    fi
-  fi
-fi
-
-echo "BACK_DIR=${BACK_DIR:-none}"
-[ -n "${BACK_DIR:-}" ] && [ -d "$BACK_DIR" ] || {
-  echo "ERR: Impossible de localiser automatiquement le backend qui tourne."
-  echo "Donne moi le chemin du backend (ex: /opt/traderone/server) et je te fais un batch exact."
-  exit 1
-}
-
-echo "=== [4] Ensure it's a Node project ==="
-if [ ! -f "$BACK_DIR/package.json" ]; then
-  echo "WARN: pas de package.json dans $BACK_DIR"
-  echo "Je cherche un sous-dossier Node proche..."
-  hit="$(find "$BACK_DIR" -maxdepth 3 -type f -name package.json 2>/dev/null | head -n1 || true)"
-  [ -n "$hit" ] || { echo "ERR: aucun package.json trouvé"; exit 1; }
-  BACK_DIR="$(dirname "$hit")"
-  echo "Using BACK_DIR=$BACK_DIR"
-fi
-
-echo "=== [5] Copy strategy routes into backend ==="
-mkdir -p "$BACK_DIR/routes"
-
-SRC="/root/wolv_backend_patch/routes/strategy.routes.js"
-if [ ! -f "$SRC" ]; then
-  # recreate it if missing
-  cat >"$SRC" <<'JS'
-const express = require("express");
-const router = express.Router();
-
-const state = {};
-function getWallet(req){ return (req.body.wallet || req.query.wallet || "").trim(); }
-function ensureWallet(wallet){ if(!state[wallet]) state[wallet] = { active:null, history:[] }; }
-
-function makeHandlers(name){
-  const base = "/" + name;
-
-  router.post(base + "/start", (req,res)=>{
-    const wallet=getWallet(req); if(!wallet) return res.status(400).send("missing wallet");
-    ensureWallet(wallet);
-    const cfg = Object.assign({}, req.body);
-    state[wallet].active = { name, mode:(req.body.mode||name), status:"RUNNING", config:cfg, startedAt:Date.now() };
-    state[wallet].history.push({ts:Date.now(), event:"START", name, cfg});
-    res.json({ok:true, active:state[wallet].active});
-  });
-
-  router.post(base + "/pause", (req,res)=>{
-    const wallet=getWallet(req); if(!wallet) return res.status(400).send("missing wallet");
-    ensureWallet(wallet);
-    if(state[wallet].active && state[wallet].active.name===name){
-      state[wallet].active.status="PAUSED";
-      state[wallet].history.push({ts:Date.now(), event:"PAUSE", name});
-    }
-    res.json({ok:true, active:state[wallet].active});
-  });
-
-  router.post(base + "/stop", (req,res)=>{
-    const wallet=getWallet(req); if(!wallet) return res.status(400).send("missing wallet");
-    ensureWallet(wallet);
-    if(state[wallet].active && state[wallet].active.name===name){
-      state[wallet].history.push({ts:Date.now(), event:"STOP", name});
-      state[wallet].active=null;
-    } else {
-      state[wallet].history.push({ts:Date.now(), event:"STOP_NOOP", name});
-    }
-    res.json({ok:true, active:state[wallet].active});
-  });
-
-  router.get(base + "/status", (req,res)=>{
-    const wallet=getWallet(req); if(!wallet) return res.status(400).send("missing wallet");
-    ensureWallet(wallet);
-    res.json({ok:true, active:state[wallet].active, last:state[wallet].history.slice(-10)});
-  });
-}
-
-["dca","grid","arbitrage","trend"].forEach(makeHandlers);
-module.exports = router;
-JS
-fi
-
-cp -a "$SRC" "$BACK_DIR/routes/strategy.routes.js"
-echo "OK copied -> $BACK_DIR/routes/strategy.routes.js"
-
-echo "=== [6] Wire route into server entry ==="
-# try to find entry file
-ENTRY=""
-# prefer common names
-for f in server.js app.js index.js main.js src/server.js src/app.js src/index.js; do
-  if [ -f "$BACK_DIR/$f" ]; then ENTRY="$BACK_DIR/$f"; break; fi
-done
-# fallback: first file that creates express app
-if [ -z "$ENTRY" ]; then
-  ENTRY="$(grep -RIl --no-messages -E "express\\(|const app *= *express\\(" "$BACK_DIR" --include="*.js" --include="*.cjs" --include="*.mjs" | head -n1 || true)"
-fi
-[ -n "$ENTRY" ] || { echo "ERR: impossible de trouver le fichier serveur (server.js/app.js)"; exit 1; }
-
-echo "ENTRY=$ENTRY"
 TS="$(date +%s)"
 mkdir -p /root/wolv_backups
-cp -a "$ENTRY" "/root/wolv_backups/backend_entry.$TS.bak"
+cp -a "$HTML" "/root/wolv_backups/index.html.$TS.bak"
+echo "Backup: /root/wolv_backups/index.html.$TS.bak"
 
-# add require if missing
-if ! grep -q "strategy\\.routes" "$ENTRY"; then
-  # insert require after express require or after app creation
-  perl -0777 -i -pe '
-    my $s=$_;
-    if($s !~ /strategyRoutes/){
-      if($s =~ /const\s+express\s*=\s*require\([^)]+\);\s*/s){
-        $s =~ s/(const\s+express\s*=\s*require\([^)]+\);\s*)/$1\nconst strategyRoutes = require(".\/routes\/strategy.routes");\n/s;
-      } elsif($s =~ /const\s+app\s*=\s*express\(\)\s*;\s*/s){
-        $s =~ s/(const\s+app\s*=\s*express\(\)\s*;\s*)/$1\nconst strategyRoutes = require(".\/routes\/strategy.routes");\n/s;
-      } else {
-        $s = "const strategyRoutes = require(\".\/routes\/strategy.routes\");\n".$s;
-      }
+# 2) Loader JS qui charge solanaWeb3 (fallback) puis charge terminal.js
+cat >"$WEB_DIR/ui/solana_loader.js" <<'JS'
+(async()=>{
+  function load(src){
+    return new Promise((res,rej)=>{
+      const s=document.createElement("script");
+      s.src=src; s.async=true;
+      s.onload=()=>res(true);
+      s.onerror=()=>rej(new Error("fail "+src));
+      document.head.appendChild(s);
+    });
+  }
+  async function ensure(){
+    if(window.solanaWeb3?.Connection) return true;
+    const cdns=[
+      "https://unpkg.com/@solana/web3.js@latest/lib/index.iife.min.js",
+      "https://cdn.jsdelivr.net/npm/@solana/web3.js@latest/lib/index.iife.min.js"
+    ];
+    for(const u of cdns){
+      try{ await load(u); }catch(e){ continue; }
+      if(window.solanaWeb3?.Connection) return true;
     }
-    $_=$s;
-  ' "$ENTRY"
-fi
+    return false;
+  }
 
-# add app.use if missing
-if ! grep -q "/api/strategy" "$ENTRY"; then
-  # put near other app.use
-  perl -0777 -i -pe '
-    my $s=$_;
-    if($s !~ /\/api\/strategy/){
-      if($s =~ /app\.use\(/s){
-        $s =~ s/(app\.use\([^\n;]+\);\s*)/$1\napp.use("\/api\/strategy", strategyRoutes);\n/s;
-      } else {
-        $s .= "\napp.use(\"/api/strategy\", strategyRoutes);\n";
-      }
-    }
-    $_=$s;
-  ' "$ENTRY"
-fi
+  const ok = await ensure();
+  if(!ok){
+    console.warn("[WOLV] solana web3 NOT loaded -> balances will stay …");
+  } else {
+    console.log("[WOLV] solana web3 loaded");
+  }
 
-echo "WIRED ✅ /api/strategy"
+  // maintenant on charge le JS principal
+  await load("ui/terminal.js?v="+Date.now());
+})();
+JS
 
-echo "=== [7] Restart backend ==="
-# if we have a service, restart it
-if [ -n "${SERVICE:-}" ]; then
-  systemctl restart "$SERVICE" && echo "systemctl restart $SERVICE OK" || true
-elif command -v pm2 >/dev/null 2>&1; then
-  pm2 restart all && echo "pm2 restart all OK" || true
+# 3) Patch index.html: enlever anciens tags solanaWeb3 + terminal.js, mettre loader
+#    (on évite les doubles chargements)
+perl -0777 -i -pe '
+  s#<script[^>]*@solana/web3\.js[^<]*</script>\s*##gsi;
+  s#<script[^>]*src="ui/terminal\.js"[^>]*></script>\s*##gsi;
+' "$HTML"
+
+# Inserer le loader juste avant </body> (ou à la fin si pas trouvé)
+if grep -qi "</body>" "$HTML"; then
+  sed -i 's#</body>#  <script src="ui/solana_loader.js"></script>\n</body>#i' "$HTML"
 else
-  echo "WARN: pas de service/pm2 trouvé. Redémarre ton node manuellement si nécessaire."
+  echo '<script src="ui/solana_loader.js"></script>' >> "$HTML"
 fi
 
-echo "=== [8] Quick test ==="
-curl -sS "http://127.0.0.1:3000/api/strategy/dca/status?wallet=test" 2>/dev/null || true
-curl -sS "http://127.0.0.1:8080/api/strategy/dca/status?wallet=test" 2>/dev/null || true
+nginx -t && systemctl reload nginx || true
 
-echo ""
-echo "DONE ✅"
-echo "Backend entry backup: /root/wolv_backups/backend_entry.$TS.bak"
-echo "If something breaks, restore it:"
-echo "  cp -a /root/wolv_backups/backend_entry.$TS.bak $ENTRY"
+echo "DONE ✅  Ctrl+F5 sur https://fireinners.online/wolverine/"
+echo "Rollback:"
+echo "  cp -a /root/wolv_backups/index.html.$TS.bak $HTML"
 BASH
 
-bash /root/WOLV_WIRE_STRATEGY_BACKEND.sh
+bash /root/WOLV_FIX_SOLANA_LIB_LOAD.sh
