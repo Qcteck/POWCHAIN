@@ -1,301 +1,143 @@
+bash -lc 'cat > /root/WOLV_HARD_RESET_V9.sh << "BASH"
 #!/usr/bin/env bash
 set -euo pipefail
+TS="$(date +%s)"
 
-# =========================
-# WOLVERINE • MEGA RESTORE + UI SINGLE (NO DOUBLONS)
-# - restaure index.html si backup trouvé
-# - sinon force une UI MIN (1 seul dépôt manuel + Connect + Mode + Start)
-# - corrige nginx (supprime anciens blocs WOLV*, ajoute /wolverine + /wolverine/api)
-# =========================
-
-APPLY_MIN_UI=1   # 1 = force UI MIN (recommandé) | 0 = tente restore backup seulement
 SITE="fireinners.online"
 VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
-WROOT="/opt/fireinners/frontend-react/app/dist/wolverine"
-INDEX="$WROOT/index.html"
-TS="$(date +%s)"
+SNIP="/etc/nginx/snippets/wolverine_static.conf"
+STATIC="/opt/fireinners/wolverine-static"
+INDEX="$STATIC/index.html"
 
 log(){ echo "[WOLV] $*"; }
 die(){ echo "[WOLV][ERR] $*" >&2; exit 1; }
 
-[ "$(id -u)" = "0" ] || die "Lance en root."
+[ "$(id -u)" = "0" ] || die "root seulement"
+[ -f "$VHOST" ] || die "VHOST introuvable: $VHOST"
 
-mkdir -p "$WROOT" "$WROOT/_backups"
+mkdir -p /root/wolv_backups /etc/nginx/snippets "$STATIC"
 
-# --- backup index actuel
-if [ -f "$INDEX" ]; then
-  cp -a "$INDEX" "$WROOT/_backups/index.html.bak.$TS" || true
-fi
+# unlock (au cas où)
+chattr -i /etc/nginx/nginx.conf 2>/dev/null || true
+chattr -i "$VHOST" 2>/dev/null || true
+chattr -i "$SNIP" 2>/dev/null || true
+chattr -i "$INDEX" 2>/dev/null || true
 
-# --- find best backup candidate (dernier)
-find_candidate(){
-  ls -1t \
-    "$WROOT"/index.html.bak.* \
-    "$WROOT"/index.html.disabled.* \
-    "$WROOT"/index.html.save* \
-    "$WROOT"/index.*.bak* \
-    2>/dev/null | head -n1 || true
-}
+# backup vhost
+cp -a "$VHOST" "/root/wolv_backups/fireinners.online-ssl.bak.$TS"
 
-CAND="$(find_candidate)"
-
-if [ "$APPLY_MIN_UI" = "0" ] && [ -n "${CAND:-}" ] && [ -f "$CAND" ]; then
-  log "Restore index depuis: $CAND"
-  cp -af "$CAND" "$INDEX"
-else
-  log "Force UI MIN (single dépôt / no doublons) -> $INDEX"
-  cat >"$INDEX" <<'HTML'
+# 1) UI: SINGLE dépôt manuel (1 seule section, point)
+cat >"$INDEX" << "HTML"
 <!doctype html><html lang="fr"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><meta http-equiv="Pragma" content="no-cache"/><meta http-equiv="Expires" content="0"/><meta http-equiv="Cache-Control" content="no-store,no-cache,must-revalidate,proxy-revalidate,max-age=0"/><title>WOLVERINE</title><style>body{font:14px Arial,system-ui;margin:0;padding:14px;background:#fff;color:#111}#wrap{max-width:980px;margin:0 auto;border:1px solid #bbb;border-radius:12px;padding:12px}h1{margin:0 0 12px 0;font-size:32px;letter-spacing:.5px}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:10px 0}.mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;word-break:break-all}.box{padding:10px;border:1px solid #bbb;border-radius:10px;background:#f7f7f7}button,select,input{font:inherit;padding:6px 8px}small{color:#444}.ok{color:#060}.bad{color:#a00}hr{border:none;border-top:1px solid #ddd;margin:12px 0}</style></head><body><div id="wrap"><h1>WOLVERINE</h1>
-
-<div class="box">
-  <div class="row">
-    <button id="btnConnect" type="button">Connect Wallet (Phantom)</button>
-    <div>Wallet: <span id="pub" class="mono">—</span></div>
-    <button id="btnRefresh" type="button" disabled>Refresh soldes</button>
-  </div>
-  <div class="row"><small>Status: <span id="status">—</span></small></div>
-  <div class="row"><div class="mono" id="balances">—</div></div>
-</div>
-
+<div class="box"><b>Wallet</b><div class="row"><button id="btnConnect" type="button">Connect Wallet (Phantom)</button><div>Wallet: <span id="pub" class="mono">—</span></div><button id="btnRefresh" type="button" disabled>Refresh soldes</button></div><div class="row"><small>Status: <span id="status">—</span></small></div><pre class="mono" id="balances" style="margin:0;white-space:pre-wrap">—</pre></div>
 <hr/>
-
-<div class="box">
-  <b>Mode</b>
-  <div class="row">
-    <select id="mode">
-      <option value="SAFE">SAFE</option>
-      <option value="AUTO">AUTO</option>
-      <option value="RR">RR</option>
-      <option value="SCALP">SCALP</option>
-    </select>
-    <button id="btnMode" type="button" disabled>Appliquer mode</button>
-    <small id="modeMsg">—</small>
-  </div>
-</div>
-
+<div class="box"><b>Mode TraderOne</b><div class="row"><select id="mode"><option value="SAFE">SAFE</option><option value="AUTO">AUTO</option><option value="RR">RR</option><option value="SCALP">SCALP</option></select><button id="btnMode" type="button" disabled>Appliquer mode</button><small id="modeMsg">—</small></div></div>
 <hr/>
-
-<div class="box">
-  <b>Dépôt manuel (obligatoire) — UN SEUL</b>
-  <div class="row"><small>Envoie depuis ton Phantom vers TraderOne (bot) puis confirme ici.</small></div>
-  <div class="row">
-    <select id="asset">
-      <option value="SOL">SOL</option>
-      <option value="USDC">USDC</option>
-    </select>
-    <input id="amount" placeholder="Montant (ex: 0.1)" inputmode="decimal" />
-    <button id="btnConfirm" type="button" disabled>CONFIRMER DÉPÔT (on-chain)</button>
-    <small id="depMsg">—</small>
-  </div>
-</div>
-
+<div class="box"><b>Dépôt manuel (obligatoire) — UNIQUE</b><div class="row"><small>Envoie depuis Phantom vers le bot, puis confirme ici.</small></div><div class="row"><select id="asset"><option value="SOL">SOL</option><option value="USDC">USDC</option></select><input id="amount" placeholder="Montant (ex: 0.1)" inputmode="decimal"/><button id="btnConfirm" type="button" disabled>CONFIRMER DÉPÔT (on-chain)</button><small id="depMsg">—</small></div></div>
 <hr/>
-
-<div class="box">
-  <b>Lancer WOLVERINE</b>
-  <div class="row">
-    <button id="btnStart" type="button" disabled>START WOLVERINE (TraderOne)</button>
-    <small id="startMsg">—</small>
-  </div>
-</div>
-
-<script>
-(()=>{"use strict";
-const $=s=>document.querySelector(s);
-const st=$("#status"),pubEl=$("#pub"),bal=$("#balances"),mode=$("#mode"),modeMsg=$("#modeMsg"),asset=$("#asset"),amount=$("#amount"),depMsg=$("#depMsg"),startMsg=$("#startMsg");
-const btnConnect=$("#btnConnect"),btnRefresh=$("#btnRefresh"),btnMode=$("#btnMode"),btnConfirm=$("#btnConfirm"),btnStart=$("#btnStart");
-let PUB="",DEP_OK=false;
-
-function setStatus(t,ok){st.textContent=t;st.className=ok?"ok":"bad";}
-async function fetchAny(url,opts){
-  const r=await fetch(url,opts||{});
-  const ct=(r.headers.get("content-type")||"").toLowerCase();
-  if(ct.includes("application/json")){
-    const j=await r.json();
-    return {ok:r.ok,status:r.status,json:j};
-  }else{
-    const t=await r.text();
-    return {ok:r.ok,status:r.status,nonjson:t.slice(0,600)};
-  }
-}
-async function refresh(){
-  if(!PUB) return;
-  setStatus("REFRESH…",true);
-  const u="/wolverine/api/balances2?pub="+encodeURIComponent(PUB)+"&t="+Date.now();
-  const res=await fetchAny(u);
-  if(res.json){
-    bal.textContent=JSON.stringify(res.json,null,2);
-    setStatus("OK",true);
-  }else{
-    bal.textContent="non-JSON "+res.status+": "+(res.nonjson||"");
-    setStatus("API NON-JSON",false);
-  }
-}
-async function applyMode(){
-  if(!PUB) return;
-  modeMsg.textContent="…";
-  const body=JSON.stringify({pub:PUB,mode:mode.value,t:Date.now()});
-  const res=await fetchAny("/wolverine/api/mode",{method:"POST",headers:{"content-type":"application/json"},body});
-  if(res.json){modeMsg.textContent="OK: "+(res.json.ok!==undefined?res.json.ok:"");modeMsg.className="ok";}
-  else{modeMsg.textContent="non-JSON "+res.status;modeMsg.className="bad";}
-}
-async function confirmDeposit(){
-  if(!PUB) return;
-  DEP_OK=false; btnStart.disabled=true;
-  depMsg.textContent="scan…"; depMsg.className="";
-  const body=JSON.stringify({pub:PUB,asset:asset.value,amount:String(amount.value||""),t:Date.now()});
-  const res=await fetchAny("/wolverine/api/confirm_deposit_v2",{method:"POST",headers:{"content-type":"application/json"},body});
-  if(res.json){
-    depMsg.textContent="OK: "+JSON.stringify(res.json);
-    depMsg.className="ok";
-    DEP_OK=!!(res.json.ok ?? true);
-    btnStart.disabled=!DEP_OK;
-  }else{
-    depMsg.textContent="non-JSON "+res.status+": "+(res.nonjson||"");
-    depMsg.className="bad";
-  }
-}
-async function start(){
-  if(!PUB || !DEP_OK) return;
-  startMsg.textContent="…"; startMsg.className="";
-  const body=JSON.stringify({pub:PUB,mode:mode.value,t:Date.now()});
-  const res=await fetchAny("/wolverine/api/start",{method:"POST",headers:{"content-type":"application/json"},body});
-  if(res.json){startMsg.textContent="OK: "+JSON.stringify(res.json);startMsg.className="ok";}
-  else{startMsg.textContent="non-JSON "+res.status+": "+(res.nonjson||"");startMsg.className="bad";}
-}
-
-btnConnect.onclick=async()=>{
-  try{
-    if(!window.solana||!window.solana.isPhantom){setStatus("Phantom absent",false);return;}
-    const r=await window.solana.connect({onlyIfTrusted:false});
-    PUB=(r&&r.publicKey)?r.publicKey.toString():(window.solana.publicKey?window.solana.publicKey.toString():"");
-    pubEl.textContent=PUB||"—";
-    const ok=!!PUB;
-    btnRefresh.disabled=!ok; btnMode.disabled=!ok; btnConfirm.disabled=!ok;
-    setStatus(ok?"CONNECTÉ":"FAIL",ok);
-    if(ok) refresh();
-  }catch(e){setStatus("ERR CONNECT",false);}
-};
-btnRefresh.onclick=refresh;
-btnMode.onclick=applyMode;
-btnConfirm.onclick=confirmDeposit;
-btnStart.onclick=start;
-})();
-</script>
+<div class="box"><b>Lancer</b><div class="row"><button id="btnStart" type="button" disabled>START WOLVERINE (TraderOne)</button><small id="startMsg">—</small></div></div>
+<script>(()=>{"use strict";const $=s=>document.querySelector(s),st=$("#status"),pubEl=$("#pub"),bal=$("#balances"),mode=$("#mode"),modeMsg=$("#modeMsg"),asset=$("#asset"),amount=$("#amount"),depMsg=$("#depMsg"),startMsg=$("#startMsg"),btnConnect=$("#btnConnect"),btnRefresh=$("#btnRefresh"),btnMode=$("#btnMode"),btnConfirm=$("#btnConfirm"),btnStart=$("#btnStart");let PUB="",DEP_OK=false;function setStatus(t,ok){st.textContent=t;st.className=ok?"ok":"bad"}async function fetchAny(url,opts){const r=await fetch(url,opts||{});const ct=(r.headers.get("content-type")||"").toLowerCase();if(ct.includes("application/json")){return{ok:r.ok,status:r.status,json:await r.json()}}return{ok:r.ok,status:r.status,nonjson:(await r.text()).slice(0,900)}}async function refresh(){if(!PUB)return;setStatus("REFRESH…",true);const res=await fetchAny("/wolverine/api/balances2?pub="+encodeURIComponent(PUB)+"&t="+Date.now());if(res.json){bal.textContent=JSON.stringify(res.json,null,2);setStatus("OK",true)}else{bal.textContent="non-JSON "+res.status+": "+(res.nonjson||"");setStatus("API NON-JSON",false)}}async function applyMode(){if(!PUB)return;modeMsg.textContent="…";modeMsg.className="";const body=JSON.stringify({pub:PUB,mode:mode.value,t:Date.now()});const res=await fetchAny("/wolverine/api/mode",{method:"POST",headers:{"content-type":"application/json"},body});if(res.json){modeMsg.textContent="OK";modeMsg.className="ok"}else{modeMsg.textContent="non-JSON "+res.status;modeMsg.className="bad"}}async function confirmDeposit(){if(!PUB)return;DEP_OK=false;btnStart.disabled=true;depMsg.textContent="scan…";depMsg.className="";const body=JSON.stringify({pub:PUB,asset:asset.value,amount:String(amount.value||""),t:Date.now()});const res=await fetchAny("/wolverine/api/confirm_deposit_v2",{method:"POST",headers:{"content-type":"application/json"},body});if(res.json){depMsg.textContent="OK: "+JSON.stringify(res.json);depMsg.className="ok";DEP_OK=!!(res.json.ok??true);btnStart.disabled=!DEP_OK}else{depMsg.textContent="non-JSON "+res.status+": "+(res.nonjson||"");depMsg.className="bad"}}async function start(){if(!PUB||!DEP_OK)return;startMsg.textContent="…";startMsg.className="";const body=JSON.stringify({pub:PUB,mode:mode.value,t:Date.now()});const res=await fetchAny("/wolverine/api/start",{method:"POST",headers:{"content-type":"application/json"},body});if(res.json){startMsg.textContent="OK: "+JSON.stringify(res.json);startMsg.className="ok"}else{startMsg.textContent="non-JSON "+res.status+": "+(res.nonjson||"");startMsg.className="bad"}}btnConnect.onclick=async()=>{try{if(!window.solana||!window.solana.isPhantom){setStatus("Phantom absent",false);return}const r=await window.solana.connect({onlyIfTrusted:false});PUB=(r&&r.publicKey)?r.publicKey.toString():(window.solana.publicKey?window.solana.publicKey.toString():"");pubEl.textContent=PUB||"—";const ok=!!PUB;btnRefresh.disabled=!ok;btnMode.disabled=!ok;btnConfirm.disabled=!ok;setStatus(ok?"CONNECTÉ":"FAIL",ok);if(ok)refresh()}catch(e){setStatus("ERR CONNECT",false)}};btnRefresh.onclick=refresh;btnMode.onclick=applyMode;btnConfirm.onclick=confirmDeposit;btnStart.onclick=start})();</script>
 </div></body></html>
 HTML
-fi
 
-# --- permissions (anti "Permission denied" + fichiers immuables)
-chattr -i "$INDEX" 2>/dev/null || true
-chmod 0644 "$INDEX" 2>/dev/null || true
-chown -R root:root "$WROOT" 2>/dev/null || true
+chmod 0644 "$INDEX"
+chown -R root:root "$STATIC"
 
-# --- nginx: assure 1 seul vhost actif pour fireinners.online (évite "conflicting server name")
-CANON="$VHOST"
-[ -f "$CANON" ] || die "VHOST introuvable: $CANON"
+# guard: 1 seul "Dépôt manuel"
+CNT="$(grep -o "Dépôt manuel" "$INDEX" | wc -l | tr -d " ")"
+[ "$CNT" = "1" ] || die "UI contient $CNT fois \"Dépôt manuel\" (doit = 1)."
 
-# désactive tous les liens sites-enabled qui pointent vers autre chose que CANON mais match fireinners.online
+# 2) Snippet nginx: FORCE alias vers /opt/fireinners/wolverine-static (bypass dist/react)
+cat >"$SNIP" << "EOF"
+# WOLVERINE (HARD) - single source of truth
+location ^~ /wolverine/api/ {
+  rewrite ^/wolverine/api/(.*)$ /api/$1 break;
+  proxy_pass http://127.0.0.1:3000;
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  proxy_read_timeout 60s;
+}
+location ^~ /wolverine/ {
+  alias /opt/fireinners/wolverine-static/;
+  try_files $uri $uri/ /wolverine/index.html;
+  add_header Cache-Control "no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0" always;
+  add_header Pragma "no-cache" always;
+  add_header Expires "0" always;
+}
+EOF
+chmod 0644 "$SNIP"
+chown root:root "$SNIP"
+
+# 3) VHOST: retirer anciens morceaux wolverine (locations/includes) puis inclure snippet UNE fois
+tmp="/root/wolv_backups/vhost.clean.$TS"
+awk '
+BEGIN{skip=0}
+{
+  line=$0
+  if(line ~ /location[[:space:]]+\^~[[:space:]]+\/wolverine\/api\//){skip=1}
+  if(line ~ /location[[:space:]]+\^~[[:space:]]+\/wolverine\//){skip=1}
+  if(line ~ /include[[:space:]]+\/etc\/nginx\/snippets\/wolverine/){next}
+  if(skip){
+    if(line ~ /^\s*\}/){skip=0; next}
+    next
+  }
+  print
+}' "$VHOST" > "$tmp"
+cp -a "$tmp" "$VHOST"
+rm -f "$tmp"
+
+# inject include avant la fin de CHAQUE server{} qui a server_name fireinners.online (idempotent)
+tmp="/root/wolv_backups/vhost.inject.$TS"
+awk -v inc="    include /etc/nginx/snippets/wolverine_static.conf;" '
+function has(s,pat){ return (s ~ pat) }
+function countchr(s,c,  n,i){n=0;for(i=1;i<=length(s);i++)if(substr(s,i,1)==c)n++;return n}
+BEGIN{in=0;depth=0;target=0;added=0}
+{
+  line=$0
+  if(!in && line ~ /^[[:space:]]*server[[:space:]]*\{/){in=1;depth=0;target=0;added=0}
+  if(in){
+    depth += countchr(line,"{"); depth -= countchr(line,"}")
+    if(line ~ /server_name/ && line ~ /fireinners\.online/){target=1}
+    if(line ~ /include[[:space:]]+\/etc\/nginx\/snippets\/wolverine_static\.conf/){added=1}
+    if(depth==0 && line ~ /^\s*\}\s*$/){
+      if(target && !added){print inc}
+      print line
+      in=0;target=0;added=0
+      next
+    }
+    print line
+    next
+  }
+  print line
+}
+' "$VHOST" > "$tmp"
+cp -a "$tmp" "$VHOST"
+rm -f "$tmp"
+
+# 4) Conflits nginx: disable tout autre enabled qui claim fireinners.online (sauf notre vhost)
 for f in /etc/nginx/sites-enabled/*; do
   [ -e "$f" ] || continue
-  tgt="$f"
-  if [ -L "$f" ]; then tgt="$(readlink -f "$f" || echo "$f")"; fi
-  if [ "$tgt" != "$CANON" ]; then
-    if grep -Eq 'server_name\s+.*fireinners\.online' "$tgt" 2>/dev/null; then
-      log "Disable conflicting enabled: $f -> $tgt"
-      rm -f "$f" 2>/dev/null || true
-    fi
+  tgt="$f"; [ -L "$f" ] && tgt="$(readlink -f "$f" || echo "$f")"
+  if [ "$tgt" != "$VHOST" ] && grep -Eq "server_name[[:space:]].*fireinners\.online" "$tgt" 2>/dev/null; then
+    rm -f "$f" 2>/dev/null || true
   fi
 done
+ln -sf "$VHOST" "/etc/nginx/sites-enabled/$(basename "$VHOST")"
 
-# assure lien canon
-ln -sf "$CANON" "/etc/nginx/sites-enabled/$(basename "$CANON")"
-
-# --- patch vhost: supprime anciens blocs WOLV* puis insère bloc unique (api + static)
-python3 - <<'PY'
-import re,sys,os
-p="/etc/nginx/sites-available/fireinners.online-ssl"
-txt=open(p,"r",encoding="utf-8",errors="ignore").read()
-
-# remove any previous WOLV marker blocks (V3..V99)
-txt=re.sub(r'\n?\s*#\s*BEGIN\s+WOLV_[A-Z0-9_]+\s*.*?\n\s*#\s*END\s+WOLV_[A-Z0-9_]+\s*\n',"\n",txt,flags=re.S)
-
-# find server blocks containing server_name fireinners.online
-def server_blocks(s):
-  out=[]
-  for m in re.finditer(r'(?m)^\s*server\s*\{',s):
-    i=m.start()
-    depth=0
-    j=i
-    while j<len(s):
-      c=s[j]
-      if c=='{': depth+=1
-      elif c=='}':
-        depth-=1
-        if depth==0:
-          out.append((i,j+1))
-          break
-      j+=1
-  return out
-
-blocks=server_blocks(txt)
-if not blocks:
-  print("ERR: aucun bloc server {}",file=sys.stderr); sys.exit(2)
-
-targets=[]
-for (a,b) in blocks:
-  blk=txt[a:b]
-  if re.search(r'(?m)^\s*server_name\s+.*\bfireinners\.online\b',blk):
-    targets.append((a,b))
-
-if not targets:
-  # fallback: patch last server block
-  targets=[blocks[-1]]
-
-MARK_BEGIN="# BEGIN WOLV_SINGLE_UI_V7"
-MARK_END="# END WOLV_SINGLE_UI_V7"
-WROOT="/opt/fireinners/frontend-react/app/dist"
-block=f"""
-    {MARK_BEGIN}
-    location ^~ /wolverine/api/ {{
-        rewrite ^/wolverine/api/(.*)$ /api/$1 break;
-        proxy_pass http://127.0.0.1:3000;
-        proxy_http_version 1.1;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_read_timeout 60s;
-    }}
-
-    location ^~ /wolverine/ {{
-        root {WROOT};
-        try_files $uri $uri/ /wolverine/index.html;
-        add_header Cache-Control "no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0" always;
-        add_header Pragma "no-cache" always;
-        add_header Expires "0" always;
-    }}
-    {MARK_END}
-"""
-
-# inject before final } of each target server block
-new=txt
-shift=0
-for (a,b) in targets:
-  a+=shift; b+=shift
-  blk=new[a:b]
-  k=blk.rfind("}")
-  if k<0: continue
-  ins=blk[:k]+"\n"+block+"\n"+blk[k:]
-  new=new[:a]+ins+new[b:]
-  shift += len(ins)-(b-a)
-
-open(p,"w",encoding="utf-8").write(new)
-print("OK: vhost patch applied")
-PY
-
+# 5) test + reload
 nginx -t
 systemctl reload nginx
 
-log "OK. URL: https://fireinners.online/wolverine/"
-log "Si ton navigateur garde du vieux: Ctrl+F5"
+# re-lock (optionnel)
+chattr +i /etc/nginx/nginx.conf 2>/dev/null || true
+chattr +i "$VHOST" 2>/dev/null || true
+
+log "OK. Wolverine sert maintenant /opt/fireinners/wolverine-static/index.html (1 seul dépôt manuel)."
+log "URL: https://fireinners.online/wolverine/"
+BASH
+chmod +x /root/WOLV_HARD_RESET_V9.sh
+/root/WOLV_HARD_RESET_V9.sh
+'
