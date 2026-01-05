@@ -1,34 +1,96 @@
-#!/usr/bin/env bash
-set -e
+# ==============================
+# SCRIPT POWERSELL TRADERONE VPS ROBUSTE
+# ==============================
 
-echo "=== FIX NODE/NPM — CLEAN & FINAL ==="
+# --- CONFIGURATION ---
+$VPS_IP     = "72.61.79.12"                     # IP du VPS
+$SSH_KEY    = "$env:USERPROFILE\.ssh\id_ed25519"  # Chemin vers la clé privée
+$LOCAL_PORT = 8081                               # Port local pour le dashboard
 
-echo "[1] PURGE NODE & NPM APT (FORCE)"
-apt-get purge -y nodejs npm nodejs-doc libnode* || true
-apt-get autoremove -y
-apt-get autoclean -y
+# --- Vérifier que la clé SSH existe ---
+if (-Not (Test-Path $SSH_KEY)) {
+    Write-Host "[ERROR] Clé SSH introuvable : $SSH_KEY" -ForegroundColor Red
+    Read-Host "Appuie sur Entrée pour quitter..."
+    exit
+}
 
-echo "[2] REMOVE LEFTOVERS"
-rm -rf /usr/lib/node_modules || true
-rm -rf /usr/local/lib/node_modules || true
-rm -rf /usr/include/node || true
-rm -f /usr/bin/node /usr/bin/npm || true
+# --- Commande à exécuter sur le VPS ---
+$sshCommand = @'
+cd /opt/traderone-opt
 
-echo "[3] FIX BROKEN APT STATE"
-apt-get -f install -y || true
-dpkg --configure -a || true
+# === Installer dépendances si nécessaire ===
+if ! command -v node >/dev/null 2>&1; then
+    echo "[INFO] Node.js non trouvé, installation..."
+    curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+    apt-get install -y nodejs
+fi
 
-echo "[4] INSTALL NODE 20 (NODESOURCE ONLY)"
-curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-apt-get install -y nodejs
+if ! command -v npm >/dev/null 2>&1; then
+    echo "[INFO] npm non trouvé, installation..."
+    apt-get install -y npm
+fi
 
-echo "[5] VERIFY"
-node -v
-npm -v
+if ! command -v serve >/dev/null 2>&1; then
+    echo "[INFO] serve non trouvé, installation globale..."
+    npm install -g serve
+fi
 
-echo "[6] INSTALL PM2 (GLOBAL)"
-npm install -g pm2
+# === Gestion wallet ===
+if [ ! -f wallet.json ]; then
+    read -p "Clé privée base58 : " PRIV_KEY
+    echo "{\"PRIVATE_KEY_BASE58\": \"$PRIV_KEY\"}" > wallet.json
+    chmod 600 wallet.json
+    echo "[OK] Wallet créé"
+else
+    echo "[INFO] Wallet existant"
+fi
 
-echo "======================================"
-echo "NODE/NPM FIXED CLEANLY"
-echo "======================================"
+# === Lancer le dashboard si besoin ===
+if ! pgrep -f "serve -s /opt/traderone -l 8081" > /dev/null; then
+    nohup serve -s /opt/traderone -l 8081 > dashboard.log 2>&1 &
+    echo "[INFO] Dashboard lancé sur le port 8081"
+fi
+
+# === Fonction pour relancer TraderOne automatiquement ===
+start_traderone() {
+    if pgrep -f "node get_balances.mjs" > /dev/null; then
+        echo "[INFO] TraderOne déjà en cours"
+    else
+        nohup node get_balances.mjs > traderone.log 2>&1 &
+        echo "[INFO] TraderOne lancé ou relancé. Log : traderone.log"
+    fi
+}
+
+# === Boucle infinie pour surveiller TraderOne ===
+while true; do
+    start_traderone
+    sleep 10
+done
+'@
+
+# --- Arguments SSH ---
+$sshArgs = @(
+    "-i", "$SSH_KEY",
+    "-p", "2222",
+    "-L", "$LOCAL_PORT`:localhost`:$LOCAL_PORT",
+    "root@$VPS_IP",
+    $sshCommand
+)
+
+Write-Host "[INFO] Lancement du tunnel SSH vers $VPS_IP sur le port local $LOCAL_PORT..." -ForegroundColor Cyan
+
+# --- Lancer le tunnel SSH et le script VPS ---
+Start-Process ssh -ArgumentList $sshArgs -NoNewWindow
+
+# --- Pause pour laisser le tunnel s'établir ---
+Start-Sleep -Seconds 5
+
+# --- Vérifier si le tunnel est actif ---
+$netstat = netstat -ano | Select-String ":$LOCAL_PORT"
+if ($netstat) {
+    Write-Host "[OK] Tunnel actif sur localhost:$LOCAL_PORT" -ForegroundColor Green
+    Write-Host "[INFO] Ouverture automatique du dashboard dans le navigateur..."
+    Start-Process "http://localhost:$LOCAL_PORT/"
+} else {
+    Write-Host "[WARN] Tunnel non détecté. Vérifie la connexion SSH." -ForegroundColor Yellow
+}
