@@ -1,1 +1,80 @@
-curl -fsSL https://fireinners.online/MEGA_TRADERONE_WOLVERINE.sh | bash
+bash <<'EOF'
+set -e
+
+APP_DIR="/opt/traderone"
+ENV_FILE="$APP_DIR/.env"
+TARGET_PUB="e8DbBrTJxRetx3HNFb83CsXMySETydHVLwxMzkjcVqh"
+PORT="3000"
+NGINX_SITE="/etc/nginx/sites-available/fireinners.online-ssl"
+SNIPPET="/etc/nginx/snippets/traderone_wolverine.conf"
+
+echo "=== TRADERONE • VERIFY KEY + WOLVERINE HTTPS ==="
+
+# 1) CHECK ENV
+if [ ! -f "$ENV_FILE" ]; then
+  echo "[ERR] $ENV_FILE introuvable"
+  exit 1
+fi
+
+KEY=$(grep '^SOLANA_PRIVATE_KEY_BASE58=' "$ENV_FILE" | cut -d= -f2-)
+if [ -z "$KEY" ]; then
+  echo "[ERR] SOLANA_PRIVATE_KEY_BASE58 absent"
+  exit 1
+fi
+
+# 2) VERIFY KEY
+node <<JS
+const bs58=require('bs58');
+const {Keypair}=require('@solana/web3.js');
+try{
+  const raw=bs58.decode("$KEY");
+  const kp=Keypair.fromSecretKey(raw);
+  const pub=kp.publicKey.toBase58();
+  if(pub!=="$TARGET_PUB"){
+    console.error("[ERR] Mauvaise clé privée");
+    process.exit(1);
+  }
+  console.log("[OK] Clé valide →",pub);
+}catch(e){
+  console.error("[ERR] Clé invalide",e.message);
+  process.exit(1);
+}
+JS
+
+# 3) CHECK PORT
+if ! ss -lnt | grep -q ":$PORT"; then
+  echo "[ERR] TraderOne n'écoute pas sur $PORT"
+  exit 1
+fi
+echo "[OK] TraderOne écoute sur $PORT"
+
+# 4) CREATE NGINX LOCATION
+mkdir -p /etc/nginx/snippets
+cat > "$SNIPPET" <<'NG'
+location /wolverine/ {
+    proxy_pass http://127.0.0.1:3000/;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_read_timeout 300s;
+}
+NG
+
+# 5) INCLUDE IF MISSING
+if ! grep -q "traderone_wolverine.conf" "$NGINX_SITE"; then
+  sed -i '/server {/a \    include /etc/nginx/snippets/traderone_wolverine.conf;' "$NGINX_SITE"
+fi
+
+# 6) RELOAD NGINX
+nginx -t
+systemctl reload nginx
+
+# 7) LOCAL TEST
+sleep 2
+curl -s http://127.0.0.1:$PORT | head -n 5 && echo
+
+echo "=== SUCCESS ==="
+echo "URL : https://www.fireinners.online/wolverine"
+EOF
