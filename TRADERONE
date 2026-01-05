@@ -1,8 +1,8 @@
-cat >/root/WOLV_FIX_SOLANA_LIB_LOAD.sh <<'BASH'
+cat >/root/WOLV_FIX_BALANCES_SOL_USDC_V2.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 1) Trouver le dossier web /wolverine
+# Locate /wolverine web dir
 WEB_DIR=""
 for d in \
   /opt/fireinners/frontend-react/app/dist/wolverine \
@@ -17,18 +17,34 @@ done
 echo "WEB_DIR=$WEB_DIR"
 
 HTML="$WEB_DIR/index.html"
-[ -f "$HTML" ] || { echo "ERR: index.html introuvable: $HTML"; exit 1; }
-
+JS="$WEB_DIR/ui/terminal.js"
 mkdir -p "$WEB_DIR/ui"
+[ -f "$HTML" ] || { echo "ERR: index.html introuvable: $HTML"; exit 1; }
+[ -f "$JS" ] || { echo "ERR: terminal.js introuvable: $JS"; exit 1; }
 
 TS="$(date +%s)"
 mkdir -p /root/wolv_backups
 cp -a "$HTML" "/root/wolv_backups/index.html.$TS.bak"
-echo "Backup: /root/wolv_backups/index.html.$TS.bak"
+cp -a "$JS"   "/root/wolv_backups/terminal.js.$TS.bak"
+echo "Backup OK -> /root/wolv_backups/(index.html|terminal.js).$TS.bak"
 
-# 2) Loader JS qui charge solanaWeb3 (fallback) puis charge terminal.js
+# 1) Ensure debug box exists (visible)
+if ! grep -q 'id="wolvDbg"' "$HTML"; then
+  perl -0777 -i -pe 's#</aside>#\n<div id="wolvDbg" class="notice" style="margin-top:10px">\n  <div style="font-weight:1000;margin-bottom:6px">Debug</div>\n  <div class="small" id="wolvDbgText">Boot…</div>\n</div>\n\n</aside>#sm' "$HTML"
+  echo "Added debug box"
+fi
+
+# 2) Solana loader: remove old solanaWeb3 + terminal.js tags, then load loader
+perl -0777 -i -pe '
+  s#<script[^>]*@solana/web3\.js[^<]*</script>\s*##gsi;
+  s#<script[^>]*src="ui/terminal\.js"[^>]*></script>\s*##gsi;
+  s#<script[^>]*src="ui/solana_loader\.js"[^>]*></script>\s*##gsi;
+' "$HTML"
+
 cat >"$WEB_DIR/ui/solana_loader.js" <<'JS'
 (async()=>{
+  const dbg=(t)=>{ try{ const el=document.getElementById("wolvDbgText"); if(el) el.textContent=t; }catch(_){}; console.log("[WOLVDBG]",t); };
+
   function load(src){
     return new Promise((res,rej)=>{
       const s=document.createElement("script");
@@ -38,43 +54,165 @@ cat >"$WEB_DIR/ui/solana_loader.js" <<'JS'
       document.head.appendChild(s);
     });
   }
-  async function ensure(){
+
+  async function ensureWeb3(){
     if(window.solanaWeb3?.Connection) return true;
     const cdns=[
       "https://unpkg.com/@solana/web3.js@latest/lib/index.iife.min.js",
       "https://cdn.jsdelivr.net/npm/@solana/web3.js@latest/lib/index.iife.min.js"
     ];
     for(const u of cdns){
-      try{ await load(u); }catch(e){ continue; }
+      try{
+        dbg("Load solana web3: "+u);
+        await load(u);
+      }catch(e){ continue; }
       if(window.solanaWeb3?.Connection) return true;
     }
     return false;
   }
 
-  const ok = await ensure();
-  if(!ok){
-    console.warn("[WOLV] solana web3 NOT loaded -> balances will stay …");
-  } else {
-    console.log("[WOLV] solana web3 loaded");
-  }
+  const ok = await ensureWeb3();
+  dbg(ok ? "solanaWeb3 OK ✅" : "solanaWeb3 FAIL ❌ (CSP/adblock/CDN)");
 
-  // maintenant on charge le JS principal
+  // Load main app JS after web3 attempt (even if fail -> UI will show debug)
   await load("ui/terminal.js?v="+Date.now());
 })();
 JS
 
-# 3) Patch index.html: enlever anciens tags solanaWeb3 + terminal.js, mettre loader
-#    (on évite les doubles chargements)
-perl -0777 -i -pe '
-  s#<script[^>]*@solana/web3\.js[^<]*</script>\s*##gsi;
-  s#<script[^>]*src="ui/terminal\.js"[^>]*></script>\s*##gsi;
-' "$HTML"
-
-# Inserer le loader juste avant </body> (ou à la fin si pas trouvé)
+# inject loader before </body>
 if grep -qi "</body>" "$HTML"; then
   sed -i 's#</body>#  <script src="ui/solana_loader.js"></script>\n</body>#i' "$HTML"
 else
   echo '<script src="ui/solana_loader.js"></script>' >> "$HTML"
+fi
+
+# 3) Patch terminal.js: robust SOL/USDC balance + write into both id sets
+if ! grep -q "WOLV_BAL_FIX_V2" "$JS"; then
+  cat >>"$JS" <<'JS'
+
+// === WOLV_BAL_FIX_V2 ===
+(()=>{"use strict";
+const USDC_MINT="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1";
+const RPCS=[
+  (window.__RPC__||"").trim(),
+  "https://api.mainnet-beta.solana.com"
+].filter(Boolean);
+
+function dbg(t){
+  try{ const el=document.getElementById("wolvDbgText"); if(el) el.textContent=t; }catch(_){}
+  console.log("[WOLVDBG]",t);
+}
+function setAny(ids, v){
+  for(const id of ids){
+    const el=document.getElementById(id);
+    if(el) el.textContent=v;
+  }
+}
+function fmt(n,d){ n=Number(n||0); if(!isFinite(n)) n=0; return n.toFixed(d); }
+
+async function waitWeb3(){
+  for(let i=0;i<80;i++){
+    if(window.solanaWeb3?.Connection && window.solanaWeb3?.PublicKey) return true;
+    await new Promise(r=>setTimeout(r,100));
+  }
+  return false;
+}
+
+async function phantomPub(trusted){
+  if(!window.solana || !window.solana.isPhantom) return "";
+  if(window.solana.publicKey) return window.solana.publicKey.toBase58();
+  try{
+    const r=await window.solana.connect(trusted?{onlyIfTrusted:true}:{});
+    return r?.publicKey ? r.publicKey.toBase58() : "";
+  }catch(_){ return ""; }
+}
+
+async function connAny(){
+  const web3=window.solanaWeb3;
+  for(const rpc of RPCS){
+    try{
+      const c=new web3.Connection(rpc,"confirmed");
+      // small ping
+      await c.getLatestBlockhash("confirmed");
+      return c;
+    }catch(_){}
+  }
+  return null;
+}
+
+async function readBalances(){
+  const ok=await waitWeb3();
+  if(!ok){ dbg("solanaWeb3 missing -> balances …"); return; }
+
+  const pub = await phantomPub(true);
+  if(!pub){
+    dbg("Phantom not connected");
+    setAny(["balSol","walletSol"], "—");
+    setAny(["balUsdc","walletUsdc"], "—");
+    setAny(["walletPub"], "—");
+    return;
+  }
+
+  const short = pub.slice(0,4)+"…"+pub.slice(-4);
+  setAny(["walletPub"], short);
+
+  const web3=window.solanaWeb3;
+  const conn=await connAny();
+  if(!conn){ dbg("RPC unreachable"); return; }
+
+  try{
+    // SOL
+    const lam=await conn.getBalance(new web3.PublicKey(pub),"confirmed");
+    setAny(["balSol","walletSol"], fmt(lam/1e9,6)+" SOL");
+  }catch(e){
+    dbg("SOL err: "+(e?.message||e));
+  }
+
+  try{
+    // USDC
+    const res=await conn.getParsedTokenAccountsByOwner(
+      new web3.PublicKey(pub),
+      { mint: new web3.PublicKey(USDC_MINT) },
+      "confirmed"
+    );
+    let sum=0;
+    for(const it of (res.value||[])){
+      const ui=it.account?.data?.parsed?.info?.tokenAmount?.uiAmount;
+      sum += Number(ui||0);
+    }
+    setAny(["balUsdc","walletUsdc"], fmt(sum,2)+" USDC");
+    dbg("Balances OK ✅");
+  }catch(e){
+    dbg("USDC err: "+(e?.message||e));
+  }
+}
+
+// refresh loop
+setTimeout(()=>readBalances().catch(()=>{}), 800);
+setInterval(()=>readBalances().catch(()=>{}), 6000);
+
+// connect button hook (if exists)
+document.addEventListener("DOMContentLoaded", ()=>{
+  const btn=document.getElementById("btnConnect");
+  if(btn){
+    btn.addEventListener("click", async()=>{
+      try{
+        dbg("Connecting Phantom…");
+        const pub = await phantomPub(false);
+        dbg(pub ? "Phantom connected ✅" : "Phantom connect refused");
+        await readBalances();
+      }catch(e){
+        dbg("Connect err: "+(e?.message||e));
+      }
+    });
+  }
+});
+})();
+// === /WOLV_BAL_FIX_V2 ===
+JS
+  echo "Patched terminal.js (balances fix v2)"
+else
+  echo "terminal.js already contains WOLV_BAL_FIX_V2"
 fi
 
 nginx -t && systemctl reload nginx || true
@@ -82,6 +220,7 @@ nginx -t && systemctl reload nginx || true
 echo "DONE ✅  Ctrl+F5 sur https://fireinners.online/wolverine/"
 echo "Rollback:"
 echo "  cp -a /root/wolv_backups/index.html.$TS.bak $HTML"
+echo "  cp -a /root/wolv_backups/terminal.js.$TS.bak $JS"
 BASH
 
-bash /root/WOLV_FIX_SOLANA_LIB_LOAD.sh
+bash /root/WOLV_FIX_BALANCES_SOL_USDC_V2.sh
