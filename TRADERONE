@@ -1,49 +1,49 @@
-cat >/root/WOLV_PATCH_MANUAL_DEPOSIT_CONFIRM_V1.sh <<'BASH'
+cat >/root/WOLV_FIX_BADJSON_CONFIRM_V2.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
 RPC_DEFAULT='https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac'
 USDC_MINT='EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1'
 
-# --- Find FRONT html(s)
-mapfile -t HTMLS < <(find /opt/fireinners /var/www /opt/traderone-opt -type f -name 'index.html' 2>/dev/null | grep -E '/wolverine/|/wolverine$' || true)
-if [ ${#HTMLS[@]} -eq 0 ]; then
-  # fallback: likely served dist path
-  for f in \
-    /opt/fireinners/frontend-react/app/dist/wolverine/index.html \
-    /var/www/fireinners/wolverine/index.html \
-    /var/www/wolverine/index.html \
-    /opt/traderone-opt/public/index.html
-  do
-    [ -f "$f" ] && HTMLS+=("$f")
-  done
-fi
-HTMLS=($(printf "%s\n" "${HTMLS[@]}" | awk '!seen[$0]++'))
-[ ${#HTMLS[@]} -gt 0 ] || { echo "ERR: FRONT wolverine index.html introuvable"; exit 1; }
+# -------- FRONT targets
+HTMLS=()
+for f in \
+  /opt/fireinners/frontend-react/app/dist/wolverine/index.html \
+  /opt/fireinners/frontend-react/app/dist/wolverine/traderone/index.html \
+  /var/www/fireinners/wolverine/index.html \
+  /var/www/wolverine/index.html \
+  /opt/traderone-opt/public/index.html
+do
+  [ -f "$f" ] && HTMLS+=("$f")
+done
 
-# --- Patch JS for FRONT: hide wallets list + manual deposit confirm flow
-make_front_patch () {
+# also search
+mapfile -t MORE < <(find /opt/fireinners /var/www /opt/traderone-opt -type f -name 'index.html' 2>/dev/null | grep -E '/wolverine/' || true)
+for x in "${MORE[@]}"; do HTMLS+=("$x"); done
+HTMLS=($(printf "%s\n" "${HTMLS[@]}" | awk 'NF && !seen[$0]++'))
+
+[ ${#HTMLS[@]} -gt 0 ] || { echo "ERR: index.html wolverine introuvable"; exit 1; }
+
+# -------- FRONT patch (V2)
+write_front_patch () {
   local HTML="$1"
   local DIR PATCH
   DIR="$(dirname "$HTML")"
   mkdir -p "$DIR/patches"
-  PATCH="$DIR/patches/wolv_manual_deposit_confirm_v1.js"
+  PATCH="$DIR/patches/wolv_manual_deposit_confirm_v2.js"
 
   cat >"$PATCH" <<'JS'
 (()=>{"use strict";
 const $=s=>document.querySelector(s),$$=s=>[...document.querySelectorAll(s)];
 const txt=e=>((e&&e.textContent)||"").replace(/\s+/g," ").trim();
 const low=s=>String(s||"").toLowerCase();
-function byText(selector,needle){
-  needle=low(needle);
-  return $$(selector).find(e=>low(txt(e)).includes(needle));
-}
-function escapeHtml(s){return String(s||"").replace(/[&<>"']/g,m=>({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[m]));}
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+function byText(sel,needle){needle=low(needle);return $$(sel).find(e=>low(txt(e)).includes(needle));}
+function esc(s){return String(s||"").replace(/[&<>"']/g,m=>({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[m]));}
 
 function getBotAddrFromPage(){
-  // Try to parse "Wallet TraderOne (bot) Adresse: <addr>"
   const body=txt(document.body);
-  const m=body.match(/Wallet\s*TraderOne\s*\(bot\)[\s\S]{0,200}?Adresse:\s*([1-9A-HJ-NP-Za-km-z]{32,44})/i)
+  const m=body.match(/Wallet\s*TraderOne\s*\(bot\)[\s\S]{0,240}?Adresse:\s*([1-9A-HJ-NP-Za-km-z]{32,44})/i)
        || body.match(/Adresse:\s*([1-9A-HJ-NP-Za-km-z]{32,44})/i);
   return m?m[1]:"";
 }
@@ -55,24 +55,21 @@ function getUserPub(){
 }
 
 function hideWalletsToDisplay(){
-  // Hide heading block "Wallets à afficher" (and its container)
-  const t=byText("*","wallets à afficher")||byText("*","wallets a afficher");
-  if(t){
-    const box=t.closest("section,fieldset,div,table")||t.parentElement;
-    if(box) box.style.display="none";
-  }
-  // Hide instruction line "Colle ici..." + textarea below
-  const inst=byText("*","colle ici des adresses")||byText("*","colle ici des adresse");
-  if(inst){
-    const box=inst.closest("section,fieldset,div,table")||inst.parentElement;
-    if(box) box.style.display="none";
+  const killTexts=[
+    "wallets à afficher","wallets a afficher","colle ici des adresses","colle ici des adresse"
+  ];
+  for(const t of killTexts){
+    const el=byText("*",t);
+    if(el){
+      const box=el.closest("section,fieldset,div,table")||el.parentElement;
+      if(box) box.style.display="none";
+    }
   }
   const ta=$("textarea");
   if(ta){
     const ctx=low(txt(ta.parentElement||document.body));
     if(ctx.includes("colle ici")||ctx.includes("wallets à afficher")||ctx.includes("wallets a afficher")) ta.style.display="none";
   }
-  // Hide the upper "Refresh tous les soldes" button linked to that list
   const b=byText("button","refresh tous les soldes")||byText("input","refresh tous les soldes");
   if(b){
     const ctx=low(txt(b.closest("section,fieldset,div")||b.parentElement||document.body));
@@ -80,75 +77,94 @@ function hideWalletsToDisplay(){
   }
 }
 
-function installDepositBox(){
-  if($("#wolvDepositBox")) return;
-  const host = byText("*","Budget (sera")?.closest("div,section,fieldset") || document.body;
+async function postJsonTry(url,body){
+  const res=await fetch(url,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});
+  const t=await res.text();
+  let j=null;
+  try{ j=JSON.parse(t); }catch(_e){
+    const head=t.slice(0,180).replace(/\s+/g," ").trim();
+    throw new Error("HTTP "+res.status+" non-JSON: "+head);
+  }
+  if(!res.ok && (!j || !j.ok)) throw new Error("HTTP "+res.status+": "+(j&&j.error?j.error:"bad"));
+  return j;
+}
+async function postJsonFallback(urls,body){
+  let last=null;
+  for(const u of urls){
+    try{ return await postJsonTry(u,body); }
+    catch(e){ last=e; }
+    await sleep(150);
+  }
+  throw last||new Error("all failed");
+}
+
+function replaceNode(el){
+  if(!el) return null;
+  const n=el.cloneNode(true);
+  el.parentNode.replaceChild(n,el);
+  return n;
+}
+
+function ensureDepositBox(){
+  if($("#wolvDepositBoxV2")) return;
+  const host = byText("*","Wallet TraderOne")?.closest("div,section,fieldset") || document.body;
   const botAddr=getBotAddrFromPage();
+
   const box=document.createElement("div");
-  box.id="wolvDepositBox";
+  box.id="wolvDepositBoxV2";
   box.style.margin="10px 0";
   box.style.padding="10px";
   box.style.border="1px solid #bbb";
   box.style.borderRadius="8px";
   box.style.maxWidth="980px";
-
-  const html =
+  box.innerHTML=
     '<div style="font-weight:700;margin-bottom:6px">Dépôt manuel (obligatoire)</div>'+
-    '<div style="margin-bottom:6px">1) Envoie depuis ton Phantom vers TraderOne (bot) :</div>'+
-    '<div style="font-family:monospace;word-break:break-all;margin-bottom:8px">'+escapeHtml(botAddr||"(adresse bot introuvable)")+'</div>'+
+    '<div style="margin-bottom:6px">Envoie depuis ton Phantom vers TraderOne (bot) :</div>'+
+    '<div style="font-family:monospace;word-break:break-all;margin-bottom:8px">'+esc(botAddr||"(adresse bot introuvable)")+'</div>'+
     '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">'+
-      '<label>Asset <select id="wolvAssetSel"><option value="SOL">SOL</option><option value="USDC">USDC</option></select></label>'+
-      '<label>Montant <input id="wolvAmt" inputmode="decimal" placeholder="ex: 0.1" style="width:120px"/></label>'+
-      '<button id="wolvConfirmBtn" type="button">CONFIRMER DÉPÔT (on-chain)</button>'+
-      '<span id="wolvConfirmState" style="margin-left:6px"></span>'+
+      '<label>Asset <select id="wolvAssetSelV2"><option value="SOL">SOL</option><option value="USDC">USDC</option></select></label>'+
+      '<label>Montant <input id="wolvAmtV2" inputmode="decimal" placeholder="ex: 0.1" style="width:120px"/></label>'+
+      '<button id="wolvConfirmBtnV2" type="button">CONFIRMER DÉPÔT (on-chain)</button>'+
+      '<span id="wolvStateV2" style="margin-left:6px"></span>'+
     '</div>'+
-    '<div style="font-size:12px;color:#333">Après confirmation, START WOLVERINE devient disponible.</div>';
-  box.innerHTML=html;
-  host.insertBefore(box, host.firstChild.nextSibling || host.firstChild);
+    '<div style="font-size:12px;color:#333">Après confirmation, START WOLVERINE devient cliquable.</div>';
+  host.insertBefore(box, host.firstChild||null);
 
-  const confirmBtn=$("#wolvConfirmBtn");
-  const state=$("#wolvConfirmState");
-  const asset=$("#wolvAssetSel");
-  const amt=$("#wolvAmt");
+  const state=$("#wolvStateV2");
+  const asset=$("#wolvAssetSelV2");
+  const amt=$("#wolvAmtV2");
+  const confirmBtn=$("#wolvConfirmBtnV2");
 
   function setState(s,ok){
     state.textContent=s;
     state.style.color=ok? "#0a0" : "#a00";
   }
-  function enableStart(enabled){
-    const startBtn = byText("button","START WOLVERINE") || byText("input","START WOLVERINE");
-    if(startBtn){
-      startBtn.disabled=!enabled;
-      startBtn.style.opacity=enabled? "1":"0.45";
-    }
+  function enableStart(en){
+    const sb=byText("button","START WOLVERINE")||byText("input","START WOLVERINE");
+    if(sb){ sb.disabled=!en; sb.style.opacity=en?"1":"0.45"; }
   }
-
-  // Force START disabled until confirmed
   enableStart(false);
 
-  // Hijack existing START click: do not send funds, only call /api/start after confirmed
-  let confirmedPayload=null;
-  const startBtn = byText("button","START WOLVERINE") || byText("input","START WOLVERINE");
-  if(startBtn && !startBtn.__wolvPatched){
-    startBtn.__wolvPatched=true;
-    startBtn.addEventListener("click", async (ev)=>{
-      if(!confirmedPayload){
-        ev.preventDefault(); ev.stopPropagation();
-        setState("Dépôt non confirmé.", false);
-        return;
-      }
+  let confirmed=null;
+
+  // Rebind START safely
+  const start0 = byText("button","START WOLVERINE")||byText("input","START WOLVERINE");
+  const start = replaceNode(start0);
+  if(start){
+    start.disabled=true;
+    start.style.opacity="0.45";
+    start.addEventListener("click", async (ev)=>{
       ev.preventDefault(); ev.stopPropagation();
+      if(!confirmed){ setState("Dépôt non confirmé.",false); return; }
       try{
-        setState("Démarrage...", true);
+        setState("START…",true);
         const pub=getUserPub();
-        const res=await fetch("/api/start",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({
-          pub, asset:confirmedPayload.asset, amount:confirmedPayload.amount, depositSig:confirmedPayload.signature
-        })});
-        const j=await res.json().catch(()=>({ok:false,error:"bad json"}));
-        if(j && j.ok) setState("START OK", true);
-        else setState("ERR START: "+(j.error||res.status), false);
+        const urls=["/api/start","/wolverine/api/start"];
+        const j=await postJsonFallback(urls,{pub,asset:confirmed.asset,amount:confirmed.amount,depositSig:confirmed.signature});
+        if(j&&j.ok) setState("START OK",true);
+        else setState("ERR START",false);
       }catch(e){
-        setState("ERR START: "+(e&&e.message||e), false);
+        setState("ERR START: "+(e&&e.message||e),false);
       }
     }, true);
   }
@@ -156,35 +172,27 @@ function installDepositBox(){
   confirmBtn.addEventListener("click", async ()=>{
     try{
       const pub=getUserPub();
-      if(!pub){
-        setState("Connecte Phantom d'abord.", false);
-        return;
-      }
+      const bot=getBotAddrFromPage();
+      if(!pub){ setState("Connecte Phantom d'abord.",false); return; }
+      if(!bot){ setState("Adresse bot introuvable sur la page.",false); return; }
       const v=Number(String(amt.value||"").replace(",","."));
-      if(!isFinite(v) || v<=0){
-        setState("Montant invalide.", false);
-        return;
-      }
-      confirmBtn.disabled=true;
-      setState("Vérification on-chain…", true);
+      if(!isFinite(v)||v<=0){ setState("Montant invalide.",false); return; }
 
-      const res=await fetch("/api/confirm_deposit",{
-        method:"POST",
-        headers:{"content-type":"application/json"},
-        body:JSON.stringify({pub, asset:asset.value, minAmount:v})
-      });
-      const j=await res.json().catch(()=>({ok:false,error:"bad json"}));
-      if(!j || !j.ok) throw new Error(j && j.error ? j.error : ("HTTP "+res.status));
+      confirmBtn.disabled=true;
+      setState("Vérification on-chain…",true);
+
+      const urls=["/api/confirm_deposit_v2","/wolverine/api/confirm_deposit_v2"];
+      const j=await postJsonFallback(urls,{pub,botAddr:bot,asset:asset.value,minAmount:v});
 
       if(j.confirmed){
-        confirmedPayload={asset:asset.value, amount:j.amount, signature:j.signature};
-        setState("Dépôt confirmé: "+j.amount+" "+asset.value+" / "+j.signature, true);
+        confirmed={asset:asset.value,amount:j.amount,signature:j.signature};
+        setState("Confirmé: "+j.amount+" "+asset.value+" / "+j.signature,true);
         enableStart(true);
       }else{
-        setState("Pas trouvé. Attends 10-20s puis recommence.", false);
+        setState("Pas trouvé. Attends 10-20s puis recommence.",false);
       }
     }catch(e){
-      setState("ERR: "+(e&&e.message||e), false);
+      setState("ERR: "+(e&&e.message||e),false);
     }finally{
       confirmBtn.disabled=false;
     }
@@ -193,18 +201,18 @@ function installDepositBox(){
 
 document.addEventListener("DOMContentLoaded",()=>{
   hideWalletsToDisplay();
-  installDepositBox();
-  setTimeout(()=>{hideWalletsToDisplay();installDepositBox();},600);
-  setTimeout(()=>{hideWalletsToDisplay();installDepositBox();},1600);
+  ensureDepositBox();
+  setTimeout(()=>{hideWalletsToDisplay();ensureDepositBox();},700);
+  setTimeout(()=>{hideWalletsToDisplay();ensureDepositBox();},1700);
 });
 })();
 JS
 
   python3 - <<PY
-import re, time, pathlib
+import time, pathlib
 p=pathlib.Path(r"$HTML")
 s=p.read_text(encoding="utf-8",errors="ignore")
-tag='patches/wolv_manual_deposit_confirm_v1.js'
+tag='patches/wolv_manual_deposit_confirm_v2.js'
 if tag not in s:
   ins='\\n<script defer src="'+tag+'?v=%d"></script>\\n'%int(time.time())
   if "</body>" in s: s=s.replace("</body>",ins+"</body>")
@@ -214,46 +222,36 @@ print("OK FRONT:",str(p))
 PY
 }
 
-for h in "${HTMLS[@]}"; do make_front_patch "$h"; done
+for h in "${HTMLS[@]}"; do write_front_patch "$h"; done
 
-# --- Find BACKEND file that serves /api/start
-SRV=""
-for base in /opt/fireinners /opt/traderone-opt /root /srv /var/www; do
-  [ -d "$base" ] || continue
-  m="$(grep -R --line-number --binary-files=without-match -E "app\.post\\(\\s*['\"]/api/start|['\"]/api/start" "$base" 2>/dev/null | head -n1 || true)"
-  if [ -n "$m" ]; then
-    SRV="${m%%:*}"
-    break
-  fi
-done
+# -------- BACKEND patch: add /api/confirm_deposit_v2
+SRVS=()
+mapfile -t HITS < <(grep -R --line-number --binary-files=without-match -E "app\.post\\(\\s*['\"]/api/start|['\"]/api/start" /opt/fireinners /opt/traderone-opt /root /srv /var/www 2>/dev/null | cut -d: -f1 | awk 'NF && !seen[$0]++' || true)
+for f in "${HITS[@]}"; do [ -f "$f" ] && SRVS+=("$f"); done
+SRVS=($(printf "%s\n" "${SRVS[@]}" | awk 'NF && !seen[$0]++'))
 
-[ -n "$SRV" ] || { echo "WARN: backend file avec /api/start introuvable. FRONT patch OK, mais confirm_deposit non installé."; exit 0; }
+if [ ${#SRVS[@]} -eq 0 ]; then
+  echo "WARN: backend avec /api/start introuvable. FRONT OK, mais endpoint confirm_deposit_v2 non installé."
+  echo "Ctrl+F5 puis reteste. Si toujours bad json, on patchera le backend exact."
+  exit 0
+fi
 
-# --- Patch BACKEND: add /api/confirm_deposit (SOL/USDC) + ledger
-LEDGER_DIR="/opt/traderone-opt/data"
-LEDGER_FILE="$LEDGER_DIR/wolv_ledger.json"
-mkdir -p "$LEDGER_DIR"
-[ -f "$LEDGER_FILE" ] || echo '{}' >"$LEDGER_FILE"
-
-python3 - <<'PY'
-import re, pathlib, json, time, os
-srv_path=os.environ.get("SRV","")
-p=pathlib.Path(srv_path)
+patch_backend_one () {
+  local SRV="$1"
+  python3 - <<PY
+import re, pathlib, os
+p=pathlib.Path(r"$SRV")
 s=p.read_text(encoding="utf-8",errors="ignore")
 
-marker="/* WOLV_CONFIRM_DEPOSIT_V1 */"
+marker="/* WOLV_CONFIRM_DEPOSIT_V2 */"
 if marker in s:
-  print("OK BACKEND (already patched):", srv_path)
+  print("OK BACKEND already:", str(p))
   raise SystemExit(0)
 
-# try to locate app var name
-app_var="app"
-m=re.search(r'\bconst\s+(\w+)\s*=\s*express\(\s*\)\s*;', s)
-if m: app_var=m.group(1)
-
-# ensure body parser exists (most already have express.json)
-if "express.json" not in s:
-  s=re.sub(r'(require\([\'"]express[\'"]\)\s*;)', r'\1\n', s)
+# detect app var
+app="app"
+m=re.search(r'\\bconst\\s+(\\w+)\\s*=\\s*express\\(\\s*\\)\\s*;', s)
+if m: app=m.group(1)
 
 block=f"""
 {marker}
@@ -262,17 +260,18 @@ const path=require('path');
 const {{Connection,PublicKey}}=require('@solana/web3.js');
 const WOLV_RPC=process.env.SOLANA_RPC||process.env.RPC_URL||"{RPC_DEFAULT}";
 const WOLV_USDC_MINT="{USDC_MINT}";
-const WOLV_LEDGER_DIR="{LEDGER_DIR}";
-const WOLV_LEDGER_FILE="{LEDGER_FILE}";
+const WOLV_LEDGER_DIR="/opt/traderone-opt/data";
+const WOLV_LEDGER_FILE="/opt/traderone-opt/data/wolv_ledger.json";
 function _wolvReadLedger(){{try{{return JSON.parse(fs.readFileSync(WOLV_LEDGER_FILE,'utf8')||'{{}}');}}catch(e){{return {{}};}}}}
 function _wolvWriteLedger(o){{try{{fs.mkdirSync(WOLV_LEDGER_DIR,{{recursive:true}});fs.writeFileSync(WOLV_LEDGER_FILE,JSON.stringify(o,null,2));}}catch(e){{}}}}
-function _wolvNum(x){{x=Number(x);return (isFinite(x)&&x>0)?x:0;}}
-async function _wolvConfirmDeposit(pub,asset,minAmount,botAddr){{
+function _num(x){{x=Number(x);return (isFinite(x)&&x>0)?x:0;}}
+
+async function _confirmDeposit(pub,botAddr,asset,minAmount){{
   const conn=new Connection(WOLV_RPC,'confirmed');
   const bot=new PublicKey(botAddr);
   const user=new PublicKey(pub);
-  const min=_wolvNum(minAmount);
-  const sigs=await conn.getSignaturesForAddress(bot,{{limit:25}});
+  const min=_num(minAmount);
+  const sigs=await conn.getSignaturesForAddress(bot,{{limit:30}});
   for(const s of sigs){{
     const tx=await conn.getParsedTransaction(s.signature,{{maxSupportedTransactionVersion:0,commitment:'confirmed'}}).catch(()=>null);
     if(!tx||!tx.meta||!tx.transaction) continue;
@@ -297,7 +296,7 @@ async function _wolvConfirmDeposit(pub,asset,minAmount,botAddr){{
       const post=tx.meta.postTokenBalances||[];
       let botDelta=0.0, userDelta=0.0;
       function amt(e){{try{{return Number(e.uiTokenAmount.uiAmountString||e.uiTokenAmount.uiAmount||0);}}catch(_e){{return 0;}}}}
-      const byIdxPre={{}}; 
+      const byIdxPre={{}};
       for(const e of pre) if(e.mint===WOLV_USDC_MINT) byIdxPre[e.accountIndex]=e;
       for(const e of post){{
         if(e.mint!==WOLV_USDC_MINT) continue;
@@ -315,17 +314,16 @@ async function _wolvConfirmDeposit(pub,asset,minAmount,botAddr){{
   return {{confirmed:false}};
 }}
 
-{app_var}.post('/api/confirm_deposit', async (req,res)=>{{
+{app}.post('/api/confirm_deposit_v2', async (req,res)=>{{
   try{{
     const pub=String((req.body&&req.body.pub)||"").trim();
+    const botAddr=String((req.body&&req.body.botAddr)||"").trim();
     const asset=String((req.body&&req.body.asset)||"SOL").toUpperCase();
     const minAmount=req.body&&req.body.minAmount;
-    // bot address: reuse existing config if present, else try env TRADERONE_PUB, else hard parse from frontend usage
-    const botAddr=(process.env.TRADERONE_WALLET||process.env.TRADERONE_PUB||process.env.BOT_WALLET||"").trim();
-    if(!pub) return res.json({{ok:false,error:"missing pub"}});
-    if(asset!=="SOL" and asset!=="USDC") return res.json({{ok:false,error:"asset must be SOL or USDC"}});
-    if(!botAddr) return res.json({{ok:false,error:"missing bot wallet address (env TRADERONE_WALLET/TRADERONE_PUB)"}});
-    const r=await _wolvConfirmDeposit(pub,asset,minAmount,botAddr);
+    if(!pub) return res.status(200).json({{ok:false,error:"missing pub"}});
+    if(!botAddr) return res.status(200).json({{ok:false,error:"missing botAddr"}});
+    if(asset!=="SOL" && asset!=="USDC") return res.status(200).json({{ok:false,error:"asset must be SOL or USDC"}});
+    const r=await _confirmDeposit(pub,botAddr,asset,minAmount);
     if(r.confirmed){{
       const L=_wolvReadLedger();
       L[pub]=L[pub]||{{deposits:[]}};
@@ -335,40 +333,36 @@ async function _wolvConfirmDeposit(pub,asset,minAmount,botAddr){{
       }}
       _wolvWriteLedger(L);
     }}
-    return res.json({{ok:true,...r}});
+    return res.status(200).json({{ok:true,...r}});
   }}catch(e){{
-    return res.json({{ok:false,error:String(e&&e.message||e)}});
+    return res.status(200).json({{ok:false,error:String(e&&e.message||e)}});
   }}
 }});
-/* END WOLV_CONFIRM_DEPOSIT_V1 */
+/* END WOLV_CONFIRM_DEPOSIT_V2 */
 """
 
-# insert before app.listen if possible
+# insert before listen if possible
 idx=s.rfind(".listen(")
 if idx!=-1:
-  s=s[:idx]+block+"\n"+s[idx:]
+  s=s[:idx]+block+"\\n"+s[idx:]
 else:
-  s+=("\n"+block+"\n")
-
+  s+="\\n"+block+"\\n"
 p.write_text(s,encoding="utf-8")
-print("OK BACKEND patched:", srv_path)
+print("OK BACKEND:", str(p))
 PY
+}
 
-# Export SRV path for python
-export SRV="$SRV"
+for s in "${SRVS[@]}"; do patch_backend_one "$s"; done
 
-# --- Restart service if known (best effort, no hard fail)
-for unit in wolverine.service traderone.service fireinners.service; do
-  if systemctl list-unit-files 2>/dev/null | grep -q "^${unit}"; then
-    systemctl restart "$unit" || true
-  fi
+# -------- Restart best-effort
+for unit in $(systemctl list-units --type=service --all 2>/dev/null | awk '{print $1}' | grep -Ei 'wolv|traderone|fireinners' || true); do
+  systemctl restart "$unit" >/dev/null 2>&1 || true
 done
 if command -v pm2 >/dev/null 2>&1; then
   pm2 reload all >/dev/null 2>&1 || true
 fi
 
-echo "OK. Ctrl+F5 sur https://fireinners.online/wolverine/"
-echo "Flow: 1) Connect Phantom  2) Envoie SOL/USDC au wallet bot  3) CONFIRMER DÉPÔT  4) START WOLVERINE"
+echo "OK V2 installé. Fais Ctrl+F5 sur https://fireinners.online/wolverine/ puis clique CONFIRMER."
 BASH
 
-bash /root/WOLV_PATCH_MANUAL_DEPOSIT_CONFIRM_V1.sh
+bash /root/WOLV_FIX_BADJSON_CONFIRM_V2.sh
