@@ -1,110 +1,45 @@
 bash <<'EOF'
 set -e
 
-APP_DIR="/opt/traderone-opt"
-ENV_FILE="$APP_DIR/.env"
-PORT=3000
+APP="/opt/traderone-opt"
+ENV="$APP/.env"
+KEYFILE="/tmp/fixed_key.txt"
 
-echo "=== TRADERONE • WOLVERINE LIVE SETUP ==="
+echo "=== TRADERONE • FIX PRIVATE KEY ==="
 
-# 1) Vérifier clé privée interne
-grep -q SOLANA_PRIVATE_KEY_BASE58 "$ENV_FILE" || { echo "[ERR] clé privée interne absente"; exit 1; }
+# 1) Vérifier .env
+[ -f "$ENV" ] || { echo "[ERR] .env absent"; exit 1; }
 
-# 2) Patch server.js (balances + start)
-cat > "$APP_DIR/server.js" <<'JS'
-import http from "http";
-import bs58 from "bs58";
-import { Connection, Keypair, PublicKey, SystemProgram, Transaction, LAMPORTS_PER_SOL } from "@solana/web3.js";
+# 2) Extraire la clé depuis le scan MATCH_FOUND
+KEY=$(grep MATCH_FOUND /tmp/traderone_key_scan.log | sed 's/.*MATCH_FOUND:://' | cut -d: -f1)
 
-const PORT = 3000;
-const RPC = "https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac";
+if [ -z "$KEY" ]; then
+  echo "[ERR] clé non trouvée dans le log"
+  exit 1
+fi
 
-const PRIVATE = bs58.decode(process.env.SOLANA_PRIVATE_KEY_BASE58);
-const INTERNAL = Keypair.fromSecretKey(PRIVATE);
-const connection = new Connection(RPC,"confirmed");
-
-async function sol(pub){
-  return (await connection.getBalance(pub))/LAMPORTS_PER_SOL;
+# 3) Normaliser clé (JSON array → base58 si besoin)
+node <<JS > "$KEYFILE"
+const bs58=require("bs58");
+const raw='$KEY'.trim();
+let out;
+if(raw.startsWith("[")){
+  out=bs58.encode(Uint8Array.from(JSON.parse(raw)));
+}else{
+  out=raw;
 }
-
-const server = http.createServer(async (req,res)=>{
-  if(req.url==="/api/balances"){
-    const phantom = req.headers["x-phantom"];
-    const data = {
-      internal: await sol(INTERNAL.publicKey),
-      phantom: phantom ? await sol(new PublicKey(phantom)) : null
-    };
-    res.end(JSON.stringify(data));
-    return;
-  }
-
-  if(req.url==="/api/start" && req.method==="POST"){
-    let body="";
-    req.on("data",d=>body+=d);
-    req.on("end",async()=>{
-      const {phantom,amount} = JSON.parse(body);
-      const tx = new Transaction().add(
-        SystemProgram.transfer({
-          fromPubkey: new PublicKey(phantom),
-          toPubkey: INTERNAL.publicKey,
-          lamports: Math.floor(amount*LAMPORTS_PER_SOL)
-        })
-      );
-      const sig = await connection.sendRawTransaction(tx.serialize({requireAllSignatures:false}));
-      res.end(JSON.stringify({ok:true,tx:sig}));
-    });
-    return;
-  }
-
-  res.writeHead(200,{"Content-Type":"text/html"});
-  res.end(`
-<!doctype html><html><body style="background:#111;color:#eee;font-family:Arial">
-<h2>TraderOne • Wolverine LIVE</h2>
-<button onclick="connect()">Connect Phantom</button>
-<p>Wallet Phantom: <span id="p"></span></p>
-<p>Solde Phantom: <span id="ps"></span> SOL</p>
-<p>Wallet Interne:</p>
-<pre>${INTERNAL.publicKey.toBase58()}</pre>
-<p>Solde Interne: <span id="is"></span> SOL</p>
-<input id="amt" value="0.001"/>
-<button onclick="start()">START</button>
-<pre id="out"></pre>
-
-<script>
-let phantom=null;
-async function connect(){
-  const r=await window.solana.connect();
-  phantom=r.publicKey.toString();
-  document.getElementById("p").textContent=phantom;
-  refresh();
-}
-async function refresh(){
-  const r=await fetch("/api/balances",{headers:{"x-phantom":phantom}});
-  const j=await r.json();
-  document.getElementById("ps").textContent=j.phantom;
-  document.getElementById("is").textContent=j.internal;
-}
-async function start(){
-  const amt=parseFloat(document.getElementById("amt").value);
-  const r=await fetch("/api/start",{method:"POST",body:JSON.stringify({phantom,amount:amt})});
-  document.getElementById("out").textContent=await r.text();
-}
-</script>
-</body></html>
-`);
-});
-
-server.listen(PORT,"0.0.0.0");
+console.log(out);
 JS
 
-# 3) PM2 restart
-pm2 delete traderone || true
-pm2 start "$APP_DIR/server.js" --name traderone
+FIXED=$(cat "$KEYFILE")
+
+# 4) Injecter dans .env
+sed -i '/SOLANA_PRIVATE_KEY_BASE58/d' "$ENV"
+echo "SOLANA_PRIVATE_KEY_BASE58=$FIXED" >> "$ENV"
+
+# 5) Restart PM2 avec update-env
+pm2 restart traderone --update-env
 pm2 save
 
-# 4) Vérifications locales
-curl -fsSL http://127.0.0.1:3000/api/balances >/dev/null
-
-echo "=== TRADERONE LIVE OK ==="
-echo "URL : https://www.fireinners.online/wolverine"
+echo "=== CLÉ PRIVÉE APPLIQUÉE ==="
 EOF
