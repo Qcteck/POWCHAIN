@@ -1,103 +1,58 @@
 #!/bin/bash
 set -e
 
-echo "=== WOLVERINE • FIX SOLDES UI (ONE-SHOT) ==="
+echo "=== TRADERONE • FIX BACKEND BALANCES ==="
 
-UI="/opt/fireinners/frontend-react/app/dist/wolverine/index.html"
-BACKUP="$UI.bak.$(date +%s)"
+DIR="/opt/wolverine"
+SERVER="$DIR/server.js"
+BACKUP="$SERVER.bak.$(date +%s)"
 
-echo "[1/5] Backup UI"
-cp "$UI" "$BACKUP"
+echo "[1/6] Backup server.js"
+cp "$SERVER" "$BACKUP"
 
-echo "[2/5] Patch HTML + JS (balances auto-refresh)"
-cat > "$UI" <<'HTML'
-<!doctype html><html lang="fr"><head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>TraderOne</title>
-<style>
-body{background:#0b1020;color:#fff;font-family:system-ui;margin:0}
-#c{max-width:900px;margin:20px auto;padding:16px}
-button,input{padding:10px 14px;border-radius:10px;border:0;margin:6px}
-input{width:100%}
-</style>
-</head>
-<body>
-<div id="c">
-<h2>TraderOne</h2>
-
-<button id="con">Connect Phantom</button>
-<div>Wallet: <span id="addr">-</span></div>
-<hr>
-
-<div>Internal SOL: <b id="int">-</b></div>
-<div>Phantom SOL: <b id="pha">-</b></div>
-<div>Budget initial: <b id="bud">-</b></div>
-<div>Profit total: <b id="pnl">-</b></div>
-
-<input id="amt" placeholder="Budget SOL" value=".001"/>
-<button id="start">Start</button>
-<button id="stop">Stop</button>
-<button id="cash">Cash-out</button>
-
-<pre id="log"></pre>
-</div>
-
-<script src="/wolverine/vendor/web3.min.js"></script>
-<script>
-const log=t=>logEl.textContent+=t+"\\n";
-const logEl=document.getElementById("log");
-let pub=null,budget=0;
-
-async function refreshBalances(){
-  try{
-    let u="/wolverine/api/balances";
-    if(pub)u+="?user="+pub;
-    const r=await fetch(u);
-    const j=await r.json();
-    if(j.internalSOL!=null)int.textContent=j.internalSOL.toFixed(6)+" SOL";
-    if(j.phantomSOL!=null)pha.textContent=j.phantomSOL.toFixed(6)+" SOL";
-  }catch(e){console.error(e);}
+echo "[2/6] Patch balances endpoint"
+node <<'NODE'
+const fs=require("fs");
+let s=fs.readFileSync("/opt/wolverine/server.js","utf8");
+if(s.includes("api/balances")){
+  console.log("balances endpoint already present");
+  process.exit(0);
 }
+s+=`
+/* === BALANCES ENDPOINT (AUTO-PATCH) === */
+const {Connection,PublicKey,LAMPORTS_PER_SOL}=require("@solana/web3.js");
+const RPC=process.env.SOLANA_RPC||"https://api.mainnet-beta.solana.com";
+const conn=new Connection(RPC,"confirmed");
 
-con.onclick=async()=>{
-  const p=window.solana;if(!p)return alert("Install Phantom");
-  const r=await p.connect();
-  pub=r.publicKey.toString();
-  addr.textContent=pub;
-  refreshBalances();
-};
+app.get("/api/balances",async(req,res)=>{
+  try{
+    const user=req.query.user;
+    let phantomSOL=null;
+    if(user){
+      const b=await conn.getBalance(new PublicKey(user));
+      phantomSOL=b/LAMPORTS_PER_SOL;
+    }
+    const internalSOL=(global.internalSOL||0);
+    res.json({phantomSOL,internalSOL});
+  }catch(e){
+    res.status(500).json({error:e.message});
+  }
+});
+`;
+fs.writeFileSync("/opt/wolverine/server.js",s);
+console.log("balances endpoint added");
+NODE
 
-start.onclick=async()=>{
-  if(!pub)return alert("Connect Phantom");
-  budget=parseFloat(amt.value||0);
-  if(budget<=0)return alert("Budget invalide");
-  bud.textContent=budget+" SOL";
-  await fetch("/wolverine/api/start",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({phantom:pub,amount:budget})});
-  log("START "+budget+" SOL");
-};
+echo "[3/6] Install deps (if missing)"
+cd "$DIR"
+npm install @solana/web3.js --omit=dev
 
-stop.onclick=async()=>{
-  await fetch("/wolverine/api/stop",{method:"POST"});
-  log("STOP");
-};
+echo "[4/6] Restart PM2"
+pm2 restart traderone || pm2 start server.js --name traderone
+pm2 save
 
-cash.onclick=async()=>{
-  await fetch("/wolverine/api/cashout",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({phantom:pub})});
-  log("CASHOUT");
-};
+echo "[5/6] Test endpoint"
+curl -s "http://127.0.0.1:3000/api/balances" || true
 
-setInterval(refreshBalances,5000);
-</script>
-</body></html>
-HTML
-
-echo "[3/5] Reload nginx"
-nginx -t && systemctl reload nginx
-
-echo "[4/5] Test endpoint balances"
-curl -s http://127.0.0.1:3000/api/balances || true
-
-echo "[5/5] DONE"
-echo "UI BACKUP: $BACKUP"
-echo "URL: https://www.fireinners.online/wolverine"
+echo "[6/6] DONE"
+echo "Backup: $BACKUP"
