@@ -2,7 +2,7 @@ cat >/root/WOLV_PATCH_INVEST_V1.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 1) FRONT (index.html Wolverine)
+# --- trouver le front wolverine
 CAND_HTML=(
 /opt/fireinners/frontend-react/app/dist/wolverine/index.html
 /opt/fireinners/frontend-react/app/dist/wolverine/traderone.html
@@ -16,17 +16,17 @@ for f in "${CAND_HTML[@]}"; do [ -f "$f" ] && HTML="$f" && break; done
 FRONT_DIR="$(dirname "$HTML")"
 mkdir -p "$FRONT_DIR/patches"
 
-# 2) BACK (server avec /api/start)
+# --- trouver le back (celui qui sert /api)
 BACK="$(grep -RIl --include="server.js" --include="app.js" --include="index.js" "/api/start" /opt /srv /root 2>/dev/null | head -n1 || true)"
 [ -n "$BACK" ] || { echo "ERR: backend introuvable (pas de fichier avec /api/start)"; exit 1; }
 
-# 3) Ledger
+# --- ledger
 LEDGER_DIR="/opt/traderone-opt/data"
 mkdir -p "$LEDGER_DIR"
 LEDGER="$LEDGER_DIR/wolv_ledger.json"
 [ -f "$LEDGER" ] || echo "{}" >"$LEDGER"
 
-# 4) Patch FRONT: widget "Investi (TraderOne)"
+# --- front patch js
 cat >"$FRONT_DIR/patches/wolv_invested.js" <<'JS'
 (()=>{"use strict";
 const $=s=>document.querySelector(s),sleep=ms=>new Promise(r=>setTimeout(r,ms));
@@ -86,18 +86,17 @@ if tag not in s:
 print("OK FRONT:",p)
 PY
 
-# 5) Patch BACK: /api/invested + /api/record_deposit + /api/record_withdraw
+# --- back patch
 export BACK LEDGER
 python3 - <<'PY'
-import os,re,datetime
+import os,re
 back=os.environ["BACK"]
 ledger=os.environ["LEDGER"]
 txt=open(back,"r",encoding="utf-8",errors="ignore").read()
-
 M0="// WOLV_INVEST_LEDGER_v1"
 M1="// /WOLV_INVEST_LEDGER_v1"
 if M0 in txt and M1 in txt:
-  a=txt.split(M0,1)[0]; b=txt.split(M1,1)[1]; txt=a+b
+  txt=txt.split(M0,1)[0]+txt.split(M1,1)[1]
 
 inject=f'''
 // WOLV_INVEST_LEDGER_v1
@@ -108,13 +107,6 @@ function __wolv_load(){{try{{return JSON.parse(fs.readFileSync(__WOLV_LEDGER_PAT
 function __wolv_save(db){{fs.mkdirSync(path.dirname(__WOLV_LEDGER_PATH),{{recursive:true}});fs.writeFileSync(__WOLV_LEDGER_PATH,JSON.stringify(db));}}
 function __wolv_initUser(db,pub){{if(!db[pub]) db[pub]={{sol:0,usdc:0,deposits:[],withdraws:[],updated:new Date().toISOString()}};}}
 function __wolv_apply(db,pub,asset,amount,sig,kind){{
-  __wolv_initUser(db,pub);
-  amount=Number(amount||0); 
-  if(not (amount>0)): 
-    raise Exception("amount")
-}}
-/* python guard removed; real code below */
-function __wolv_apply2(db,pub,asset,amount,sig,kind){{
   __wolv_initUser(db,pub);
   amount=Number(amount||0); if(!isFinite(amount)||amount<=0) throw new Error("amount");
   asset=String(asset||"").toUpperCase();
@@ -132,6 +124,7 @@ function __wolv_apply2(db,pub,asset,amount,sig,kind){{
     if(sig) u.withdraws.push(sig);
     if(u.sol<0) u.sol=0;
     if(u.usdc<0) u.usdc=0;
+    if(sig) u.withdraws.push(sig);
   }}
   u.updated=new Date().toISOString();
 }}
@@ -151,7 +144,7 @@ app.post("/api/record_deposit",express.json(),(req,res)=>{{
     const {{pub,asset,amount,depositSig}}=req.body||{{}};
     if(!pub||!asset||!amount) return res.status(400).json({{ok:false,error:"params"}});
     const db=__wolv_load();
-    __wolv_apply2(db,String(pub).trim(),asset,amount,depositSig||"","deposit");
+    __wolv_apply(db,String(pub).trim(),asset,amount,depositSig||"","deposit");
     __wolv_save(db);
     res.json({{ok:true}});
   }}catch(e){{res.status(500).json({{ok:false,error:String(e&&e.message||e)}});}}
@@ -162,29 +155,22 @@ app.post("/api/record_withdraw",express.json(),(req,res)=>{{
     const {{pub,asset,amount,txSig}}=req.body||{{}};
     if(!pub||!asset||!amount) return res.status(400).json({{ok:false,error:"params"}});
     const db=__wolv_load();
-    __wolv_apply2(db,String(pub).trim(),asset,amount,txSig||"","withdraw");
+    __wolv_apply(db,String(pub).trim(),asset,amount,txSig||"","withdraw");
     __wolv_save(db);
     res.json({{ok:true}});
   }}catch(e){{res.status(500).json({{ok:false,error:String(e&&e.message||e)}});}}
 }});
 // /WOLV_INVEST_LEDGER_v1
 '''
-
-# retire le petit "python guard" si jamais ça existe (sécurité)
-inject=re.sub(r'function __wolv_apply\([^}]+\}\n/\* python guard removed; real code below \*/\n','',inject,flags=re.S)
-
 m=re.search(r"\n\s*app\.listen\s*\(",txt)
-if m:
-  txt=txt[:m.start()]+inject+"\n"+txt[m.start():]
-else:
-  txt=txt+"\n"+inject+"\n"
-
+if m: txt=txt[:m.start()]+inject+"\n"+txt[m.start():]
+else: txt=txt+"\n"+inject+"\n"
 open(back,"w",encoding="utf-8").write(txt)
 print("OK BACK:",back)
 PY
 
 echo "OK PATCH INSTALLE."
-echo "Redémarre ton service node (celui qui sert /api) puis Ctrl+F5 sur https://fireinners.online/wolverine/"
+echo "Redemarre ton service node (celui qui sert /api) puis Ctrl+F5 sur https://fireinners.online/wolverine/"
 BASH
 
 bash /root/WOLV_PATCH_INVEST_V1.sh
