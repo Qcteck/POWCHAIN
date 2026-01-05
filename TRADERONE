@@ -1,27 +1,27 @@
-cat >/root/WOLV_FIX_405_PROXY_V3.sh <<'BASH'
+cat >/root/WOLV_NGINX_PROXY_V4.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
-
 SITE="/etc/nginx/sites-available/fireinners.online-ssl"
 NGINX="/etc/nginx/nginx.conf"
 PORT="3000"
+MARK="# WOLV_API_PROXY_V4"
 
-[ -f "$SITE" ] || { echo "ERR: nginx site introuvable: $SITE"; exit 1; }
+[ -f "$SITE" ] || { echo "ERR: vhost introuvable: $SITE"; exit 1; }
 
-# 1) Patch NGINX: /wolverine/api/* -> /api/* -> node:3000
 chattr -i "$NGINX" "$SITE" 2>/dev/null || true
 
 python3 - <<'PY'
-import pathlib, re
+import pathlib,re,sys
 p=pathlib.Path("/etc/nginx/sites-available/fireinners.online-ssl")
 s=p.read_text(encoding="utf-8",errors="ignore")
 
-marker="# WOLV_API_PROXY_V3"
-if marker in s:
+MARK="# WOLV_API_PROXY_V4"
+if MARK in s:
   print("OK nginx proxy déjà présent")
-else:
-  block=f"""
-    {marker}
+  sys.exit(0)
+
+block=f"""
+    {MARK}
     location ^~ /wolverine/api/ {{
         rewrite ^/wolverine/api/(.*)$ /api/$1 break;
         proxy_pass http://127.0.0.1:3000;
@@ -32,252 +32,72 @@ else:
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_read_timeout 60s;
     }}
-    # END WOLV_API_PROXY_V3
+    # END WOLV_API_PROXY_V4
 """
-  # insère dans le server { ... } principal (avant le dernier '}')
-  m=list(re.finditer(r'\n\s*server\s*\{', s))
-  if not m:
-    raise SystemExit("ERR: bloc server { introuvable dans le vhost")
-  # prend le dernier server (souvent le ssl)
-  start=m[-1].start()
-  tail=s[start:]
-  # trouve la dernière '}' de ce server (naïf mais ok ici)
-  idx=tail.rfind("\n}")
-  if idx==-1:
-    raise SystemExit("ERR: fin de bloc server introuvable")
-  tail2=tail[:idx] + "\n" + block + tail[idx:]
-  s2=s[:start]+tail2
-  p.write_text(s2,encoding="utf-8")
-  print("OK nginx proxy installé")
+
+# --- parse server { ... } blocks (simple brace counter) ---
+def find_server_blocks(text):
+  out=[]
+  for m in re.finditer(r'(?m)^\s*server\s*\{', text):
+    i=m.start()
+    j=m.end()-1  # position of '{'
+    depth=0
+    k=j
+    while k < len(text):
+      c=text[k]
+      if c=='{': depth+=1
+      elif c=='}':
+        depth-=1
+        if depth==0:
+          out.append((i,k))  # inclusive end brace
+          break
+      k+=1
+  return out
+
+blocks=find_server_blocks(s)
+if not blocks:
+  # fallback: try server { at file start without newline
+  m=re.search(r'\s*server\s*\{', s)
+  if not m: raise SystemExit("ERR: aucun bloc server { trouvé dans le vhost")
+  # try brace match from first '{'
+  i=m.start(); j=s.find('{',m.start())
+  depth=0; k=j
+  while k<len(s):
+    c=s[k]
+    if c=='{': depth+=1
+    elif c=='}':
+      depth-=1
+      if depth==0:
+        blocks=[(i,k)]
+        break
+    k+=1
+  if not blocks: raise SystemExit("ERR: fin de bloc server introuvable")
+
+# choose best server: prefer one that has listen 443 and ssl
+def score(b):
+  seg=s[b[0]:b[1]+1]
+  sc=0
+  if re.search(r'(?m)^\s*listen\s+443\b', seg): sc+=5
+  if 'ssl' in seg: sc+=2
+  if re.search(r'(?m)^\s*server_name\b.*fireinners\.online', seg): sc+=2
+  return sc
+
+blocks_sorted=sorted(blocks,key=score,reverse=True)
+target=blocks_sorted[0]
+seg=s[target[0]:target[1]+1]
+
+# insert before the closing brace of target server block
+insert_pos=target[1]  # index of '}'
+s2=s[:insert_pos] + "\n" + block + s[insert_pos:]
+p.write_text(s2,encoding="utf-8")
+print("OK nginx proxy V4 installé dans un bloc server")
 PY
 
 nginx -t
 systemctl reload nginx
+
 chattr +i "$NGINX" "$SITE" 2>/dev/null || true
-
-# 2) Patch FRONT: enlever doublons + utiliser /wolverine/api/*
-find_htmls() {
-  for f in \
-    /opt/fireinners/frontend-react/app/dist/wolverine/index.html \
-    /opt/fireinners/frontend-react/app/dist/wolverine/traderone/index.html \
-    /var/www/fireinners/wolverine/index.html \
-    /var/www/wolverine/index.html \
-    /opt/traderone-opt/public/index.html
-  do
-    [ -f "$f" ] && echo "$f"
-  done
-  find /opt/fireinners /var/www /opt/traderone-opt -type f -name 'index.html' 2>/dev/null | grep -E '/wolverine/' || true
-}
-mapfile -t HTMLS < <(find_htmls | awk 'NF && !seen[$0]++')
-[ ${#HTMLS[@]} -gt 0 ] || { echo "ERR: index.html wolverine introuvable"; exit 1; }
-
-write_patch_js() {
-  local html="$1"
-  local dir
-  dir="$(dirname "$html")"
-  mkdir -p "$dir/patches"
-  cat >"$dir/patches/wolv_manual_deposit_confirm_v3.js" <<'JS'
-(()=>{"use strict";
-const $=s=>document.querySelector(s),$$=s=>[...document.querySelectorAll(s)];
-const txt=e=>((e&&e.textContent)||"").replace(/\s+/g," ").trim();
-const low=s=>String(s||"").toLowerCase();
-const sleep=ms=>new Promise(r=>setTimeout(r,ms));
-function byText(sel,needle){needle=low(needle);return $$(sel).find(e=>low(txt(e)).includes(needle));}
-function esc(s){return String(s||"").replace(/[&<>"']/g,m=>({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[m]));}
-function killDupBoxes(){
-  ["wolvDepositBoxV2","wolvDepositBoxV3","wolvDepositBox","wolvInvestBox"].forEach(id=>{const n=document.getElementById(id);if(n)n.remove();});
-  // si un ancien bloc "Dépôt manuel" a été injecté en dur, on tente d'en enlever un doublon
-  const all=$$("div,section,fieldset");
-  const hits=all.filter(e=>low(txt(e)).includes("dépôt manuel")||low(txt(e)).includes("depot manuel"));
-  // garde le premier gros bloc, supprime les suivants injectés
-  if(hits.length>1) for(let i=1;i<hits.length;i++){ try{ hits[i].remove(); }catch(_e){} }
-}
-function hideWalletsToDisplay(){
-  const killTexts=["wallets à afficher","wallets a afficher","colle ici des adresses","colle ici des adresse"];
-  for(const t of killTexts){
-    const el=byText("*",t);
-    if(el){
-      const box=el.closest("section,fieldset,div,table")||el.parentElement;
-      if(box) box.style.display="none";
-    }
-  }
-}
-function getBotAddr(){
-  const body=txt(document.body);
-  const m=body.match(/Wallet\s*TraderOne\s*\(bot\)[\s\S]{0,260}?Adresse:\s*([1-9A-HJ-NP-Za-km-z]{32,44})/i)
-       || body.match(/Adresse:\s*([1-9A-HJ-NP-Za-km-z]{32,44})/i);
-  return m?m[1]:"";
-}
-function getUserPub(){
-  try{
-    if(window.solana && window.solana.isPhantom && window.solana.publicKey) return window.solana.publicKey.toBase58();
-  }catch(_){}
-  return "";
-}
-async function postJsonTry(url,body){
-  const res=await fetch(url,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});
-  const t=await res.text();
-  let j=null;
-  try{ j=JSON.parse(t); }catch(_e){
-    const head=t.slice(0,180).replace(/\s+/g," ").trim();
-    throw new Error("HTTP "+res.status+" non-JSON: "+head);
-  }
-  if(!res.ok && (!j || !j.ok)) throw new Error("HTTP "+res.status+": "+(j&&j.error?j.error:"bad"));
-  return j;
-}
-async function postJsonFallback(urls,body){
-  let last=null;
-  for(const u of urls){
-    try{ return await postJsonTry(u,body); }
-    catch(e){ last=e; }
-    await sleep(120);
-  }
-  throw last||new Error("all failed");
-}
-function replaceNode(el){
-  if(!el) return null;
-  const n=el.cloneNode(true);
-  el.parentNode.replaceChild(n,el);
-  return n;
-}
-
-function ensureDepositBox(){
-  if(document.getElementById("wolvDepositBoxV3")) return;
-
-  const bot=getBotAddr();
-  const host=byText("*","WOLVERINE")?.closest("div,section,fieldset") || document.body;
-
-  const box=document.createElement("div");
-  box.id="wolvDepositBoxV3";
-  box.style.margin="10px 0";
-  box.style.padding="10px";
-  box.style.border="1px solid #bbb";
-  box.style.borderRadius="8px";
-  box.style.maxWidth="980px";
-  box.innerHTML=
-    '<div style="font-weight:700;margin-bottom:6px">Dépôt manuel (obligatoire)</div>'+
-    '<div style="margin-bottom:6px">Envoie depuis ton Phantom vers TraderOne (bot) :</div>'+
-    '<div style="font-family:monospace;word-break:break-all;margin-bottom:8px">'+esc(bot||"(adresse bot introuvable)")+'</div>'+
-    '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">'+
-      '<label>Asset <select id="wolvAssetSelV3"><option value="SOL">SOL</option><option value="USDC">USDC</option></select></label>'+
-      '<label>Montant <input id="wolvAmtV3" inputmode="decimal" placeholder="ex: 0.1" style="width:120px"/></label>'+
-      '<button id="wolvConfirmBtnV3" type="button">CONFIRMER DÉPÔT (on-chain)</button>'+
-      '<span id="wolvStateV3" style="margin-left:6px"></span>'+
-    '</div>'+
-    '<div style="font-size:12px;color:#333">Après confirmation, START WOLVERINE devient cliquable.</div>';
-
-  host.insertBefore(box, host.firstChild||null);
-
-  const state=$("#wolvStateV3");
-  const asset=$("#wolvAssetSelV3");
-  const amt=$("#wolvAmtV3");
-  const confirmBtn=$("#wolvConfirmBtnV3");
-
-  function setState(s,ok){
-    state.textContent=s;
-    state.style.color=ok? "#0a0" : "#a00";
-  }
-  function enableStart(en){
-    const sb=byText("button","START WOLVERINE")||byText("input","START WOLVERINE");
-    if(sb){ sb.disabled=!en; sb.style.opacity=en?"1":"0.45"; }
-  }
-  enableStart(false);
-
-  let confirmed=null;
-
-  const start0=byText("button","START WOLVERINE")||byText("input","START WOLVERINE");
-  const start=replaceNode(start0);
-  if(start){
-    start.disabled=true;
-    start.style.opacity="0.45";
-    start.addEventListener("click", async (ev)=>{
-      ev.preventDefault(); ev.stopPropagation();
-      if(!confirmed){ setState("Dépôt non confirmé.",false); return; }
-      try{
-        setState("START…",true);
-        const pub=getUserPub();
-        const j=await postJsonFallback(["/wolverine/api/start","/api/start"],{pub,asset:confirmed.asset,amount:confirmed.amount,depositSig:confirmed.signature});
-        if(j&&j.ok) setState("START OK",true); else setState("ERR START",false);
-      }catch(e){
-        setState("ERR START: "+(e&&e.message||e),false);
-      }
-    }, true);
-  }
-
-  confirmBtn.addEventListener("click", async ()=>{
-    try{
-      const pub=getUserPub();
-      const botAddr=getBotAddr();
-      if(!pub){ setState("Connecte Phantom d'abord.",false); return; }
-      if(!botAddr){ setState("Adresse bot introuvable sur la page.",false); return; }
-      const v=Number(String(amt.value||"").replace(",","."));
-      if(!isFinite(v)||v<=0){ setState("Montant invalide.",false); return; }
-
-      confirmBtn.disabled=true;
-      setState("Vérification on-chain…",true);
-
-      const j=await postJsonFallback(
-        ["/wolverine/api/confirm_deposit_v2","/api/confirm_deposit_v2"],
-        {pub,botAddr,asset:asset.value,minAmount:v}
-      );
-
-      if(j.confirmed){
-        confirmed={asset:asset.value,amount:j.amount,signature:j.signature};
-        setState("Confirmé: "+j.amount+" "+asset.value+" / "+j.signature,true);
-        enableStart(true);
-      }else{
-        setState("Pas trouvé. Attends 10-20s puis recommence.",false);
-      }
-    }catch(e){
-      setState("ERR: "+(e&&e.message||e),false);
-    }finally{
-      confirmBtn.disabled=false;
-    }
-  });
-}
-
-function main(){
-  killDupBoxes();
-  hideWalletsToDisplay();
-  ensureDepositBox();
-  setTimeout(()=>{killDupBoxes();hideWalletsToDisplay();ensureDepositBox();},700);
-  setTimeout(()=>{killDupBoxes();hideWalletsToDisplay();ensureDepositBox();},1700);
-}
-document.addEventListener("DOMContentLoaded", main);
-})();
-JS
-}
-
-clean_html() {
-  local html="$1"
-  python3 - <<PY
-import pathlib, re, time
-p=pathlib.Path(r"$html")
-s=p.read_text(encoding="utf-8",errors="ignore")
-
-# retire anciens scripts de patch (v1/v2)
-s=re.sub(r'.*wolv_manual_deposit_confirm_v2\.js.*\n','',s)
-s=re.sub(r'.*wolv_manual_deposit_confirm_v1\.js.*\n','',s)
-s=re.sub(r'.*wolv_invested\.js.*\n','',s)
-
-# ajoute v3 si absent
-tag='patches/wolv_manual_deposit_confirm_v3.js'
-if tag not in s:
-  ins='\\n<script defer src="'+tag+'?v=%d"></script>\\n'%int(time.time())
-  if "</body>" in s: s=s.replace("</body>",ins+"</body>")
-  else: s+=ins
-
-p.write_text(s,encoding="utf-8")
-print("OK FRONT:",str(p))
-PY
-}
-
-for h in "${HTMLS[@]}"; do
-  write_patch_js "$h"
-  clean_html "$h"
-done
-
-echo "OK. Proxy nginx + front V3 installés. Fais Ctrl+F5 sur https://fireinners.online/wolverine/"
+echo "OK. Proxy actif. Test: POST /wolverine/api/confirm_deposit_v2 doit répondre JSON."
 BASH
 
-bash /root/WOLV_FIX_405_PROXY_V3.sh
+bash /root/WOLV_NGINX_PROXY_V4.sh
