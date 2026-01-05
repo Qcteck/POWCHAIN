@@ -1,4 +1,4 @@
-cat >/root/WOLV_MIN_UI_V1.sh <<'BASH'
+cat >/root/WOLV_FORCE_MIN_V2.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -9,36 +9,24 @@ RPC_URL="${RPC_URL:-https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR
 API_DIR="/opt/wolverine-api"
 API_PORT="3002"
 
-LEDGER_DIR="/opt/traderone-opt/data"
-LEDGER_FILE="${LEDGER_DIR}/wolv_ledger.json"
-
 VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
 NGINX_MAIN="/etc/nginx/nginx.conf"
 
-FRONT_CANDIDATES=(
-  "/opt/fireinners/frontend-react/app/dist/wolverine/index.html"
-  "/var/www/fireinners/wolverine/index.html"
-  "/var/www/wolverine/index.html"
-)
-PATCH_DIR_CANDIDATES=(
-  "/opt/fireinners/frontend-react/app/dist/wolverine/patches"
-  "/var/www/fireinners/wolverine/patches"
-  "/var/www/wolverine/patches"
-)
+TS="$(date +%s)"
+PATCH_NAME="wolv_force_min_v2.js"
 
-PATCH_NAME="wolv_ui_min_v1.js"
-OLD_PATCH_1="wolv_ui_patch_base_v1.js"
-OLD_PATCH_2="wolv_ui_patch" # wildcard
-
-mkdir -p "$LEDGER_DIR"
-if [ ! -f "$LEDGER_FILE" ]; then echo '{"users":{},"deposits_seen":{}}' >"$LEDGER_FILE"; fi
-
+# 1) Ensure minimal API running (used only for confirm+mode, and proxy to 3000 for /api/*)
 mkdir -p "$API_DIR"
 cd "$API_DIR"
 if [ ! -f package.json ]; then npm init -y >/dev/null 2>&1; fi
 npm pkg set name="wolverine-api" >/dev/null 2>&1 || true
 npm pkg set type="commonjs" >/dev/null 2>&1 || true
 npm i express node-fetch@2 @solana/web3.js @solana/spl-token >/dev/null 2>&1 || true
+
+LEDGER_DIR="/opt/traderone-opt/data"
+LEDGER_FILE="${LEDGER_DIR}/wolv_ledger.json"
+mkdir -p "$LEDGER_DIR"
+if [ ! -f "$LEDGER_FILE" ]; then echo '{"users":{},"deposits_seen":{}}' >"$LEDGER_FILE"; fi
 
 cat >"$API_DIR/server.js" <<'JS'
 "use strict";
@@ -61,12 +49,8 @@ app.use(express.json({limit:"256kb"}));
 const n=x=>{const v=Number(x);return Number.isFinite(v)?v:0;};
 const now=()=>Date.now();
 
-function readLedger(){
-  try{return JSON.parse(fs.readFileSync(LEDGER_FILE,"utf8")||"{}");}
-  catch{return {users:{},deposits_seen:{}};}
-}
+function readLedger(){try{return JSON.parse(fs.readFileSync(LEDGER_FILE,"utf8")||"{}")}catch{return {users:{},deposits_seen:{}}}}
 function writeLedger(L){fs.writeFileSync(LEDGER_FILE,JSON.stringify(L,null,2));}
-
 function botUsdcAta(){ return spl.getAssociatedTokenAddressSync(USDC_MINT,BOT_PUB,false); }
 
 function matchSolDeposit(tx,fromPub,minSol){
@@ -83,7 +67,6 @@ function matchSolDeposit(tx,fromPub,minSol){
   }
   return null;
 }
-
 function matchUsdcDeposit(tx,fromPub,minUsdc){
   if(!tx||tx.meta?.err) return null;
   const dstAta=botUsdcAta().toBase58();
@@ -97,14 +80,12 @@ function matchUsdcDeposit(tx,fromPub,minUsdc){
         if(info.tokenAmount && info.tokenAmount.uiAmount!=null) ui=n(info.tokenAmount.uiAmount);
         else if(info.amount) ui=n(info.amount)/1e6;
         const auth=info.authority||"";
-        const okFrom=(auth===fromPub);
-        if(okFrom && ui+1e-12>=minUsdc) return {sig:tx.transaction.signatures?.[0],amount:ui};
+        if(auth===fromPub && ui+1e-12>=minUsdc) return {sig:tx.transaction.signatures?.[0],amount:ui};
       }
     }
   }
   return null;
 }
-
 async function scanDeposit(pub,asset,amount){
   const fromPub=new PublicKey(pub).toBase58();
   const L=readLedger();
@@ -112,7 +93,7 @@ async function scanDeposit(pub,asset,amount){
   if(!L.deposits_seen) L.deposits_seen={};
 
   const target=(asset==="USDC")?botUsdcAta():BOT_PUB;
-  const sigs=await conn.getSignaturesForAddress(target,{limit:40});
+  const sigs=await conn.getSignaturesForAddress(target,{limit:50});
   for(const s of sigs){
     const sig=s.signature;
     if(!sig||L.deposits_seen[sig]) continue;
@@ -141,11 +122,9 @@ app.post("/wolverine/api/wolv_set_mode",(req,res)=>{
   const pub=String(req.body?.pub||"");
   const mode=String(req.body?.mode||"AUTO").toUpperCase().slice(0,24);
   if(!pub) return res.status(400).json({ok:false,err:"bad_params"});
-  const L=readLedger();
-  if(!L.users) L.users={};
+  const L=readLedger(); if(!L.users) L.users={};
   if(!L.users[pub]) L.users[pub]={mode:"AUTO",last_deposit:null};
-  L.users[pub].mode=mode;
-  writeLedger(L);
+  L.users[pub].mode=mode; writeLedger(L);
   res.json({ok:true,mode});
 });
 app.post("/wolverine/api/wolv_confirm_deposit",async(req,res)=>{
@@ -161,7 +140,7 @@ app.post("/wolverine/api/wolv_confirm_deposit",async(req,res)=>{
   }
 });
 
-// proxy fallback vers ton API existante (3000): /wolverine/api/* -> http://127.0.0.1:3000/api/*
+// proxy vers ton backend existant (127.0.0.1:3000) pour start etc
 app.use("/wolverine/api/",async(req,res)=>{
   try{
     const sub=req.originalUrl.replace(/^\/wolverine\/api\//,"");
@@ -182,7 +161,7 @@ JS
 
 cat >/etc/systemd/system/wolverine-api.service <<EOF
 [Unit]
-Description=Wolverine API (minimal)
+Description=Wolverine API (force-min v2)
 After=network.target
 
 [Service]
@@ -206,6 +185,7 @@ systemctl daemon-reload
 systemctl enable --now wolverine-api.service
 systemctl restart wolverine-api.service
 
+# 2) Nginx: force location ^~ /wolverine/api/ BEFORE spa try_files
 chattr -i "$VHOST" 2>/dev/null || true
 chattr -i "$NGINX_MAIN" 2>/dev/null || true
 
@@ -214,7 +194,7 @@ import re,sys
 vhost="$VHOST"
 s=open(vhost,"r",encoding="utf-8",errors="ignore").read()
 
-marker="# WOLV_API_PROXY_MIN_V1"
+marker="# WOLV_API_PROXY_FORCE_V2"
 block=f"""
     {marker}
     location ^~ /wolverine/api/ {{
@@ -227,17 +207,14 @@ block=f"""
         proxy_read_timeout 60s;
     }}
 """
-
 if marker in s:
     print("OK nginx proxy déjà présent"); sys.exit(0)
 
-# simple: choisit le dernier bloc server { ... } (souvent ssl)
 starts=[m.start() for m in re.finditer(r'(?m)^\\s*server\\s*\\{',s)]
 if not starts: raise SystemExit("ERR: aucun server{} dans vhost")
 start=starts[-1]
-# trouve la fin de ce server avec compteur d'accolades
 i=start; depth=0; opened=False
-while i < len(s):
+while i<len(s):
     c=s[i]
     if c=='{': depth+=1; opened=True
     elif c=='}' and opened:
@@ -245,8 +222,7 @@ while i < len(s):
         if depth==0:
             end=i+1
             blk=s[start:end]
-            ins=blk[:-1]+block+"\\n}"
-            out=s[:start]+ins+s[end:]
+            out=s[:start]+blk[:-1]+block+"\\n}"+s[end:]
             open(vhost,"w",encoding="utf-8").write(out)
             print("OK nginx proxy ajouté"); sys.exit(0)
     i+=1
@@ -258,33 +234,23 @@ systemctl reload nginx
 chattr +i "$VHOST" 2>/dev/null || true
 chattr +i "$NGINX_MAIN" 2>/dev/null || true
 
-# Patch front: UI minimal
-for d in "${PATCH_DIR_CANDIDATES[@]}"; do
-  mkdir -p "$d"
-  cat >"$d/$PATCH_NAME" <<'JS'
-(()=>{"use strict";const BOT="e8DbBrTJxRetx3HNFb83CsXMySETydHVLwxMzkjcVqh";const $=s=>document.querySelector(s);const ce=t=>document.createElement(t);
-const txt=(el)=>((el&&el.innerText)||"").trim().toLowerCase();
-const hideBlockByText=(needle)=>{
-  const all=[...document.querySelectorAll("div,section,fieldset,table,h1,h2,h3,p,label,legend,strong,b")];
-  for(const el of all){
-    const t=txt(el);
-    if(!t) continue;
-    if(t.includes(needle)){
-      let box=el;
-      for(let i=0;i<7;i++){
-        if(!box||!box.parentElement) break;
-        box=box.parentElement;
-        if(txt(box).includes(needle)){ box.style.display="none"; break; }
-      }
-    }
-  }
-};
-const hideOldUI=()=>{
-  hideBlockByText("wallets à afficher");
-  hideBlockByText("colle ici des adresses");
-  hideBlockByText("budget (sera envoyé");
-  // cache les tables de listing si présentes
-  for(const t of [...document.querySelectorAll("table")]){ if(txt(t).includes("wallet") && (txt(t).includes("sol")||txt(t).includes("usdc"))) t.style.display="none"; }
+# 3) Front FORCE: inject a patch that HIDES/REMOVES everything except our single panel
+PATCH_JS=$(cat <<'JS'
+(()=>{"use strict";
+const BOT="e8DbBrTJxRetx3HNFb83CsXMySETydHVLwxMzkjcVqh";
+const $=s=>document.querySelector(s);
+const ce=t=>document.createElement(t);
+const txt=el=>((el&&el.innerText)||"").trim();
+
+const addGlobalHide=()=>{
+  if($("#wolvForceStyle")) return;
+  const st=ce("style"); st.id="wolvForceStyle";
+  st.textContent=`
+  body>*:not(#wolvForceRoot){display:none!important;}
+  #wolvForceRoot,*[data-wolv-keep]{display:block!important;}
+  #wolvForceRoot *{display:initial!important;}
+  `;
+  document.head.appendChild(st);
 };
 
 const getPub=async()=>{
@@ -298,175 +264,175 @@ const getPub=async()=>{
 
 const apiPost=async(path,obj)=>{
   const r=await fetch(path,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(obj||{})});
-  const txt=await r.text(); let j=null; try{j=JSON.parse(txt)}catch{}
-  if(!r.ok) throw new Error((j&&j.err)||txt||("HTTP "+r.status));
+  const t=await r.text(); let j=null; try{j=JSON.parse(t)}catch{}
+  if(!r.ok) throw new Error((j&&j.err)||t||("HTTP "+r.status));
   return j||{};
 };
 const apiGet=async(url)=>{
   const r=await fetch(url,{method:"GET"});
-  const txt=await r.text(); let j=null; try{j=JSON.parse(txt)}catch{}
-  if(!r.ok) throw new Error((j&&j.err)||txt||("HTTP "+r.status));
+  const t=await r.text(); let j=null; try{j=JSON.parse(t)}catch{}
+  if(!r.ok) throw new Error((j&&j.err)||t||("HTTP "+r.status));
   return j||{};
 };
 
-const ensurePanel=async()=>{
-  hideOldUI();
-  if($("#wolvMinPanel")) return;
+const build=async()=>{
+  addGlobalHide();
 
-  const host=$("#top")||document.body;
-  const wrap=ce("div");wrap.id="wolvMinPanel";
-  wrap.style.border="1px solid #bbb";wrap.style.borderRadius="10px";
-  wrap.style.padding="12px";wrap.style.margin="10px 0";wrap.style.maxWidth="980px";
+  let root=$("#wolvForceRoot");
+  if(!root){
+    root=ce("div"); root.id="wolvForceRoot";
+    root.style.maxWidth="980px";
+    root.style.margin="12px";
+    root.style.border="1px solid #bbb";
+    root.style.borderRadius="12px";
+    root.style.padding="12px";
+    root.innerHTML=`
+      <div style="font-weight:800;font-size:26px;margin-bottom:10px">WOLVERINE</div>
 
-  wrap.innerHTML=`
-  <div style="font-weight:700;margin-bottom:8px">WOLVERINE</div>
-  <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
-    <button id="wolvConnect" type="button">Connect Wallet (Phantom)</button>
-    <span id="wolvPub" style="font-family:monospace;font-size:12px">—</span>
-  </div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
+        <button id="wfConnect" type="button">Connect Wallet (Phantom)</button>
+        <span id="wfPub" style="font-family:monospace;font-size:12px">—</span>
+      </div>
 
-  <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-bottom:12px">
-    <div style="font-weight:700">Mode</div>
-    <select id="wolvMode">
-      <option value="AUTO">AUTO</option>
-      <option value="CONSERVATEUR">CONSERVATEUR</option>
-      <option value="AGRESSIF">AGRESSIF</option>
-      <option value="DCA">DCA</option>
-      <option value="SCALP">SCALP</option>
-    </select>
-    <button id="wolvSaveMode" type="button">Sauver</button>
-    <span id="wolvModeMsg"></span>
-  </div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:10px 0">
+        <div style="font-weight:700">Mode</div>
+        <select id="wfMode">
+          <option value="AUTO">AUTO</option>
+          <option value="SAFE">SAFE</option>
+          <option value="AGRESSIF">AGRESSIF</option>
+          <option value="DCA">DCA</option>
+          <option value="SCALP">SCALP</option>
+        </select>
+        <button id="wfSaveMode" type="button">Sauver</button>
+        <span id="wfModeMsg"></span>
+      </div>
 
-  <div style="border-top:1px solid #ddd;padding-top:10px">
-    <div style="font-weight:700;margin-bottom:6px">Dépôt manuel</div>
-    <div style="margin-bottom:6px">Envoie depuis ton Phantom vers TraderOne (bot) :</div>
-    <div style="font-family:monospace;font-size:12px;margin-bottom:10px">${BOT}</div>
-    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-      <select id="wolvAsset"><option value="USDC">USDC</option><option value="SOL">SOL</option></select>
-      <input id="wolvAmount" placeholder="Montant (ex: 1 ou 0.1)" style="min-width:220px"/>
-      <button id="wolvConfirm" type="button">CONFIRMER DÉPÔT (scan on-chain)</button>
-      <span id="wolvDepMsg" style="margin-left:8px"></span>
-    </div>
-    <div style="margin-top:10px">
-      <button id="wolvStart" type="button" disabled>START WOLVERINE</button>
-      <span id="wolvStartMsg" style="margin-left:8px"></span>
-    </div>
-  </div>
-  `;
-  host.prepend(wrap);
+      <div style="border-top:1px solid #ddd;padding-top:10px;margin-top:10px">
+        <div style="font-weight:700;margin-bottom:6px">Dépôt manuel</div>
+        <div style="margin-bottom:6px">Envoie depuis ton Phantom vers TraderOne (bot) :</div>
+        <div style="font-family:monospace;font-size:12px;margin-bottom:10px">${BOT}</div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+          <select id="wfAsset"><option value="USDC">USDC</option><option value="SOL">SOL</option></select>
+          <input id="wfAmt" placeholder="Montant (ex: 1 ou 0.1)" style="min-width:220px"/>
+          <button id="wfConfirm" type="button">CONFIRMER DÉPÔT (scan on-chain)</button>
+          <span id="wfDepMsg" style="margin-left:8px"></span>
+        </div>
+        <div style="margin-top:10px">
+          <button id="wfStart" type="button" disabled>START WOLVERINE</button>
+          <span id="wfStartMsg" style="margin-left:8px"></span>
+        </div>
+      </div>
+    `;
+    document.body.prepend(root);
+  }
 
-  const setDepMsg=(m,ok)=>{const el=$("#wolvDepMsg");el.textContent=m;el.style.color=ok?"#060":"#a00";};
-  const setStartMsg=(m,ok)=>{const el=$("#wolvStartMsg");el.textContent=m;el.style.color=ok?"#060":"#a00";};
+  const depMsg=(m,ok)=>{const el=$("#wfDepMsg");el.textContent=m;el.style.color=ok?"#060":"#a00";};
+  const startMsg=(m,ok)=>{const el=$("#wfStartMsg");el.textContent=m;el.style.color=ok?"#060":"#a00";};
 
-  const refreshState=async()=>{
+  const refresh=async()=>{
     const pub=await getPub();
-    $("#wolvPub").textContent=pub?pub:"Non connecté";
+    $("#wfPub").textContent=pub?pub:"Non connecté";
     if(!pub) return;
     const st=await apiGet("/wolverine/api/wolv_state?pub="+encodeURIComponent(pub));
-    const u=st.user||{};
-    $("#wolvMode").value=(u.mode||"AUTO");
-    const ld=u.last_deposit;
-    if(ld && ld.sig){
-      setDepMsg("Dernier dépôt: "+ld.asset+" "+Number(ld.amount||0)+" (sig "+ld.sig+")", true);
-      $("#wolvStart").disabled=false;
+    $("#wfMode").value=(st.user&&st.user.mode)||"AUTO";
+    const ld=st.user&&st.user.last_deposit;
+    if(ld&&ld.sig){
+      depMsg("Dernier dépôt: "+ld.asset+" "+Number(ld.amount||0)+" (sig "+ld.sig+")", true);
+      $("#wfStart").disabled=false;
     }
   };
 
-  $("#wolvConnect").addEventListener("click",async()=>{
-    const pub=await getPub();
-    $("#wolvPub").textContent=pub?pub:"Connexion refusée";
-    await refreshState().catch(()=>{});
-  });
+  $("#wfConnect").onclick=async()=>{await refresh().catch(()=>{});};
 
-  $("#wolvSaveMode").addEventListener("click",async()=>{
+  $("#wfSaveMode").onclick=async()=>{
     try{
-      $("#wolvModeMsg").textContent="";
-      const pub=await getPub(); if(!pub){$("#wolvModeMsg").textContent="Connecte Phantom."; return;}
-      const mode=$("#wolvMode").value;
-      await apiPost("/wolverine/api/wolv_set_mode",{pub,mode});
-      $("#wolvModeMsg").textContent="OK";
-    }catch{ $("#wolvModeMsg").textContent="ERR"; }
-  });
+      $("#wfModeMsg").textContent="";
+      const pub=await getPub(); if(!pub){$("#wfModeMsg").textContent="Connecte Phantom."; return;}
+      await apiPost("/wolverine/api/wolv_set_mode",{pub,mode:$("#wfMode").value});
+      $("#wfModeMsg").textContent="OK";
+    }catch{ $("#wfModeMsg").textContent="ERR"; }
+  };
 
-  $("#wolvConfirm").addEventListener("click",async()=>{
+  $("#wfConfirm").onclick=async()=>{
     try{
-      setDepMsg("",false);
-      const pub=await getPub(); if(!pub){setDepMsg("Connecte Phantom.",false); return;}
-      const asset=$("#wolvAsset").value;
-      const amount=Number($("#wolvAmount").value||0);
-      if(!(amount>0)){ setDepMsg("Montant invalide.",false); return; }
-      setDepMsg("Scan...",false);
-      const out=await apiPost("/wolverine/api/wolv_confirm_deposit",{pub,asset,amount});
-      if(out && out.ok){
-        setDepMsg("OK (sig "+out.sig+")", true);
-        $("#wolvStart").disabled=false;
+      depMsg("",false);
+      const pub=await getPub(); if(!pub){depMsg("Connecte Phantom.",false); return;}
+      const a=$("#wfAsset").value;
+      const amt=Number($("#wfAmt").value||0);
+      if(!(amt>0)){depMsg("Montant invalide.",false); return;}
+      depMsg("Scan...",false);
+      const out=await apiPost("/wolverine/api/wolv_confirm_deposit",{pub,asset:a,amount:amt});
+      if(out&&out.ok){
+        depMsg("OK (sig "+out.sig+")", true);
+        $("#wfStart").disabled=false;
       }else{
-        setDepMsg("Rien trouvé (attends la confirmation puis réessaie).", false);
+        depMsg("Rien trouvé (attends la confirmation puis réessaie).", false);
       }
     }catch(e){
-      setDepMsg("ERR: "+String(e&&e.message?e.message:e), false);
+      depMsg("ERR: "+String(e&&e.message?e.message:e), false);
     }
-  });
+  };
 
-  $("#wolvStart").addEventListener("click",async()=>{
+  $("#wfStart").onclick=async()=>{
     try{
-      setStartMsg("",false);
-      // On clique le bouton START existant si présent (pour garder ta logique actuelle)
-      const btns=[...document.querySelectorAll("button")];
-      let native=null;
-      for(const b of btns){
-        if(b.id==="wolvStart") continue;
-        const t=(b.textContent||"").toLowerCase();
-        if(t.includes("start wolverine")){ native=b; break; }
-      }
-      if(native){ native.click(); setStartMsg("OK (launch)", true); return; }
-      // fallback: appel direct si endpoint existe
-      const pub=await getPub(); if(!pub){ setStartMsg("Connecte Phantom.", false); return; }
+      startMsg("",false);
+      const pub=await getPub(); if(!pub){startMsg("Connecte Phantom.",false); return;}
+      // on appelle ton backend existant via proxy: POST /wolverine/api/start -> 127.0.0.1:3000/api/start
       await apiPost("/wolverine/api/start",{pub});
-      setStartMsg("OK", true);
+      startMsg("OK", true);
     }catch(e){
-      setStartMsg("ERR: "+String(e&&e.message?e.message:e), false);
+      startMsg("ERR: "+String(e&&e.message?e.message:e), false);
     }
-  });
+  };
 
-  await refreshState().catch(()=>{});
+  await refresh().catch(()=>{});
 };
 
-document.addEventListener("DOMContentLoaded",()=>{ensurePanel().catch(()=>{});});
-setTimeout(()=>{ensurePanel().catch(()=>{});},800);
+document.addEventListener("DOMContentLoaded",()=>{build().catch(()=>{});});
+setTimeout(()=>{build().catch(()=>{});},600);
 })();
 JS
+)
+
+# find ALL wolverine patches dirs, create if needed
+mapfile -t PATCH_DIRS < <(find /opt/fireinners /var/www /usr/share/nginx /srv -type d -path "*wolverine*patches*" 2>/dev/null | head -n 20 || true)
+if [ "${#PATCH_DIRS[@]}" -eq 0 ]; then
+  # fallback: create common
+  mkdir -p "/opt/fireinners/frontend-react/app/dist/wolverine/patches"
+  PATCH_DIRS=("/opt/fireinners/frontend-react/app/dist/wolverine/patches")
+fi
+
+for d in "${PATCH_DIRS[@]}"; do
+  mkdir -p "$d"
+  printf "%s\n" "$PATCH_JS" >"$d/$PATCH_NAME"
 done
 
-FRONT=""
-for f in "${FRONT_CANDIDATES[@]}"; do
-  if [ -f "$f" ]; then FRONT="$f"; break; fi
-done
+# patch ALL candidate index.html that contains "WOLVERINE" or "START WOLVERINE"
+mapfile -t IDX < <(grep -RIl --include="index.html" -e "START WOLVERINE" -e "<title>WOLVERINE" /opt/fireinners /var/www /usr/share/nginx /srv 2>/dev/null | head -n 30 || true)
 
-if [ -n "$FRONT" ]; then
+for f in "${IDX[@]}"; do
+  cp -a "$f" "$f.bak.$TS" 2>/dev/null || true
   python3 - <<PY
 import re
-p="$FRONT"
+p=r"$f"
 s=open(p,"r",encoding="utf-8",errors="ignore").read()
-
-# retire anciens scripts patch (base)
-s=re.sub(r'\\s*<script\\s+src="/wolverine/patches/[^"]*(wolv_ui_patch_base_v1\\.js)[^"]*"></script>\\s*','\\n',s,flags=re.I)
-s=re.sub(r'\\s*<script\\s+src="/wolverine/patches/[^"]*wolv_ui_patch[^"]*"></script>\\s*','\\n',s,flags=re.I)
-
-tag=f'<script src="/wolverine/patches/{PATCH_NAME}?v=1"></script>'
+# remove ANY old patches includes
+s=re.sub(r'\\s*<script\\s+[^>]*src="\\/wolverine\\/patches\\/[^"]+"[^>]*><\\/script>\\s*','\\n',s,flags=re.I)
+# add our force patch + cache buster
+tag=f'<script src="/wolverine/patches/{PATCH_NAME}?v={TS}"></script>'
 if tag not in s:
   if "</body>" in s: s=s.replace("</body>", tag+"\\n</body>")
   else: s+="\\n"+tag+"\\n"
+# hard no-cache meta (helps)
+if "<meta http-equiv=\"Cache-Control\"" not in s:
+  s=s.replace("<head>","<head>\\n<meta http-equiv=\\"Cache-Control\\" content=\\"no-store\\"/>\\n<meta http-equiv=\\"Pragma\\" content=\\"no-cache\\"/>\\n<meta http-equiv=\\"Expires\\" content=\\"0\\"/>\\n",1)
 open(p,"w",encoding="utf-8").write(s)
-print("OK front patch:",p)
+print("OK patched:",p)
 PY
-else
-  echo "WARN: index.html wolverine introuvable (paths candidats). Patch JS installé dans patches/."
-fi
+done
 
-systemctl restart wolverine-api.service >/dev/null 2>&1 || true
-echo "OK. Va sur https://fireinners.online/wolverine/ puis Ctrl+F5."
+echo "OK FORCE MIN V2 installé."
+echo "Recharge: https://fireinners.online/wolverine/?v=$TS puis Ctrl+F5"
 BASH
 
-bash /root/WOLV_MIN_UI_V1.sh
+bash /root/WOLV_FORCE_MIN_V2.sh
