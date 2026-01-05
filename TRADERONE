@@ -1,77 +1,119 @@
 #!/bin/bash
 set -e
 
-FILE="/opt/fireinners/frontend-react/app/dist/wolverine/index.html"
+### PATHS FIXES
+BACK="/opt/wolverine"
+FRONT="/opt/fireinners/frontend-react/app/dist/wolverine"
+RPC="https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac"
+USDC="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1"
+
+echo "=== BACKEND : API BALANCES ==="
+
+mkdir -p $BACK
+cd $BACK
+
+cat > server.js <<EOF
+import express from "express";
+import {Connection,PublicKey} from "@solana/web3.js";
+
+const app=express();
+const RPC="$RPC";
+const USDC="$USDC";
+const conn=new Connection(RPC,"confirmed");
+
+const INTERNAL_WALLET="2uHqvSM6vrm7Ye7ntMFUA1RHiqAinGjeCx17dozsLx1z";
+
+app.get("/api/balances",async(req,res)=>{
+ try{
+  const user=req.query.user;
+  const out={};
+
+  const sol=async(pk)=>(await conn.getBalance(new PublicKey(pk)))/1e9;
+  const usdc=async(pk)=>{
+    const ac=await conn.getParsedTokenAccountsByOwner(
+      new PublicKey(pk),
+      {mint:new PublicKey(USDC)}
+    );
+    return ac.value.reduce((s,a)=>s+(a.account.data.parsed.info.tokenAmount.uiAmount||0),0);
+  };
+
+  out.internalSOL=await sol(INTERNAL_WALLET);
+  out.internalUSDC=await usdc(INTERNAL_WALLET);
+
+  if(user){
+    out.userSOL=await sol(user);
+    out.userUSDC=await usdc(user);
+  }
+
+  res.json(out);
+ }catch(e){
+  res.status(500).json({error:e.message});
+ }
+});
+
+app.listen(3000,()=>console.log("BALANCES API OK :3000"));
+EOF
+
+npm install express @solana/web3.js
+pm2 delete traderone 2>/dev/null || true
+pm2 start server.js --name traderone
+pm2 save
+
+echo "=== FRONTEND : AFFICHAGE LIVE ==="
+
+INDEX="$FRONT/index.html"
 
 node <<'NODE'
 const fs=require("fs");
-let h=fs.readFileSync(process.env.FILE||"/opt/fireinners/frontend-react/app/dist/wolverine/index.html","utf8");
+let h=fs.readFileSync(process.env.INDEX,"utf8");
 
-/* 1. SUPPRIME TOUS LES MENUS / PANELS */
-h=h.replace(/<div[^>]*(menu|option|settings|panel)[\s\S]*?<\/div>/gi,"");
+if(!h.includes("SOL_LIVE")){
+h=h.replace("</body>",`
+<script>
+const API="/api/balances";
+let phantomPK=null;
 
-/* 2. SUPPRIME ANCIENS SCRIPTS COULEUR */
-h=h.replace(/<script[^>]*WOLV_COLOR_SCRIPT[\s\S]*?<\/script>/gi,"");
-
-/* 3. AJOUTE BOUTON ⚙️ UNIQUE */
-if(!h.includes("WOLV_GEAR")){
- h=h.replace("</body>",`
-<style>
-#wolv-gear{
- position:fixed;bottom:18px;right:18px;
- width:54px;height:54px;border-radius:50%;
- display:flex;align-items:center;justify-content:center;
- font-size:24px;cursor:pointer;
- background:linear-gradient(135deg,#ff5cf4,#3fffd8);
- box-shadow:0 0 30px rgba(255,120,255,.6);
- border:none;color:#000;z-index:9999;
- transition:.3s;
-}
-#wolv-gear:hover{transform:rotate(90deg) scale(1.1)}
-</style>
-
-<button id="wolv-gear" title="Switch palette">⚙️</button>
-
-<script id="WOLV_COLOR_SCRIPT">
-function r(a,b){return Math.random()*(b-a)+a}
-function hsl(h,s,l){return \`hsl(\${h},\${s}%,\${l}%)\`}
-
-function gen(){
- const h=r(0,360)
- const a=(h+r(80,160))%360
- const b=(h+r(200,320))%360
- const l=r(18,82)
- return{
-  base:hsl(h,r(35,85),l),
-  accent:hsl(a,r(60,100),l>50?r(20,35):r(65,85)),
-  action:hsl(b,r(70,100),r(45,65)),
-  light:l>50
- }
+async function refresh(){
+ let url=API+(phantomPK?("?user="+phantomPK):"");
+ let j=await fetch(url).then(r=>r.json());
+ document.getElementById("internal-sol").innerText=j.internalSOL?.toFixed(4)||"-";
+ document.getElementById("internal-usdc").innerText=j.internalUSDC?.toFixed(2)||"-";
+ document.getElementById("phantom-sol").innerText=j.userSOL?.toFixed(4)||"-";
+ document.getElementById("phantom-usdc").innerText=j.userUSDC?.toFixed(2)||"-";
 }
 
-function apply(){
- const m=gen()
- document.body.style.background=m.base
- document.body.style.color=m.light?"#000":"#fff"
- document.querySelectorAll("button").forEach(b=>{
-  b.style.background=\`linear-gradient(135deg,\${m.accent},\${m.action})\`
-  b.style.color=m.light?"#000":"#fff"
-  b.style.boxShadow=\`0 0 20px \${m.action}\`
- })
- const g=document.getElementById("wolv-gear")
- g.style.background=\`linear-gradient(135deg,\${m.action},\${m.accent})\`
- g.style.color=m.light?"#000":"#fff"
- g.style.boxShadow=\`0 0 35px \${m.accent}\`
+async function connectPhantom(){
+ const r=await window.solana.connect();
+ phantomPK=r.publicKey.toString();
+ refresh();
 }
 
-document.getElementById("wolv-gear").onclick=apply
-apply()
+setInterval(refresh,15000);
 </script>
-</body>`)
-}
+</body>`);
 
-fs.writeFileSync(process.env.FILE||"/opt/fireinners/frontend-react/app/dist/wolverine/index.html",h);
+h=h.replace(
+/Internal SOL[^<]*-/,
+`Internal SOL: <span id="internal-sol">-</span>`
+);
+h=h.replace(
+/Phantom SOL[^<]*-/,
+`Phantom SOL: <span id="phantom-sol">-</span>`
+);
+
+h=h=h.replace(
+/Budget initial[^<]*-/,
+`USDC Phantom: <span id="phantom-usdc">-</span><br>USDC Interne: <span id="internal-usdc">-</span>`
+);
+
+h=h.replace(
+/Connect Phantom[^>]*>/,
+`Connect Phantom</button><script>document.querySelector("button").onclick=connectPhantom</script>`
+);
+
+fs.writeFileSync(process.env.INDEX,h);
 NODE
 
 nginx -t && systemctl reload nginx
-echo "✅ MODE RNG COULEUR ACTIF — 1 bouton ⚙️, zéro menu"
+
+echo "✅ SOLDES SOL / USDC LIVE OK"
