@@ -1,52 +1,104 @@
+cat >/root/REMOVE_SHARE_PATCH.sh <<'BASH'
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
-APP="/opt/wolverine"
-HTML="$APP/index.html"
-BACKUP="$HTML.bak.$(date +%s)"
+# Cherche les pages html (wolverine + autres) et injecte un petit patch JS
+PATCH_JS_NAME="patch_hide_share.js"
 
-echo "==[1/5] Vérification =="
-[ -f "$HTML" ] || { echo "❌ index.html introuvable"; exit 1; }
+# 1) Crée le patch JS (cache le bouton + ferme/empêche la popup)
+cat >/tmp/$PATCH_JS_NAME <<'JS'
+(()=>{"use strict";
+const $=s=>document.querySelector(s);
+const $$=s=>Array.from(document.querySelectorAll(s));
 
-echo "==[2/5] Backup sécurité =="
-cp "$HTML" "$BACKUP"
+function txt(el){return (el?.textContent||"").trim().toLowerCase();}
 
-echo "==[3/5] Suppression HTML (panel + boutons Partager) =="
-sed -i \
-  -e '/Partager/d' \
-  -e '/Facebook/d' \
-  -e '/X\/Twitter/d' \
-  -e '/Telegram/d' \
-  -e '/WhatsApp/d' \
-  -e '/Copier lien/d' \
-  -e '/Fermer/d' \
-  -e '/share-panel/d' \
-  -e '/sharePanel/d' \
-  "$HTML"
+function isShareButton(el){
+  if(!el) return false;
+  const t=txt(el);
+  const id=(el.id||"").toLowerCase();
+  const cls=(el.className||"").toString().toLowerCase();
+  return t==="partager" || t.includes("share") || t.includes("partager")
+      || id.includes("share") || id.includes("partager")
+      || cls.includes("share") || cls.includes("partager");
+}
 
-echo "==[4/5] Neutralisation JS (anti-réapparition) =="
-sed -i '/<\/body>/i \
-<script>\
-(()=>{\
-const kill=()=>{\
-document.querySelectorAll("[id*=share],[class*=share]").forEach(e=>e.remove());\
-};\
-kill();\
-setInterval(kill,500);\
-})();\
-</script>' "$HTML"
+function hide(el){
+  if(!el) return;
+  el.style.display="none";
+  el.style.visibility="hidden";
+  el.style.pointerEvents="none";
+}
 
-echo "==[5/5] CSS hard-kill (au cas où) =="
-sed -i '/<\/head>/i \
-<style>\
-[id*=share],\
-[class*=share],\
-button[data-share],\
-button.share{display:none!important;opacity:0!important;pointer-events:none!important}\
-</style>' "$HTML"
+function killShareUI(){
+  // Cache boutons "Partager/Share"
+  for(const el of $$("button,a,div,span")) if(isShareButton(el)) hide(el);
 
-nginx -t && systemctl reload nginx
+  // Cache la popup (le bloc qui contient Facebook / X / Telegram / WhatsApp / Copier lien / Fermer)
+  for(const box of $$("div,section,dialog")){
+    const t=txt(box);
+    if(t.includes("facebook") && (t.includes("telegram") || t.includes("whatsapp")) && (t.includes("copier") || t.includes("copy"))){
+      hide(box);
+      // cache aussi le parent overlay
+      hide(box.parentElement);
+    }
+  }
 
-echo "✅ Panneau PARTAGER supprimé définitivement"
-echo "⚙️ Bouton THEME intact"
-echo "🧼 Interface propre, sans doublon"
+  // Stop propagation sur toute tentative de "share"
+  document.addEventListener("click",(e)=>{
+    const path = e.composedPath ? e.composedPath() : [];
+    for(const el of path){
+      if(el && isShareButton(el)){
+        e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
+        return false;
+      }
+    }
+  }, true);
+}
+
+// Observe pour les UI ajoutées après (React, etc.)
+const obs=new MutationObserver(()=>killShareUI());
+obs.observe(document.documentElement,{childList:true,subtree:true});
+
+if(document.readyState==="loading") document.addEventListener("DOMContentLoaded",killShareUI);
+else killShareUI();
+})();
+JS
+
+# 2) Trouve un dossier web où déposer le patch (on cible wolverine d'abord)
+TARGET_DIR=""
+for d in \
+  /opt/fireinners/frontend-react/app/dist/wolverine \
+  /var/www/fireinners/wolverine \
+  /var/www/wolverine \
+  /opt/traderone-opt/public \
+  /srv/www \
+  /var/www/html
+do
+  if [ -d "$d" ]; then TARGET_DIR="$d"; break; fi
+done
+
+[ -n "$TARGET_DIR" ] || { echo "ERR: dossier web introuvable"; exit 1; }
+
+mkdir -p "$TARGET_DIR/patches"
+cp /tmp/$PATCH_JS_NAME "$TARGET_DIR/patches/$PATCH_JS_NAME"
+echo "OK: patch copié -> $TARGET_DIR/patches/$PATCH_JS_NAME"
+
+# 3) Injecte le script dans tous les .html du dossier cible (et sous-dossiers)
+shopt -s nullglob
+for f in "$TARGET_DIR"/*.html "$TARGET_DIR"/*/*.html; do
+  [ -f "$f" ] || continue
+  grep -q "patches/$PATCH_JS_NAME" "$f" && continue
+  if grep -qi "</body>" "$f"; then
+    sed -i "s#</body>#\n<script src=\"patches/$PATCH_JS_NAME\"></script>\n</body>#i" "$f"
+    echo "PATCH HTML -> $f"
+  else
+    echo -e "\n<script src=\"patches/$PATCH_JS_NAME\"></script>\n" >> "$f"
+    echo "PATCH HTML (append) -> $f"
+  fi
+done
+
+echo "DONE. Recharge la page en dur: Ctrl+F5. Le bouton Share/Partager + la popup seront cachés."
+BASH
+
+bash /root/REMOVE_SHARE_PATCH.sh
