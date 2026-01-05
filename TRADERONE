@@ -1,47 +1,221 @@
-cat >/root/WOLV_FIND_API_PORT.sh <<'BASH'
+cat >/root/WOLV_PATCH_API_3000_STRATEGY_SWAP.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "=== LISTEN ports (node) ==="
-ss -lptn 2>/dev/null | grep -E 'LISTEN' | grep -E 'users:\(\("node"|users:\(\("pm2"|node' || true
-echo
+PORT=3000
 
-echo "=== Ports only (node) ==="
-ss -lptn 2>/dev/null | awk '
-  /LISTEN/ && $0 ~ /users:\(\("node"/ {
-    # local address is column 4, like 0.0.0.0:3000 or [::]:8080
-    addr=$4
-    sub(/^.*:/,"",addr)
-    print addr
-  }' | sort -nu || true
-echo
+echo "=== [1] Find PID listening on :$PORT (node) ==="
+PID="$(ss -lptn 2>/dev/null | awk -v P=":$PORT" '
+  $0 ~ /LISTEN/ && $0 ~ P && $0 ~ /users:\(\("node"/ {
+    match($0, /pid=[0-9]+/); if(RLENGTH){ print substr($0,RSTART+4,RLENGTH-4); exit }
+  }')"
 
-echo "=== Try common local API health ==="
-for p in 3000 3001 8080 8000 5000 4000; do
-  if curl -sS --max-time 1 "http://127.0.0.1:$p/api" >/dev/null 2>&1; then
-    echo "✅ API responds on :$p (GET /api)"
-  fi
-done
-echo
+[ -n "${PID:-}" ] || { echo "ERR: aucun node n'écoute sur :$PORT"; exit 1; }
+echo "PID=$PID"
 
-echo "=== systemd node services (running) ==="
-systemctl list-units --type=service --state=running --no-pager 2>/dev/null | \
-  awk '{print $1}' | grep -E '\.service$' | while read -r s; do
-    es="$(systemctl show -p ExecStart --value "$s" 2>/dev/null || true)"
-    if echo "$es" | grep -qi "node"; then
-      echo "SERVICE: $s"
-      echo "  ExecStart: $es"
-      echo "  WorkingDirectory: $(systemctl show -p WorkingDirectory --value "$s" 2>/dev/null || true)"
-      echo
-    fi
-  done || true
+BACK_DIR="$(readlink -f /proc/$PID/cwd || true)"
+[ -n "${BACK_DIR:-}" ] && [ -d "$BACK_DIR" ] || { echo "ERR: cwd introuvable pour PID $PID"; exit 1; }
+echo "BACK_DIR=$BACK_DIR"
 
-echo "=== PM2 (if installed) ==="
-if command -v pm2 >/dev/null 2>&1; then
-  pm2 list || true
-else
-  echo "pm2 not installed"
+if [ ! -f "$BACK_DIR/package.json" ]; then
+  echo "WARN: pas de package.json dans $BACK_DIR, je cherche un sous-dossier node..."
+  hit="$(find "$BACK_DIR" -maxdepth 3 -type f -name package.json 2>/dev/null | head -n1 || true)"
+  [ -n "$hit" ] || { echo "ERR: aucun package.json trouvé"; exit 1; }
+  BACK_DIR="$(dirname "$hit")"
+  echo "BACK_DIR=$BACK_DIR"
 fi
+
+echo "=== [2] Find related systemd service (WorkingDirectory match) ==="
+SERVICE=""
+while read -r s; do
+  wd="$(systemctl show -p WorkingDirectory --value "$s" 2>/dev/null || true)"
+  if [ -n "$wd" ] && [ "$(readlink -f "$wd" 2>/dev/null || true)" = "$BACK_DIR" ]; then
+    SERVICE="$s"; break
+  fi
+done < <(systemctl list-units --type=service --state=running --no-pager 2>/dev/null | awk '{print $1}' | grep -E '\.service$' || true)
+
+echo "SERVICE=${SERVICE:-none} (ok si none)"
+
+TS="$(date +%s)"
+mkdir -p /root/wolv_backups
+
+echo "=== [3] Create routes: strategy + swap ==="
+mkdir -p "$BACK_DIR/routes"
+
+cat >"$BACK_DIR/routes/strategy.routes.js" <<'JS'
+const express = require("express");
+const router = express.Router();
+
+const state = {}; // wallet -> { active, history }
+function walletOf(req){ return (req.body.wallet || req.query.wallet || "").trim(); }
+function ensure(wallet){ if(!state[wallet]) state[wallet] = { active:null, history:[] }; }
+
+function make(name){
+  const base = "/" + name;
+
+  router.post(base + "/start", (req,res)=>{
+    const wallet = walletOf(req);
+    if(!wallet) return res.status(400).send("missing wallet");
+    ensure(wallet);
+    const cfg = Object.assign({}, req.body);
+    state[wallet].active = { name, mode:(req.body.mode||name), status:"RUNNING", config:cfg, startedAt:Date.now() };
+    state[wallet].history.push({ts:Date.now(), event:"START", name, cfg});
+    res.json({ok:true, active:state[wallet].active});
+  });
+
+  router.post(base + "/pause", (req,res)=>{
+    const wallet = walletOf(req);
+    if(!wallet) return res.status(400).send("missing wallet");
+    ensure(wallet);
+    if(state[wallet].active && state[wallet].active.name===name){
+      state[wallet].active.status="PAUSED";
+      state[wallet].history.push({ts:Date.now(), event:"PAUSE", name});
+    }
+    res.json({ok:true, active:state[wallet].active});
+  });
+
+  router.post(base + "/stop", (req,res)=>{
+    const wallet = walletOf(req);
+    if(!wallet) return res.status(400).send("missing wallet");
+    ensure(wallet);
+    if(state[wallet].active && state[wallet].active.name===name){
+      state[wallet].history.push({ts:Date.now(), event:"STOP", name});
+      state[wallet].active=null;
+    } else {
+      state[wallet].history.push({ts:Date.now(), event:"STOP_NOOP", name});
+    }
+    res.json({ok:true, active:state[wallet].active});
+  });
+
+  router.get(base + "/status", (req,res)=>{
+    const wallet = walletOf(req);
+    if(!wallet) return res.status(400).send("missing wallet");
+    ensure(wallet);
+    res.json({ok:true, active:state[wallet].active, last:state[wallet].history.slice(-10)});
+  });
+}
+
+["dca","grid","arbitrage","trend"].forEach(make);
+module.exports = router;
+JS
+
+cat >"$BACK_DIR/routes/swap.routes.js" <<'JS'
+/**
+ * Swap routes (Solana) via Jupiter:
+ *  GET  /api/swap/quote?inputMint=&outputMint=&amount=&slippageBps=
+ *  POST /api/swap/tx   { userPublicKey, quoteResponse, wrapAndUnwrapSol?:true }
+ * NOTE: /tx retourne une tx base64 à SIGNER côté wallet (plus safe).
+ */
+const express = require("express");
+const router = express.Router();
+
+const JUP_QUOTE = "https://quote-api.jup.ag/v6/quote";
+const JUP_SWAP  = "https://quote-api.jup.ag/v6/swap";
+
+router.get("/quote", async (req,res)=>{
+  try{
+    const { inputMint, outputMint, amount, slippageBps } = req.query;
+    if(!inputMint || !outputMint || !amount) return res.status(400).send("missing params");
+    const u = new URL(JUP_QUOTE);
+    u.searchParams.set("inputMint", String(inputMint));
+    u.searchParams.set("outputMint", String(outputMint));
+    u.searchParams.set("amount", String(amount));
+    u.searchParams.set("slippageBps", String(slippageBps || 50));
+    const r = await fetch(u);
+    const t = await r.text();
+    if(!r.ok) return res.status(r.status).send(t);
+    res.type("application/json").send(t);
+  }catch(e){
+    res.status(500).send(e?.message || String(e));
+  }
+});
+
+router.post("/tx", async (req,res)=>{
+  try{
+    const { userPublicKey, quoteResponse, wrapAndUnwrapSol } = req.body || {};
+    if(!userPublicKey || !quoteResponse) return res.status(400).send("missing userPublicKey/quoteResponse");
+
+    const r = await fetch(JUP_SWAP, {
+      method:"POST",
+      headers:{ "content-type":"application/json" },
+      body: JSON.stringify({
+        quoteResponse,
+        userPublicKey,
+        wrapAndUnwrapSol: !!wrapAndUnwrapSol
+      })
+    });
+    const t = await r.text();
+    if(!r.ok) return res.status(r.status).send(t);
+    res.type("application/json").send(t);
+  }catch(e){
+    res.status(500).send(e?.message || String(e));
+  }
+});
+
+module.exports = router;
+JS
+
+echo "=== [4] Wire routes into server entry ==="
+ENTRY=""
+for f in server.js app.js index.js main.js src/server.js src/app.js src/index.js; do
+  if [ -f "$BACK_DIR/$f" ]; then ENTRY="$BACK_DIR/$f"; break; fi
+done
+if [ -z "$ENTRY" ]; then
+  ENTRY="$(grep -RIl --no-messages -E "const app *= *express\\(" "$BACK_DIR" --include="*.js" --include="*.cjs" --include="*.mjs" | head -n1 || true)"
+fi
+[ -n "$ENTRY" ] || { echo "ERR: entry express introuvable dans $BACK_DIR"; exit 1; }
+
+echo "ENTRY=$ENTRY"
+cp -a "$ENTRY" "/root/wolv_backups/backend_entry.$TS.bak"
+
+# ensure requires
+if ! grep -q "strategyRoutes" "$ENTRY"; then
+  perl -0777 -i -pe '
+    my $s=$_;
+    if($s =~ /const\s+express\s*=\s*require\([^)]+\);\s*/s){
+      $s =~ s/(const\s+express\s*=\s*require\([^)]+\);\s*)/$1\nconst strategyRoutes = require(".\/routes\/strategy.routes");\nconst swapRoutes = require(".\/routes\/swap.routes");\n/s;
+    } elsif($s =~ /const\s+app\s*=\s*express\(\)\s*;\s*/s){
+      $s =~ s/(const\s+app\s*=\s*express\(\)\s*;\s*)/$1\nconst strategyRoutes = require(".\/routes\/strategy.routes");\nconst swapRoutes = require(".\/routes\/swap.routes");\n/s;
+    } else {
+      $s = "const strategyRoutes = require(\".\/routes\/strategy.routes\");\nconst swapRoutes = require(\".\/routes\/swap.routes\");\n".$s;
+    }
+    $_=$s;
+  ' "$ENTRY"
+fi
+
+# ensure app.use
+if ! grep -q "/api/strategy" "$ENTRY"; then
+  echo 'app.use("/api/strategy", strategyRoutes);' >> "$ENTRY"
+fi
+if ! grep -q "/api/swap" "$ENTRY"; then
+  echo 'app.use("/api/swap", swapRoutes);' >> "$ENTRY"
+fi
+
+echo "WIRED ✅ /api/strategy + /api/swap"
+
+echo "=== [5] Restart backend ==="
+if [ -n "${SERVICE:-}" ]; then
+  systemctl restart "$SERVICE"
+  echo "systemctl restarted: $SERVICE"
+else
+  echo "WARN: service non trouvé, je redémarre le PID $PID (best effort)"
+  kill -HUP "$PID" || true
+fi
+
+echo "=== [6] Local quick test ==="
+for p in 3000; do
+  echo "-- http://127.0.0.1:$p/api/strategy/dca/status?wallet=test"
+  curl -sS "http://127.0.0.1:$p/api/strategy/dca/status?wallet=test" || true
+  echo
+  echo "-- http://127.0.0.1:$p/api/swap/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1&amount=10000000&slippageBps=50"
+  curl -sS "http://127.0.0.1:$p/api/swap/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1&amount=10000000&slippageBps=50" | head -c 200 || true
+  echo
+done
+
+echo ""
+echo "DONE ✅"
+echo "Rollback:"
+echo "  cp -a /root/wolv_backups/backend_entry.$TS.bak $ENTRY"
 BASH
 
-bash /root/WOLV_FIND_API_PORT.sh
+bash /root/WOLV_PATCH_API_3000_STRATEGY_SWAP.sh
