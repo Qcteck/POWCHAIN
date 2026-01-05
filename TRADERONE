@@ -1,104 +1,190 @@
-cat >/root/REMOVE_SHARE_PATCH.sh <<'BASH'
+cat >/root/WOLV_PATCH_INVEST_V1.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Cherche les pages html (wolverine + autres) et injecte un petit patch JS
-PATCH_JS_NAME="patch_hide_share.js"
+# 1) FRONT (index.html Wolverine)
+CAND_HTML=(
+/opt/fireinners/frontend-react/app/dist/wolverine/index.html
+/opt/fireinners/frontend-react/app/dist/wolverine/traderone.html
+/var/www/fireinners/wolverine/index.html
+/var/www/wolverine/index.html
+/opt/traderone-opt/public/index.html
+)
+HTML=""
+for f in "${CAND_HTML[@]}"; do [ -f "$f" ] && HTML="$f" && break; done
+[ -n "$HTML" ] || { echo "ERR: wolverine index.html introuvable"; exit 1; }
+FRONT_DIR="$(dirname "$HTML")"
+mkdir -p "$FRONT_DIR/patches"
 
-# 1) Crée le patch JS (cache le bouton + ferme/empêche la popup)
-cat >/tmp/$PATCH_JS_NAME <<'JS'
+# 2) BACK (server avec /api/start)
+BACK="$(grep -RIl --include="server.js" --include="app.js" --include="index.js" "/api/start" /opt /srv /root 2>/dev/null | head -n1 || true)"
+[ -n "$BACK" ] || { echo "ERR: backend introuvable (pas de fichier avec /api/start)"; exit 1; }
+
+# 3) Ledger
+LEDGER_DIR="/opt/traderone-opt/data"
+mkdir -p "$LEDGER_DIR"
+LEDGER="$LEDGER_DIR/wolv_ledger.json"
+[ -f "$LEDGER" ] || echo "{}" >"$LEDGER"
+
+# 4) Patch FRONT: widget "Investi (TraderOne)"
+cat >"$FRONT_DIR/patches/wolv_invested.js" <<'JS'
 (()=>{"use strict";
-const $=s=>document.querySelector(s);
-const $$=s=>Array.from(document.querySelectorAll(s));
-
-function txt(el){return (el?.textContent||"").trim().toLowerCase();}
-
-function isShareButton(el){
-  if(!el) return false;
-  const t=txt(el);
-  const id=(el.id||"").toLowerCase();
-  const cls=(el.className||"").toString().toLowerCase();
-  return t==="partager" || t.includes("share") || t.includes("partager")
-      || id.includes("share") || id.includes("partager")
-      || cls.includes("share") || cls.includes("partager");
+const $=s=>document.querySelector(s),sleep=ms=>new Promise(r=>setTimeout(r,ms));
+const fmt=(n,d)=>{n=Number(n||0);if(!isFinite(n))n=0;return n.toFixed(d);};
+function ensureBox(){
+  if($("#wolvInvestBox"))return;
+  const host=$("#top")||document.body;
+  const box=document.createElement("div");
+  box.id="wolvInvestBox";
+  box.style.margin="8px 0";
+  box.style.padding="8px";
+  box.style.border="1px solid #bbb";
+  box.style.borderRadius="8px";
+  box.style.maxWidth="980px";
+  box.innerHTML='<div style="font-weight:700;margin-bottom:6px">Investi (TraderOne)</div><div id="wolvInvestLine" style="font-size:13px">Connecte Phantom...</div>';
+  host.appendChild(box);
 }
-
-function hide(el){
-  if(!el) return;
-  el.style.display="none";
-  el.style.visibility="hidden";
-  el.style.pointerEvents="none";
+async function getPub(){
+  if(!window.solana||!window.solana.isPhantom)return "";
+  if(window.solana.publicKey)return window.solana.publicKey.toBase58();
+  try{const r=await window.solana.connect({onlyIfTrusted:true});return (r&&r.publicKey)?r.publicKey.toBase58():"";}catch(_){return "";}
 }
-
-function killShareUI(){
-  // Cache boutons "Partager/Share"
-  for(const el of $$("button,a,div,span")) if(isShareButton(el)) hide(el);
-
-  // Cache la popup (le bloc qui contient Facebook / X / Telegram / WhatsApp / Copier lien / Fermer)
-  for(const box of $$("div,section,dialog")){
-    const t=txt(box);
-    if(t.includes("facebook") && (t.includes("telegram") || t.includes("whatsapp")) && (t.includes("copier") || t.includes("copy"))){
-      hide(box);
-      // cache aussi le parent overlay
-      hide(box.parentElement);
-    }
+async function refresh(pub){
+  const line=$("#wolvInvestLine"); if(!line)return;
+  try{
+    const r=await fetch("/api/invested?pub="+encodeURIComponent(pub),{cache:"no-store"});
+    const t=await r.text(); let j=null; try{j=JSON.parse(t);}catch(_){j={raw:t};}
+    if(!r.ok) throw new Error((j&&j.error)||t||("HTTP "+r.status));
+    line.textContent="SOL: "+fmt(j.sol,6)+" | USDC: "+fmt(j.usdc,2)+(j.updated?(" • "+j.updated):"");
+  }catch(e){
+    line.textContent="ERR: "+(e&&e.message?e.message:String(e));
   }
-
-  // Stop propagation sur toute tentative de "share"
-  document.addEventListener("click",(e)=>{
-    const path = e.composedPath ? e.composedPath() : [];
-    for(const el of path){
-      if(el && isShareButton(el)){
-        e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
-        return false;
-      }
-    }
-  }, true);
 }
-
-// Observe pour les UI ajoutées après (React, etc.)
-const obs=new MutationObserver(()=>killShareUI());
-obs.observe(document.documentElement,{childList:true,subtree:true});
-
-if(document.readyState==="loading") document.addEventListener("DOMContentLoaded",killShareUI);
-else killShareUI();
+async function loop(){
+  ensureBox();
+  let last="";
+  for(;;){
+    const pub=await getPub();
+    if(pub && pub!==last){ last=pub; await refresh(pub); }
+    if(pub && Math.random()<0.25) await refresh(pub);
+    await sleep(3000);
+  }
+}
+document.addEventListener("DOMContentLoaded",()=>{ensureBox();loop();});
 })();
 JS
 
-# 2) Trouve un dossier web où déposer le patch (on cible wolverine d'abord)
-TARGET_DIR=""
-for d in \
-  /opt/fireinners/frontend-react/app/dist/wolverine \
-  /var/www/fireinners/wolverine \
-  /var/www/wolverine \
-  /opt/traderone-opt/public \
-  /srv/www \
-  /var/www/html
-do
-  if [ -d "$d" ]; then TARGET_DIR="$d"; break; fi
-done
+python3 - <<PY
+p=r"$HTML"
+s=open(p,"r",encoding="utf-8",errors="ignore").read()
+tag="patches/wolv_invested.js"
+if tag not in s:
+  ins='\\n<script src="patches/wolv_invested.js"></script>\\n'
+  if "</body>" in s: s=s.replace("</body>",ins+"</body>")
+  else: s+=ins
+  open(p,"w",encoding="utf-8").write(s)
+print("OK FRONT:",p)
+PY
 
-[ -n "$TARGET_DIR" ] || { echo "ERR: dossier web introuvable"; exit 1; }
+# 5) Patch BACK: /api/invested + /api/record_deposit + /api/record_withdraw
+export BACK LEDGER
+python3 - <<'PY'
+import os,re,datetime
+back=os.environ["BACK"]
+ledger=os.environ["LEDGER"]
+txt=open(back,"r",encoding="utf-8",errors="ignore").read()
 
-mkdir -p "$TARGET_DIR/patches"
-cp /tmp/$PATCH_JS_NAME "$TARGET_DIR/patches/$PATCH_JS_NAME"
-echo "OK: patch copié -> $TARGET_DIR/patches/$PATCH_JS_NAME"
+M0="// WOLV_INVEST_LEDGER_v1"
+M1="// /WOLV_INVEST_LEDGER_v1"
+if M0 in txt and M1 in txt:
+  a=txt.split(M0,1)[0]; b=txt.split(M1,1)[1]; txt=a+b
 
-# 3) Injecte le script dans tous les .html du dossier cible (et sous-dossiers)
-shopt -s nullglob
-for f in "$TARGET_DIR"/*.html "$TARGET_DIR"/*/*.html; do
-  [ -f "$f" ] || continue
-  grep -q "patches/$PATCH_JS_NAME" "$f" && continue
-  if grep -qi "</body>" "$f"; then
-    sed -i "s#</body>#\n<script src=\"patches/$PATCH_JS_NAME\"></script>\n</body>#i" "$f"
-    echo "PATCH HTML -> $f"
-  else
-    echo -e "\n<script src=\"patches/$PATCH_JS_NAME\"></script>\n" >> "$f"
-    echo "PATCH HTML (append) -> $f"
-  fi
-done
+inject=f'''
+// WOLV_INVEST_LEDGER_v1
+const fs=require("fs");
+const path=require("path");
+const __WOLV_LEDGER_PATH=process.env.WOLV_LEDGER_PATH||"{ledger.replace("\\\\","\\\\\\\\").replace('"','\\\\"')}";
+function __wolv_load(){{try{{return JSON.parse(fs.readFileSync(__WOLV_LEDGER_PATH,"utf8")||"{{}}");}}catch(e){{return {{}};}}}}
+function __wolv_save(db){{fs.mkdirSync(path.dirname(__WOLV_LEDGER_PATH),{{recursive:true}});fs.writeFileSync(__WOLV_LEDGER_PATH,JSON.stringify(db));}}
+function __wolv_initUser(db,pub){{if(!db[pub]) db[pub]={{sol:0,usdc:0,deposits:[],withdraws:[],updated:new Date().toISOString()}};}}
+function __wolv_apply(db,pub,asset,amount,sig,kind){{
+  __wolv_initUser(db,pub);
+  amount=Number(amount||0); 
+  if(not (amount>0)): 
+    raise Exception("amount")
+}}
+/* python guard removed; real code below */
+function __wolv_apply2(db,pub,asset,amount,sig,kind){{
+  __wolv_initUser(db,pub);
+  amount=Number(amount||0); if(!isFinite(amount)||amount<=0) throw new Error("amount");
+  asset=String(asset||"").toUpperCase();
+  const u=db[pub];
+  if(sig && (u.deposits.includes(sig) || u.withdraws.includes(sig))) return;
+  if(kind==="deposit"){{
+    if(asset==="SOL") u.sol += amount;
+    else if(asset==="USDC") u.usdc += amount;
+    else throw new Error("asset");
+    if(sig) u.deposits.push(sig);
+  }}else{{
+    if(asset==="SOL") u.sol -= amount;
+    else if(asset==="USDC") u.usdc -= amount;
+    else throw new Error("asset");
+    if(sig) u.withdraws.push(sig);
+    if(u.sol<0) u.sol=0;
+    if(u.usdc<0) u.usdc=0;
+  }}
+  u.updated=new Date().toISOString();
+}}
 
-echo "DONE. Recharge la page en dur: Ctrl+F5. Le bouton Share/Partager + la popup seront cachés."
+app.get("/api/invested",(req,res)=>{{
+  try{{
+    const pub=String(req.query.pub||"").trim();
+    if(!pub) return res.status(400).json({{error:"pub"}});
+    const db=__wolv_load();
+    const u=db[pub]||{{sol:0,usdc:0,updated:null}};
+    res.json({{sol:Number(u.sol||0),usdc:Number(u.usdc||0),updated:u.updated||null}});
+  }}catch(e){{res.status(500).json({{error:String(e&&e.message||e)}});}}
+}});
+
+app.post("/api/record_deposit",express.json(),(req,res)=>{{
+  try{{
+    const {{pub,asset,amount,depositSig}}=req.body||{{}};
+    if(!pub||!asset||!amount) return res.status(400).json({{ok:false,error:"params"}});
+    const db=__wolv_load();
+    __wolv_apply2(db,String(pub).trim(),asset,amount,depositSig||"","deposit");
+    __wolv_save(db);
+    res.json({{ok:true}});
+  }}catch(e){{res.status(500).json({{ok:false,error:String(e&&e.message||e)}});}}
+}});
+
+app.post("/api/record_withdraw",express.json(),(req,res)=>{{
+  try{{
+    const {{pub,asset,amount,txSig}}=req.body||{{}};
+    if(!pub||!asset||!amount) return res.status(400).json({{ok:false,error:"params"}});
+    const db=__wolv_load();
+    __wolv_apply2(db,String(pub).trim(),asset,amount,txSig||"","withdraw");
+    __wolv_save(db);
+    res.json({{ok:true}});
+  }}catch(e){{res.status(500).json({{ok:false,error:String(e&&e.message||e)}});}}
+}});
+// /WOLV_INVEST_LEDGER_v1
+'''
+
+# retire le petit "python guard" si jamais ça existe (sécurité)
+inject=re.sub(r'function __wolv_apply\([^}]+\}\n/\* python guard removed; real code below \*/\n','',inject,flags=re.S)
+
+m=re.search(r"\n\s*app\.listen\s*\(",txt)
+if m:
+  txt=txt[:m.start()]+inject+"\n"+txt[m.start():]
+else:
+  txt=txt+"\n"+inject+"\n"
+
+open(back,"w",encoding="utf-8").write(txt)
+print("OK BACK:",back)
+PY
+
+echo "OK PATCH INSTALLE."
+echo "Redémarre ton service node (celui qui sert /api) puis Ctrl+F5 sur https://fireinners.online/wolverine/"
 BASH
 
-bash /root/REMOVE_SHARE_PATCH.sh
+bash /root/WOLV_PATCH_INVEST_V1.sh
