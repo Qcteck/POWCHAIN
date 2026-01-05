@@ -1,17 +1,14 @@
-cat >/root/WOLV_FIX_BLANK_PAGE.sh <<'BASH'
+cat >/root/WOLV_DETECT_BUTTONS.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "== 1) Trouver le dossier réellement servi par nginx pour /wolverine =="
-NGINX_ROOTS=$(grep -RIn --no-messages "location\s\+\/wolverine" /etc/nginx 2>/dev/null || true)
-echo "$NGINX_ROOTS" | head -n 50 || true
-
-# Heuristique: on garde ton dist connu si présent
+echo "== FIND WEB DIR =="
 WEB_DIR=""
 for d in \
   /opt/fireinners/frontend-react/app/dist/wolverine \
   /var/www/fireinners/wolverine \
   /var/www/wolverine \
+  /opt/traderone-opt/public/wolverine \
   /opt/traderone-opt/public
 do
   if [ -d "$d" ]; then WEB_DIR="$d"; break; fi
@@ -19,40 +16,69 @@ done
 [ -n "$WEB_DIR" ] || { echo "ERR: dossier wolverine introuvable"; exit 1; }
 echo "WEB_DIR=$WEB_DIR"
 
-echo "== 2) Vérifier que le JS patch est servi par le web server =="
-echo "Fichiers patches:"
-ls -la "$WEB_DIR/patches" 2>/dev/null || true
+OUT="/root/wolv_dump"
+rm -rf "$OUT"
+mkdir -p "$OUT"
 
-echo "== 3) Voir si index.html contient les scripts injectés =="
-for f in "$WEB_DIR"/*.html "$WEB_DIR"/*/*.html; do
+echo "== COPY FILES =="
+# copie light (sans node_modules si jamais)
+tar -C "$WEB_DIR" -cf - . | tar -C "$OUT" -xf -
+echo "Copied -> $OUT"
+
+echo "== BASIC FILE LIST =="
+( cd "$OUT" && find . -maxdepth 4 -type f | sed 's|^\./||' | sort ) >"$OUT/FILES.txt"
+
+echo "== DETECT ENTRY HTML =="
+ENTRY=""
+for f in "$OUT"/*.html "$OUT"/**/*.html; do
   [ -f "$f" ] || continue
-  if grep -q "patches/patch_hide_share.js" "$f" || grep -q "patches/wolv_invested.js" "$f"; then
-    echo "--- $f (scripts trouvés) ---"
-    grep -n "patches/patch_hide_share.js\|patches/wolv_invested.js" "$f" || true
+  if grep -qi "wolverine" "$f" || grep -qi "root" "$f" || grep -qi "script" "$f"; then
+    ENTRY="$f"
+    break
   fi
 done
+echo "ENTRY=${ENTRY:-none}" >"$OUT/ENTRY.txt"
 
-echo "== 4) ROLLBACK: retirer patch_hide_share.js des HTML (si présent) =="
-for f in "$WEB_DIR"/*.html "$WEB_DIR"/*/*.html; do
-  [ -f "$f" ] || continue
-  if grep -q "patches/patch_hide_share.js" "$f"; then
-    cp -a "$f" "$f.bak.$(date +%s)"
-    sed -i '/patches\/patch_hide_share\.js/d' "$f"
-    echo "ROLLBACK HTML -> $f"
-  fi
-done
+echo "== REPORT (BUTTON + HANDLERS) =="
+REPORT="$OUT/REPORT.txt"
+: >"$REPORT"
 
-echo "== 5) (optionnel) si page encore blanche, retirer aussi wolv_invested.js =="
-# Décommente les 3 lignes ci-dessous si besoin :
-# for f in "$WEB_DIR"/*.html "$WEB_DIR"/*/*.html; do
-#   [ -f "$f" ] || continue
-#   sed -i '/patches\/wolv_invested\.js/d' "$f"
-# done
+echo "### 1) Scripts chargés par HTML" >>"$REPORT"
+if [ -n "${ENTRY:-}" ]; then
+  echo "# HTML: $ENTRY" >>"$REPORT"
+  grep -nE "<script[^>]+src=" "$ENTRY" >>"$REPORT" || true
+  echo "" >>"$REPORT"
+else
+  echo "No HTML entry found in $OUT" >>"$REPORT"
+fi
 
-echo "== 6) Reload nginx + hard refresh =="
-nginx -t && systemctl reload nginx || true
+echo "### 2) Recherche handlers (onclick / addEventListener / onClick React)" >>"$REPORT"
+# on scan JS/CSS/HTML
+grep -RIn --no-messages -E \
+  "onclick=|addEventListener\\(['\"]click['\"]|\\.onclick\\s*=|onClick\\s*=|handleClick|share|partager|telegram|whatsapp|facebook|twitter|copy.*link|copier.*lien" \
+  "$OUT" \
+  --include="*.js" --include="*.mjs" --include="*.cjs" --include="*.html" \
+  | head -n 2000 >>"$REPORT" || true
+echo "" >>"$REPORT"
 
-echo "DONE. Maintenant recharge la page: Ctrl+F5 sur https://fireinners.online/wolverine/"
+echo "### 3) Liste des fichiers JS les plus probables (gros bundles)" >>"$REPORT"
+( cd "$OUT" && find . -type f \( -name "*.js" -o -name "*.mjs" -o -name "*.cjs" \) -printf "%s\t%p\n" | sort -nr | head -n 30 ) >>"$REPORT"
+echo "" >>"$REPORT"
+
+echo "### 4) Cherche 'routes/api' utilisées côté front (fetch/axios)" >>"$REPORT"
+grep -RIn --no-messages -E "fetch\\(|axios\\.|/api/|http://|https://" \
+  "$OUT" --include="*.js" --include="*.mjs" --include="*.cjs" \
+  | head -n 1500 >>"$REPORT" || true
+echo "" >>"$REPORT"
+
+echo "### 5) Si React build: cherche composants sidebar/trade/chart" >>"$REPORT"
+grep -RIn --no-messages -E "Dashboard|Trade|Positions|Orders|History|Wallet|Settings|chart|candl|kline|symbol|buy|sell" \
+  "$OUT" --include="*.js" --include="*.mjs" --include="*.cjs" \
+  | head -n 1500 >>"$REPORT" || true
+
+echo "== DONE =="
+echo "Rapport: $REPORT"
+echo "Fichiers: $OUT/FILES.txt"
 BASH
 
-bash /root/WOLV_FIX_BLANK_PAGE.sh
+bash /root/WOLV_DETECT_BUTTONS.sh
