@@ -1,53 +1,173 @@
 bash -lc 'set -euo pipefail;
-CAND=(
+
+# 1) Trouve le FRONT (index.html Wolverine)
+CAND_HTML=(
 /opt/fireinners/frontend-react/app/dist/wolverine/index.html
 /var/www/fireinners/wolverine/index.html
 /var/www/wolverine/index.html
 /opt/traderone-opt/public/index.html
 );
 HTML="";
-for f in "${CAND[@]}"; do [ -f "$f" ] && HTML="$f" && break; done;
-[ -n "$HTML" ] || { echo "ERR: index.html Wolverine introuvable (paths connus)"; exit 1; }
-ROOTDIR="$(dirname "$HTML")";
-mkdir -p "$ROOTDIR/patches";
+for f in "${CAND_HTML[@]}";do [ -f "$f" ]&&HTML="$f"&&break;done;
+[ -n "$HTML" ]||{ echo "ERR: index.html wolverine introuvable"; exit 1; }
+FRONT_DIR="$(dirname "$HTML")";
+mkdir -p "$FRONT_DIR/patches";
 
-cat >"$ROOTDIR/patches/wolv_deposit.js" <<'"'"'JS'"'"'
+# 2) Trouve le BACK (server express qui a /api/start)
+BACK="$(grep -RIl --include="server.js" --include="app.js" --include="index.js" "/api/start" /opt /srv 2>/dev/null | head -n1 || true)";
+[ -n "$BACK" ]||{ echo "ERR: backend introuvable (aucun server.js/app.js/index.js avec /api/start)"; exit 1; }
+
+# 3) Ledger file (server)
+LEDGER_DIR="/opt/traderone-opt/data"; mkdir -p "$LEDGER_DIR";
+LEDGER="$LEDGER_DIR/wolv_ledger.json";
+[ -f "$LEDGER" ]||echo "{}" >"$LEDGER";
+
+# 4) Patch FRONT: affiche "Investi (TraderOne)" quand Phantom connecté + endpoint /api/invested?pub=
+cat >"$FRONT_DIR/patches/wolv_invested.js" <<'"'"'JS'"'"'
 (()=>{"use strict";
-const USDC_MINT="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1";
-const FALLBACK_TRADERONE="e8DbBrTJxRetx3HNFb83CsXMySETydHVLwxMzkjcVqh";
-const RPCS=[(window.__RPC__||"").trim(),"https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac","https://api.mainnet-beta.solana.com"].filter(Boolean);
-const $=s=>document.querySelector(s),$$=s=>Array.from(document.querySelectorAll(s));
-const sleep=ms=>new Promise(r=>setTimeout(r,ms));
-function logStatus(t){try{const el=$("#status")||$("#Status")||null;if(el)el.textContent=t;}catch(_){}console.log("[WOLV]",t);}
-function findBtnByText(txt){const t=String(txt||"").toLowerCase();return $$("button").find(b=>String(b.textContent||"").toLowerCase().includes(t))||null;}
-function parseTraderOneFromDOM(){const bodyText=(document.body&&document.body.innerText)||"";const m=bodyText.match(/Wallet\s*TraderOne.*?Adresse:\s*([1-9A-HJ-NP-Za-km-z]{32,44})/s);return(m&&m[1])?m[1].trim():FALLBACK_TRADERONE;}
-async function getWeb3(){for(let i=0;i<120;i++){if(window.solanaWeb3&&window.solanaWeb3.Connection&&window.solanaWeb3.PublicKey)return window.solanaWeb3;await sleep(50);}return null;}
-async function connectIfNeeded(){if(!window.solana)throw new Error("Phantom absent");if(window.solana.isConnected&&window.solana.publicKey)return window.solana.publicKey.toBase58();const r=await window.solana.connect();const pk=(r&&r.publicKey)?r.publicKey.toBase58():(window.solana.publicKey?window.solana.publicKey.toBase58():"");if(!pk)throw new Error("Connexion Phantom échouée");return pk;}
-async function scanDeposit({asset,minAmount,fromPub,toPub}){const web3=await getWeb3();if(!web3)throw new Error("Libs Solana pas prêtes");let lastErr=null;for(const rpc of RPCS){try{const conn=new web3.Connection(rpc,"confirmed");const to=new web3.PublicKey(toPub);const sigs=await conn.getSignaturesForAddress(to,{limit:30},"confirmed");const minLamports=(asset==="SOL")?Math.round(Number(minAmount||0)*1e9):0;const minUsdc=(asset==="USDC")?Number(minAmount||0):0;for(const s of sigs){const sig=s.signature;const tx=await conn.getParsedTransaction(sig,{maxSupportedTransactionVersion:0,commitment:"confirmed"});if(!tx||!tx.transaction)continue;if(asset==="SOL"){const ins=tx.transaction.message.instructions||[];for(const i of ins){if(i&&i.program==="system"&&i.parsed&&i.parsed.type==="transfer"){const info=i.parsed.info||{};const src=String(info.source||"");const dst=String(info.destination||"");const lam=Number(info.lamports||0);if(dst===toPub&&lam>=minLamports){if(fromPub&&src!==fromPub)continue;return{ok:true,sig,rpc,kind:"SOL",lamports:lam};}}}}else{const pre=tx.meta&&tx.meta.preTokenBalances?tx.meta.preTokenBalances:[];const post=tx.meta&&tx.meta.postTokenBalances?tx.meta.postTokenBalances:[];const sumByOwnerMint=(arr,owner,mint)=>{let sum=0;for(const b of arr){if(String(b.owner||"")===owner&&String(b.mint||"")===mint){const ui=b.uiTokenAmount&&typeof b.uiTokenAmount.uiAmount==="number"?b.uiTokenAmount.uiAmount:0;sum+=Number(ui||0);}}return sum;};const preSum=sumByOwnerMint(pre,toPub,USDC_MINT);const postSum=sumByOwnerMint(post,toPub,USDC_MINT);const delta=postSum-preSum;if(delta>=minUsdc){return{ok:true,sig,rpc,kind:"USDC",delta};}}}return{ok:false,reason:"Aucune TX entrante trouvée (30 dernières)"};}catch(e){lastErr=e;}}throw new Error(lastErr&&(lastErr.message||String(lastErr))||"RPC error");}
-function injectUI(){const startBtn=findBtnByText("start wolverine")||findBtnByText("start");if(!startBtn){logStatus("ERR: bouton START introuvable");return;}startBtn.style.display="none";const hostRow=startBtn.parentElement||document.body;const wrap=document.createElement("span");wrap.style.marginLeft="8px";wrap.style.display="inline-flex";wrap.style.gap="6px";wrap.style.alignItems="center";const assetSel=document.createElement("select");assetSel.id="wolvAsset";assetSel.innerHTML='<option value="SOL">SOL</option><option value="USDC">USDC</option>';const amt=document.createElement("input");amt.id="wolvAmt";amt.placeholder="Budget";amt.style.width="90px";const existingBudget=$$("input").find(x=>{const ph=(x.placeholder||"").toLowerCase();const nm=(x.name||"").toLowerCase();const id=(x.id||"").toLowerCase();return ph.includes("budget")||nm.includes("budget")||id.includes("budget");});if(existingBudget){amt.value=existingBudget.value||"";amt.addEventListener("input",()=>{existingBudget.value=amt.value;});existingBudget.addEventListener("input",()=>{amt.value=existingBudget.value;});}
-const confirmBtn=document.createElement("button");confirmBtn.id="wolvConfirmDeposit";confirmBtn.textContent="CONFIRMER DEPOT (ONCHAIN)";const info=document.createElement("span");info.id="wolvInfo";info.style.fontSize="12px";
-wrap.appendChild(document.createTextNode("Asset:"));wrap.appendChild(assetSel);wrap.appendChild(amt);wrap.appendChild(confirmBtn);wrap.appendChild(info);hostRow.appendChild(wrap);
-const LS_KEY="WOLV_DEPOSIT_OK_V1";const stored=(()=>{try{return JSON.parse(localStorage.getItem(LS_KEY)||"null");}catch(_){return null;}})();if(stored&&stored.ok&&stored.to===parseTraderOneFromDOM()){info.textContent="Depot déjà confirmé: "+stored.asset+" "+stored.amount+" (sig "+String(stored.sig||"").slice(0,10)+"...)";startBtn.style.display="";}
-confirmBtn.addEventListener("click",async()=>{try{info.textContent="";logStatus("Dépôt: scan on-chain...");const userPk=await connectIfNeeded();const toPk=parseTraderOneFromDOM();const asset=assetSel.value;const amount=Number((amt.value||"").trim());if(!amount||amount<=0)throw new Error("Montant budget invalide");const r=await scanDeposit({asset,minAmount:amount,fromPub:userPk,toPub:toPk});if(!r.ok)throw new Error(r.reason||"Depot non trouvé");localStorage.setItem(LS_KEY,JSON.stringify({ok:true,ts:Date.now(),asset,amount,sig:r.sig,to:toPk,from:userPk,rpc:r.rpc}));info.textContent="DEPOT OK: "+asset+" "+amount+" (sig "+String(r.sig).slice(0,12)+"...)";logStatus("DEPOT OK. START activé.");startBtn.style.display="";}catch(e){const m=e&&(e.message||String(e))||"ERR";info.textContent="ERR: "+m;logStatus("ERR dépôt: "+m);}});
-startBtn.addEventListener("click",async()=>{try{const st=(()=>{try{return JSON.parse(localStorage.getItem(LS_KEY)||"null");}catch(_){return null;}})();if(!st||!st.ok)throw new Error("Depot non confirmé");logStatus("START: appel API /api/start ...");const res=await fetch("/api/start",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({from:st.from,to:st.to,asset:st.asset,budget:st.amount,depositSig:st.sig})});const txt=await res.text();if(!res.ok)throw new Error("API start: "+txt);logStatus("START OK: "+txt);}catch(e){logStatus("ERR START: "+(e&&(e.message||String(e))||"ERR"));}},true);
-logStatus("Patch dépôt manuel chargé. 1) Send dans Phantom vers TraderOne 2) CONFIRMER DEPOT 3) START.");
+const $=s=>document.querySelector(s),sleep=ms=>new Promise(r=>setTimeout(r,ms));
+function fmt(n,d){n=Number(n||0);if(!isFinite(n))n=0;return n.toFixed(d);}
+function ensureBox(){
+  if($("#wolvInvestBox")) return;
+  const host=($("#top")||document.body);
+  const box=document.createElement("div");
+  box.id="wolvInvestBox";
+  box.style.marginTop="8px";
+  box.style.padding="8px";
+  box.style.border="1px solid #bbb";
+  box.style.borderRadius="8px";
+  box.style.maxWidth="980px";
+  box.innerHTML='<div style="font-weight:700;margin-bottom:6px">Investi (TraderOne)</div><div id="wolvInvestLine" style="font-size:13px">Connecte Phantom...</div>';
+  host.appendChild(box);
 }
-document.addEventListener("DOMContentLoaded",injectUI);
+async function getPub(){
+  if(!window.solana||!window.solana.isPhantom) return "";
+  if(window.solana.publicKey) return window.solana.publicKey.toBase58();
+  try{const r=await window.solana.connect({onlyIfTrusted:true});return (r&&r.publicKey)?r.publicKey.toBase58():"";}catch(_){return "";}
+}
+async function refresh(pub){
+  const line=$("#wolvInvestLine"); if(!line) return;
+  try{
+    const r=await fetch("/api/invested?pub="+encodeURIComponent(pub),{cache:"no-store"});
+    const t=await r.text();
+    let j=null; try{j=JSON.parse(t);}catch(_){j={raw:t};}
+    if(!r.ok) throw new Error((j&&j.error)||t||("HTTP "+r.status));
+    const sol=fmt(j.sol,6), usdc=fmt(j.usdc,2);
+    const upd=j.updated?(" • "+j.updated):"";
+    line.textContent="SOL: "+sol+" | USDC: "+usdc+upd;
+  }catch(e){
+    line.textContent="ERR: "+(e&&e.message?e.message:String(e));
+  }
+}
+async function loop(){
+  ensureBox();
+  let last="";
+  for(;;){
+    const pub=await getPub();
+    if(pub && pub!==last){ last=pub; await refresh(pub); }
+    if(pub && Math.random()<0.2) await refresh(pub);
+    await sleep(3000);
+  }
+}
+document.addEventListener("DOMContentLoaded",()=>{ensureBox();loop();});
 })();
 JS
 
 python3 - <<PY
 p=r"$HTML"
 s=open(p,"r",encoding="utf-8",errors="ignore").read()
-tag="patches/wolv_deposit.js"
+tag="patches/wolv_invested.js"
 if tag not in s:
-  ins='<script src="patches/wolv_deposit.js"></script>\\n'
+  ins='<script src="patches/wolv_invested.js"></script>\\n'
   if "</body>" in s: s=s.replace("</body>",ins+"</body>")
   else: s+=ins
   open(p,"w",encoding="utf-8").write(s)
-print("OK: patch injecté dans",p)
+print("OK FRONT:",p)
 PY
 
-echo "OK. Recharge https://fireinners.online/wolverine/ (Ctrl+F5)."
-echo "Flow: l utilisateur fait Send (SOL/USDC) -> clique CONFIRMER DEPOT (ONCHAIN) -> START WOLVERINE."
+# 5) Patch BACK: ledger + GET /api/invested + POST /api/record_deposit + POST /api/record_withdraw (optionnel)
+python3 - <<PY
+import re,os,sys,datetime
+back=r"$BACK"
+txt=open(back,"r",encoding="utf-8",errors="ignore").read()
+M0="// WOLV_INVEST_LEDGER_v1"
+M1="// /WOLV_INVEST_LEDGER_v1"
+if M0 in txt and M1 in txt:
+  a=txt.split(M0,1)[0]; b=txt.split(M1,1)[1]; txt=a+b
+
+inject = r'''
+// WOLV_INVEST_LEDGER_v1
+const fs=require("fs");
+const path=require("path");
+const __WOLV_LEDGER_PATH=process.env.WOLV_LEDGER_PATH||"%s";
+function __wolv_load(){try{return JSON.parse(fs.readFileSync(__WOLV_LEDGER_PATH,"utf8")||"{}");}catch(e){return {};}}
+function __wolv_save(db){fs.mkdirSync(path.dirname(__WOLV_LEDGER_PATH),{recursive:true});fs.writeFileSync(__WOLV_LEDGER_PATH,JSON.stringify(db));}
+function __wolv_initUser(db,pub){if(!db[pub]) db[pub]={sol:0,usdc:0,deposits:[],withdraws:[],updated:new Date().toISOString()};}
+function __wolv_apply(db,pub,asset,amount,sig,kind){
+  __wolv_initUser(db,pub);
+  amount=Number(amount||0); if(!isFinite(amount)||amount<=0) throw new Error("amount");
+  asset=String(asset||"").toUpperCase();
+  const u=db[pub];
+  const arr=(kind==="deposit")?u.deposits:u.withdraws;
+  if(sig && (u.deposits.includes(sig) || u.withdraws.includes(sig))) return;
+  if(kind==="deposit"){
+    if(asset==="SOL") u.sol += amount;
+    else if(asset==="USDC") u.usdc += amount;
+    else throw new Error("asset");
+    if(sig) u.deposits.push(sig);
+  }else{
+    if(asset==="SOL") u.sol -= amount;
+    else if(asset==="USDC") u.usdc -= amount;
+    else throw new Error("asset");
+    if(sig) u.withdraws.push(sig);
+    if(u.sol<0) u.sol=0;
+    if(u.usdc<0) u.usdc=0;
+  }
+  u.updated=new Date().toISOString();
+}
+app.get("/api/invested",(req,res)=>{
+  try{
+    const pub=String(req.query.pub||"").trim();
+    if(!pub) return res.status(400).json({error:"pub"});
+    const db=__wolv_load();
+    const u=db[pub]||{sol:0,usdc:0,updated:null};
+    res.json({sol:Number(u.sol||0),usdc:Number(u.usdc||0),updated:u.updated||null});
+  }catch(e){res.status(500).json({error:String(e&&e.message||e)});}
+});
+app.post("/api/record_deposit",express.json(),(req,res)=>{
+  try{
+    const {pub,asset,amount,depositSig}=req.body||{};
+    if(!pub||!asset||!amount) return res.status(400).json({ok:false,error:"params"});
+    const db=__wolv_load();
+    __wolv_apply(db,String(pub).trim(),asset,amount,depositSig||"", "deposit");
+    __wolv_save(db);
+    res.json({ok:true});
+  }catch(e){res.status(500).json({ok:false,error:String(e&&e.message||e)});}
+});
+app.post("/api/record_withdraw",express.json(),(req,res)=>{
+  try{
+    const {pub,asset,amount,txSig}=req.body||{};
+    if(!pub||!asset||!amount) return res.status(400).json({ok:false,error:"params"});
+    const db=__wolv_load();
+    __wolv_apply(db,String(pub).trim(),asset,amount,txSig||"", "withdraw");
+    __wolv_save(db);
+    res.json({ok:true});
+  }catch(e){res.status(500).json({ok:false,error:String(e&&e.message||e)});}
+});
+// /WOLV_INVEST_LEDGER_v1
+''' % (r"$LEDGER").replace("\\","\\\\").replace('"','\\"')
+
+# Injecte juste avant app.listen si possible, sinon à la fin
+m=re.search(r"\n\s*app\.listen\s*\(",txt)
+if m:
+  txt=txt[:m.start()]+inject+"\n"+txt[m.start():]
+else:
+  txt=txt+"\n"+inject+"\n"
+open(back,"w",encoding="utf-8").write(txt)
+print("OK BACK:",back)
+PY
+
+echo "OK. Front+Back patchés."
+echo "IMPORTANT: Quand tu confirmes un dépôt côté UI (ton flow), appelle aussi POST /api/record_deposit pour comptabiliser l investi."
+echo "Redémarre ton service node puis Ctrl+F5 sur /wolverine."
 '
