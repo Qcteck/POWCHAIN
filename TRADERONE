@@ -1,30 +1,31 @@
-cat >/root/WOLV_SINGLE_UI_V2.sh <<'BASH'
+cat >/root/WOLV_SINGLE_UI_V3.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 TS="$(date +%s)"
 DIST="/opt/fireinners/frontend-react/app/dist"
 WOLV="$DIST/wolverine"
-NG="/etc/nginx/sites-available/fireinners.online-ssl"
 BOT="e8DbBrTJxRetx3HNFb83CsXMySETydHVLwxMzkjcVqh"
 
+# find vhost file (available/enabled)
+NG=""
+for f in /etc/nginx/sites-available/fireinners.online-ssl /etc/nginx/sites-enabled/fireinners.online-ssl; do
+  [ -f "$f" ] && NG="$f" && break
+done
+[ -n "$NG" ] || { echo "ERR: vhost fireinners.online-ssl introuvable"; exit 1; }
 [ -d "$DIST" ] || { echo "ERR: dist introuvable: $DIST"; exit 1; }
-[ -f "$NG" ] || { echo "ERR: vhost introuvable: $NG"; exit 1; }
 
-# wipe wolverine (backup rapide)
-mkdir -p "$DIST/_bak_wolverine_$TS"
-if [ -d "$WOLV" ]; then
-  chattr -i "$WOLV" 2>/dev/null || true
-  cp -a "$WOLV"/. "$DIST/_bak_wolverine_$TS/" 2>/dev/null || true
-  rm -rf "$WOLV"
-fi
+# wipe wolverine
+mkdir -p "$WOLV"
+rm -rf "$WOLV"
 mkdir -p "$WOLV"
 
-# write HTML via python (aucun risque que bash exécute le JS)
-python3 - <<PY
+# write HTML (no shell expansion inside python)
+python3 - <<'PY'
 from pathlib import Path
-TS=${TS}
-BOT="${BOT}"
-WOLV=Path("${WOLV}")
+import time
+TS=int(time.time())
+BOT="e8DbBrTJxRetx3HNFb83CsXMySETydHVLwxMzkjcVqh"
+WOLV=Path("/opt/fireinners/frontend-react/app/dist/wolverine")
 html=f"""<!doctype html><html lang="fr"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><meta http-equiv="Cache-Control" content="no-store"/><meta http-equiv="Pragma" content="no-cache"/><meta http-equiv="Expires" content="0"/><title>WOLVERINE</title><style>
 body{{font:14px Arial,system-ui;margin:0;padding:14px;background:#fff}}
 #wrap{{max-width:980px;margin:0 auto;border:1px solid #bbb;border-radius:12px;padding:12px}}
@@ -43,6 +44,7 @@ hr{{border:none;border-top:1px solid #ddd;margin:12px 0}}
 <div class="row">
   <button id="btnConnect" type="button">Connect Wallet (Phantom)</button>
   <div>Wallet: <span id="pub" class="mono">—</span></div>
+  <div>Investi: <span id="invested" class="mono">—</span></div>
 </div>
 
 <div class="box">
@@ -90,78 +92,81 @@ hr{{border:none;border-top:1px solid #ddd;margin:12px 0}}
 <div class="row"><small>Build:</small> <span class="mono">{TS}</span></div>
 
 <script>
-(()=>{{"use strict";
+(()=>{"use strict";
 const BOT="{BOT}";
 const $=s=>document.querySelector(s);
-const setMsg=(el,txt,ok)=>{{el.textContent=txt||"";el.className=ok?"ok":"bad";}};
-(async()=>{{try{{if("serviceWorker"in navigator){{const regs=await navigator.serviceWorker.getRegistrations();for(const r of regs)try{{await r.unregister()}}catch(_e){{}}}}}}catch(_e){{}}}})();
+const setMsg=(el,txt,ok)=>{el.textContent=txt||"";el.className=ok?"ok":"bad";};
 
-const jpost=async(url,obj)=>{{
-  const r=await fetch(url,{{method:"POST",headers:{{"content-type":"application/json"}},body:JSON.stringify(obj||{{}})}});
-  const t=await r.text(); let j=null; try{{j=JSON.parse(t)}}catch(_e){{}}
+(async()=>{try{if("serviceWorker"in navigator){const regs=await navigator.serviceWorker.getRegistrations();for(const r of regs)try{await r.unregister()}catch(e){}}}catch(e){}})();
+
+const jpost=async(url,obj)=>{
+  const r=await fetch(url,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(obj||{})});
+  const t=await r.text(); let j=null; try{j=JSON.parse(t)}catch(e){}
   if(!r.ok) throw new Error((j&&j.err)||t||("HTTP "+r.status));
-  return j||{{}};
-}};
-const jget=async(url)=>{{
-  const r=await fetch(url,{{method:"GET"}});
-  const t=await r.text(); let j=null; try{{j=JSON.parse(t)}}catch(_e){{}}
+  return j||{};
+};
+const jget=async(url)=>{
+  const r=await fetch(url,{method:"GET"});
+  const t=await r.text(); let j=null; try{j=JSON.parse(t)}catch(e){}
   if(!r.ok) throw new Error((j&&j.err)||t||("HTTP "+r.status));
-  return j||{{}};
-}};
-const getPub=async()=>{{
+  return j||{};
+};
+const getPub=async()=>{
   if(!window.solana||!window.solana.isPhantom) throw new Error("Phantom non détecté");
   if(window.solana.publicKey) return window.solana.publicKey.toBase58();
   const r=await window.solana.connect(); return r&&r.publicKey?r.publicKey.toBase58():"";
-}};
-async function refresh(pub){{
+};
+async function refresh(pub){
   const st=await jget("/wolverine/api/wolv_state?pub="+encodeURIComponent(pub));
   const m=(st&&st.user&&st.user.mode)||"SAFE"; $("#mode").value=m;
+  const inv=(st && st.user && (st.user.invested_usdc ?? st.user.invested ?? null));
+  $("#invested").textContent=(inv===null||inv===undefined)?"—":String(inv);
   const ld=st&&st.user&&st.user.last_deposit;
-  if(ld&&ld.sig){{$("#lastDep").textContent=(ld.asset+" "+ld.amount+" | "+ld.sig); $("#btnStart").disabled=false;}}
-  else {{$("#lastDep").textContent="—"; $("#btnStart").disabled=true;}}
-}}
+  if(ld&&ld.sig){$("#lastDep").textContent=(ld.asset+" "+ld.amount+" | "+ld.sig); $("#btnStart").disabled=false;}
+  else {$("#lastDep").textContent="—"; $("#btnStart").disabled=true;}
+}
 
-$("#btnConnect").onclick=async()=>{{
-  try{{const pub=await getPub(); $("#pub").textContent=pub; await refresh(pub);}}
-  catch(e){{alert(String(e&&e.message?e.message:e));}}
-}};
-$("#btnMode").onclick=async()=>{{
-  try{{
+$("#btnConnect").onclick=async()=>{
+  try{const pub=await getPub(); $("#pub").textContent=pub; await refresh(pub);}
+  catch(e){alert(String(e&&e.message?e.message:e));}
+};
+$("#btnMode").onclick=async()=>{
+  try{
     const pub=await getPub(); $("#pub").textContent=pub;
     setMsg($("#modeMsg"),"Sauvegarde...",false);
-    await jpost("/wolverine/api/wolv_set_mode",{{pub,mode:$("#mode").value}});
+    await jpost("/wolverine/api/wolv_set_mode",{pub,mode:$("#mode").value});
     setMsg($("#modeMsg"),"OK",true);
-  }}catch(e){{setMsg($("#modeMsg"),"ERR: "+String(e&&e.message?e.message:e),false);}}
-}};
-$("#btnConfirm").onclick=async()=>{{
-  try{{
+  }catch(e){setMsg($("#modeMsg"),"ERR: "+String(e&&e.message?e.message:e),false);}
+};
+$("#btnConfirm").onclick=async()=>{
+  try{
     const pub=await getPub(); $("#pub").textContent=pub;
     const asset=$("#asset").value;
     const amt=Number($("#amount").value||0);
     if(!(amt>0)) return setMsg($("#depMsg"),"Montant invalide",false);
     setMsg($("#depMsg"),"Scan on-chain...",false);
-    const out=await jpost("/wolverine/api/wolv_confirm_deposit",{{pub,asset,amount:amt,bot:BOT}});
-    if(out&&out.ok&&out.sig){{setMsg($("#depMsg"),"OK: "+out.sig,true); await refresh(pub);}}
+    const out=await jpost("/wolverine/api/wolv_confirm_deposit",{pub,asset,amount:amt,bot:BOT});
+    if(out&&out.ok&&out.sig){setMsg($("#depMsg"),"OK: "+out.sig,true); await refresh(pub);}
     else setMsg($("#depMsg"),"Pas trouvé (réessaie après confirmation réseau)",false);
-  }}catch(e){{setMsg($("#depMsg"),"ERR: "+String(e&&e.message?e.message:e),false);}}
-}};
-$("#btnStart").onclick=async()=>{{
-  try{{
+  }catch(e){setMsg($("#depMsg"),"ERR: "+String(e&&e.message?e.message:e),false);}
+};
+$("#btnStart").onclick=async()=>{
+  try{
     const pub=await getPub(); $("#pub").textContent=pub;
     setMsg($("#startMsg"),"Start...",false);
-    await jpost("/wolverine/api/start",{{pub}});
+    await jpost("/wolverine/api/start",{pub});
     setMsg($("#startMsg"),"OK",true);
-  }}catch(e){{setMsg($("#startMsg"),"ERR: "+String(e&&e.message?e.message:e),false);}}
-}};
-}})();
-</script></body></html>"""
-(WOLV/f"index.{TS}.html").write_text(html, encoding="utf-8")
-(WOLV/"index.html").write_text(html, encoding="utf-8")
+  }catch(e){setMsg($("#startMsg"),"ERR: "+String(e&&e.message?e.message:e),false);}
+};
+})();
+</script></div></body></html>"""
+(WOLV/f"index.{TS}.html").write_text(html,encoding="utf-8")
+(WOLV/"index.html").write_text(html,encoding="utf-8")
 PY
 
-# patch nginx dans le server 443 (brace counter), avec markers
-MARK_BEGIN="# BEGIN WOLV_SINGLE_UI_V2"
-MARK_END="# END WOLV_SINGLE_UI_V2"
+# nginx patch (insert in server 443 of this vhost)
+MARK_BEGIN="# BEGIN WOLV_SINGLE_UI_V3"
+MARK_END="# END WOLV_SINGLE_UI_V3"
 BLOCK="$MARK_BEGIN
 location = /wolverine/ {
   add_header Cache-Control \"no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0\" always;
@@ -199,37 +204,32 @@ r=replace_marked(s)
 if r is not None:
     open(p,"w",encoding="utf-8").write(r); sys.exit(0)
 
-# find server blocks with brace counting
+# find server blocks (brace counter)
 servers=[]
-for m in re.finditer(r'(?m)^\\s*server\\s*\\{', s):
-    i=m.start()
-    depth=0
-    j=i
+for m in re.finditer(r'(?m)^\s*server\s*\{', s):
+    i=m.start(); depth=0; j=i
     while j < len(s):
         c=s[j]
         if c=='{': depth+=1
         elif c=='}':
             depth-=1
             if depth==0:
-                servers.append((i,j+1,s[i:j+1]))
-                break
+                servers.append((i,j+1,s[i:j+1])); break
         j+=1
 
 if not servers:
     raise SystemExit("ERR: aucun bloc server { } trouvé dans le vhost")
 
-# pick 443 ssl server if possible
+# pick 443 server
 pick=None
 for a,b,txt in servers:
-    if re.search(r'(?m)^\\s*listen\\s+443', txt) and ('fireinners.online' in txt or 'server_name' in txt):
+    if re.search(r'(?m)^\s*listen\s+443', txt):
         pick=(a,b,txt); break
-if pick is None:
-    pick=servers[-1]
+if pick is None: pick=servers[-1]
 a,b,txt=pick
 
-# insert before last closing brace of that server
-ins_pos=b-1
-out=s[:ins_pos].rstrip()+"\n\n"+block+"\n\n"+s[ins_pos:]
+ins=b-1
+out=s[:ins].rstrip()+"\n\n"+block+"\n\n"+s[ins:]
 open(p,"w",encoding="utf-8").write(out)
 PY
 
@@ -237,8 +237,8 @@ nginx -t
 systemctl reload nginx
 chattr +i "$NG" 2>/dev/null || true
 
-echo "OK: Wolverine SINGLE UI V2 installé."
-echo "Ouvre: https://fireinners.online/wolverine/ (redir vers /wolverine/index.$TS.html)"
+echo "OK: SINGLE UI V3 installé"
+echo "URL: https://fireinners.online/wolverine/ (redir auto vers index.$TS.html)"
 BASH
 
-bash /root/WOLV_SINGLE_UI_V2.sh
+bash /root/WOLV_SINGLE_UI_V3.sh
