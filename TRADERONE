@@ -1,428 +1,472 @@
-bash -lc 'cat > /root/WOLV_PATCH_MANUAL_DEPOSIT_V1.sh << "SH"
+cat >/root/WOLV_MIN_UI_V1.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
-MARKER_NGX="WOLV_API_PROXY_V5"
-NOW="$(date +%s)"
-
-BOT_PUB_DEFAULT="e8DbBrTJxRetx3HNFb83CsXMySETydHVLwxMzkjcVqh"
-RPC_DEFAULT="https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac"
+BOT_PUB="e8DbBrTJxRetx3HNFb83CsXMySETydHVLwxMzkjcVqh"
 USDC_MINT="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1"
+RPC_URL="${RPC_URL:-https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac}"
 
-echo "[1/6] Patch nginx: /wolverine/api -> 127.0.0.1:3000 (/api/*)"
+API_DIR="/opt/wolverine-api"
+API_PORT="3002"
 
-# dégel si immutable (ignore si non)
-chattr -i /etc/nginx/nginx.conf 2>/dev/null || true
+LEDGER_DIR="/opt/traderone-opt/data"
+LEDGER_FILE="${LEDGER_DIR}/wolv_ledger.json"
+
+VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
+NGINX_MAIN="/etc/nginx/nginx.conf"
+
+FRONT_CANDIDATES=(
+  "/opt/fireinners/frontend-react/app/dist/wolverine/index.html"
+  "/var/www/fireinners/wolverine/index.html"
+  "/var/www/wolverine/index.html"
+)
+PATCH_DIR_CANDIDATES=(
+  "/opt/fireinners/frontend-react/app/dist/wolverine/patches"
+  "/var/www/fireinners/wolverine/patches"
+  "/var/www/wolverine/patches"
+)
+
+PATCH_NAME="wolv_ui_min_v1.js"
+OLD_PATCH_1="wolv_ui_patch_base_v1.js"
+OLD_PATCH_2="wolv_ui_patch" # wildcard
+
+mkdir -p "$LEDGER_DIR"
+if [ ! -f "$LEDGER_FILE" ]; then echo '{"users":{},"deposits_seen":{}}' >"$LEDGER_FILE"; fi
+
+mkdir -p "$API_DIR"
+cd "$API_DIR"
+if [ ! -f package.json ]; then npm init -y >/dev/null 2>&1; fi
+npm pkg set name="wolverine-api" >/dev/null 2>&1 || true
+npm pkg set type="commonjs" >/dev/null 2>&1 || true
+npm i express node-fetch@2 @solana/web3.js @solana/spl-token >/dev/null 2>&1 || true
+
+cat >"$API_DIR/server.js" <<'JS'
+"use strict";
+const fs=require("fs");
+const express=require("express");
+const fetch=require("node-fetch");
+const {Connection,PublicKey}=require("@solana/web3.js");
+const spl=require("@solana/spl-token");
+
+const BOT_PUB=new PublicKey(process.env.BOT_PUB);
+const USDC_MINT=new PublicKey(process.env.USDC_MINT);
+const RPC_URL=process.env.RPC_URL;
+const LEDGER_FILE=process.env.LEDGER_FILE;
+const API_PORT=Number(process.env.API_PORT||3002);
+
+const conn=new Connection(RPC_URL,"confirmed");
+const app=express();
+app.use(express.json({limit:"256kb"}));
+
+const n=x=>{const v=Number(x);return Number.isFinite(v)?v:0;};
+const now=()=>Date.now();
+
+function readLedger(){
+  try{return JSON.parse(fs.readFileSync(LEDGER_FILE,"utf8")||"{}");}
+  catch{return {users:{},deposits_seen:{}};}
+}
+function writeLedger(L){fs.writeFileSync(LEDGER_FILE,JSON.stringify(L,null,2));}
+
+function botUsdcAta(){ return spl.getAssociatedTokenAddressSync(USDC_MINT,BOT_PUB,false); }
+
+function matchSolDeposit(tx,fromPub,minSol){
+  if(!tx||tx.meta?.err) return null;
+  const ix=tx.transaction?.message?.instructions||[];
+  for(const it of ix){
+    if(it?.program==="system"&&it?.parsed?.type==="transfer"){
+      const info=it.parsed.info||{};
+      if(info.source===fromPub && info.destination===BOT_PUB.toBase58()){
+        const sol=n(info.lamports)/1e9;
+        if(sol+1e-12>=minSol) return {sig:tx.transaction.signatures?.[0],amount:sol};
+      }
+    }
+  }
+  return null;
+}
+
+function matchUsdcDeposit(tx,fromPub,minUsdc){
+  if(!tx||tx.meta?.err) return null;
+  const dstAta=botUsdcAta().toBase58();
+  const ix=tx.transaction?.message?.instructions||[];
+  for(const it of ix){
+    if(it?.program==="spl-token" && it?.parsed){
+      const info=it.parsed.info||{};
+      const dst=info.destination;
+      if(dst===dstAta){
+        let ui=0;
+        if(info.tokenAmount && info.tokenAmount.uiAmount!=null) ui=n(info.tokenAmount.uiAmount);
+        else if(info.amount) ui=n(info.amount)/1e6;
+        const auth=info.authority||"";
+        const okFrom=(auth===fromPub);
+        if(okFrom && ui+1e-12>=minUsdc) return {sig:tx.transaction.signatures?.[0],amount:ui};
+      }
+    }
+  }
+  return null;
+}
+
+async function scanDeposit(pub,asset,amount){
+  const fromPub=new PublicKey(pub).toBase58();
+  const L=readLedger();
+  if(!L.users) L.users={};
+  if(!L.deposits_seen) L.deposits_seen={};
+
+  const target=(asset==="USDC")?botUsdcAta():BOT_PUB;
+  const sigs=await conn.getSignaturesForAddress(target,{limit:40});
+  for(const s of sigs){
+    const sig=s.signature;
+    if(!sig||L.deposits_seen[sig]) continue;
+    const tx=await conn.getParsedTransaction(sig,{maxSupportedTransactionVersion:0,commitment:"confirmed"});
+    const hit=(asset==="SOL")?matchSolDeposit(tx,fromPub,amount):matchUsdcDeposit(tx,fromPub,amount);
+    if(hit&&hit.sig){
+      L.deposits_seen[hit.sig]={at:now(),pub:fromPub,asset,amount:hit.amount};
+      if(!L.users[fromPub]) L.users[fromPub]={mode:"AUTO",last_deposit:null};
+      L.users[fromPub].last_deposit={sig:hit.sig,asset,amount:hit.amount,at:now()};
+      writeLedger(L);
+      return {ok:true,sig:hit.sig,amount:hit.amount};
+    }
+  }
+  writeLedger(L);
+  return {ok:false};
+}
+
+app.get("/wolverine/api/health",(_req,res)=>res.json({ok:true}));
+app.get("/wolverine/api/wolv_state",(req,res)=>{
+  const pub=String(req.query.pub||"");
+  const L=readLedger();
+  const u=(pub && L.users && L.users[pub])?L.users[pub]:{mode:"AUTO",last_deposit:null};
+  res.json({ok:true,bot_pub:BOT_PUB.toBase58(),bot_usdc_ata:botUsdcAta().toBase58(),user:u});
+});
+app.post("/wolverine/api/wolv_set_mode",(req,res)=>{
+  const pub=String(req.body?.pub||"");
+  const mode=String(req.body?.mode||"AUTO").toUpperCase().slice(0,24);
+  if(!pub) return res.status(400).json({ok:false,err:"bad_params"});
+  const L=readLedger();
+  if(!L.users) L.users={};
+  if(!L.users[pub]) L.users[pub]={mode:"AUTO",last_deposit:null};
+  L.users[pub].mode=mode;
+  writeLedger(L);
+  res.json({ok:true,mode});
+});
+app.post("/wolverine/api/wolv_confirm_deposit",async(req,res)=>{
+  try{
+    const pub=String(req.body?.pub||"");
+    const asset=String(req.body?.asset||"USDC").toUpperCase();
+    const amount=n(req.body?.amount);
+    if(!pub||!["SOL","USDC"].includes(asset)||!(amount>0)) return res.status(400).json({ok:false,err:"bad_params"});
+    const out=await scanDeposit(pub,asset,amount);
+    res.json(out);
+  }catch(e){
+    res.status(500).json({ok:false,err:String(e&&e.message?e.message:e)});
+  }
+});
+
+// proxy fallback vers ton API existante (3000): /wolverine/api/* -> http://127.0.0.1:3000/api/*
+app.use("/wolverine/api/",async(req,res)=>{
+  try{
+    const sub=req.originalUrl.replace(/^\/wolverine\/api\//,"");
+    const url=`http://127.0.0.1:3000/api/${sub}`;
+    const headers={...req.headers}; delete headers.host;
+    const body=(req.method==="GET"||req.method==="HEAD")?undefined:JSON.stringify(req.body??{});
+    const r=await fetch(url,{method:req.method,headers:{...headers,"content-type":"application/json"},body});
+    const txt=await r.text();
+    res.status(r.status);
+    try{res.json(JSON.parse(txt));}catch{res.type("text/plain").send(txt);}
+  }catch(e){
+    res.status(502).json({ok:false,err:"proxy_fail",detail:String(e&&e.message?e.message:e)});
+  }
+});
+
+app.listen(API_PORT,"127.0.0.1",()=>console.log("wolverine-api 127.0.0.1:"+API_PORT));
+JS
+
+cat >/etc/systemd/system/wolverine-api.service <<EOF
+[Unit]
+Description=Wolverine API (minimal)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=$API_DIR
+Environment=BOT_PUB=$BOT_PUB
+Environment=USDC_MINT=$USDC_MINT
+Environment=RPC_URL=$RPC_URL
+Environment=API_PORT=$API_PORT
+Environment=LEDGER_FILE=$LEDGER_FILE
+ExecStart=/usr/bin/node $API_DIR/server.js
+Restart=always
+RestartSec=1
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now wolverine-api.service
+systemctl restart wolverine-api.service
+
 chattr -i "$VHOST" 2>/dev/null || true
+chattr -i "$NGINX_MAIN" 2>/dev/null || true
 
 python3 - <<PY
 import re,sys
-p="$VHOST"
-marker="$MARKER_NGX"
+vhost="$VHOST"
+s=open(vhost,"r",encoding="utf-8",errors="ignore").read()
+
+marker="# WOLV_API_PROXY_MIN_V1"
 block=f"""
-    # {marker}
+    {marker}
     location ^~ /wolverine/api/ {{
-        rewrite ^/wolverine/api/(.*)\$ /api/\$1 break;
-        proxy_pass http://127.0.0.1:3000;
+        proxy_pass http://127.0.0.1:{API_PORT};
         proxy_http_version 1.1;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Host \\$host;
+        proxy_set_header X-Real-IP \\$remote_addr;
+        proxy_set_header X-Forwarded-For \\$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \\$scheme;
         proxy_read_timeout 60s;
     }}
-    # END {marker}
 """
-s=open(p,"r",encoding="utf-8",errors="ignore").read()
+
 if marker in s:
-    print("OK nginx: marker already present")
-    sys.exit(0)
+    print("OK nginx proxy déjà présent"); sys.exit(0)
 
-# trouve blocs server { ... } et choisit celui qui contient listen 443 ou ssl
-def server_blocks(txt):
-    out=[]
-    i=0
-    while True:
-        m=re.search(r'(?m)^[ \t]*server[ \t]*\{', txt[i:])
-        if not m: break
-        start=i+m.start()
-        j=start+m.end()-m.start()
-        depth=0
-        k=j
-        while k < len(txt):
-            ch=txt[k]
-            if ch=='{': depth+=1
-            elif ch=='}':
-                if depth==0:
-                    end=k+1
-                    out.append((start,end))
-                    i=end
-                    break
-                depth-=1
-            k+=1
-        else:
-            break
-    return out
-
-blocks=server_blocks(s)
-if not blocks:
-    raise SystemExit("ERR: no server{} block found in vhost")
-
-best=None
-for (a,b) in blocks:
-    seg=s[a:b]
-    if ("listen 443" in seg) or ("ssl" in seg):
-        best=(a,b); break
-if best is None:
-    best=blocks[-1]
-a,b=best
-seg=s[a:b]
-
-# insère avant la dernière }
-ins=seg.rfind("}")
-if ins==-1:
-    raise SystemExit("ERR: server block malformed")
-seg2=seg[:ins] + block + seg[ins:]
-s2=s[:a] + seg2 + s[b:]
-
-open(p,"w",encoding="utf-8").write(s2)
-print("OK nginx: inserted proxy block")
+# simple: choisit le dernier bloc server { ... } (souvent ssl)
+starts=[m.start() for m in re.finditer(r'(?m)^\\s*server\\s*\\{',s)]
+if not starts: raise SystemExit("ERR: aucun server{} dans vhost")
+start=starts[-1]
+# trouve la fin de ce server avec compteur d'accolades
+i=start; depth=0; opened=False
+while i < len(s):
+    c=s[i]
+    if c=='{': depth+=1; opened=True
+    elif c=='}' and opened:
+        depth-=1
+        if depth==0:
+            end=i+1
+            blk=s[start:end]
+            ins=blk[:-1]+block+"\\n}"
+            out=s[:start]+ins+s[end:]
+            open(vhost,"w",encoding="utf-8").write(out)
+            print("OK nginx proxy ajouté"); sys.exit(0)
+    i+=1
+raise SystemExit("ERR: fin server{} introuvable")
 PY
 
-nginx -t >/dev/null
+nginx -t
 systemctl reload nginx
-
-# regel si tu veux (ignore si fail)
-chattr +i /etc/nginx/nginx.conf 2>/dev/null || true
 chattr +i "$VHOST" 2>/dev/null || true
+chattr +i "$NGINX_MAIN" 2>/dev/null || true
 
-echo "[2/6] Trouve le backend (port 3000) et injecte wolv_ledger_api.js"
-
-PID="$(lsof -t -iTCP:3000 -sTCP:LISTEN 2>/dev/null | head -n1 || true)"
-UNIT=""
-if [ -n "${PID:-}" ]; then
-  UNIT="$(systemctl status "$PID" --no-pager 2>/dev/null | head -n1 | sed -n "s/^● \\([^ ]\\+\\).*/\\1/p" || true)"
-fi
-
-SERVER_JS="$(grep -Rsl --exclude-dir=node_modules --exclude-dir=dist --exclude-dir=.git "app.post('/api/start'" /opt /var/www 2>/dev/null | head -n1 || true)"
-if [ -z "${SERVER_JS:-}" ]; then
-  SERVER_JS="$(grep -Rsl --exclude-dir=node_modules --exclude-dir=dist --exclude-dir=.git "/api/start" /opt /var/www 2>/dev/null | head -n1 || true)"
-fi
-if [ -z "${SERVER_JS:-}" ]; then
-  if [ -f /opt/traderone-opt/server.js ]; then SERVER_JS="/opt/traderone-opt/server.js"; fi
-fi
-if [ -z "${SERVER_JS:-}" ]; then
-  echo "ERR: backend server.js introuvable (port 3000). Dis-moi le chemin exact du fichier node qui écoute 3000."
-  exit 1
-fi
-
-BDIR="$(cd "$(dirname "$SERVER_JS")" && pwd)"
-LEDGER_DIR="/opt/traderone-opt/data"
-LEDGER_FILE="$LEDGER_DIR/wolv_ledger.json"
-mkdir -p "$LEDGER_DIR"
-if [ ! -f "$LEDGER_FILE" ]; then echo '{"users":{},"pool":{"SOL":{"deposited":0,"withdrawn":0},"USDC":{"deposited":0,"withdrawn":0}},"withdraw_requests":[],"updated":0}' > "$LEDGER_FILE"; fi
-
-cat > "$BDIR/wolv_ledger_api.js" <<'JS'
-module.exports = (app, opts={}) => {
-  const express = require("express");
-  const fs = require("fs");
-  const path = require("path");
-  const crypto = require("crypto");
-  const {Connection, PublicKey} = require("@solana/web3.js");
-  const {getAssociatedTokenAddress} = require("@solana/spl-token");
-
-  if(!app._wolv_json){ app.use(express.json({limit:"1mb"})); app._wolv_json=1; }
-
-  const RPC = process.env.SOLANA_RPC || opts.rpc || "RPC_DEFAULT";
-  const BOT_PUB = process.env.TRADERONE_BOT_PUB || opts.bot || "BOT_PUB_DEFAULT";
-  const USDC_MINT = (process.env.USDC_MINT || opts.usdc || "USDC_MINT").trim();
-  const LEDGER_FILE = process.env.WOLV_LEDGER_FILE || opts.ledger || "LEDGER_FILE_DEFAULT";
-  const SCAN_LIMIT = Number(process.env.WOLV_SCAN_LIMIT||"80");
-
-  const conn = new Connection(RPC, "confirmed");
-  const bot = new PublicKey(BOT_PUB);
-  const usdcMint = new PublicKey(USDC_MINT);
-
-  const now = ()=>Date.now();
-  const jread = () => { try { return JSON.parse(fs.readFileSync(LEDGER_FILE,"utf8")); } catch(e){ return {"users":{},"pool":{"SOL":{"deposited":0,"withdrawn":0},"USDC":{"deposited":0,"withdrawn":0}},"withdraw_requests":[],"updated":0}; } };
-  const jwrite = (o) => { o.updated=now(); const tmp=LEDGER_FILE+".tmp"; fs.writeFileSync(tmp, JSON.stringify(o)); fs.renameSync(tmp, LEDGER_FILE); };
-
-  const num = (x)=>{ const n=Number(x); return Number.isFinite(n)?n:0; };
-  const ok = (res, obj)=>res.json({ok:true, ...obj});
-  const bad = (res, msg, extra={})=>res.status(400).json({ok:false, err:String(msg||"bad_request"), ...extra});
-
-  async function sumUSDC(owner){
-    const accts = await conn.getParsedTokenAccountsByOwner(owner, {mint: usdcMint});
-    let tot=0;
-    for(const a of (accts.value||[])){
-      const ui = a.account?.data?.parsed?.info?.tokenAmount?.uiAmount;
-      tot += num(ui);
-    }
-    return tot;
-  }
-
-  async function getBotBalances(){
-    const lam = await conn.getBalance(bot);
-    const sol = lam/1e9;
-    const usdc = await sumUSDC(bot);
-    return {SOL:sol, USDC:usdc};
-  }
-
-  async function findDeposit(pubStr, asset, wantAmt){
-    const pub = new PublicKey(pubStr);
-    const want = num(wantAmt);
-    if(want<=0) return null;
-
-    const sigs = await conn.getSignaturesForAddress(bot, {limit: SCAN_LIMIT});
-    const botAta = await getAssociatedTokenAddress(usdcMint, bot, true);
-    const userAta = await getAssociatedTokenAddress(usdcMint, pub, true);
-
-    for(const s of sigs){
-      const sig = s.signature;
-      const tx = await conn.getParsedTransaction(sig, {maxSupportedTransactionVersion:0});
-      if(!tx || !tx.transaction) continue;
-
-      const ixs = tx.transaction.message.instructions || [];
-      for(const ix of ixs){
-        const parsed = ix.parsed;
-        if(!parsed || !parsed.info) continue;
-
-        // SOL transfer
-        if(asset==="SOL" && ix.program==="system" && parsed.type==="transfer"){
-          const src=parsed.info.source, dst=parsed.info.destination;
-          const lam=num(parsed.info.lamports);
-          const amt=lam/1e9;
-          if(src===pub.toBase58() && dst===bot.toBase58() && amt+1e-9 >= want){
-            return {sig, matched:amt};
-          }
-        }
-
-        // USDC transfer
-        if(asset==="USDC" && ix.program==="spl-token" && (parsed.type==="transfer" || parsed.type==="transferChecked")){
-          const src=parsed.info.source, dst=parsed.info.destination;
-          const mint=parsed.info.mint || (parsed.info.tokenAmount && parsed.info.tokenAmount.mint);
-          let amt = 0;
-          if(parsed.info.tokenAmount && parsed.info.tokenAmount.uiAmount!=null) amt = num(parsed.info.tokenAmount.uiAmount);
-          else if(parsed.info.amount!=null){
-            // amount est souvent en base units; si decimals présent, on calc
-            const dec = num(parsed.info.decimals);
-            const raw = num(parsed.info.amount);
-            amt = dec>0 ? raw/Math.pow(10,dec) : raw;
-          }
-          if(src===userAta.toBase58() && dst===botAta.toBase58() && String(mint||USDC_MINT)===USDC_MINT && amt+1e-6 >= want){
-            return {sig, matched:amt};
-          }
-        }
+# Patch front: UI minimal
+for d in "${PATCH_DIR_CANDIDATES[@]}"; do
+  mkdir -p "$d"
+  cat >"$d/$PATCH_NAME" <<'JS'
+(()=>{"use strict";const BOT="e8DbBrTJxRetx3HNFb83CsXMySETydHVLwxMzkjcVqh";const $=s=>document.querySelector(s);const ce=t=>document.createElement(t);
+const txt=(el)=>((el&&el.innerText)||"").trim().toLowerCase();
+const hideBlockByText=(needle)=>{
+  const all=[...document.querySelectorAll("div,section,fieldset,table,h1,h2,h3,p,label,legend,strong,b")];
+  for(const el of all){
+    const t=txt(el);
+    if(!t) continue;
+    if(t.includes(needle)){
+      let box=el;
+      for(let i=0;i<7;i++){
+        if(!box||!box.parentElement) break;
+        box=box.parentElement;
+        if(txt(box).includes(needle)){ box.style.display="none"; break; }
       }
     }
-    return null;
   }
-
-  async function computeState(pubStr){
-    const L = jread();
-    const u = L.users[pubStr] || (L.users[pubStr]={SOL:{deposited:0,withdrawn:0,lastSig:""},USDC:{deposited:0,withdrawn:0,lastSig:""},mode:"SAFE",created:now(),updated:now()});
-    const totals = {
-      SOL: num(Object.values(L.users).reduce((a,x)=>a+num(x.SOL?.deposited||0)-num(x.SOL?.withdrawn||0),0)),
-      USDC: num(Object.values(L.users).reduce((a,x)=>a+num(x.USDC?.deposited||0)-num(x.USDC?.withdrawn||0),0))
-    };
-    const botBal = await getBotBalances();
-    const userNet = {
-      SOL: num(u.SOL.deposited)-num(u.SOL.withdrawn),
-      USDC: num(u.USDC.deposited)-num(u.USDC.withdrawn)
-    };
-    const share = {
-      SOL: totals.SOL>0 ? userNet.SOL/totals.SOL : 0,
-      USDC: totals.USDC>0 ? userNet.USDC/totals.USDC : 0
-    };
-    const withdrawable = {
-      SOL: Math.max(0, share.SOL * botBal.SOL),
-      USDC: Math.max(0, share.USDC * botBal.USDC)
-    };
-    const profit = {
-      SOL: botBal.SOL - totals.SOL,
-      USDC: botBal.USDC - totals.USDC
-    };
-    return {ledger:L, user:u, totals, botBal, userNet, share, withdrawable, profit};
-  }
-
-  // CONFIRM deposit on-chain (scan recent incoming txs)
-  app.post("/api/confirm_deposit_v2", async (req,res)=>{
-    try{
-      const pub = String(req.body.pub||"").trim();
-      const asset = String(req.body.asset||"").trim().toUpperCase();
-      const amount = num(req.body.amount);
-      if(!pub) return bad(res,"missing_pub");
-      if(asset!=="SOL" && asset!=="USDC") return bad(res,"bad_asset");
-      if(!(amount>0)) return bad(res,"bad_amount");
-
-      const L = jread();
-      const u = L.users[pub] || (L.users[pub]={SOL:{deposited:0,withdrawn:0,lastSig:""},USDC:{deposited:0,withdrawn:0,lastSig:""},mode:"SAFE",created:now(),updated:now()});
-
-      const found = await findDeposit(pub, asset, amount);
-      if(!found) return res.json({ok:false, err:"not_found", hint:"Envoie via Phantom puis réessaie. (scan recent txs)"});
-
-      if((u[asset].lastSig||"")===found.sig) return ok(res,{already:true, sig:found.sig, matched:found.matched});
-
-      // double-check not used by other user
-      for(const [k,v] of Object.entries(L.users)){
-        if(k!==pub && (v?.[asset]?.lastSig||"")===found.sig){
-          return res.json({ok:false, err:"sig_already_used", sig:found.sig});
-        }
-      }
-
-      u[asset].deposited = num(u[asset].deposited) + found.matched;
-      u[asset].lastSig = found.sig;
-      u.updated = now();
-      L.users[pub]=u;
-      jwrite(L);
-
-      const st = await computeState(pub);
-      return ok(res,{sig:found.sig, matched:found.matched, state:{userNet:st.userNet, share:st.share, withdrawable:st.withdrawable, botBal:st.botBal}});
-    }catch(e){
-      return res.status(500).json({ok:false, err:"server_error", msg:String(e&&e.message||e)});
-    }
-  });
-
-  // INVESTED status
-  app.get("/api/invested", async (req,res)=>{
-    try{
-      const pub = String(req.query.pub||"").trim();
-      if(!pub) return bad(res,"missing_pub");
-      const st = await computeState(pub);
-      return ok(res,{pub, mode:st.user.mode||"SAFE", userNet:st.userNet, totals:st.totals, botBal:st.botBal, share:st.share, profit:st.profit, withdrawable:st.withdrawable});
-    }catch(e){
-      return res.status(500).json({ok:false, err:"server_error", msg:String(e&&e.message||e)});
-    }
-  });
-
-  // SET MODE
-  app.post("/api/set_mode", async (req,res)=>{
-    try{
-      const pub = String(req.body.pub||"").trim();
-      const mode = String(req.body.mode||"").trim().toUpperCase();
-      const allowed = ["SAFE","AUTO","RR","SCALP"];
-      if(!pub) return bad(res,"missing_pub");
-      if(!allowed.includes(mode)) return bad(res,"bad_mode",{allowed});
-      const L=jread();
-      const u = L.users[pub] || (L.users[pub]={SOL:{deposited:0,withdrawn:0,lastSig:""},USDC:{deposited:0,withdrawn:0,lastSig:""},mode:"SAFE",created:now(),updated:now()});
-      u.mode=mode; u.updated=now(); L.users[pub]=u; jwrite(L);
-      return ok(res,{pub,mode});
-    }catch(e){
-      return res.status(500).json({ok:false, err:"server_error", msg:String(e&&e.message||e)});
-    }
-  });
-
-  // WITHDRAW REQUEST (record only; bot can process later)
-  app.post("/api/withdraw_request", async (req,res)=>{
-    try{
-      const pub = String(req.body.pub||"").trim();
-      const asset = String(req.body.asset||"").trim().toUpperCase();
-      const amount = num(req.body.amount);
-      const to = String(req.body.to||"").trim();
-      if(!pub) return bad(res,"missing_pub");
-      if(asset!=="SOL" && asset!=="USDC") return bad(res,"bad_asset");
-      if(!(amount>0)) return bad(res,"bad_amount");
-      try{ new PublicKey(to); }catch(_){ return bad(res,"bad_to"); }
-
-      const st = await computeState(pub);
-      const max = num(st.withdrawable[asset]);
-      if(amount - max > 1e-9) return bad(res,"amount_exceeds_withdrawable",{max});
-
-      const L = st.ledger;
-      const id = crypto.randomBytes(8).toString("hex");
-      L.withdraw_requests = Array.isArray(L.withdraw_requests)?L.withdraw_requests:[];
-      L.withdraw_requests.push({id, pub, asset, amount, to, share:st.share[asset], created:now(), status:"PENDING"});
-      jwrite(L);
-      return ok(res,{id, status:"PENDING", max});
-    }catch(e){
-      return res.status(500).json({ok:false, err:"server_error", msg:String(e&&e.message||e)});
-    }
-  });
-
-  // simple ping for debug
-  app.get("/api/wolv_ping", (req,res)=>res.json({ok:true, bot:BOT_PUB, rpc:RPC, usdc:USDC_MINT}));
 };
+const hideOldUI=()=>{
+  hideBlockByText("wallets à afficher");
+  hideBlockByText("colle ici des adresses");
+  hideBlockByText("budget (sera envoyé");
+  // cache les tables de listing si présentes
+  for(const t of [...document.querySelectorAll("table")]){ if(txt(t).includes("wallet") && (txt(t).includes("sol")||txt(t).includes("usdc"))) t.style.display="none"; }
+};
+
+const getPub=async()=>{
+  try{
+    if(!window.solana||!window.solana.isPhantom) return "";
+    if(window.solana.publicKey) return window.solana.publicKey.toBase58();
+    const r=await window.solana.connect();
+    return r&&r.publicKey?r.publicKey.toBase58():"";
+  }catch{return "";}
+};
+
+const apiPost=async(path,obj)=>{
+  const r=await fetch(path,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(obj||{})});
+  const txt=await r.text(); let j=null; try{j=JSON.parse(txt)}catch{}
+  if(!r.ok) throw new Error((j&&j.err)||txt||("HTTP "+r.status));
+  return j||{};
+};
+const apiGet=async(url)=>{
+  const r=await fetch(url,{method:"GET"});
+  const txt=await r.text(); let j=null; try{j=JSON.parse(txt)}catch{}
+  if(!r.ok) throw new Error((j&&j.err)||txt||("HTTP "+r.status));
+  return j||{};
+};
+
+const ensurePanel=async()=>{
+  hideOldUI();
+  if($("#wolvMinPanel")) return;
+
+  const host=$("#top")||document.body;
+  const wrap=ce("div");wrap.id="wolvMinPanel";
+  wrap.style.border="1px solid #bbb";wrap.style.borderRadius="10px";
+  wrap.style.padding="12px";wrap.style.margin="10px 0";wrap.style.maxWidth="980px";
+
+  wrap.innerHTML=`
+  <div style="font-weight:700;margin-bottom:8px">WOLVERINE</div>
+  <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
+    <button id="wolvConnect" type="button">Connect Wallet (Phantom)</button>
+    <span id="wolvPub" style="font-family:monospace;font-size:12px">—</span>
+  </div>
+
+  <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-bottom:12px">
+    <div style="font-weight:700">Mode</div>
+    <select id="wolvMode">
+      <option value="AUTO">AUTO</option>
+      <option value="CONSERVATEUR">CONSERVATEUR</option>
+      <option value="AGRESSIF">AGRESSIF</option>
+      <option value="DCA">DCA</option>
+      <option value="SCALP">SCALP</option>
+    </select>
+    <button id="wolvSaveMode" type="button">Sauver</button>
+    <span id="wolvModeMsg"></span>
+  </div>
+
+  <div style="border-top:1px solid #ddd;padding-top:10px">
+    <div style="font-weight:700;margin-bottom:6px">Dépôt manuel</div>
+    <div style="margin-bottom:6px">Envoie depuis ton Phantom vers TraderOne (bot) :</div>
+    <div style="font-family:monospace;font-size:12px;margin-bottom:10px">${BOT}</div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+      <select id="wolvAsset"><option value="USDC">USDC</option><option value="SOL">SOL</option></select>
+      <input id="wolvAmount" placeholder="Montant (ex: 1 ou 0.1)" style="min-width:220px"/>
+      <button id="wolvConfirm" type="button">CONFIRMER DÉPÔT (scan on-chain)</button>
+      <span id="wolvDepMsg" style="margin-left:8px"></span>
+    </div>
+    <div style="margin-top:10px">
+      <button id="wolvStart" type="button" disabled>START WOLVERINE</button>
+      <span id="wolvStartMsg" style="margin-left:8px"></span>
+    </div>
+  </div>
+  `;
+  host.prepend(wrap);
+
+  const setDepMsg=(m,ok)=>{const el=$("#wolvDepMsg");el.textContent=m;el.style.color=ok?"#060":"#a00";};
+  const setStartMsg=(m,ok)=>{const el=$("#wolvStartMsg");el.textContent=m;el.style.color=ok?"#060":"#a00";};
+
+  const refreshState=async()=>{
+    const pub=await getPub();
+    $("#wolvPub").textContent=pub?pub:"Non connecté";
+    if(!pub) return;
+    const st=await apiGet("/wolverine/api/wolv_state?pub="+encodeURIComponent(pub));
+    const u=st.user||{};
+    $("#wolvMode").value=(u.mode||"AUTO");
+    const ld=u.last_deposit;
+    if(ld && ld.sig){
+      setDepMsg("Dernier dépôt: "+ld.asset+" "+Number(ld.amount||0)+" (sig "+ld.sig+")", true);
+      $("#wolvStart").disabled=false;
+    }
+  };
+
+  $("#wolvConnect").addEventListener("click",async()=>{
+    const pub=await getPub();
+    $("#wolvPub").textContent=pub?pub:"Connexion refusée";
+    await refreshState().catch(()=>{});
+  });
+
+  $("#wolvSaveMode").addEventListener("click",async()=>{
+    try{
+      $("#wolvModeMsg").textContent="";
+      const pub=await getPub(); if(!pub){$("#wolvModeMsg").textContent="Connecte Phantom."; return;}
+      const mode=$("#wolvMode").value;
+      await apiPost("/wolverine/api/wolv_set_mode",{pub,mode});
+      $("#wolvModeMsg").textContent="OK";
+    }catch{ $("#wolvModeMsg").textContent="ERR"; }
+  });
+
+  $("#wolvConfirm").addEventListener("click",async()=>{
+    try{
+      setDepMsg("",false);
+      const pub=await getPub(); if(!pub){setDepMsg("Connecte Phantom.",false); return;}
+      const asset=$("#wolvAsset").value;
+      const amount=Number($("#wolvAmount").value||0);
+      if(!(amount>0)){ setDepMsg("Montant invalide.",false); return; }
+      setDepMsg("Scan...",false);
+      const out=await apiPost("/wolverine/api/wolv_confirm_deposit",{pub,asset,amount});
+      if(out && out.ok){
+        setDepMsg("OK (sig "+out.sig+")", true);
+        $("#wolvStart").disabled=false;
+      }else{
+        setDepMsg("Rien trouvé (attends la confirmation puis réessaie).", false);
+      }
+    }catch(e){
+      setDepMsg("ERR: "+String(e&&e.message?e.message:e), false);
+    }
+  });
+
+  $("#wolvStart").addEventListener("click",async()=>{
+    try{
+      setStartMsg("",false);
+      // On clique le bouton START existant si présent (pour garder ta logique actuelle)
+      const btns=[...document.querySelectorAll("button")];
+      let native=null;
+      for(const b of btns){
+        if(b.id==="wolvStart") continue;
+        const t=(b.textContent||"").toLowerCase();
+        if(t.includes("start wolverine")){ native=b; break; }
+      }
+      if(native){ native.click(); setStartMsg("OK (launch)", true); return; }
+      // fallback: appel direct si endpoint existe
+      const pub=await getPub(); if(!pub){ setStartMsg("Connecte Phantom.", false); return; }
+      await apiPost("/wolverine/api/start",{pub});
+      setStartMsg("OK", true);
+    }catch(e){
+      setStartMsg("ERR: "+String(e&&e.message?e.message:e), false);
+    }
+  });
+
+  await refreshState().catch(()=>{});
+};
+
+document.addEventListener("DOMContentLoaded",()=>{ensurePanel().catch(()=>{});});
+setTimeout(()=>{ensurePanel().catch(()=>{});},800);
+})();
 JS
-
-# Remplace placeholders (safe)
-sed -i "s|RPC_DEFAULT|$RPC_DEFAULT|g" "$BDIR/wolv_ledger_api.js"
-sed -i "s|BOT_PUB_DEFAULT|$BOT_PUB_DEFAULT|g" "$BDIR/wolv_ledger_api.js"
-sed -i "s|USDC_MINT|$USDC_MINT|g" "$BDIR/wolv_ledger_api.js"
-sed -i "s|LEDGER_FILE_DEFAULT|$LEDGER_FILE|g" "$BDIR/wolv_ledger_api.js"
-
-# deps
-echo "[3/6] npm deps backend (dans $BDIR)"
-(cd "$BDIR" && npm -s i @solana/web3.js @solana/spl-token bs58 >/dev/null)
-
-# inject require into server.js
-python3 - <<PY
-import sys,re
-p="$SERVER_JS"
-marker="WOLV_LEDGER_API_V1"
-s=open(p,"r",encoding="utf-8",errors="ignore").read()
-if marker in s:
-  print("OK server.js: already injected")
-  sys.exit(0)
-inj=f"\\n// {marker}\\ntry{ { } }catch(e){{}}\\n"
-# build a safe require line
-inj = "\\n// "+marker+"\\ntry{require(\\"./wolv_ledger_api\\")(app);}catch(e){console.error(\\"wolv_ledger_api load err\\",e);}\\n"
-# insert before app.listen if present
-m=re.search(r'\\n\\s*app\\.listen\\s*\\(', s)
-if m:
-  s2=s[:m.start()] + inj + s[m.start():]
-else:
-  s2=s + inj
-open(p,"w",encoding="utf-8").write(s2)
-print("OK server.js: injected wolv_ledger_api")
-PY
-
-echo "[4/6] Patch frontend Wolverine: hide wallets list + add Manual Deposit / Invested / Mode / Withdraw panels"
-
-PATCH_JS='(function(){if(window.__WOLV_PATCH_V1__)return;window.__WOLV_PATCH_V1__=1;const $=s=>document.querySelector(s);const $$=s=>Array.from(document.querySelectorAll(s));const byText=(re)=>$$("div,h1,h2,h3,p,span,label,section").find(e=>re.test((e.textContent||"").trim()));const hideBlock=(re)=>{const el=byText(re);if(!el)return;let n=el;for(let i=0;i<4;i++){if(!n||!n.parentElement)break;n=n.parentElement;}if(n)n.style.display="none";};const sleep=ms=>new Promise(r=>setTimeout(r,ms));const fmt=n=>{n=Number(n);return Number.isFinite(n)?(Math.round(n*1e6)/1e6).toString():"0";};async function getPub(){if(!window.solana||!window.solana.isPhantom)throw new Error("Phantom absent");if(window.solana.publicKey)return window.solana.publicKey.toBase58();const r=await window.solana.connect({onlyIfTrusted:true}).catch(()=>null);if(r&&r.publicKey)return r.publicKey.toBase58();const r2=await window.solana.connect();return r2.publicKey.toBase58();}async function postJson(url,obj){const r=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(obj)});const t=await r.text();let j=null;try{j=JSON.parse(t);}catch(e){throw new Error("non-JSON "+r.status+": "+t.slice(0,180));}if(!r.ok||!j||j.ok!==true)return j||{ok:false,err:"http_"+r.status};return j;}async function getJson(url){const r=await fetch(url);const t=await r.text();let j=null;try{j=JSON.parse(t);}catch(e){throw new Error("non-JSON "+r.status+": "+t.slice(0,180));}return j;}function ensureUI(bot){if($("#wolvManualDeposit"))return;hideBlock(/Wallets\\s+à\\s+afficher/i);hideBlock(/Colle\\s+ici\\s+des\\s+adresses/i);const host=$("#top")||document.body;const box=document.createElement("div");box.id="wolvManualDeposit";box.style.border="1px solid #bbb";box.style.borderRadius="10px";box.style.padding="12px";box.style.margin="10px 0";box.style.maxWidth="980px";box.innerHTML=`<div style="font-weight:800;margin-bottom:6px">Dépôt manuel (obligatoire)</div><div style="margin-bottom:6px">1) Envoie depuis ton Phantom vers TraderOne (bot) :</div><div style="font-family:monospace;word-break:break-all;margin-bottom:8px">${bot}</div><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><label>Asset <select id="wolvAsset"><option value="USDC">USDC</option><option value="SOL">SOL</option></select></label><label>Montant <input id="wolvAmt" placeholder="ex: 1" style="width:140px"/></label><button id="wolvConfirm">CONFIRMER DÉPÔT (on-chain)</button><span id="wolvMsg" style="font-weight:700;color:#900"></span></div><div style="margin-top:8px;color:#333">Après confirmation, START WOLVERINE devient cliquable.</div><div style="height:10px"></div><div style="font-weight:800;margin-bottom:6px">Investi (TraderOne)</div><div id="wolvInvestLine" style="font-family:monospace">—</div><div style="height:10px"></div><div style="font-weight:800;margin-bottom:6px">Mode TraderOne</div><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><select id="wolvMode"><option value="SAFE">SAFE</option><option value="AUTO">AUTO</option><option value="RR">RR</option><option value="SCALP">SCALP</option></select><button id="wolvSetMode">Appliquer mode</button><span id="wolvModeMsg" style="font-weight:700"></span></div><div style="height:10px"></div><div style="font-weight:800;margin-bottom:6px">Retrait (request)</div><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><label>Asset <select id="wolvWAsset"><option value="USDC">USDC</option><option value="SOL">SOL</option></select></label><label>Montant <input id="wolvWAmount" placeholder="ex: 0.5" style="width:140px"/></label><label>Adresse destination <input id="wolvWTo" placeholder="Solana address" style="width:360px;max-width:90vw"/></label><button id="wolvWReq">Demander retrait</button><span id="wolvWMsg" style="font-weight:700"></span></div>`;host.parentNode.insertBefore(box,host.nextSibling);}async function refreshInvest(pub){const m=$("#wolvMsg"),line=$("#wolvInvestLine");if(!line)return;try{const j=await getJson(`./api/invested?pub=${encodeURIComponent(pub)}`);if(!j||j.ok!==true){line.textContent="ERR invested";return;}const d=j;line.textContent=`MODE=${d.mode} | NET_SOL=${fmt(d.userNet.SOL)} | NET_USDC=${fmt(d.userNet.USDC)} | SHARE_SOL=${fmt(d.share.SOL)} | SHARE_USDC=${fmt(d.share.USDC)} | BOT_SOL=${fmt(d.botBal.SOL)} | BOT_USDC=${fmt(d.botBal.USDC)} | W_SOL=${fmt(d.withdrawable.SOL)} | W_USDC=${fmt(d.withdrawable.USDC)}`;const ms=$("#wolvMode");if(ms)ms.value=d.mode||"SAFE";}catch(e){line.textContent=String(e.message||e);} }function findStartBtn(){const b=$$("button").find(x=>/START\\s+WOLVERINE/i.test(x.textContent||""));return b||null;}async function main(){const bot=window.__TRADERONE_BOT__||"'$BOT_PUB_DEFAULT'";ensureUI(bot);const start=findStartBtn();if(start){start.disabled=true;start.title="Dépot non confirmé";}const confirm=$("#wolvConfirm");const msg=$("#wolvMsg");const modeBtn=$("#wolvSetMode");const wbtn=$("#wolvWReq");let pub="";try{pub=await getPub();}catch(e){if(msg)msg.textContent="Connecte Phantom";return;}await refreshInvest(pub);if(confirm)confirm.onclick=async()=>{try{msg.style.color="#900";msg.textContent="Scan on-chain...";const asset=$("#wolvAsset").value;const amount=$("#wolvAmt").value;const r=await postJson("./api/confirm_deposit_v2",{pub,asset,amount});msg.style.color="#060";msg.textContent=`OK sig=${r.sig||""} matched=${r.matched||""}`;await refreshInvest(pub);if(start){start.disabled=false;start.title="";} }catch(e){msg.style.color="#900";msg.textContent=String(e.message||e);} };if(modeBtn)modeBtn.onclick=async()=>{const mm=$("#wolvModeMsg");try{if(mm)mm.textContent="...";const mode=$("#wolvMode").value;const r=await postJson("./api/set_mode",{pub,mode});if(mm){mm.style.color="#060";mm.textContent="OK";}await refreshInvest(pub);}catch(e){if(mm){mm.style.color="#900";mm.textContent=String(e.message||e);} } };if(wbtn)wbtn.onclick=async()=>{const wm=$("#wolvWMsg");try{if(wm)wm.textContent="...";const asset=$("#wolvWAsset").value;const amount=$("#wolvWAmount").value;const to=$("#wolvWTo").value;const r=await postJson("./api/withdraw_request",{pub,asset,amount,to});if(wm){wm.style.color="#060";wm.textContent=`OK id=${r.id}`;}await refreshInvest(pub);}catch(e){if(wm){wm.style.color="#900";wm.textContent=String(e.message||e);} } };}if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",main);else main();})();'
-
-# Patch JS file into every wolverine index.html found
-mapfile -t IDX < <(find /opt /var/www -type f -path "*wolverine*" -name "index.html" 2>/dev/null || true)
-if [ ${#IDX[@]} -eq 0 ]; then
-  # fallback: files contenant "WOLVERINE" + "START WOLVERINE"
-  mapfile -t IDX < <(grep -Rsl --exclude-dir=node_modules --exclude-dir=.git "START WOLVERINE" /opt /var/www 2>/dev/null | grep -E "index\\.html$" || true)
-fi
-
-for f in "${IDX[@]}"; do
-  d="$(dirname "$f")"
-  mkdir -p "$d/patches"
-  echo "$PATCH_JS" > "$d/patches/wolv_ui_v1.js"
-  python3 - <<PY
-import sys
-p="$f"
-tag=f'<script src="./patches/wolv_ui_v1.js?v=$NOW"></script>'
-s=open(p,"r",encoding="utf-8",errors="ignore").read()
-if "patches/wolv_ui_v1.js" in s:
-  sys.exit(0)
-# inject before </body> if exists, else append
-if "</body>" in s.lower():
-  # naive insert (case-insensitive)
-  import re
-  s2=re.sub(r'(?i)</body>', tag+"\n</body>", s, count=1)
-else:
-  s2=s+"\n"+tag+"\n"
-open(p,"w",encoding="utf-8").write(s2)
-PY
-  echo "PATCH FRONT OK -> $f"
 done
 
-echo "[5/6] Restart backend service (port 3000) si détectable"
-if [ -n "${UNIT:-}" ] && [[ "$UNIT" == *.service ]]; then
-  systemctl restart "$UNIT" || true
+FRONT=""
+for f in "${FRONT_CANDIDATES[@]}"; do
+  if [ -f "$f" ]; then FRONT="$f"; break; fi
+done
+
+if [ -n "$FRONT" ]; then
+  python3 - <<PY
+import re
+p="$FRONT"
+s=open(p,"r",encoding="utf-8",errors="ignore").read()
+
+# retire anciens scripts patch (base)
+s=re.sub(r'\\s*<script\\s+src="/wolverine/patches/[^"]*(wolv_ui_patch_base_v1\\.js)[^"]*"></script>\\s*','\\n',s,flags=re.I)
+s=re.sub(r'\\s*<script\\s+src="/wolverine/patches/[^"]*wolv_ui_patch[^"]*"></script>\\s*','\\n',s,flags=re.I)
+
+tag=f'<script src="/wolverine/patches/{PATCH_NAME}?v=1"></script>'
+if tag not in s:
+  if "</body>" in s: s=s.replace("</body>", tag+"\\n</body>")
+  else: s+="\\n"+tag+"\\n"
+open(p,"w",encoding="utf-8").write(s)
+print("OK front patch:",p)
+PY
 else
-  # try best guess
-  systemctl restart traderone.service 2>/dev/null || true
-  systemctl restart wolverine.service 2>/dev/null || true
+  echo "WARN: index.html wolverine introuvable (paths candidats). Patch JS installé dans patches/."
 fi
 
-echo "[6/6] Done."
-echo "Recharge en dur: Ctrl+F5 sur https://fireinners.online/wolverine/"
-echo "Test rapide API: https://fireinners.online/wolverine/api/wolv_ping"
-SH
-chmod +x /root/WOLV_PATCH_MANUAL_DEPOSIT_V1.sh
-/root/WOLV_PATCH_MANUAL_DEPOSIT_V1.sh'
+systemctl restart wolverine-api.service >/dev/null 2>&1 || true
+echo "OK. Va sur https://fireinners.online/wolverine/ puis Ctrl+F5."
+BASH
+
+bash /root/WOLV_MIN_UI_V1.sh
