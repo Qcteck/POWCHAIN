@@ -1,102 +1,59 @@
 #!/usr/bin/env bash
 set -e
 
-UI="/opt/fireinners/frontend-react/app/dist/wolverine/index.html"
-BACKUP="$UI.bak.$(date +%s)"
+APP="/opt/wolverine"
+SERVER="$APP/server.js"
+BACKUP="$SERVER.bak.$(date +%s)"
 
-echo "=== TRADERONE DASHBOARD PATCH (SOLDES + PROFIT) ==="
+echo "=== TRADERONE BACKEND BALANCES FIX ==="
 
-echo "[1/5] Backup UI"
-cp "$UI" "$BACKUP"
+cd "$APP" || { echo "❌ /opt/wolverine introuvable"; exit 1; }
 
-echo "[2/5] Écriture nouvelle UI"
-cat > "$UI" <<'EOF'
-<!doctype html>
-<html lang="fr">
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>TraderOne</title>
-<style>
-body{margin:0;background:#0b1020;color:#fff;font-family:system-ui}
-#c{max-width:900px;margin:30px auto;padding:20px}
-button,input{padding:10px 14px;border-radius:10px;border:0;margin:6px}
-input{width:100%}
-.stat{margin:6px 0}
-.ok{color:#9ff}
-.bad{color:#ff9f9f}
-</style>
+echo "[1/6] Backup server.js"
+cp "$SERVER" "$BACKUP"
 
-<div id="c">
-<h1>TraderOne</h1>
+echo "[2/6] Patch route /api/balances"
+grep -q "api/balances" "$SERVER" && echo "Route déjà présente" || cat >> "$SERVER" <<'EOF'
 
-<button id="con">Connect Phantom</button>
-<div class="stat">Wallet: <span id="addr">-</span></div>
+/* === BALANCES API === */
+const { Connection, PublicKey, LAMPORTS_PER_SOL } = require("@solana/web3.js");
+const RPC = process.env.SOLANA_RPC || "https://api.mainnet-beta.solana.com";
+const connection = new Connection(RPC);
 
-<hr/>
+app.get("/api/balances", async (req,res)=>{
+  try{
+    const user=req.query.user;
+    let phantomSOL=null;
 
-<div class="stat">Internal SOL: <b id="int">-</b></div>
-<div class="stat">Phantom SOL: <b id="pha">-</b></div>
-<div class="stat">Budget initial: <b id="bud">-</b></div>
-<div class="stat">Profit total: <b id="pnl">-</b></div>
+    if(user){
+      const pub=new PublicKey(user);
+      const bal=await connection.getBalance(pub);
+      phantomSOL=bal/LAMPORTS_PER_SOL;
+    }
 
-<hr/>
+    const botBal=await connection.getBalance(wallet.publicKey);
+    const internalSOL=botBal/LAMPORTS_PER_SOL;
 
-<input id="amt" placeholder="Budget SOL"/>
-<button id="start">Start</button>
-<button id="stop">Stop</button>
-<button id="cash">Cash-out</button>
-
-<pre id="log"></pre>
-</div>
-
-<script src="/wolverine/vendor/web3.min.js"></script>
-<script>
-const log=t=>logEl.textContent+=t+"\\n";
-const logEl=document.querySelector("#log");
-let pub=null,startBudget=0;
-
-async function getBalances(){
-  const r=await fetch("/wolverine/api/balances?user="+(pub||""));
-  const j=await r.json();
-  int.textContent=j.internalSOL?.toFixed(4)+" SOL";
-  pha.textContent=j.phantomSOL?j.phantomSOL.toFixed(4)+" SOL":"-";
-  bud.textContent=startBudget?startBudget+" SOL":"-";
-  if(startBudget && j.phantomSOL){
-    const p=((j.phantomSOL-startBudget)/startBudget)*100;
-    pnl.textContent=p.toFixed(2)+" %";
-    pnl.className=p>=0?"ok":"bad";
+    res.json({
+      internalSOL,
+      phantomSOL
+    });
+  }catch(e){
+    res.status(500).json({error:e.message});
   }
-}
-
-con.onclick=async()=>{
-  if(!window.solana)return alert("Install Phantom");
-  const r=await solana.connect();
-  pub=r.publicKey.toString();
-  addr.textContent=pub;
-  getBalances();
-};
-
-start.onclick=async()=>{
-  const amt=+document.querySelector("#amt").value;
-  if(!pub||!amt)return alert("Connect + budget");
-  startBudget=amt;
-  await fetch("/wolverine/api/start",{method:"POST",headers:{'content-type':'application/json'},body:JSON.stringify({amount:amt})});
-  getBalances();
-};
-
-stop.onclick=async()=>{await fetch("/wolverine/api/stop",{method:"POST"});};
-cash.onclick=async()=>{await fetch("/wolverine/api/cashout",{method:"POST"});};
-
-setInterval(getBalances,5000);
-</script>
-</html>
+});
 EOF
 
-echo "[3/5] Reload nginx"
-nginx -t && systemctl reload nginx
+echo "[3/6] Install deps if missing"
+npm list @solana/web3.js >/dev/null 2>&1 || npm install @solana/web3.js
 
-echo "[4/5] Test API"
-curl -s https://www.fireinners.online/wolverine/api/balances || true
+echo "[4/6] Restart TraderOne"
+pm2 restart traderone || pm2 start server.js --name traderone
 
-echo "[5/5] DONE"
-echo "URL: https://www.fireinners.online/wolverine"
+echo "[5/6] Save PM2"
+pm2 save
+
+echo "[6/6] Test balances API"
+curl -s "http://127.0.0.1:3000/api/balances" || true
+
+echo "=== FIX DONE ==="
