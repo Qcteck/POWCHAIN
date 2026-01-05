@@ -1,154 +1,81 @@
-bash <<'MEGABATCH'
+bash <<'MEGA'
 set -e
 
-### CONFIG
-APP_PORT=3000
-ROOT_UI="/opt/fireinners/frontend-react/app/dist/wolverine"
-API_URL="/wolverine/api"
-NGINX_SITE="/etc/nginx/sites-available/fireinners.online-ssl"
-ENV_FILE="/opt/traderone/.env"
+### PATHS
+BOT="/opt/traderone"
+STATE="$BOT/state.json"
+LOG="$BOT/trades.log"
 
-echo "=== TRADERONE + WOLVERINE FULL LIVE ==="
+echo "=== TRADERONE AUTO-TRADE ENGINE ==="
 
-### 1) VERIFY ENV
-grep -q "SOLANA_PRIVATE_KEY_BASE58" "$ENV_FILE" || { echo "[ERR] clé privée interne absente"; exit 1; }
+### 1) STATE INIT
+cat > "$STATE" <<'JSON'
+{
+  "armed": false,
+  "running": false,
+  "budget": 0,
+  "entry": 0,
+  "token": null,
+  "pnl": 0,
+  "last": "idle"
+}
+JSON
 
-### 2) BACKEND PATCH
-cat > /opt/traderone/server.js <<'JS'
+touch "$LOG"
+
+### 2) ENGINE (LOGIC)
+cat > "$BOT/engine.js" <<'JS'
+const fs=require("fs");
+const state=()=>JSON.parse(fs.readFileSync("state.json"));
+const save=s=>fs.writeFileSync("state.json",JSON.stringify(s,null,2));
+const log=m=>fs.appendFileSync("trades.log",new Date().toISOString()+" "+m+"\n");
+
+module.exports={
+ arm(){const s=state();s.armed=true;save(s);log("ARMED");},
+ disarm(){const s=state();s.armed=false;save(s);log("DISARMED");},
+ start(budget){
+  const s=state();
+  if(!s.armed)throw"NOT_ARMED";
+  s.running=true;s.budget=budget;s.last="started";
+  save(s);log("START "+budget);
+ },
+ stop(){
+  const s=state();
+  s.running=false;s.budget=0;s.last="stopped";
+  save(s);log("STOP");
+ },
+ status(){return state();}
+};
+JS
+
+### 3) SERVER PATCH
+cat > "$BOT/server.js" <<'JS'
 const http=require("http");
-const {Connection,Keypair,PublicKey,LAMPORTS_PER_SOL,SystemProgram,Transaction}=require("@solana/web3.js");
-require("dotenv").config();
+const engine=require("./engine");
+const fs=require("fs");
 
-const conn=new Connection("https://api.mainnet-beta.solana.com","confirmed");
-const kp=Keypair.fromSecretKey(Buffer.from(require("bs58").decode(process.env.SOLANA_PRIVATE_KEY_BASE58)));
-
-let STATE={running:false,locked:0};
-
-async function sol(pub){return (await conn.getBalance(new PublicKey(pub)))/LAMPORTS_PER_SOL;}
+const json=(res,o)=>{res.setHeader("content-type","application/json");res.end(JSON.stringify(o));};
 
 http.createServer(async(req,res)=>{
-res.setHeader("content-type","application/json");
-
-if(req.url==="/api/balances"){
- const phantom=req.headers["x-phantom"];
- res.end(JSON.stringify({
-  internal:await sol(kp.publicKey),
-  phantom:phantom?await sol(phantom):null,
-  running:STATE.running,
-  locked:STATE.locked
- }));
- return;
-}
-
-if(req.url==="/api/start"&&req.method==="POST"){
- let b="";req.on("data",d=>b+=d);
- req.on("end",async()=>{
-  const {phantom,amount}=JSON.parse(b||"{}");
-  if(STATE.running)return res.end(JSON.stringify({err:"already running"}));
-  if(!phantom||!amount||amount<=0)return res.end(JSON.stringify({err:"invalid"}));
-  const bal=await sol(phantom);
-  if(bal<amount)return res.end(JSON.stringify({err:"insufficient"}));
-  STATE.running=true;STATE.locked=amount;
-  res.end(JSON.stringify({ok:true}));
- });
- return;
-}
-
-if(req.url==="/api/stop"){
- STATE.running=false;STATE.locked=0;
- res.end(JSON.stringify({ok:true}));
- return;
-}
-
-if(req.url==="/api/cashout"&&req.method==="POST"){
- STATE.running=false;STATE.locked=0;
- res.end(JSON.stringify({ok:true}));
- return;
-}
-
-res.statusCode=404;res.end("{}");
+ try{
+  if(req.url==="/api/status") return json(res,engine.status());
+  if(req.url==="/api/arm"){engine.arm();return json(res,{ok:true});}
+  if(req.url==="/api/disarm"){engine.disarm();return json(res,{ok:true});}
+  if(req.url==="/api/start"&&req.method==="POST"){
+   let b="";req.on("data",d=>b+=d);req.on("end",()=>{
+    const {amount}=JSON.parse(b);
+    engine.start(amount);
+    json(res,{ok:true});
+   });return;
+  }
+  if(req.url==="/api/stop"){engine.stop();return json(res,{ok:true});}
+ }catch(e){json(res,{err:e.toString()});}
+ res.statusCode=404;res.end();
 }).listen(3000);
 JS
 
 pm2 restart traderone
 pm2 save
 
-### 3) FRONTEND UI
-cp "$ROOT_UI/index.html" "$ROOT_UI/index.html.bak.$(date +%s)"
-
-cat > "$ROOT_UI/index.html" <<'HTML'
-<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
-<title>TraderOne</title>
-<style>
-body{background:#0b1020;color:#fff;font-family:system-ui;margin:0}
-#c{max-width:600px;margin:40px auto}
-button,input{padding:10px 14px;border-radius:10px;border:0;margin:6px}
-input{width:100%}
-</style>
-</head>
-<body><div id=c>
-<h2>TraderOne</h2>
-<button id=con>Connect Phantom</button>
-<div>Wallet: <span id=addr>-</span></div>
-<div>Internal SOL: <b id=int>0</b></div>
-<div>Phantom SOL: <b id=pha>0</b></div>
-<input id=amt placeholder="Budget SOL">
-<button id=start>Start</button>
-<button id=stop>Stop</button>
-<button id=cash>Cash-out</button>
-<pre id=log></pre>
-</div>
-
-<script src="/wolverine/vendor/web3.min.js"></script>
-<script>
-let pub=null;
-const log=t=>logEl.textContent+=t+"\n";
-const logEl=document.querySelector("#log");
-
-async function api(u,o){
- return fetch("/wolverine/api"+u,{
-  method:o?"POST":"GET",
-  headers:{ "content-type":"application/json","x-phantom":pub||"" },
-  body:o?JSON.stringify(o):null
- }).then(r=>r.json());
-}
-
-async function refresh(){
- const d=await api("/balances");
- int.textContent=d.internal?.toFixed(4);
- pha.textContent=d.phantom?.toFixed(4);
-}
-
-con.onclick=async()=>{
- const p=window.solana;if(!p)return alert("Install Phantom");
- const r=await p.connect();pub=r.publicKey.toString();
- addr.textContent=pub;refresh();
-};
-
-start.onclick=async()=>{
- if(!pub)return alert("Connect Phantom");
- const amt=parseFloat(amtEl.value);
- if(!amt||amt<=0)return alert("Invalid amount");
- const r=await api("/start",{phantom:pub,amount:amt});
- log(JSON.stringify(r));refresh();
-};
-
-stop.onclick=async()=>{log(JSON.stringify(await api("/stop")));refresh();}
-cash.onclick=async()=>{log(JSON.stringify(await api("/cashout")));refresh();}
-
-const amtEl=document.querySelector("#amt");
-refresh();
-</script>
-</body></html>
-HTML
-
-### 4) NGINX API ROUTE
-grep -q "wolverine/api" "$NGINX_SITE" || sed -i '/location \/wolverine {/a \
-location /wolverine/api/ { proxy_pass http://127.0.0.1:3000/api/; proxy_set_header Host $host; }' "$NGINX_SITE"
-
-nginx -t
-systemctl reload nginx
-
-echo "=== TRADERONE LIVE ==="
-echo "URL: https://www.fireinners.online/wolverine"
-MEGABATCH
+echo "=== AUTO-TRADE ENGINE READY ==="
+MEGA
