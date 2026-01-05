@@ -1,221 +1,210 @@
-cat >/root/WOLV_PATCH_API_3000_STRATEGY_SWAP.sh <<'BASH'
+cat >/root/WOLV_ADD_SWAP_TAB.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-PORT=3000
+# --- locate /wolverine frontend ---
+WEB_DIR=""
+for d in \
+  /opt/fireinners/frontend-react/app/dist/wolverine \
+  /var/www/fireinners/wolverine \
+  /var/www/wolverine \
+  /opt/traderone-opt/public/wolverine \
+  /opt/traderone-opt/public
+do
+  if [ -d "$d" ]; then WEB_DIR="$d"; break; fi
+done
+[ -n "$WEB_DIR" ] || { echo "ERR: dossier /wolverine introuvable"; exit 1; }
 
-echo "=== [1] Find PID listening on :$PORT (node) ==="
-PID="$(ss -lptn 2>/dev/null | awk -v P=":$PORT" '
-  $0 ~ /LISTEN/ && $0 ~ P && $0 ~ /users:\(\("node"/ {
-    match($0, /pid=[0-9]+/); if(RLENGTH){ print substr($0,RSTART+4,RLENGTH-4); exit }
-  }')"
-
-[ -n "${PID:-}" ] || { echo "ERR: aucun node n'écoute sur :$PORT"; exit 1; }
-echo "PID=$PID"
-
-BACK_DIR="$(readlink -f /proc/$PID/cwd || true)"
-[ -n "${BACK_DIR:-}" ] && [ -d "$BACK_DIR" ] || { echo "ERR: cwd introuvable pour PID $PID"; exit 1; }
-echo "BACK_DIR=$BACK_DIR"
-
-if [ ! -f "$BACK_DIR/package.json" ]; then
-  echo "WARN: pas de package.json dans $BACK_DIR, je cherche un sous-dossier node..."
-  hit="$(find "$BACK_DIR" -maxdepth 3 -type f -name package.json 2>/dev/null | head -n1 || true)"
-  [ -n "$hit" ] || { echo "ERR: aucun package.json trouvé"; exit 1; }
-  BACK_DIR="$(dirname "$hit")"
-  echo "BACK_DIR=$BACK_DIR"
-fi
-
-echo "=== [2] Find related systemd service (WorkingDirectory match) ==="
-SERVICE=""
-while read -r s; do
-  wd="$(systemctl show -p WorkingDirectory --value "$s" 2>/dev/null || true)"
-  if [ -n "$wd" ] && [ "$(readlink -f "$wd" 2>/dev/null || true)" = "$BACK_DIR" ]; then
-    SERVICE="$s"; break
-  fi
-done < <(systemctl list-units --type=service --state=running --no-pager 2>/dev/null | awk '{print $1}' | grep -E '\.service$' || true)
-
-echo "SERVICE=${SERVICE:-none} (ok si none)"
+HTML="$WEB_DIR/index.html"
+JS="$WEB_DIR/ui/terminal.js"
+[ -f "$HTML" ] || { echo "ERR: index.html introuvable: $HTML"; exit 1; }
+[ -f "$JS" ] || { echo "ERR: terminal.js introuvable: $JS"; exit 1; }
 
 TS="$(date +%s)"
 mkdir -p /root/wolv_backups
+cp -a "$HTML" "/root/wolv_backups/index.html.$TS.bak"
+cp -a "$JS"   "/root/wolv_backups/terminal.js.$TS.bak"
+echo "Backup OK -> /root/wolv_backups/(index.html|terminal.js).$TS.bak"
+echo "WEB_DIR=$WEB_DIR"
 
-echo "=== [3] Create routes: strategy + swap ==="
-mkdir -p "$BACK_DIR/routes"
+# --- 1) Add sidebar menu item "Swap" ---
+if ! grep -q 'id="navSwap"' "$HTML"; then
+  # try insert after existing Trade button if found
+  perl -0777 -i -pe 's#(<[^>]+id="navTrade"[^>]*>.*?</[^>]+>)#$1\n<button class="navItem" id="navSwap">Swap</button>#si' "$HTML" || true
+  # fallback: insert near sidebar if not inserted
+  if ! grep -q 'id="navSwap"' "$HTML"; then
+    perl -0777 -i -pe 's#(</aside>)#\n<button class="navItem" id="navSwap">Swap</button>\n$1#si' "$HTML"
+  fi
+  echo "Added navSwap"
+else
+  echo "navSwap already present"
+fi
 
-cat >"$BACK_DIR/routes/strategy.routes.js" <<'JS'
-const express = require("express");
-const router = express.Router();
+# --- 2) Add Swap page section ---
+if ! grep -q 'id="pageSwap"' "$HTML"; then
+  SWAP_SECTION=$(cat <<'HTMLSEC'
+<section id="pageSwap" style="display:none">
+  <div class="panelTitle">Swap (Internal)</div>
 
-const state = {}; // wallet -> { active, history }
-function walletOf(req){ return (req.body.wallet || req.query.wallet || "").trim(); }
-function ensure(wallet){ if(!state[wallet]) state[wallet] = { active:null, history:[] }; }
+  <div class="formRow">
+    <label class="small">From</label>
+    <select id="swapFrom">
+      <option value="So11111111111111111111111111111111111111112">SOL</option>
+      <option value="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1" selected>USDC</option>
+    </select>
 
-function make(name){
-  const base = "/" + name;
+    <label class="small">To</label>
+    <select id="swapTo">
+      <option value="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1">USDC</option>
+      <option value="So11111111111111111111111111111111111111112" selected>SOL</option>
+    </select>
+  </div>
 
-  router.post(base + "/start", (req,res)=>{
-    const wallet = walletOf(req);
-    if(!wallet) return res.status(400).send("missing wallet");
-    ensure(wallet);
-    const cfg = Object.assign({}, req.body);
-    state[wallet].active = { name, mode:(req.body.mode||name), status:"RUNNING", config:cfg, startedAt:Date.now() };
-    state[wallet].history.push({ts:Date.now(), event:"START", name, cfg});
-    res.json({ok:true, active:state[wallet].active});
-  });
+  <div class="formRow" style="margin-top:10px">
+    <label class="small">Amount</label>
+    <input class="input" id="swapAmount" value="10" />
+    <label class="small">Slippage (bps)</label>
+    <input class="input" id="swapSlip" value="50" />
+  </div>
 
-  router.post(base + "/pause", (req,res)=>{
-    const wallet = walletOf(req);
-    if(!wallet) return res.status(400).send("missing wallet");
-    ensure(wallet);
-    if(state[wallet].active && state[wallet].active.name===name){
-      state[wallet].active.status="PAUSED";
-      state[wallet].history.push({ts:Date.now(), event:"PAUSE", name});
-    }
-    res.json({ok:true, active:state[wallet].active});
-  });
+  <div class="formRow" style="margin-top:10px">
+    <button class="btn" id="btnSwapQuote">QUOTE</button>
+    <button class="btn primary" id="btnSwapExecute">SWAP</button>
+  </div>
 
-  router.post(base + "/stop", (req,res)=>{
-    const wallet = walletOf(req);
-    if(!wallet) return res.status(400).send("missing wallet");
-    ensure(wallet);
-    if(state[wallet].active && state[wallet].active.name===name){
-      state[wallet].history.push({ts:Date.now(), event:"STOP", name});
-      state[wallet].active=null;
-    } else {
-      state[wallet].history.push({ts:Date.now(), event:"STOP_NOOP", name});
-    }
-    res.json({ok:true, active:state[wallet].active});
-  });
+  <div class="notice" style="margin-top:10px">
+    <div class="small" id="swapOut">—</div>
+  </div>
+</section>
+HTMLSEC
+)
 
-  router.get(base + "/status", (req,res)=>{
-    const wallet = walletOf(req);
-    if(!wallet) return res.status(400).send("missing wallet");
-    ensure(wallet);
-    res.json({ok:true, active:state[wallet].active, last:state[wallet].history.slice(-10)});
-  });
-}
+  # Insert before </main> if exists, else before </body>
+  if grep -qi "</main>" "$HTML"; then
+    perl -0777 -i -pe 's#</main>#'"$SWAP_SECTION"'\n</main>#si' "$HTML"
+  else
+    perl -0777 -i -pe 's#</body>#'"$SWAP_SECTION"'\n</body>#si' "$HTML"
+  fi
 
-["dca","grid","arbitrage","trend"].forEach(make);
-module.exports = router;
-JS
+  echo "Added pageSwap"
+else
+  echo "pageSwap already present"
+fi
 
-cat >"$BACK_DIR/routes/swap.routes.js" <<'JS'
-/**
- * Swap routes (Solana) via Jupiter:
- *  GET  /api/swap/quote?inputMint=&outputMint=&amount=&slippageBps=
- *  POST /api/swap/tx   { userPublicKey, quoteResponse, wrapAndUnwrapSol?:true }
- * NOTE: /tx retourne une tx base64 à SIGNER côté wallet (plus safe).
- */
-const express = require("express");
-const router = express.Router();
+# --- 3) Add JS logic (tab + quote + execute) ---
+if ! grep -q "WOLV_SWAP_TAB_V1" "$JS"; then
+  cat >>"$JS" <<'JS'
 
-const JUP_QUOTE = "https://quote-api.jup.ag/v6/quote";
-const JUP_SWAP  = "https://quote-api.jup.ag/v6/swap";
+// --- WOLV_SWAP_TAB_V1 ---
+(function(){
+  const $ = (id)=>document.getElementById(id);
 
-router.get("/quote", async (req,res)=>{
-  try{
-    const { inputMint, outputMint, amount, slippageBps } = req.query;
-    if(!inputMint || !outputMint || !amount) return res.status(400).send("missing params");
-    const u = new URL(JUP_QUOTE);
-    u.searchParams.set("inputMint", String(inputMint));
-    u.searchParams.set("outputMint", String(outputMint));
-    u.searchParams.set("amount", String(amount));
-    u.searchParams.set("slippageBps", String(slippageBps || 50));
-    const r = await fetch(u);
-    const t = await r.text();
-    if(!r.ok) return res.status(r.status).send(t);
-    res.type("application/json").send(t);
-  }catch(e){
-    res.status(500).send(e?.message || String(e));
+  // If you already have your own page router, this won't break it;
+  // it only toggles known pages if they exist.
+  function showPage(pageId){
+    const candidates = ["pageDashboard","pageTrade","pageWallet","pagePositions","pageOrders","pageHistory","pageSwap"];
+    candidates.forEach(p=>{
+      const el=$(p);
+      if(el) el.style.display = (p===pageId ? "block" : "none");
+    });
   }
-});
 
-router.post("/tx", async (req,res)=>{
-  try{
-    const { userPublicKey, quoteResponse, wrapAndUnwrapSol } = req.body || {};
-    if(!userPublicKey || !quoteResponse) return res.status(400).send("missing userPublicKey/quoteResponse");
+  async function phantomPub(){
+    if(!window.solana || !window.solana.isPhantom) throw new Error("Phantom missing");
+    if(!window.solana.publicKey) await window.solana.connect();
+    return window.solana.publicKey.toBase58();
+  }
 
-    const r = await fetch(JUP_SWAP, {
+  function decimals(mint){
+    if(mint === "So11111111111111111111111111111111111111112") return 9; // SOL
+    if(mint === "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1") return 6; // USDC
+    return 6;
+  }
+
+  async function quote(){
+    const inputMint = $("swapFrom").value;
+    const outputMint = $("swapTo").value;
+    const amtUi = Number($("swapAmount").value || 0);
+    const slippageBps = Number($("swapSlip").value || 50);
+
+    if(!amtUi || amtUi <= 0) throw new Error("Amount invalid");
+    if(inputMint === outputMint) throw new Error("From/To must differ");
+
+    const amtBase = Math.floor(amtUi * (10 ** decimals(inputMint)));
+    const url = `/api/swap/quote?inputMint=${encodeURIComponent(inputMint)}&outputMint=${encodeURIComponent(outputMint)}&amount=${amtBase}&slippageBps=${slippageBps}`;
+
+    const r = await fetch(url, { cache:"no-store" });
+    if(!r.ok) throw new Error(await r.text());
+    const data = await r.json();
+
+    const best = data.data?.[0];
+    if(!best) throw new Error("No route");
+
+    window.__lastQuote = best;
+    $("swapOut").textContent = `Route OK ✅ | outAmount: ${best.outAmount} | priceImpactPct: ${best.priceImpactPct ?? "?"}`;
+  }
+
+  async function execute(){
+    if(!window.solanaWeb3?.VersionedTransaction) throw new Error("solanaWeb3 not loaded");
+    const pub = await phantomPub();
+    if(!window.__lastQuote) throw new Error("Do QUOTE first");
+
+    const r = await fetch("/api/swap/tx", {
       method:"POST",
       headers:{ "content-type":"application/json" },
       body: JSON.stringify({
-        quoteResponse,
-        userPublicKey,
-        wrapAndUnwrapSol: !!wrapAndUnwrapSol
+        userPublicKey: pub,
+        quoteResponse: window.__lastQuote,
+        wrapAndUnwrapSol: true
       })
     });
     const t = await r.text();
-    if(!r.ok) return res.status(r.status).send(t);
-    res.type("application/json").send(t);
-  }catch(e){
-    res.status(500).send(e?.message || String(e));
+    if(!r.ok) throw new Error(t);
+    const { swapTransaction } = JSON.parse(t);
+    if(!swapTransaction) throw new Error("No swapTransaction");
+
+    const txBuf = Uint8Array.from(atob(swapTransaction), c => c.charCodeAt(0));
+    const tx = window.solanaWeb3.VersionedTransaction.deserialize(txBuf);
+
+    const signed = await window.solana.signTransaction(tx);
+    const conn = new window.solanaWeb3.Connection("https://api.mainnet-beta.solana.com","confirmed");
+    const sig = await conn.sendTransaction(signed, { maxRetries: 3 });
+    await conn.confirmTransaction(sig, "confirmed");
+
+    $("swapOut").textContent = `SWAP OK ✅ tx: ${sig}`;
   }
-});
 
-module.exports = router;
+  function bind(){
+    const nav = $("navSwap");
+    if(nav) nav.addEventListener("click", ()=>showPage("pageSwap"));
+
+    const bq = $("btnSwapQuote");
+    if(bq) bq.addEventListener("click", ()=>quote().catch(e=>{
+      if($("swapOut")) $("swapOut").textContent="ERR: "+(e.message||e);
+    }));
+
+    const bx = $("btnSwapExecute");
+    if(bx) bx.addEventListener("click", ()=>execute().catch(e=>{
+      if($("swapOut")) $("swapOut").textContent="ERR: "+(e.message||e);
+    }));
+  }
+
+  if(document.readyState==="loading") document.addEventListener("DOMContentLoaded", bind);
+  else bind();
+})();
+// --- /WOLV_SWAP_TAB_V1 ---
 JS
-
-echo "=== [4] Wire routes into server entry ==="
-ENTRY=""
-for f in server.js app.js index.js main.js src/server.js src/app.js src/index.js; do
-  if [ -f "$BACK_DIR/$f" ]; then ENTRY="$BACK_DIR/$f"; break; fi
-done
-if [ -z "$ENTRY" ]; then
-  ENTRY="$(grep -RIl --no-messages -E "const app *= *express\\(" "$BACK_DIR" --include="*.js" --include="*.cjs" --include="*.mjs" | head -n1 || true)"
-fi
-[ -n "$ENTRY" ] || { echo "ERR: entry express introuvable dans $BACK_DIR"; exit 1; }
-
-echo "ENTRY=$ENTRY"
-cp -a "$ENTRY" "/root/wolv_backups/backend_entry.$TS.bak"
-
-# ensure requires
-if ! grep -q "strategyRoutes" "$ENTRY"; then
-  perl -0777 -i -pe '
-    my $s=$_;
-    if($s =~ /const\s+express\s*=\s*require\([^)]+\);\s*/s){
-      $s =~ s/(const\s+express\s*=\s*require\([^)]+\);\s*)/$1\nconst strategyRoutes = require(".\/routes\/strategy.routes");\nconst swapRoutes = require(".\/routes\/swap.routes");\n/s;
-    } elsif($s =~ /const\s+app\s*=\s*express\(\)\s*;\s*/s){
-      $s =~ s/(const\s+app\s*=\s*express\(\)\s*;\s*)/$1\nconst strategyRoutes = require(".\/routes\/strategy.routes");\nconst swapRoutes = require(".\/routes\/swap.routes");\n/s;
-    } else {
-      $s = "const strategyRoutes = require(\".\/routes\/strategy.routes\");\nconst swapRoutes = require(\".\/routes\/swap.routes\");\n".$s;
-    }
-    $_=$s;
-  ' "$ENTRY"
-fi
-
-# ensure app.use
-if ! grep -q "/api/strategy" "$ENTRY"; then
-  echo 'app.use("/api/strategy", strategyRoutes);' >> "$ENTRY"
-fi
-if ! grep -q "/api/swap" "$ENTRY"; then
-  echo 'app.use("/api/swap", swapRoutes);' >> "$ENTRY"
-fi
-
-echo "WIRED ✅ /api/strategy + /api/swap"
-
-echo "=== [5] Restart backend ==="
-if [ -n "${SERVICE:-}" ]; then
-  systemctl restart "$SERVICE"
-  echo "systemctl restarted: $SERVICE"
+  echo "Patched terminal.js with Swap tab logic"
 else
-  echo "WARN: service non trouvé, je redémarre le PID $PID (best effort)"
-  kill -HUP "$PID" || true
+  echo "Swap tab JS already present"
 fi
 
-echo "=== [6] Local quick test ==="
-for p in 3000; do
-  echo "-- http://127.0.0.1:$p/api/strategy/dca/status?wallet=test"
-  curl -sS "http://127.0.0.1:$p/api/strategy/dca/status?wallet=test" || true
-  echo
-  echo "-- http://127.0.0.1:$p/api/swap/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1&amount=10000000&slippageBps=50"
-  curl -sS "http://127.0.0.1:$p/api/swap/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1&amount=10000000&slippageBps=50" | head -c 200 || true
-  echo
-done
+nginx -t && systemctl reload nginx || true
 
-echo ""
-echo "DONE ✅"
+echo "DONE ✅  Ctrl+F5 sur https://fireinners.online/wolverine/"
 echo "Rollback:"
-echo "  cp -a /root/wolv_backups/backend_entry.$TS.bak $ENTRY"
+echo "  cp -a /root/wolv_backups/index.html.$TS.bak $HTML"
+echo "  cp -a /root/wolv_backups/terminal.js.$TS.bak $JS"
 BASH
 
-bash /root/WOLV_PATCH_API_3000_STRATEGY_SWAP.sh
+bash /root/WOLV_ADD_SWAP_TAB.sh
