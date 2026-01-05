@@ -1,4 +1,4 @@
-cat >/root/WOLV_HARD_RESET_SINGLE_V2.sh <<'BASH'
+cat >/root/WOLV_FORCE_SINGLE_DEPOT_AND_FIX_PERMS.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 TS="$(date +%s)"
@@ -7,7 +7,7 @@ DIST="/opt/fireinners/frontend-react/app/dist"
 WOLV="$DIST/wolverine"
 mkdir -p "$WOLV"
 
-# 1) Trouver le vrai vhost nginx (server{} + server_name fireinners.online + listen 443)
+# Trouver vhost canon (fireinners.online + listen 443)
 CANON="$(python3 - <<'PY'
 import re,glob,sys,os
 paths=[]
@@ -29,7 +29,7 @@ def server_blocks(txt):
           out.append((i,j+1,txt[i:j+1])); break
       j+=1
   return out
-cands=[]
+c=[]
 for p in paths:
   if re.search(r'\.(bak|old|save|disabled)(\.|$)', p): 
     continue
@@ -39,34 +39,52 @@ for p in paths:
       score=0
       if re.search(r'(?m)^\s*listen\s+443', t): score+=10
       if "ssl" in t: score+=2
-      cands.append((score,p))
-if not cands: sys.exit("ERR: vhost fireinners.online introuvable")
-cands.sort(reverse=True)
-print(cands[0][1])
+      c.append((score,p))
+if not c: sys.exit("ERR: vhost fireinners.online introuvable")
+c.sort(reverse=True)
+print(c[0][1])
 PY
 )"
-
-# 2) Nettoyer sites-enabled doublons (garder seulement CANON)
 CANON_REAL="$(readlink -f "$CANON" || echo "$CANON")"
+
+# Déverrouille (immutable) sur tout ce qui peut bloquer (sans casser)
+chattr -i /etc/nginx/nginx.conf 2>/dev/null || true
+chattr -i "$CANON" 2>/dev/null || true
+for f in /etc/nginx/sites-enabled/* /etc/nginx/sites-available/* /etc/nginx/conf.d/*; do
+  [ -e "$f" ] || continue
+  case "$f" in
+    *.bak*|*.disabled.*|*.old*|*.save*) continue;;
+  esac
+  chattr -i "$f" 2>/dev/null || true
+done
+
+# Désactive tous les doublons fireinners.online dans sites-enabled (sauf canon)
 for f in /etc/nginx/sites-enabled/*; do
   [ -e "$f" ] || continue
+  tgt="$f"; [ -L "$f" ] && tgt="$(readlink -f "$f" || echo "$f")"
   txt="$(python3 - <<PY
 import sys
 p=sys.argv[1]
 try: print(open(p,'r',encoding='utf-8',errors='ignore').read())
 except: print('')
 PY
-"$f")"
+"$tgt")"
   if echo "$txt" | grep -qE '^\s*server_name\s+.*\bfireinners\.online\b'; then
-    tgt="$f"; [ -L "$f" ] && tgt="$(readlink -f "$f" || echo "$f")"
     if [ "$tgt" != "$CANON_REAL" ]; then
-      [ -L "$f" ] && rm -f "$f" || mv -f "$f" "$f.disabled.$TS"
+      chattr -i "$f" 2>/dev/null || true
+      if [ -L "$f" ]; then
+        rm -f "$f"
+      else
+        mv -f "$f" "$f.disabled.$TS"
+      fi
     fi
   fi
 done
+
+# Assure le lien canon
 ln -sf "$CANON" "/etc/nginx/sites-enabled/$(basename "$CANON")"
 
-# 3) Patch nginx Wolverine (proxy API + serve UI) + no-cache
+# Injecte/replace le bloc Wolverine (proxy API + serve UI + no-cache)
 MARK_BEGIN="# BEGIN WOLV_SINGLE_UI_V2"
 MARK_END="# END WOLV_SINGLE_UI_V2"
 BLOCK="$MARK_BEGIN
@@ -91,19 +109,13 @@ location ^~ /wolverine/ {
 }
 $MARK_END"
 
-chattr -i "$CANON" 2>/dev/null || true
 python3 - "$CANON" "$MARK_BEGIN" "$MARK_END" "$BLOCK" <<'PY'
 import sys,re
 p,mb,me,block=sys.argv[1],sys.argv[2],sys.argv[3],sys.argv[4]
 s=open(p,"r",encoding="utf-8",errors="ignore").read()
 
-# remove older wolv blocks (any version)
+# remove any older wolv blocks
 s=re.sub(r'(?s)# BEGIN WOLV_.*?# END WOLV_.*?\n?','',s)
-
-if mb in s and me in s:
-  a=s.index(mb); b=s.index(me,a)+len(me)
-  s=s[:a]+block+s[b:]
-  open(p,"w",encoding="utf-8").write(s); raise SystemExit(0)
 
 def server_blocks(txt):
   out=[]
@@ -122,24 +134,22 @@ def server_blocks(txt):
 B=server_blocks(s)
 c=[b for b in B if re.search(r'(?m)^\s*server_name\s+.*\bfireinners\.online\b', b[2])]
 if not c: raise SystemExit("ERR: aucun server{} fireinners.online dans "+p)
+
 pick=None
 for b in c:
   if re.search(r'(?m)^\s*listen\s+443', b[2]): pick=b; break
 if pick is None: pick=c[0]
+
 a,b,t=pick
 ins=b-1
 s=s[:ins].rstrip()+"\n\n"+block+"\n\n"+s[ins:]
 open(p,"w",encoding="utf-8").write(s)
 PY
 
-nginx -t
-systemctl reload nginx
-chattr +i "$CANON" 2>/dev/null || true
-
-# 4) Purge anciens fichiers Wolverine (évite UI old/doublons)
+# Purge anciennes variantes d'UI pour éviter affichage doublon
 rm -f "$WOLV"/index.*.html 2>/dev/null || true
 
-# 5) UI SINGLE (1 seul dépôt manuel + mode + start)
+# UI SINGLE: 1 dépôt manuel (plus de retrait / plus de sections dupliquées)
 cat >"$WOLV/index.html" <<'HTML'
 <!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Pragma" content="no-cache"><meta http-equiv="Expires" content="0"><title>WOLVERINE</title><style>body{font:14px Arial,system-ui;margin:0;padding:14px;background:#fff}#wrap{max-width:980px;margin:0 auto;border:1px solid #bbb;border-radius:12px;padding:12px}h1{margin:0 0 10px 0;font-size:32px;letter-spacing:.5px}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:10px 0}.mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;word-break:break-all}.box{padding:10px;border:1px solid #bbb;border-radius:10px;background:#f7f7f7}button,select,input{font:inherit;padding:6px 8px}small{color:#444}.ok{color:#060}.bad{color:#a00}</style></head><body><div id="wrap"><h1>WOLVERINE</h1>
 
@@ -169,7 +179,7 @@ cat >"$WOLV/index.html" <<'HTML'
   </div>
   <div id="depMsg" class="mono"></div>
   <div class="row">
-    <button id="btnStart" type="button" disabled>START WOLVERINE</button>
+    <button id="btnStart" type="button" disabled>Lancer WOLVERINE</button>
     <div id="startMsg" class="mono"></div>
   </div>
 </div>
@@ -214,9 +224,16 @@ $("#btnStart").onclick=async()=>{
 </div></body></html>
 HTML
 
-echo "OK WOLV HARD RESET SINGLE V2"
-echo "NGINX: $CANON"
+nginx -t
+systemctl reload nginx
+
+# Re-lock
+chattr +i /etc/nginx/nginx.conf 2>/dev/null || true
+chattr +i "$CANON" 2>/dev/null || true
+
+echo "OK: Wolverine SINGLE installé"
+echo "VHOST: $CANON"
 echo "URL: https://fireinners.online/wolverine/?v=$TS"
 BASH
 
-bash /root/WOLV_HARD_RESET_SINGLE_V2.sh
+bash /root/WOLV_FORCE_SINGLE_DEPOT_AND_FIX_PERMS.sh
