@@ -1,203 +1,51 @@
-cat >/root/TRADERONE_ALL_IN_ONE.sh <<'SH'
+cat >/root/FIX_NGINX_TRADERONE.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-### ====== CONFIG FIGÉE ======
-BASE="/opt/traderone"
-API="$BASE/api"
-WAL="$BASE/wallet"
-LOGS="$BASE/logs"
-CFG="$BASE/config.json"
-
-FRONT="/opt/fireinners/frontend-react/app/dist/wolverine"
 VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
+BACKUP="/root/nginx_fireinners_backup_$(date +%s).conf"
 
-RPC_URL="https://api.mainnet-beta.solana.com"
-FEE_SOL=0.001
+echo "[FIX] backup vhost"
+cp -a "$VHOST" "$BACKUP"
 
-# WALLET INTERNE TRADERONE (PUB CONFIRMÉE)
-WALLET_INTERNAL_PUB="e8DbBrTJxRetx3HNFb83CsXMySETydHVLwxMzkjcVqh"
+echo "[FIX] clean any misplaced TraderOne blocks"
+sed -i '/# --- TRADERONE ---/,/# --- END TRADERONE ---/d' "$VHOST"
 
-NODE_MIN=20
-PORT=3000
+echo "[FIX] reinject TraderOne INSIDE server{}"
 
-log(){ echo "[TRADERONE] $*"; }
-need_root(){ [ "$(id -u)" -eq 0 ] || { echo "Run as root"; exit 1; }; }
-
-### ====== PRÉREQUIS ======
-need_root
-apt-get update -y
-apt-get install -y curl ca-certificates git nginx
-
-### ====== NODE 20 ======
-if ! command -v node >/dev/null 2>&1 || [ "$(node -v | sed 's/v//' | cut -d. -f1)" -lt "$NODE_MIN" ]; then
-  curl -fsSL https://deb.nodesource.com/setup_${NODE_MIN}.x | bash -
-  apt-get install -y nodejs
-fi
-npm i -g pm2
-
-### ====== DOSSIERS ======
-mkdir -p "$API" "$WAL" "$LOGS" "$FRONT"
-
-### ====== CONFIG ======
-cat >"$CFG" <<JSON
+awk '
+BEGIN{done=0}
 {
-  "rpc": "$RPC_URL",
-  "fee_sol": $FEE_SOL,
-  "wallet_internal_pub": "$WALLET_INTERNAL_PUB",
-  "log": "$LOGS/traderone.log"
-}
-JSON
-
-### ====== WALLET INTERNE (si absent) ======
-if [ ! -f "$WAL/traderone.keypair.json" ]; then
-  log "Création wallet interne VPS"
-  solana-keygen new --no-bip39-passphrase --outfile "$WAL/traderone.keypair.json"
-fi
-
-### ====== API ======
-cat >"$API/server.js" <<'JS'
-import http from "http";
-import fs from "fs";
-import path from "path";
-import { Connection, PublicKey, Keypair, SystemProgram, Transaction } from "@solana/web3.js";
-
-const BASE="/opt/traderone";
-const CFG=JSON.parse(fs.readFileSync(path.join(BASE,"config.json"),"utf8"));
-const LOG=CFG.log;
-const PORT=3000;
-
-const conn=new Connection(CFG.rpc,"confirmed");
-const kp=Keypair.fromSecretKey(
-  Uint8Array.from(JSON.parse(fs.readFileSync(path.join(BASE,"wallet","traderone.keypair.json"),"utf8")))
-);
-
-let running=false;
-
-const log=(m)=>fs.appendFileSync(LOG,`[${new Date().toISOString()}] ${m}\n`);
-
-async function loop(){
-  if(!running) return;
-  // PLACEHOLDER trading loop (safe)
-  log("loop tick");
-  setTimeout(loop, 15000);
-}
-
-const server=http.createServer(async (req,res)=>{
-  res.setHeader("Content-Type","application/json");
-  try{
-    if(req.method==="POST" && req.url==="/api/status"){
-      const bal=await conn.getBalance(kp.publicKey);
-      res.end(JSON.stringify({running,internal:kp.publicKey.toBase58(),bal}));
-      return;
-    }
-    if(req.method==="POST" && req.url==="/api/start"){
-      running=true; log("START"); loop();
-      res.end(JSON.stringify({ok:true}));
-      return;
-    }
-    if(req.method==="POST" && req.url==="/api/stop"){
-      running=false; log("STOP");
-      res.end(JSON.stringify({ok:true}));
-      return;
-    }
-    if(req.method==="POST" && req.url==="/api/cashout"){
-      let body=""; req.on("data",c=>body+=c);
-      req.on("end",async()=>{
-        const j=JSON.parse(body||"{}");
-        const dest=new PublicKey(j.userPub);
-        const bal=await conn.getBalance(kp.publicKey);
-        const tx=new Transaction().add(SystemProgram.transfer({
-          fromPubkey: kp.publicKey,
-          toPubkey: dest,
-          lamports: Math.max(0, bal-5000)
-        }));
-        const sig=await conn.sendTransaction(tx,[kp]);
-        running=false; log("CASHOUT "+sig);
-        res.end(JSON.stringify({ok:true, sig}));
-      });
-      return;
-    }
-    res.statusCode=404; res.end(JSON.stringify({err:"not found"}));
-  }catch(e){
-    log("ERR "+e.message);
-    res.statusCode=500; res.end(JSON.stringify({err:e.message}));
+  print
+  if(!done && $0 ~ /server\s*{/){
+    print "    # --- TRADERONE ---"
+    print "    location ^~ /wolverine/ {"
+    print "        root /opt/fireinners/frontend-react/app/dist;"
+    print "        index index.html;"
+    print "        try_files $uri $uri/ /wolverine/index.html;"
+    print "    }"
+    print ""
+    print "    location ^~ /api/ {"
+    print "        proxy_pass http://127.0.0.1:3000/;"
+    print "        proxy_http_version 1.1;"
+    print "        proxy_set_header Host $host;"
+    print "        proxy_set_header X-Real-IP $remote_addr;"
+    print "        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;"
+    print "    }"
+    print "    # --- END TRADERONE ---"
+    done=1
   }
-});
-server.listen(PORT,()=>log("API up :"+PORT));
-JS
+}' "$VHOST" > /tmp/fireinners.fixed && mv /tmp/fireinners.fixed "$VHOST"
 
-### ====== FRONTEND ======
-cat >"$FRONT/index.html" <<'HTML'
-<!doctype html><html lang="fr"><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>TraderOne</title>
-<style>
-body{background:#0b1020;color:#fff;font-family:system-ui;margin:0}
-#c{max-width:900px;margin:20px auto;padding:16px}
-button,input{padding:10px 14px;border-radius:10px;border:0;margin:6px}
-input{width:100%}
-</style>
-<div id=c>
-<h2>TraderOne</h2>
-<button id=con>Connect Phantom</button>
-<div>Wallet: <span id=addr>-</span></div>
-<input id=amt placeholder="Budget SOL"/>
-<button id=start>Start</button>
-<button id=stop>Stop</button>
-<button id=cash>Cash-out</button>
-<pre id=log></pre>
-</div>
-<script src="https://unpkg.com/@solana/web3.js@latest/lib/index.iife.min.js"></script>
-<script>
-const log=t=>document.querySelector("#log").textContent+=t+"\\n";
-let pub=null;
-document.querySelector("#con").onclick=async()=>{
- const p=window.solana;if(!p){alert("Install Phantom");return;}
- const r=await p.connect(); pub=r.publicKey.toString();
- document.querySelector("#addr").textContent=pub;
-};
-async function post(u,o){return fetch(u,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(o||{})}).then(r=>r.json())}
-document.querySelector("#start").onclick=async()=>{await post("/api/start");log("started")};
-document.querySelector("#stop").onclick=async()=>{await post("/api/stop");log("stopped")};
-document.querySelector("#cash").onclick=async()=>{const r=await post("/api/cashout",{userPub:pub});log(JSON.stringify(r))};
-</script>
-</html>
-HTML
-
-### ====== NGINX (IDEMPOTENT) ======
-if ! grep -q "location ^~ /wolverine/" "$VHOST"; then
-cat >>"$VHOST" <<'NGX'
-
-# --- TRADERONE ---
-location ^~ /wolverine/ {
-  root /opt/fireinners/frontend-react/app/dist;
-  index index.html;
-  try_files $uri $uri/ /wolverine/index.html;
-}
-location ^~ /api/ {
-  proxy_pass http://127.0.0.1:3000/;
-  proxy_http_version 1.1;
-  proxy_set_header Host $host;
-}
-# --- END TRADERONE ---
-NGX
-fi
-
+echo "[FIX] test nginx"
 nginx -t
+
+echo "[FIX] reload nginx"
 systemctl reload nginx
 
-### ====== PM2 ======
-cat >"$BASE/run.sh" <<'SH2'
-#!/usr/bin/env bash
-node /opt/traderone/api/server.js
-SH2
-chmod +x "$BASE/run.sh"
-
-pm2 delete traderone || true
-pm2 start "$BASE/run.sh" --name traderone
-pm2 save
-
-log "ALL-IN-ONE DONE"
+echo "[OK] nginx fixed successfully"
+echo "[INFO] backup saved at: $BACKUP"
 SH
-chmod +x /root/TRADERONE_ALL_IN_ONE.sh
-/root/TRADERONE_ALL_IN_ONE.sh
+
+chmod +x /root/FIX_NGINX_TRADERONE.sh
+/root/FIX_NGINX_TRADERONE.sh
