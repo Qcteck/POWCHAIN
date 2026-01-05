@@ -1,101 +1,75 @@
 #!/bin/bash
 set -e
 
-UI="/opt/fireinners/frontend-react/app/dist/wolverine/index.html"
-BK="$UI.bak.$(date +%s)"
+FRONT="/opt/fireinners/frontend-react/app/dist/wolverine/index.html"
+BACK="/opt/wolverine/server.js"
 
-echo "=== WOLVERINE • TRANSPARENCE + FOND ADAPTATIF ==="
+echo "=== WOLVERINE • FIX SOLDES SOL / USDC ==="
 
-echo "[1/5] Backup"
-cp "$UI" "$BK"
+### 1️⃣ BACKEND — route balances
+if ! grep -q "/api/balances" "$BACK"; then
+echo "[1/4] Patch backend balances"
 
-echo "[2/5] Patch CSS fond unique + transparence"
-node <<'NODE'
-const fs=require("fs");
-const p="/opt/fireinners/frontend-react/app/dist/wolverine/index.html";
-let s=fs.readFileSync(p,"utf8");
-if(s.includes("WOLVERINE_BG")){
-  console.log("Patch déjà présent");
-  process.exit(0);
-}
-const css=`
-<style id="WOLVERINE_BG">
-:root{
---main:#ec4899;
---alpha:.08;
-}
-html,body{
-background:
-radial-gradient(1200px 800px at 50% 0%,color-mix(in srgb,var(--main) 35%,transparent),transparent 65%),
-radial-gradient(900px 600px at 50% 100%,color-mix(in srgb,var(--main) 20%,transparent),transparent 70%),
-#05060b;
-transition:background .6s ease;
-}
-.panel,.card{
-background:color-mix(in srgb,#ffffff calc(var(--alpha)*100%),transparent);
-backdrop-filter:blur(14px);
-border:1px solid rgba(255,255,255,.18);
-transition:background .4s ease;
-}
-</style>
-`;
-s=s.replace(/<\/head>/i,css+"\n</head>");
-fs.writeFileSync(p,s);
-NODE
+cat >> "$BACK" <<'EOF'
 
-echo "[3/5] Ajout slider Transparence + fond principal"
-node <<'NODE'
-const fs=require("fs");
-const p="/opt/fireinners/frontend-react/app/dist/wolverine/index.html";
-let s=fs.readFileSync(p,"utf8");
+// === BALANCES API ===
+app.get("/api/balances", async (req,res)=>{
+  try{
+    const {user} = req.query;
+    if(!user) return res.status(400).json({error:"missing user"});
 
-if(!s.includes("Transparence")){
-s=s.replace(
-/(<div id="settingsPanel"[\\s\\S]*?>)/,
-`$1
-<hr>
-<b>Fond & Transparence</b><br><br>
-<label>Couleur fond
-<select id="bgMode">
-<option value="rose">Rose</option>
-<option value="turquoise">Turquoise</option>
-</select>
-</label><br><br>
-<label>Transparence
-<input type="range" id="alpha" min="0" max="100" value="8">
-</label><br><br>
-`
-);
-}
-fs.writeFileSync(p,s);
-NODE
+    const pub = new solanaWeb3.PublicKey(user);
 
-echo "[4/5] Logique JS adaptative + persistance"
+    const lamports = await connection.getBalance(pub);
+    const solUser = lamports / solanaWeb3.LAMPORTS_PER_SOL;
+
+    const usdcMint = new solanaWeb3.PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1");
+    const atas = await connection.getParsedTokenAccountsByOwner(pub,{mint:usdcMint});
+    let usdcUser = 0;
+    atas.value.forEach(a=>{
+      usdcUser += a.account.data.parsed.info.tokenAmount.uiAmount || 0;
+    });
+
+    res.json({
+      phantom:{ sol:solUser, usdc:usdcUser },
+      internal:{
+        sol: global.INTERNAL_SOL || 0,
+        usdc: global.INTERNAL_USDC || 0
+      }
+    });
+  }catch(e){
+    res.status(500).json({error:e.message});
+  }
+});
+EOF
+fi
+
+### 2️⃣ RESTART BACKEND
+echo "[2/4] Restart backend"
+pm2 restart traderone || pm2 start "$BACK" --name traderone
+pm2 save
+
+### 3️⃣ FRONTEND — affichage soldes
+echo "[3/4] Patch frontend"
+
 node <<'NODE'
 const fs=require("fs");
 const p="/opt/fireinners/frontend-react/app/dist/wolverine/index.html";
 let s=fs.readFileSync(p,"utf8");
 
-if(s.includes("applyBG"))process.exit(0);
+if(s.includes("loadBalances"))process.exit(0);
 
 const js=`
 <script>
-const BGDEF={mode:"rose",alpha:8};
-function applyBG(b){
-const main=b.mode==="turquoise"?"#2dd4bf":"#ec4899";
-document.documentElement.style.setProperty("--main",main);
-document.documentElement.style.setProperty("--alpha",(b.alpha/100).toFixed(2));
-localStorage.setItem("wolverine_bg",JSON.stringify(b));
+async function loadBalances(){
+ if(!window.walletAddress)return;
+ const r=await fetch("/api/balances?user="+walletAddress);
+ const j=await r.json();
+ document.getElementById("phantomSol").textContent=j.phantom.sol.toFixed(4)+" SOL";
+ document.getElementById("phantomUsdc").textContent=j.phantom.usdc.toFixed(2)+" USDC";
+ document.getElementById("internalSol").textContent=j.internal.sol.toFixed(4)+" SOL";
+ document.getElementById("internalUsdc").textContent=j.internal.usdc.toFixed(2)+" USDC";
 }
-function loadBG(){
-const b=JSON.parse(localStorage.getItem("wolverine_bg")||"null")||BGDEF;
-applyBG(b);
-const m=document.getElementById("bgMode");
-const a=document.getElementById("alpha");
-if(m){m.value=b.mode;m.onchange=()=>{b.mode=m.value;applyBG(b)}}
-if(a){a.value=b.alpha;a.oninput=()=>{b.alpha=+a.value;applyBG(b)}}
-}
-window.addEventListener("load",loadBG);
 </script>
 `;
 
@@ -103,8 +77,8 @@ s=s.replace(/<\/body>/i,js+"\n</body>");
 fs.writeFileSync(p,s);
 NODE
 
-echo "[5/5] Reload nginx"
+### 4️⃣ RELOAD NGINX
+echo "[4/4] Reload nginx"
 nginx -t && systemctl reload nginx
 
-echo "DONE ✔️"
-echo "Backup: $BK"
+echo "✅ SOLDES SOL + USDC OK"
