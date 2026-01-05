@@ -1,8 +1,8 @@
-cat >/root/WOLV_ADD_WALLET_BALANCES.sh <<'BASH'
+cat >/root/WOLV_ADD_STRATEGY_MODES.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 1) Trouver le dossier web /wolverine
+echo "=== [1] FIND FRONTEND /wolverine ==="
 WEB_DIR=""
 for d in \
   /opt/fireinners/frontend-react/app/dist/wolverine \
@@ -21,100 +21,441 @@ JS="$WEB_DIR/ui/terminal.js"
 [ -f "$HTML" ] || { echo "ERR: index.html introuvable: $HTML"; exit 1; }
 [ -f "$JS" ] || { echo "ERR: terminal.js introuvable: $JS"; exit 1; }
 
-# 2) Backup
 TS="$(date +%s)"
 mkdir -p /root/wolv_backups
 cp -a "$HTML" "/root/wolv_backups/index.html.$TS.bak"
 cp -a "$JS"   "/root/wolv_backups/terminal.js.$TS.bak"
-echo "Backup OK -> /root/wolv_backups/(index.html|terminal.js).$TS.bak"
+echo "Backup frontend OK -> /root/wolv_backups/*.$TS.bak"
 
-# 3) Assurer solana web3 IIFE dans le HTML
-if ! grep -q "@solana/web3.js" "$HTML"; then
-  sed -i 's#</body>#  <script src="https://unpkg.com/@solana/web3.js@latest/lib/index.iife.min.js"></script>\n</body>#i' "$HTML"
-  echo "Added solana web3 script tag"
-fi
+echo "=== [2] PATCH FRONTEND (UI Strategy + API calls) ==="
 
-# 4) Ajouter le bloc HTML Wallet Balances (si absent)
-if ! grep -q 'id="walletPub"' "$HTML"; then
-  # on l'insère juste après le bloc "Soldes Wallet" existant si possible, sinon avant </aside>
-  if grep -q "Soldes Wallet" "$HTML"; then
-    perl -0777 -i -pe 's/(Soldes Wallet[\s\S]{0,2500}?<\/div>)/$1\n\n<div id="walletBalances" style="margin-top:10px" class="notice">\n  <div style="font-weight:1000;margin-bottom:6px">Wallet Balances</div>\n  <div class="kv"><span>Wallet</span><strong id="walletPub">—</strong></div>\n  <div class="kv"><span>SOL</span><strong id="walletSol">—</strong></div>\n  <div class="kv"><span>USDC</span><strong id="walletUsdc">—</strong></div>\n</div>\n/sm' "$HTML" || true
-  fi
-  if ! grep -q 'id="walletPub"' "$HTML"; then
-    perl -0777 -i -pe 's#</aside>#\n<div id="walletBalances" style="margin-top:10px" class="notice">\n  <div style="font-weight:1000;margin-bottom:6px">Wallet Balances</div>\n  <div class="kv"><span>Wallet</span><strong id="walletPub">—</strong></div>\n  <div class="kv"><span>SOL</span><strong id="walletSol">—</strong></div>\n  <div class="kv"><span>USDC</span><strong id="walletUsdc">—</strong></div>\n</div>\n\n</aside>#sm' "$HTML"
-  fi
-  echo "Added Wallet Balances HTML block"
+# Inject UI block (Trade panel area) if not already present
+if ! grep -q 'id="strategyMode"' "$HTML"; then
+  perl -0777 -i -pe 's#(<div class="notice">\s*<div style="font-weight:1000;margin-bottom:6px">TraderOne Control</div>)#$1\n\n<div style="height:10px"></div>\n<div style="font-weight:1000;margin-bottom:6px">Trading Strategy</div>\n<div class="formRow">\n  <select id="strategyMode">\n    <option value="DCA">DCA</option>\n    <option value="GRID">GRID</option>\n    <option value="ARBITRAGE">ARBITRAGE</option>\n    <option value="TREND">TREND</option>\n  </select>\n  <button class="btn primary" id="btnStrStart">START</button>\n  <button class="btn" id="btnStrPause">PAUSE</button>\n  <button class="btn bad" id="btnStrStop">STOP</button>\n</div>\n\n<div id="strategyForm" style="margin-top:10px"></div>\n<div class="small" style="margin-top:8px">\n  Endpoints: <b>/api/strategy/{dca|grid|arbitrage|trend}/{start|pause|stop|status}</b>\n</div>\n#sm' "$HTML" || true
+  echo "Injected Strategy UI block into index.html"
 else
-  echo "Wallet Balances HTML already present"
+  echo "Strategy UI already present in index.html"
 fi
 
-# 5) Ajouter le code JS balances (si absent)
-if ! grep -q "function refreshWalletBalances" "$JS"; then
+# Append JS logic for dynamic forms + endpoints
+if ! grep -q "WOLV_STRATEGY_UI_V1" "$JS"; then
   cat >>"$JS" <<'JS'
 
-// --- WOLV_WALLET_BALANCES_V1 ---
-const __WOLV_USDC_MINT__ = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1";
-function __wolv_set(id, v){ const el=document.getElementById(id); if(el) el.textContent=v; }
-function __wolv_fmt(n,d){ n=Number(n||0); if(!isFinite(n)) n=0; return n.toFixed(d); }
+// === WOLV_STRATEGY_UI_V1 ===
+(function(){
+  const $ = (s)=>document.querySelector(s);
+  const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
 
-async function refreshWalletBalances(){
-  try{
-    if(!window.solana || !window.solana.isPhantom) return;
-    if(!window.solanaWeb3 || !window.solanaWeb3.Connection) return;
-
-    // connect onlyIfTrusted si pas déjà connecté
-    if(!window.solana.publicKey){
-      try{ await window.solana.connect({onlyIfTrusted:true}); }catch(_){ return; }
-    }
-    if(!window.solana.publicKey) return;
-
-    const pub = window.solana.publicKey.toBase58();
-    __wolv_set("walletPub", pub.slice(0,4)+"…"+pub.slice(-4));
-
-    const conn = new window.solanaWeb3.Connection("https://api.mainnet-beta.solana.com","confirmed");
-
-    // SOL
-    const lamports = await conn.getBalance(new window.solanaWeb3.PublicKey(pub),"confirmed");
-    __wolv_set("walletSol", __wolv_fmt(lamports/1e9,6)+" SOL");
-
-    // USDC
-    const res = await conn.getParsedTokenAccountsByOwner(
-      new window.solanaWeb3.PublicKey(pub),
-      { mint: new window.solanaWeb3.PublicKey(__WOLV_USDC_MINT__) },
-      "confirmed"
-    );
-    let usdc=0;
-    for(const it of (res.value||[])){
-      const ui = it.account?.data?.parsed?.info?.tokenAmount?.uiAmount;
-      usdc += Number(ui||0);
-    }
-    __wolv_set("walletUsdc", __wolv_fmt(usdc,2)+" USDC");
-  }catch(_){
-    // silence
+  function chip(t){ const el=$("#statusChip"); if(el) el.textContent=t; console.log("[STRATEGY]",t); }
+  async function phantomPub(){
+    if(!window.solana || !window.solana.isPhantom) return "";
+    if(window.solana.publicKey) return window.solana.publicKey.toBase58();
+    try{
+      const r = await window.solana.connect({onlyIfTrusted:true});
+      return r?.publicKey ? r.publicKey.toBase58() : "";
+    }catch(_){ return ""; }
   }
-}
+  async function post(url, body){
+    const r = await fetch(url,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body||{})});
+    const t = await r.text();
+    if(!r.ok) throw new Error(t || ("HTTP "+r.status));
+    try{ return JSON.parse(t); } catch(_){ return t; }
+  }
+  async function get(url){
+    const r = await fetch(url,{cache:"no-store"});
+    const t = await r.text();
+    if(!r.ok) throw new Error(t || ("HTTP "+r.status));
+    try{ return JSON.parse(t); } catch(_){ return t; }
+  }
 
-// auto refresh
-setInterval(()=>refreshWalletBalances().catch(()=>{}), 5000);
+  function renderForm(mode){
+    const box = $("#strategyForm");
+    if(!box) return;
 
-// refresh quand Phantom connect
-if(window.solana?.isPhantom && window.solana?.on){
-  try{ window.solana.on("connect", ()=>refreshWalletBalances().catch(()=>{})); }catch(_){}
-}
-// --- /WOLV_WALLET_BALANCES_V1 ---
+    const commonPair = `
+      <div class="formRow">
+        <label class="small">Pair<br><input class="input" id="strPair" value="SOL/USDC" /></label>
+      </div>
+    `;
+
+    const dca = `
+      ${commonPair}
+      <div class="formRow" style="margin-top:10px">
+        <label class="small">Total Budget<br><input class="input" id="dcaTotal" value="50" /></label>
+        <label class="small">Interval (sec)<br><input class="input" id="dcaInterval" value="86400" /></label>
+      </div>
+      <div class="formRow" style="margin-top:10px">
+        <label class="small">Duration (sec)<br><input class="input" id="dcaDuration" value="2592000" /></label>
+        <label class="small">Slippage %<br><input class="input" id="dcaSlip" value="1" /></label>
+      </div>
+      <div class="formRow" style="margin-top:10px">
+        <label class="small">StopLoss % (pause)<br><input class="input" id="dcaStop" value="20" /></label>
+      </div>
+    `;
+
+    const grid = `
+      ${commonPair}
+      <div class="formRow" style="margin-top:10px">
+        <label class="small">Price Min<br><input class="input" id="gridMin" value="0.8" /></label>
+        <label class="small">Price Max<br><input class="input" id="gridMax" value="1.2" /></label>
+      </div>
+      <div class="formRow" style="margin-top:10px">
+        <label class="small">Grid Count<br><input class="input" id="gridCount" value="10" /></label>
+        <label class="small">Capital<br><input class="input" id="gridCap" value="100" /></label>
+      </div>
+      <div class="formRow" style="margin-top:10px">
+        <label class="small">Dynamic (true/false)<br><input class="input" id="gridDyn" value="true" /></label>
+        <label class="small">Max DD %<br><input class="input" id="gridDD" value="10" /></label>
+      </div>
+    `;
+
+    const arb = `
+      <div class="formRow">
+        <label class="small">Asset<br><input class="input" id="arbAsset" value="USDC" /></label>
+        <label class="small">Scan Interval (sec)<br><input class="input" id="arbInterval" value="10" /></label>
+      </div>
+      <div class="formRow" style="margin-top:10px">
+        <label class="small">Min Profit %<br><input class="input" id="arbMin" value="0.5" /></label>
+        <label class="small">Max Exposure %<br><input class="input" id="arbMax" value="5" /></label>
+      </div>
+      <div class="formRow" style="margin-top:10px">
+        <label class="small">Chains (csv)<br><input class="input" id="arbChains" value="solana,ethereum,polygon" /></label>
+      </div>
+    `;
+
+    const trend = `
+      ${commonPair}
+      <div class="formRow" style="margin-top:10px">
+        <label class="small">Timeframe<br>
+          <select id="trendTf">
+            <option value="15m">15m</option>
+            <option value="1h" selected>1h</option>
+            <option value="4h">4h</option>
+          </select>
+        </label>
+        <label class="small">Allocation %<br><input class="input" id="trendAlloc" value="20" /></label>
+      </div>
+      <div class="formRow" style="margin-top:10px">
+        <label class="small">Indicators (csv)<br><input class="input" id="trendInd" value="MA,RSI,MACD" /></label>
+      </div>
+      <div class="formRow" style="margin-top:10px">
+        <label class="small">SL %<br><input class="input" id="trendSL" value="5" /></label>
+        <label class="small">TP %<br><input class="input" id="trendTP" value="10" /></label>
+      </div>
+    `;
+
+    box.innerHTML =
+      mode==="DCA" ? dca :
+      mode==="GRID" ? grid :
+      mode==="ARBITRAGE" ? arb :
+      trend;
+  }
+
+  function endpointBase(mode){
+    if(mode==="DCA") return "/api/strategy/dca";
+    if(mode==="GRID") return "/api/strategy/grid";
+    if(mode==="ARBITRAGE") return "/api/strategy/arbitrage";
+    return "/api/strategy/trend";
+  }
+
+  function collect(mode){
+    const pair = $("#strPair")?.value || "SOL/USDC";
+
+    if(mode==="DCA"){
+      return {
+        pair,
+        totalAmount: Number($("#dcaTotal")?.value||0),
+        intervalSec: Number($("#dcaInterval")?.value||0),
+        durationSec: Number($("#dcaDuration")?.value||0),
+        slippagePct: Number($("#dcaSlip")?.value||1),
+        stopLossPct: Number($("#dcaStop")?.value||0)
+      };
+    }
+    if(mode==="GRID"){
+      return {
+        pair,
+        priceMin: Number($("#gridMin")?.value||0),
+        priceMax: Number($("#gridMax")?.value||0),
+        grids: Number($("#gridCount")?.value||0),
+        capital: Number($("#gridCap")?.value||0),
+        dynamic: String($("#gridDyn")?.value||"true")==="true",
+        maxDrawdownPct: Number($("#gridDD")?.value||0)
+      };
+    }
+    if(mode==="ARBITRAGE"){
+      return {
+        asset: $("#arbAsset")?.value || "USDC",
+        scanIntervalSec: Number($("#arbInterval")?.value||10),
+        minProfitPct: Number($("#arbMin")?.value||0.5),
+        maxExposurePct: Number($("#arbMax")?.value||5),
+        chains: String($("#arbChains")?.value||"solana").split(",").map(s=>s.trim()).filter(Boolean)
+      };
+    }
+    return {
+      pair,
+      timeframe: $("#trendTf")?.value || "1h",
+      indicators: String($("#trendInd")?.value||"MA").split(",").map(s=>s.trim()).filter(Boolean),
+      allocationPct: Number($("#trendAlloc")?.value||20),
+      stopLossPct: Number($("#trendSL")?.value||0),
+      takeProfitPct: Number($("#trendTP")?.value||0)
+    };
+  }
+
+  async function bind(){
+    const sel=$("#strategyMode");
+    const start=$("#btnStrStart");
+    const pause=$("#btnStrPause");
+    const stop=$("#btnStrStop");
+    if(!sel || !start || !pause || !stop) return;
+
+    renderForm(sel.value);
+    sel.addEventListener("change", ()=>renderForm(sel.value));
+
+    start.addEventListener("click", async()=>{
+      try{
+        chip("STRATEGY START...");
+        const pub = await phantomPub();
+        if(!pub) throw new Error("Wallet Phantom non connecté");
+        const mode = sel.value;
+        const base = endpointBase(mode);
+        const payload = Object.assign({wallet: pub, mode}, collect(mode));
+        const out = await post(base+"/start", payload);
+        chip("START OK");
+        console.log(out);
+      }catch(e){
+        chip("ERR START: "+(e.message||String(e)));
+        alert("ERR START: "+(e.message||String(e)));
+      }
+    });
+
+    pause.addEventListener("click", async()=>{
+      try{
+        chip("STRATEGY PAUSE...");
+        const pub = await phantomPub();
+        if(!pub) throw new Error("Wallet Phantom non connecté");
+        const mode = sel.value;
+        const base = endpointBase(mode);
+        const out = await post(base+"/pause", {wallet: pub, mode});
+        chip("PAUSE OK");
+        console.log(out);
+      }catch(e){
+        chip("ERR PAUSE: "+(e.message||String(e)));
+        alert("ERR PAUSE: "+(e.message||String(e)));
+      }
+    });
+
+    stop.addEventListener("click", async()=>{
+      try{
+        chip("STRATEGY STOP...");
+        const pub = await phantomPub();
+        if(!pub) throw new Error("Wallet Phantom non connecté");
+        const mode = sel.value;
+        const base = endpointBase(mode);
+        const out = await post(base+"/stop", {wallet: pub, mode});
+        chip("STOP OK");
+        console.log(out);
+      }catch(e){
+        chip("ERR STOP: "+(e.message||String(e)));
+        alert("ERR STOP: "+(e.message||String(e)));
+      }
+    });
+
+    // optional status poll
+    (async()=>{
+      while(true){
+        await sleep(12000);
+        try{
+          const pub = await phantomPub();
+          if(!pub) continue;
+          const mode = sel.value;
+          const base = endpointBase(mode);
+          const st = await get(base+"/status?wallet="+encodeURIComponent(pub));
+          console.log("[STRATEGY STATUS]", st);
+        }catch(_){}
+      }
+    })();
+  }
+
+  if(document.readyState==="loading") document.addEventListener("DOMContentLoaded", bind);
+  else bind();
+})();
+// === /WOLV_STRATEGY_UI_V1 ===
 JS
-  echo "Added refreshWalletBalances() into terminal.js"
+  echo "Patched terminal.js with Strategy UI logic"
 else
-  echo "refreshWalletBalances() already present in terminal.js"
+  echo "Strategy JS already present"
 fi
 
-# 6) Reload nginx
+echo "=== [3] FIND BACKEND (Node/Express) + PATCH ROUTES ==="
+BACK_DIR=""
+
+# Heuristique: trouver un package.json et un fichier server/app/index qui contient express
+CANDIDATES=(
+  /opt/fireinners
+  /opt/traderone*
+  /var/www
+  /srv
+  /root
+)
+for base in "${CANDIDATES[@]}"; do
+  [ -d "$base" ] || continue
+  hit=$(find "$base" -maxdepth 5 -type f -name package.json 2>/dev/null | head -n 1 || true)
+  if [ -n "$hit" ]; then
+    dir=$(dirname "$hit")
+    if grep -RIn --no-messages "express\(" "$dir" --include="*.js" --include="*.mjs" --include="*.cjs" | head -n 1 >/dev/null 2>&1; then
+      BACK_DIR="$dir"
+      break
+    fi
+  fi
+done
+
+if [ -z "$BACK_DIR" ]; then
+  echo "WARN: Backend Node/Express introuvable automatiquement."
+  echo "-> Je crée les fichiers backend dans: /root/wolv_backend_patch (à copier dans ton projet backend)."
+  BACK_DIR="/root/wolv_backend_patch"
+  mkdir -p "$BACK_DIR"
+fi
+
+mkdir -p "$BACK_DIR/routes"
+PATCH_FILE="$BACK_DIR/routes/strategy.routes.js"
+
+cat >"$PATCH_FILE" <<'JS'
+/**
+ * strategy.routes.js
+ * Endpoints:
+ *  POST /api/strategy/dca/start|pause|stop
+ *  GET  /api/strategy/dca/status?wallet=
+ *  (idem grid/arbitrage/trend)
+ */
+const express = require("express");
+const router = express.Router();
+
+// In-memory state (remplace par DB plus tard)
+const state = {
+  // wallet: { active: { mode, name, config, status, startedAt }, history: [] }
+};
+
+function getWallet(req){
+  return (req.body.wallet || req.query.wallet || "").trim();
+}
+function ensureWallet(wallet){
+  if(!state[wallet]) state[wallet] = { active: null, history: [] };
+}
+
+function makeHandlers(name){
+  const base = "/" + name;
+
+  router.post(base + "/start", (req,res)=>{
+    const wallet = getWallet(req);
+    if(!wallet) return res.status(400).send("missing wallet");
+    ensureWallet(wallet);
+    const cfg = Object.assign({}, req.body);
+    state[wallet].active = {
+      name,
+      mode: (req.body.mode || name).toString(),
+      status: "RUNNING",
+      config: cfg,
+      startedAt: Date.now()
+    };
+    state[wallet].history.push({ts:Date.now(), event:"START", name, cfg});
+    res.json({ok:true, active: state[wallet].active});
+  });
+
+  router.post(base + "/pause", (req,res)=>{
+    const wallet = getWallet(req);
+    if(!wallet) return res.status(400).send("missing wallet");
+    ensureWallet(wallet);
+    if(!state[wallet].active || state[wallet].active.name !== name){
+      return res.json({ok:true, note:"no active strategy for this type"});
+    }
+    state[wallet].active.status = "PAUSED";
+    state[wallet].history.push({ts:Date.now(), event:"PAUSE", name});
+    res.json({ok:true, active: state[wallet].active});
+  });
+
+  router.post(base + "/stop", (req,res)=>{
+    const wallet = getWallet(req);
+    if(!wallet) return res.status(400).send("missing wallet");
+    ensureWallet(wallet);
+    if(state[wallet].active && state[wallet].active.name === name){
+      state[wallet].history.push({ts:Date.now(), event:"STOP", name});
+      state[wallet].active = null;
+    }else{
+      state[wallet].history.push({ts:Date.now(), event:"STOP_NOOP", name});
+    }
+    res.json({ok:true, active: state[wallet].active});
+  });
+
+  router.get(base + "/status", (req,res)=>{
+    const wallet = getWallet(req);
+    if(!wallet) return res.status(400).send("missing wallet");
+    ensureWallet(wallet);
+    res.json({ok:true, active: state[wallet].active, last: state[wallet].history.slice(-10)});
+  });
+}
+
+makeHandlers("dca");
+makeHandlers("grid");
+makeHandlers("arbitrage");
+makeHandlers("trend");
+
+module.exports = router;
+JS
+
+echo "Created backend routes: $PATCH_FILE"
+
+# Try to auto-wire into an existing Express app:
+# Search for app.use("/api", ...) or similar and patch if found.
+WIRED=0
+if [ "$BACK_DIR" != "/root/wolv_backend_patch" ]; then
+  # Find a likely server entry file
+  ENTRY=$(grep -RIl --no-messages -E "express\\(|app\\.use\\(" "$BACK_DIR" --include="*.js" --include="*.mjs" --include="*.cjs" | head -n 1 || true)
+  if [ -n "$ENTRY" ]; then
+    # Backup entry
+    cp -a "$ENTRY" "/root/wolv_backups/backend_entry.$TS.bak" || true
+
+    if ! grep -q "strategy.routes" "$ENTRY"; then
+      # Insert require + app.use under first app.use("/api"
+      perl -0777 -i -pe '
+        if($ARGV[0]){
+          my $s = $_;
+          my $ins = "\n// WOLV_STRATEGY_ROUTES_V1\nconst strategyRoutes = require(\"./routes/strategy.routes\");\n";
+          $s =~ s/(const\s+app\s*=\s*express\(\)\s*;)/$1$ins/s unless $s =~ /strategyRoutes/;
+          $s =~ s/(app\.use\(\s*[\"'\'' ]\/api[\"'\'' ]\s*,\s*[^;]+;\s*)/$1\napp.use(\"\/api\/strategy\", strategyRoutes);\n/sm unless $s =~ /\/api\/strategy/;
+          $_ = $s;
+        }
+      ' "$ENTRY" || true
+
+      # If still not wired, append a minimal wire at end
+      if ! grep -q "/api/strategy" "$ENTRY"; then
+        echo -e "\n// WOLV_STRATEGY_ROUTES_V1 (fallback)\ntry{ const strategyRoutes=require('./routes/strategy.routes'); app.use('/api/strategy', strategyRoutes);}catch(e){ console.log('strategy routes not wired', e?.message||e); }\n" >> "$ENTRY"
+      fi
+
+      WIRED=1
+      echo "Wired strategy routes into: $ENTRY"
+    else
+      echo "Backend entry already contains strategy routes require"
+    fi
+  else
+    echo "WARN: impossible de trouver entry express automatiquement dans $BACK_DIR"
+  fi
+fi
+
+echo "=== [4] RELOAD nginx (frontend) ==="
 nginx -t && systemctl reload nginx || true
 
-echo "DONE ✅  Va sur https://fireinners.online/wolverine/ puis Ctrl+F5"
-echo "ROLLBACK ✅ :"
+echo ""
+echo "✅ DONE"
+echo "Frontend: Strategy selector + Start/Pause/Stop ajoutés."
+echo "Backend routes: /api/strategy/* créées."
+if [ "$BACK_DIR" = "/root/wolv_backend_patch" ]; then
+  echo "⚠️ Backend pas auto-detecté: copie /root/wolv_backend_patch/routes/strategy.routes.js dans ton backend et ajoute:"
+  echo "   app.use('/api/strategy', require('./routes/strategy.routes'));"
+fi
+echo ""
+echo "Rollback frontend:"
 echo "  cp -a /root/wolv_backups/index.html.$TS.bak $HTML"
 echo "  cp -a /root/wolv_backups/terminal.js.$TS.bak $JS"
 BASH
 
-bash /root/WOLV_ADD_WALLET_BALANCES.sh
+bash /root/WOLV_ADD_STRATEGY_MODES.sh
