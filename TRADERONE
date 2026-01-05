@@ -1,4 +1,4 @@
-cat >/root/WOLV_MEGA_FIX_SINGLE_V1.sh <<'BASH'
+cat >/root/WOLV_HARD_RESET_SINGLE_V2.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 TS="$(date +%s)"
@@ -7,9 +7,9 @@ DIST="/opt/fireinners/frontend-react/app/dist"
 WOLV="$DIST/wolverine"
 mkdir -p "$WOLV"
 
-# 1) Trouver le vrai vhost nginx qui contient server{} + server_name fireinners.online
+# 1) Trouver le vrai vhost nginx (server{} + server_name fireinners.online + listen 443)
 CANON="$(python3 - <<'PY'
-import os,re,glob,sys
+import re,glob,sys,os
 paths=[]
 paths+=glob.glob("/etc/nginx/sites-available/*")
 paths+=glob.glob("/etc/nginx/conf.d/*")
@@ -17,7 +17,6 @@ def read(p):
   try: return open(p,"r",encoding="utf-8",errors="ignore").read()
   except: return ""
 def server_blocks(txt):
-  # parse naive server{...} blocks with brace counting
   out=[]
   for m in re.finditer(r'(?m)^\s*server\s*\{', txt):
     i=m.start(); depth=0; j=i
@@ -27,8 +26,7 @@ def server_blocks(txt):
       elif c=='}':
         depth-=1
         if depth==0:
-          out.append((i,j+1,txt[i:j+1]))
-          break
+          out.append((i,j+1,txt[i:j+1])); break
       j+=1
   return out
 cands=[]
@@ -36,21 +34,19 @@ for p in paths:
   if re.search(r'\.(bak|old|save|disabled)(\.|$)', p): 
     continue
   s=read(p)
-  bl=server_blocks(s)
-  for (a,b,t) in bl:
+  for a,b,t in server_blocks(s):
     if re.search(r'(?m)^\s*server_name\s+.*\bfireinners\.online\b', t):
       score=0
       if re.search(r'(?m)^\s*listen\s+443', t): score+=10
-      if "ssl" in t: score+=3
+      if "ssl" in t: score+=2
       cands.append((score,p))
-if not cands:
-  sys.exit("ERR: aucun vhost avec server_name fireinners.online trouvé")
+if not cands: sys.exit("ERR: vhost fireinners.online introuvable")
 cands.sort(reverse=True)
 print(cands[0][1])
 PY
-)" || { echo "$CANON"; exit 1; }
+)"
 
-# 2) Désactiver les doublons dans sites-enabled (garder seulement celui qui pointe vers CANON)
+# 2) Nettoyer sites-enabled doublons (garder seulement CANON)
 CANON_REAL="$(readlink -f "$CANON" || echo "$CANON")"
 for f in /etc/nginx/sites-enabled/*; do
   [ -e "$f" ] || continue
@@ -62,28 +58,26 @@ except: print('')
 PY
 "$f")"
   if echo "$txt" | grep -qE '^\s*server_name\s+.*\bfireinners\.online\b'; then
-    tgt="$f"
-    if [ -L "$f" ]; then tgt="$(readlink -f "$f" || echo "$f")"; fi
+    tgt="$f"; [ -L "$f" ] && tgt="$(readlink -f "$f" || echo "$f")"
     if [ "$tgt" != "$CANON_REAL" ]; then
-      # disable
-      if [ -L "$f" ]; then rm -f "$f"; else mv -f "$f" "$f.disabled.$TS"; fi
+      [ -L "$f" ] && rm -f "$f" || mv -f "$f" "$f.disabled.$TS"
     fi
   fi
 done
 ln -sf "$CANON" "/etc/nginx/sites-enabled/$(basename "$CANON")"
 
-# 3) Patch nginx: /wolverine/api/ avant /wolverine/
-MARK_BEGIN="# BEGIN WOLV_SINGLE_UI_V1"
-MARK_END="# END WOLV_SINGLE_UI_V1"
+# 3) Patch nginx Wolverine (proxy API + serve UI) + no-cache
+MARK_BEGIN="# BEGIN WOLV_SINGLE_UI_V2"
+MARK_END="# END WOLV_SINGLE_UI_V2"
 BLOCK="$MARK_BEGIN
 location ^~ /wolverine/api/ {
-  rewrite ^/wolverine/api/(.*)$ /api/\$1 break;
-  proxy_pass http://127.0.0.1:3000;
+  proxy_pass http://127.0.0.1:3000/api/;
   proxy_http_version 1.1;
   proxy_set_header Host \$host;
   proxy_set_header X-Real-IP \$remote_addr;
   proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
   proxy_set_header X-Forwarded-Proto \$scheme;
+  add_header Cache-Control \"no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0\" always;
   proxy_read_timeout 60s;
 }
 location = /wolverine/ {
@@ -98,28 +92,20 @@ location ^~ /wolverine/ {
 $MARK_END"
 
 chattr -i "$CANON" 2>/dev/null || true
-
 python3 - "$CANON" "$MARK_BEGIN" "$MARK_END" "$BLOCK" <<'PY'
 import sys,re
 p,mb,me,block=sys.argv[1],sys.argv[2],sys.argv[3],sys.argv[4]
 s=open(p,"r",encoding="utf-8",errors="ignore").read()
 
-# supprime anciens blocs Wolverine si existants
-for ob in ["# BEGIN WOLV_SINGLE_UI_V6","# BEGIN WOLV_SINGLE_UI_V5","# BEGIN WOLV_SINGLE_UI_V4","# BEGIN WOLV_SINGLE_UI_V3"]:
-  oe=ob.replace("BEGIN","END")
-  if ob in s and oe in s:
-    a=s.index(ob); b=s.index(oe,a)+len(oe)
-    s=s[:a]+s[b:]
+# remove older wolv blocks (any version)
+s=re.sub(r'(?s)# BEGIN WOLV_.*?# END WOLV_.*?\n?','',s)
 
-# remplace si présent
 if mb in s and me in s:
   a=s.index(mb); b=s.index(me,a)+len(me)
   s=s[:a]+block+s[b:]
-  open(p,"w",encoding="utf-8").write(s)
-  raise SystemExit(0)
+  open(p,"w",encoding="utf-8").write(s); raise SystemExit(0)
 
-# parse server blocks
-def blocks(txt):
+def server_blocks(txt):
   out=[]
   for m in re.finditer(r'(?m)^\s*server\s*\{', txt):
     i=m.start(); depth=0; j=i
@@ -129,32 +115,31 @@ def blocks(txt):
       elif c=='}':
         depth-=1
         if depth==0:
-          out.append((i,j+1,txt[i:j+1]))
-          break
+          out.append((i,j+1,txt[i:j+1])); break
       j+=1
   return out
 
-B=blocks(s)
-cands=[b for b in B if re.search(r'(?m)^\s*server_name\s+.*\bfireinners\.online\b', b[2])]
-if not cands: raise SystemExit("ERR: aucun server{} avec server_name fireinners.online dans "+p)
+B=server_blocks(s)
+c=[b for b in B if re.search(r'(?m)^\s*server_name\s+.*\bfireinners\.online\b', b[2])]
+if not c: raise SystemExit("ERR: aucun server{} fireinners.online dans "+p)
 pick=None
-for b in cands:
+for b in c:
   if re.search(r'(?m)^\s*listen\s+443', b[2]): pick=b; break
-if pick is None: pick=cands[0]
+if pick is None: pick=c[0]
 a,b,t=pick
 ins=b-1
-out=s[:ins].rstrip()+"\n\n"+block+"\n\n"+s[ins:]
-open(p,"w",encoding="utf-8").write(out)
+s=s[:ins].rstrip()+"\n\n"+block+"\n\n"+s[ins:]
+open(p,"w",encoding="utf-8").write(s)
 PY
 
 nginx -t
 systemctl reload nginx
 chattr +i "$CANON" 2>/dev/null || true
 
-# 4) Remplacer l’UI Wolverine par SINGLE UI (pas de doublons)
-#    purge anciens index.*.html pour éviter de servir une vieille version
+# 4) Purge anciens fichiers Wolverine (évite UI old/doublons)
 rm -f "$WOLV"/index.*.html 2>/dev/null || true
 
+# 5) UI SINGLE (1 seul dépôt manuel + mode + start)
 cat >"$WOLV/index.html" <<'HTML'
 <!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Pragma" content="no-cache"><meta http-equiv="Expires" content="0"><title>WOLVERINE</title><style>body{font:14px Arial,system-ui;margin:0;padding:14px;background:#fff}#wrap{max-width:980px;margin:0 auto;border:1px solid #bbb;border-radius:12px;padding:12px}h1{margin:0 0 10px 0;font-size:32px;letter-spacing:.5px}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:10px 0}.mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;word-break:break-all}.box{padding:10px;border:1px solid #bbb;border-radius:10px;background:#f7f7f7}button,select,input{font:inherit;padding:6px 8px}small{color:#444}.ok{color:#060}.bad{color:#a00}</style></head><body><div id="wrap"><h1>WOLVERINE</h1>
 
@@ -165,12 +150,7 @@ cat >"$WOLV/index.html" <<'HTML'
   </div>
   <div class="row">
     <div>Mode:</div>
-    <select id="mode">
-      <option value="SAFE">SAFE</option>
-      <option value="AUTO">AUTO</option>
-      <option value="RR">RR</option>
-      <option value="SCALP">SCALP</option>
-    </select>
+    <select id="mode"><option value="SAFE">SAFE</option><option value="AUTO">AUTO</option><option value="RR">RR</option><option value="SCALP">SCALP</option></select>
     <button id="btnMode" type="button">Appliquer mode</button>
     <div id="modeMsg" class="mono"></div>
   </div>
@@ -180,18 +160,13 @@ cat >"$WOLV/index.html" <<'HTML'
   <b>Dépôt manuel (obligatoire)</b><br>
   <small>Envoie depuis ton Phantom vers TraderOne (bot) :</small>
   <div class="mono" id="botAddr" style="margin-top:6px">e8DbBrTJxRetx3HNFb83CsXMySETydHVLwxMzkjcVqh</div>
-
   <div class="row">
     <div>Asset</div>
-    <select id="asset">
-      <option value="USDC">USDC</option>
-      <option value="SOL">SOL</option>
-    </select>
+    <select id="asset"><option value="USDC">USDC</option><option value="SOL">SOL</option></select>
     <div>Montant</div>
     <input id="amount" placeholder="ex: 1" inputmode="decimal">
     <button id="btnConfirm" type="button">CONFIRMER DÉPÔT (on-chain)</button>
   </div>
-
   <div id="depMsg" class="mono"></div>
   <div class="row">
     <button id="btnStart" type="button" disabled>START WOLVERINE</button>
@@ -206,11 +181,10 @@ const API="/wolverine/api";
 let PUB="";
 async function post(path,obj){
   const r=await fetch(API+path,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(obj||{})});
-  const tx=await r.text();
-  try{ return {ok:r.ok,status:r.status,json:JSON.parse(tx)}; }
-  catch(e){ return {ok:false,status:r.status,nonjson:tx.slice(0,300)}; }
+  const t=await r.text();
+  try{ return {ok:r.ok,status:r.status,json:JSON.parse(t)}; }catch(e){ return {ok:false,status:r.status,nonjson:t.slice(0,300)}; }
 }
-function msg(el,ok,txt){el.innerHTML=(ok?'<span class="ok">':'<span class="bad">')+txt.replace(/</g,"&lt;")+"</span>";}
+function msg(el,ok,txt){el.innerHTML=(ok?'<span class="ok">':'<span class="bad">')+String(txt).replace(/</g,"&lt;")+"</span>";}
 $("#btnConnect").onclick=async()=>{
   try{
     if(!window.solana||!window.solana.isPhantom) return msg($("#startMsg"),false,"Phantom non détecté");
@@ -218,42 +192,31 @@ $("#btnConnect").onclick=async()=>{
     PUB=(r&&r.publicKey)?r.publicKey.toString():"";
     $("#pub").textContent=PUB||"—";
     msg($("#startMsg"),true,"Wallet connecté");
-  }catch(e){ msg($("#startMsg"),false,String(e&&e.message||e)); }
+  }catch(e){ msg($("#startMsg"),false,e&&e.message||String(e)); }
 };
 $("#btnMode").onclick=async()=>{
-  const m=$("#mode").value;
-  const res=await post("/mode",{mode:m,from:PUB});
-  if(res.ok) msg($("#modeMsg"),true,JSON.stringify(res.json));
-  else msg($("#modeMsg"),false,(res.json?JSON.stringify(res.json):("HTTP "+res.status+" "+(res.nonjson||"non-json"))));
+  const res=await post("/mode",{mode:$("#mode").value,from:PUB});
+  res.ok?msg($("#modeMsg"),true,JSON.stringify(res.json)):msg($("#modeMsg"),false,res.json?JSON.stringify(res.json):("HTTP "+res.status+" "+(res.nonjson||"non-json")));
 };
 $("#btnConfirm").onclick=async()=>{
-  const asset=$("#asset").value;
-  const amount=($("#amount").value||"").trim();
-  if(!amount) return msg($("#depMsg"),false,"Montant requis");
-  const res=await post("/confirm_deposit_v2",{asset,amount,from:PUB});
-  if(res.ok){
-    msg($("#depMsg"),true,JSON.stringify(res.json));
-    $("#btnStart").disabled=false;
-  }else{
-    msg($("#depMsg"),false,(res.json?JSON.stringify(res.json):("HTTP "+res.status+" "+(res.nonjson||"non-json"))));
-    $("#btnStart").disabled=true;
-  }
+  const amount=($("#amount").value||"").trim(); if(!amount) return msg($("#depMsg"),false,"Montant requis");
+  const res=await post("/confirm_deposit_v2",{asset:$("#asset").value,amount,from:PUB});
+  if(res.ok){ msg($("#depMsg"),true,JSON.stringify(res.json)); $("#btnStart").disabled=false; }
+  else { msg($("#depMsg"),false,res.json?JSON.stringify(res.json):("HTTP "+res.status+" "+(res.nonjson||"non-json"))); $("#btnStart").disabled=true; }
 };
 $("#btnStart").onclick=async()=>{
-  const m=$("#mode").value;
-  const res=await post("/start",{mode:m,from:PUB});
-  if(res.ok) msg($("#startMsg"),true,JSON.stringify(res.json));
-  else msg($("#startMsg"),false,(res.json?JSON.stringify(res.json):("HTTP "+res.status+" "+(res.nonjson||"non-json"))));
+  const res=await post("/start",{mode:$("#mode").value,from:PUB});
+  res.ok?msg($("#startMsg"),true,JSON.stringify(res.json)):msg($("#startMsg"),false,res.json?JSON.stringify(res.json):("HTTP "+res.status+" "+(res.nonjson||"non-json")));
 };
 })();
 </script>
+
 </div></body></html>
 HTML
 
-echo "OK: MEGA FIX SINGLE V1"
-echo "NGINX CANON: $CANON"
-echo "UI: $WOLV/index.html"
-echo "URL: https://fireinners.online/wolverine/"
+echo "OK WOLV HARD RESET SINGLE V2"
+echo "NGINX: $CANON"
+echo "URL: https://fireinners.online/wolverine/?v=$TS"
 BASH
 
-bash /root/WOLV_MEGA_FIX_SINGLE_V1.sh
+bash /root/WOLV_HARD_RESET_SINGLE_V2.sh
