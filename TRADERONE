@@ -1,114 +1,102 @@
 #!/usr/bin/env bash
 set -e
 
-BASE="/opt/wolverine"
-APP="traderone"
-PORT=3000
+UI="/opt/fireinners/frontend-react/app/dist/wolverine/index.html"
+BACKUP="$UI.bak.$(date +%s)"
 
-echo "=== TRADERONE BACKEND MEGA BATCH ==="
+echo "=== TRADERONE DASHBOARD PATCH (SOLDES + PROFIT) ==="
 
-echo "[1/7] Préparation dossier"
-mkdir -p $BASE
-cd $BASE
+echo "[1/5] Backup UI"
+cp "$UI" "$BACKUP"
 
-echo "[2/7] Création package.json"
-cat > package.json <<'EOF'
-{
-  "name": "traderone-backend",
-  "version": "1.0.0",
-  "type": "module",
-  "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  },
-  "dependencies": {
-    "express": "^4.19.2",
-    "@solana/web3.js": "^1.95.4",
-    "cors": "^2.8.5"
+echo "[2/5] Écriture nouvelle UI"
+cat > "$UI" <<'EOF'
+<!doctype html>
+<html lang="fr">
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>TraderOne</title>
+<style>
+body{margin:0;background:#0b1020;color:#fff;font-family:system-ui}
+#c{max-width:900px;margin:30px auto;padding:20px}
+button,input{padding:10px 14px;border-radius:10px;border:0;margin:6px}
+input{width:100%}
+.stat{margin:6px 0}
+.ok{color:#9ff}
+.bad{color:#ff9f9f}
+</style>
+
+<div id="c">
+<h1>TraderOne</h1>
+
+<button id="con">Connect Phantom</button>
+<div class="stat">Wallet: <span id="addr">-</span></div>
+
+<hr/>
+
+<div class="stat">Internal SOL: <b id="int">-</b></div>
+<div class="stat">Phantom SOL: <b id="pha">-</b></div>
+<div class="stat">Budget initial: <b id="bud">-</b></div>
+<div class="stat">Profit total: <b id="pnl">-</b></div>
+
+<hr/>
+
+<input id="amt" placeholder="Budget SOL"/>
+<button id="start">Start</button>
+<button id="stop">Stop</button>
+<button id="cash">Cash-out</button>
+
+<pre id="log"></pre>
+</div>
+
+<script src="/wolverine/vendor/web3.min.js"></script>
+<script>
+const log=t=>logEl.textContent+=t+"\\n";
+const logEl=document.querySelector("#log");
+let pub=null,startBudget=0;
+
+async function getBalances(){
+  const r=await fetch("/wolverine/api/balances?user="+(pub||""));
+  const j=await r.json();
+  int.textContent=j.internalSOL?.toFixed(4)+" SOL";
+  pha.textContent=j.phantomSOL?j.phantomSOL.toFixed(4)+" SOL":"-";
+  bud.textContent=startBudget?startBudget+" SOL":"-";
+  if(startBudget && j.phantomSOL){
+    const p=((j.phantomSOL-startBudget)/startBudget)*100;
+    pnl.textContent=p.toFixed(2)+" %";
+    pnl.className=p>=0?"ok":"bad";
   }
 }
-EOF
 
-echo "[3/7] Création server.js"
-cat > server.js <<'EOF'
-import express from "express";
-import cors from "cors";
-import { Connection, PublicKey, LAMPORTS_PER_SOL } from "@solana/web3.js";
-
-const app = express();
-app.use(cors());
-app.use(express.json());
-
-const RPC = "https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac";
-const connection = new Connection(RPC, "confirmed");
-
-// WALLET INTERNE (exemple – remplaçable plus tard)
-const INTERNAL_WALLET = new PublicKey("2uHqvSM6vrm7Ye7ntMFUA1RHiqAinGjeCx17dozsLx1z");
-
-let state = {
-  running: false,
-  budget: 0,
-  startTime: null
+con.onclick=async()=>{
+  if(!window.solana)return alert("Install Phantom");
+  const r=await solana.connect();
+  pub=r.publicKey.toString();
+  addr.textContent=pub;
+  getBalances();
 };
 
-async function getSol(pubkey) {
-  const bal = await connection.getBalance(new PublicKey(pubkey));
-  return bal / LAMPORTS_PER_SOL;
-}
+start.onclick=async()=>{
+  const amt=+document.querySelector("#amt").value;
+  if(!pub||!amt)return alert("Connect + budget");
+  startBudget=amt;
+  await fetch("/wolverine/api/start",{method:"POST",headers:{'content-type':'application/json'},body:JSON.stringify({amount:amt})});
+  getBalances();
+};
 
-app.get("/api/balances", async (req, res) => {
-  try {
-    const user = req.query.user;
-    const internalSOL = await getSol(INTERNAL_WALLET);
-    let phantomSOL = null;
-    if (user) phantomSOL = await getSol(user);
-    res.json({
-      internalSOL,
-      phantomSOL,
-      running: state.running,
-      budget: state.budget,
-      uptime: state.startTime ? (Date.now() - state.startTime) : 0
-    });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
+stop.onclick=async()=>{await fetch("/wolverine/api/stop",{method:"POST"});};
+cash.onclick=async()=>{await fetch("/wolverine/api/cashout",{method:"POST"});};
 
-app.post("/api/start", (req, res) => {
-  const { amount } = req.body;
-  if (!amount || amount <= 0) return res.status(400).json({ error: "Invalid budget" });
-  state.running = true;
-  state.budget = amount;
-  state.startTime = Date.now();
-  res.json({ ok: true, status: "STARTED", budget: amount });
-});
-
-app.post("/api/stop", (req, res) => {
-  state.running = false;
-  res.json({ ok: true, status: "STOPPED" });
-});
-
-app.post("/api/cashout", (req, res) => {
-  state.running = false;
-  res.json({ ok: true, status: "CASHOUT" });
-});
-
-app.listen(3000, () => {
-  console.log("TraderOne backend listening on port 3000");
-});
+setInterval(getBalances,5000);
+</script>
+</html>
 EOF
 
-echo "[4/7] Installation dépendances"
-npm install --omit=dev
+echo "[3/5] Reload nginx"
+nginx -t && systemctl reload nginx
 
-echo "[5/7] Redémarrage PM2"
-pm2 delete traderone 2>/dev/null || true
-pm2 start server.js --name traderone
-pm2 save
+echo "[4/5] Test API"
+curl -s https://www.fireinners.online/wolverine/api/balances || true
 
-echo "[6/7] Vérification locale"
-curl -s http://127.0.0.1:3000/api/balances || true
-
-echo "[7/7] TERMINÉ"
-echo "Backend TraderOne ACTIF"
-echo "API: https://www.fireinners.online/wolverine/api/balances"
+echo "[5/5] DONE"
+echo "URL: https://www.fireinners.online/wolverine"
