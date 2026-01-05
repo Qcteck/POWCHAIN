@@ -1,169 +1,38 @@
-cat >/root/WOLV_SINGLE_UI_V5.sh <<'BASH'
+cat >/root/WOLV_NGINX_FIX_V6.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 TS="$(date +%s)"
 DIST="/opt/fireinners/frontend-react/app/dist"
 WOLV="$DIST/wolverine"
-BOT="e8DbBrTJxRetx3HNFb83CsXMySETydHVLwxMzkjcVqh"
 
-# 1) Trouve le bon vhost (celui qui a server_name fireinners.online)
-NG="$(grep -RIlE '^\s*server_name\s+.*fireinners\.online' /etc/nginx/sites-available /etc/nginx/sites-enabled 2>/dev/null | head -n1 || true)"
-if [ -z "${NG:-}" ]; then
-  NG="$(grep -RIl 'fireinners.online' /etc/nginx/sites-available /etc/nginx/sites-enabled 2>/dev/null | head -n1 || true)"
+# Choix du vhost CANONIQUE (évite .bak)
+CANON="/etc/nginx/sites-available/fireinners.online-ssl"
+if [ ! -f "$CANON" ]; then
+  CANON="$(grep -RIlE '^\s*server_name\s+.*fireinners\.online' /etc/nginx/sites-available 2>/dev/null | grep -vE '\.bak|\.old|\.save|~' | head -n1 || true)"
 fi
-[ -n "${NG:-}" ] || { echo "ERR: vhost fireinners.online introuvable dans sites-available/enabled"; exit 1; }
+[ -n "${CANON:-}" ] && [ -f "$CANON" ] || { echo "ERR: vhost canonique introuvable"; exit 1; }
 
-# 2) Reset UI (zéro doublon)
-rm -rf "$WOLV"
-mkdir -p "$WOLV"
+# Désactive tous les vhosts doublons dans sites-enabled qui match fireinners.online, sauf celui qui pointe sur CANON
+mapfile -t EN < <(grep -RIlE '^\s*server_name\s+.*fireinners\.online' /etc/nginx/sites-enabled 2>/dev/null | sort -u || true)
+for f in "${EN[@]:-}"; do
+  tgt="$f"
+  if [ -L "$f" ]; then
+    tgt="$(readlink -f "$f" || echo "$f")"
+  fi
+  if [ "$tgt" != "$(readlink -f "$CANON")" ]; then
+    # disable
+    if [ -L "$f" ]; then rm -f "$f"; else mv -f "$f" "$f.disabled.$TS"; fi
+  fi
+done
 
-python3 - <<'PY'
-from pathlib import Path
-import time
-TS=str(int(time.time()))
-BOT="e8DbBrTJxRetx3HNFb83CsXMySETydHVLwxMzkjcVqh"
-WOLV=Path("/opt/fireinners/frontend-react/app/dist/wolverine")
-tpl=r"""<!doctype html><html lang="fr"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><meta http-equiv="Cache-Control" content="no-store"/><meta http-equiv="Pragma" content="no-cache"/><meta http-equiv="Expires" content="0"/><title>WOLVERINE</title><style>
-body{font:14px Arial,system-ui;margin:0;padding:14px;background:#fff}
-#wrap{max-width:980px;margin:0 auto;border:1px solid #bbb;border-radius:12px;padding:12px}
-h1{margin:0 0 10px 0;font-size:32px;letter-spacing:.5px}
-.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:10px 0}
-.mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;word-break:break-all}
-.box{padding:10px;border:1px solid #bbb;border-radius:10px;background:#f7f7f7}
-button,select,input{font:inherit;padding:6px 8px}
-small{color:#444}
-.ok{color:#060}
-.bad{color:#a00}
-hr{border:none;border-top:1px solid #ddd;margin:12px 0}
-</style></head><body><div id="wrap">
-<h1>WOLVERINE</h1>
+# Assure qu'il y a bien un lien sites-enabled vers CANON
+if ! ls -l /etc/nginx/sites-enabled 2>/dev/null | grep -q "$(basename "$CANON")"; then
+  ln -sf "$CANON" "/etc/nginx/sites-enabled/$(basename "$CANON")"
+fi
 
-<div class="row">
-  <button id="btnConnect" type="button">Connect Wallet (Phantom)</button>
-  <div>Wallet: <span id="pub" class="mono">—</span></div>
-  <div>Investi: <span id="invested" class="mono">—</span></div>
-</div>
-
-<div class="box">
-  <b>Mode TraderOne</b>
-  <div class="row">
-    <select id="mode">
-      <option value="SAFE">SAFE</option>
-      <option value="AUTO">AUTO</option>
-      <option value="RR">RR</option>
-      <option value="SCALP">SCALP</option>
-    </select>
-    <button id="btnMode" type="button">Sauver</button>
-    <span id="modeMsg"></span>
-  </div>
-</div>
-
-<hr>
-
-<div class="box">
-  <b>Dépôt manuel (unique)</b><br>
-  <small>Envoie depuis ton Phantom vers TraderOne (bot) :</small>
-  <div class="mono" id="bot">__BOT__</div>
-  <div class="row">
-    <label>Asset
-      <select id="asset">
-        <option value="USDC">USDC</option>
-        <option value="SOL">SOL</option>
-      </select>
-    </label>
-    <label>Montant
-      <input id="amount" placeholder="ex: 1 ou 0.1" style="min-width:220px"/>
-    </label>
-    <button id="btnConfirm" type="button">CONFIRMER DÉPÔT (scan on-chain)</button>
-    <span id="depMsg"></span>
-  </div>
-  <small>Après confirmation, START devient actif.</small>
-  <div><b>Dernier dépôt détecté</b> : <span id="lastDep" class="mono">—</span></div>
-</div>
-
-<div class="row" style="margin-top:12px">
-  <button id="btnStart" type="button" disabled>START WOLVERINE</button>
-  <span id="startMsg"></span>
-</div>
-
-<div class="row"><small>Build:</small> <span class="mono">__TS__</span></div>
-
-<script>
-(()=>{"use strict";
-const BOT="__BOT__";
-const $=s=>document.querySelector(s);
-const setMsg=(el,txt,ok)=>{el.textContent=txt||"";el.className=ok?"ok":"bad";};
-
-const jpost=async(url,obj)=>{
-  const r=await fetch(url,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(obj||{})});
-  const t=await r.text(); let j=null; try{j=JSON.parse(t)}catch(e){}
-  if(!r.ok) throw new Error((j&&j.err)||t||("HTTP "+r.status));
-  return j||{};
-};
-const jget=async(url)=>{
-  const r=await fetch(url,{method:"GET"});
-  const t=await r.text(); let j=null; try{j=JSON.parse(t)}catch(e){}
-  if(!r.ok) throw new Error((j&&j.err)||t||("HTTP "+r.status));
-  return j||{};
-};
-const getPub=async()=>{
-  if(!window.solana||!window.solana.isPhantom) throw new Error("Phantom non détecté");
-  if(window.solana.publicKey) return window.solana.publicKey.toBase58();
-  const r=await window.solana.connect(); return r&&r.publicKey?r.publicKey.toBase58():"";
-};
-
-async function refresh(pub){
-  const st=await jget("/wolverine/api/wolv_state?pub="+encodeURIComponent(pub));
-  const m=(st&&st.user&&st.user.mode)||"SAFE"; $("#mode").value=m;
-  const inv=(st && st.user && (st.user.invested_usdc ?? st.user.invested ?? null));
-  $("#invested").textContent=(inv===null||inv===undefined)?"—":String(inv);
-  const ld=st&&st.user&&st.user.last_deposit;
-  if(ld&&ld.sig){$("#lastDep").textContent=(ld.asset+" "+ld.amount+" | "+ld.sig); $("#btnStart").disabled=false;}
-  else {$("#lastDep").textContent="—"; $("#btnStart").disabled=true;}
-}
-
-$("#btnConnect").onclick=async()=>{
-  try{const pub=await getPub(); $("#pub").textContent=pub; await refresh(pub);}
-  catch(e){alert(String(e&&e.message?e.message:e));}
-};
-$("#btnMode").onclick=async()=>{
-  try{
-    const pub=await getPub(); $("#pub").textContent=pub;
-    setMsg($("#modeMsg"),"Sauvegarde...",false);
-    await jpost("/wolverine/api/wolv_set_mode",{pub,mode:$("#mode").value});
-    setMsg($("#modeMsg"),"OK",true);
-  }catch(e){setMsg($("#modeMsg"),"ERR: "+String(e&&e.message?e.message:e),false);}
-};
-$("#btnConfirm").onclick=async()=>{
-  try{
-    const pub=await getPub(); $("#pub").textContent=pub;
-    const asset=$("#asset").value;
-    const amt=Number($("#amount").value||0);
-    if(!(amt>0)) return setMsg($("#depMsg"),"Montant invalide",false);
-    setMsg($("#depMsg"),"Scan on-chain...",false);
-    const out=await jpost("/wolverine/api/wolv_confirm_deposit",{pub,asset,amount:amt,bot:BOT});
-    if(out&&out.ok&&out.sig){setMsg($("#depMsg"),"OK: "+out.sig,true); await refresh(pub);}
-    else setMsg($("#depMsg"),"Pas trouvé (réessaie après confirmation réseau)",false);
-  }catch(e){setMsg($("#depMsg"),"ERR: "+String(e&&e.message?e.message:e),false);}
-};
-$("#btnStart").onclick=async()=>{
-  try{
-    const pub=await getPub(); $("#pub").textContent=pub;
-    setMsg($("#startMsg"),"Start...",false);
-    await jpost("/wolverine/api/start",{pub});
-    setMsg($("#startMsg"),"OK",true);
-  }catch(e){setMsg($("#startMsg"),"ERR: "+String(e&&e.message?e.message:e),false);}
-};
-})();
-</script></div></body></html>"""
-html=tpl.replace("__BOT__",BOT).replace("__TS__",TS)
-(WOLV/f"index.{TS}.html").write_text(html,encoding="utf-8")
-(WOLV/"index.html").write_text(html,encoding="utf-8")
-PY
-
-# 3) Patch nginx: /wolverine/ (alias) + /wolverine/api/ -> 127.0.0.1:3000/api/
-MARK_BEGIN="# BEGIN WOLV_SINGLE_UI_V5"
-MARK_END="# END WOLV_SINGLE_UI_V5"
+# Bloc Wolverine (idempotent)
+MARK_BEGIN="# BEGIN WOLV_SINGLE_UI_V6"
+MARK_END="# END WOLV_SINGLE_UI_V6"
 BLOCK="$MARK_BEGIN
 location ^~ /wolverine/api/ {
   rewrite ^/wolverine/api/(.*)$ /api/\$1 break;
@@ -177,56 +46,56 @@ location ^~ /wolverine/api/ {
 }
 location = /wolverine/ {
   add_header Cache-Control \"no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0\" always;
-  return 302 /wolverine/index.$TS.html;
+  return 302 /wolverine/index.html;
 }
 location ^~ /wolverine/ {
   alias /opt/fireinners/frontend-react/app/dist/wolverine/;
   add_header Cache-Control \"no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0\" always;
-  try_files \$uri \$uri/ /index.$TS.html;
+  try_files \$uri \$uri/ /index.html;
 }
 $MARK_END"
 
-chattr -i "$NG" 2>/dev/null || true
+chattr -i "$CANON" 2>/dev/null || true
 
-python3 - "$NG" "$MARK_BEGIN" "$MARK_END" "$BLOCK" <<'PY'
+python3 - "$CANON" "$MARK_BEGIN" "$MARK_END" "$BLOCK" <<'PY'
 import sys,re
 p,mb,me,block=sys.argv[1],sys.argv[2],sys.argv[3],sys.argv[4]
 s=open(p,"r",encoding="utf-8",errors="ignore").read()
 
-# replace existing marked block
-if mb in s and me in s:
-    a=s.index(mb); b=s.index(me,a)+len(me)
-    s=s[:a]+block+s[b:]
-    open(p,"w",encoding="utf-8").write(s)
-    raise SystemExit(0)
+# remove any old V5 blocks too (just in case)
+for ob,oe in [("# BEGIN WOLV_SINGLE_UI_V5","# END WOLV_SINGLE_UI_V5"),("# BEGIN WOLV_SINGLE_UI_V4","# END WOLV_SINGLE_UI_V4"),("# BEGIN WOLV_SINGLE_UI_V3","# END WOLV_SINGLE_UI_V3")]:
+  if ob in s and oe in s:
+    a=s.index(ob); b=s.index(oe,a)+len(oe)
+    s=s[:a]+s[b:]
 
-# parse server blocks
+if mb in s and me in s:
+  a=s.index(mb); b=s.index(me,a)+len(me)
+  s=s[:a]+block+s[b:]
+  open(p,"w",encoding="utf-8").write(s); raise SystemExit(0)
+
+# insert inside the server {} that contains server_name fireinners.online (prefer 443)
 starts=[m.start() for m in re.finditer(r'(?m)^\s*server\s*\{', s)]
 def get_block(i):
-    depth=0; j=i
-    while j < len(s):
-        c=s[j]
-        if c=='{': depth+=1
-        elif c=='}':
-            depth-=1
-            if depth==0:
-                return (i,j+1,s[i:j+1])
-        j+=1
-    return None
+  depth=0; j=i
+  while j<len(s):
+    c=s[j]
+    if c=='{': depth+=1
+    elif c=='}':
+      depth-=1
+      if depth==0: return (i,j+1,s[i:j+1])
+    j+=1
+  return None
+blocks=[b for b in (get_block(i) for i in starts) if b]
+if not blocks: raise SystemExit("ERR: aucun server{} dans "+p)
 
-blocks=[get_block(i) for i in starts]
-blocks=[b for b in blocks if b]
-if not blocks: raise SystemExit("ERR: aucun bloc server { } trouvé dans le fichier ciblé: "+p)
-
-# pick block containing server_name fireinners.online, prefer listen 443
+cands=[b for b in blocks if re.search(r'(?m)^\s*server_name\s+.*fireinners\.online', b[2])]
+if not cands: cands=blocks
+# prefer listen 443 ssl
 pick=None
-for a,b,t in blocks:
-    if re.search(r'(?m)^\s*server_name\s+.*fireinners\.online', t):
-        pick=(a,b,t); break
-if pick is None:
-    pick=blocks[-1]
+for b in cands:
+  if re.search(r'(?m)^\s*listen\s+443', b[2]): pick=b; break
+if pick is None: pick=cands[0]
 a,b,t=pick
-
 ins=b-1
 out=s[:ins].rstrip()+"\n\n"+block+"\n\n"+s[ins:]
 open(p,"w",encoding="utf-8").write(out)
@@ -234,11 +103,11 @@ PY
 
 nginx -t
 systemctl reload nginx
-chattr +i "$NG" 2>/dev/null || true
+chattr +i "$CANON" 2>/dev/null || true
 
-echo "OK: SINGLE UI V5 installé"
-echo "VHOST: $NG"
+echo "OK: doublons vhost supprimés + wolverine patch V6 appliqué"
+echo "CANON: $CANON"
 echo "URL: https://fireinners.online/wolverine/"
 BASH
 
-bash /root/WOLV_SINGLE_UI_V5.sh
+bash /root/WOLV_NGINX_FIX_V6.sh
