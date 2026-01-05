@@ -2,83 +2,76 @@
 set -e
 
 FRONT="/opt/fireinners/frontend-react/app/dist/wolverine/index.html"
-BACK="/opt/wolverine/server.js"
 
-echo "=== WOLVERINE • FIX SOLDES SOL / USDC ==="
+echo "=== WOLVERINE • FIX SOLDES + BACKGROUND ==="
 
-### 1️⃣ BACKEND — route balances
-if ! grep -q "/api/balances" "$BACK"; then
-echo "[1/4] Patch backend balances"
-
-cat >> "$BACK" <<'EOF'
-
-// === BALANCES API ===
-app.get("/api/balances", async (req,res)=>{
-  try{
-    const {user} = req.query;
-    if(!user) return res.status(400).json({error:"missing user"});
-
-    const pub = new solanaWeb3.PublicKey(user);
-
-    const lamports = await connection.getBalance(pub);
-    const solUser = lamports / solanaWeb3.LAMPORTS_PER_SOL;
-
-    const usdcMint = new solanaWeb3.PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1");
-    const atas = await connection.getParsedTokenAccountsByOwner(pub,{mint:usdcMint});
-    let usdcUser = 0;
-    atas.value.forEach(a=>{
-      usdcUser += a.account.data.parsed.info.tokenAmount.uiAmount || 0;
-    });
-
-    res.json({
-      phantom:{ sol:solUser, usdc:usdcUser },
-      internal:{
-        sol: global.INTERNAL_SOL || 0,
-        usdc: global.INTERNAL_USDC || 0
-      }
-    });
-  }catch(e){
-    res.status(500).json({error:e.message});
-  }
-});
-EOF
-fi
-
-### 2️⃣ RESTART BACKEND
-echo "[2/4] Restart backend"
-pm2 restart traderone || pm2 start "$BACK" --name traderone
-pm2 save
-
-### 3️⃣ FRONTEND — affichage soldes
-echo "[3/4] Patch frontend"
-
+### 1️⃣ PATCH FRONTEND (Phantom + soldes)
 node <<'NODE'
 const fs=require("fs");
-const p="/opt/fireinners/frontend-react/app/dist/wolverine/index.html";
-let s=fs.readFileSync(p,"utf8");
+const p=process.env.FRONT||"/opt/fireinners/frontend-react/app/dist/wolverine/index.html";
+let h=fs.readFileSync(p,"utf8");
 
-if(s.includes("loadBalances"))process.exit(0);
+h=h.replace(/Internal SOL:.*?<br>/s,'Internal SOL: <span id="internalSol">-</span><br>');
+h=h.replace(/Phantom SOL:.*?<br>/s,'Phantom SOL: <span id="phantomSol">-</span><br>');
 
-const js=`
+if(!h.includes("connectPhantom")){
+h=h.replace("</body>",`
 <script>
+let walletAddress=null;
+
+async function connectPhantom(){
+ if(!window.solana){alert("Phantom non détecté");return;}
+ const r=await window.solana.connect();
+ walletAddress=r.publicKey.toString();
+ document.querySelector("strong")?.remove();
+ document.querySelector("body").innerHTML=document.body.innerHTML.replace("Wallet: -","Wallet: "+walletAddress);
+ loadBalances();
+}
+
 async function loadBalances(){
- if(!window.walletAddress)return;
+ if(!walletAddress)return;
  const r=await fetch("/api/balances?user="+walletAddress);
  const j=await r.json();
  document.getElementById("phantomSol").textContent=j.phantom.sol.toFixed(4)+" SOL";
- document.getElementById("phantomUsdc").textContent=j.phantom.usdc.toFixed(2)+" USDC";
  document.getElementById("internalSol").textContent=j.internal.sol.toFixed(4)+" SOL";
- document.getElementById("internalUsdc").textContent=j.internal.usdc.toFixed(2)+" USDC";
 }
 </script>
-`;
+</body>`);
+}
 
-s=s.replace(/<\/body>/i,js+"\n</body>");
-fs.writeFileSync(p,s);
+fs.writeFileSync(p,h);
 NODE
 
-### 4️⃣ RELOAD NGINX
-echo "[4/4] Reload nginx"
+### 2️⃣ BACKGROUND UNIVERSEL
+node <<'NODE'
+const fs=require("fs");
+const p="/opt/fireinners/frontend-react/app/dist/wolverine/index.html";
+let h=fs.readFileSync(p,"utf8");
+
+h=h.replace(/<style>[\s\S]*?<\/style>/,`
+<style>
+html,body{
+ margin:0;
+ height:100%;
+ font-family:system-ui;
+ background:linear-gradient(135deg,#ff4fd8,#30e3ca);
+ background-attachment:fixed;
+}
+*{box-sizing:border-box}
+button,input{
+ background:rgba(255,255,255,0.2);
+ color:#fff;
+ border:1px solid rgba(255,255,255,0.4);
+ border-radius:10px;
+ padding:10px;
+}
+</style>
+`);
+
+fs.writeFileSync(p,h);
+NODE
+
+### 3️⃣ RELOAD NGINX
 nginx -t && systemctl reload nginx
 
-echo "✅ SOLDES SOL + USDC OK"
+echo "✅ CORRIGÉ : Phantom + soldes + background universel"
