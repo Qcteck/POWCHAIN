@@ -1,4 +1,4 @@
-cat >/root/WOLV_SINGLE_UI_V4.sh <<'BASH'
+cat >/root/WOLV_SINGLE_UI_V5.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 TS="$(date +%s)"
@@ -6,14 +6,14 @@ DIST="/opt/fireinners/frontend-react/app/dist"
 WOLV="$DIST/wolverine"
 BOT="e8DbBrTJxRetx3HNFb83CsXMySETydHVLwxMzkjcVqh"
 
-# vhost file (available/enabled)
-NG=""
-for f in /etc/nginx/sites-available/fireinners.online-ssl /etc/nginx/sites-enabled/fireinners.online-ssl; do
-  [ -f "$f" ] && NG="$f" && break
-done
-[ -n "$NG" ] || { echo "ERR: vhost fireinners.online-ssl introuvable"; exit 1; }
+# 1) Trouve le bon vhost (celui qui a server_name fireinners.online)
+NG="$(grep -RIlE '^\s*server_name\s+.*fireinners\.online' /etc/nginx/sites-available /etc/nginx/sites-enabled 2>/dev/null | head -n1 || true)"
+if [ -z "${NG:-}" ]; then
+  NG="$(grep -RIl 'fireinners.online' /etc/nginx/sites-available /etc/nginx/sites-enabled 2>/dev/null | head -n1 || true)"
+fi
+[ -n "${NG:-}" ] || { echo "ERR: vhost fireinners.online introuvable dans sites-available/enabled"; exit 1; }
 
-mkdir -p "$WOLV"
+# 2) Reset UI (zéro doublon)
 rm -rf "$WOLV"
 mkdir -p "$WOLV"
 
@@ -94,8 +94,6 @@ const BOT="__BOT__";
 const $=s=>document.querySelector(s);
 const setMsg=(el,txt,ok)=>{el.textContent=txt||"";el.className=ok?"ok":"bad";};
 
-(async()=>{try{if("serviceWorker"in navigator){const regs=await navigator.serviceWorker.getRegistrations();for(const r of regs)try{await r.unregister()}catch(e){}}}catch(e){}})();
-
 const jpost=async(url,obj)=>{
   const r=await fetch(url,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(obj||{})});
   const t=await r.text(); let j=null; try{j=JSON.parse(t)}catch(e){}
@@ -113,6 +111,7 @@ const getPub=async()=>{
   if(window.solana.publicKey) return window.solana.publicKey.toBase58();
   const r=await window.solana.connect(); return r&&r.publicKey?r.publicKey.toBase58():"";
 };
+
 async function refresh(pub){
   const st=await jget("/wolverine/api/wolv_state?pub="+encodeURIComponent(pub));
   const m=(st&&st.user&&st.user.mode)||"SAFE"; $("#mode").value=m;
@@ -162,17 +161,10 @@ html=tpl.replace("__BOT__",BOT).replace("__TS__",TS)
 (WOLV/"index.html").write_text(html,encoding="utf-8")
 PY
 
-MARK_BEGIN="# BEGIN WOLV_SINGLE_UI_V4"
-MARK_END="# END WOLV_SINGLE_UI_V4"
+# 3) Patch nginx: /wolverine/ (alias) + /wolverine/api/ -> 127.0.0.1:3000/api/
+MARK_BEGIN="# BEGIN WOLV_SINGLE_UI_V5"
+MARK_END="# END WOLV_SINGLE_UI_V5"
 BLOCK="$MARK_BEGIN
-location = /wolverine/ {
-  add_header Cache-Control \"no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0\" always;
-  return 302 /wolverine/index.$TS.html;
-}
-location = /wolverine/index.$TS.html {
-  add_header Cache-Control \"no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0\" always;
-  try_files /wolverine/index.$TS.html =404;
-}
 location ^~ /wolverine/api/ {
   rewrite ^/wolverine/api/(.*)$ /api/\$1 break;
   proxy_pass http://127.0.0.1:3000;
@@ -183,43 +175,58 @@ location ^~ /wolverine/api/ {
   proxy_set_header X-Forwarded-Proto \$scheme;
   proxy_read_timeout 60s;
 }
+location = /wolverine/ {
+  add_header Cache-Control \"no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0\" always;
+  return 302 /wolverine/index.$TS.html;
+}
+location ^~ /wolverine/ {
+  alias /opt/fireinners/frontend-react/app/dist/wolverine/;
+  add_header Cache-Control \"no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0\" always;
+  try_files \$uri \$uri/ /index.$TS.html;
+}
 $MARK_END"
 
 chattr -i "$NG" 2>/dev/null || true
+
 python3 - "$NG" "$MARK_BEGIN" "$MARK_END" "$BLOCK" <<'PY'
 import sys,re
 p,mb,me,block=sys.argv[1],sys.argv[2],sys.argv[3],sys.argv[4]
 s=open(p,"r",encoding="utf-8",errors="ignore").read()
 
-def replace_marked(txt):
-    if mb in txt and me in txt:
-        a=txt.index(mb); b=txt.index(me,a)+len(me)
-        return txt[:a]+block+txt[b:]
-    return None
+# replace existing marked block
+if mb in s and me in s:
+    a=s.index(mb); b=s.index(me,a)+len(me)
+    s=s[:a]+block+s[b:]
+    open(p,"w",encoding="utf-8").write(s)
+    raise SystemExit(0)
 
-r=replace_marked(s)
-if r is not None:
-    open(p,"w",encoding="utf-8").write(r); sys.exit(0)
-
-servers=[]
-for m in re.finditer(r'(?m)^\s*server\s*\{', s):
-    i=m.start(); depth=0; j=i
+# parse server blocks
+starts=[m.start() for m in re.finditer(r'(?m)^\s*server\s*\{', s)]
+def get_block(i):
+    depth=0; j=i
     while j < len(s):
         c=s[j]
         if c=='{': depth+=1
         elif c=='}':
             depth-=1
             if depth==0:
-                servers.append((i,j+1,s[i:j+1])); break
+                return (i,j+1,s[i:j+1])
         j+=1
-if not servers: raise SystemExit("ERR: aucun bloc server { } trouvé dans le vhost")
+    return None
 
+blocks=[get_block(i) for i in starts]
+blocks=[b for b in blocks if b]
+if not blocks: raise SystemExit("ERR: aucun bloc server { } trouvé dans le fichier ciblé: "+p)
+
+# pick block containing server_name fireinners.online, prefer listen 443
 pick=None
-for a,b,txt in servers:
-    if re.search(r'(?m)^\s*listen\s+443', txt):
-        pick=(a,b,txt); break
-if pick is None: pick=servers[-1]
-a,b,txt=pick
+for a,b,t in blocks:
+    if re.search(r'(?m)^\s*server_name\s+.*fireinners\.online', t):
+        pick=(a,b,t); break
+if pick is None:
+    pick=blocks[-1]
+a,b,t=pick
+
 ins=b-1
 out=s[:ins].rstrip()+"\n\n"+block+"\n\n"+s[ins:]
 open(p,"w",encoding="utf-8").write(out)
@@ -229,8 +236,9 @@ nginx -t
 systemctl reload nginx
 chattr +i "$NG" 2>/dev/null || true
 
-echo "OK: SINGLE UI V4 installé"
-echo "URL: https://fireinners.online/wolverine/ (redir auto vers index.$TS.html)"
+echo "OK: SINGLE UI V5 installé"
+echo "VHOST: $NG"
+echo "URL: https://fireinners.online/wolverine/"
 BASH
 
-bash /root/WOLV_SINGLE_UI_V4.sh 
+bash /root/WOLV_SINGLE_UI_V5.sh
