@@ -1,184 +1,24 @@
-bash -lc 'set -euo pipefail
-RPC_FALLBACK="https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac"
-USDC_MINT="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1"
-BOT_FALLBACK="e8DbBrTJxRetx3HNFb83CsXMySETydHVLwxMzkjcVqh"
-MARK="WOLV_SPLIT_BUTTONS_V1"
-
-JS="$(cat <<JS
-/* ${MARK} */
-(()=>{const W=window;const LOG=(...a)=>console.log("[WOLV]",...a);
-const STATUS=(t)=>{try{const el=document.querySelector("#status,#statusLine,[data-status]");if(el){if(/Status:/i.test(el.textContent||""))el.textContent="Status: "+t;else el.textContent=t;}}catch(e){}LOG(t);};
-
-const startBtn=()=>[...document.querySelectorAll("button,input[type=button],input[type=submit],a")].find(x=>/START\\s*WOLVERINE|^START$/i.test(((x.textContent||x.value||"")+"").trim()));
-const budgetEl=()=>document.querySelector("#budget,input[name=budget]")||[...document.querySelectorAll("input")].find(i=>/budget/i.test((i.id||"")+(i.name||"")+(i.placeholder||"")) );
-const budget=()=>{const el=budgetEl();const v=parseFloat(((el&&el.value)||"").toString().replace(",", "."));return isFinite(v)?v:0;};
-const findBot=()=>{try{const t=document.body.innerText||"";const m=t.match(/Adresse\\s*:\\s*([1-9A-HJ-NP-Za-km-z]{32,44})/i);if(m&&m[1])return m[1];}catch(e){}return (W.TRADERONE_WALLET||W.__TRADERONE_WALLET||"${BOT_FALLBACK}");};
-
-function ensureUI(){
-  if(document.querySelector("#wolvAsset"))return;
-  const s=startBtn(); if(!s)return;
-  const wrap=document.createElement("div");
-  wrap.id="wolvSplitWrap";
-  wrap.style.cssText="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:10px";
-  const sel=document.createElement("select");sel.id="wolvAsset";sel.innerHTML="<option value=\\"SOL\\">SOL</option><option value=\\"USDC\\">USDC</option>";
-  sel.value=localStorage.getItem("WOLV_ASSET")||"USDC";
-  sel.onchange=()=>localStorage.setItem("WOLV_ASSET",sel.value);
-
-  const send=document.createElement("button");
-  send.id="wolvSendTx";
-  send.textContent="SEND (PHANTOM TX)";
-  send.style.cssText="padding:10px 12px;border-radius:10px;border:1px solid #334;background:#101a33;color:#e7f0ff;cursor:pointer;font-weight:700";
-
-  const note=document.createElement("span");
-  note.textContent="Budget -> TraderOne (popup Phantom)";
-  note.style.opacity=".8";
-
-  wrap.appendChild(document.createTextNode("Asset:"));
-  wrap.appendChild(sel);
-  wrap.appendChild(send);
-  wrap.appendChild(note);
-
-  // Place sous le bouton START (ou après budget)
-  const b=budgetEl();
-  const anchor=b&&b.parentNode?b:s;
-  anchor.parentNode.insertBefore(wrap, anchor.nextSibling);
-}
-const getAsset=()=>document.querySelector("#wolvAsset")?.value||localStorage.getItem("WOLV_ASSET")||"USDC";
-
-function addScript(src){return new Promise((res,rej)=>{const s=document.createElement("script");s.src=src;s.async=true;s.onload=()=>res(src);s.onerror=()=>rej(new Error("load fail "+src));document.head.appendChild(s);});}
-async function ensureLibs(){
-  if(W.solanaWeb3&&W.solanaWeb3.PublicKey&&W.solanaWeb3.Connection) return W.solanaWeb3;
-  STATUS("DEBUG: charge libs...");
-  await addScript("/wolverine/vendor/solana-web3.min.js");
-  await addScript("/wolverine/vendor/spl-token.min.js");
-  if(!(W.solanaWeb3&&W.solanaWeb3.PublicKey&&W.solanaWeb3.Connection)) throw new Error("libs pas prêtes");
-  return W.solanaWeb3;
-}
-async function phantomNoReconnect(){
-  const P=W.phantom?.solana||W.solana;
-  if(!P) throw new Error("Phantom introuvable");
-  // IMPORTANT: pas de reconnect forcé si déjà connecté
-  if(!P.isConnected){
-    STATUS("Connect Phantom (popup)...");
-    await P.connect({onlyIfTrusted:false});
-  }
-  return P;
-}
-function conn(S){return W.__WOLV_CONN__||(W.__WOLV_CONN__=new S.Connection(W.__RPC__||W.RPC_URL||"${RPC_FALLBACK}","confirmed"));}
-
-async function buildSOL(S,owner,to,amtSOL){
-  const c=conn(S);
-  const lamports=Math.round(amtSOL*1e9);
-  const ix=S.SystemProgram.transfer({fromPubkey:owner,toPubkey:to,lamports});
-  const {blockhash,lastValidBlockHeight}=await c.getLatestBlockhash("confirmed");
-  const tx=new S.Transaction({feePayer:owner,blockhash,lastValidBlockHeight}).add(ix);
-  return {tx,blockhash,lastValidBlockHeight,c};
-}
-async function buildUSDC(S,owner,to,amtUSDC){
-  const c=conn(S);
-  const T=W.splToken; if(!T) throw new Error("spl-token manquant");
-  const mint=new S.PublicKey("${USDC_MINT}");
-  const TOKEN_PROGRAM_ID=T.TOKEN_PROGRAM_ID||new S.PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
-  const ASSOCIATED_TOKEN_PROGRAM_ID=T.ASSOCIATED_TOKEN_PROGRAM_ID||new S.PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
-  const ata=(ownerPk)=>{const [a]=S.PublicKey.findProgramAddressSync([ownerPk.toBuffer(),TOKEN_PROGRAM_ID.toBuffer(),mint.toBuffer()],ASSOCIATED_TOKEN_PROGRAM_ID);return a;};
-  const fromAta=ata(owner), toAta=ata(to);
-  const ixs=[];
-  const toInfo=await c.getAccountInfo(toAta,"confirmed");
-  if(!toInfo && T.createAssociatedTokenAccountInstruction){
-    ixs.push(T.createAssociatedTokenAccountInstruction(owner,toAta,to,mint,TOKEN_PROGRAM_ID,ASSOCIATED_TOKEN_PROGRAM_ID));
-  }
-  const amt=Math.round(amtUSDC*1e6);
-  if(!T.createTransferInstruction) throw new Error("transfer ix manquant");
-  ixs.push(T.createTransferInstruction(fromAta,toAta,owner,amt,[],TOKEN_PROGRAM_ID));
-  const {blockhash,lastValidBlockHeight}=await c.getLatestBlockhash("confirmed");
-  const tx=new S.Transaction({feePayer:owner,blockhash,lastValidBlockHeight}); ixs.forEach(ix=>tx.add(ix));
-  return {tx,blockhash,lastValidBlockHeight,c};
-}
-
-async function sendPhantomTx(){
-  ensureUI();
-  STATUS("DEBUG: SEND click");
-  const amt=budget(); if(!(amt>0)) throw new Error("Budget invalide");
-  const asset=getAsset();
-  const bot=findBot();
-  const S=await ensureLibs();
-  const P=await phantomNoReconnect();
-  const owner=new S.PublicKey(P.publicKey.toString());
-  const to=new S.PublicKey(bot);
-
-  STATUS("DEBUG: build tx...");
-  const pack = asset==="SOL" ? await buildSOL(S,owner,to,amt) : await buildUSDC(S,owner,to,amt);
-
-  STATUS("DEBUG: Phantom popup...");
-  let txid;
-  if(P.signAndSendTransaction){
-    const r=await P.signAndSendTransaction(pack.tx);
-    txid=(r.signature||r).toString();
-  } else {
-    const stx=await P.signTransaction(pack.tx);
-    txid=await pack.c.sendRawTransaction(stx.serialize(),{skipPreflight:false});
-  }
-
-  STATUS("DEBUG: confirm...");
-  await pack.c.confirmTransaction({signature:txid,blockhash:pack.blockhash,lastValidBlockHeight:pack.lastValidBlockHeight},"confirmed");
-  STATUS("OK TX "+txid.slice(0,8)+"...");
-}
-
-async function startOnly(){
-  const amt=budget(); // optional
-  const asset=getAsset();
-  const bot=findBot();
-  STATUS("API /api/start...");
-  try{await fetch("/api/start",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({mode:"START_ONLY",asset,budget:amt,to:bot})});}catch(e){}
-  STATUS("OK START");
-}
-
-function bind(){
-  const s=startBtn(); if(!s){setTimeout(bind,250);return;}
-  ensureUI();
-
-  // START WOLVERINE => API ONLY (pas Phantom)
-  s.addEventListener("click",(e)=>{e.preventDefault();e.stopPropagation();e.stopImmediatePropagation();startOnly().catch(err=>STATUS("ERR: "+((err&&err.message)||err)));},true);
-
-  // SEND => Phantom TX
-  document.addEventListener("click",(e)=>{
-    const t=e.target;
-    if(t && t.id==="wolvSendTx"){
-      e.preventDefault();e.stopPropagation();e.stopImmediatePropagation();
-      sendPhantomTx().catch(err=>{STATUS("ERR: "+((err&&err.message)||err));LOG("ERR FULL",err);});
-    }
-  },true);
-
-  STATUS("READY");
-}
-if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",bind); else bind();
-})();
+bash -lc 'set -euo pipefail;JS="/opt/fireinners/frontend-react/app/dist/wolverine/patches/wolv_pay_then_start.js";mkdir -p "$(dirname "$JS")";cat >"$JS"<<'"'"'JS'"'"'
+(()=>{"use strict";const USDC_MINT="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1";const $=(s,r=document)=>r.querySelector(s);const $$=(s,r=document)=>Array.from(r.querySelectorAll(s));const log=(...a)=>{try{console.log("[WOLV]",...a)}catch(_){}};const setStatus=(t)=>{const el=$("#status")||$("[data-status]");if(el)el.textContent=t;log(t)};const lsKey=(to,asset,amt)=>"WOLV_PAID:"+to+":"+asset+":"+amt;const hexToBytes=(h)=>{h=h.replace(/^0x/,"");if(h.length%2)h="0"+h;const a=new Uint8Array(h.length/2);for(let i=0;i<a.length;i++)a[i]=parseInt(h.slice(i*2,i*2+2),16);return a};const loadLib=async()=>{if(window.solanaWeb3&&window.splToken&&window.Buffer)return true;const wait=(ms)=>new Promise(r=>setTimeout(r,ms));for(let i=0;i<50;i++){if(window.solanaWeb3&&window.splToken&&window.Buffer)return true;await wait(100)}return !!(window.solanaWeb3&&window.splToken)};const ensureConnect=async()=>{if(!window.solana||!window.solana.isPhantom)throw new Error("Phantom introuvable");const r=await window.solana.connect({onlyIfTrusted:false});return r.publicKey.toString()};const findStartBtn=()=>{let b=$("#startWolverine")||$("#btnStart")||$("#start");if(b)return b;const cand=$$("button,input[type=button],a").find(x=>/START\s*WOLVERINE/i.test((x.textContent||x.value||"")));return cand||null};const findBudgetInput=()=>$("#budget")||$("#budgetInput")||$$("input").find(x=>/budget/i.test(x.id||"")||/budget/i.test(x.name||""))||null;const findAssetSelect=()=>$("#asset")||$("#assetSelect")||$$("select").find(x=>/asset/i.test(x.id||"")||/asset/i.test(x.name||""))||null;const getTraderOneAddr=()=>{const el=$("#traderOneAddr")||$("#botAddr")||$("[data-traderone]");if(el&&el.textContent){const m=el.textContent.match(/[1-9A-HJ-NP-Za-km-z]{32,44}/);if(m)return m[0]}const html=document.body.innerText||"";const m=html.match(/Wallet TraderOne.*?Adresse:\s*([1-9A-HJ-NP-Za-km-z]{32,44})/s);return m?m[1]:null};const makeUi=(startBtn,budgetEl,assetEl,toAddr)=>{const row=startBtn.parentElement||document.body;const wrap=document.createElement("span");wrap.id="wolvPayWrap";wrap.style.marginLeft="8px";wrap.style.display="inline-flex";wrap.style.gap="8px";wrap.style.alignItems="center";const pay=document.createElement("button");pay.id="wolvPayBtn";pay.textContent="PAYER (Phantom)";pay.type="button";const st=document.createElement("span");st.id="wolvPayState";st.style.fontSize="12px";st.style.opacity="0.8";st.textContent="";wrap.appendChild(pay);wrap.appendChild(st);row.insertBefore(wrap,startBtn);startBtn.style.display="none";const refreshUi=()=>{const amt=(budgetEl&&budgetEl.value?String(budgetEl.value).trim():"");const asset=(assetEl&&assetEl.value?String(assetEl.value).trim().toUpperCase():"SOL");const k=lsKey(toAddr,asset,amt);const paid=!!localStorage.getItem(k);if(paid){pay.disabled=true;pay.textContent="PAYÉ";st.textContent="OK";startBtn.style.display="inline-block"}else{pay.disabled=false;pay.textContent="PAYER (Phantom)";st.textContent="";startBtn.style.display="none"}};if(budgetEl)budgetEl.addEventListener("input",refreshUi);if(assetEl)assetEl.addEventListener("change",refreshUi);refreshUi();return {pay,st,refreshUi}};const sendSol=async(conn,fromPk,toPk,lamports)=>{const {SystemProgram,Transaction}=window.solanaWeb3;const tx=new Transaction().add(SystemProgram.transfer({fromPubkey:fromPk,toPubkey:toPk,lamports}));tx.feePayer=fromPk;const bh=await conn.getLatestBlockhash("finalized");tx.recentBlockhash=bh.blockhash;return {tx,blockhash:bh.blockhash,lastValidBlockHeight:bh.lastValidBlockHeight}};const getATA=async(owner,mint)=>{const {getAssociatedTokenAddress}=window.splToken;return await getAssociatedTokenAddress(mint,owner,false)};const buildUsdcTransfer=async(conn,fromPk,toPk,amountUi)=>{const {PublicKey,Transaction}=window.solanaWeb3;const {createTransferInstruction,createAssociatedTokenAccountInstruction}=window.splToken;const mint=new PublicKey(USDC_MINT);const fromATA=await getATA(fromPk,mint);const toATA=await getATA(toPk,mint);const ix=[];const info=await conn.getAccountInfo(toATA).catch(()=>null);if(!info){ix.push(createAssociatedTokenAccountInstruction(fromPk,toATA,toPk,mint))}const decimals=6;const amt=Math.round(Number(amountUi)*Math.pow(10,decimals));ix.push(createTransferInstruction(fromATA,toATA,fromPk,amt));const tx=new Transaction();ix.forEach(i=>tx.add(i));tx.feePayer=fromPk;const bh=await conn.getLatestBlockhash("finalized");tx.recentBlockhash=bh.blockhash;return {tx,blockhash:bh.blockhash,lastValidBlockHeight:bh.lastValidBlockHeight,amtRaw:amt}};const main=async()=>{setStatus("OK");const ok=await loadLib();if(!ok){setStatus("Libs Solana pas prêtes");return}const startBtn=findStartBtn();if(!startBtn){setStatus("Bouton START introuvable");return}const budgetEl=findBudgetInput();const assetEl=findAssetSelect();const toAddr=getTraderOneAddr();if(!toAddr){setStatus("Adresse TraderOne introuvable");return}const ui=makeUi(startBtn,budgetEl,assetEl,toAddr);ui.pay.onclick=async()=>{try{ui.pay.disabled=true;ui.st.textContent="Préparation...";const asset=(assetEl&&assetEl.value?String(assetEl.value).trim().toUpperCase():"SOL");const amt=(budgetEl&&budgetEl.value?String(budgetEl.value).trim():"");if(!amt||!isFinite(Number(amt))||Number(amt)<=0)throw new Error("Budget invalide");await ensureConnect();const {PublicKey,Connection}=window.solanaWeb3;const conn=new Connection((window.__RPC_URL__||window.RPC_URL||"https://api.mainnet-beta.solana.com"),"confirmed");const fromPk=window.solana.publicKey;const toPk=new PublicKey(toAddr);let txMeta;if(asset==="USDC"){txMeta=await buildUsdcTransfer(conn,fromPk,toPk,Number(amt))}else{const lamports=Math.round(Number(amt)*1e9);txMeta=await sendSol(conn,fromPk,toPk,lamports)}ui.st.textContent="Signature Phantom...";let sig=null;try{const r=await window.solana.signAndSendTransaction(txMeta.tx,{skipPreflight:false,maxRetries:3});sig=r.signature||r} catch(e){const signed=await window.solana.signTransaction(txMeta.tx);sig=await conn.sendRawTransaction(signed.serialize(),{skipPreflight:false,maxRetries:3})}ui.st.textContent="Confirmation...";await conn.confirmTransaction({signature:sig,blockhash:txMeta.blockhash,lastValidBlockHeight:txMeta.lastValidBlockHeight},"confirmed");localStorage.setItem(lsKey(toAddr,asset,String(amt).trim()),String(sig));ui.st.textContent="OK";ui.refreshUi();setStatus("Paiement confirmé");}catch(e){console.error(e);setStatus("ERR paiement: "+(e&&e.message?e.message:String(e)));ui.st.textContent="";ui.pay.disabled=false}};startBtn.onclick=async(ev)=>{try{ev.preventDefault();ev.stopPropagation();const asset=(assetEl&&assetEl.value?String(assetEl.value).trim().toUpperCase():"SOL");const amt=(budgetEl&&budgetEl.value?String(budgetEl.value).trim():"");const k=lsKey(toAddr,asset,amt);if(!localStorage.getItem(k)){setStatus("Paiement requis avant START");return}setStatus("START → API");const payload={asset,budget:String(amt).trim(),to:toAddr,tx:localStorage.getItem(k)||""};const r=await fetch("/api/start",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(payload)});const j=await r.json().catch(()=>({}));setStatus((j&&j.ok)?"START OK":"START ERR");}catch(e){console.error(e);setStatus("START ERR: "+(e&&e.message?e.message:String(e)))}};};if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",main,{once:true});else main();})();
 JS
-)"
-
-patched=0
-while IFS= read -r f; do
-  d="$(dirname "$f")"; mkdir -p "$d/patches"
-  printf "%s\n" "$JS" > "$d/patches/wolv_split_buttons.js"
-
-  # inject vendor libs early
-  if ! grep -q "/wolverine/vendor/solana-web3.min.js" "$f"; then
-    perl -0777 -pe "s#</head>#<script src=\"/wolverine/vendor/solana-web3.min.js\"></script><script src=\"/wolverine/vendor/spl-token.min.js\"></script>\\n</head>#i" -i "$f"
+chmod 644 "$JS"
+apply_one(){ local H="$1"; [ -f "$H" ] || return 0;
+  grep -qi "START WOLVERINE" "$H" || return 0
+  # remplace ancien patch si présent
+  if grep -q "patches/wolv_" "$H"; then
+    sed -i "s#patches/wolv_[^\"]*\\.js#patches/wolv_pay_then_start.js#g" "$H"
+  else
+    # injecte avant </body> si pas déjà
+    grep -q "wolv_pay_then_start" "$H" || sed -i "s#</body>#<script src=\"patches/wolv_pay_then_start.js\"></script></body>#I" "$H"
   fi
-
-  # inject patch script
-  if ! grep -q "${MARK}" "$f"; then
-    if grep -qi "</body>" "$f"; then
-      perl -0777 -pe "s#</body>#<script src=\"./patches/wolv_split_buttons.js\"></script>\\n</body>#i" -i "$f"
-    else
-      printf "\n<script src=\"./patches/wolv_split_buttons.js\"></script>\n" >> "$f"
-    fi
-  fi
-
-  echo "[OK] SPLIT PATCH -> $f"
-  patched=1
-done < <(find /opt /var/www /srv /root /home -type f -iname "index.html" 2>/dev/null | xargs -r grep -Il "START WOLVERINE" 2>/dev/null || true)
-
-[ "$patched" -eq 1 ] || { echo "[ERR] index.html avec START WOLVERINE introuvable"; exit 2; }
-echo "DONE. Recharge page (Ctrl+F5). Utilise SEND (PHANTOM TX) pour popup. START WOLVERINE = API only."
+  echo "PATCH OK -> $H"
+}
+# patch dist + emplacements possibles
+apply_one "/opt/fireinners/frontend-react/app/dist/wolverine/index.html"
+apply_one "/var/www/fireinners/wolverine/index.html"
+apply_one "/var/www/wolverine/index.html"
+# patch staging repo si présent
+apply_one "/opt/wolverine_repo_stage/repo/index.html"
+apply_one "/opt/wolverine_repo_stage/repo/TRADEONE/public/index.html" 2>/dev/null || true
+echo "OK. Recharge la page en dur (Ctrl+F5). Étapes: 1) Connect Wallet 2) Choisis Asset + Budget 3) PAYER (Phantom) -> popup 4) START apparaît."
 '
