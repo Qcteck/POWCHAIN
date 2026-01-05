@@ -1,438 +1,178 @@
-cat >/root/WOLV_FORCE_MIN_V2.sh <<'BASH'
+cat >/root/WOLV_MIN_UI_ONLY.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
+TS="$(date +%s)"
+
+ROOT="/opt/fireinners/frontend-react/app/dist"
+WOLV_DIR="$ROOT/wolverine"
+INDEX="$WOLV_DIR/index.html"
 
 BOT_PUB="e8DbBrTJxRetx3HNFb83CsXMySETydHVLwxMzkjcVqh"
-USDC_MINT="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1"
-RPC_URL="${RPC_URL:-https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac}"
 
-API_DIR="/opt/wolverine-api"
-API_PORT="3002"
+mkdir -p "$WOLV_DIR"
+chattr -i "$INDEX" 2>/dev/null || true
 
-VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
-NGINX_MAIN="/etc/nginx/nginx.conf"
+cat >"$INDEX" <<HTML
+<!doctype html><html lang="fr"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<meta http-equiv="Cache-Control" content="no-store"/><meta http-equiv="Pragma" content="no-cache"/><meta http-equiv="Expires" content="0"/>
+<title>WOLVERINE</title>
+<style>
+body{font:14px Arial,system-ui;margin:0;padding:14px}
+#box{max-width:980px;border:1px solid #bbb;border-radius:12px;padding:12px}
+h1{margin:0 0 10px 0;font-size:28px}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:8px 0}
+.mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;word-break:break-all}
+hr{border:none;border-top:1px solid #ddd;margin:12px 0}
+button,select,input{font:inherit;padding:6px 8px}
+small{color:#444}
+.ok{color:#060}.bad{color:#a00}
+</style>
+</head><body>
+<div id="box">
+  <h1>WOLVERINE</h1>
 
-TS="$(date +%s)"
-PATCH_NAME="wolv_force_min_v2.js"
+  <div class="row">
+    <button id="btnConnect" type="button">Connect Wallet (Phantom)</button>
+    <div>Wallet: <span id="pub" class="mono">—</span></div>
+  </div>
 
-# 1) Ensure minimal API running (used only for confirm+mode, and proxy to 3000 for /api/*)
-mkdir -p "$API_DIR"
-cd "$API_DIR"
-if [ ! -f package.json ]; then npm init -y >/dev/null 2>&1; fi
-npm pkg set name="wolverine-api" >/dev/null 2>&1 || true
-npm pkg set type="commonjs" >/dev/null 2>&1 || true
-npm i express node-fetch@2 @solana/web3.js @solana/spl-token >/dev/null 2>&1 || true
+  <div class="row">
+    <b>Mode TraderOne</b>
+    <select id="mode">
+      <option value="SAFE">SAFE</option>
+      <option value="AUTO">AUTO</option>
+      <option value="RR">RR</option>
+      <option value="SCALP">SCALP</option>
+    </select>
+    <button id="btnMode" type="button">Sauver</button>
+    <span id="modeMsg"></span>
+  </div>
 
-LEDGER_DIR="/opt/traderone-opt/data"
-LEDGER_FILE="${LEDGER_DIR}/wolv_ledger.json"
-mkdir -p "$LEDGER_DIR"
-if [ ! -f "$LEDGER_FILE" ]; then echo '{"users":{},"deposits_seen":{}}' >"$LEDGER_FILE"; fi
+  <hr>
 
-cat >"$API_DIR/server.js" <<'JS'
-"use strict";
-const fs=require("fs");
-const express=require("express");
-const fetch=require("node-fetch");
-const {Connection,PublicKey}=require("@solana/web3.js");
-const spl=require("@solana/spl-token");
+  <div>
+    <b>Dépôt manuel (obligatoire)</b><br>
+    <small>Envoie depuis ton Phantom vers TraderOne (bot) :</small>
+    <div class="mono" id="bot">$BOT_PUB</div>
+    <div class="row">
+      <label>Asset
+        <select id="asset"><option value="USDC">USDC</option><option value="SOL">SOL</option></select>
+      </label>
+      <label>Montant
+        <input id="amount" placeholder="ex: 1 ou 0.1" style="min-width:220px"/>
+      </label>
+      <button id="btnConfirm" type="button">CONFIRMER DÉPÔT (scan on-chain)</button>
+      <span id="depMsg"></span>
+    </div>
+    <small>Après confirmation, START WOLVERINE devient cliquable.</small>
+  </div>
 
-const BOT_PUB=new PublicKey(process.env.BOT_PUB);
-const USDC_MINT=new PublicKey(process.env.USDC_MINT);
-const RPC_URL=process.env.RPC_URL;
-const LEDGER_FILE=process.env.LEDGER_FILE;
-const API_PORT=Number(process.env.API_PORT||3002);
+  <div class="row" style="margin-top:10px">
+    <button id="btnStart" type="button" disabled>START WOLVERINE</button>
+    <span id="startMsg"></span>
+  </div>
 
-const conn=new Connection(RPC_URL,"confirmed");
-const app=express();
-app.use(express.json({limit:"256kb"}));
+  <hr>
 
-const n=x=>{const v=Number(x);return Number.isFinite(v)?v:0;};
-const now=()=>Date.now();
+  <div><b>Dernier dépôt détecté</b> : <span id="lastDep" class="mono">—</span></div>
+</div>
 
-function readLedger(){try{return JSON.parse(fs.readFileSync(LEDGER_FILE,"utf8")||"{}")}catch{return {users:{},deposits_seen:{}}}}
-function writeLedger(L){fs.writeFileSync(LEDGER_FILE,JSON.stringify(L,null,2));}
-function botUsdcAta(){ return spl.getAssociatedTokenAddressSync(USDC_MINT,BOT_PUB,false); }
-
-function matchSolDeposit(tx,fromPub,minSol){
-  if(!tx||tx.meta?.err) return null;
-  const ix=tx.transaction?.message?.instructions||[];
-  for(const it of ix){
-    if(it?.program==="system"&&it?.parsed?.type==="transfer"){
-      const info=it.parsed.info||{};
-      if(info.source===fromPub && info.destination===BOT_PUB.toBase58()){
-        const sol=n(info.lamports)/1e9;
-        if(sol+1e-12>=minSol) return {sig:tx.transaction.signatures?.[0],amount:sol};
-      }
-    }
-  }
-  return null;
-}
-function matchUsdcDeposit(tx,fromPub,minUsdc){
-  if(!tx||tx.meta?.err) return null;
-  const dstAta=botUsdcAta().toBase58();
-  const ix=tx.transaction?.message?.instructions||[];
-  for(const it of ix){
-    if(it?.program==="spl-token" && it?.parsed){
-      const info=it.parsed.info||{};
-      const dst=info.destination;
-      if(dst===dstAta){
-        let ui=0;
-        if(info.tokenAmount && info.tokenAmount.uiAmount!=null) ui=n(info.tokenAmount.uiAmount);
-        else if(info.amount) ui=n(info.amount)/1e6;
-        const auth=info.authority||"";
-        if(auth===fromPub && ui+1e-12>=minUsdc) return {sig:tx.transaction.signatures?.[0],amount:ui};
-      }
-    }
-  }
-  return null;
-}
-async function scanDeposit(pub,asset,amount){
-  const fromPub=new PublicKey(pub).toBase58();
-  const L=readLedger();
-  if(!L.users) L.users={};
-  if(!L.deposits_seen) L.deposits_seen={};
-
-  const target=(asset==="USDC")?botUsdcAta():BOT_PUB;
-  const sigs=await conn.getSignaturesForAddress(target,{limit:50});
-  for(const s of sigs){
-    const sig=s.signature;
-    if(!sig||L.deposits_seen[sig]) continue;
-    const tx=await conn.getParsedTransaction(sig,{maxSupportedTransactionVersion:0,commitment:"confirmed"});
-    const hit=(asset==="SOL")?matchSolDeposit(tx,fromPub,amount):matchUsdcDeposit(tx,fromPub,amount);
-    if(hit&&hit.sig){
-      L.deposits_seen[hit.sig]={at:now(),pub:fromPub,asset,amount:hit.amount};
-      if(!L.users[fromPub]) L.users[fromPub]={mode:"AUTO",last_deposit:null};
-      L.users[fromPub].last_deposit={sig:hit.sig,asset,amount:hit.amount,at:now()};
-      writeLedger(L);
-      return {ok:true,sig:hit.sig,amount:hit.amount};
-    }
-  }
-  writeLedger(L);
-  return {ok:false};
-}
-
-app.get("/wolverine/api/health",(_req,res)=>res.json({ok:true}));
-app.get("/wolverine/api/wolv_state",(req,res)=>{
-  const pub=String(req.query.pub||"");
-  const L=readLedger();
-  const u=(pub && L.users && L.users[pub])?L.users[pub]:{mode:"AUTO",last_deposit:null};
-  res.json({ok:true,bot_pub:BOT_PUB.toBase58(),bot_usdc_ata:botUsdcAta().toBase58(),user:u});
-});
-app.post("/wolverine/api/wolv_set_mode",(req,res)=>{
-  const pub=String(req.body?.pub||"");
-  const mode=String(req.body?.mode||"AUTO").toUpperCase().slice(0,24);
-  if(!pub) return res.status(400).json({ok:false,err:"bad_params"});
-  const L=readLedger(); if(!L.users) L.users={};
-  if(!L.users[pub]) L.users[pub]={mode:"AUTO",last_deposit:null};
-  L.users[pub].mode=mode; writeLedger(L);
-  res.json({ok:true,mode});
-});
-app.post("/wolverine/api/wolv_confirm_deposit",async(req,res)=>{
-  try{
-    const pub=String(req.body?.pub||"");
-    const asset=String(req.body?.asset||"USDC").toUpperCase();
-    const amount=n(req.body?.amount);
-    if(!pub||!["SOL","USDC"].includes(asset)||!(amount>0)) return res.status(400).json({ok:false,err:"bad_params"});
-    const out=await scanDeposit(pub,asset,amount);
-    res.json(out);
-  }catch(e){
-    res.status(500).json({ok:false,err:String(e&&e.message?e.message:e)});
-  }
-});
-
-// proxy vers ton backend existant (127.0.0.1:3000) pour start etc
-app.use("/wolverine/api/",async(req,res)=>{
-  try{
-    const sub=req.originalUrl.replace(/^\/wolverine\/api\//,"");
-    const url=`http://127.0.0.1:3000/api/${sub}`;
-    const headers={...req.headers}; delete headers.host;
-    const body=(req.method==="GET"||req.method==="HEAD")?undefined:JSON.stringify(req.body??{});
-    const r=await fetch(url,{method:req.method,headers:{...headers,"content-type":"application/json"},body});
-    const txt=await r.text();
-    res.status(r.status);
-    try{res.json(JSON.parse(txt));}catch{res.type("text/plain").send(txt);}
-  }catch(e){
-    res.status(502).json({ok:false,err:"proxy_fail",detail:String(e&&e.message?e.message:e)});
-  }
-});
-
-app.listen(API_PORT,"127.0.0.1",()=>console.log("wolverine-api 127.0.0.1:"+API_PORT));
-JS
-
-cat >/etc/systemd/system/wolverine-api.service <<EOF
-[Unit]
-Description=Wolverine API (force-min v2)
-After=network.target
-
-[Service]
-Type=simple
-WorkingDirectory=$API_DIR
-Environment=BOT_PUB=$BOT_PUB
-Environment=USDC_MINT=$USDC_MINT
-Environment=RPC_URL=$RPC_URL
-Environment=API_PORT=$API_PORT
-Environment=LEDGER_FILE=$LEDGER_FILE
-ExecStart=/usr/bin/node $API_DIR/server.js
-Restart=always
-RestartSec=1
-User=root
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl daemon-reload
-systemctl enable --now wolverine-api.service
-systemctl restart wolverine-api.service
-
-# 2) Nginx: force location ^~ /wolverine/api/ BEFORE spa try_files
-chattr -i "$VHOST" 2>/dev/null || true
-chattr -i "$NGINX_MAIN" 2>/dev/null || true
-
-python3 - <<PY
-import re,sys
-vhost="$VHOST"
-s=open(vhost,"r",encoding="utf-8",errors="ignore").read()
-
-marker="# WOLV_API_PROXY_FORCE_V2"
-block=f"""
-    {marker}
-    location ^~ /wolverine/api/ {{
-        proxy_pass http://127.0.0.1:{API_PORT};
-        proxy_http_version 1.1;
-        proxy_set_header Host \\$host;
-        proxy_set_header X-Real-IP \\$remote_addr;
-        proxy_set_header X-Forwarded-For \\$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \\$scheme;
-        proxy_read_timeout 60s;
-    }}
-"""
-if marker in s:
-    print("OK nginx proxy déjà présent"); sys.exit(0)
-
-starts=[m.start() for m in re.finditer(r'(?m)^\\s*server\\s*\\{',s)]
-if not starts: raise SystemExit("ERR: aucun server{} dans vhost")
-start=starts[-1]
-i=start; depth=0; opened=False
-while i<len(s):
-    c=s[i]
-    if c=='{': depth+=1; opened=True
-    elif c=='}' and opened:
-        depth-=1
-        if depth==0:
-            end=i+1
-            blk=s[start:end]
-            out=s[:start]+blk[:-1]+block+"\\n}"+s[end:]
-            open(vhost,"w",encoding="utf-8").write(out)
-            print("OK nginx proxy ajouté"); sys.exit(0)
-    i+=1
-raise SystemExit("ERR: fin server{} introuvable")
-PY
-
-nginx -t
-systemctl reload nginx
-chattr +i "$VHOST" 2>/dev/null || true
-chattr +i "$NGINX_MAIN" 2>/dev/null || true
-
-# 3) Front FORCE: inject a patch that HIDES/REMOVES everything except our single panel
-PATCH_JS=$(cat <<'JS'
+<script>
 (()=>{"use strict";
-const BOT="e8DbBrTJxRetx3HNFb83CsXMySETydHVLwxMzkjcVqh";
-const $=s=>document.querySelector(s);
-const ce=t=>document.createElement(t);
-const txt=el=>((el&&el.innerText)||"").trim();
-
-const addGlobalHide=()=>{
-  if($("#wolvForceStyle")) return;
-  const st=ce("style"); st.id="wolvForceStyle";
-  st.textContent=`
-  body>*:not(#wolvForceRoot){display:none!important;}
-  #wolvForceRoot,*[data-wolv-keep]{display:block!important;}
-  #wolvForceRoot *{display:initial!important;}
-  `;
-  document.head.appendChild(st);
-};
-
-const getPub=async()=>{
-  try{
-    if(!window.solana||!window.solana.isPhantom) return "";
-    if(window.solana.publicKey) return window.solana.publicKey.toBase58();
-    const r=await window.solana.connect();
-    return r&&r.publicKey?r.publicKey.toBase58():"";
-  }catch{return "";}
-};
-
-const apiPost=async(path,obj)=>{
-  const r=await fetch(path,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(obj||{})});
+const BOT="$BOT_PUB";
+const \$=s=>document.querySelector(s);
+const setMsg=(el,txt,ok)=>{el.textContent=txt||"";el.className=ok?"ok":"bad";};
+const jpost=async(url,obj)=>{
+  const r=await fetch(url,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(obj||{})});
   const t=await r.text(); let j=null; try{j=JSON.parse(t)}catch{}
   if(!r.ok) throw new Error((j&&j.err)||t||("HTTP "+r.status));
   return j||{};
 };
-const apiGet=async(url)=>{
+const jget=async(url)=>{
   const r=await fetch(url,{method:"GET"});
   const t=await r.text(); let j=null; try{j=JSON.parse(t)}catch{}
   if(!r.ok) throw new Error((j&&j.err)||t||("HTTP "+r.status));
   return j||{};
 };
-
-const build=async()=>{
-  addGlobalHide();
-
-  let root=$("#wolvForceRoot");
-  if(!root){
-    root=ce("div"); root.id="wolvForceRoot";
-    root.style.maxWidth="980px";
-    root.style.margin="12px";
-    root.style.border="1px solid #bbb";
-    root.style.borderRadius="12px";
-    root.style.padding="12px";
-    root.innerHTML=`
-      <div style="font-weight:800;font-size:26px;margin-bottom:10px">WOLVERINE</div>
-
-      <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
-        <button id="wfConnect" type="button">Connect Wallet (Phantom)</button>
-        <span id="wfPub" style="font-family:monospace;font-size:12px">—</span>
-      </div>
-
-      <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:10px 0">
-        <div style="font-weight:700">Mode</div>
-        <select id="wfMode">
-          <option value="AUTO">AUTO</option>
-          <option value="SAFE">SAFE</option>
-          <option value="AGRESSIF">AGRESSIF</option>
-          <option value="DCA">DCA</option>
-          <option value="SCALP">SCALP</option>
-        </select>
-        <button id="wfSaveMode" type="button">Sauver</button>
-        <span id="wfModeMsg"></span>
-      </div>
-
-      <div style="border-top:1px solid #ddd;padding-top:10px;margin-top:10px">
-        <div style="font-weight:700;margin-bottom:6px">Dépôt manuel</div>
-        <div style="margin-bottom:6px">Envoie depuis ton Phantom vers TraderOne (bot) :</div>
-        <div style="font-family:monospace;font-size:12px;margin-bottom:10px">${BOT}</div>
-        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-          <select id="wfAsset"><option value="USDC">USDC</option><option value="SOL">SOL</option></select>
-          <input id="wfAmt" placeholder="Montant (ex: 1 ou 0.1)" style="min-width:220px"/>
-          <button id="wfConfirm" type="button">CONFIRMER DÉPÔT (scan on-chain)</button>
-          <span id="wfDepMsg" style="margin-left:8px"></span>
-        </div>
-        <div style="margin-top:10px">
-          <button id="wfStart" type="button" disabled>START WOLVERINE</button>
-          <span id="wfStartMsg" style="margin-left:8px"></span>
-        </div>
-      </div>
-    `;
-    document.body.prepend(root);
-  }
-
-  const depMsg=(m,ok)=>{const el=$("#wfDepMsg");el.textContent=m;el.style.color=ok?"#060":"#a00";};
-  const startMsg=(m,ok)=>{const el=$("#wfStartMsg");el.textContent=m;el.style.color=ok?"#060":"#a00";};
-
-  const refresh=async()=>{
-    const pub=await getPub();
-    $("#wfPub").textContent=pub?pub:"Non connecté";
-    if(!pub) return;
-    const st=await apiGet("/wolverine/api/wolv_state?pub="+encodeURIComponent(pub));
-    $("#wfMode").value=(st.user&&st.user.mode)||"AUTO";
-    const ld=st.user&&st.user.last_deposit;
-    if(ld&&ld.sig){
-      depMsg("Dernier dépôt: "+ld.asset+" "+Number(ld.amount||0)+" (sig "+ld.sig+")", true);
-      $("#wfStart").disabled=false;
-    }
-  };
-
-  $("#wfConnect").onclick=async()=>{await refresh().catch(()=>{});};
-
-  $("#wfSaveMode").onclick=async()=>{
-    try{
-      $("#wfModeMsg").textContent="";
-      const pub=await getPub(); if(!pub){$("#wfModeMsg").textContent="Connecte Phantom."; return;}
-      await apiPost("/wolverine/api/wolv_set_mode",{pub,mode:$("#wfMode").value});
-      $("#wfModeMsg").textContent="OK";
-    }catch{ $("#wfModeMsg").textContent="ERR"; }
-  };
-
-  $("#wfConfirm").onclick=async()=>{
-    try{
-      depMsg("",false);
-      const pub=await getPub(); if(!pub){depMsg("Connecte Phantom.",false); return;}
-      const a=$("#wfAsset").value;
-      const amt=Number($("#wfAmt").value||0);
-      if(!(amt>0)){depMsg("Montant invalide.",false); return;}
-      depMsg("Scan...",false);
-      const out=await apiPost("/wolverine/api/wolv_confirm_deposit",{pub,asset:a,amount:amt});
-      if(out&&out.ok){
-        depMsg("OK (sig "+out.sig+")", true);
-        $("#wfStart").disabled=false;
-      }else{
-        depMsg("Rien trouvé (attends la confirmation puis réessaie).", false);
-      }
-    }catch(e){
-      depMsg("ERR: "+String(e&&e.message?e.message:e), false);
-    }
-  };
-
-  $("#wfStart").onclick=async()=>{
-    try{
-      startMsg("",false);
-      const pub=await getPub(); if(!pub){startMsg("Connecte Phantom.",false); return;}
-      // on appelle ton backend existant via proxy: POST /wolverine/api/start -> 127.0.0.1:3000/api/start
-      await apiPost("/wolverine/api/start",{pub});
-      startMsg("OK", true);
-    }catch(e){
-      startMsg("ERR: "+String(e&&e.message?e.message:e), false);
-    }
-  };
-
-  await refresh().catch(()=>{});
+const getPub=async()=>{
+  if(!window.solana||!window.solana.isPhantom) throw new Error("Phantom non détecté");
+  if(window.solana.publicKey) return window.solana.publicKey.toBase58();
+  const r=await window.solana.connect();
+  return r&&r.publicKey?r.publicKey.toBase58():"";
 };
 
-document.addEventListener("DOMContentLoaded",()=>{build().catch(()=>{});});
-setTimeout(()=>{build().catch(()=>{});},600);
+async function refreshState(){
+  const pub=$("#pub").textContent;
+  if(!pub||pub==="—") return;
+  const st=await jget("/wolverine/api/wolv_state?pub="+encodeURIComponent(pub));
+  if(st && st.user){
+    $("#mode").value=(st.user.mode||"SAFE");
+    const ld=st.user.last_deposit;
+    if(ld && ld.sig){
+      $("#lastDep").textContent=\`\${ld.asset} \${ld.amount} | \${ld.sig}\`;
+      $("#btnStart").disabled=false;
+    } else {
+      $("#lastDep").textContent="—";
+    }
+  }
+}
+
+$("#btnConnect").onclick=async()=>{
+  try{
+    const pub=await getPub();
+    $("#pub").textContent=pub;
+    await refreshState();
+  }catch(e){ alert(String(e&&e.message?e.message:e)); }
+};
+
+$("#btnMode").onclick=async()=>{
+  try{
+    const pub=await getPub(); $("#pub").textContent=pub;
+    setMsg($("#modeMsg"),"Sauvegarde...",false);
+    await jpost("/wolverine/api/wolv_set_mode",{pub,mode:$("#mode").value});
+    setMsg($("#modeMsg"),"OK",true);
+  }catch(e){ setMsg($("#modeMsg"),"ERR: "+String(e&&e.message?e.message:e),false); }
+};
+
+$("#btnConfirm").onclick=async()=>{
+  try{
+    const pub=await getPub(); $("#pub").textContent=pub;
+    const asset=$("#asset").value;
+    const amt=Number($("#amount").value||0);
+    if(!(amt>0)) return setMsg($("#depMsg"),"Montant invalide",false);
+    setMsg($("#depMsg"),"Scan...",false);
+    const out=await jpost("/wolverine/api/wolv_confirm_deposit",{pub,asset,amount:amt});
+    if(out && out.ok){
+      setMsg($("#depMsg"),"OK: "+out.sig,true);
+      $("#btnStart").disabled=false;
+      await refreshState();
+    } else {
+      setMsg($("#depMsg"),"Rien trouvé (attends confirmation puis réessaie)",false);
+    }
+  }catch(e){ setMsg($("#depMsg"),"ERR: "+String(e&&e.message?e.message:e),false); }
+};
+
+$("#btnStart").onclick=async()=>{
+  try{
+    const pub=await getPub(); $("#pub").textContent=pub;
+    setMsg($("#startMsg"),"Start...",false);
+    await jpost("/wolverine/api/start",{pub});
+    setMsg($("#startMsg"),"OK",true);
+  }catch(e){ setMsg($("#startMsg"),"ERR: "+String(e&&e.message?e.message:e),false); }
+};
+
 })();
-JS
-)
+</script>
+</body></html>
+HTML
 
-# find ALL wolverine patches dirs, create if needed
-mapfile -t PATCH_DIRS < <(find /opt/fireinners /var/www /usr/share/nginx /srv -type d -path "*wolverine*patches*" 2>/dev/null | head -n 20 || true)
-if [ "${#PATCH_DIRS[@]}" -eq 0 ]; then
-  # fallback: create common
-  mkdir -p "/opt/fireinners/frontend-react/app/dist/wolverine/patches"
-  PATCH_DIRS=("/opt/fireinners/frontend-react/app/dist/wolverine/patches")
-fi
+chmod 644 "$INDEX" 2>/dev/null || true
 
-for d in "${PATCH_DIRS[@]}"; do
-  mkdir -p "$d"
-  printf "%s\n" "$PATCH_JS" >"$d/$PATCH_NAME"
-done
+nginx -t >/dev/null 2>&1 && systemctl reload nginx || true
 
-# patch ALL candidate index.html that contains "WOLVERINE" or "START WOLVERINE"
-mapfile -t IDX < <(grep -RIl --include="index.html" -e "START WOLVERINE" -e "<title>WOLVERINE" /opt/fireinners /var/www /usr/share/nginx /srv 2>/dev/null | head -n 30 || true)
-
-for f in "${IDX[@]}"; do
-  cp -a "$f" "$f.bak.$TS" 2>/dev/null || true
-  python3 - <<PY
-import re
-p=r"$f"
-s=open(p,"r",encoding="utf-8",errors="ignore").read()
-# remove ANY old patches includes
-s=re.sub(r'\\s*<script\\s+[^>]*src="\\/wolverine\\/patches\\/[^"]+"[^>]*><\\/script>\\s*','\\n',s,flags=re.I)
-# add our force patch + cache buster
-tag=f'<script src="/wolverine/patches/{PATCH_NAME}?v={TS}"></script>'
-if tag not in s:
-  if "</body>" in s: s=s.replace("</body>", tag+"\\n</body>")
-  else: s+="\\n"+tag+"\\n"
-# hard no-cache meta (helps)
-if "<meta http-equiv=\"Cache-Control\"" not in s:
-  s=s.replace("<head>","<head>\\n<meta http-equiv=\\"Cache-Control\\" content=\\"no-store\\"/>\\n<meta http-equiv=\\"Pragma\\" content=\\"no-cache\\"/>\\n<meta http-equiv=\\"Expires\\" content=\\"0\\"/>\\n",1)
-open(p,"w",encoding="utf-8").write(s)
-print("OK patched:",p)
-PY
-done
-
-echo "OK FORCE MIN V2 installé."
-echo "Recharge: https://fireinners.online/wolverine/?v=$TS puis Ctrl+F5"
+echo "OK UI MIN installé: $INDEX"
+echo "Ouvre: https://fireinners.online/wolverine/?v=$TS puis Ctrl+F5"
 BASH
 
-bash /root/WOLV_FORCE_MIN_V2.sh
+bash /root/WOLV_MIN_UI_ONLY.sh
