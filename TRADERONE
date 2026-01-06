@@ -1,60 +1,180 @@
-cat >/root/WOLV_FIND_SIGNER_PORT_STRONG.sh <<'BASH'
+cat >/root/WOLV_ENABLE_EXECUTE_API3002_SIGNER8484.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "=== qplus-signer.service details ==="
-systemctl is-active --quiet qplus-signer.service && echo "ACTIVE ✅" || echo "NOT ACTIVE ❌"
-systemctl show qplus-signer.service -p MainPID -p WorkingDirectory -p ExecStart --no-pager
-echo
+API_PORT=3002
+SIGNER_PORT=8484
+RPC_DEFAULT="https://api.mainnet-beta.solana.com"
 
-MPID="$(systemctl show -p MainPID --value qplus-signer.service 2>/dev/null || true)"
-WD="$(systemctl show -p WorkingDirectory --value qplus-signer.service 2>/dev/null || true)"
-EXE="$(systemctl show -p ExecStart --value qplus-signer.service 2>/dev/null || true)"
-echo "MainPID=$MPID"
-echo "WD=${WD:-unknown}"
-echo "ExecStart=${EXE:-unknown}"
-echo
+echo "=== Find node PID listening on :$API_PORT ==="
+PID="$(ss -lptn 2>/dev/null | awk -v P=":$API_PORT" '
+  $0 ~ /LISTEN/ && $0 ~ P && $0 ~ /users:\(\("node"/ {
+    match($0, /pid=[0-9]+/); if(RLENGTH){ print substr($0,RSTART+4,RLENGTH-4); exit }
+  }')"
+[ -n "${PID:-}" ] || { echo "ERR: aucun node n'écoute sur :$API_PORT"; exit 1; }
 
-echo "=== Listening sockets for MainPID (ss) ==="
-if [ -n "${MPID:-}" ] && [ "$MPID" != "0" ]; then
-  ss -lptn 2>/dev/null | grep -F "pid=$MPID" || true
-else
-  echo "No MainPID (0) -> service may be Type=oneshot or wrapper"
-fi
-echo
+BACK_DIR="$(readlink -f /proc/$PID/cwd || true)"
+[ -d "$BACK_DIR" ] || { echo "ERR: backend cwd introuvable"; exit 1; }
+echo "BACK_DIR=$BACK_DIR"
 
-echo "=== lsof network for MainPID ==="
-if command -v lsof >/dev/null 2>&1 && [ -n "${MPID:-}" ] && [ "$MPID" != "0" ]; then
-  lsof -Pan -p "$MPID" -i 2>/dev/null || true
-else
-  echo "lsof missing or MainPID=0"
-fi
-echo
+TS="$(date +%s)"
+mkdir -p /root/wolv_backups "$BACK_DIR/routes"
+SWAP="$BACK_DIR/routes/swap.routes.js"
+[ -f "$SWAP" ] && cp -a "$SWAP" "/root/wolv_backups/swap.routes.js.$TS.bak" || true
 
-echo "=== Guess port from ExecStart (common flags) ==="
-PORT_FROM_EXEC=""
-if echo "$EXE" | grep -Eoq '(--port|PORT=|:)[0-9]{2,5}'; then
-  PORT_FROM_EXEC="$(echo "$EXE" | grep -Eo '([0-9]{2,5})' | tail -n1 || true)"
-fi
-echo "PORT_FROM_EXEC=${PORT_FROM_EXEC:-none}"
-echo
+echo "=== Patch swap.routes.js: add /execute using qplus-signer ==="
+cat >"$SWAP" <<JS
+const express = require("express");
+const router = express.Router();
 
-echo "=== Scan common signer ports for /health or / ==="
-FOUND=""
-for p in ${PORT_FROM_EXEC:-} 8787 8788 9000 9010 5001 4001 3003 3333; do
-  [ -n "$p" ] || continue
-  if curl -sS --max-time 1 "http://127.0.0.1:$p/health" >/dev/null 2>&1 || \
-     curl -sS --max-time 1 "http://127.0.0.1:$p/" >/dev/null 2>&1; then
-    FOUND="$p"; break
-  fi
+const JUP_QUOTE = "https://quote-api.jup.ag/v6/quote";
+const JUP_SWAP  = "https://quote-api.jup.ag/v6/swap";
+
+const SIGNER_URL = "http://127.0.0.1:${SIGNER_PORT}";
+const RPC = process.env.SOLANA_RPC || "${RPC_DEFAULT}";
+
+async function rpc(method, params){
+  const r = await fetch(RPC, {
+    method:"POST",
+    headers:{ "content-type":"application/json" },
+    body: JSON.stringify({ jsonrpc:"2.0", id:1, method, params })
+  });
+  const j = await r.json();
+  if(j.error) throw new Error(j.error.message || JSON.stringify(j.error));
+  return j.result;
+}
+
+async function confirm(sig, timeoutMs=90000){
+  const start = Date.now();
+  while(Date.now() - start < timeoutMs){
+    const st = await rpc("getSignatureStatuses", [[sig], { searchTransactionHistory:true }]);
+    const v = st?.value?.[0];
+    if(v && (v.confirmationStatus === "confirmed" || v.confirmationStatus === "finalized")) return v;
+    await new Promise(r=>setTimeout(r, 1200));
+  }
+  throw new Error("confirm timeout");
+}
+
+router.get("/quote", async (req,res)=>{
+  try{
+    const { inputMint, outputMint, amount, slippageBps } = req.query;
+    if(!inputMint || !outputMint || !amount) return res.status(400).send("missing params");
+    const u = new URL(JUP_QUOTE);
+    u.searchParams.set("inputMint", String(inputMint));
+    u.searchParams.set("outputMint", String(outputMint));
+    u.searchParams.set("amount", String(amount));
+    u.searchParams.set("slippageBps", String(slippageBps || 50));
+    const r = await fetch(u);
+    const t = await r.text();
+    if(!r.ok) return res.status(r.status).send(t);
+    res.type("application/json").send(t);
+  }catch(e){ res.status(500).send(e?.message || String(e)); }
+});
+
+router.post("/tx", async (req,res)=>{
+  try{
+    const { userPublicKey, quoteResponse, wrapAndUnwrapSol } = req.body || {};
+    if(!userPublicKey || !quoteResponse) return res.status(400).send("missing userPublicKey/quoteResponse");
+    const r = await fetch(JUP_SWAP, {
+      method:"POST",
+      headers:{ "content-type":"application/json" },
+      body: JSON.stringify({ quoteResponse, userPublicKey, wrapAndUnwrapSol: !!wrapAndUnwrapSol })
+    });
+    const t = await r.text();
+    if(!r.ok) return res.status(r.status).send(t);
+    res.type("application/json").send(t);
+  }catch(e){ res.status(500).send(e?.message || String(e)); }
+});
+
+// SERVER EXECUTE: quoteResponse -> swapTx -> signer -> send -> confirm
+router.post("/execute", async (req,res)=>{
+  try{
+    const { userPublicKey, quoteResponse, wrapAndUnwrapSol } = req.body || {};
+    if(!userPublicKey || !quoteResponse) return res.status(400).send("missing userPublicKey/quoteResponse");
+
+    const r1 = await fetch(JUP_SWAP, {
+      method:"POST",
+      headers:{ "content-type":"application/json" },
+      body: JSON.stringify({ quoteResponse, userPublicKey, wrapAndUnwrapSol: !!wrapAndUnwrapSol })
+    });
+    const j1 = await r1.json().catch(()=>null);
+    if(!r1.ok) return res.status(r1.status).send(JSON.stringify(j1 || {error:"swap api error"}));
+    const swapTransaction = j1?.swapTransaction;
+    if(!swapTransaction) return res.status(500).send("missing swapTransaction from Jupiter");
+
+    // signer-service endpoints candidates (qplus-signer)
+    const payload = { transaction: swapTransaction, encoding:"base64" };
+    const eps = ["/sign", "/api/sign", "/tx/sign", "/v1/sign", "/signTransaction", "/sign-transaction"];
+    let signedTxB64 = "", lastErr = "";
+
+    for(const ep of eps){
+      try{
+        const rs = await fetch(SIGNER_URL + ep, {
+          method:"POST",
+          headers:{ "content-type":"application/json" },
+          body: JSON.stringify(payload)
+        });
+        const txt = await rs.text();
+        if(!rs.ok){ lastErr = ep + " -> " + txt; continue; }
+        const js = JSON.parse(txt);
+        signedTxB64 = js.signedTransaction || js.signed || js.tx || js.transaction || "";
+        if(signedTxB64) break;
+        lastErr = ep + " -> " + txt;
+      }catch(e){ lastErr = ep + " -> " + (e?.message||String(e)); }
+    }
+
+    if(!signedTxB64) return res.status(500).send("signer-service failed. lastErr=" + lastErr);
+
+    const sig = await rpc("sendTransaction", [signedTxB64, { encoding:"base64", skipPreflight:false, maxRetries:3 }]);
+    await confirm(sig, 90000);
+    res.json({ ok:true, signature:sig });
+  }catch(e){ res.status(500).send(e?.message || String(e)); }
+});
+
+module.exports = router;
+JS
+
+echo "=== Ensure express entry has app.use('/api/swap', swapRoutes) ==="
+ENTRY=""
+for f in server.js app.js index.js main.js src/server.js src/app.js src/index.js; do
+  if [ -f "$BACK_DIR/$f" ]; then ENTRY="$BACK_DIR/$f"; break; fi
 done
-echo "SIGNER_PORT=${FOUND:-NOT_FOUND}"
-echo
+[ -n "$ENTRY" ] || { echo "ERR: entry express introuvable"; exit 1; }
+cp -a "$ENTRY" "/root/wolv_backups/backend_entry.$TS.bak"
 
-echo "=== If still NOT_FOUND, show last logs ==="
-if [ -z "${FOUND:-}" ]; then
-  journalctl -u qplus-signer.service -n 80 --no-pager || true
+if ! grep -q "swapRoutes" "$ENTRY"; then
+  perl -0777 -i -pe '
+    my $s=$_;
+    $s = "const swapRoutes = require(\".\/routes\/swap.routes\");\n".$s if $s !~ /swapRoutes/;
+    $_=$s;
+  ' "$ENTRY"
 fi
+if ! grep -q 'app.use("/api/swap"' "$ENTRY"; then
+  echo 'app.use("/api/swap", swapRoutes);' >> "$ENTRY"
+fi
+
+echo "=== Restart service that owns port :$API_PORT (best effort) ==="
+# Try match by WorkingDirectory
+SERVICE=""
+while read -r s; do
+  wd="$(systemctl show -p WorkingDirectory --value "$s" 2>/dev/null || true)"
+  if [ -n "$wd" ] && [ "$(readlink -f "$wd" 2>/dev/null || true)" = "$BACK_DIR" ]; then
+    SERVICE="$s"; break
+  fi
+done < <(systemctl list-units --type=service --state=running --no-pager 2>/dev/null | awk '{print $1}' | grep -E '\.service$' || true)
+
+if [ -n "$SERVICE" ]; then
+  systemctl restart "$SERVICE"
+  echo "Restarted: $SERVICE"
+else
+  kill -HUP "$PID" || true
+  echo "HUP sent to PID $PID"
+fi
+
+echo "=== Quick check: route exists ==="
+curl -sS -X POST "http://127.0.0.1:$API_PORT/api/swap/execute" -H "content-type: application/json" -d '{}' | head -c 200 || true
+echo
+echo "DONE ✅"
 BASH
 
-bash /root/WOLV_FIND_SIGNER_PORT_STRONG.sh
+bash /root/WOLV_ENABLE_EXECUTE_API3002_SIGNER8484.sh
