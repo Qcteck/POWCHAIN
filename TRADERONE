@@ -1,3 +1,43 @@
-WORKER_URL="https://TON-VRAI-WORKER.workers.dev"
-getent hosts "$(echo "$WORKER_URL" | sed -E 's#https?://##; s#/.*##')" || true
+cat >/root/WOLV_PATCH_SWAP_TO_CF_WORKER_FIXED.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
 
+WORKER_URL="https://TON-VRAI-WORKER.workers.dev"   # <-- mets TON URL
+RELAY_TOKEN="TON_VRAI_TOKEN"                        # <-- mets TON TOKEN
+SWAP="/opt/wolverine-api/routes/swap.routes.js"
+
+if [[ "$WORKER_URL" == *"XXX.workers.dev"* || "$WORKER_URL" == *"TON-WORKER"* ]]; then
+  echo "ERR: WORKER_URL est un placeholder. Mets l'URL réelle du worker."
+  exit 1
+fi
+
+HOST="$(echo "$WORKER_URL" | sed -E 's#https?://##; s#/.*##')"
+echo "DNS check: $HOST"
+getent hosts "$HOST" >/dev/null || { echo "ERR: DNS ne résout pas $HOST"; exit 1; }
+
+[ -f "$SWAP" ] || { echo "ERR: $SWAP introuvable"; exit 1; }
+
+mkdir -p /root/wolv_backups
+cp -a "$SWAP" "/root/wolv_backups/swap.routes.js.$(date +%s).bak" || true
+
+# 1) remplace les endpoints
+sed -i -E \
+  "s#const JUP_QUOTE = \".*\";#const JUP_QUOTE = \"${WORKER_URL}/quote\";#g; \
+   s#const JUP_SWAP  = \".*\";#const JUP_SWAP  = \"${WORKER_URL}/swap\";#g" \
+  "$SWAP"
+
+# 2) injecte le header token dans curlJson() (si pas déjà présent)
+perl -0777 -i -pe '
+  my $tok = $ENV{"RELAY_TOKEN"} // "";
+  if($tok eq "") { die "RELAY_TOKEN missing\n"; }
+
+  if($_ !~ /x-relay-token:/){
+    s/\[\s*"-sS"/["-sS","-H","x-relay-token: ".$tok]/s;
+  }
+' "$SWAP" RELAY_TOKEN="$RELAY_TOKEN"
+
+systemctl restart wolverine-api.service
+echo "OK ✅ swap.routes.js -> Cloudflare Worker + token"
+BASH
+
+bash /root/WOLV_PATCH_SWAP_TO_CF_WORKER_FIXED.sh
