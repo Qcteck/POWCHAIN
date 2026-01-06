@@ -1,284 +1,38 @@
-cat >/root/WOLV_ENABLE_WOLFSWAP_BACKGROUND_EXECUTE.sh <<'BASH'
+cat >/root/WOLV_REMOVE_AMCQ.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-API_PORT=3000
-RPC_DEFAULT="https://api.mainnet-beta.solana.com"
-
-echo "=== Find backend listening on :$API_PORT ==="
-PID="$(ss -lptn 2>/dev/null | awk -v P=":$API_PORT" '
-  $0 ~ /LISTEN/ && $0 ~ P && $0 ~ /users:\(\("node"/ {
-    match($0, /pid=[0-9]+/); if(RLENGTH){ print substr($0,RSTART+4,RLENGTH-4); exit }
-  }')"
-[ -n "${PID:-}" ] || { echo "ERR: aucun node n'écoute sur :$API_PORT"; exit 1; }
-
-BACK_DIR="$(readlink -f /proc/$PID/cwd || true)"
-[ -d "$BACK_DIR" ] || { echo "ERR: backend cwd introuvable"; exit 1; }
-echo "BACK_DIR=$BACK_DIR"
-
-echo "=== Detect qplus-signer port (by systemd cwd /root/qplus-secure) ==="
-SIGNER_WD="$(systemctl show -p WorkingDirectory --value qplus-signer.service 2>/dev/null || true)"
-SIGNER_WD="${SIGNER_WD:-/root/qplus-secure}"
-SIGNER_PORT=""
-
-# Find node PID whose cwd == SIGNER_WD and grab its listening port(s)
-while read -r line; do
-  spid="$(echo "$line" | sed -E 's/.*pid=([0-9]+).*/\1/')"
-  [ -n "$spid" ] || continue
-  cwd="$(readlink -f /proc/$spid/cwd 2>/dev/null || true)"
-  if [ -n "$cwd" ] && [ "$cwd" = "$(readlink -f "$SIGNER_WD" 2>/dev/null || echo "$SIGNER_WD")" ]; then
-    # extract port from local addr col4
-    port="$(echo "$line" | awk '{print $4}' | sed -E 's/.*:([0-9]+)$/\1/')"
-    if [ -n "$port" ]; then SIGNER_PORT="$port"; break; fi
-  fi
-done < <(ss -lptn 2>/dev/null | grep -E 'LISTEN' | grep -E 'users:\(\("node"' || true)
-
-if [ -z "$SIGNER_PORT" ]; then
-  # fallback: scan common signer ports
-  for p in 8787 8788 9000 9010 5001 4001; do
-    if curl -sS --max-time 1 "http://127.0.0.1:$p/health" >/dev/null 2>&1 || \
-       curl -sS --max-time 1 "http://127.0.0.1:$p/" >/dev/null 2>&1; then
-      SIGNER_PORT="$p"; break
-    fi
-  done
-fi
-
-[ -n "$SIGNER_PORT" ] || {
-  echo "ERR: impossible de détecter le port du signer-service (qplus-signer)."
-  echo "Fais: ss -lptn | grep node  et envoie-moi la ligne du process dans /root/qplus-secure"
-  exit 1
-}
-echo "SIGNER_PORT=$SIGNER_PORT"
-
-TS="$(date +%s)"
-mkdir -p /root/wolv_backups "$BACK_DIR/routes"
-
-echo "=== Patch swap.routes.js (add /execute with signer-service) ==="
-SWAP="$BACK_DIR/routes/swap.routes.js"
-if [ -f "$SWAP" ]; then cp -a "$SWAP" "/root/wolv_backups/swap.routes.js.$TS.bak"; fi
-
-cat >"$SWAP" <<JS
-/**
- * WOLFSWAP backend routes
- * - GET  /api/swap/quote
- * - POST /api/swap/tx       (unsigned tx for Phantom)
- * - POST /api/swap/execute  (SERVER EXECUTE via signer-service)  ✅
- */
-const express = require("express");
-const router = express.Router();
-
-const JUP_QUOTE = "https://quote-api.jup.ag/v6/quote";
-const JUP_SWAP  = "https://quote-api.jup.ag/v6/swap";
-
-const SIGNER_URL = "http://127.0.0.1:${SIGNER_PORT}";
-const RPC = process.env.SOLANA_RPC || "${RPC_DEFAULT}";
-
-async function rpc(method, params){
-  const r = await fetch(RPC, {
-    method:"POST",
-    headers:{ "content-type":"application/json" },
-    body: JSON.stringify({ jsonrpc:"2.0", id:1, method, params })
-  });
-  const j = await r.json();
-  if(j.error) throw new Error(j.error.message || JSON.stringify(j.error));
-  return j.result;
-}
-
-async function confirm(sig, timeoutMs=60000){
-  const start = Date.now();
-  while(Date.now() - start < timeoutMs){
-    const st = await rpc("getSignatureStatuses", [[sig], { searchTransactionHistory:true }]);
-    const v = st?.value?.[0];
-    if(v && (v.confirmationStatus === "confirmed" || v.confirmationStatus === "finalized")) return v;
-    await new Promise(r=>setTimeout(r, 1200));
-  }
-  throw new Error("confirm timeout");
-}
-
-router.get("/quote", async (req,res)=>{
-  try{
-    const { inputMint, outputMint, amount, slippageBps } = req.query;
-    if(!inputMint || !outputMint || !amount) return res.status(400).send("missing params");
-    const u = new URL(JUP_QUOTE);
-    u.searchParams.set("inputMint", String(inputMint));
-    u.searchParams.set("outputMint", String(outputMint));
-    u.searchParams.set("amount", String(amount));
-    u.searchParams.set("slippageBps", String(slippageBps || 50));
-    const r = await fetch(u);
-    const t = await r.text();
-    if(!r.ok) return res.status(r.status).send(t);
-    res.type("application/json").send(t);
-  }catch(e){
-    res.status(500).send(e?.message || String(e));
-  }
-});
-
-router.post("/tx", async (req,res)=>{
-  try{
-    const { userPublicKey, quoteResponse, wrapAndUnwrapSol } = req.body || {};
-    if(!userPublicKey || !quoteResponse) return res.status(400).send("missing userPublicKey/quoteResponse");
-
-    const r = await fetch(JUP_SWAP, {
-      method:"POST",
-      headers:{ "content-type":"application/json" },
-      body: JSON.stringify({
-        quoteResponse,
-        userPublicKey,
-        wrapAndUnwrapSol: !!wrapAndUnwrapSol
-      })
-    });
-    const t = await r.text();
-    if(!r.ok) return res.status(r.status).send(t);
-    res.type("application/json").send(t);
-  }catch(e){
-    res.status(500).send(e?.message || String(e));
-  }
-});
-
-/**
- * SERVER EXECUTE (TraderOne/WOLVERINE):
- * body: { userPublicKey, quoteResponse, wrapAndUnwrapSol?:true }
- * - gets swapTransaction from Jupiter
- * - sends it to signer-service -> signedTransaction
- * - sends signed tx to Solana RPC
- */
-router.post("/execute", async (req,res)=>{
-  try{
-    const { userPublicKey, quoteResponse, wrapAndUnwrapSol } = req.body || {};
-    if(!userPublicKey || !quoteResponse) return res.status(400).send("missing userPublicKey/quoteResponse");
-
-    // 1) get unsigned swap tx (base64)
-    const r1 = await fetch(JUP_SWAP, {
-      method:"POST",
-      headers:{ "content-type":"application/json" },
-      body: JSON.stringify({
-        quoteResponse,
-        userPublicKey,
-        wrapAndUnwrapSol: !!wrapAndUnwrapSol
-      })
-    });
-    const j1 = await r1.json().catch(()=>null);
-    if(!r1.ok) return res.status(r1.status).send(JSON.stringify(j1 || {error:"swap api error"}));
-    const swapTransaction = j1?.swapTransaction;
-    if(!swapTransaction) return res.status(500).send("missing swapTransaction from Jupiter");
-
-    // 2) sign via signer-service (best effort endpoints)
-    let signedTxB64 = "";
-    const payload = { transaction: swapTransaction, encoding:"base64" };
-
-    const tryEndpoints = ["/sign", "/api/sign", "/tx/sign"];
-    let lastErr = "";
-    for(const ep of tryEndpoints){
-      try{
-        const rs = await fetch(SIGNER_URL + ep, {
-          method:"POST",
-          headers:{ "content-type":"application/json" },
-          body: JSON.stringify(payload)
-        });
-        const txt = await rs.text();
-        if(!rs.ok){ lastErr = txt; continue; }
-        const js = JSON.parse(txt);
-        signedTxB64 = js.signedTransaction || js.signed || js.tx || "";
-        if(signedTxB64) break;
-        lastErr = txt;
-      }catch(e){ lastErr = e?.message || String(e); }
-    }
-    if(!signedTxB64){
-      return res.status(500).send("signer-service failed. lastErr=" + lastErr);
-    }
-
-    // 3) send raw transaction
-    const sig = await rpc("sendTransaction", [signedTxB64, { encoding:"base64", skipPreflight:false, maxRetries:3 }]);
-    await confirm(sig, 90000);
-
-    res.json({ ok:true, signature:sig });
-  }catch(e){
-    res.status(500).send(e?.message || String(e));
-  }
-});
-
-module.exports = router;
-JS
-
-echo "=== Ensure server wires /api/swap (if missing) ==="
-ENTRY=""
-for f in server.js app.js index.js main.js src/server.js src/app.js src/index.js; do
-  if [ -f "$BACK_DIR/$f" ]; then ENTRY="$BACK_DIR/$f"; break; fi
-done
-if [ -z "$ENTRY" ]; then
-  ENTRY="$(grep -RIl --no-messages -E "const app *= *express\\(" "$BACK_DIR" --include="*.js" --include="*.cjs" --include="*.mjs" | head -n1 || true)"
-fi
-[ -n "$ENTRY" ] || { echo "ERR: entry express introuvable"; exit 1; }
-cp -a "$ENTRY" "/root/wolv_backups/backend_entry.$TS.bak"
-
-if ! grep -q "swapRoutes" "$ENTRY"; then
-  perl -0777 -i -pe '
-    my $s=$_;
-    if($s =~ /const\s+express\s*=\s*require\([^)]+\);\s*/s){
-      $s =~ s/(const\s+express\s*=\s*require\([^)]+\);\s*)/$1\nconst swapRoutes = require(".\/routes\/swap.routes");\n/s;
-    } elsif($s =~ /const\s+app\s*=\s*express\(\)\s*;\s*/s){
-      $s =~ s/(const\s+app\s*=\s*express\(\)\s*;\s*)/$1\nconst swapRoutes = require(".\/routes\/swap.routes");\n/s;
-    } else {
-      $s = "const swapRoutes = require(\".\/routes\/swap.routes\");\n".$s;
-    }
-    $_=$s;
-  ' "$ENTRY"
-fi
-
-if ! grep -q "/api/swap" "$ENTRY"; then
-  echo 'app.use("/api/swap", swapRoutes);' >> "$ENTRY"
-fi
-
-echo "=== Hide WOLFSWAP UI (menu + page) but keep backend ==="
-WEB_DIR=""
-for d in \
-  /opt/fireinners/frontend-react/app/dist/wolverine \
-  /var/www/fireinners/wolverine \
-  /var/www/wolverine \
-  /opt/traderone-opt/public/wolverine \
-  /opt/traderone-opt/public
-do
-  if [ -d "$d" ]; then WEB_DIR="$d"; break; fi
-done
-
-if [ -n "$WEB_DIR" ] && [ -f "$WEB_DIR/index.html" ]; then
-  HTML="$WEB_DIR/index.html"
-  cp -a "$HTML" "/root/wolv_backups/index.html.$TS.bak"
-  # remove left menu button and hide section if present
-  perl -0777 -i -pe '
-    s#<button[^>]*id="navWolfSwap"[^>]*>.*?</button>\s*##gsi;
-    s#<section[^>]*id="pageWolfSwap"[^>]*>#<section id="pageWolfSwap" style="display:none">#gsi;
-  ' "$HTML"
-  nginx -t && systemctl reload nginx || true
-  echo "WOLFSWAP UI hidden"
+echo "=== Stop/Disable amcq.service ==="
+if systemctl list-unit-files | grep -q "^amcq.service"; then
+  systemctl stop amcq.service || true
+  systemctl disable amcq.service || true
+  systemctl mask amcq.service || true
+  echo "✅ amcq.service stopped+disabled+masked"
 else
-  echo "WARN: frontend not found to hide UI (OK)."
+  echo "ℹ️ amcq.service not found"
 fi
 
-echo "=== Restart backend service for :3000 (best effort: wolverine-api.service) ==="
-if systemctl is-active --quiet wolverine-api.service; then
-  systemctl restart wolverine-api.service
-  echo "systemctl restart wolverine-api.service OK"
-else
-  # fallback: restart node on port 3000 via HUP
-  kill -HUP "$PID" || true
-  echo "HUP sent to PID $PID"
-fi
-
-echo "=== Quick tests ==="
-echo "-- quote"
-curl -sS "http://127.0.0.1:$API_PORT/api/swap/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1&amount=10000000&slippageBps=50" | head -c 180 || true
 echo
-echo "-- execute endpoint exists?"
-curl -sS -X POST "http://127.0.0.1:$API_PORT/api/swap/execute" -H "content-type: application/json" -d '{}' || true
+echo "=== Kill any leftover node running /root/amcq/server.js (if any) ==="
+pids="$(ps aux | grep -E '[n]ode .*\/root\/amcq\/server\.js' | awk '{print $2}' || true)"
+if [ -n "${pids:-}" ]; then
+  echo "Killing: $pids"
+  kill -9 $pids || true
+else
+  echo "No amcq node process found"
+fi
+
+echo
+echo "=== Optional: remove folder /root/amcq (rename backup) ==="
+if [ -d /root/amcq ]; then
+  mv /root/amcq "/root/amcq_DISABLED_$(date +%s)" || true
+  echo "✅ /root/amcq moved to backup folder"
+else
+  echo "ℹ️ /root/amcq not present"
+fi
+
 echo
 echo "DONE ✅"
-echo "Rollback backend entry:"
-echo "  cp -a /root/wolv_backups/backend_entry.$TS.bak $ENTRY"
-echo "Rollback swap routes:"
-echo "  [ -f /root/wolv_backups/swap.routes.js.$TS.bak ] && cp -a /root/wolv_backups/swap.routes.js.$TS.bak $SWAP"
-echo "Rollback frontend hide (if edited):"
-echo "  [ -f /root/wolv_backups/index.html.$TS.bak ] && cp -a /root/wolv_backups/index.html.$TS.bak $WEB_DIR/index.html && nginx -t && systemctl reload nginx"
 BASH
 
-bash /root/WOLV_ENABLE_WOLFSWAP_BACKGROUND_EXECUTE.sh
+bash /root/WOLV_REMOVE_AMCQ.sh
