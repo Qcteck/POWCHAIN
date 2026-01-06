@@ -1,70 +1,138 @@
-cat >/root/WOLV_FIX_NODEFETCH_AND_IPV4_JUP.sh <<'BASH'
+cat >/root/WOLV_USE_CURL_FOR_JUPITER_SWAPROUTES.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
 BACK_DIR="/opt/wolverine-api"
 SWAP="$BACK_DIR/routes/swap.routes.js"
-
 [ -d "$BACK_DIR" ] || { echo "ERR: $BACK_DIR introuvable"; exit 1; }
-[ -f "$BACK_DIR/package.json" ] || { echo "ERR: package.json introuvable dans $BACK_DIR"; exit 1; }
-[ -f "$SWAP" ] || { echo "ERR: swap.routes.js introuvable: $SWAP"; exit 1; }
+[ -f "$SWAP" ] || { echo "ERR: $SWAP introuvable"; exit 1; }
 
 TS="$(date +%s)"
 mkdir -p /root/wolv_backups
 cp -a "$SWAP" "/root/wolv_backups/swap.routes.js.$TS.bak"
 
-echo "=== Install node-fetch@2 (CJS) ==="
-cd "$BACK_DIR"
-npm i node-fetch@2 --silent
+apt-get update -y >/dev/null 2>&1 || true
+apt-get install -y curl >/dev/null 2>&1 || true
 
-echo "=== Inject FETCH+IPv4 shim at top of swap.routes.js ==="
-perl -0777 -i -pe '
-  my $s=$_;
-  if($s !~ /WOLV_FETCH_IPV4_SHIM_V1/){
-    my $shim = "/* WOLV_FETCH_IPV4_SHIM_V1 */\n".
-      "const https = require(\"https\");\n".
-      "let fetchFn = global.fetch;\n".
-      "if (!fetchFn) {\n".
-      "  const nf = require(\"node-fetch\");\n".
-      "  fetchFn = nf.default || nf;\n".
-      "}\n".
-      "const __httpsAgent4 = new https.Agent({ keepAlive: true, family: 4 });\n".
-      "const fetch = (url, opts={}) => fetchFn(url, Object.assign({ agent: __httpsAgent4 }, opts));\n\n";
-    $s = $shim . $s;
+cat >"$SWAP" <<'JS'
+const express = require("express");
+const router = express.Router();
+const { execFile } = require("child_process");
+
+const JUP_QUOTE = "https://quote-api.jup.ag/v6/quote";
+const JUP_SWAP  = "https://quote-api.jup.ag/v6/swap";
+
+const SIGNER_URL = "http://127.0.0.1:8484"; // ton signer trouvé
+const RPC = process.env.SOLANA_RPC || "https://api.mainnet-beta.solana.com";
+
+function curlJson(args, timeoutMs=12000){
+  return new Promise((resolve, reject)=>{
+    execFile("curl", ["-sS", "--max-time", String(Math.ceil(timeoutMs/1000)), ...args], (err, stdout, stderr)=>{
+      if(err) return reject(new Error((stderr||stdout||err.message||"curl failed").toString().slice(0,1200)));
+      try { resolve(JSON.parse(stdout)); }
+      catch(e){ reject(new Error(("BAD_JSON: "+stdout).slice(0,1200))); }
+    });
+  });
+}
+
+async function rpc(method, params){
+  const body = JSON.stringify({ jsonrpc:"2.0", id:1, method, params });
+  const res = await curlJson(["-H","content-type: application/json","-X","POST","--data",body,RPC], 15000);
+  if(res.error) throw new Error(res.error.message || JSON.stringify(res.error));
+  return res.result;
+}
+
+async function confirm(sig, timeoutMs=90000){
+  const start = Date.now();
+  while(Date.now()-start < timeoutMs){
+    const st = await rpc("getSignatureStatuses", [[sig], { searchTransactionHistory:true }]);
+    const v = st?.value?.[0];
+    if(v && (v.confirmationStatus === "confirmed" || v.confirmationStatus === "finalized")) return v;
+    await new Promise(r=>setTimeout(r, 1200));
   }
-  $_=$s;
-' "$SWAP"
+  throw new Error("confirm timeout");
+}
+
+router.get("/quote", async (req,res)=>{
+  try{
+    const { inputMint, outputMint, amount, slippageBps } = req.query;
+    if(!inputMint || !outputMint || !amount) return res.status(400).send("missing params");
+
+    const u = new URL(JUP_QUOTE);
+    u.searchParams.set("inputMint", String(inputMint));
+    u.searchParams.set("outputMint", String(outputMint));
+    u.searchParams.set("amount", String(amount));
+    u.searchParams.set("slippageBps", String(slippageBps || 50));
+
+    const j = await curlJson([u.toString()], 12000);
+    return res.json(j);
+  }catch(e){
+    return res.status(500).send(e?.message || String(e));
+  }
+});
+
+router.post("/tx", async (req,res)=>{
+  try{
+    const { userPublicKey, quoteResponse, wrapAndUnwrapSol } = req.body || {};
+    if(!userPublicKey || !quoteResponse) return res.status(400).send("missing userPublicKey/quoteResponse");
+
+    const body = JSON.stringify({ quoteResponse, userPublicKey, wrapAndUnwrapSol: !!wrapAndUnwrapSol });
+    const j = await curlJson(["-H","content-type: application/json","-X","POST","--data",body,JUP_SWAP], 15000);
+    return res.json(j);
+  }catch(e){
+    return res.status(500).send(e?.message || String(e));
+  }
+});
+
+router.post("/execute", async (req,res)=>{
+  try{
+    const { userPublicKey, quoteResponse, wrapAndUnwrapSol } = req.body || {};
+    if(!userPublicKey || !quoteResponse) return res.status(400).send("missing userPublicKey/quoteResponse");
+
+    // 1) get swapTransaction from Jupiter (via curl)
+    const body1 = JSON.stringify({ quoteResponse, userPublicKey, wrapAndUnwrapSol: !!wrapAndUnwrapSol });
+    const j1 = await curlJson(["-H","content-type: application/json","-X","POST","--data",body1,JUP_SWAP], 20000);
+    const swapTransaction = j1?.swapTransaction;
+    if(!swapTransaction) return res.status(500).send("missing swapTransaction from Jupiter");
+
+    // 2) sign via qplus-signer (try multiple endpoints)
+    const payload = JSON.stringify({ transaction: swapTransaction, encoding:"base64" });
+    const eps = ["/sign","/api/sign","/tx/sign","/v1/sign","/signTransaction","/sign-transaction"];
+    let signedTxB64 = "";
+    let lastErr = "";
+
+    for(const ep of eps){
+      try{
+        const js = await curlJson(["-H","content-type: application/json","-X","POST","--data",payload, SIGNER_URL + ep], 12000);
+        signedTxB64 = js.signedTransaction || js.signed || js.tx || js.transaction || "";
+        if(signedTxB64) break;
+        lastErr = JSON.stringify(js).slice(0,400);
+      }catch(e){ lastErr = e?.message || String(e); }
+    }
+    if(!signedTxB64) return res.status(500).send("signer-service failed. lastErr=" + lastErr);
+
+    // 3) send tx + confirm
+    const sig = await rpc("sendTransaction", [signedTxB64, { encoding:"base64", skipPreflight:false, maxRetries:3 }]);
+    await confirm(sig, 90000);
+    return res.json({ ok:true, signature:sig });
+  }catch(e){
+    return res.status(500).send(e?.message || String(e));
+  }
+});
+
+module.exports = router;
+JS
 
 echo "=== Restart wolverine-api ==="
 systemctl restart wolverine-api.service || true
 sleep 1
 
-echo "=== Node test (Jupiter quote) ==="
-node - <<'NODE'
-const nf = require("node-fetch");
-const fetch = nf.default || nf;
-const https = require("https");
-const agent = new https.Agent({ keepAlive:true, family:4 });
-
-(async () => {
-  const url="https://quote-api.jup.ag/v6/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1&amount=10000000&slippageBps=50";
-  try{
-    const r = await fetch(url, { agent, timeout: 10000 });
-    const t = await r.text();
-    console.log("status=", r.status);
-    console.log(t.slice(0,200));
-    process.exit(r.ok ? 0 : 2);
-  }catch(e){
-    console.error("NODE_ERR:", e && (e.stack||e.message||e));
-    process.exit(3);
-  }
-})();
-NODE
-
+echo "=== TEST quote (local) ==="
+curl -sS "http://127.0.0.1:3050/api/swap/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1&amount=10000000&slippageBps=50" | head -c 220 || true
 echo
 echo "DONE ✅"
 echo "Rollback:"
 echo "  cp -a /root/wolv_backups/swap.routes.js.$TS.bak $SWAP && systemctl restart wolverine-api.service"
 BASH
 
-bash /root/WOLV_FIX_NODEFETCH_AND_IPV4_JUP.sh
+bash /root/WOLV_USE_CURL_FOR_JUPITER_SWAPROUTES.sh
