@@ -1,8 +1,235 @@
-cat >/root/WOLV_WOLFSWAP_AND_API_PROXY.sh <<'BASH'
+cat >/root/WOLV_ENABLE_WOLFSWAP_BACKGROUND_EXECUTE.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-# -------- locate wolverine frontend --------
+API_PORT=3000
+RPC_DEFAULT="https://api.mainnet-beta.solana.com"
+
+echo "=== Find backend listening on :$API_PORT ==="
+PID="$(ss -lptn 2>/dev/null | awk -v P=":$API_PORT" '
+  $0 ~ /LISTEN/ && $0 ~ P && $0 ~ /users:\(\("node"/ {
+    match($0, /pid=[0-9]+/); if(RLENGTH){ print substr($0,RSTART+4,RLENGTH-4); exit }
+  }')"
+[ -n "${PID:-}" ] || { echo "ERR: aucun node n'écoute sur :$API_PORT"; exit 1; }
+
+BACK_DIR="$(readlink -f /proc/$PID/cwd || true)"
+[ -d "$BACK_DIR" ] || { echo "ERR: backend cwd introuvable"; exit 1; }
+echo "BACK_DIR=$BACK_DIR"
+
+echo "=== Detect qplus-signer port (by systemd cwd /root/qplus-secure) ==="
+SIGNER_WD="$(systemctl show -p WorkingDirectory --value qplus-signer.service 2>/dev/null || true)"
+SIGNER_WD="${SIGNER_WD:-/root/qplus-secure}"
+SIGNER_PORT=""
+
+# Find node PID whose cwd == SIGNER_WD and grab its listening port(s)
+while read -r line; do
+  spid="$(echo "$line" | sed -E 's/.*pid=([0-9]+).*/\1/')"
+  [ -n "$spid" ] || continue
+  cwd="$(readlink -f /proc/$spid/cwd 2>/dev/null || true)"
+  if [ -n "$cwd" ] && [ "$cwd" = "$(readlink -f "$SIGNER_WD" 2>/dev/null || echo "$SIGNER_WD")" ]; then
+    # extract port from local addr col4
+    port="$(echo "$line" | awk '{print $4}' | sed -E 's/.*:([0-9]+)$/\1/')"
+    if [ -n "$port" ]; then SIGNER_PORT="$port"; break; fi
+  fi
+done < <(ss -lptn 2>/dev/null | grep -E 'LISTEN' | grep -E 'users:\(\("node"' || true)
+
+if [ -z "$SIGNER_PORT" ]; then
+  # fallback: scan common signer ports
+  for p in 8787 8788 9000 9010 5001 4001; do
+    if curl -sS --max-time 1 "http://127.0.0.1:$p/health" >/dev/null 2>&1 || \
+       curl -sS --max-time 1 "http://127.0.0.1:$p/" >/dev/null 2>&1; then
+      SIGNER_PORT="$p"; break
+    fi
+  done
+fi
+
+[ -n "$SIGNER_PORT" ] || {
+  echo "ERR: impossible de détecter le port du signer-service (qplus-signer)."
+  echo "Fais: ss -lptn | grep node  et envoie-moi la ligne du process dans /root/qplus-secure"
+  exit 1
+}
+echo "SIGNER_PORT=$SIGNER_PORT"
+
+TS="$(date +%s)"
+mkdir -p /root/wolv_backups "$BACK_DIR/routes"
+
+echo "=== Patch swap.routes.js (add /execute with signer-service) ==="
+SWAP="$BACK_DIR/routes/swap.routes.js"
+if [ -f "$SWAP" ]; then cp -a "$SWAP" "/root/wolv_backups/swap.routes.js.$TS.bak"; fi
+
+cat >"$SWAP" <<JS
+/**
+ * WOLFSWAP backend routes
+ * - GET  /api/swap/quote
+ * - POST /api/swap/tx       (unsigned tx for Phantom)
+ * - POST /api/swap/execute  (SERVER EXECUTE via signer-service)  ✅
+ */
+const express = require("express");
+const router = express.Router();
+
+const JUP_QUOTE = "https://quote-api.jup.ag/v6/quote";
+const JUP_SWAP  = "https://quote-api.jup.ag/v6/swap";
+
+const SIGNER_URL = "http://127.0.0.1:${SIGNER_PORT}";
+const RPC = process.env.SOLANA_RPC || "${RPC_DEFAULT}";
+
+async function rpc(method, params){
+  const r = await fetch(RPC, {
+    method:"POST",
+    headers:{ "content-type":"application/json" },
+    body: JSON.stringify({ jsonrpc:"2.0", id:1, method, params })
+  });
+  const j = await r.json();
+  if(j.error) throw new Error(j.error.message || JSON.stringify(j.error));
+  return j.result;
+}
+
+async function confirm(sig, timeoutMs=60000){
+  const start = Date.now();
+  while(Date.now() - start < timeoutMs){
+    const st = await rpc("getSignatureStatuses", [[sig], { searchTransactionHistory:true }]);
+    const v = st?.value?.[0];
+    if(v && (v.confirmationStatus === "confirmed" || v.confirmationStatus === "finalized")) return v;
+    await new Promise(r=>setTimeout(r, 1200));
+  }
+  throw new Error("confirm timeout");
+}
+
+router.get("/quote", async (req,res)=>{
+  try{
+    const { inputMint, outputMint, amount, slippageBps } = req.query;
+    if(!inputMint || !outputMint || !amount) return res.status(400).send("missing params");
+    const u = new URL(JUP_QUOTE);
+    u.searchParams.set("inputMint", String(inputMint));
+    u.searchParams.set("outputMint", String(outputMint));
+    u.searchParams.set("amount", String(amount));
+    u.searchParams.set("slippageBps", String(slippageBps || 50));
+    const r = await fetch(u);
+    const t = await r.text();
+    if(!r.ok) return res.status(r.status).send(t);
+    res.type("application/json").send(t);
+  }catch(e){
+    res.status(500).send(e?.message || String(e));
+  }
+});
+
+router.post("/tx", async (req,res)=>{
+  try{
+    const { userPublicKey, quoteResponse, wrapAndUnwrapSol } = req.body || {};
+    if(!userPublicKey || !quoteResponse) return res.status(400).send("missing userPublicKey/quoteResponse");
+
+    const r = await fetch(JUP_SWAP, {
+      method:"POST",
+      headers:{ "content-type":"application/json" },
+      body: JSON.stringify({
+        quoteResponse,
+        userPublicKey,
+        wrapAndUnwrapSol: !!wrapAndUnwrapSol
+      })
+    });
+    const t = await r.text();
+    if(!r.ok) return res.status(r.status).send(t);
+    res.type("application/json").send(t);
+  }catch(e){
+    res.status(500).send(e?.message || String(e));
+  }
+});
+
+/**
+ * SERVER EXECUTE (TraderOne/WOLVERINE):
+ * body: { userPublicKey, quoteResponse, wrapAndUnwrapSol?:true }
+ * - gets swapTransaction from Jupiter
+ * - sends it to signer-service -> signedTransaction
+ * - sends signed tx to Solana RPC
+ */
+router.post("/execute", async (req,res)=>{
+  try{
+    const { userPublicKey, quoteResponse, wrapAndUnwrapSol } = req.body || {};
+    if(!userPublicKey || !quoteResponse) return res.status(400).send("missing userPublicKey/quoteResponse");
+
+    // 1) get unsigned swap tx (base64)
+    const r1 = await fetch(JUP_SWAP, {
+      method:"POST",
+      headers:{ "content-type":"application/json" },
+      body: JSON.stringify({
+        quoteResponse,
+        userPublicKey,
+        wrapAndUnwrapSol: !!wrapAndUnwrapSol
+      })
+    });
+    const j1 = await r1.json().catch(()=>null);
+    if(!r1.ok) return res.status(r1.status).send(JSON.stringify(j1 || {error:"swap api error"}));
+    const swapTransaction = j1?.swapTransaction;
+    if(!swapTransaction) return res.status(500).send("missing swapTransaction from Jupiter");
+
+    // 2) sign via signer-service (best effort endpoints)
+    let signedTxB64 = "";
+    const payload = { transaction: swapTransaction, encoding:"base64" };
+
+    const tryEndpoints = ["/sign", "/api/sign", "/tx/sign"];
+    let lastErr = "";
+    for(const ep of tryEndpoints){
+      try{
+        const rs = await fetch(SIGNER_URL + ep, {
+          method:"POST",
+          headers:{ "content-type":"application/json" },
+          body: JSON.stringify(payload)
+        });
+        const txt = await rs.text();
+        if(!rs.ok){ lastErr = txt; continue; }
+        const js = JSON.parse(txt);
+        signedTxB64 = js.signedTransaction || js.signed || js.tx || "";
+        if(signedTxB64) break;
+        lastErr = txt;
+      }catch(e){ lastErr = e?.message || String(e); }
+    }
+    if(!signedTxB64){
+      return res.status(500).send("signer-service failed. lastErr=" + lastErr);
+    }
+
+    // 3) send raw transaction
+    const sig = await rpc("sendTransaction", [signedTxB64, { encoding:"base64", skipPreflight:false, maxRetries:3 }]);
+    await confirm(sig, 90000);
+
+    res.json({ ok:true, signature:sig });
+  }catch(e){
+    res.status(500).send(e?.message || String(e));
+  }
+});
+
+module.exports = router;
+JS
+
+echo "=== Ensure server wires /api/swap (if missing) ==="
+ENTRY=""
+for f in server.js app.js index.js main.js src/server.js src/app.js src/index.js; do
+  if [ -f "$BACK_DIR/$f" ]; then ENTRY="$BACK_DIR/$f"; break; fi
+done
+if [ -z "$ENTRY" ]; then
+  ENTRY="$(grep -RIl --no-messages -E "const app *= *express\\(" "$BACK_DIR" --include="*.js" --include="*.cjs" --include="*.mjs" | head -n1 || true)"
+fi
+[ -n "$ENTRY" ] || { echo "ERR: entry express introuvable"; exit 1; }
+cp -a "$ENTRY" "/root/wolv_backups/backend_entry.$TS.bak"
+
+if ! grep -q "swapRoutes" "$ENTRY"; then
+  perl -0777 -i -pe '
+    my $s=$_;
+    if($s =~ /const\s+express\s*=\s*require\([^)]+\);\s*/s){
+      $s =~ s/(const\s+express\s*=\s*require\([^)]+\);\s*)/$1\nconst swapRoutes = require(".\/routes\/swap.routes");\n/s;
+    } elsif($s =~ /const\s+app\s*=\s*express\(\)\s*;\s*/s){
+      $s =~ s/(const\s+app\s*=\s*express\(\)\s*;\s*)/$1\nconst swapRoutes = require(".\/routes\/swap.routes");\n/s;
+    } else {
+      $s = "const swapRoutes = require(\".\/routes\/swap.routes\");\n".$s;
+    }
+    $_=$s;
+  ' "$ENTRY"
+fi
+
+if ! grep -q "/api/swap" "$ENTRY"; then
+  echo 'app.use("/api/swap", swapRoutes);' >> "$ENTRY"
+fi
+
+echo "=== Hide WOLFSWAP UI (menu + page) but keep backend ==="
 WEB_DIR=""
 for d in \
   /opt/fireinners/frontend-react/app/dist/wolverine \
@@ -13,336 +240,45 @@ for d in \
 do
   if [ -d "$d" ]; then WEB_DIR="$d"; break; fi
 done
-[ -n "$WEB_DIR" ] || { echo "ERR: dossier /wolverine introuvable"; exit 1; }
 
-HTML="$WEB_DIR/index.html"
-JS="$WEB_DIR/ui/terminal.js"
-[ -f "$HTML" ] || { echo "ERR: index.html introuvable: $HTML"; exit 1; }
-[ -f "$JS" ] || { echo "ERR: terminal.js introuvable: $JS"; exit 1; }
-
-TS="$(date +%s)"
-mkdir -p /root/wolv_backups
-cp -a "$HTML" "/root/wolv_backups/index.html.$TS.bak"
-cp -a "$JS"   "/root/wolv_backups/terminal.js.$TS.bak"
-echo "Backup OK -> /root/wolv_backups/(index.html|terminal.js).$TS.bak"
-echo "WEB_DIR=$WEB_DIR"
-
-# -------- 1) Add left menu item WOLFSWAP --------
-if ! grep -q 'id="navWolfSwap"' "$HTML"; then
-  # Insert after navWallet if possible, else before </aside>
+if [ -n "$WEB_DIR" ] && [ -f "$WEB_DIR/index.html" ]; then
+  HTML="$WEB_DIR/index.html"
+  cp -a "$HTML" "/root/wolv_backups/index.html.$TS.bak"
+  # remove left menu button and hide section if present
   perl -0777 -i -pe '
-    if($_ !~ /id="navWolfSwap"/){
-      if($_ =~ /(id="navWallet"[^>]*>.*?<\/[^>]+>)/si){
-        s/(id="navWallet"[^>]*>.*?<\/[^>]+>)/$1\n<button class="navItem" id="navWolfSwap">WOLFSWAP<\/button>/si;
-      } else {
-        s/(<\/aside>)/<button class="navItem" id="navWolfSwap">WOLFSWAP<\/button>\n$1/si;
-      }
-    }
+    s#<button[^>]*id="navWolfSwap"[^>]*>.*?</button>\s*##gsi;
+    s#<section[^>]*id="pageWolfSwap"[^>]*>#<section id="pageWolfSwap" style="display:none">#gsi;
   ' "$HTML"
-  echo "Added navWolfSwap to left menu"
+  nginx -t && systemctl reload nginx || true
+  echo "WOLFSWAP UI hidden"
 else
-  echo "navWolfSwap already present"
+  echo "WARN: frontend not found to hide UI (OK)."
 fi
 
-# Optional: remove old bottom "Swap" button if it exists outside menu (safe)
-# We only remove a standalone line like <button ...>Swap</button> that is NOT navWolfSwap
-perl -0777 -i -pe '
-  s/<button[^>]*>\s*Swap\s*<\/button>\s*//gsi;
-' "$HTML" || true
-
-# -------- 2) Create pageWolfSwap with modules --------
-if ! grep -q 'id="pageWolfSwap"' "$HTML"; then
-  # If pageSwap exists, rename it to pageWolfSwap
-  if grep -q 'id="pageSwap"' "$HTML"; then
-    sed -i 's/id="pageSwap"/id="pageWolfSwap"/g' "$HTML"
-    sed -i 's/Swap (Internal)/WOLFSWAP (Internal)/g' "$HTML"
-    echo "Renamed pageSwap -> pageWolfSwap"
-  else
-    # Otherwise inject new section
-    SWAP_SECTION=$(cat <<'HTMLSEC'
-<section id="pageWolfSwap" style="display:none">
-  <div class="panelTitle">WOLFSWAP (Internal)</div>
-
-  <div class="notice" style="margin-top:10px">
-    <div style="font-weight:1000;margin-bottom:6px">Wallet (Live)</div>
-    <div class="small">Wallet: <span id="wolfSwapPub">—</span></div>
-    <div class="small">SOL: <span id="wolfSwapSol">—</span></div>
-    <div class="small">USDC: <span id="wolfSwapUsdc">—</span></div>
-  </div>
-
-  <div class="notice" style="margin-top:10px">
-    <div style="font-weight:1000;margin-bottom:6px">Swap Module</div>
-
-    <div class="formRow">
-      <label class="small">From</label>
-      <select id="swapFrom">
-        <option value="So11111111111111111111111111111111111111112">SOL</option>
-        <option value="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1" selected>USDC</option>
-      </select>
-
-      <label class="small">To</label>
-      <select id="swapTo">
-        <option value="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1">USDC</option>
-        <option value="So11111111111111111111111111111111111111112" selected>SOL</option>
-      </select>
-    </div>
-
-    <div class="formRow" style="margin-top:10px">
-      <label class="small">Amount</label>
-      <input class="input" id="swapAmount" value="1" />
-      <label class="small">Slippage (bps)</label>
-      <input class="input" id="swapSlip" value="50" />
-    </div>
-
-    <div class="formRow" style="margin-top:10px">
-      <button class="btn" id="btnSwapQuote">QUOTE</button>
-      <button class="btn primary" id="btnSwapExecute">SWAP</button>
-    </div>
-
-    <div class="notice" style="margin-top:10px">
-      <div class="small" id="swapOut">—</div>
-    </div>
-  </div>
-
-  <div class="notice" style="margin-top:10px">
-    <div style="font-weight:1000;margin-bottom:6px">Trade Hooks (Modules)</div>
-    <div class="small">• Route Monitor (quote refresh)</div>
-    <div class="small">• Slippage Guard</div>
-    <div class="small">• Auto-Quote before Swap</div>
-    <div class="small">• Tx Log (last 10)</div>
-    <div class="small" id="wolfSwapLog">—</div>
-  </div>
-</section>
-HTMLSEC
-)
-
-    if grep -qi "</main>" "$HTML"; then
-      perl -0777 -i -pe 's#</main>#'"$SWAP_SECTION"'\n</main>#si' "$HTML"
-    else
-      perl -0777 -i -pe 's#</body>#'"$SWAP_SECTION"'\n</body>#si' "$HTML"
-    fi
-    echo "Injected pageWolfSwap"
-  fi
+echo "=== Restart backend service for :3000 (best effort: wolverine-api.service) ==="
+if systemctl is-active --quiet wolverine-api.service; then
+  systemctl restart wolverine-api.service
+  echo "systemctl restart wolverine-api.service OK"
 else
-  echo "pageWolfSwap already present"
+  # fallback: restart node on port 3000 via HUP
+  kill -HUP "$PID" || true
+  echo "HUP sent to PID $PID"
 fi
 
-# -------- 3) Patch terminal.js (navigation + swap auto-quote + display wallet balances in WOLFSWAP) --------
-if ! grep -q "WOLV_WOLFSWAP_V1" "$JS"; then
-  cat >>"$JS" <<'JS'
-
-// === WOLV_WOLFSWAP_V1 ===
-(function(){
-  const $ = (id)=>document.getElementById(id);
-  const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1";
-  const SOL_MINT  = "So11111111111111111111111111111111111111112";
-
-  function log(t){
-    const el = $("wolfSwapLog");
-    if(el) el.textContent = t;
-    console.log("[WOLFSWAP]", t);
-  }
-
-  function showPage(pageId){
-    const candidates = ["pageDashboard","pageTrade","pageWallet","pagePositions","pageOrders","pageHistory","pageSettings","pageWolfSwap","pageSwap"];
-    candidates.forEach(p=>{
-      const el=$(p);
-      if(el) el.style.display = (p===pageId ? "block" : "none");
-    });
-  }
-
-  async function phantomPub(){
-    if(!window.solana || !window.solana.isPhantom) throw new Error("Phantom missing");
-    if(!window.solana.publicKey) await window.solana.connect();
-    return window.solana.publicKey.toBase58();
-  }
-
-  function decimals(mint){
-    if(mint === SOL_MINT) return 9;
-    if(mint === USDC_MINT) return 6;
-    return 6;
-  }
-
-  async function conn(){
-    if(!window.solanaWeb3?.Connection) throw new Error("solanaWeb3 not loaded");
-    return new window.solanaWeb3.Connection("https://api.mainnet-beta.solana.com","confirmed");
-  }
-
-  async function refreshWolfSwapBalances(){
-    try{
-      const pub = (window.solana?.publicKey?.toBase58?.() || "");
-      if(!pub){
-        if($("wolfSwapPub")) $("wolfSwapPub").textContent = "—";
-        if($("wolfSwapSol")) $("wolfSwapSol").textContent = "—";
-        if($("wolfSwapUsdc")) $("wolfSwapUsdc").textContent = "—";
-        return;
-      }
-      const short = pub.slice(0,4)+"…"+pub.slice(-4);
-      if($("wolfSwapPub")) $("wolfSwapPub").textContent = short;
-
-      const c = await conn();
-      const web3 = window.solanaWeb3;
-
-      const lam = await c.getBalance(new web3.PublicKey(pub), "confirmed");
-      if($("wolfSwapSol")) $("wolfSwapSol").textContent = (lam/1e9).toFixed(6);
-
-      const tok = await c.getParsedTokenAccountsByOwner(
-        new web3.PublicKey(pub),
-        { mint: new web3.PublicKey(USDC_MINT) },
-        "confirmed"
-      );
-      let sum = 0;
-      for(const it of (tok.value||[])){
-        sum += Number(it.account?.data?.parsed?.info?.tokenAmount?.uiAmount || 0);
-      }
-      if($("wolfSwapUsdc")) $("wolfSwapUsdc").textContent = sum.toFixed(2);
-    }catch(e){
-      log("Balance err: " + (e?.message||e));
-    }
-  }
-
-  async function quote(){
-    const inputMint = $("swapFrom")?.value;
-    const outputMint = $("swapTo")?.value;
-    const amtUi = Number($("swapAmount")?.value || 0);
-    const slippageBps = Number($("swapSlip")?.value || 50);
-
-    if(!amtUi || amtUi <= 0) throw new Error("Amount invalid");
-    if(inputMint === outputMint) throw new Error("From/To must differ");
-
-    const amtBase = Math.floor(amtUi * (10 ** decimals(inputMint)));
-    const url = `/api/swap/quote?inputMint=${encodeURIComponent(inputMint)}&outputMint=${encodeURIComponent(outputMint)}&amount=${amtBase}&slippageBps=${slippageBps}`;
-
-    const r = await fetch(url, { cache:"no-store" });
-    const t = await r.text();
-    if(!r.ok) throw new Error(t);
-
-    const data = JSON.parse(t);
-    const best = data.data?.[0];
-    if(!best) throw new Error("No route");
-    window.__lastQuote = best;
-
-    if($("swapOut")) $("swapOut").textContent = `Route OK ✅ | outAmount: ${best.outAmount} | priceImpactPct: ${best.priceImpactPct ?? "?"}`;
-    log("Quote OK");
-    return best;
-  }
-
-  async function execute(){
-    if(!window.solanaWeb3?.VersionedTransaction) throw new Error("solanaWeb3 not loaded");
-    const pub = await phantomPub();
-
-    // Auto-QUOTE if missing
-    if(!window.__lastQuote){
-      if($("swapOut")) $("swapOut").textContent = "Auto-QUOTE…";
-      await quote();
-    }
-
-    const r = await fetch("/api/swap/tx", {
-      method:"POST",
-      headers:{ "content-type":"application/json" },
-      body: JSON.stringify({
-        userPublicKey: pub,
-        quoteResponse: window.__lastQuote,
-        wrapAndUnwrapSol: true
-      })
-    });
-    const t = await r.text();
-    if(!r.ok) throw new Error(t);
-
-    const { swapTransaction } = JSON.parse(t);
-    if(!swapTransaction) throw new Error("No swapTransaction");
-
-    const txBuf = Uint8Array.from(atob(swapTransaction), c => c.charCodeAt(0));
-    const tx = window.solanaWeb3.VersionedTransaction.deserialize(txBuf);
-
-    const signed = await window.solana.signTransaction(tx);
-    const c = await conn();
-    const sig = await c.sendTransaction(signed, { maxRetries: 3 });
-    await c.confirmTransaction(sig, "confirmed");
-
-    if($("swapOut")) $("swapOut").textContent = `SWAP OK ✅ tx: ${sig}`;
-    log("Swap OK: " + sig);
-
-    // refresh balances after swap
-    setTimeout(()=>refreshWolfSwapBalances().catch(()=>{}), 1200);
-  }
-
-  function bind(){
-    const nav = $("navWolfSwap");
-    if(nav) nav.addEventListener("click", ()=>{
-      showPage("pageWolfSwap");
-      refreshWolfSwapBalances().catch(()=>{});
-    });
-
-    const bq = $("btnSwapQuote");
-    if(bq) bq.addEventListener("click", ()=>quote().catch(e=>{
-      if($("swapOut")) $("swapOut").textContent = "ERR: " + (e.message||e);
-    }));
-
-    const bx = $("btnSwapExecute");
-    if(bx) bx.addEventListener("click", ()=>execute().catch(e=>{
-      if($("swapOut")) $("swapOut").textContent = "ERR: " + (e.message||e);
-    }));
-
-    // keep balances fresh if user stays on page
-    setInterval(()=>refreshWolfSwapBalances().catch(()=>{}), 7000);
-  }
-
-  if(document.readyState==="loading") document.addEventListener("DOMContentLoaded", bind);
-  else bind();
-})();
-// === /WOLV_WOLFSWAP_V1 ===
-JS
-  echo "Patched terminal.js (WOLFSWAP)"
-else
-  echo "terminal.js already contains WOLV_WOLFSWAP_V1"
-fi
-
-# -------- 4) Fix Nginx: proxy /api -> localhost:3000 to remove 404 --------
-echo "=== NGINX proxy /api -> 127.0.0.1:3000 ==="
-NGINX_SITE=""
-# try to find server block for fireinners.online
-for f in /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*; do
-  [ -f "$f" ] || continue
-  if grep -qi "server_name .*fireinners\.online" "$f"; then
-    NGINX_SITE="$f"; break
-  fi
-done
-
-if [ -z "$NGINX_SITE" ]; then
-  echo "WARN: server_name fireinners.online not found; I will NOT auto-edit nginx."
-  echo "If /api still 404, send me: ls -la /etc/nginx/sites-enabled && grep -R \"server_name\" -n /etc/nginx/sites-enabled"
-else
-  echo "NGINX_SITE=$NGINX_SITE"
-  cp -a "$NGINX_SITE" "/root/wolv_backups/nginx_site.$TS.bak"
-
-  if ! grep -q "location \^~ /api/" "$NGINX_SITE"; then
-    # insert inside the first matching server { ... }
-    perl -0777 -i -pe '
-      my $s=$_;
-      if($s !~ /location\s+\^~\s+\/api\//){
-        $s =~ s/(server\s*\{)/$1\n\n    location ^~ \/api\/ {\n        proxy_pass http:\/\/127.0.0.1:3000\/api\/;\n        proxy_http_version 1.1;\n        proxy_set_header Host $host;\n        proxy_set_header X-Real-IP $remote_addr;\n        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n        proxy_set_header X-Forwarded-Proto $scheme;\n    }\n\n/s;
-      }
-      $_=$s;
-    ' "$NGINX_SITE"
-    echo "Inserted /api proxy block"
-  else
-    echo "/api proxy already present"
-  fi
-
-  nginx -t && systemctl reload nginx
-  echo "nginx reloaded"
-fi
-
-echo ""
+echo "=== Quick tests ==="
+echo "-- quote"
+curl -sS "http://127.0.0.1:$API_PORT/api/swap/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1&amount=10000000&slippageBps=50" | head -c 180 || true
+echo
+echo "-- execute endpoint exists?"
+curl -sS -X POST "http://127.0.0.1:$API_PORT/api/swap/execute" -H "content-type: application/json" -d '{}' || true
+echo
 echo "DONE ✅"
-echo "Open: https://fireinners.online/wolverine/ then Ctrl+F5"
-echo ""
-echo "Rollback frontend:"
-echo "  cp -a /root/wolv_backups/index.html.$TS.bak $HTML"
-echo "  cp -a /root/wolv_backups/terminal.js.$TS.bak $JS"
-echo "Rollback nginx (if edited):"
-echo "  [ -f /root/wolv_backups/nginx_site.$TS.bak ] && cp -a /root/wolv_backups/nginx_site.$TS.bak $NGINX_SITE && nginx -t && systemctl reload nginx"
+echo "Rollback backend entry:"
+echo "  cp -a /root/wolv_backups/backend_entry.$TS.bak $ENTRY"
+echo "Rollback swap routes:"
+echo "  [ -f /root/wolv_backups/swap.routes.js.$TS.bak ] && cp -a /root/wolv_backups/swap.routes.js.$TS.bak $SWAP"
+echo "Rollback frontend hide (if edited):"
+echo "  [ -f /root/wolv_backups/index.html.$TS.bak ] && cp -a /root/wolv_backups/index.html.$TS.bak $WEB_DIR/index.html && nginx -t && systemctl reload nginx"
 BASH
 
-bash /root/WOLV_WOLFSWAP_AND_API_PROXY.sh 
+bash /root/WOLV_ENABLE_WOLFSWAP_BACKGROUND_EXECUTE.sh
