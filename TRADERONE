@@ -1,52 +1,149 @@
-cat >/root/WOLV_FIND_REAL_API_PORT_AND_FIX_NGINX.sh <<'BASH'
+cat >/root/WOLV_CLEAN_SWAPROUTES_TLS4_AND_FIX_NGINX.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "=== Restart wolverine-api ==="
-systemctl restart wolverine-api.service || true
+BACK_DIR="/opt/wolverine-api"
+SWAP="$BACK_DIR/routes/swap.routes.js"
+
+[ -d "$BACK_DIR" ] || { echo "ERR: $BACK_DIR introuvable"; exit 1; }
+[ -f "$SWAP" ] || { echo "ERR: $SWAP introuvable"; exit 1; }
+
+TS="$(date +%s)"
+mkdir -p /root/wolv_backups
+cp -a "$SWAP" "/root/wolv_backups/swap.routes.js.$TS.bak"
+
+apt-get update -y >/dev/null 2>&1 || true
+apt-get install -y curl ca-certificates >/dev/null 2>&1 || true
+update-ca-certificates >/dev/null 2>&1 || true
+
+echo "=== 1) Rewrite swap.routes.js CLEAN (curl -4 + TLS1.2) ==="
+cat >"$SWAP" <<'JS'
+const express = require("express");
+const router = express.Router();
+const { execFile } = require("child_process");
+
+const JUP_QUOTE = "https://quote-api.jup.ag/v6/quote";
+const JUP_SWAP  = "https://quote-api.jup.ag/v6/swap";
+
+const SIGNER_URL = "http://127.0.0.1:8484";
+const RPC = process.env.SOLANA_RPC || "https://api.mainnet-beta.solana.com";
+
+function curlJson(args, timeoutMs=15000){
+  return new Promise((resolve, reject)=>{
+    const base = [
+      "-sS",
+      "-4",                 // force IPv4
+      "--tlsv1.2",          // avoid weird TLS negotiation
+      "--retry", "2",
+      "--retry-delay", "1",
+      "--max-time", String(Math.ceil(timeoutMs/1000)),
+      ...args
+    ];
+    execFile("curl", base, (err, stdout, stderr)=>{
+      if(err) return reject(new Error(((stderr||stdout||err.message)||"curl failed").toString().slice(0,1600)));
+      try { resolve(JSON.parse(stdout)); }
+      catch(e){ reject(new Error(("BAD_JSON: "+stdout).slice(0,1600))); }
+    });
+  });
+}
+
+async function rpc(method, params){
+  const body = JSON.stringify({ jsonrpc:"2.0", id:1, method, params });
+  const res = await curlJson(["-H","content-type: application/json","-X","POST","--data",body,RPC], 20000);
+  if(res.error) throw new Error(res.error.message || JSON.stringify(res.error));
+  return res.result;
+}
+
+async function confirm(sig, timeoutMs=90000){
+  const start = Date.now();
+  while(Date.now()-start < timeoutMs){
+    const st = await rpc("getSignatureStatuses", [[sig], { searchTransactionHistory:true }]);
+    const v = st?.value?.[0];
+    if(v && (v.confirmationStatus === "confirmed" || v.confirmationStatus === "finalized")) return v;
+    await new Promise(r=>setTimeout(r, 1200));
+  }
+  throw new Error("confirm timeout");
+}
+
+router.get("/quote", async (req,res)=>{
+  try{
+    const { inputMint, outputMint, amount, slippageBps } = req.query;
+    if(!inputMint || !outputMint || !amount) return res.status(400).send("missing params");
+
+    const u = new URL(JUP_QUOTE);
+    u.searchParams.set("inputMint", String(inputMint));
+    u.searchParams.set("outputMint", String(outputMint));
+    u.searchParams.set("amount", String(amount));
+    u.searchParams.set("slippageBps", String(slippageBps || 50));
+
+    const j = await curlJson([u.toString()], 15000);
+    return res.json(j);
+  }catch(e){
+    return res.status(500).send(e?.message || String(e));
+  }
+});
+
+router.post("/tx", async (req,res)=>{
+  try{
+    const { userPublicKey, quoteResponse, wrapAndUnwrapSol } = req.body || {};
+    if(!userPublicKey || !quoteResponse) return res.status(400).send("missing userPublicKey/quoteResponse");
+
+    const body = JSON.stringify({ quoteResponse, userPublicKey, wrapAndUnwrapSol: !!wrapAndUnwrapSol });
+    const j = await curlJson(["-H","content-type: application/json","-X","POST","--data",body,JUP_SWAP], 20000);
+    return res.json(j);
+  }catch(e){
+    return res.status(500).send(e?.message || String(e));
+  }
+});
+
+router.post("/execute", async (req,res)=>{
+  try{
+    const { userPublicKey, quoteResponse, wrapAndUnwrapSol } = req.body || {};
+    if(!userPublicKey || !quoteResponse) return res.status(400).send("missing userPublicKey/quoteResponse");
+
+    const body1 = JSON.stringify({ quoteResponse, userPublicKey, wrapAndUnwrapSol: !!wrapAndUnwrapSol });
+    const j1 = await curlJson(["-H","content-type: application/json","-X","POST","--data",body1,JUP_SWAP], 25000);
+
+    const swapTransaction = j1?.swapTransaction;
+    if(!swapTransaction) return res.status(500).send("missing swapTransaction from Jupiter");
+
+    const payload = JSON.stringify({ transaction: swapTransaction, encoding:"base64" });
+    const eps = ["/sign","/api/sign","/tx/sign","/v1/sign","/signTransaction","/sign-transaction"];
+    let signedTxB64 = "";
+    let lastErr = "";
+
+    for(const ep of eps){
+      try{
+        const js = await curlJson(["-H","content-type: application/json","-X","POST","--data",payload, SIGNER_URL + ep], 15000);
+        signedTxB64 = js.signedTransaction || js.signed || js.tx || js.transaction || "";
+        if(signedTxB64) break;
+        lastErr = JSON.stringify(js).slice(0,500);
+      }catch(e){ lastErr = e?.message || String(e); }
+    }
+    if(!signedTxB64) return res.status(500).send("signer-service failed. lastErr=" + lastErr);
+
+    const sig = await rpc("sendTransaction", [signedTxB64, { encoding:"base64", skipPreflight:false, maxRetries:3 }]);
+    await confirm(sig, 90000);
+    return res.json({ ok:true, signature:sig });
+  }catch(e){
+    return res.status(500).send(e?.message || String(e));
+  }
+});
+
+module.exports = router;
+JS
+
+echo "=== 2) Restart wolverine-api ==="
+systemctl reset-failed wolverine-api.service || true
+systemctl restart wolverine-api.service
 sleep 1
 
-echo
-echo "=== Status + last logs ==="
-systemctl status wolverine-api.service --no-pager | head -n 25 || true
-echo
-journalctl -u wolverine-api.service -n 80 --no-pager || true
-echo
+echo "=== 3) Detect API port (from logs) ==="
+API_PORT="$(journalctl -u wolverine-api.service -n 200 --no-pager 2>/dev/null | grep -Eo '127\.0\.0\.1:[0-9]{2,5}' | tail -n1 | sed -E 's/.*:([0-9]+)$/\1/' || true)"
+[ -n "${API_PORT:-}" ] || API_PORT="3002"
+echo "API_PORT=$API_PORT"
 
-echo "=== Try extract port from logs (API up on http://127.0.0.1:PORT) ==="
-PORT_FROM_LOG="$(journalctl -u wolverine-api.service -n 200 --no-pager 2>/dev/null | \
-  grep -Eo '127\.0\.0\.1:[0-9]{2,5}' | tail -n1 | sed -E 's/.*:([0-9]+)$/\1/' || true)"
-echo "PORT_FROM_LOG=${PORT_FROM_LOG:-none}"
-
-echo
-echo "=== Scan localhost ports for /api ==="
-API_PORT=""
-CANDIDATES="$(ss -lptn 2>/dev/null | awk '/LISTEN/ {print $4}' | sed -E 's/.*:([0-9]+)$/\1/' | sort -nu || true)"
-CANDIDATES="$PORT_FROM_LOG $CANDIDATES 3050 3002 3000 8080 8000 5000 4000 3001 3003"
-
-for p in $CANDIDATES; do
-  [ -n "${p:-}" ] || continue
-  if curl -sS --max-time 1 "http://127.0.0.1:$p/api" >/dev/null 2>&1; then
-    API_PORT="$p"; break
-  fi
-done
-
-echo "API_PORT=${API_PORT:-NOT_FOUND}"
-if [ -z "${API_PORT:-}" ]; then
-  echo "ERR: aucun port ne répond à /api en local."
-  echo "Montre-moi: ss -lptn | grep node"
-  exit 1
-fi
-
-echo
-echo "=== Test /api/swap/quote on the real port ==="
-curl -sS --max-time 6 \
-"http://127.0.0.1:$API_PORT/api/swap/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1&amount=10000000&slippageBps=50" \
-| head -c 220 || true
-echo
-
-echo
-echo "=== Patch nginx: /api -> 127.0.0.1:$API_PORT ==="
+echo "=== 4) Fix nginx /api proxy cleanly (rewrite block) ==="
 NGINX_SITE=""
 for f in /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*; do
   [ -f "$f" ] || continue
@@ -54,24 +151,25 @@ for f in /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*; do
 done
 
 if [ -n "$NGINX_SITE" ]; then
-  TS="$(date +%s)"
-  mkdir -p /root/wolv_backups
   cp -a "$NGINX_SITE" "/root/wolv_backups/nginx_site.$TS.bak"
 
-  if grep -q "location \^~ /api/" "$NGINX_SITE"; then
-    sed -i -E "s#proxy_pass http://127\.0\.0\.1:[0-9]+/api/#proxy_pass http://127.0.0.1:$API_PORT/api/#g" "$NGINX_SITE"
-  else
-    perl -0777 -i -pe "s/(server\\s*\\{)/\$1\\n\\n    location ^~ \\/api\\/ {\\n        proxy_pass http:\\/\\/127.0.0.1:$API_PORT\\/api\\/;\\n        proxy_http_version 1.1;\\n        proxy_set_header Host \\$host;\\n        proxy_set_header X-Real-IP \\$remote_addr;\\n        proxy_set_header X-Forwarded-For \\$proxy_add_x_forwarded_for;\\n        proxy_set_header X-Forwarded-Proto \\$scheme;\\n    }\\n\\n/s" "$NGINX_SITE"
-  fi
+  # remove any existing location ^~ /api/ block (rough but effective)
+  perl -0777 -i -pe 's/location\s+\^~\s+\/api\/\s*\{.*?\}\s*//si' "$NGINX_SITE"
+
+  # insert a clean block after first "server {"
+  perl -0777 -i -pe 's/server\s*\{/server {\n\n    location ^~ \/api\/ {\n        proxy_pass http:\/\/127.0.0.1:'"$API_PORT"'\/api\/;\n        proxy_http_version 1.1;\n        proxy_set_header Host \$host;\n        proxy_set_header X-Real-IP \$remote_addr;\n        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;\n        proxy_set_header X-Forwarded-Proto \$scheme;\n    }\n\n/si' "$NGINX_SITE"
 
   nginx -t && systemctl reload nginx
-  echo "nginx OK ✅ (proxy /api -> :$API_PORT)"
+  echo "nginx OK ✅"
 else
   echo "WARN: nginx vhost fireinners.online introuvable (skip)"
 fi
 
+echo "=== 5) TEST: local /api/swap/quote ==="
+curl -sS --max-time 10 \
+"http://127.0.0.1:$API_PORT/api/swap/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1&amount=10000000&slippageBps=50" | head -c 220 || true
 echo
-echo "DONE ✅ API_PORT=$API_PORT"
+echo "DONE ✅"
 BASH
 
-bash /root/WOLV_FIND_REAL_API_PORT_AND_FIX_NGINX.sh
+bash /root/WOLV_CLEAN_SWAPROUTES_TLS4_AND_FIX_NGINX.sh
