@@ -1,82 +1,53 @@
-cat >/root/WOLV_PATCH_SWAP_TO_CF_WORKER_BBTRADERJUP.sh <<'BASH'
+cat >/root/WOLV_DEBUG_BAD_JSON_WORKER_AND_FIX_TOKEN.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
 WORKER_URL="https://bbtrader-jup.paycashnostory.workers.dev"
-# Si tu as mis un token dans ton Worker, mets-le ici. Sinon laisse vide.
-RELAY_TOKEN=""
+API_PORT="3002"
 
-SWAP="/opt/wolverine-api/routes/swap.routes.js"
-[ -f "$SWAP" ] || { echo "ERR: $SWAP introuvable"; exit 1; }
+Q="/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1&amount=10000000&slippageBps=50"
+LOCAL="http://127.0.0.1:${API_PORT}/api/swap/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1&amount=10000000&slippageBps=50"
 
-HOST="$(echo "$WORKER_URL" | sed -E 's#https?://##; s#/.*##')"
-echo "WORKER_HOST=$HOST"
-getent hosts "$HOST" || true
+echo "=== [1] RAW Worker response (no token) ==="
+curl -sS -i --max-time 12 "$WORKER_URL$Q" | head -n 30 || true
 echo
 
-echo "=== Test Worker /quote (try -4 then -6) ==="
-Q="$WORKER_URL/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1&amount=10000000&slippageBps=50"
+echo "=== [2] RAW Local API response (/api/swap/quote) ==="
+curl -sS -i --max-time 12 "$LOCAL" | head -n 40 || true
+echo
 
-HDR=()
+echo "=== If you see 401/unauthorized above, paste token now (or press Enter to skip) ==="
+read -r RELAY_TOKEN || true
+
 if [ -n "${RELAY_TOKEN:-}" ]; then
-  HDR=(-H "x-relay-token: $RELAY_TOKEN")
-fi
+  echo "=== [3] RAW Worker response WITH token ==="
+  curl -sS -i --max-time 12 -H "x-relay-token: $RELAY_TOKEN" "$WORKER_URL$Q" | head -n 30 || true
+  echo
 
-set +e
-curl -4 -sS --max-time 10 "${HDR[@]}" "$Q" | head -c 200
-RC4=$?
-echo
-curl -6 -sS --max-time 10 "${HDR[@]}" "$Q" | head -c 200
-RC6=$?
-echo
-set -e
-echo "worker_test_rc4=$RC4 worker_test_rc6=$RC6"
-echo
+  echo "=== [4] Patch backend to send x-relay-token in curlJson() ==="
+  SWAP="/opt/wolverine-api/routes/swap.routes.js"
+  [ -f "$SWAP" ] || { echo "ERR: $SWAP introuvable"; exit 1; }
 
-echo "=== Backup swap.routes.js ==="
-mkdir -p /root/wolv_backups
-cp -a "$SWAP" "/root/wolv_backups/swap.routes.js.$(date +%s).bak" || true
+  cp -a "$SWAP" "/root/wolv_backups/swap.routes.js.$(date +%s).bak" 2>/dev/null || true
 
-echo "=== Patch endpoints to Worker ==="
-sed -i -E \
-  "s#const JUP_QUOTE = \".*\";#const JUP_QUOTE = \"${WORKER_URL}/quote\";#g; \
-   s#const JUP_SWAP  = \".*\";#const JUP_SWAP  = \"${WORKER_URL}/swap\";#g" \
-  "$SWAP"
-
-echo "=== Remove forced curl -4 in swap.routes.js (to allow IPv6 if needed) ==="
-# supprime les occurrences de "-4" dans les args curl (sans casser le reste)
-sed -i -E 's/"-4",[[:space:]]*//g; s/,[[:space:]]*"-4"//g' "$SWAP"
-
-echo "=== Inject x-relay-token header (only if RELAY_TOKEN set and not already present) ==="
-if [ -n "${RELAY_TOKEN:-}" ]; then
   perl -0777 -i -pe '
     my $tok = $ENV{"RELAY_TOKEN"} // "";
-    if($tok ne "" && $_ !~ /x-relay-token:/){
+    die "missing token\n" if $tok eq "";
+    # inject only if not already present
+    if($_ !~ /x-relay-token:/){
       s/\[\s*"-sS"/["-sS","-H","x-relay-token: ".$tok]/s;
     }
   ' "$SWAP" RELAY_TOKEN="$RELAY_TOKEN"
+
+  systemctl restart wolverine-api.service || true
+  sleep 1
+
+  echo "=== [5] Test Local API again ==="
+  curl -sS -i --max-time 12 "$LOCAL" | head -n 40 || true
+  echo
 fi
 
-echo "=== Restart wolverine-api ==="
-systemctl restart wolverine-api.service || true
-sleep 1
-
-echo "=== Find API port and test /api/swap/quote ==="
-API_PORT=""
-for p in 3002 3050 3000 8080 8000 5000 4000 3001 3003; do
-  if curl -sS --max-time 1 "http://127.0.0.1:$p/api" >/dev/null 2>&1; then
-    API_PORT="$p"; break
-  fi
-done
-
-echo "API_PORT=${API_PORT:-NOT_FOUND}"
-[ -n "${API_PORT:-}" ] || { echo "ERR: aucun port /api trouvé"; ss -lptn | grep -E 'node|pm2' || true; exit 1; }
-
-curl -sS --max-time 10 \
-"http://127.0.0.1:$API_PORT/api/swap/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1&amount=10000000&slippageBps=50" \
-| head -c 220
-echo
 echo "DONE ✅"
 BASH
 
-bash /root/WOLV_PATCH_SWAP_TO_CF_WORKER_BBTRADERJUP.sh
+bash /root/WOLV_DEBUG_BAD_JSON_WORKER_AND_FIX_TOKEN.sh
