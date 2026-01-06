@@ -1,70 +1,75 @@
-cat >/root/WOLV_FIX_FETCH_SWAP_API3002.sh <<'BASH'
+cat >/root/WOLV_DEBUG_FETCH_FAILED_JUPITER.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-API_PORT=3002
-
-echo "=== Find PID on :$API_PORT ==="
-PID="$(ss -lptn 2>/dev/null | awk -v P=":$API_PORT" '
-  $0 ~ /LISTEN/ && $0 ~ P && $0 ~ /users:\(\("node"/ {
-    match($0, /pid=[0-9]+/); if(RLENGTH){ print substr($0,RSTART+4,RLENGTH-4); exit }
-  }')"
-[ -n "${PID:-}" ] || { echo "ERR: no node on :$API_PORT"; exit 1; }
-
-BACK_DIR="$(readlink -f /proc/$PID/cwd || true)"
-[ -d "$BACK_DIR" ] || { echo "ERR: backend cwd not found"; exit 1; }
-echo "BACK_DIR=$BACK_DIR"
-
-TS="$(date +%s)"
-mkdir -p /root/wolv_backups "$BACK_DIR/routes"
-
-SWAP="$BACK_DIR/routes/swap.routes.js"
-[ -f "$SWAP" ] && cp -a "$SWAP" "/root/wolv_backups/swap.routes.js.$TS.bak" || true
-
-echo "=== Ensure node-fetch installed (CJS) ==="
-cd "$BACK_DIR"
-if [ -f package.json ]; then
-  npm i node-fetch@2 --silent
-else
-  echo "ERR: package.json missing in $BACK_DIR"
-  exit 1
-fi
-
-echo "=== Patch swap.routes.js to use node-fetch@2 ==="
-# If file exists, we keep your current routes, but inject a safe fetch shim at top.
-if [ -f "$SWAP" ]; then
-  cp -a "$SWAP" "/root/wolv_backups/swap.routes.js.preinject.$TS.bak"
-  perl -0777 -i -pe '
-    my $s=$_;
-    if($s !~ /WOLV_FETCH_SHIM_V1/){
-      $s = "/* WOLV_FETCH_SHIM_V1 */\n".
-           "let fetchFn;\n".
-           "try {\n".
-           "  fetchFn = global.fetch;\n".
-           "} catch(e) { fetchFn = null; }\n".
-           "if (!fetchFn) {\n".
-           "  const nf = require(\"node-fetch\");\n".
-           "  fetchFn = nf.default || nf;\n".
-           "}\n".
-           "const fetch = (...args) => fetchFn(...args);\n\n".$s;
-    }
-    $_=$s;
-  ' "$SWAP"
-else
-  echo "ERR: swap.routes.js not found: $SWAP"
-  exit 1
-fi
-
-echo "=== Restart wolverine-api.service ==="
-systemctl restart wolverine-api.service || true
-sleep 1
-
-echo "=== Quick test quote ==="
-curl -sS "http://127.0.0.1:$API_PORT/api/swap/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1&amount=10000000&slippageBps=50" | head -c 220 || true
+echo "=== [A] Basic system info ==="
+node -v || true
+npm -v || true
+date || true
 echo
-echo "DONE ✅"
-echo "Rollback:"
-echo "  [ -f /root/wolv_backups/swap.routes.js.$TS.bak ] && cp -a /root/wolv_backups/swap.routes.js.$TS.bak $SWAP && systemctl restart wolverine-api.service"
+
+echo "=== [B] DNS test ==="
+getent hosts quote-api.jup.ag || true
+cat /etc/resolv.conf || true
+echo
+
+echo "=== [C] CURL direct to Jupiter (HTTPS) ==="
+set +e
+curl -sS -I --max-time 8 https://quote-api.jup.ag/v6/quote | head -n 8
+CURL_RC=$?
+set -e
+echo "curl_rc=$CURL_RC"
+echo
+
+echo "=== [D] Install/repair TLS CA certs + curl ==="
+apt-get update -y >/dev/null 2>&1 || true
+apt-get install -y ca-certificates curl openssl >/dev/null 2>&1 || true
+update-ca-certificates >/dev/null 2>&1 || true
+echo "CA certs refreshed ✅"
+echo
+
+echo "=== [E] CURL real quote (SOL->USDC sample) ==="
+set +e
+curl -sS --max-time 10 \
+"https://quote-api.jup.ag/v6/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1&amount=10000000&slippageBps=50" \
+| head -c 200
+echo
+CURL2_RC=$?
+set -e
+echo "curl_quote_rc=$CURL2_RC"
+echo
+
+echo "=== [F] Node-fetch test (same machine) ==="
+set +e
+node - <<'NODE'
+const fetch = require("node-fetch");
+(async()=>{
+  try{
+    const url="https://quote-api.jup.ag/v6/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1&amount=10000000&slippageBps=50";
+    const r = await fetch(url, { timeout: 10000 });
+    const t = await r.text();
+    console.log("status=", r.status);
+    console.log(t.slice(0,200));
+  }catch(e){
+    console.error("NODE_FETCH_ERR:", e && (e.stack || e.message || e));
+    process.exit(2);
+  }
+})();
+NODE
+NODE_RC=$?
+set -e
+echo "node_fetch_rc=$NODE_RC"
+echo
+
+echo "=== [G] If curl OK but node-fetch fails: show OpenSSL handshake ==="
+set +e
+echo | openssl s_client -connect quote-api.jup.ag:443 -servername quote-api.jup.ag 2>/dev/null | head -n 25
+set -e
+echo
+
+echo "=== DONE ==="
+echo "If CURL_RC!=0 => réseau/DNS/TLS bloqué côté VPS."
+echo "If curl OK and node_fetch fails => problème node runtime/env (proxy/CA) -> on fix dans service."
 BASH
 
-bash /root/WOLV_FIX_FETCH_SWAP_API3002.sh
+bash /root/WOLV_DEBUG_FETCH_FAILED_JUPITER.sh
