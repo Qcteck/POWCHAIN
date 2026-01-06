@@ -1,24 +1,108 @@
-cat >/root/FIX_DNS_RESOLVCONF.sh <<'BASH'
+cat >/root/WOLV_CF_WORKER_SETUP_AND_PATCH.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-cp -a /etc/resolv.conf /etc/resolv.conf.bak.$(date +%s) || true
+### >>> METS ICI TA VRAIE URL WORKER + TOKEN (PAS UN PLACEHOLDER) <<<
+WORKER_URL="https://COLLE_TON_WORKER_ICI.workers.dev"
+RELAY_TOKEN="COLLE_TON_TOKEN_ICI"
+SWAP="/opt/wolverine-api/routes/swap.routes.js"
+### ---------------------------------------------------------------
 
-cat >/etc/resolv.conf <<'EOF'
-nameserver 1.1.1.1
-nameserver 1.0.0.1
-nameserver 8.8.8.8
-nameserver 8.8.4.4
-options timeout:2 attempts:2 rotate
+echo "=== [1] Fix DNS file (resolv.conf) if protected/immutable ==="
+ls -l /etc/resolv.conf || true
+if command -v lsattr >/dev/null 2>&1; then
+  lsattr /etc/resolv.conf || true
+  if lsattr /etc/resolv.conf 2>/dev/null | grep -q '^-i'; then
+    echo "resolv.conf immutable -> chattr -i"
+    chattr -i /etc/resolv.conf || true
+  fi
+fi
+
+if systemctl list-unit-files 2>/dev/null | grep -q '^systemd-resolved\.service'; then
+  mkdir -p /etc/systemd
+  cp -a /etc/systemd/resolved.conf /etc/systemd/resolved.conf.bak.$(date +%s) 2>/dev/null || true
+  if ! grep -q '^\[Resolve\]' /etc/systemd/resolved.conf 2>/dev/null; then
+    cat >/etc/systemd/resolved.conf <<'EOF'
+[Resolve]
+DNS=1.1.1.1 1.0.0.1 8.8.8.8 8.8.4.4
+FallbackDNS=9.9.9.9 149.112.112.112
 EOF
+  else
+    sed -i 's/^#\?DNS=.*/DNS=1.1.1.1 1.0.0.1 8.8.8.8 8.8.4.4/' /etc/systemd/resolved.conf || true
+    if grep -q '^#\?FallbackDNS=' /etc/systemd/resolved.conf; then
+      sed -i 's/^#\?FallbackDNS=.*/FallbackDNS=9.9.9.9 149.112.112.112/' /etc/systemd/resolved.conf || true
+    else
+      echo 'FallbackDNS=9.9.9.9 149.112.112.112' >> /etc/systemd/resolved.conf
+    fi
+  fi
+  systemctl restart systemd-resolved.service || true
+  if [ ! -L /etc/resolv.conf ]; then
+    rm -f /etc/resolv.conf || true
+    ln -s /run/systemd/resolve/resolv.conf /etc/resolv.conf || true
+  fi
+fi
 
-echo "DNS now:"
-cat /etc/resolv.conf
+echo "=== resolv.conf ==="
+cat /etc/resolv.conf || true
 echo
 
-echo "Test:"
-getent hosts workers.dev
-getent hosts cloudflare.com
+echo "=== [2] Validate WORKER_URL resolves ==="
+HOST="$(echo "$WORKER_URL" | sed -E 's#https?://##; s#/.*##')"
+if [[ "$WORKER_URL" == *"COLLE_TON_WORKER"* ]]; then
+  echo "ERR: tu dois remplacer WORKER_URL par l’URL exacte Cloudflare Workers."
+  exit 1
+fi
+echo "WORKER_HOST=$HOST"
+getent hosts workers.dev || true
+getent hosts "$HOST" || { echo "ERR: DNS ne résout pas $HOST (URL worker pas bonne OU workers.dev pas activé)."; exit 1; }
+echo
+
+echo "=== [3] Test direct Worker (force IPv4) ==="
+curl -4 -sS --max-time 10 -H "x-relay-token: $RELAY_TOKEN" \
+"$WORKER_URL/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1&amount=10000000&slippageBps=50" \
+| head -c 200
+echo
+echo
+
+echo "=== [4] Patch wolverine swap.routes.js -> Worker + token ==="
+[ -f "$SWAP" ] || { echo "ERR: $SWAP introuvable"; exit 1; }
+mkdir -p /root/wolv_backups
+cp -a "$SWAP" "/root/wolv_backups/swap.routes.js.$(date +%s).bak" || true
+
+# replace endpoints
+sed -i -E \
+  "s#const JUP_QUOTE = \".*\";#const JUP_QUOTE = \"${WORKER_URL}/quote\";#g; \
+   s#const JUP_SWAP  = \".*\";#const JUP_SWAP  = \"${WORKER_URL}/swap\";#g" \
+  "$SWAP"
+
+# inject header into curlJson base args (only once)
+perl -0777 -i -pe '
+  my $tok = $ENV{"RELAY_TOKEN"} // "";
+  die "RELAY_TOKEN missing\n" if $tok eq "";
+  if($_ !~ /x-relay-token:/){
+    s/\[\s*"-sS"/["-sS","-H","x-relay-token: ".$tok]/s;
+  }
+' "$SWAP" RELAY_TOKEN="$RELAY_TOKEN"
+
+systemctl restart wolverine-api.service || true
+sleep 1
+
+echo "=== [5] Test local API (change port if needed) ==="
+for p in 3002 3050 3000 8080; do
+  if curl -sS --max-time 1 "http://127.0.0.1:$p/api" >/dev/null 2>&1; then
+    echo "API_PORT=$p"
+    curl -sS --max-time 10 \
+      "http://127.0.0.1:$p/api/swap/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1&amount=10000000&slippageBps=50" \
+      | head -c 220
+    echo
+    echo "DONE ✅"
+    exit 0
+  fi
+done
+
+echo "ERR: API port not found (no /api responding)."
+ss -lptn | grep -E 'node|pm2' || true
+exit 1
 BASH
 
-bash /root/FIX_DNS_RESOLVCONF.sh
+bash /root/WOLV_CF_WORKER_SETUP_AND_PATCH.sh
