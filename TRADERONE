@@ -1,38 +1,80 @@
-cat >/root/WOLV_REMOVE_AMCQ.sh <<'BASH'
+cat >/root/WOLV_RECOVER_API_AND_SIGNER_PORTS_NO_AMCQ.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "=== Stop/Disable amcq.service ==="
-if systemctl list-unit-files | grep -q "^amcq.service"; then
-  systemctl stop amcq.service || true
-  systemctl disable amcq.service || true
-  systemctl mask amcq.service || true
-  echo "✅ amcq.service stopped+disabled+masked"
+echo "=== [0] Restart likely API services (NO amcq) ==="
+for s in wolverine-api.service traderone.service; do
+  if systemctl list-unit-files | grep -q "^$s"; then
+    echo "-> restarting $s"
+    systemctl restart "$s" || true
+  fi
+done
+
+echo
+echo "=== [1] Find API port that responds to /api ==="
+API_PORT=""
+PORTS="$(ss -lptn 2>/dev/null | awk '/LISTEN/ && $0~"users:\\(\\(\\"node\\""{print $4}' | sed -E 's/.*:([0-9]+)$/\1/' | sort -nu || true)"
+PORTS="$PORTS 3000 8080 8000 5000 4000 3001 3002"
+
+for p in $PORTS; do
+  if curl -sS --max-time 1 "http://127.0.0.1:$p/api" >/dev/null 2>&1; then
+    API_PORT="$p"; break
+  fi
+done
+
+if [ -z "$API_PORT" ]; then
+  echo "ERR: aucun backend ne répond sur /api (localhost)."
+  echo "Run: ss -lptn | grep node"
+  exit 1
+fi
+echo "✅ API_PORT=$API_PORT"
+
+echo
+echo "=== [2] Ensure qplus-signer is running ==="
+if systemctl list-unit-files | grep -q "^qplus-signer.service"; then
+  systemctl restart qplus-signer.service || true
+  systemctl is-active --quiet qplus-signer.service && echo "✅ qplus-signer.service active" || echo "⚠️ qplus-signer.service NOT active"
 else
-  echo "ℹ️ amcq.service not found"
+  echo "⚠️ qplus-signer.service not installed (unit not found)"
 fi
 
 echo
-echo "=== Kill any leftover node running /root/amcq/server.js (if any) ==="
-pids="$(ps aux | grep -E '[n]ode .*\/root\/amcq\/server\.js' | awk '{print $2}' || true)"
-if [ -n "${pids:-}" ]; then
-  echo "Killing: $pids"
-  kill -9 $pids || true
-else
-  echo "No amcq node process found"
+echo "=== [3] Detect signer port (node listening + cwd match /root/qplus-secure) ==="
+SIGNER_WD="$(systemctl show -p WorkingDirectory --value qplus-signer.service 2>/dev/null || true)"
+SIGNER_WD="${SIGNER_WD:-/root/qplus-secure}"
+SIGNER_WD="$(readlink -f "$SIGNER_WD" 2>/dev/null || echo "$SIGNER_WD")"
+SIGNER_PORT=""
+
+while read -r line; do
+  spid="$(echo "$line" | sed -E 's/.*pid=([0-9]+).*/\1/')"
+  [ -n "$spid" ] || continue
+  cwd="$(readlink -f /proc/$spid/cwd 2>/dev/null || true)"
+  if [ -n "$cwd" ] && [ "$cwd" = "$SIGNER_WD" ]; then
+    SIGNER_PORT="$(echo "$line" | awk '{print $4}' | sed -E 's/.*:([0-9]+)$/\1/')"
+    break
+  fi
+done < <(ss -lptn 2>/dev/null | grep -E 'LISTEN' | grep -E 'users:\(\("node"' || true)
+
+if [ -z "$SIGNER_PORT" ]; then
+  for p in 8787 8788 9000 9010 5001 4001; do
+    if curl -sS --max-time 1 "http://127.0.0.1:$p/health" >/dev/null 2>&1 || \
+       curl -sS --max-time 1 "http://127.0.0.1:$p/" >/dev/null 2>&1; then
+      SIGNER_PORT="$p"; break
+    fi
+  done
 fi
 
-echo
-echo "=== Optional: remove folder /root/amcq (rename backup) ==="
-if [ -d /root/amcq ]; then
-  mv /root/amcq "/root/amcq_DISABLED_$(date +%s)" || true
-  echo "✅ /root/amcq moved to backup folder"
-else
-  echo "ℹ️ /root/amcq not present"
-fi
+echo "SIGNER_WD=$SIGNER_WD"
+echo "SIGNER_PORT=${SIGNER_PORT:-NOT_FOUND}"
 
 echo
-echo "DONE ✅"
+echo "=== [4] Summary ==="
+echo "API:    http://127.0.0.1:$API_PORT/api"
+if [ -n "${SIGNER_PORT:-}" ]; then
+  echo "Signer: http://127.0.0.1:$SIGNER_PORT"
+else
+  echo "Signer: NOT FOUND -> systemctl status qplus-signer.service --no-pager"
+fi
 BASH
 
-bash /root/WOLV_REMOVE_AMCQ.sh
+bash /root/WOLV_RECOVER_API_AND_SIGNER_PORTS_NO_AMCQ.sh
