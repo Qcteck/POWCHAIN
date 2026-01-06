@@ -1,75 +1,70 @@
-cat >/root/WOLV_DEBUG_FETCH_FAILED_JUPITER.sh <<'BASH'
+cat >/root/WOLV_FIX_NODEFETCH_AND_IPV4_JUP.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "=== [A] Basic system info ==="
-node -v || true
-npm -v || true
-date || true
-echo
+BACK_DIR="/opt/wolverine-api"
+SWAP="$BACK_DIR/routes/swap.routes.js"
 
-echo "=== [B] DNS test ==="
-getent hosts quote-api.jup.ag || true
-cat /etc/resolv.conf || true
-echo
+[ -d "$BACK_DIR" ] || { echo "ERR: $BACK_DIR introuvable"; exit 1; }
+[ -f "$BACK_DIR/package.json" ] || { echo "ERR: package.json introuvable dans $BACK_DIR"; exit 1; }
+[ -f "$SWAP" ] || { echo "ERR: swap.routes.js introuvable: $SWAP"; exit 1; }
 
-echo "=== [C] CURL direct to Jupiter (HTTPS) ==="
-set +e
-curl -sS -I --max-time 8 https://quote-api.jup.ag/v6/quote | head -n 8
-CURL_RC=$?
-set -e
-echo "curl_rc=$CURL_RC"
-echo
+TS="$(date +%s)"
+mkdir -p /root/wolv_backups
+cp -a "$SWAP" "/root/wolv_backups/swap.routes.js.$TS.bak"
 
-echo "=== [D] Install/repair TLS CA certs + curl ==="
-apt-get update -y >/dev/null 2>&1 || true
-apt-get install -y ca-certificates curl openssl >/dev/null 2>&1 || true
-update-ca-certificates >/dev/null 2>&1 || true
-echo "CA certs refreshed ✅"
-echo
+echo "=== Install node-fetch@2 (CJS) ==="
+cd "$BACK_DIR"
+npm i node-fetch@2 --silent
 
-echo "=== [E] CURL real quote (SOL->USDC sample) ==="
-set +e
-curl -sS --max-time 10 \
-"https://quote-api.jup.ag/v6/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1&amount=10000000&slippageBps=50" \
-| head -c 200
-echo
-CURL2_RC=$?
-set -e
-echo "curl_quote_rc=$CURL2_RC"
-echo
+echo "=== Inject FETCH+IPv4 shim at top of swap.routes.js ==="
+perl -0777 -i -pe '
+  my $s=$_;
+  if($s !~ /WOLV_FETCH_IPV4_SHIM_V1/){
+    my $shim = "/* WOLV_FETCH_IPV4_SHIM_V1 */\n".
+      "const https = require(\"https\");\n".
+      "let fetchFn = global.fetch;\n".
+      "if (!fetchFn) {\n".
+      "  const nf = require(\"node-fetch\");\n".
+      "  fetchFn = nf.default || nf;\n".
+      "}\n".
+      "const __httpsAgent4 = new https.Agent({ keepAlive: true, family: 4 });\n".
+      "const fetch = (url, opts={}) => fetchFn(url, Object.assign({ agent: __httpsAgent4 }, opts));\n\n";
+    $s = $shim . $s;
+  }
+  $_=$s;
+' "$SWAP"
 
-echo "=== [F] Node-fetch test (same machine) ==="
-set +e
+echo "=== Restart wolverine-api ==="
+systemctl restart wolverine-api.service || true
+sleep 1
+
+echo "=== Node test (Jupiter quote) ==="
 node - <<'NODE'
-const fetch = require("node-fetch");
-(async()=>{
+const nf = require("node-fetch");
+const fetch = nf.default || nf;
+const https = require("https");
+const agent = new https.Agent({ keepAlive:true, family:4 });
+
+(async () => {
+  const url="https://quote-api.jup.ag/v6/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1&amount=10000000&slippageBps=50";
   try{
-    const url="https://quote-api.jup.ag/v6/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1&amount=10000000&slippageBps=50";
-    const r = await fetch(url, { timeout: 10000 });
+    const r = await fetch(url, { agent, timeout: 10000 });
     const t = await r.text();
     console.log("status=", r.status);
     console.log(t.slice(0,200));
+    process.exit(r.ok ? 0 : 2);
   }catch(e){
-    console.error("NODE_FETCH_ERR:", e && (e.stack || e.message || e));
-    process.exit(2);
+    console.error("NODE_ERR:", e && (e.stack||e.message||e));
+    process.exit(3);
   }
 })();
 NODE
-NODE_RC=$?
-set -e
-echo "node_fetch_rc=$NODE_RC"
-echo
 
-echo "=== [G] If curl OK but node-fetch fails: show OpenSSL handshake ==="
-set +e
-echo | openssl s_client -connect quote-api.jup.ag:443 -servername quote-api.jup.ag 2>/dev/null | head -n 25
-set -e
 echo
-
-echo "=== DONE ==="
-echo "If CURL_RC!=0 => réseau/DNS/TLS bloqué côté VPS."
-echo "If curl OK and node_fetch fails => problème node runtime/env (proxy/CA) -> on fix dans service."
+echo "DONE ✅"
+echo "Rollback:"
+echo "  cp -a /root/wolv_backups/swap.routes.js.$TS.bak $SWAP && systemctl restart wolverine-api.service"
 BASH
 
-bash /root/WOLV_DEBUG_FETCH_FAILED_JUPITER.sh
+bash /root/WOLV_FIX_NODEFETCH_AND_IPV4_JUP.sh
