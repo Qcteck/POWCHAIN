@@ -1,40 +1,70 @@
-cat >/root/WOLV_FIX_API_PORT_AFTER_RESTART.sh <<'BASH'
+cat >/root/WOLV_FIX_FETCH_SWAP_API3002.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "=== STATUS: wolverine-api.service ==="
-systemctl status wolverine-api.service --no-pager || true
-echo
+API_PORT=3002
 
-echo "=== LAST LOGS (wolverine-api) ==="
-journalctl -u wolverine-api.service -n 120 --no-pager || true
-echo
+echo "=== Find PID on :$API_PORT ==="
+PID="$(ss -lptn 2>/dev/null | awk -v P=":$API_PORT" '
+  $0 ~ /LISTEN/ && $0 ~ P && $0 ~ /users:\(\("node"/ {
+    match($0, /pid=[0-9]+/); if(RLENGTH){ print substr($0,RSTART+4,RLENGTH-4); exit }
+  }')"
+[ -n "${PID:-}" ] || { echo "ERR: no node on :$API_PORT"; exit 1; }
 
-echo "=== LISTEN ports (node) ==="
-ss -lptn 2>/dev/null | grep -E 'LISTEN' | grep -E 'users:\(\("node"|users:\(\("pm2"|node' || true
-echo
+BACK_DIR="$(readlink -f /proc/$PID/cwd || true)"
+[ -d "$BACK_DIR" ] || { echo "ERR: backend cwd not found"; exit 1; }
+echo "BACK_DIR=$BACK_DIR"
 
-echo "=== Auto-detect API port responding to /api ==="
-API_PORT=""
-PORTS="$(ss -lptn 2>/dev/null | awk '/LISTEN/ && $0~"users:\\(\\(\\"node\\""{print $4}' | sed -E 's/.*:([0-9]+)$/\1/' | sort -nu || true)"
-PORTS="$PORTS 3002 3000 8080 8000 5000 4000 3001 3003"
+TS="$(date +%s)"
+mkdir -p /root/wolv_backups "$BACK_DIR/routes"
 
-for p in $PORTS; do
-  if curl -sS --max-time 1 "http://127.0.0.1:$p/api" >/dev/null 2>&1; then
-    API_PORT="$p"; break
-  fi
-done
+SWAP="$BACK_DIR/routes/swap.routes.js"
+[ -f "$SWAP" ] && cp -a "$SWAP" "/root/wolv_backups/swap.routes.js.$TS.bak" || true
 
-echo "API_PORT=${API_PORT:-NOT_FOUND}"
-if [ -n "${API_PORT:-}" ]; then
-  echo
-  echo "=== TEST /api/swap/quote on :$API_PORT ==="
-  curl -sS "http://127.0.0.1:$API_PORT/api/swap/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1&amount=10000000&slippageBps=50" | head -c 200 || true
-  echo
+echo "=== Ensure node-fetch installed (CJS) ==="
+cd "$BACK_DIR"
+if [ -f package.json ]; then
+  npm i node-fetch@2 --silent
+else
+  echo "ERR: package.json missing in $BACK_DIR"
+  exit 1
 fi
 
+echo "=== Patch swap.routes.js to use node-fetch@2 ==="
+# If file exists, we keep your current routes, but inject a safe fetch shim at top.
+if [ -f "$SWAP" ]; then
+  cp -a "$SWAP" "/root/wolv_backups/swap.routes.js.preinject.$TS.bak"
+  perl -0777 -i -pe '
+    my $s=$_;
+    if($s !~ /WOLV_FETCH_SHIM_V1/){
+      $s = "/* WOLV_FETCH_SHIM_V1 */\n".
+           "let fetchFn;\n".
+           "try {\n".
+           "  fetchFn = global.fetch;\n".
+           "} catch(e) { fetchFn = null; }\n".
+           "if (!fetchFn) {\n".
+           "  const nf = require(\"node-fetch\");\n".
+           "  fetchFn = nf.default || nf;\n".
+           "}\n".
+           "const fetch = (...args) => fetchFn(...args);\n\n".$s;
+    }
+    $_=$s;
+  ' "$SWAP"
+else
+  echo "ERR: swap.routes.js not found: $SWAP"
+  exit 1
+fi
+
+echo "=== Restart wolverine-api.service ==="
+systemctl restart wolverine-api.service || true
+sleep 1
+
+echo "=== Quick test quote ==="
+curl -sS "http://127.0.0.1:$API_PORT/api/swap/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1&amount=10000000&slippageBps=50" | head -c 220 || true
 echo
-echo "DONE"
+echo "DONE ✅"
+echo "Rollback:"
+echo "  [ -f /root/wolv_backups/swap.routes.js.$TS.bak ] && cp -a /root/wolv_backups/swap.routes.js.$TS.bak $SWAP && systemctl restart wolverine-api.service"
 BASH
 
-bash /root/WOLV_FIX_API_PORT_AFTER_RESTART.sh
+bash /root/WOLV_FIX_FETCH_SWAP_API3002.sh
