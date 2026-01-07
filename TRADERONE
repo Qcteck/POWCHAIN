@@ -1,44 +1,34 @@
 set -e
 cd /root
 
-echo "=== 1) Trouver où /api/status est géré (ou où 'internal' est renvoyé) ==="
-HIT="$(grep -RIn --line-number -E '/api/status|engine\.status\(|res\.json\(|internal"' /opt 2>/dev/null | head -n 1 || true)"
+echo "=== 1) Trouver le fichier qui contient /api/status ==="
+HIT="$(grep -RIn --line-number 'app\.post\(["'\'']\/api\/status' /opt 2>/dev/null | head -n 1 || true)"
 echo "HIT=$HIT"
 
 FILE="$(echo "$HIT" | cut -d: -f1)"
-LINE="$(echo "$HIT" | cut -d: -f2)"
-
-if [ -z "$FILE" ] || [ ! -f "$FILE" ]; then
-  echo "!! Pas trouvé automatiquement. Colle la sortie de:"
-  echo "grep -RIn --line-number -E '/api/status|internal\"' /opt 2>/dev/null | head -n 50"
-  exit 1
-fi
+[ -f "$FILE" ] || { echo "Introuvable. Colle: grep -RIn '\/api\/status' /opt | head"; exit 1; }
 
 echo
-echo "=== 2) Backup + contexte ==="
+echo "=== 2) Backup ==="
 mkdir -p /root/traderone_backups
 cp -v "$FILE" "/root/traderone_backups/$(basename "$FILE").$(date +%Y%m%d_%H%M%S)"
-START=$((LINE-20)); [ "$START" -lt 1 ] && START=1
-END=$((LINE+20))
-nl -ba "$FILE" | awk -v s="$START" -v e="$END" '$1>=s && $1<=e{print}'
 
 echo
-echo "=== 3) Patch: supprime internal de la réponse /status (patterns courants Node/Express) ==="
-perl -pi -e '
-  s/res\.json\s*\(\s*engine\.status\(\)\s*\)\s*;/const s = engine.status(); delete s.internal; res.json(s);/g;
-  s/return\s+json\s*\(\s*res\s*,\s*engine\.status\(\)\s*\)\s*;/const s = engine.status(); delete s.internal; return json(res, s);/g;
-' "$FILE"
-
-echo "--- Vérif patch ---"
-grep -n "delete s\.internal" "$FILE" || { echo "!! Patch auto pas appliqué (handler différent). Colle les 30 lignes affichées au-dessus."; exit 1; }
+echo "=== 3) Patch: supprimer la propriété internal: ... (ligne) ==="
+# enlève toute ligne "internal: ..." dans l'objet json du status
+perl -pi -e 's/^\s*internal\s*:\s*.*?,\s*$//mg' "$FILE"
 
 echo
-echo "=== 4) Restart (tente plusieurs) ==="
+echo "=== 4) Vérif (ne doit plus trouver 'internal:' dans /api/status) ==="
+grep -n 'internal\s*:' "$FILE" || echo "OK: plus de internal:"
+
+echo
+echo "=== 5) Restart ==="
 systemctl restart traderone 2>/dev/null || true
 systemctl restart wolverine 2>/dev/null || true
 pm2 restart traderone 2>/dev/null || true
 pm2 restart all 2>/dev/null || true
 
 echo
-echo "=== 5) Test direct backend: internal doit DISPARAÎTRE ==="
+echo "=== 6) Test direct backend (DOIT NE PLUS contenir internal) ==="
 curl -sS -X POST http://127.0.0.1:3000/api/status -H "content-type: application/json" --data '{}' ; echo
