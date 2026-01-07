@@ -1,31 +1,74 @@
 set -e
 cd /root
 
-echo "=== 1) TEST POST sur le gateway (3002) ==="
-curl -sS -i -X POST "http://127.0.0.1:3002/wolverine/api/status" \
-  -H "content-type: application/json" --data '{}' | head -n 40 || true
+F="/opt/wolverine-api/server.js"
+cp -v "$F" "/root/wolverine-api.server.js.$(date +%Y%m%d_%H%M%S).bak"
 
-echo
-echo "=== 2) Montre le handler gateway (autour de app.use /wolverine/api/) ==="
-nl -ba /opt/wolverine-api/server.js | sed -n '100,160p'
+# Injecte un proxy /api/* avant app.listen(...) si pas déjà présent
+python3 - <<'PY'
+import re, pathlib
+p = pathlib.Path("/opt/wolverine-api/server.js")
+s = p.read_text()
 
-echo
-echo "=== 3) PATCH: gateway forward req.method + body (backup + edit) ==="
-cp -v /opt/wolverine-api/server.js "/root/wolverine-api.server.js.$(date +%Y%m%d_%H%M%S).bak"
+if 'LEGACY_PROXY_API_TO_3000' in s:
+    print("OK: proxy /api/* déjà présent")
+    raise SystemExit(0)
 
-# Remplace un "method: 'GET'" (si présent) par "method: req.method"
-perl -pi -e "s/method:\s*'GET'/method: req.method/g" /opt/wolverine-api/server.js
+m = re.search(r'^\s*app\.listen\(', s, flags=re.M)
+if not m:
+    raise SystemExit("ERREUR: app.listen(...) introuvable dans server.js")
 
-# Si le gateway utilise fetch(), on injecte un body conditionnel (POST/PUT/PATCH)
-# (ça n'ajoute le body que si on voit 'fetch(' dans le fichier)
-if grep -q "fetch(" /opt/wolverine-api/server.js; then
-  perl -0777 -i -pe 's/(fetch\(\s*upstreamUrl\s*,\s*\{\s*\n(?:[^\}]*\n)*?method:\s*req\.method\s*,\s*\n)/$1  body: (req.method === "GET" || req.method === "HEAD") ? undefined : JSON.stringify(req.body || {}),\n/s' /opt/wolverine-api/server.js || true
-fi
+inject = r'''
+// === LEGACY_PROXY_API_TO_3000 ===
+// Permet POST/GET/etc sur /api/* (ex: /api/status) via Wolverine (3002) -> TraderOne (3000)
+const __fetch = (global.fetch ? global.fetch : require("node-fetch"));
+app.use("/api/", async (req, res) => {
+  try {
+    const suffix = (req.originalUrl || req.url).replace(/^\/api\//, "");
+    const url = "http://127.0.0.1:3000/api/" + suffix;
+
+    const headers = { ...(req.headers || {}) };
+    delete headers.host;
+
+    const init = {
+      method: req.method,
+      headers,
+    };
+
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      // Si req.body existe déjà, on le forward, sinon on laisse vide
+      init.body = (req.body !== undefined) ? JSON.stringify(req.body) : "{}";
+      if (!init.headers["content-type"]) init.headers["content-type"] = "application/json";
+    }
+
+    const r = await __fetch(url, init);
+    const text = await r.text();
+    res.status(r.status);
+
+    // forward content-type si présent
+    const ct = r.headers.get("content-type");
+    if (ct) res.set("content-type", ct);
+
+    res.send(text);
+  } catch (e) {
+    res.status(502).json({ ok: false, err: "proxy_fail", detail: String(e) });
+  }
+});
+// === /LEGACY_PROXY_API_TO_3000 ===
+
+'''
+
+s2 = s[:m.start()] + inject + s[m.start():]
+p.write_text(s2)
+print("OK: proxy /api/* injecté")
+PY
 
 systemctl restart wolverine-api.service
 sleep 1
 
+echo "=== TEST 1: POST /api/status via 3002 (doit plus faire Cannot POST) ==="
+curl -sS -i -X POST "http://127.0.0.1:3002/api/status" -H "content-type: application/json" --data '{}' | head -n 40
+
 echo
-echo "=== 4) RE-TEST POST gateway (3002) ==="
-curl -sS -i -X POST "http://127.0.0.1:3002/wolverine/api/status" \
-  -H "content-type: application/json" --data '{}' | head -n 60 || true
+echo "=== TEST 2: POST /wolverine/api/status via 3002 (si tu veux) ==="
+curl -sS -i -X POST "http://127.0.0.1:3002/wolverine/api/status" -H "content-type: application/json" --data '{}' | head -n 40
