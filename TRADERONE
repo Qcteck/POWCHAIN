@@ -1,5 +1,37 @@
-KEY=$(grep -oP 'http_x_api_key != "\K[^"]+' /etc/nginx/sites-enabled/fireinners.online-ssl | head -n1)
-curl -sS -i -X POST "https://fireinners.online/wolverine/traderone/api/status" \
-  -H "content-type: application/json" \
-  -H "X-API-KEY: $KEY" \
-  --data '{}' | head -n 25 
+set -e
+cd /root
+mkdir -p /root/nginx_backups
+
+# 1) Génère une nouvelle clé et la stocke dans un fichier root-only
+NEWKEY="$(openssl rand -hex 32)"
+KEYFILE="/root/x_api_key_$(date +%Y%m%d_%H%M%S).txt"
+umask 077
+printf "%s" "$NEWKEY" > "$KEYFILE"
+echo "OK: nouvelle clé stockée dans $KEYFILE (permissions 600)"
+
+# 2) Remplace la clé dans les 2 vhosts (http + ssl) sans l’afficher
+for f in /etc/nginx/sites-enabled/fireinners.online /etc/nginx/sites-enabled/fireinners.online-ssl; do
+  [ -f "$f" ] || continue
+  cp -v "$f" "/root/nginx_backups/$(basename "$f").rotate_key.$(date +%Y%m%d_%H%M%S)"
+  sed -i -E 's/(http_x_api_key != ")[^"]+(")/\1'"$NEWKEY"'\2/g' "$f"
+done
+
+nginx -t
+systemctl reload nginx
+
+# 3) Tests PUBLIC: sans clé => 403, avec clé => 200 (la clé ne s’affiche pas)
+BASE="https://fireinners.online/wolverine/traderone/api/status"
+
+echo
+echo "=== SANS clé => 403 attendu ==="
+curl -sS -i -X POST "$BASE" -H "content-type: application/json" --data '{}' | head -n 15
+
+echo
+echo "=== AVEC nouvelle clé => 200 attendu ==="
+KEY="$(cat "$KEYFILE")"
+curl -sS -i -X POST "$BASE" -H "content-type: application/json" -H "X-API-KEY: $KEY" --data '{}' | head -n 25
+
+# 4) Affiche juste l’empreinte (pas la clé)
+echo
+echo "=== Empreinte SHA256 de la clé (à garder) ==="
+printf "%s" "$KEY" | sha256sum
