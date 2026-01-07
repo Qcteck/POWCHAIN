@@ -1,33 +1,44 @@
 set -e
 cd /root
 
-BLOCK='location ^~ /wolverine/traderone/api/ {
-  proxy_pass http://127.0.0.1:3000/api/;
-  proxy_set_header Host $host;
-  proxy_set_header X-Real-IP $remote_addr;
-  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-}'
+echo "=== 0) Erreur nginx actuelle (complète) ==="
+nginx -t 2>&1 || true
 
+echo
+echo "=== 1) Trouve TOUTES les proxy_set_header vides (valeur manquante) ==="
+# match: proxy_set_header <NAME> ;
+grep -RIn --line-number --color=always -E 'proxy_set_header[[:space:]]+[A-Za-z0-9_-]+[[:space:]]*;' \
+  /etc/nginx/nginx.conf /etc/nginx/sites-enabled /etc/nginx/conf.d 2>/dev/null | head -n 200 || true
+
+echo
+echo "=== 2) Backup des vhosts (on patch surtout fireinners) ==="
 for f in /etc/nginx/sites-enabled/fireinners.online /etc/nginx/sites-enabled/fireinners.online-ssl; do
   [ -f "$f" ] || continue
-  echo "PATCH $f"
   cp -v "$f" "$f.bak.$(date +%Y%m%d_%H%M%S)"
-
-  # Remplace complètement le bloc existant /wolverine/traderone/api/
-  perl -0777 -i -pe "s#location\\s+\\^~\\s+/wolverine/traderone/api/\\s*\\{.*?\\}#$BLOCK#sg" "$f"
 done
 
 echo
-echo "=== nginx -t + reload ==="
+echo "=== 3) Patch: remplace proxy_set_header vides (même si 2 sur une ligne) ==="
+for f in /etc/nginx/nginx.conf /etc/nginx/sites-enabled/fireinners.online /etc/nginx/sites-enabled/fireinners.online-ssl; do
+  [ -f "$f" ] || continue
+  echo "PATCH $f"
+
+  # Host
+  perl -pi -e 's/\bproxy_set_header\s+Host\s*;\s*/proxy_set_header Host $host;\n/g' "$f"
+  # X-Real-IP
+  perl -pi -e 's/\bproxy_set_header\s+X-Real-IP\s*;\s*/proxy_set_header X-Real-IP $remote_addr;\n/g' "$f"
+  # X-Forwarded-For
+  perl -pi -e 's/\bproxy_set_header\s+X-Forwarded-For\s*;\s*/proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n/g' "$f"
+  # X-Forwarded-Proto
+  perl -pi -e 's/\bproxy_set_header\s+X-Forwarded-Proto\s*;\s*/proxy_set_header X-Forwarded-Proto $scheme;\n/g' "$f"
+done
+
+echo
+echo "=== 4) Re-scan (il ne doit plus rien rester) ==="
+grep -RIn -E 'proxy_set_header[[:space:]]+[A-Za-z0-9_-]+[[:space:]]*;' \
+  /etc/nginx/nginx.conf /etc/nginx/sites-enabled/fireinners.online /etc/nginx/sites-enabled/fireinners.online-ssl 2>/dev/null || true
+
+echo
+echo "=== 5) nginx -t + reload ==="
 nginx -t
 systemctl reload nginx
-
-echo
-echo "=== Test LOCAL via nginx ==="
-curl -sS -i -X POST -H "Host: fireinners.online" -H "content-type: application/json" \
-  http://127.0.0.1/wolverine/traderone/api/status --data '{}' | head -n 40
-
-echo
-echo "=== Test PUBLIC ==="
-BASE="https://fireinners.online/wolverine/traderone/api"
-curl -sS -i -X POST "$BASE/status" -H "content-type: application/json" --data '{}' | head -n 40
