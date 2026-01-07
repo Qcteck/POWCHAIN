@@ -1,5 +1,51 @@
+set -e
+cd /root
 
-KEY="f8c134653272bb613bb70fb0c3d54c7df89210c146f9f5cd8284130c53dcb19e"
-curl -sS -i -X POST "https://fireinners.online/wolverine/traderone/api/status" \
-  -H "content-type: application/json" \
-  -H "X-API-KEY: $KEY" --data '{}' | head -n 20
+echo "=== 1) Trouver le handler /api/status ==="
+# on cherche d'abord la route, puis fallback sur "internal" si besoin
+grep -RIn --line-number -E '/api/status|wolverine/traderone/api/status' /opt 2>/dev/null | head -n 30 || true
+echo
+HIT="$(grep -RIn --line-number -E '/api/status' /opt 2>/dev/null | head -n 1 || true)"
+
+if [ -z "$HIT" ]; then
+  echo "!! Pas trouvé /api/status direct. Fallback: cherche internal + status"
+  HIT="$(grep -RIn --line-number -E 'internal.*status|status.*internal' /opt 2>/dev/null | head -n 1 || true)"
+fi
+
+echo "HIT=$HIT"
+FILE="$(echo "$HIT" | cut -d: -f1)"
+[ -f "$FILE" ] || { echo "!! Je n'ai pas trouvé le fichier. Colle-moi la sortie de: grep -RIn \"/api/status\" /opt | head"; exit 1; }
+
+echo
+echo "=== 2) Backup + patch (supprime internal de la réponse) ==="
+mkdir -p /root/traderone_backups
+cp -v "$FILE" "/root/traderone_backups/$(basename "$FILE").$(date +%Y%m%d_%H%M%S)"
+
+# Patch patterns courants Node/Express:
+# - res.json(engine.status())
+# - return json(res, engine.status())
+perl -pi -e '
+  s/res\.json\s*\(\s*engine\.status\(\)\s*\)\s*;/const s = engine.status(); delete s.internal; res.json(s);/g;
+  s/return\s+json\s*\(\s*res\s*,\s*engine\.status\(\)\s*\)\s*;/const s = engine.status(); delete s.internal; return json(res, s);/g;
+' "$FILE"
+
+echo "--- Vérif (doit trouver delete s.internal) ---"
+grep -n "delete s\.internal" "$FILE" || {
+  echo "!! Patch auto non appliqué. Affiche 30 lignes autour du HIT:"
+  L="$(echo "$HIT" | cut -d: -f2)"
+  START=$((L-15)); [ "$START" -lt 1 ] && START=1
+  END=$((L+15))
+  nl -ba "$FILE" | awk -v s="$START" -v e="$END" '$1>=s && $1<=e{print}'
+  exit 1
+}
+
+echo
+echo "=== 3) Restart (essaie plusieurs méthodes) ==="
+systemctl restart traderone 2>/dev/null || true
+systemctl restart wolverine 2>/dev/null || true
+pm2 restart traderone 2>/dev/null || true
+pm2 restart all 2>/dev/null || true
+
+echo
+echo "=== 4) Test direct backend: internal doit DISPARAÎTRE ==="
+curl -sS -X POST http://127.0.0.1:3000/api/status -H "content-type: application/json" --data '{}' ; echo
