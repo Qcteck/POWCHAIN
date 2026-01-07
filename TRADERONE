@@ -1,33 +1,34 @@
 set -e
 cd /root
 
-# 1) nouvelle clé
-KEY="$(openssl rand -hex 32)"
-echo "=== NOUVELLE KEY (à garder) ==="
-echo "$KEY"
-
-# 2) backups
-mkdir -p /root/nginx_backups
-cp -v /etc/nginx/sites-enabled/fireinners.online     "/root/nginx_backups/fireinners.online.$(date +%Y%m%d_%H%M%S)"
-cp -v /etc/nginx/sites-enabled/fireinners.online-ssl "/root/nginx_backups/fireinners.online-ssl.$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
-
-# 3) remplace la clé dans les 2 fichiers (ligne if ($http_x_api_key != "..."))
-for f in /etc/nginx/sites-enabled/fireinners.online /etc/nginx/sites-enabled/fireinners.online-ssl; do
-  [ -f "$f" ] || continue
-  sed -i -E 's/if \(\$http_x_api_key != ".*"\) \{ return 403; \}/if (\$http_x_api_key != "'"$KEY"'") { return 403; }/g' "$f"
-done
-
-# 4) test + reload
-nginx -t
-systemctl reload nginx
-
-# 5) tests
-BASE="https://fireinners.online/wolverine/traderone/api"
+echo "=== 1) Où est /api/status ? ==="
+HIT="$(grep -RIn --line-number -E '/api/status|engine\.status\(|status\(\)' /opt/traderone /opt/wolverine /opt 2>/dev/null | head -n 1 || true)"
+echo "$HIT"
+FILE="$(echo "$HIT" | cut -d: -f1)"
+[ -f "$FILE" ] || { echo "Je n'ai pas trouvé le fichier du handler. Colle-moi la sortie de la commande ci-dessus."; exit 1; }
 
 echo
-echo "=== sans clé (403 attendu) ==="
-curl -sS -i -X POST "$BASE/status" -H "content-type: application/json" --data '{}' | head -n 15
+echo "=== 2) Backup + patch (retire internal de la réponse) ==="
+mkdir -p /root/traderone_backups
+cp -v "$FILE" "/root/traderone_backups/$(basename "$FILE").$(date +%Y%m%d_%H%M%S)"
+
+# Patch le pattern le plus courant: return json(res, engine.status());
+perl -pi -e '
+  s/return\s+json\s*\(\s*res\s*,\s*engine\.status\(\)\s*\)\s*;/
+    const s = engine.status(); delete s.internal; return json(res, s);
+  /g
+' "$FILE"
+
+echo "--- Vérif patch ---"
+grep -n "delete s\.internal" "$FILE" || { echo "Patch non appliqué automatiquement. Montre-moi 15 lignes autour de /api/status dans $FILE."; exit 1; }
 
 echo
-echo "=== avec clé (200 attendu) ==="
-curl -sS -i -X POST "$BASE/status" -H "content-type: application/json" -H "X-API-KEY: $KEY" --data '{}' | head -n 15
+echo "=== 3) Restart (essaie plusieurs méthodes) ==="
+systemctl restart traderone 2>/dev/null || true
+systemctl restart wolverine 2>/dev/null || true
+pm2 restart traderone 2>/dev/null || true
+pm2 restart all 2>/dev/null || true
+
+echo
+echo "=== 4) Test DIRECT backend (doit NE PLUS contenir internal) ==="
+curl -sS -X POST http://127.0.0.1:3000/api/status -H "content-type: application/json" --data '{}' ; echo
