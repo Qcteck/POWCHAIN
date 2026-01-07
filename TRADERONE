@@ -3,24 +3,44 @@ cd /root
 
 KEY="CHANGE-MOI-EN-UNE-GROSSE-CLE-64CHARS"
 
+echo "=== 1) Backup ==="
+mkdir -p /root/nginx_backups
+cp -v /etc/nginx/nginx.conf "/root/nginx_backups/nginx.conf.$(date +%Y%m%d_%H%M%S)"
+
 for f in /etc/nginx/sites-enabled/fireinners.online /etc/nginx/sites-enabled/fireinners.online-ssl; do
   [ -f "$f" ] || continue
   cp -v "$f" "/root/nginx_backups/$(basename "$f").$(date +%Y%m%d_%H%M%S)"
-
-  # insère le check juste après l’ouverture du bloc location API
-  perl -0777 -i -pe 's#(location\s+\^~\s+/wolverine/traderone/api/\s*\{\n)#$1  if (\$http_x_api_key != "'"$KEY"'") { return 403; }\n#s' "$f"
 done
 
+echo
+echo "=== 2) Ajoute un map dans nginx.conf (http{}) si absent ==="
+if ! grep -q 'map $http_x_api_key $traderone_ok' /etc/nginx/nginx.conf; then
+  perl -0777 -i -pe 's#http\s*\{#http {\n\n  map $http_x_api_key $traderone_ok {\n    default 0;\n    "'"$KEY"'" 1;\n  }\n#s' /etc/nginx/nginx.conf
+fi
+
+echo
+echo "=== 3) Ajoute le guard (403) dans les 2 vhosts, dans le location traderone ==="
+for f in /etc/nginx/sites-enabled/fireinners.online /etc/nginx/sites-enabled/fireinners.online-ssl; do
+  [ -f "$f" ] || continue
+
+  # injecte la ligne juste après l'ouverture du bloc location ^~ /wolverine/traderone/api/
+  perl -0777 -i -pe '
+    s#(location\s+\^~\s+/wolverine/traderone/api/\s*\{\n)(?!\s*if\s*\(\$traderone_ok)#${1}  if ($traderone_ok = 0) { return 403; }\n#s
+  ' "$f"
+done
+
+echo
+echo "=== 4) nginx -t + reload ==="
 nginx -t
 systemctl reload nginx
 
-
-
-
+echo
+echo "=== 5) Tests (sans clé = 403, avec clé = 200) ==="
 BASE="https://fireinners.online/wolverine/traderone/api"
 
-# doit faire 403
-curl -sS -i -X POST "$BASE/status" -H "content-type: application/json" --data '{}' | head -n 20
+echo "--- sans clé (doit être 403) ---"
+curl -sS -i -X POST "$BASE/status" -H "content-type: application/json" --data '{}' | head -n 15
 
-# doit faire 200
-curl -sS -i -X POST "$BASE/status" -H "content-type: application/json" -H "X-API-KEY: CHANGE-MOI-EN-UNE-GROSSE-CLE-64CHARS" --data '{}' | head -n 20
+echo
+echo "--- avec clé (doit être 200) ---"
+curl -sS -i -X POST "$BASE/status" -H "content-type: application/json" -H "X-API-KEY: $KEY" --data '{}' | head -n 15
