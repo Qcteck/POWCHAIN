@@ -1,74 +1,26 @@
 set -e
 cd /root
 
-F="/opt/wolverine-api/server.js"
-cp -v "$F" "/root/wolverine-api.server.js.$(date +%Y%m%d_%H%M%S).bak"
+F="/opt/traderone-opt/server.js"
+[ -f "$F" ] || { echo "Introuvable: $F"; exit 1; }
 
-# Injecte un proxy /api/* avant app.listen(...) si pas déjà présent
-python3 - <<'PY'
-import re, pathlib
-p = pathlib.Path("/opt/wolverine-api/server.js")
-s = p.read_text()
+mkdir -p /root/traderone_backups
+cp -v "$F" "/root/traderone_backups/server.js.$(date +%Y%m%d_%H%M%S).bak"
 
-if 'LEGACY_PROXY_API_TO_3000' in s:
-    print("OK: proxy /api/* déjà présent")
-    raise SystemExit(0)
+echo "=== Patch: app.get('/api/status'...) -> app.all('/api/status'...) ==="
+sed -i -E 's/\bapp\.get\((\s*["'\'']\/api\/status\b)/app.all(\1/g' "$F"
 
-m = re.search(r'^\s*app\.listen\(', s, flags=re.M)
-if not m:
-    raise SystemExit("ERREUR: app.listen(...) introuvable dans server.js")
+echo "=== Vérif (doit montrer app.all('/api/status'...) ==="
+grep -nE "app\.(all|get|post)\(\s*['\"]/api/status" "$F" || true
 
-inject = r'''
-// === LEGACY_PROXY_API_TO_3000 ===
-// Permet POST/GET/etc sur /api/* (ex: /api/status) via Wolverine (3002) -> TraderOne (3000)
-const __fetch = (global.fetch ? global.fetch : require("node-fetch"));
-app.use("/api/", async (req, res) => {
-  try {
-    const suffix = (req.originalUrl || req.url).replace(/^\/api\//, "");
-    const url = "http://127.0.0.1:3000/api/" + suffix;
+echo "=== Restart traderone ==="
+pm2 restart traderone --update-env || pm2 restart all --update-env
 
-    const headers = { ...(req.headers || {}) };
-    delete headers.host;
-
-    const init = {
-      method: req.method,
-      headers,
-    };
-
-    if (req.method !== "GET" && req.method !== "HEAD") {
-      // Si req.body existe déjà, on le forward, sinon on laisse vide
-      init.body = (req.body !== undefined) ? JSON.stringify(req.body) : "{}";
-      if (!init.headers["content-type"]) init.headers["content-type"] = "application/json";
-    }
-
-    const r = await __fetch(url, init);
-    const text = await r.text();
-    res.status(r.status);
-
-    // forward content-type si présent
-    const ct = r.headers.get("content-type");
-    if (ct) res.set("content-type", ct);
-
-    res.send(text);
-  } catch (e) {
-    res.status(502).json({ ok: false, err: "proxy_fail", detail: String(e) });
-  }
-});
-// === /LEGACY_PROXY_API_TO_3000 ===
-
-'''
-
-s2 = s[:m.start()] + inject + s[m.start():]
-p.write_text(s2)
-print("OK: proxy /api/* injecté")
-PY
-
-systemctl restart wolverine-api.service
 sleep 1
-
-echo "=== TEST 1: POST /api/status via 3002 (doit plus faire Cannot POST) ==="
-curl -sS -i -X POST "http://127.0.0.1:3002/api/status" -H "content-type: application/json" --data '{}' | head -n 40
+echo
+echo "=== TEST A: POST direct sur 3000 ==="
+curl -sS -i -X POST "http://127.0.0.1:3000/api/status" -H "content-type: application/json" --data '{}' | head -n 40
 
 echo
-echo "=== TEST 2: POST /wolverine/api/status via 3002 (si tu veux) ==="
+echo "=== TEST B: POST via gateway 3002 (/wolverine/api) ==="
 curl -sS -i -X POST "http://127.0.0.1:3002/wolverine/api/status" -H "content-type: application/json" --data '{}' | head -n 40
