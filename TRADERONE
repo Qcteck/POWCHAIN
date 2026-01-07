@@ -1,42 +1,22 @@
 set -e
 cd /root
 
-echo "=== 1) nginx -t (capture) ==="
-ERR="$(nginx -t 2>&1 || true)"
-echo "$ERR" | tail -n 60
+KEY="CHANGE-MOI-EN-UNE-GROSSE-CLE-64CHARS"
 
-FILE="$(echo "$ERR" | sed -n 's/.* in \(\/[^:]*\):\([0-9]\+\).*/\1/p' | head -n 1)"
-LINE="$(echo "$ERR" | sed -n 's/.* in \(\/[^:]*\):\([0-9]\+\).*/\2/p' | head -n 1)"
-echo "FILE=$FILE"
-echo "LINE=$LINE"
-
-if [ -z "$FILE" ] || [ -z "$LINE" ] || [ ! -f "$FILE" ]; then
-  echo "Impossible d'extraire FILE/LINE. Colle: nginx -t 2>&1 | tail -n 60"
-  exit 1
-fi
-
-echo
-echo "=== 2) Contexte (sans index négatif) ==="
-START=$((LINE-30)); [ "$START" -lt 1 ] && START=1
-END=$((LINE+30))
-awk -v s="$START" -v e="$END" 'NR>=s && NR<=e {printf "%5d  %s\n", NR, $0}' "$FILE"
-
-echo
-echo "=== 3) Backup du fichier fautif ==="
 mkdir -p /root/nginx_backups
-cp -v "$FILE" "/root/nginx_backups/$(basename "$FILE").$(date +%Y%m%d_%H%M%S)"
+for f in /etc/nginx/sites-enabled/fireinners.online /etc/nginx/sites-enabled/fireinners.online-ssl; do
+  [ -f "$f" ] || continue
+  cp -v "$f" "/root/nginx_backups/$(basename "$f").$(date +%Y%m%d_%H%M%S)"
 
-if [ "$FILE" = "/etc/nginx/nginx.conf" ]; then
-  echo
-  echo "=== 4) Nettoyage nginx.conf (retire map traderone_ok + if traderone mal placé) ==="
-  # supprime blocs map $http_x_api_key $traderone_ok {...}
-  perl -0777 -i -pe 's/\n\s*map\s+\$http_x_api_key\s+\$traderone_ok\s*\{.*?\}\s*\n/\n/sg' /etc/nginx/nginx.conf
-  # supprime toute ligne "if (...traderone...)" dans nginx.conf (ça doit être dans les vhosts, pas ici)
-  sed -i '/^[[:space:]]*if[[:space:]]*(.*traderone.*)[[:space:]]*{.*$/d' /etc/nginx/nginx.conf
-  sed -i '/^[[:space:]]*if[[:space:]]*(.*traderone_ok.*)[[:space:]]*{.*$/d' /etc/nginx/nginx.conf
-fi
+  # 1) supprime la ligne invalide "if ( = 0) { ... }"
+  sed -i -E '/^[[:space:]]*if[[:space:]]*\([[:space:]]*=[[:space:]]*0[[:space:]]*\)[[:space:]]*\{[[:space:]]*return[[:space:]]+403;[[:space:]]*\}[[:space:]]*$/d' "$f"
 
-echo
-echo "=== 5) Re-test + reload ==="
+  # 2) supprime toutes les lignes if ($http_x_api_key != ...) (on les remet propres après)
+  sed -i -E '/^[[:space:]]*if[[:space:]]*\(\$http_x_api_key[[:space:]]*!=[[:space:]]*".*"\)[[:space:]]*\{[[:space:]]*return[[:space:]]+403;[[:space:]]*\}[[:space:]]*$/d' "$f"
+
+  # 3) ré-injecte UN SEUL check juste après l’ouverture du location traderone
+  perl -0777 -i -pe 's#(location\s+\^~\s+/wolverine/traderone/api/\s*\{\n)#$1  if (\$http_x_api_key != "'"$KEY"'") { return 403; }\n#s' "$f"
+done
+
 nginx -t
 systemctl reload nginx
