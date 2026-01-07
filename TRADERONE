@@ -1,47 +1,27 @@
 set -e
 cd /root
 
-fix_loc () {
+add_keystate () {
   local f="$1"
   [ -f "$f" ] || return 0
 
-  mkdir -p /root/nginx_backups
-  cp -v "$f" "/root/nginx_backups/$(basename "$f").authfix.$(date +%Y%m%d_%H%M%S)"
+  cp -v "$f" "/root/nginx_backups/$(basename "$f").keystate.$(date +%Y%m%d_%H%M%S)"
 
-  # récupère la clé existante sans l'afficher
-  KEY="$(sed -n 's/.*http_x_api_key[[:space:]]*!=[[:space:]]*"\([^"]*\)".*/\1/p' "$f" | head -n 1)"
-  [ -n "$KEY" ] || { echo "KEY introuvable dans $f"; exit 1; }
-
-  awk -v key="$KEY" '
-    BEGIN{inblk=0}
-    /^location[[:space:]]+(\^~|~\^|~)[[:space:]]+\/wolverine\/traderone\/api\/[[:space:]]*\{/{
-      inblk=1
-      print "location ^~ /wolverine/traderone/api/ {"
-      print "  add_header X-MATCH traderone-api always;"
-      print "  if ($http_x_api_key = \"\") { return 403; }"
-      print "  if ($http_x_api_key != \"" key "\") { return 403; }"
-      print "  proxy_pass http://127.0.0.1:3002/wolverine/api/;"
-      print "  proxy_set_header Host $host;"
-      print "  proxy_set_header X-Real-IP $remote_addr;"
-      print "  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;"
-      print "}"
-      next
-    }
-    inblk==1{ if ($0 ~ /^[[:space:]]*}[[:space:]]*$/){ inblk=0 } ; next }
-    {print}
-  ' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+  # Injecte 3 lignes juste après le début du location traderone/api (si pas déjà présent)
+  perl -0777 -i -pe '
+    s#(location\s+\^~\s+/wolverine/traderone/api/\s*\{\n)(?!.*X-KEYSTATE)#$1  set \$keystate missing;\n  if (\$http_x_api_key != "") { set \$keystate present; }\n  add_header X-KEYSTATE \$keystate always;\n#s
+  ' "$f"
 }
 
-fix_loc /etc/nginx/sites-enabled/fireinners.online
-fix_loc /etc/nginx/sites-enabled/fireinners.online-ssl
+add_keystate /etc/nginx/sites-enabled/fireinners.online
+add_keystate /etc/nginx/sites-enabled/fireinners.online-ssl
 
 nginx -t
 systemctl reload nginx
 
-echo "=== TEST sans clé (FORCÉ) => 403 attendu ==="
-URL="https://127.0.0.1/wolverine/traderone/api/status"
-/usr/bin/curl -q -sS -k -i -X POST "$URL" \
+echo "=== TEST FORCÉ SANS CLÉ (doit montrer X-KEYSTATE: missing et idéalement 403) ==="
+/usr/bin/curl -q -sS -k -i -X POST "https://127.0.0.1/wolverine/traderone/api/status" \
   -H "Host: fireinners.online" \
   -H "content-type: application/json" \
   -H "X-API-KEY:" \
-  --data '{}' | head -n 40
+  --data '{}' | head -n 60
