@@ -1,66 +1,29 @@
 set -e
 cd /root
 
-echo "=============================="
-echo "0) Check ports (3000/80/443)"
-echo "=============================="
-ss -ltnp | egrep ':3000|:80|:443' || true
+echo "=== 1) Récupère l'erreur nginx -t (fichier + ligne) ==="
+ERR="$(nginx -t 2>&1 || true)"
+echo "$ERR" | tail -n 25
+
+FILE="$(echo "$ERR" | sed -n 's/.*in \(\/[^:]*\):.*/\1/p' | head -n 1)"
+LINE="$(echo "$ERR" | sed -n 's/.*in \/[^:]*:\([0-9]\+\).*/\1/p' | head -n 1)"
+echo "FILE=$FILE"
+echo "LINE=$LINE"
 
 echo
-echo "=============================="
-echo "1) Test DIRECT backend (doit repondre 200 sur /api/status)"
-echo "=============================="
-curl -sS -i -X POST http://127.0.0.1:3000/api/status \
-  -H "content-type: application/json" --data '{}' | head -n 60 || true
+echo "=== 2) Montre 20 lignes autour de la ligne fautive ==="
+nl -ba "$FILE" | sed -n "$((LINE-10)),$((LINE+10))p"
 
 echo
-echo "=============================="
-echo "2) Patch NGINX (80 + 443) -> proxy vers 3000/api/"
-echo "=============================="
-for f in /etc/nginx/sites-enabled/fireinners.online /etc/nginx/sites-enabled/fireinners.online-ssl; do
-  if [ -f "$f" ]; then
-    echo "PATCH $f"
-    cp -v "$f" "$f.bak.$(date +%Y%m%d_%H%M%S)"
-    if grep -q "location \^~ /wolverine/traderone/api/" "$f"; then
-      perl -0777 -i -pe 's#location\s+\^~\s+/wolverine/traderone/api/\s*\{.*?\}#location ^~ /wolverine/traderone/api/ {\n  proxy_pass http://127.0.0.1:3000/api/;\n  proxy_set_header Host $host;\n  proxy_set_header X-Real-IP $remote_addr;\n  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n}\n#sg' "$f"
-    else
-      perl -0777 -i -pe 's#(server\s*\{)#${1}\n\nlocation ^~ /wolverine/traderone/api/ {\n  proxy_pass http://127.0.0.1:3000/api/;\n  proxy_set_header Host $host;\n  proxy_set_header X-Real-IP $remote_addr;\n  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n}\n#' "$f"
-    fi
-  fi
-done
+echo "=== 3) Liste toutes les directives proxy_set_* dans nginx.conf (pour repérer l'intrus) ==="
+grep -nE '^\s*proxy_set_' /etc/nginx/nginx.conf || true
 
 echo
-echo "=============================="
-echo "3) NGINX test + reload"
-echo "=============================="
+echo "=== 4) Backup + commente EXACTEMENT la ligne fautive ==="
+cp -v "$FILE" "$FILE.bak.$(date +%Y%m%d_%H%M%S)"
+perl -pi -e "if (\$. == $LINE) { s/^\\s*/# FIX_DISABLED_BAD_PROXY_SET_DIRECTIVE / }" "$FILE"
+
+echo
+echo "=== 5) Re-test + reload ==="
 nginx -t
 systemctl reload nginx
-
-echo
-echo "=============================="
-echo "4) Test LOCAL via nginx (contourne Cloudflare)"
-echo "=============================="
-curl -sS -i -X POST -H "Host: fireinners.online" \
-  -H "content-type: application/json" \
-  http://127.0.0.1/wolverine/traderone/api/status --data '{}' | head -n 60 || true
-echo
-curl -sS -i -X POST -H "Host: fireinners.online" \
-  -H "content-type: application/json" \
-  http://127.0.0.1/wolverine/traderone/api/start --data '{}' | head -n 80 || true
-
-echo
-echo "=============================="
-echo "5) Test PUBLIC (Cloudflare)"
-echo "=============================="
-BASE="https://fireinners.online/wolverine/traderone/api"
-curl -sS -i -X POST "$BASE/status" -H "content-type: application/json" --data '{}' | head -n 60 || true
-echo
-curl -sS -i -X POST "$BASE/start"  -H "content-type: application/json" --data '{}' | head -n 80 || true
-
-echo
-echo "=============================="
-echo "6) Logs (si 4xx/5xx)"
-echo "=============================="
-tail -n 80 /var/log/nginx/error.log 2>/dev/null || true
-tail -n 80 /var/log/nginx/access.log 2>/dev/null || true
-tail -n 120 /var/log/traderone-rest.log 2>/dev/null || true
