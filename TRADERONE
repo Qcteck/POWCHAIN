@@ -1,64 +1,157 @@
 set -e
 cd /root
 
-# 1) Vérif que le fichier existe
-ls -la /root/get_balances.cjs
+# backup
+cp -v /root/get_balances.cjs "/root/get_balances.cjs.bak.$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
 
-# 2) Backup
-cp -v /root/get_balances.cjs "/root/get_balances.cjs.bak.$(date +%Y%m%d_%H%M%S)"
+# write new file
+cat > /root/get_balances.cjs <<'EOF'
+#!/usr/bin/env node
+"use strict";
 
-# 3) Patch: force le wallet TraderOne depuis /root/traderone_wallet_backup.txt
-node <<'NODE'
 const fs = require("fs");
+const bs58 = require("bs58");
+const {
+  Connection,
+  PublicKey,
+  Keypair,
+  LAMPORTS_PER_SOL,
+  VersionedTransaction,
+} = require("@solana/web3.js");
 
-const file = "/root/get_balances.cjs";
-let s = fs.readFileSync(file, "utf8");
+let createJupiterApiClient = null;
+try {
+  ({ createJupiterApiClient } = require("@jup-ag/api"));
+} catch (_) {
+  // OK si tu veux "sans jup" / juste balances
+}
 
-if (!s.includes("/root/traderone_wallet_backup.txt")) {
-  // s'assure que fs est importé
-  if (!s.match(/const\s+fs\s*=\s*require\(["']fs["']\);/)) {
-    s = s.replace(/(['"]use strict['"];\s*\n)/, `$1\nconst fs = require("fs");\n`);
-  }
+// ====== CONFIG ======
+const RPC_URL = process.env.RPC_URL || "https://api.mainnet-beta.solana.com";
+const WALLET_FILE = "/root/traderone_wallet_backup.txt";
 
-  // injecte loadTraderOneWallet après createJupiterApiClient (si présent)
-  const anchor = `const { createJupiterApiClient } = require("@jup-ag/api");\n`;
-  if (!s.includes(anchor)) throw new Error("Anchor @jup-ag/api introuvable dans get_balances.cjs");
+// IMPORTANT: vrai mint USDC (qSSqe)
+const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1";
+const SOL_MINT  = "So11111111111111111111111111111111111111112";
 
-  if (!s.includes("function loadTraderOneWallet()")) {
-    s = s.replace(anchor, anchor + `
-// ====== WALLET TRADERONE (file) ======
+const SLIPPAGE_BPS = 50;
+
+// ====== WALLET LOADER ======
 function loadTraderOneWallet() {
-  const p = "/root/traderone_wallet_backup.txt";
-  const raw = fs.readFileSync(p, "utf8").trim();
+  const raw = fs.readFileSync(WALLET_FILE, "utf8").trim();
 
+  // JSON array ?
   try {
     const a = JSON.parse(raw);
     if (Array.isArray(a)) return Keypair.fromSecretKey(Uint8Array.from(a));
   } catch (_) {}
 
+  // base58
   return Keypair.fromSecretKey(bs58.decode(raw));
 }
-`);
+
+// ====== BALANCES ======
+async function getTokenBalance(connection, ownerPubkey, mintStr) {
+  const mint = new PublicKey(mintStr);
+  const resp = await connection.getParsedTokenAccountsByOwner(ownerPubkey, { mint });
+  let ui = 0;
+  for (const acc of resp.value) {
+    const info = acc.account.data.parsed.info;
+    ui += (info.tokenAmount.uiAmount ?? 0);
   }
-
-  // remplace la saisie clavier (pub + priv) par wallet auto
-  s = s.replace(
-    /const\s+solPub\s*=\s*readline\.question[\s\S]*?\nconst\s+solPrivBase58\s*=\s*readline\.question[\s\S]*?\);\s*\n/s,
-`const wallet = loadTraderOneWallet();
-console.log("[INFO] TraderOne pubkey:", wallet.publicKey.toBase58());
-`
-  );
-
-  // si owner était basé sur solPub, on bascule sur wallet.publicKey
-  s = s.replace(/const\s+owner\s*=\s*new\s+PublicKey\(\s*solPub\s*\)\s*;/g, `const owner = wallet.publicKey;`);
-
-  fs.writeFileSync(file, s);
-  console.log("✅ Patch OK sur /root/get_balances.cjs");
-} else {
-  console.log("ℹ️ Déjà patché.");
+  return ui;
 }
-NODE
 
-# 4) Run (si tu utilises encore Jupiter dans ce fichier)
-# export JUP_API_KEY='b27f38da-a45a-4fca-bbf7-4cb67a95bd85'
-node /root/get_balances.cjs 
+async function getSolBalance(connection, ownerPubkey) {
+  const lamports = await connection.getBalance(ownerPubkey, "confirmed");
+  return lamports / LAMPORTS_PER_SOL;
+}
+
+// ====== JUP SWAP (OPTIONNEL) ======
+function toAtomicAmount(amountHuman, decimals) {
+  return Math.round(Number(amountHuman) * Math.pow(10, decimals)).toString();
+}
+
+async function swapViaJupiter({ connection, wallet, inputMint, outputMint, amountHuman, inputDecimals }) {
+  if (!createJupiterApiClient) throw new Error("@jup-ag/api not installed");
+  if (!process.env.JUP_API_KEY) throw new Error("Missing JUP_API_KEY env var");
+
+  const jup = createJupiterApiClient({
+    basePath: "https://api.jup.ag",
+    headers: { "x-api-key": process.env.JUP_API_KEY },
+  });
+
+  const amount = toAtomicAmount(amountHuman, inputDecimals);
+
+  const quote = await jup.quoteGet({
+    inputMint,
+    outputMint,
+    amount,
+    swapMode: "ExactIn",
+    slippageBps: SLIPPAGE_BPS,
+  });
+
+  const swap = await jup.swapPost({
+    swapRequest: {
+      quoteResponse: quote,
+      userPublicKey: wallet.publicKey.toBase58(),
+      wrapAndUnwrapSol: true,
+    },
+  });
+
+  const txBuf = Buffer.from(swap.swapTransaction, "base64");
+  const tx = VersionedTransaction.deserialize(txBuf);
+  tx.sign([wallet]);
+
+  const sig = await connection.sendTransaction(tx, { maxRetries: 3 });
+  console.log("[EXEC] Swap sent:", sig);
+  await connection.confirmTransaction(sig, "confirmed");
+  return sig;
+}
+
+// ====== MAIN ======
+(async () => {
+  const wallet = loadTraderOneWallet();
+  console.log("[INFO] TraderOne pubkey:", wallet.publicKey.toBase58());
+
+  const connection = new Connection(RPC_URL, "confirmed");
+
+  const solBal = await getSolBalance(connection, wallet.publicKey);
+  const usdcBal = await getTokenBalance(connection, wallet.publicKey, USDC_MINT);
+
+  console.log("[INFO] SOL :", solBal);
+  console.log("[INFO] USDC:", usdcBal);
+
+  // ---- OPTIONNEL: swap ----
+  const DO_SWAP = false;                 // mets true si tu veux swap
+  const SWAP_DIRECTION = "USDC_TO_SOL";  // "USDC_TO_SOL" ou "SOL_TO_USDC"
+  const AMOUNT_HUMAN = "1.0";            // "1.0" USDC ou "0.01" SOL
+
+  if (!DO_SWAP) process.exit(0);
+
+  if (SWAP_DIRECTION === "USDC_TO_SOL") {
+    await swapViaJupiter({
+      connection,
+      wallet,
+      inputMint: USDC_MINT,
+      outputMint: SOL_MINT,
+      amountHuman: AMOUNT_HUMAN,
+      inputDecimals: 6,
+    });
+  } else {
+    await swapViaJupiter({
+      connection,
+      wallet,
+      inputMint: SOL_MINT,
+      outputMint: USDC_MINT,
+      amountHuman: AMOUNT_HUMAN,
+      inputDecimals: 9,
+    });
+  }
+})();
+EOF
+
+chmod +x /root/get_balances.cjs
+
+# run (balances only)
+node /root/get_balances.cjs
