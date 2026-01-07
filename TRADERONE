@@ -1,50 +1,44 @@
 set -e
 cd /root
 
-BLOCK=$(cat <<'EOF'
-location ^~ /wolverine/traderone/api/ {
-  proxy_pass http://127.0.0.1:3000/api/;
-  proxy_set_header Host $host;
-  proxy_set_header X-Real-IP $remote_addr;
-  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-}
-EOF
-)
+echo "=== 0) Cherche toutes les lignes proxy_set_header vides ==="
+grep -RIn --line-number -E 'proxy_set_header[[:space:]]+[A-Za-z0-9_-]+[[:space:]]*;' \
+  /etc/nginx/nginx.conf /etc/nginx/sites-enabled /etc/nginx/conf.d /etc/nginx/snippets 2>/dev/null || true
 
-mkdir -p /root/nginx_backups
-
-for f in /etc/nginx/sites-enabled/fireinners.online /etc/nginx/sites-enabled/fireinners.online-ssl; do
+echo
+echo "=== 1) Backup des fichiers nginx qu'on va toucher ==="
+mkdir -p /root/nginx_backups_full
+for f in /etc/nginx/nginx.conf /etc/nginx/sites-enabled/* /etc/nginx/conf.d/* /etc/nginx/snippets/*; do
   [ -f "$f" ] || continue
-  echo "PATCH $f"
-  cp -v "$f" "/root/nginx_backups/$(basename "$f").$(date +%Y%m%d_%H%M%S)"
-
-  # 1) supprime tous les anciens blocs location /wolverine/traderone/api/ (regex ou ^~ ou simple)
-  perl -0777 -i -pe '
-    s#location\s+(?:\^~\s+|~\*?\s+|=\s+)?/wolverine/traderone/api/\s*\{.*?\}\s*##sg;
-  ' "$f"
-
-  # 2) supprime les proxy_set_header vides (sinon nginx -t peut casser)
-  sed -i \
-    -e 's/^[[:space:]]*proxy_set_header[[:space:]]\+Host[[:space:]]*;[[:space:]]*$/# removed empty proxy_set_header Host ;/g' \
-    -e 's/^[[:space:]]*proxy_set_header[[:space:]]\+X-Real-IP[[:space:]]*;[[:space:]]*$/# removed empty proxy_set_header X-Real-IP ;/g' \
-    -e 's/^[[:space:]]*proxy_set_header[[:space:]]\+X-Forwarded-For[[:space:]]*;[[:space:]]*$/# removed empty proxy_set_header X-Forwarded-For ;/g' \
-    "$f"
-
-  # 3) ré-insère 1 seul bloc propre juste après "server {"
-  perl -0777 -i -pe 's#(server\s*\{)#$1\n\n'"$BLOCK"'\n#s' "$f"
+  cp -n "$f" "/root/nginx_backups_full/$(echo "$f" | sed 's#/#__#g').bak" 2>/dev/null || true
 done
 
 echo
-echo "=== nginx -t + reload ==="
+echo "=== 2) Fix global: remplit les headers connus, commente les inconnus, sépare si collés ==="
+for f in /etc/nginx/nginx.conf /etc/nginx/sites-enabled/* /etc/nginx/conf.d/* /etc/nginx/snippets/*; do
+  [ -f "$f" ] || continue
+
+  perl -pi -e '
+    # sépare si plusieurs directives sur la même ligne
+    s/;\s*(proxy_set_header)/;\n  $1/g;
+
+    # remplit les vides connus
+    s/\bproxy_set_header\s+Host\s*;/proxy_set_header Host \$host;/g;
+    s/\bproxy_set_header\s+X-Real-IP\s*;/proxy_set_header X-Real-IP \$remote_addr;/g;
+    s/\bproxy_set_header\s+X-Forwarded-For\s*;/proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;/g;
+    s/\bproxy_set_header\s+X-Forwarded-Proto\s*;/proxy_set_header X-Forwarded-Proto \$scheme;/g;
+
+    # tout proxy_set_header encore vide -> commenté (pour ne plus casser nginx -t)
+    s/^\s*(proxy_set_header\s+[A-Za-z0-9_-]+\s*;)\s*$/# FIX_REMOVED_EMPTY $1/mg;
+  ' "$f"
+done
+
+echo
+echo "=== 3) Re-scan: il ne doit plus rester de 'proxy_set_header XXX ;' non commenté ==="
+grep -RIn --line-number -E '^[[:space:]]*proxy_set_header[[:space:]]+[A-Za-z0-9_-]+[[:space:]]*;' \
+  /etc/nginx/nginx.conf /etc/nginx/sites-enabled /etc/nginx/conf.d /etc/nginx/snippets 2>/dev/null || true
+
+echo
+echo "=== 4) nginx -t + reload ==="
 nginx -t
 systemctl reload nginx
-
-echo
-echo "=== Test LOCAL via nginx (DOIT renvoyer running/bal/etc) ==="
-curl -sS -i -X POST -H "Host: fireinners.online" -H "content-type: application/json" \
-  http://127.0.0.1/wolverine/traderone/api/status --data '{}' | head -n 60
-
-echo
-echo "=== Test PUBLIC HTTPS ==="
-BASE="https://fireinners.online/wolverine/traderone/api"
-curl -sS -i -X POST "$BASE/status" -H "content-type: application/json" --data '{}' | head -n 60
