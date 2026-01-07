@@ -1,38 +1,44 @@
 set -e
 cd /root
 
-echo "=== 1) Le projet est en ESM ? (type: module) ==="
-cat /opt/traderone/package.json 2>/dev/null | egrep '"type"|"name"' || echo "pas de package.json"
+echo "=== 1) Confirme type module ==="
+cat /opt/traderone/package.json | egrep '"type"|"name"' || true
 
 echo
-echo "=== 2) Affiche autour de la ligne 26 ==="
-nl -ba /opt/traderone/server.js | sed -n '1,60p'
+echo "=== 2) Backup + créer engine.cjs ==="
+cp -v /opt/traderone/engine.js /opt/traderone/engine.js.bak.$(date +%s)
+cp -v /opt/traderone/engine.js /opt/traderone/engine.cjs
 
 echo
-echo "=== 3) Combien de fois fs est déclaré ? ==="
-grep -nE "^\s*(const|let|var)\s+fs\s*=" /opt/traderone/server.js || true
-
-echo
-echo "=== 4) Backup + FIX: rendre require OK en ESM + supprimer les doublons fs ==="
+echo "=== 3) Patch server.js pour utiliser engine.cjs (via createRequire) ==="
 cp -v /opt/traderone/server.js /opt/traderone/server.js.bak.$(date +%s)
 
-# 4a) supprime toutes les lignes "const fs = ..." (on le remet propre après)
-perl -ni -e 'print unless /^\s*(const|let|var)\s+fs\s*=\s*require\(/' /opt/traderone/server.js
+# remplace les require("./engine") / require("./engine.js") / import ...engine...
+perl -0777 -i -pe '
+  s/require\((["'\''])(\.\/engine(?:\.js)?)\1\)/require($1.\/engine.cjs$1)/g;
+  s/require\((["'\''])(\.\/engine\.cjs)\1\)/require($1.\/engine.cjs$1)/g;
+' /opt/traderone/server.js
 
-# 4b) insère un require ESM-compatible + fs UNE SEULE FOIS après les imports/init (tout en haut)
-perl -0777 -i -pe 's#^#import { createRequire } from "module";\nconst require = createRequire(import.meta.url);\nconst fs = require("fs");\n\n#s' /opt/traderone/server.js
+# si createRequire n'est pas présent, on l’ajoute au tout début
+grep -q "createRequire" /opt/traderone/server.js || \
+perl -0777 -i -pe 's#^#import { createRequire } from "module";\nconst require = createRequire(import.meta.url);\n\n#s' /opt/traderone/server.js
 
 echo
-echo "=== 5) Relance TraderOne REST sur 3000 ==="
+echo "=== 4) Vérif rapide: engine.cjs existe et server.js pointe dessus ==="
+ls -la /opt/traderone/engine.cjs
+grep -nE "engine\.cjs|createRequire" /opt/traderone/server.js | head -n 20
+
+echo
+echo "=== 5) Relance REST sur 3000 ==="
 sudo fuser -k 3000/tcp 2>/dev/null || true
-nohup node /opt/traderone/server.js > /var/log/tr_toggle_traderone-rest.log 2>&1 &
+nohup node /opt/traderone/server.js > /var/log/traderone-rest.log 2>&1 &
 sleep 1
 
 echo
-echo "=== 6) Check écoute + test /api/status ==="
+echo "=== 6) Check écoute + test status ==="
 ss -ltnp | egrep ':3000|:12703|:3002' || true
 curl -sS -i -X POST http://127.0.0.1:3000/api/status -H "content-type: application/json" --data '{}' | head -n 40 || true
 
 echo
 echo "=== 7) Si ça rate: log ==="
-tail -n 80 /var/log/tr_toggle_traderone-rest.log || true
+tail -n 80 /var/log/traderone-rest.log || true
