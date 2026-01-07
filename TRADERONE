@@ -1,23 +1,42 @@
 set -e
 cd /root
 
-echo "=== 1) nginx -t (récupérer fichier:ligne) ==="
+echo "=== 1) nginx -t (capture) ==="
 ERR="$(nginx -t 2>&1 || true)"
-echo "$ERR" | tail -n 40
+echo "$ERR" | tail -n 60
 
-LINE="$(echo "$ERR" | sed -n 's/.*map" directive in \/etc\/nginx\/nginx\.conf:\([0-9]\+\).*/\1/p' | head -n 1)"
+FILE="$(echo "$ERR" | sed -n 's/.* in \(\/[^:]*\):\([0-9]\+\).*/\1/p' | head -n 1)"
+LINE="$(echo "$ERR" | sed -n 's/.* in \(\/[^:]*\):\([0-9]\+\).*/\2/p' | head -n 1)"
+echo "FILE=$FILE"
 echo "LINE=$LINE"
 
-echo
-echo "=== 2) Afficher le contexte autour de la ligne ==="
-nl -ba /etc/nginx/nginx.conf | sed -n "$((LINE-30)),$((LINE+30))p" || true
+if [ -z "$FILE" ] || [ -z "$LINE" ] || [ ! -f "$FILE" ]; then
+  echo "Impossible d'extraire FILE/LINE. Colle: nginx -t 2>&1 | tail -n 60"
+  exit 1
+fi
 
 echo
-echo "=== 3) Supprimer le bloc map (de 'map ... {' jusqu'à la prochaine ligne avec '}') ==="
-cp -v /etc/nginx/nginx.conf "/root/nginx_backups/nginx.conf.$(date +%Y%m%d_%H%M%S)"
-sed -i '/^[[:space:]]*map[[:space:]].*{[[:space:]]*$/,/^[[:space:]]*}[[:space:]]*$/d' /etc/nginx/nginx.conf
+echo "=== 2) Contexte (sans index négatif) ==="
+START=$((LINE-30)); [ "$START" -lt 1 ] && START=1
+END=$((LINE+30))
+awk -v s="$START" -v e="$END" 'NR>=s && NR<=e {printf "%5d  %s\n", NR, $0}' "$FILE"
 
 echo
-echo "=== 4) Re-test + reload ==="
+echo "=== 3) Backup du fichier fautif ==="
+mkdir -p /root/nginx_backups
+cp -v "$FILE" "/root/nginx_backups/$(basename "$FILE").$(date +%Y%m%d_%H%M%S)"
+
+if [ "$FILE" = "/etc/nginx/nginx.conf" ]; then
+  echo
+  echo "=== 4) Nettoyage nginx.conf (retire map traderone_ok + if traderone mal placé) ==="
+  # supprime blocs map $http_x_api_key $traderone_ok {...}
+  perl -0777 -i -pe 's/\n\s*map\s+\$http_x_api_key\s+\$traderone_ok\s*\{.*?\}\s*\n/\n/sg' /etc/nginx/nginx.conf
+  # supprime toute ligne "if (...traderone...)" dans nginx.conf (ça doit être dans les vhosts, pas ici)
+  sed -i '/^[[:space:]]*if[[:space:]]*(.*traderone.*)[[:space:]]*{.*$/d' /etc/nginx/nginx.conf
+  sed -i '/^[[:space:]]*if[[:space:]]*(.*traderone_ok.*)[[:space:]]*{.*$/d' /etc/nginx/nginx.conf
+fi
+
+echo
+echo "=== 5) Re-test + reload ==="
 nginx -t
 systemctl reload nginx
