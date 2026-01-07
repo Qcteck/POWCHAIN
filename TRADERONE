@@ -1,44 +1,66 @@
 set -e
 cd /root
 
-echo "=== 1) Où nginx référence encore 3000 ? ==="
-nginx -T 2>/dev/null | grep -n "127.0.0.1:3000" || echo "OK: aucune ref 3000 dans nginx -T"
+echo "=============================="
+echo "1) NGINX TEST (donne fichier + ligne)"
+echo "=============================="
+nginx -t 2>&1 | tail -n 40 || true
 
 echo
-echo "=== 2) Trouve les blocs qui match /wolverine/traderone/api ==="
-nginx -T 2>/dev/null | grep -nE "server_name fireinners\.online|listen 80|listen 443|location \^~ /wolverine/traderone/api/|location /wolverine/traderone/api/|proxy_pass" | head -n 260
+echo "=============================="
+echo "2) Récupère le fichier fautif depuis nginx -t"
+echo "=============================="
+ERR=$(nginx -t 2>&1 || true)
+FILE=$(echo "$ERR" | sed -n 's/.*in \(\/[^:]*\):.*/\1/p' | head -n 1)
+LINE=$(echo "$ERR" | sed -n 's/.*in \/[^:]*:\([0-9][0-9]*\).*/\1/p' | head -n 1)
+echo "FILE=$FILE"
+echo "LINE=$LINE"
+
+if [ -n "$FILE" ] && [ -f "$FILE" ]; then
+  echo
+  echo "=============================="
+  echo "3) Montre 25 lignes autour de l’erreur"
+  echo "=============================="
+  nl -ba "$FILE" | sed -n "$((LINE-15)),$((LINE+15))p" || true
+
+  echo
+  echo "=============================="
+  echo "4) Fix auto: normalise les proxy_set_header (Host / X-Real-IP / X-Forwarded-For)"
+  echo "   (on remplace toutes les variantes cassées par les 3 lignes propres)"
+  echo "=============================="
+  cp -v "$FILE" "$FILE.bak.$(date +%Y%m%d_%H%M%S)"
+  perl -pi -e 's/^\s*proxy_set_header\s+Host\s+.*;/  proxy_set_header Host \$host;/g' "$FILE"
+  perl -pi -e 's/^\s*proxy_set_header\s+X-Real-IP\s+.*;/  proxy_set_header X-Real-IP \$remote_addr;/g' "$FILE"
+  perl -pi -e 's/^\s*proxy_set_header\s+X-Forwarded-For\s+.*;/  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;/g' "$FILE"
+fi
 
 echo
-echo "=== 3) Patch: remplace tout 3000 -> 12703 dans sites-enabled ==="
-grep -RIl "127\.0\.0\.1:3000" /etc/nginx/sites-enabled 2>/dev/null | while read -r f; do
-  cp -v "$f" "$f.bak.$(date +%Y%m%d_%H%M%S)"
-  sed -i 's/127\.0\.0\.1:3000/127.0.0.1:12703/g' "$f"
-done
-
-echo
-echo "=== 4) IMPORTANT: rewrite path -> /api/ (dans les 2 vhosts si présents) ==="
+echo "=============================="
+echo "5) Force un mapping propre /wolverine/traderone/api/* -> http://127.0.0.1:12703/api/*"
+echo "   dans les 2 fichiers (80 et 443) si présents"
+echo "=============================="
 for f in /etc/nginx/sites-available/fireinners.online /etc/nginx/sites-available/fireinners.online-ssl; do
   if [ -f "$f" ]; then
+    echo "PATCH $f"
     cp -v "$f" "$f.bak.$(date +%Y%m%d_%H%M%S)"
-    # Remplace le bloc location si déjà là, sinon ajoute à la fin du server block (ça suffit dans 99% des cas)
-    if grep -q "location \^~ /wolverine/traderone/api/" "$f"; then
-      perl -0777 -i -pe 's#location \^~ /wolverine/traderone/api/ \{.*?\}#location ^~ /wolverine/traderone/api/ {\n  proxy_pass http://127.0.0.1:12703/api/;\n  proxy_set_header Host $host;\n  proxy_set_header X-Real-IP $remote_addr;\n  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n}\n#sg' "$f"
-    else
-      perl -0777 -i -pe 's#(server\s*\{)#${1}\n\nlocation ^~ /wolverine/traderone/api/ {\n  proxy_pass http://127.0.0.1:12703/api/;\n  proxy_set_header Host $host;\n  proxy_set_header X-Real-IP $remote_addr;\n  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n}\n#' "$f"
-    fi
+    perl -0777 -i -pe 's#location\s+\^~\s+/wolverine/traderone/api/\s*\{.*?\}#location ^~ /wolverine/traderone/api/ {\n  proxy_pass http://127.0.0.1:12703/api/;\n  proxy_set_header Host $host;\n  proxy_set_header X-Real-IP $remote_addr;\n  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n}\n#sg' "$f"
   fi
 done
 
 echo
-echo "=== 5) Reload nginx ==="
+echo "=============================="
+echo "6) Test + reload"
+echo "=============================="
 nginx -t
 systemctl reload nginx
 
 echo
-echo "=== 6) Tests (Cloudflare) ==="
+echo "=============================="
+echo "7) Tests Cloudflare (status/start) — on veut plus voir method:-32601"
+echo "=============================="
 BASE="https://fireinners.online/wolverine/traderone/api"
 echo "--- POST $BASE/status"
-curl -sS -i -X POST "$BASE/status" -H "content-type: application/json" --data '{}' | head -n 25
+curl -sS -i -X POST "$BASE/status" -H "content-type: application/json" --data '{}' | head -n 30
 echo
 echo "--- POST $BASE/start"
-curl -sS -i -X POST "$BASE/start" -H "content-type: application/json" --data '{}' | head -n 25
+curl -sS -i -X POST "$BASE/start"  -H "content-type: application/json" --data '{}' | head -n 30
