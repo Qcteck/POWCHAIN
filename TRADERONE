@@ -1,1 +1,64 @@
-find /root -maxdepth 5 -type f -name 'get_balances.cjs' 2>/dev/null
+set -e
+cd /root
+
+# 1) Vérif que le fichier existe
+ls -la /root/get_balances.cjs
+
+# 2) Backup
+cp -v /root/get_balances.cjs "/root/get_balances.cjs.bak.$(date +%Y%m%d_%H%M%S)"
+
+# 3) Patch: force le wallet TraderOne depuis /root/traderone_wallet_backup.txt
+node <<'NODE'
+const fs = require("fs");
+
+const file = "/root/get_balances.cjs";
+let s = fs.readFileSync(file, "utf8");
+
+if (!s.includes("/root/traderone_wallet_backup.txt")) {
+  // s'assure que fs est importé
+  if (!s.match(/const\s+fs\s*=\s*require\(["']fs["']\);/)) {
+    s = s.replace(/(['"]use strict['"];\s*\n)/, `$1\nconst fs = require("fs");\n`);
+  }
+
+  // injecte loadTraderOneWallet après createJupiterApiClient (si présent)
+  const anchor = `const { createJupiterApiClient } = require("@jup-ag/api");\n`;
+  if (!s.includes(anchor)) throw new Error("Anchor @jup-ag/api introuvable dans get_balances.cjs");
+
+  if (!s.includes("function loadTraderOneWallet()")) {
+    s = s.replace(anchor, anchor + `
+// ====== WALLET TRADERONE (file) ======
+function loadTraderOneWallet() {
+  const p = "/root/traderone_wallet_backup.txt";
+  const raw = fs.readFileSync(p, "utf8").trim();
+
+  try {
+    const a = JSON.parse(raw);
+    if (Array.isArray(a)) return Keypair.fromSecretKey(Uint8Array.from(a));
+  } catch (_) {}
+
+  return Keypair.fromSecretKey(bs58.decode(raw));
+}
+`);
+  }
+
+  // remplace la saisie clavier (pub + priv) par wallet auto
+  s = s.replace(
+    /const\s+solPub\s*=\s*readline\.question[\s\S]*?\nconst\s+solPrivBase58\s*=\s*readline\.question[\s\S]*?\);\s*\n/s,
+`const wallet = loadTraderOneWallet();
+console.log("[INFO] TraderOne pubkey:", wallet.publicKey.toBase58());
+`
+  );
+
+  // si owner était basé sur solPub, on bascule sur wallet.publicKey
+  s = s.replace(/const\s+owner\s*=\s*new\s+PublicKey\(\s*solPub\s*\)\s*;/g, `const owner = wallet.publicKey;`);
+
+  fs.writeFileSync(file, s);
+  console.log("✅ Patch OK sur /root/get_balances.cjs");
+} else {
+  console.log("ℹ️ Déjà patché.");
+}
+NODE
+
+# 4) Run (si tu utilises encore Jupiter dans ce fichier)
+# export JUP_API_KEY='TA_CLE_JUP'
+node /root/get_balances.cjs
