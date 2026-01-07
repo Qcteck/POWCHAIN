@@ -1,11 +1,32 @@
-PID=$(lsof -t -iTCP:3000 -sTCP:LISTEN | head -n1)
-CWD=$(readlink -f /proc/$PID/cwd)
-echo "PID=$PID"
-echo "CWD=$CWD"
+set -e
+cd /root
 
-# Cherche le handler /api/status dans le code (JS/TS seulement)
-grep -RIn --line-number \
-  --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=include \
-  --exclude='*.bak*' --exclude='*.log' \
-  -E 'app\.(get|post)\(\s*["'\'']\/api\/status|router\.(get|post)\(\s*["'\'']\/api\/status' \
-  "$CWD" | head -n 30
+FILE="$(grep -RIn --line-number --exclude-dir=node_modules --exclude-dir=.git --exclude='*.bak*' \
+  -E 'app\.(get|post)\(\s*["'\'']\/api\/status' /root/amcq* 2>/dev/null | head -n1 | cut -d: -f1)"
+
+echo "FILE=$FILE"
+[ -f "$FILE" ] || { echo "File introuvable"; exit 1; }
+
+mkdir -p /root/traderone_backups
+cp -v "$FILE" "/root/traderone_backups/$(basename "$FILE").$(date +%Y%m%d_%H%M%S)"
+
+# enlève la ligne "internal: ..." dans l'objet renvoyé par /api/status
+perl -pi -e 's/^\s*internal\s*:\s*.*?,\s*$//mg' "$FILE"
+
+echo "=== Vérif (ne doit plus afficher internal: dans le handler) ==="
+grep -n 'app\.(get|post)\("/api/status"' -n "$FILE" || true
+grep -n 'internal\s*:' "$FILE" || echo "OK: plus de internal:"
+
+echo "=== Restart du process qui écoute sur 3000 ==="
+PID="$(lsof -t -iTCP:3000 -sTCP:LISTEN | head -n1 || true)"
+echo "PID=$PID"
+[ -n "$PID" ] && kill "$PID" || true
+
+# relance via pm2 si c'est pm2, sinon tente node (pas grave si une commande échoue)
+pm2 restart all 2>/dev/null || true
+systemctl restart traderone 2>/dev/null || true
+systemctl restart wolverine 2>/dev/null || true
+
+sleep 1
+echo "=== Test direct backend (NE DOIT PLUS contenir internal) ==="
+curl -sS -X POST http://127.0.0.1:3000/api/status -H "content-type: application/json" --data '{}' ; echo
