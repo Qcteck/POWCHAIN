@@ -1,22 +1,44 @@
 set -e
 cd /root
 
-NEWKEY="$(openssl rand -hex 32)"
-echo "=== NEW X-API-KEY ==="
-echo "$NEWKEY"
+echo "=== 1) Trouver où /api/status est géré (ou où 'internal' est renvoyé) ==="
+HIT="$(grep -RIn --line-number -E '/api/status|engine\.status\(|res\.json\(|internal"' /opt 2>/dev/null | head -n 1 || true)"
+echo "HIT=$HIT"
 
-for f in /etc/nginx/sites-enabled/fireinners.online /etc/nginx/sites-enabled/fireinners.online-ssl; do
-  [ -f "$f" ] || continue
-  cp -v "$f" "/root/nginx_backups/$(basename "$f").$(date +%Y%m%d_%H%M%S)"
-  sed -i -E 's/if \(\$http_x_api_key != ".*"\) \{ return 403; \}/if (\$http_x_api_key != "'"$NEWKEY"'") { return 403; }/g' "$f"
-done
+FILE="$(echo "$HIT" | cut -d: -f1)"
+LINE="$(echo "$HIT" | cut -d: -f2)"
 
-nginx -t
-systemctl reload nginx
+if [ -z "$FILE" ] || [ ! -f "$FILE" ]; then
+  echo "!! Pas trouvé automatiquement. Colle la sortie de:"
+  echo "grep -RIn --line-number -E '/api/status|internal\"' /opt 2>/dev/null | head -n 50"
+  exit 1
+fi
 
-BASE="https://fireinners.online/wolverine/traderone/api"
-echo "--- sans clé (403) ---"
-curl -sS -i -X POST "$BASE/status" -H "content-type: application/json" --data '{}' | head -n 10
 echo
-echo "--- avec NOUVELLE clé (200) ---"
-curl -sS -i -X POST "$BASE/status" -H "content-type: application/json" -H "X-API-KEY: $NEWKEY" --data '{}' | head -n 10
+echo "=== 2) Backup + contexte ==="
+mkdir -p /root/traderone_backups
+cp -v "$FILE" "/root/traderone_backups/$(basename "$FILE").$(date +%Y%m%d_%H%M%S)"
+START=$((LINE-20)); [ "$START" -lt 1 ] && START=1
+END=$((LINE+20))
+nl -ba "$FILE" | awk -v s="$START" -v e="$END" '$1>=s && $1<=e{print}'
+
+echo
+echo "=== 3) Patch: supprime internal de la réponse /status (patterns courants Node/Express) ==="
+perl -pi -e '
+  s/res\.json\s*\(\s*engine\.status\(\)\s*\)\s*;/const s = engine.status(); delete s.internal; res.json(s);/g;
+  s/return\s+json\s*\(\s*res\s*,\s*engine\.status\(\)\s*\)\s*;/const s = engine.status(); delete s.internal; return json(res, s);/g;
+' "$FILE"
+
+echo "--- Vérif patch ---"
+grep -n "delete s\.internal" "$FILE" || { echo "!! Patch auto pas appliqué (handler différent). Colle les 30 lignes affichées au-dessus."; exit 1; }
+
+echo
+echo "=== 4) Restart (tente plusieurs) ==="
+systemctl restart traderone 2>/dev/null || true
+systemctl restart wolverine 2>/dev/null || true
+pm2 restart traderone 2>/dev/null || true
+pm2 restart all 2>/dev/null || true
+
+echo
+echo "=== 5) Test direct backend: internal doit DISPARAÎTRE ==="
+curl -sS -X POST http://127.0.0.1:3000/api/status -H "content-type: application/json" --data '{}' ; echo
