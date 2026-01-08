@@ -4,83 +4,53 @@ NG="/etc/nginx/sites-enabled/fireinners.online-ssl"
 [ -f "$NG" ] || { echo "KO: $NG introuvable"; exit 1; }
 
 echo "=== 0) Backup ==="
-cp -a "$NG" "$NG.bak.$(date +%s)"
+cp -a "$NG" "$NG.bak.dupe_wolv.$(date +%s)"
 
-echo "=== 1) Voir où est le check X-API-KEY actuellement ==="
-grep -nE 'http_x_api_key|X-API-KEY|return 403' "$NG" || true
+echo "=== 1) Trouver tous les blocs /wolverine ==="
+grep -nE 'WOLVERINE_BLOCK_V1|location\s+=\s*/wolverine\b|location\s+\^~\s+/wolverine/|/wolverine/traderone/api/' "$NG" | sed -n '1,220p'
 echo
 
-echo "=== 2) Commenter le check global (si présent) pour débloquer l’UI ==="
-# commente toute ligne qui mentionne http_x_api_key (ça évite que /wolverine prenne 403)
-sed -i 's/^[[:space:]]*\(.*http_x_api_key.*\)$/# \1/g' "$NG"
-
-echo "=== 3) Injecter les locations Wolverine (UI + API avec clé) si absentes ==="
+echo "=== 2) Fix: supprimer les locations /wolverine hors du bloc WOLVERINE_BLOCK_V1 ==="
 python3 - <<'PY'
 from pathlib import Path
-import re, time
+import re
 
 ng = Path("/etc/nginx/sites-enabled/fireinners.online-ssl")
 s = ng.read_text()
 
 marker = "# --- WOLVERINE_BLOCK_V1 ---"
-if marker in s:
-    print("OK: bloc déjà présent, skip")
-else:
-    # insérer avant la dernière "}" du fichier (ok si 1 server block)
-    insert = f"""
+if marker not in s:
+    raise SystemExit("KO: bloc WOLVERINE_BLOCK_V1 introuvable (ne pas auto-fix).")
 
-{marker}
+# Split around marker block so we can only clean outside it
+pre, rest = s.split(marker, 1)
+# rest contains marker removed; rebuild marker+rest for simplicity
+rest = marker + rest
 
-# /wolverine (UI)
-location = /wolverine {{
-  return 301 /wolverine/;
-}}
+def drop_locations(txt: str) -> str:
+    # remove exact blocks for:
+    # location = /wolverine { ... }
+    txt = re.sub(r'\n\s*location\s*=\s*/wolverine\s*\{[\s\S]*?\n\s*\}\s*\n', '\n', txt, flags=re.M)
+    # location ^~ /wolverine/ { ... }
+    txt = re.sub(r'\n\s*location\s+\^~\s+/wolverine/\s*\{[\s\S]*?\n\s*\}\s*\n', '\n', txt, flags=re.M)
+    # location ^~ /wolverine/traderone/api/ { ... }
+    txt = re.sub(r'\n\s*location\s+\^~\s+/wolverine/traderone/api/\s*\{[\s\S]*?\n\s*\}\s*\n', '\n', txt, flags=re.M)
+    return txt
 
-location ^~ /wolverine/ {{
-  root /var/www;
-  index index.html;
-  try_files $uri $uri/ /wolverine/index.html;
-}}
+pre2 = drop_locations(pre)
+# IMPORTANT: keep the injected block untouched
+s2 = pre2 + "\n" + rest
 
-# /wolverine/traderone/api (API -> Node /api) + clé OBLIGATOIRE
-location ^~ /wolverine/traderone/api/ {{
-  # ---- API KEY (seulement ici) ----
-  if ($http_x_api_key = "") {{ return 403; }}
-  # Remplace la valeur ci-dessous par TA clé si tu veux la hardcode côté nginx
-  # if ($http_x_api_key != "YOUR_KEY_HERE") {{ return 403; }}
-
-  rewrite ^/wolverine/traderone/api/(.*)$ /api/$1 break;
-
-  proxy_pass http://127.0.0.1:3000;
-  proxy_http_version 1.1;
-  proxy_set_header Host $host;
-  proxy_set_header X-Real-IP $remote_addr;
-  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto $scheme;
-}}
-"""
-    # insert before last closing brace
-    idx = s.rfind("}")
-    if idx == -1:
-        raise SystemExit("KO: pas de '}' trouvé dans le fichier nginx")
-    s2 = s[:idx] + insert + "\n" + s[idx:]
-    ng.write_text(s2)
-    print("OK: bloc Wolverine injecté")
+ng.write_text(s2)
+print("OK: removed duplicate /wolverine locations outside WOLVERINE_BLOCK_V1")
 PY
 
-echo "=== 4) Test + reload nginx ==="
+echo "=== 3) Test + reload ==="
 nginx -t
 systemctl reload nginx
 echo "OK: nginx reloaded"
-echo
 
-echo "=== 5) Tests ==="
-echo "--- UI (/wolverine/) ---"
-curl -sS -i https://fireinners.online/wolverine/ | head -n 20 || true
+echo "=== 4) Quick tests ==="
+curl -sS -i https://fireinners.online/wolverine/ | head -n 15 || true
 echo
-echo "--- API sans clé (doit 403) ---"
-curl -sS -i https://fireinners.online/wolverine/traderone/api/health | head -n 20 || true
-echo
-echo "--- API avec clé (doit 200) ---"
-KEY=$(grep -oP 'http_x_api_key != "\K[^"]+' /etc/nginx/sites-enabled/fireinners.online-ssl 2>/dev/null | head -n1 || true)
-[ -n "${KEY:-}" ] && curl -sS -i https://fireinners.online/wolverine/traderone/api/dexes -H "X-API-KEY: $KEY" | head -n 25 || echo "INFO: clé hardcodée non trouvée dans nginx (mets-la dans le bloc)."
+curl -sS -i https://fireinners.online/wolverine/traderone/api/health | head -n 15 || true
