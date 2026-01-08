@@ -1,7 +1,7 @@
 set -euo pipefail
 
 NG="/etc/nginx/sites-enabled/fireinners.online-ssl"
-cp -a "$NG" "$NG.bak.auth_request.$(date +%s)"
+cp -a "$NG" "$NG.bak.fix_health_public_no_nested.$(date +%s)"
 
 python3 - <<'PY'
 from pathlib import Path
@@ -10,20 +10,22 @@ import re
 ng = Path("/etc/nginx/sites-enabled/fireinners.online-ssl")
 s = ng.read_text()
 
-# 1) Enlever tout check "if ($http_x_api_key ...)" existant (où qu'il soit)
-s = re.sub(r'\n\s*if\s*\(\s*\$http_x_api_key[\s\S]*?\n\s*\}\s*\n', '\n', s, flags=re.M)
+# 1) Supprimer toute trace de auth_request + /_wolv_auth
+s = re.sub(r'^\s*auth_request\s+[^;]+;\s*\n', '', s, flags=re.M)
+s = re.sub(r'\n\s*location\s*=\s*/_wolv_auth\s*\{[\s\S]*?\n\s*\}\s*', '\n', s, flags=re.M)
 
-# 2) Trouver le bloc API principal
-pat_api = r'location\s+\^~\s+/wolverine/traderone/api/\s*\{[\s\S]*?\n\s*\}'
-m = re.search(pat_api, s, flags=re.M)
-if not m:
-    raise SystemExit("KO: bloc location ^~ /wolverine/traderone/api/ introuvable")
+# 2) Supprimer les anciens locations API/health (pour repartir clean)
+for pat in [
+  r'\n\s*location\s*=\s*/wolverine/traderone/api/health\s*\{[\s\S]*?\n\s*\}\s*',
+  r'\n\s*location\s+\^~\s+/wolverine/traderone/api/\s*\{[\s\S]*?\n\s*\}\s*',
+]:
+  s = re.sub(pat, "\n", s, flags=re.M)
 
-api_block = m.group(0)
+# 3) Ré-injecter les 2 locations propres (health public + api protégé)
+block = r'''
+# --- WOLVERINE API (health public, rest protected) ---
 
-# 3) S'assurer que /health exact existe (public)
-health_loc = r'''
-# --- PUBLIC HEALTH (no API key) ---
+# PUBLIC: /health
 location = /wolverine/traderone/api/health {
   rewrite ^/wolverine/traderone/api/(.*)$ /api/$1 break;
 
@@ -34,59 +36,42 @@ location = /wolverine/traderone/api/health {
   proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
   proxy_set_header X-Forwarded-Proto $scheme;
 }
-'''
-if "location = /wolverine/traderone/api/health" not in s:
-    s = re.sub(pat_api, health_loc + "\n\n" + api_block, s, flags=re.M)
 
-# 4) Ajouter un endpoint interne d'auth (pas d'if) + activer auth_request sur le bloc API
-auth_loc = r'''
-# --- INTERNAL AUTH (no if) ---
-location = /_wolv_auth {
-  internal;
+# PROTECTED: everything else under /wolverine/traderone/api/
+location ^~ /wolverine/traderone/api/ {
+  if ($http_x_api_key = "") { return 403; }
 
-  # Ici on exige juste que le header existe (présence). Si tu veux valider une valeur exacte, dis-moi et je te le fais.
-  if ($http_x_api_key = "") { return 401; }
+  rewrite ^/wolverine/traderone/api/(.*)$ /api/$1 break;
 
-  return 204;
+  proxy_pass http://127.0.0.1:3000;
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
 }
 '''
-# NOTE: il y a un "if" ici. Si ton nginx refuse *tout* "if", on te donnera la variante "map" + "return" ensuite.
-# Mais en général l'erreur venait d'un if MAL PLACÉ (hors location). Ici il est dans une location => OK.
 
-# Injecter auth_loc si absent (avant la fin du server block)
-if "location = /_wolv_auth" not in s:
-    idx = s.rfind("}")
-    if idx == -1:
-        raise SystemExit("KO: pas de '}' trouvé dans le conf nginx")
-    s = s[:idx] + "\n" + auth_loc + "\n" + s[idx:]
-
-# Ajouter auth_request dans le bloc API ^~
-def ensure(line, block):
-    return block if line in block else block.replace("{", "{\n  " + line, 1)
-
-api_block2 = re.search(pat_api, s, flags=re.M).group(0)
-api_block2_new = api_block2
-
-# auth_request partout sur /api/ (sauf /health géré par location exact)
-api_block2_new = ensure('auth_request /_wolv_auth;', api_block2_new)
-
-# Remettre le bloc modifié
-s = re.sub(pat_api, api_block2_new, s, flags=re.M)
+# Insert avant la dernière "}" (fin du server block)
+idx = s.rfind("}")
+if idx == -1:
+  raise SystemExit("KO: pas de '}' trouvé dans le conf nginx")
+s = s[:idx] + "\n" + block + "\n" + s[idx:]
 
 ng.write_text(s)
-print("OK: auth_request installed (health public, rest protected)")
+print("OK: cleaned auth_request/_wolv_auth + inserted final health/api locations")
 PY
 
 nginx -t
 systemctl reload nginx
 
 echo "=== TESTS ==="
-echo "--- /health (200 sans clé) ---"
+echo "--- /health (200 sans clé attendu) ---"
 curl -sS -i https://fireinners.online/wolverine/traderone/api/health | head -n 15
 echo
-echo "--- /dexes (401/403 sans clé) ---"
-curl -sS -i https://fireinners.online/wolverine/traderone/api/dexes | head -n 15
+echo "--- /dexes (403 sans clé attendu) ---"
+curl -sS -i https://fireinners.online/wolverine/traderone/api/dexes | head -n 12
 echo
-echo "--- /dexes (200 avec clé) ---"
+echo "--- /dexes (200 avec clé attendu) ---"
 KEY="TA_CLE_ICI"
 curl -sS -i https://fireinners.online/wolverine/traderone/api/dexes -H "X-API-KEY: $KEY" | head -n 25
