@@ -1,35 +1,38 @@
--data '{
-    "fromChain": 101,
-    "toChain": 101,
-    "fromToken": "So11111111111111111111111111111111111111112",
-    "toToken": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-    "fromAmount": "1000000",
-    "fromAddress": "11111111111111111111111111111111",
-    "slippage": 0.5
-  }' | head -n 30
-HTTP/1.1 404 Not Found
-Content-Security-Policy: default-src 'none'
-X-Content-Type-Options: nosniff
-Content-Type: text/html; charset=utf-8
-Content-Length: 154
-Date: Thu, 08 Jan 2026 01:23:53 GMT
-Connection: keep-alive
-Keep-Alive: timeout=5
+set -e
+cd /opt/traderone-opt
 
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>Error</title>
-</head>
-<body>
-<pre>Cannot POST /api/lifi/quote</pre>
-</body>
-</html>
-root@srv1195584:/opt/traderone-opt# curl -sS -i -X POST "http://127.0.0.1:3000/api/swap" \
+echo "=== 0) Backup ==="
+ts="$(date +%Y%m%d_%H%M%S)"
+mkdir -p /root/traderone_backups
+cp -v server.js "/root/traderone_backups/server.js.$ts.bak"
+
+echo "=== 1) Vérif si LI.FI est déjà dans server.js ==="
+grep -nE 'LI\.FI helpers|/api/lifi/quote|lifiGet\(' server.js || true
+
+echo "=== 2) Ajout helpers LI.FI (si absents) ==="
+if ! grep -q 'LI\.FI helpers' server.js; then
+  perl -0777 -i -pe 's/(app\.use\(express\.json\(\)\);\n)/$1\n\/\/ --- LI.FI helpers (Node 20 fetch OK) ---\nconst LIFI_BASE = "https:\/\/li.quest\/v1";\n\nasync function lifiGet(path, params) {\n  const qs = new URLSearchParams(params).toString();\n  const url = `${LIFI_BASE}${path}?${qs}`;\n  const r = await fetch(url, {\n    headers: {\n      accept: "application\/json",\n      "x-lifi-api-key": process.env.LIFI_API_KEY || "",\n    },\n  });\n  const text = await r.text();\n  if (!r.ok) throw new Error(`LI.FI ${r.status}: ${text.slice(0, 300)}`);\n  return JSON.parse(text);\n}\n\n/s' server.js
+fi
+
+echo "=== 3) Ajout route POST /api/lifi/quote (si absente) ==="
+if ! grep -q '\/api\/lifi\/quote' server.js; then
+  perl -0777 -i -pe 's/(app\.all\((["\x27])\/api\/status\2,[\s\S]*?\n\}\);\n)/$1\napp.post("\/api\/lifi\/quote", async (req, res) => {\n  try {\n    if (!process.env.LIFI_API_KEY) {\n      return res.status(400).json({ ok: false, error: "LIFI_API_KEY missing" });\n    }\n    const b = req.body || {};\n    const out = await lifiGet("\/quote", {\n      fromChain: String(b.fromChain),\n      toChain: String(b.toChain),\n      fromToken: String(b.fromToken),\n      toToken: String(b.toToken),\n      fromAmount: String(b.fromAmount),\n      fromAddress: String(b.fromAddress),\n      toAddress: String(b.toAddress || b.fromAddress),\n      slippage: String(b.slippage ?? "0.5"),\n      integrator: process.env.LIFI_INTEGRATOR || "traderone",\n    });\n    return res.json({ ok: true, quote: out });\n  } catch (e) {\n    return res.status(502).json({ ok: false, error: "lifi_quote_fail", detail: String(e) });\n  }\n});\n\n/s' server.js
+fi
+
+echo "=== 4) Remplace /api/swap simulé -> provider=lifi ==="
+# Remplace uniquement la ligne "simulated" existante
+perl -i -pe 's#app\.post\((["\x27])\/api\/swap\1\s*,\s*\(req,\s*res\)\s*=>\s*res\.json\(\{\s*ok:\s*true,\s*simulated:\s*true,[^;]*\}\)\s*\)\s*;#app.post("/api/swap", async (req, res) => {\n  try {\n    const b = req.body || {};\n    const provider = String(b.provider || "sim");\n\n    if (provider !== "lifi") {\n      return res.json({ ok: true, simulated: true, request: b });\n    }\n\n    if (!process.env.LIFI_API_KEY) {\n      return res.status(400).json({ ok: false, error: "LIFI_API_KEY missing" });\n    }\n\n    const quote = await lifiGet("/quote", {\n      fromChain: String(b.fromChain),\n      toChain: String(b.toChain),\n      fromToken: String(b.fromToken),\n      toToken: String(b.toToken),\n      fromAmount: String(b.fromAmount),\n      fromAddress: String(b.fromAddress),\n      toAddress: String(b.toAddress || b.fromAddress),\n      slippage: String(b.slippage ?? "0.5"),\n      integrator: process.env.LIFI_INTEGRATOR || "traderone",\n    });\n\n    return res.json({ ok: true, provider: "lifi", quote });\n  } catch (e) {\n    return res.status(502).json({ ok: false, error: "swap_fail", detail: String(e) });\n  }\n});#g' server.js
+
+echo "=== 5) Confirme que les routes existent maintenant ==="
+grep -nE 'LI\.FI helpers|/api/lifi/quote|app\.post\("\/api\/swap"' server.js || true
+echo
+echo "=== 6) Restart pm2 ==="
+pm2 restart traderone --update-env || pm2 restart all --update-env
+
+echo "=== 7) Retest local ==="
+curl -sS -i -X POST "http://127.0.0.1:3000/api/lifi/quote" \
   -H "content-type: application/json" \
   --data '{
-    "provider": "lifi",
     "fromChain": 101,
     "toChain": 101,
     "fromToken": "So11111111111111111111111111111111111111112",
@@ -37,22 +40,13 @@ root@srv1195584:/opt/traderone-opt# curl -sS -i -X POST "http://127.0.0.1:3000/a
     "fromAmount": "1000000",
     "fromAddress": "11111111111111111111111111111111",
     "slippage": 0.5
-  }' | head -n 30
-HTTP/1.1 200 OK
-Content-Type: application/json; charset=utf-8
-Content-Length: 290
-ETag: W/"122-SNUbyQzEhXFzpTYJruOVOTI6NT0"
-Date: Thu, 08 Jan 2026 01:24:50 GMT
-Connection: keep-alive
-Keep-Alive: timeout=5
+  }' | head -n 25
 
-{"ok":true,"simulated":true,"request":{"provider":"lifi","fromChain":101,"toChain":101,"fromToken":"So11111111111111111111111111111111111111112","toToken":"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v","fromAmoroot@srv1195584:/opt/traderone-opt# BASE="https://fireinners.online/wolverine/traderone/api"584:/opt/traderone-opt# BASE="https://fireinners.online/wolverine/traderone/api"
-KEY=$(grep -oP 'http_x_api_key != "\K[^"]+' /etc/nginx/sites-enabled/fireinners.online-ssl | head -n1)
-
-curl -sS -i -X POST "$BASE/lifi/quote" \
+echo
+curl -sS -i -X POST "http://127.0.0.1:3000/api/swap" \
   -H "content-type: application/json" \
-  -H "X-API-KEY: $KEY" \
   --data '{
+    "provider":"lifi",
     "fromChain": 101,
     "toChain": 101,
     "fromToken": "So11111111111111111111111111111111111111112",
@@ -60,28 +54,4 @@ curl -sS -i -X POST "$BASE/lifi/quote" \
     "fromAmount": "1000000",
     "fromAddress": "11111111111111111111111111111111",
     "slippage": 0.5
-  }' | head -n 30
-HTTP/2 404 
-date: Thu, 08 Jan 2026 01:26:02 GMT
-content-type: text/plain; charset=utf-8
-content-length: 154
-server: cloudflare
-nel: {"report_to":"cf-nel","success_fraction":0.0,"max_age":604800}
-x-powered-by: Express
-etag: W/"9a-/FsMyPN97p9MTXbtvHXSaDhRlQQ"
-cf-cache-status: DYNAMIC
-report-to: {"group":"cf-nel","max_age":604800,"endpoints":[{"url":"https://a.nel.cloudflare.com/report/v4?s=B83ix1mOIezRgBDgUZJePruDq8gHjrN%2F28COHtY6%2BLsCOpYhFZRllENN%2BENIne%2FeH%2BVTWZI3W63xzUKUEqGwSalrUl9%2Fm3Wy1%2FuzDvCvsOVE%2FhFbSiafhtqPsA%3D%3D"}]}
-cf-ray: 9ba7e7887e3cdf3f-EWR
-alt-svc: h3=":443"; ma=86400
-
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>Error</title>
-</head>
-<body>
-<pre>Cannot POST /api/lifi/quote</pre>
-</body>
-</html>
-root@srv1195584:/opt/traderone-opt# 
+  }' | head -n 25
