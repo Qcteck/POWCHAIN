@@ -1,9 +1,79 @@
-curl -sS -i https://fireinners.online/wolverine/ | head -n 20
+curl -sS -i https://fireinners.online/wolverine/ | head -n 25
 curl -sS -i https://fireinners.online/wolverine/traderone/api/health | head -n 25
-curl -sS -i https://fireinners.online/wolverine/traderone/api/dexes -H "X-API-KEY: TA_CLE_ICI" | head -n 40
+curl -sS -i https://fireinners.online/wolverine/traderone/api/dexes -H "X-API-KEY: TA_CLE" | head -n 25
 
 
 
-ls -lah /var/www
-ls -lah /var/www/wolverine || true
-ls -lah /var/www/wolverine/index.html || true
+set -euo pipefail
+
+NG="/etc/nginx/sites-enabled/fireinners.online-ssl"
+cp -a "$NG" "$NG.bak.wolverine_final.$(date +%s)"
+
+# (A) enlever tout check X-API-KEY GLOBAL (on le garde seulement dans le location API)
+sed -i 's/^[[:space:]]*\(.*http_x_api_key.*\)$/# \1/g' "$NG"
+sed -i 's/^[[:space:]]*\(.*X-API-KEY.*\)$/# \1/g' "$NG"
+
+# (B) supprimer anciens blocs wolverine si présents
+python3 - <<'PY'
+from pathlib import Path
+import re
+ng = Path("/etc/nginx/sites-enabled/fireinners.online-ssl")
+s = ng.read_text()
+
+# drop any existing wolverine locations
+for pat in [
+  r'\n\s*location\s*=\s*/wolverine\s*\{[\s\S]*?\n\s*\}\s*',
+  r'\n\s*location\s+\^~\s+/wolverine/\s*\{[\s\S]*?\n\s*\}\s*',
+  r'\n\s*location\s+\^~\s+/wolverine/traderone/api/\s*\{[\s\S]*?\n\s*\}\s*',
+]:
+  s = re.sub(pat, "\n", s, flags=re.M)
+
+block = r'''
+# --- WOLVERINE_BLOCK_FINAL ---
+
+# UI: https://fireinners.online/wolverine
+location = /wolverine { return 301 /wolverine/; }
+
+location ^~ /wolverine/ {
+  root /var/www;
+  index index.html;
+  try_files $uri $uri/ /wolverine/index.html;
+}
+
+# API: https://fireinners.online/wolverine/traderone/api/* -> http://127.0.0.1:3000/api/*
+location ^~ /wolverine/traderone/api/ {
+  # clé UNIQUEMENT ici
+  if ($http_x_api_key = "") { return 403; }
+
+  rewrite ^/wolverine/traderone/api/(.*)$ /api/$1 break;
+
+  proxy_pass http://127.0.0.1:3000;
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+}
+'''
+idx = s.rfind("}")
+if idx == -1: raise SystemExit("KO: pas de '}' trouvé")
+s = s[:idx] + "\n" + block + "\n" + s[idx:]
+ng.write_text(s)
+print("OK: wolverine block written")
+PY
+
+nginx -t
+systemctl reload nginx
+
+# permissions safe (au cas où)
+chmod 755 /var/www /var/www/wolverine || true
+chmod 644 /var/www/wolverine/index.html || true
+
+echo "=== TESTS ==="
+curl -sS -i https://fireinners.online/wolverine/ | head -n 20 || true
+curl -sS -i https://fireinners.online/wolverine/traderone/api/health | head -n 20 || true
+
+
+
+
+
