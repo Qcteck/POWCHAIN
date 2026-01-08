@@ -1,3 +1,102 @@
-cd /opt/fireinners/WOLVERINE
-find . -maxdepth 4 -name package.json -not -path "*/node_modules/*" -print
-git branch -a | head -n 60
+# ROOT — Build UI WOLVERINE depuis /opt/fireinners/WOLVERINE/TRADERONE puis deploy -> /var/www/wolverine
+set -euo pipefail
+TS="$(date +%s)"
+
+REPO="/opt/fireinners/WOLVERINE"
+APP="$REPO/TRADERONE"
+DIST="/var/www/wolverine"
+NG="/etc/nginx/sites-enabled/fireinners.online-ssl"
+
+echo "=== 0) Sanity ==="
+[ -d "$APP" ] || { echo "KO: APP introuvable: $APP"; exit 1; }
+
+echo "=== 1) Backup du /var/www/wolverine actuel (Fireinners) ==="
+if [ -d "$DIST" ]; then
+  mv "$DIST" "/var/www/wolverine_fireinners_backup_$TS"
+fi
+mkdir -p "$DIST"
+
+echo "=== 2) Update repo (main) ==="
+cd "$REPO"
+git fetch --all --prune
+git reset --hard origin/main
+
+echo "=== 3) Node + build ==="
+apt-get update -y >/dev/null
+apt-get install -y rsync curl >/dev/null
+
+if ! command -v node >/dev/null 2>&1; then
+  curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null
+  apt-get install -y nodejs >/dev/null
+fi
+
+cd "$APP"
+
+# base pour servir sous /wolverine/
+export VITE_BASE="/wolverine/"
+export VITE_API_BASE="/wolverine/traderone/api"
+
+npm install
+npm run build
+
+OUT=""
+for d in dist build out; do
+  [ -d "$APP/$d" ] && OUT="$APP/$d" && break
+done
+[ -n "$OUT" ] || { echo "KO: pas de dist/build/out après build"; exit 1; }
+
+echo "=== 4) Deploy => /var/www/wolverine ==="
+rsync -a --delete "$OUT/" "$DIST/"
+
+chmod -R 755 /var/www
+find "$DIST" -type f -exec chmod 644 {} \;
+
+echo "=== 5) Nginx: /wolverine doit servir /var/www/wolverine (sans toucher l’API) ==="
+cp -a "$NG" "$NG.bak.wolverine_ui.$TS"
+
+python3 - <<'PY'
+from pathlib import Path
+import re
+ng = Path("/etc/nginx/sites-enabled/fireinners.online-ssl")
+s = ng.read_text()
+
+# retire boucle stupide si présente
+s = re.sub(r'\n\s*location\s*=\s*/\s*\{\s*return\s+301\s+/\s*;\s*\}\s*', "\n", s, flags=re.M)
+
+# retire anciens blocs UI /wolverine (on ne touche pas /wolverine/traderone/api)
+for pat in [
+  r'\n\s*location\s*=\s*/wolverine\s*\{[\s\S]*?\n\s*\}\s*',
+  r'\n\s*location\s+\^~\s+/wolverine/\s*\{[\s\S]*?\n\s*\}\s*',
+]:
+  s = re.sub(pat, "\n", s, flags=re.M)
+
+block = r'''
+# --- WOLVERINE UI ---
+location = /wolverine { return 301 /wolverine/; }
+location ^~ /wolverine/ {
+  root /var/www;
+  index index.html;
+  try_files $uri $uri/ /wolverine/index.html;
+  add_header Cache-Control "no-store" always;
+}
+'''
+i = s.rfind("}")
+if i == -1:
+  raise SystemExit("KO: nginx conf invalide")
+s = s[:i] + "\n" + block + "\n" + s[i:]
+ng.write_text(s)
+print("OK: bloc /wolverine écrit")
+PY
+
+nginx -t
+systemctl reload nginx
+
+echo "=== 6) Preuves ==="
+echo "--- /var/www/wolverine/index.html title ---"
+grep -i "<title>" -n "$DIST/index.html" | head -n 3 || true
+echo "--- HTTP /wolverine/ ---"
+curl -LsS https://fireinners.online/wolverine/ | grep -i "<title>" | head -n 1 || true
+echo "--- API health ---"
+curl -sS -i https://fireinners.online/wolverine/traderone/api/health | head -n 12 || true
+
+echo "DONE ✅"
