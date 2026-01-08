@@ -1,4 +1,4 @@
-# ROOT — FULL DIAG+FIX Phantom (detect iframe/viewer/CSP) + robust connect + build + deploy
+# ROOT — FIX npm "must provide string spec" + rebuild/deploy Wolverine
 set -euo pipefail
 
 UI_SRC="/opt/fireinners/WOLVERINE"
@@ -6,154 +6,80 @@ UI_DIST="/var/www/wolverine"
 
 echo "=== 0) Precheck ==="
 [ -d "$UI_SRC" ] || { echo "ERROR: missing $UI_SRC"; exit 1; }
-mkdir -p "$UI_DIST"
-
-echo "=== 1) Patch UI: Wallet Debug (explique pourquoi Phantom n'injecte pas) ==="
 cd "$UI_SRC"
-mkdir -p components lib
 
-cat > components/WalletDebug.jsx <<'JSX'
-import { useEffect, useState } from "react";
+echo "Node: $(node -v) | NPM: $(npm -v)"
+echo "PWD: $(pwd)"
 
-export default function WalletDebug() {
-  const [info, setInfo] = useState(null);
+echo "=== 1) Show package.json quick (top) ==="
+ls -lah package.json
+head -n 40 package.json || true
 
-  useEffect(() => {
-    const sol = window.solana;
-    const inIframe = window.top !== window.self;
-    const https = window.location.protocol;
-
-    setInfo({
-      url: window.location.href,
-      protocol: https,
-      inIframe,
-      hasSolana: !!sol,
-      isPhantom: !!sol?.isPhantom,
-      note:
-        https !== "https:" ? "NOT HTTPS -> Phantom won't inject" :
-        inIframe ? "IN IFRAME/VIEWER -> Phantom often will NOT inject window.solana" :
-        !sol ? "NO window.solana -> Phantom not injected (wrong browser/profile/extension off)" :
-        sol && !sol.isPhantom ? "window.solana exists, but not Phantom" :
-        "Phantom detected ✅",
-      userAgent: navigator.userAgent
-    });
-  }, []);
-
-  if (!info) return null;
-
-  return (
-    <div className="card">
-      <h3 style={{marginTop:0}}>Wallet Debug</h3>
-      <pre style={{margin:0, whiteSpace:"pre-wrap"}}>{JSON.stringify(info, null, 2)}</pre>
-      {(info.inIframe || !info.hasSolana || !info.isPhantom) && (
-        <div className="bad small" style={{marginTop:10}}>
-          Fix: open the site DIRECT in Chrome/Brave (not in Hostinger/HTML viewer/iframe) with Phantom extension enabled.
-        </div>
-      )}
-    </div>
-  );
+echo "=== 2) Detect invalid dependency specs (empty/non-string) ==="
+node - <<'NODE'
+const fs = require("fs");
+const p = JSON.parse(fs.readFileSync("package.json","utf8"));
+const bad = [];
+for (const k of ["dependencies","devDependencies","optionalDependencies","peerDependencies"]) {
+  const o = p[k]; if (!o) continue;
+  for (const [name,val] of Object.entries(o)) {
+    if (typeof val !== "string" || val.trim() === "") bad.push({section:k,name,val});
+  }
 }
-JSX
-
-echo "=== 2) Patch connectPhantom (robuste + erreurs claires) ==="
-cat > lib/wallet.js <<'JS'
-export async function connectPhantom() {
-  const sol = window?.solana;
-
-  if (window.top !== window.self) {
-    throw new Error("Page is inside an iframe/viewer. Open https://fireinners.online/wolverine/ directly in Chrome/Brave.");
-  }
-  if (window.location.protocol !== "https:") {
-    throw new Error("Not HTTPS. Phantom requires HTTPS.");
-  }
-  if (!sol) {
-    throw new Error("window.solana is missing. Phantom not injected (wrong browser/profile or extension disabled).");
-  }
-  if (!sol.isPhantom) {
-    throw new Error("window.solana exists but is not Phantom.");
-  }
-
-  // forces popup on user click
-  const resp = await sol.connect({ onlyIfTrusted: false });
-  return resp.publicKey.toString();
+if (!bad.length) {
+  console.log("OK: no empty/non-string specs found.");
+} else {
+  console.log("FOUND BAD SPECS:");
+  console.log(bad);
+  process.exit(12);
 }
-JS
+NODE || true
 
-echo "=== 3) Make WalletBox show the error + allow retry ==="
-cat > components/WalletBox.jsx <<'JSX'
-import { useState } from "react";
-import { connectPhantom } from "../lib/wallet";
+echo "=== 3) Auto-fix: remove bad specs (empty/non-string) ==="
+node - <<'NODE'
+const fs = require("fs");
+const p = JSON.parse(fs.readFileSync("package.json","utf8"));
+let changed = false;
 
-export default function WalletBox() {
-  const [addr, setAddr] = useState("");
-  const [err, setErr] = useState("");
-  const [loading, setLoading] = useState(false);
-
-  async function connect() {
-    setErr("");
-    setLoading(true);
-    try {
-      const a = await connectPhantom();
-      setAddr(a);
-    } catch (e) {
-      setErr(String(e?.message || e));
-    } finally {
-      setLoading(false);
+for (const k of ["dependencies","devDependencies","optionalDependencies","peerDependencies"]) {
+  const o = p[k]; if (!o) continue;
+  for (const [name,val] of Object.entries(o)) {
+    if (typeof val !== "string" || val.trim() === "") {
+      console.log(`REMOVE ${k}.${name} =`, val);
+      delete o[name];
+      changed = true;
     }
   }
-
-  return (
-    <div className="walletBox">
-      <div className="walletTitle">Wallet</div>
-
-      {!addr ? (
-        <button className="btn ghost" onClick={connect} disabled={loading}>
-          {loading ? "Connecting..." : "Connect Phantom"}
-        </button>
-      ) : (
-        <>
-          <div className="muted">Connected</div>
-          <code style={{fontSize:12, wordBreak:"break-all"}}>{addr}</code>
-          <div style={{marginTop:10}}>
-            <button className="btn" onClick={connect} disabled={loading}>
-              {loading ? "Refreshing..." : "Reconnect/Refresh"}
-            </button>
-          </div>
-        </>
-      )}
-
-      {err && <div className="bad small" style={{marginTop:10}}>{err}</div>}
-    </div>
-  );
 }
-JSX
 
-echo "=== 4) Inject WalletDebug into dashboard ==="
-if [ -f pages/index.jsx ]; then
-  if ! grep -q 'WalletDebug' pages/index.jsx; then
-    sed -i '1i import WalletDebug from "../components/WalletDebug";' pages/index.jsx
-    sed -i 's|</>|<WalletDebug />\n</>|' pages/index.jsx
-  fi
-fi
+if (changed) {
+  fs.writeFileSync("package.json", JSON.stringify(p,null,2) + "\n");
+  console.log("package.json fixed ✅");
+} else {
+  console.log("No changes needed.");
+}
+NODE
 
-echo "=== 5) Ensure Layout uses WalletBox ==="
-if [ -f components/Layout.jsx ]; then
-  grep -q 'from "\.\/WalletBox"' components/Layout.jsx || sed -i '1i import WalletBox from "./WalletBox";' components/Layout.jsx
-  grep -q '<WalletBox' components/Layout.jsx || sed -i 's|<main|<WalletBox />\n<main|g' components/Layout.jsx
-fi
+echo "=== 4) Clean install (wipe lock + modules + cache) ==="
+rm -rf node_modules package-lock.json .next out || true
+npm cache clean --force || true
 
-echo "=== 6) Build + deploy ==="
+echo "=== 5) Install deps (show output) ==="
 npm install --legacy-peer-deps
+
+echo "=== 6) Ensure solana web3 (quoted) ==="
+npm install --save "@solana/web3.js@1.98.4" --legacy-peer-deps || npm install --save "@solana/web3.js" --legacy-peer-deps
+
+echo "=== 7) Build ==="
 npm run build
 [ -d out ] || { echo "ERROR: out/ missing after build"; exit 1; }
+
+echo "=== 8) Deploy ==="
+mkdir -p "$UI_DIST"
 rsync -a --delete out/ "$UI_DIST/"
 
-echo "=== 7) Reload nginx ==="
+echo "=== 9) Reload nginx ==="
 nginx -t
 systemctl reload nginx
 
-echo "=== 8) Check headers (helps spot iframe/CSP issues) ==="
-echo "--- headers for /wolverine/ ---"
-curl -sS -I https://fireinners.online/wolverine/ | egrep -i "HTTP/|content-security-policy|x-frame-options|permissions-policy" || true
-
-echo "DONE ✅ -> open https://fireinners.online/wolverine/ and read 'Wallet Debug'"
+echo "DONE ✅ -> refresh https://fireinners.online/wolverine/"
