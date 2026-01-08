@@ -1,36 +1,69 @@
 set -euo pipefail
+
 NG="/etc/nginx/sites-enabled/fireinners.online-ssl"
-cp -a "$NG" "$NG.bak.health_public.$(date +%s)"
+cp -a "$NG" "$NG.bak.health_public_fix.$(date +%s)"
 
 python3 - <<'PY'
 from pathlib import Path
 import re
+
 ng = Path("/etc/nginx/sites-enabled/fireinners.online-ssl")
 s = ng.read_text()
 
-# Dans le bloc: location ^~ /wolverine/traderone/api/ { ... }
-# On remplace le check "if ($http_x_api_key = '') { return 403; }"
-# par un check qui bypass /health uniquement.
-pattern = r'(location\s+\^~\s+/wolverine/traderone/api/\s*\{[\s\S]*?)(\n\s*if\s*\(\s*\$http_x_api_key\s*=\s*""\s*\)\s*\{\s*return\s+403;\s*\}\s*)([\s\S]*?\n\s*\})'
-m = re.search(pattern, s, flags=re.M)
+# 1) Trouver le bloc API principal
+pat_api = r'(location\s+\^~\s+/wolverine/traderone/api/\s*\{)([\s\S]*?)(\n\})'
+m = re.search(pat_api, s, flags=re.M)
 if not m:
-    raise SystemExit("KO: bloc API ou check X-API-KEY introuvable (rien modifié).")
+    raise SystemExit("KO: bloc location ^~ /wolverine/traderone/api/ introuvable")
 
-replacement = m.group(1) + r'''
-  # clé UNIQUEMENT sauf /health
-  if ($request_uri !~ "^/wolverine/traderone/api/health$") {
-    if ($http_x_api_key = "") { return 403; }
-  }
-''' + m.group(3)
+api_open, api_body, api_close = m.group(1), m.group(2), m.group(3)
 
-s2 = re.sub(pattern, replacement, s, flags=re.M)
-ng.write_text(s2)
-print("OK: /health public, reste protégé")
+# 2) Nettoyer toute logique 'if ($request_uri ...){ if (...) { ... } }' et remettre un check simple
+api_body = re.sub(r'\n\s*if\s*\(\s*\$request_uri[\s\S]*?\n\s*\}\s*\n', '\n', api_body, flags=re.M)  # retire le bloc if(request_uri)...
+api_body = re.sub(r'\n\s*if\s*\(\s*\$http_x_api_key[\s\S]*?\n\s*\}\s*\n', '\n', api_body, flags=re.M)  # retire anciens checks clé
+
+auth_line = '\n  # clé UNIQUEMENT ici (tout sauf /health est protégé via location séparé)\n  if ($http_x_api_key = "") { return 403; }\n'
+# Injecter auth_line après l'ouverture du bloc (au début du body)
+api_body = auth_line + api_body.lstrip("\n")
+
+new_api_block = api_open + api_body + api_close
+
+# 3) S'assurer que le location exact /health existe (public, sans clé), sinon on l'insère AVANT le bloc API
+health_loc = r'''
+# --- PUBLIC HEALTH (no API key) ---
+location = /wolverine/traderone/api/health {
+  rewrite ^/wolverine/traderone/api/(.*)$ /api/$1 break;
+
+  proxy_pass http://127.0.0.1:3000;
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+}
+'''
+
+if "location = /wolverine/traderone/api/health" not in s:
+    # remplacer l'ancien bloc API par (health + new_api_block)
+    s = re.sub(pat_api, health_loc + "\n\n" + new_api_block, s, flags=re.M)
+else:
+    # juste remplacer le bloc API
+    s = re.sub(pat_api, new_api_block, s, flags=re.M)
+
+ng.write_text(s)
+print("OK: /health public via location exact + API block single-key-check (no nested if)")
 PY
 
 nginx -t
 systemctl reload nginx
 
 echo "=== TESTS ==="
+echo "--- /health (doit 200 sans clé) ---"
 curl -sS -i https://fireinners.online/wolverine/traderone/api/health | head -n 15
-curl -sS -i https://fireinners.online/wolverine/traderone/api/dexes  | head -n 10 
+echo
+echo "--- /dexes (doit 403 sans clé) ---"
+curl -sS -i https://fireinners.online/wolverine/traderone/api/dexes | head -n 10
+echo
+echo "--- /dexes (doit 200 avec clé) ---"
+KEY="TA_CLE_ICI"
+curl -sS -i https://fireinners.online/wolverine/traderone/api/dexes -H "X-API-KEY: $KEY" | head -n 25
