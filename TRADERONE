@@ -1,55 +1,39 @@
 set -e
 cd /opt/traderone-opt
 
-echo "=== 0) Backup ==="
-cp -a server.js "server.js.bak.$(date +%s)"
+echo "=== 1) Ports ==="
+ss -ltnp | egrep ':3000|:3002|:8585' || true
+echo
 
-echo "=== 1) Create allowlist file ==="
-mkdir -p /opt/traderone-opt/config
-cat > /opt/traderone-opt/config/dex_allowlist.json <<'JSON'
-[
-  "sushiswap",
-  "jupiter",
-  "dflow",
-  "okx",
-  "mayan",
-  "chainflip",
-  "gasZipBridge",
-  "relaydepository",
-  "odos",
-  "fly",
-  "relay"
-]
-JSON
+echo "=== 2) PM2 status ==="
+pm2 ls
+echo
 
-echo "=== 2) Patch server.js (insert helpers + /api/dexes + hook in /api/swap) ==="
+echo "=== 3) Derniers logs (erreur exacte) ==="
+pm2 logs traderone --lines 120 --nostream | tail -n 120 || true
+echo
 
-# 2.1 insert helpers once (near top, after express require)
-grep -q "DEX_ALLOWLIST_PATH" server.js || perl -0777 -i -pe 's/(const\s+express\s*=\s*require\([^\n]+\);\s*\n)/$1\n\/\/ === DEX allowlist (TraderOne) ===\nconst fs = require(\"fs\");\nconst path = require(\"path\");\nconst DEX_ALLOWLIST_PATH = process.env.DEX_ALLOWLIST_PATH || path.join(__dirname, \"config\", \"dex_allowlist.json\");\nfunction loadDexAllowlist(){\n  try{\n    const raw = fs.readFileSync(DEX_ALLOWLIST_PATH, \"utf8\");\n    const arr = JSON.parse(raw);\n    return Array.isArray(arr) ? arr.map(x=>String(x).trim()).filter(Boolean) : [];\n  }catch(e){\n    return [];\n  }\n}\nfunction normalizeDexList(dex){\n  if(dex === undefined || dex === null) return null;\n  if(dex === \"all\" || dex === true) return null;\n  const arr = Array.isArray(dex) ? dex : String(dex).split(\",\");\n  const out = arr.map(s=>String(s).trim()).filter(Boolean);\n  return out.length ? out : null;\n}\n\n/sg' server.js
+echo "=== 4) Test syntax node (si possible) ==="
+node --check server.js || true
+echo
 
-# 2.2 add GET /api/dexes once (after other app.get/app.post declarations; safe insert near /api/health if present)
-grep -q "app.get('/api/dexes'" server.js || perl -0777 -i -pe 's/(app\.get\(\x27\/api\/health\x27[^\n]*\n\}\);\s*\n)/$1\napp.get(\"\/api\/dexes\", (req,res)=>{\n  const list = loadDexAllowlist();\n  res.json({ ok:true, dexes:list });\n});\n\n/sg' server.js
-
-# 2.3 hook inside POST /api/swap (before it returns), only if route exists
-if grep -q "app.post('/api/swap'" server.js; then
-  grep -q "DEX_ALLOWLIST_APPLIED" server.js || perl -0777 -i -pe 's/(app\.post\(\x27\/api\/swap\x27[^{]*\{\s*\n)/$1  \/\/ DEX_ALLOWLIST_APPLIED\n  const allowlist = loadDexAllowlist();\n  const dexReq = normalizeDexList((req.body||{}).dex);\n  const dex = dexReq ? dexReq.filter(x => allowlist.includes(x)) : null;\n\n/sg' server.js
-  # If code later builds a payload object, we try to attach allowExchanges safely when a "payload" identifier exists.
-  # This is a no-op unless your code uses `payload` for LI.FI.
-  perl -0777 -i -pe 's/(\/\*\* DEX_ALLOWLIST_APPLIED[\s\S]*?\n)([\s\S]*?)(res\.json\()/$1$2\n  try{\n    if (typeof payload === \"object\" && payload) {\n      if (dex) payload.allowExchanges = dex;\n      else if (payload.allowExchanges) delete payload.allowExchanges;\n    }\n  } catch(_) {}\n\n$3/sg' server.js 2>/dev/null || true
-
-  # Always include allowlist info in response for debug
-  perl -0777 -i -pe 's/(res\.json\(\s*\{\s*ok:\s*true,\s*simulated:\s*true,\s*request:\s*req\.body\s*\|\|\s*\{\}\s*\}\s*\)\s*;)/res.json({ ok:true, simulated:true, request:(req.body||{}), dexAllowlist: allowlist, dexApplied: (dex||\"all\") });/sg' server.js 2>/dev/null || true
-else
-  echo "WARN: route POST /api/swap not found in server.js -> patch swap hook skipped"
+echo "=== 5) Si 3000 n’écoute pas -> rollback dernier backup + restart ==="
+if ! ss -ltnp | grep -q ':3000'; then
+  echo "KO: 3000 not listening -> ROLLBACK"
+  LAST_BAK=$(ls -1t server.js.bak.* 2>/dev/null | head -n1 || true)
+  echo "LAST_BAK=$LAST_BAK"
+  if [ -z "$LAST_BAK" ]; then
+    echo "Aucun backup server.js.bak.* trouvé"; exit 1
+  fi
+  cp -a server.js "server.js.bad.$(date +%s)" || true
+  cp -a "$LAST_BAK" server.js
+  pm2 restart traderone --update-env
+  sleep 1
 fi
+echo
 
-echo "=== 3) Restart PM2 ==="
-pm2 restart traderone --update-env
-sleep 1
-
-echo "=== 4) Quick tests ==="
-curl -sS http://127.0.0.1:3000/api/dexes | head -c 400; echo
-curl -sS -X POST http://127.0.0.1:3000/api/swap -H "content-type: application/json" \
-  --data '{"provider":"lifi","dex":"all"}' | head -c 400; echo
-
+echo "=== 6) Re-check + health ==="
+ss -ltnp | egrep ':3000|:3002|:8585' || true
+echo
+curl -sS -i http://127.0.0.1:3000/health | head -n 20 || true
 echo "=== DONE ==="
