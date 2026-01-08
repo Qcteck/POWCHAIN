@@ -1,32 +1,43 @@
-# ROOT — AUTO-FIND Next app dir + FIX npm spec + BUILD + DEPLOY
+# ROOT — AUTO-FIND app dir (NO SIGPIPE) + CLEAN INSTALL + BUILD + DEPLOY
 set -euo pipefail
 
 BASE="/opt/fireinners/WOLVERINE"
 DIST="/var/www/wolverine"
 
-echo "=== 0) Find app dir (package.json with build script) ==="
+echo "=== 0) Precheck ==="
 [ -d "$BASE" ] || { echo "ERROR: missing $BASE"; exit 1; }
+mkdir -p "$DIST"
 
-APP_DIR="$(find "$BASE" -maxdepth 5 -type f -name package.json -print0 \
-  | xargs -0 -I{} sh -c 'd=$(dirname "{}"); node -e "const p=require(\"'{}'\"); process.exit(p.scripts&&p.scripts.build?0:1)" 2>/dev/null && echo "$d"' \
-  | head -n 1)"
+echo "=== 1) Find APP_DIR (package.json with scripts.build) ==="
+APP_DIR=""
 
-if [ -z "${APP_DIR:-}" ]; then
+# loop safely (no head/xargs pipes)
+while IFS= read -r -d '' pj; do
+  # does this package.json have scripts.build ?
+  if node -e '
+    const p=require(process.argv[1]);
+    process.exit(p && p.scripts && typeof p.scripts.build==="string" && p.scripts.build.length ? 0 : 1);
+  ' "$pj" >/dev/null 2>&1; then
+    APP_DIR="$(dirname "$pj")"
+    break
+  fi
+done < <(find "$BASE" -maxdepth 6 -type f -name package.json -print0)
+
+if [ -z "$APP_DIR" ]; then
   echo "ERROR: No package.json with scripts.build found under $BASE"
-  echo "DEBUG: package.json candidates:"
-  find "$BASE" -maxdepth 5 -type f -name package.json
+  echo "Candidates:"
+  find "$BASE" -maxdepth 6 -type f -name package.json
   exit 1
 fi
 
 echo "APP_DIR = $APP_DIR"
-mkdir -p "$DIST"
 
-echo "=== 1) Enter app dir ==="
+echo "=== 2) Enter app dir ==="
 cd "$APP_DIR"
 pwd
 ls -lah package.json
 
-echo "=== 2) Fix bad dependency specs (empty/non-string) ==="
+echo "=== 3) Fix bad dependency specs (empty/non-string) ==="
 node - <<'NODE'
 const fs=require("fs");
 const p=JSON.parse(fs.readFileSync("package.json","utf8"));
@@ -41,19 +52,19 @@ if(changed) fs.writeFileSync("package.json", JSON.stringify(p,null,2)+"\n");
 console.log(changed ? "package.json fixed ✅" : "package.json OK ✅");
 NODE
 
-echo "=== 3) Clean install ==="
+echo "=== 4) Clean install ==="
 rm -rf node_modules package-lock.json .next out || true
 npm cache clean --force || true
 npm install --legacy-peer-deps
 
-echo "=== 4) Build ==="
+echo "=== 5) Build ==="
 npm run build
-[ -d out ] || { echo "ERROR: out/ missing after build (Next export failed)"; exit 1; }
+[ -d out ] || { echo "ERROR: out/ missing after build"; exit 1; }
 
-echo "=== 5) Deploy ==="
+echo "=== 6) Deploy ==="
 rsync -a --delete out/ "$DIST/"
 
-echo "=== 6) Reload nginx ==="
+echo "=== 7) Reload nginx ==="
 nginx -t
 systemctl reload nginx
 
