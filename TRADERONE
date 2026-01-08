@@ -1,83 +1,47 @@
-set -euo pipefail
+set -e
 
-APP="$(python3 - <<'PY'
-import os, json
-hits=[]
-for root in ["/opt"]:
-  for dp, dn, fn in os.walk(root):
-    if "node_modules" in dp: 
-      continue
-    if "package.json" in fn:
-      p=os.path.join(dp,"package.json")
-      try: j=json.load(open(p,"r",encoding="utf-8"))
-      except: continue
-      scripts=j.get("scripts") or {}
-      if "build" in scripts:
-        name=(j.get("name") or "").lower()
-        if any(x in name for x in ["backend","server","api"]): 
-          continue
-        hits.append(dp)
-print(hits[0] if hits else "")
+echo "=== 1) Vérifier ce que /wolverine sert actuellement ==="
+ls -lah /var/www
+echo
+ls -lah /var/www/wolverine || echo "/var/www/wolverine absent"
+
+echo
+echo "=== 2) Forcer nginx à servir /var/www/wolverine pour /wolverine ==="
+
+NG="/etc/nginx/sites-enabled/fireinners.online-ssl"
+cp -a "$NG" "$NG.bak.wolverine_fix"
+
+python3 - <<'PY'
+from pathlib import Path
+import re
+
+ng = Path("/etc/nginx/sites-enabled/fireinners.online-ssl")
+s = ng.read_text()
+
+# Supprimer anciens blocs /wolverine (sans toucher /wolverine/traderone/api)
+s = re.sub(r'\n\s*location\s*=\s*/wolverine\s*\{[\s\S]*?\n\s*\}', '', s)
+s = re.sub(r'\n\s*location\s+\^~\s+/wolverine/\s*\{[\s\S]*?\n\s*\}', '', s)
+
+block = r'''
+# --- WOLVERINE UI ---
+location = /wolverine { return 301 /wolverine/; }
+
+location ^~ /wolverine/ {
+    root /var/www;
+    index index.html;
+    try_files $uri $uri/ /wolverine/index.html;
+}
+'''
+
+i = s.rfind("}")
+s = s[:i] + "\n" + block + "\n" + s[i:]
+ng.write_text(s)
+print("Bloc nginx injecté")
 PY
-)"
 
-DIST="/var/www/wolverine"
-TS="$(date +%s)"
-
-echo "=== 1) TEST ASSETS actuels (200 vs 404) ==="
-HTML="$(curl -LsS https://fireinners.online/wolverine/ || true)"
-echo "$HTML" | grep -i "<title>" | head -n 1 || true
-echo "$HTML" | grep -Eo '(src|href)="[^"]+"' | head -n 20
+nginx -t
+systemctl reload nginx
 
 echo
-echo "Codes HTTP des 12 premiers assets:"
-echo "$HTML" | grep -Eo '(src|href)="[^"]+"' | cut -d'"' -f2 | head -n 12 | while read -r u; do
-  # si u est relatif, on le rend absolu
-  if echo "$u" | grep -qE '^https?://'; then URL="$u"
-  else URL="https://fireinners.online${u#/}"
-  fi
-  code=$(curl -sS -o /dev/null -w "%{http_code}" "$URL" || true)
-  echo "$code  $u"
-done
-
-echo
-echo "=== 2) REBUILD avec base /wolverine/ (Vite) ==="
-[ -n "$APP" ] || { echo "KO: pas trouvé de projet UI buildable dans /opt"; exit 1; }
-echo "APP=$APP"
-
-cd "$APP"
-
-# Force base Vite (/wolverine/) sans casser le reste
-# (si tu as vite.config.* avec export default, on remplace/ajoute base)
-if [ -f vite.config.js ] || [ -f vite.config.mjs ] || [ -f vite.config.ts ]; then
-  for f in vite.config.js vite.config.mjs vite.config.ts; do
-    [ -f "$f" ] || continue
-    if grep -q "base:" "$f"; then
-      sed -i "s/base:\s*['\"][^'\"]*['\"]/base: '\/wolverine\/'/g" "$f"
-    else
-      # injecte base dans l'export default { ... }
-      sed -i "s/export default {/export default { base: '\/wolverine\/', /" "$f" || true
-    fi
-  done
-fi
-
-cat > .env.production <<'EOF'
-VITE_API_BASE=/wolverine/traderone/api
-EOF
-
-npm install --legacy-peer-deps
-npm run build
-
-OUT=""
-for d in dist build out; do [ -d "$APP/$d" ] && OUT="$APP/$d" && break; done
-[ -n "$OUT" ] || { echo "KO: pas de dist/build/out"; exit 1; }
-
-echo "=== 3) DEPLOY ==="
-mkdir -p "$DIST"
-rsync -a --delete "$OUT/" "$DIST/"
-
-echo "=== 4) RETEST ==="
-HTML2="$(curl -LsS https://fireinners.online/wolverine/ || true)"
-echo "$HTML2" | grep -i "<title>" | head -n 1 || true
-echo "First assets:"
-echo "$HTML2" | grep -Eo '(src|href)="[^"]+"' | head -n 10
+echo "=== 3) Test ==="
+curl -LsS https://fireinners.online/wolverine/ | head -n 5
