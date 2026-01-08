@@ -1,57 +1,73 @@
 set -euo pipefail
 
 NG="/etc/nginx/sites-enabled/fireinners.online-ssl"
-cp -a "$NG" "$NG.bak.lock_key.$(date +%s)"
+cp -a "$NG" "$NG.bak.lock_exact_key.$(date +%s)"
 
-echo "=== 1) Trouver la clé (PM2 env d'abord, sinon .env) ==="
-KEY="$(pm2 env 0 2>/dev/null | awk -F= '/^(X_API_KEY|API_KEY|TRADERONE_API_KEY)=/{print $2}' | tail -n1 | tr -d "\"'" || true)"
+echo "=== 1) Trouver le PID Node (via PM2) ==="
+PID="$(pm2 pid 0 2>/dev/null | tr -d '[:space:]' || true)"
+if [ -z "${PID:-}" ] || [ "$PID" = "0" ]; then
+  # fallback si pm2 pid 0 ne marche pas
+  PID="$(pgrep -f 'node' | head -n1 || true)"
+fi
+[ -n "${PID:-}" ] || { echo "KO: PID node introuvable"; exit 1; }
+echo "OK: PID=$PID"
 
+echo "=== 2) Extraire une clé depuis /proc/$PID/environ (sans l'afficher) ==="
+KEY=""
+KNAME=""
+# cherche d'abord des noms standards
+for name in X_API_KEY API_KEY TRADERONE_API_KEY XAPIKEY; do
+  v="$(tr '\0' '\n' < /proc/$PID/environ | awk -F= -v n="$name" '$1==n{print substr($0,index($0,"=")+1)}' | tail -n1 || true)"
+  if [ -n "${v:-}" ]; then KEY="$v"; KNAME="$name"; break; fi
+done
+# fallback: n'importe quelle variable contenant KEY et API
 if [ -z "${KEY:-}" ]; then
-  # ajuste ce chemin si ton .env est ailleurs
-  for f in /opt/traderone-opt/.env /opt/fireinners/.env /opt/*/.env; do
-    [ -f "$f" ] || continue
-    k="$(awk -F= '/^(X_API_KEY|API_KEY|TRADERONE_API_KEY)=/{print $2}' "$f" | tail -n1 | tr -d "\"'" || true)"
-    if [ -n "${k:-}" ]; then KEY="$k"; break; fi
-  done
+  line="$(tr '\0' '\n' < /proc/$PID/environ | grep -Ei 'api.*key|key.*api|x_api_key|traderone.*key' | head -n1 || true)"
+  if [ -n "${line:-}" ]; then
+    KNAME="${line%%=*}"
+    KEY="${line#*=}"
+  fi
 fi
 
-[ -n "${KEY:-}" ] || { echo "KO: clé introuvable (donne juste le NOM exact de la variable)"; exit 1; }
-echo "OK: KEY found (not printed)"
+[ -n "${KEY:-}" ] || { echo "KO: clé introuvable dans l'env du process. Donne juste le NOM de la variable."; exit 1; }
+echo "OK: KEY FOUND (name=$KNAME) (not printed)"
 
-echo "=== 2) Patcher nginx: /health public, le reste check valeur exacte ==="
+echo "=== 3) Patch nginx: check valeur exacte dans location ^~ /wolverine/traderone/api/ ==="
 python3 - <<'PY'
 from pathlib import Path
-import re
+import os, re
 
 ng = Path("/etc/nginx/sites-enabled/fireinners.online-ssl")
 s = ng.read_text()
 
-# charge la clé depuis l'environnement (injectée via bash)
-import os
 KEY = os.environ["KEY"]
 
-# remplace le check "vide" par "valeur exacte"
-# (dans le bloc: location ^~ /wolverine/traderone/api/)
-pattern = r'if\s*\(\s*\$http_x_api_key\s*=\s*""\s*\)\s*\{\s*return\s+403;\s*\}'
-repl = f'if ($http_x_api_key != "{KEY}") {{ return 403; }}'
+# Remplace un check "vide" par "valeur exacte"
+s2 = re.sub(
+    r'if\s*\(\s*\$http_x_api_key\s*=\s*""\s*\)\s*\{\s*return\s+403;\s*\}',
+    f'if ($http_x_api_key != "{KEY}") {{ return 403; }}',
+    s
+)
 
-if re.search(pattern, s):
-    s2 = re.sub(pattern, repl, s)
-else:
-    # fallback: si déjà un check existe, on le remplace aussi
-    s2 = re.sub(r'if\s*\(\s*\$http_x_api_key\s*!=\s*"[^"]*"\s*\)\s*\{\s*return\s+403;\s*\}', repl, s)
-    if s2 == s:
-        raise SystemExit("KO: check X-API-KEY introuvable dans le bloc /wolverine/traderone/api/")
+# Si déjà un != "..." existe, on remplace aussi
+s2 = re.sub(
+    r'if\s*\(\s*\$http_x_api_key\s*!=\s*"[^"]*"\s*\)\s*\{\s*return\s+403;\s*\}',
+    f'if ($http_x_api_key != "{KEY}") {{ return 403; }}',
+    s2
+)
+
+if s2 == s:
+    raise SystemExit("KO: je n'ai trouvé aucun check X-API-KEY à remplacer dans nginx.")
 
 ng.write_text(s2)
-print("OK: nginx key check locked to exact value")
+print("OK: nginx locked to exact key (not printed)")
 PY
 
 nginx -t
 systemctl reload nginx
-echo "OK: reloaded"
+echo "OK: nginx reloaded"
 
-echo "=== 3) Tests ==="
+echo "=== 4) Tests ==="
 echo "--- /health (public) ---"
 curl -sS -i https://fireinners.online/wolverine/traderone/api/health | head -n 12
 echo
