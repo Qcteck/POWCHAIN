@@ -4,13 +4,9 @@ NG="/etc/nginx/sites-enabled/fireinners.online-ssl"
 [ -f "$NG" ] || { echo "KO: $NG introuvable"; exit 1; }
 
 echo "=== 0) Backup ==="
-cp -a "$NG" "$NG.bak.dupe_wolv.$(date +%s)"
+cp -a "$NG" "$NG.bak.clean_dupes.$(date +%s)"
 
-echo "=== 1) Trouver tous les blocs /wolverine ==="
-grep -nE 'WOLVERINE_BLOCK_V1|location\s+=\s*/wolverine\b|location\s+\^~\s+/wolverine/|/wolverine/traderone/api/' "$NG" | sed -n '1,220p'
-echo
-
-echo "=== 2) Fix: supprimer les locations /wolverine hors du bloc WOLVERINE_BLOCK_V1 ==="
+echo "=== 1) Nettoyage des doublons (garder seulement le bloc APRÈS WOLVERINE_BLOCK_V1) ==="
 python3 - <<'PY'
 from pathlib import Path
 import re
@@ -19,38 +15,54 @@ ng = Path("/etc/nginx/sites-enabled/fireinners.online-ssl")
 s = ng.read_text()
 
 marker = "# --- WOLVERINE_BLOCK_V1 ---"
-if marker not in s:
-    raise SystemExit("KO: bloc WOLVERINE_BLOCK_V1 introuvable (ne pas auto-fix).")
+mpos = s.find(marker)
+if mpos == -1:
+    raise SystemExit("KO: marker WOLVERINE_BLOCK_V1 introuvable")
 
-# Split around marker block so we can only clean outside it
-pre, rest = s.split(marker, 1)
-# rest contains marker removed; rebuild marker+rest for simplicity
-rest = marker + rest
+def keep_only_after(pattern: str, keep_after_idx: int, label: str):
+    global s
+    matches = list(re.finditer(pattern, s, flags=re.M))
+    if len(matches) <= 1:
+        return
+    keep = None
+    # préfère un match situé après le marker
+    for mm in matches:
+        if mm.start() > keep_after_idx:
+            keep = mm
+            break
+    # sinon, garde le dernier
+    if keep is None:
+        keep = matches[-1]
 
-def drop_locations(txt: str) -> str:
-    # remove exact blocks for:
-    # location = /wolverine { ... }
-    txt = re.sub(r'\n\s*location\s*=\s*/wolverine\s*\{[\s\S]*?\n\s*\}\s*\n', '\n', txt, flags=re.M)
-    # location ^~ /wolverine/ { ... }
-    txt = re.sub(r'\n\s*location\s+\^~\s+/wolverine/\s*\{[\s\S]*?\n\s*\}\s*\n', '\n', txt, flags=re.M)
-    # location ^~ /wolverine/traderone/api/ { ... }
-    txt = re.sub(r'\n\s*location\s+\^~\s+/wolverine/traderone/api/\s*\{[\s\S]*?\n\s*\}\s*\n', '\n', txt, flags=re.M)
-    return txt
+    new = []
+    last = 0
+    for mm in matches:
+        if mm is keep:
+            continue
+        new.append(s[last:mm.start()])
+        last = mm.end()
+    new.append(s[last:])
+    s = "".join(new)
+    print(f"OK: removed {len(matches)-1} duplicate(s) for {label}")
 
-pre2 = drop_locations(pre)
-# IMPORTANT: keep the injected block untouched
-s2 = pre2 + "\n" + rest
+# blocs location complets (non-greedy)
+pat_eq_wolv   = r'\n\s*location\s*=\s*/wolverine\s*\{[\s\S]*?\n\s*\}\s*'
+pat_wolv_dir  = r'\n\s*location\s+\^~\s+/wolverine/\s*\{[\s\S]*?\n\s*\}\s*'
+pat_wolv_api  = r'\n\s*location\s+\^~\s+/wolverine/traderone/api/\s*\{[\s\S]*?\n\s*\}\s*'
 
-ng.write_text(s2)
-print("OK: removed duplicate /wolverine locations outside WOLVERINE_BLOCK_V1")
+keep_only_after(pat_eq_wolv,  mpos, "location = /wolverine")
+keep_only_after(pat_wolv_dir, mpos, "location ^~ /wolverine/")
+keep_only_after(pat_wolv_api, mpos, "location ^~ /wolverine/traderone/api/")
+
+ng.write_text(s)
+print("OK: file written")
 PY
 
-echo "=== 3) Test + reload ==="
+echo "=== 2) Re-check occurrences ==="
+grep -nE 'WOLVERINE_BLOCK_V1|location\s+=\s*/wolverine\b|location\s+\^~\s+/wolverine/|/wolverine/traderone/api/' "$NG" | head -n 220
+echo
+
+echo "=== 3) nginx test + reload ==="
 nginx -t
 systemctl reload nginx
 echo "OK: nginx reloaded"
-
-echo "=== 4) Quick tests ==="
-curl -sS -i https://fireinners.online/wolverine/ | head -n 15 || true
-echo
-curl -sS -i https://fireinners.online/wolverine/traderone/api/health | head -n 15 || true
