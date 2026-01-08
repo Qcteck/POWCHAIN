@@ -1,2 +1,65 @@
-ls -lah /opt/fireinners/frontend-react/app
-ls -lah /opt/fireinners/frontend-react/app/package.json
+set -euo pipefail
+
+APP="/opt/fireinners/frontend-react/app"
+DIST="/var/www/wolverine"
+NG="/etc/nginx/sites-enabled/fireinners.online-ssl"
+
+cd "$APP"
+
+# Vars prod (Vite)
+cat > .env.production <<'EOF'
+VITE_BASE=/wolverine/
+VITE_API_BASE=/wolverine/traderone/api
+EOF
+
+# Build
+npm ci
+npm run build
+
+# Deploy dist -> /var/www/wolverine
+apt-get update -y
+apt-get install -y rsync
+mkdir -p "$DIST"
+rsync -a --delete "$APP/dist/" "$DIST/"
+chmod -R 755 /var/www
+find "$DIST" -type f -exec chmod 644 {} \;
+
+# S'assurer que nginx sert /wolverine depuis /var/www/wolverine (sans toucher l'API)
+cp -a "$NG" "$NG.bak.ui_deploy_$(date +%s)"
+
+python3 - <<'PY'
+from pathlib import Path
+import re
+ng = Path("/etc/nginx/sites-enabled/fireinners.online-ssl")
+s = ng.read_text()
+
+for pat in [
+  r'\n\s*location\s*=\s*/wolverine\s*\{[\s\S]*?\n\s*\}\s*',
+  r'\n\s*location\s+\^~\s+/wolverine/\s*\{[\s\S]*?\n\s*\}\s*',
+]:
+  s = re.sub(pat, "\n", s, flags=re.M)
+
+block = r'''
+# --- WOLVERINE UI (served from /var/www/wolverine) ---
+location = /wolverine { return 301 /wolverine/; }
+
+location ^~ /wolverine/ {
+  root /var/www;
+  index index.html;
+  try_files $uri $uri/ /wolverine/index.html;
+}
+'''
+i = s.rfind("}")
+if i == -1:
+  raise SystemExit("KO: pas trouvé de '}' final dans le conf nginx")
+s = s[:i] + "\n" + block + "\n" + s[i:]
+ng.write_text(s)
+print("OK: UI bloc injected")
+PY
+
+nginx -t
+systemctl reload nginx
+
+# Tests
+curl -sS -I https://fireinners.online/wolverine/ | head -n 12
+curl -sS -i https://fireinners.online/wolverine/traderone/api/health | head -n 12
