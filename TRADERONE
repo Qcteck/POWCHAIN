@@ -1,59 +1,35 @@
 set -e
 cd /opt/traderone-opt
 
-echo "=== 0) Snapshot ports ==="
+echo "=== 1) Snapshot ports ==="
 ss -ltnp | egrep ':3000|:3002|:8585' || true
 echo
 
-echo "=== 1) Kill 8585 + empêcher le retour (service + cron) ==="
+echo "=== 2) Kill 8585 + identifier ce qui le lance ==="
 PID8585=$(ss -ltnp | sed -n 's/.*:8585.*pid=\([0-9]\+\).*/\1/p' | head -n1 || true)
 echo "PID8585=$PID8585"
 if [ -n "$PID8585" ]; then
   ps -fp "$PID8585" || true
+  echo "--- cmdline ---"
+  tr '\0' ' ' < /proc/"$PID8585"/cmdline 2>/dev/null || true
+  echo
   kill "$PID8585" || true
   sleep 1
   kill -9 "$PID8585" 2>/dev/null || true
 fi
-
-# services connus (au cas où)
-for s in wolverine-api.service wolverine-tg-monitor.service wolverine-tg-sentinel.service traderone.service; do
-  systemctl stop "$s" 2>/dev/null || true
-  systemctl disable "$s" 2>/dev/null || true
-done
-systemctl mask wolverine-api.service 2>/dev/null || true
-
-# cron root: commenter /opt/traderone-opt
-CR="/var/spool/cron/crontabs/root"
-if [ -f "$CR" ]; then
-  cp -a "$CR" "$CR.bak.$(date +%s)"
-  sed -i 's#^\([^#].*/opt/traderone-opt/.*\)$#\# DISABLED_BY_CLEANUP \1#g' "$CR"
-fi
-echo "OK: 8585 cleaned + anti-restart applied"
+echo "After kill:"
+ss -ltnp | grep ':8585' || echo "OK: 8585 libéré"
 echo
 
-echo "=== 2) Fix server.js: remove duplicate const path/fs requires (keep first only) ==="
-cp -a server.js "server.js.pre_dedup.bak.$(date +%s)"
-
-awk '
-  BEGIN{seen_path=0; seen_fs=0}
-  {
-    if ($0 ~ /^const[[:space:]]+path[[:space:]]*=[[:space:]]*require\((\"|\x27)path(\"|\x27)\);[[:space:]]*$/) {
-      if (seen_path==1) next;
-      seen_path=1
-    }
-    if ($0 ~ /^const[[:space:]]+fs[[:space:]]*=[[:space:]]*require\((\"|\x27)fs(\"|\x27)\);[[:space:]]*$/) {
-      if (seen_fs==1) next;
-      seen_fs=1
-    }
-    print
-  }
-' server.js > server.js.tmp && mv server.js.tmp server.js
-
-echo "Check: occurrences"
-grep -nE '^const (path|fs) *= *require' -n server.js || true
+echo "=== 3) Trouver le relaunch (systemd/cron) ==="
+echo "--- systemd grep server.js/8585 ---"
+grep -RIn --line-number -E 'server\.js|:8585|8585' /etc/systemd/system /lib/systemd/system 2>/dev/null | head -n 80 || true
+echo
+echo "--- cron grep traderone-opt/8585 ---"
+grep -RIn --line-number -E 'traderone-opt|server\.js|8585' /etc/cron.* /var/spool/cron/crontabs 2>/dev/null | head -n 80 || true
 echo
 
-echo "=== 3) Ensure DEX allowlist file + add GET /api/dexes (safe) ==="
+echo "=== 4) DEX allowlist file ==="
 mkdir -p config
 cat > config/dex_allowlist.json <<'JSON'
 [
@@ -70,15 +46,64 @@ cat > config/dex_allowlist.json <<'JSON'
   "relay"
 ]
 JSON
-
-# ajouter helper + route /api/dexes seulement si absent (sans re-declare path/fs)
-grep -q 'DEX_ALLOWLIST_PATH' server.js || perl -0777 -i -pe 's/(express\.json\(\)\);\s*\n)/$1\n\/\/ === DEX allowlist (TraderOne) ===\nconst DEX_ALLOWLIST_PATH = process.env.DEX_ALLOWLIST_PATH || path.join(__dirname, \"config\", \"dex_allowlist.json\");\nfunction loadDexAllowlist(){\n  try{ const raw = fs.readFileSync(DEX_ALLOWLIST_PATH,\"utf8\"); const a = JSON.parse(raw);\n    return Array.isArray(a)?a.map(x=>String(x).trim()).filter(Boolean):[];\n  }catch(e){ return []; }\n}\n\n/sg' server.js
-
-grep -q '\/api\/dexes' server.js || perl -0777 -i -pe 's/(app\.get\(\x27\/api\/health\x27[\s\S]*?\);\s*\n)/$1\napp.get(\"\\/api\\/dexes\", (req,res)=>{\n  res.json({ ok:true, dexes: loadDexAllowlist() });\n});\n\n/sg' server.js
-
+echo "OK: config/dex_allowlist.json"
 echo
 
-echo "=== 4) Restart PM2 + tests ==="
+echo "=== 5) Patch server.js (sans perl) ==="
+node <<'NODE'
+const fs = require("fs");
+const p = "/opt/traderone-opt/server.js";
+let s = fs.readFileSync(p, "utf8");
+
+function has(x){ return s.includes(x); }
+
+if(!has("DEX_ALLOWLIST_PATH")){
+  // On insère le helper juste après "app.use(express.json());" (ça existe chez toi)
+  const anchor = "app.use(express.json());";
+  const i = s.indexOf(anchor);
+  if(i === -1) throw new Error("Anchor not found: " + anchor);
+
+  const insert = `
+${anchor}
+
+// === DEX allowlist (TraderOne) ===
+const DEX_ALLOWLIST_PATH = process.env.DEX_ALLOWLIST_PATH || path.join(__dirname, "config", "dex_allowlist.json");
+function loadDexAllowlist(){
+  try{
+    const raw = fs.readFileSync(DEX_ALLOWLIST_PATH,"utf8");
+    const a = JSON.parse(raw);
+    return Array.isArray(a) ? a.map(x=>String(x).trim()).filter(Boolean) : [];
+  }catch(e){ return []; }
+}
+`;
+  s = s.slice(0, i) + insert + s.slice(i + anchor.length);
+}
+
+if(!has('app.get("/api/dexes"')){
+  // On insère la route juste après /api/health si elle existe
+  const anchor2 = "app.get('/api/health'";
+  const j = s.indexOf(anchor2);
+  if(j === -1) throw new Error("Anchor not found: /api/health route");
+
+  // Trouver la fin du handler /api/health (premier ");" après)
+  const end = s.indexOf(");", j);
+  if(end === -1) throw new Error("Could not find end of /api/health block");
+
+  const route = `
+
+app.get("/api/dexes", (req,res)=>{
+  res.json({ ok:true, dexes: loadDexAllowlist() });
+});
+`;
+  s = s.slice(0, end+2) + route + s.slice(end+2);
+}
+
+fs.writeFileSync(p, s);
+console.log("OK: server.js patched (/api/dexes + helpers)");
+NODE
+
+echo
+echo "=== 6) Restart PM2 + tests ==="
 node --check server.js
 pm2 restart traderone --update-env
 sleep 1
@@ -87,5 +112,5 @@ ss -ltnp | egrep ':3000|:3002|:8585' || true
 echo
 curl -sS -i http://127.0.0.1:3000/health | head -n 15 || true
 echo
-curl -sS http://127.0.0.1:3000/api/dexes | head -c 300; echo
+curl -sS http://127.0.0.1:3000/api/dexes | head -c 400; echo
 echo "=== DONE ==="
