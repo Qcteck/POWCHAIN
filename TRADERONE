@@ -1,102 +1,30 @@
-# ROOT — FIX: afficher soldes Phantom + TraderOne + delta (rebuild + deploy)
+# ROOT — DIAG + FIX soldes wallet
 set -e
 
 SRC="/opt/_wolverine_next_src"
 DIST="/var/www/wolverine"
 
-echo "=== 1) Ajouter libs on-chain + backend ==="
-mkdir -p "$SRC/lib"
+echo "=== 1) Vérifier que WalletBox est bien déployé ==="
+grep -R "On‑chain" -n "$DIST" || echo "⚠ WalletBox pas trouvé dans le build"
 
-cat > "$SRC/lib/onchain.js" <<'JS'
-export async function fetchOnchainBalances(pubkey) {
-  if (!window.solanaWeb3) throw new Error("solanaWeb3 not loaded");
-  const conn = new window.solanaWeb3.Connection(
-    window.solanaWeb3.clusterApiUrl("mainnet-beta")
-  );
-  const lamports = await conn.getBalance(new window.solanaWeb3.PublicKey(pubkey));
-  return { SOL: lamports / 1e9 };
-}
-JS
+echo "=== 2) Vérifier que solanaWeb3 est chargé dans le HTML ==="
+if ! grep -R "solanaWeb3" -n "$DIST"; then
+  echo "⚠ solanaWeb3 manquant → injection du script"
+  # injecter solana web3 CDN dans index.html exporté
+  sed -i 's|</head>|<script src="https://unpkg.com/@solana/web3.js@latest/lib/index.iife.min.js"></script></head>|' "$DIST/index.html"
+fi
 
-cat > "$SRC/lib/balances.js" <<'JS'
-export async function fetchInternalBalances(pubkey) {
-  const r = await fetch(`/wolverine/traderone/api/wallet/${pubkey}`);
-  if (!r.ok) throw new Error("Backend balance error");
-  return r.json();
-}
-JS
+echo "=== 3) Vérifier endpoint backend ==="
+TEST_ADDR="11111111111111111111111111111111"
+curl -sS -i "https://fireinners.online/wolverine/traderone/api/wallet/$TEST_ADDR" | head -n 10 || true
 
-echo "=== 2) Patch WalletBox ==="
-cat > "$SRC/components/WalletBox.jsx" <<'JSX'
-import { useState } from "react";
-import { connectPhantom } from "../lib/wallet";
-import { fetchOnchainBalances } from "../lib/onchain";
-import { fetchInternalBalances } from "../lib/balances";
+echo "=== 4) Reload nginx (au cas où) ==="
+nginx -t
+systemctl reload nginx
 
-export default function WalletBox() {
-  const [addr, setAddr] = useState("");
-  const [onchain, setOnchain] = useState(null);
-  const [internal, setInternal] = useState(null);
-  const [err, setErr] = useState("");
+echo "=== 5) Résumé ==="
+echo "- Recharge la page"
+echo "- Clique Connect Phantom"
+echo "- Ouvre la console (F12) et dis-moi s’il y a une erreur JS"
 
-  async function connect() {
-    try {
-      const a = await connectPhantom();
-      if (!a) return;
-      setAddr(a);
-
-      const oc = await fetchOnchainBalances(a);
-      setOnchain(oc);
-
-      const it = await fetchInternalBalances(a);
-      setInternal(it);
-    } catch (e) {
-      setErr(String(e.message || e));
-    }
-  }
-
-  function delta() {
-    if (!onchain || !internal) return null;
-    const out = {};
-    for (const k in onchain) out[k] = (onchain[k] || 0) - (internal[k] || 0);
-    return out;
-  }
-
-  const d = delta();
-
-  return (
-    <div className="walletBox">
-      <div className="walletTitle">Wallet</div>
-
-      {!addr ? (
-        <button className="btn ghost" onClick={connect}>Connect Phantom</button>
-      ) : (
-        <>
-          <div className="muted">Connected</div>
-          <code style={{fontSize:12,wordBreak:"break-all"}}>{addr}</code>
-
-          <h4>On‑chain (Phantom)</h4>
-          {onchain && Object.entries(onchain).map(([k,v]) => <div key={k}>{k}: {v}</div>)}
-
-          <h4>TraderOne</h4>
-          {internal && Object.entries(internal).map(([k,v]) => <div key={k}>{k}: {v}</div>)}
-
-          <h4>Δ non crédité</h4>
-          {d && Object.entries(d).map(([k,v]) => <div key={k}>{k}: {v}</div>)}
-        </>
-      )}
-
-      {err && <div className="bad small">{err}</div>}
-    </div>
-  );
-}
-JSX
-
-echo "=== 3) Rebuild UI ==="
-cd "$SRC"
-npm run build
-
-echo "=== 4) Redeploy ==="
-rsync -a --delete "$SRC/out/" "$DIST/"
-
-echo "DONE ✅ — recharge la page"
+echo "DONE ✅"
