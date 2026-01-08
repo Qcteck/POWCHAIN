@@ -1,38 +1,36 @@
-# ROOT batch — trouver LIFI_API_KEY dans PM2 (quel id ?) + lock nginx sur valeur exacte
 set -euo pipefail
 
-echo "=== 1) PM2 list ==="
-pm2 ls
-echo
-
-echo "=== 2) Cherche LIFI_API_KEY dans TOUS les PM2 env (sans afficher la valeur) ==="
-FOUND_ID=""
-while read -r id; do
-  [ -n "$id" ] || continue
-  if pm2 env "$id" 2>/dev/null | grep -q '^LIFI_API_KEY='; then
-    echo "FOUND: LIFI_API_KEY dans pm2 id=$id"
-    FOUND_ID="$id"
-    break
-  fi
-done < <(pm2 jlist 2>/dev/null | python3 - <<'PY'
-import json,sys
-a=json.load(sys.stdin)
-for p in a:
-  print(p.get("pm_id",""))
-PY
-)
-
-[ -n "${FOUND_ID:-}" ] || { echo "KO: LIFI_API_KEY introuvable dans pm2 env (tous les ids)."; exit 1; }
-
-echo "=== 3) Récupérer la valeur depuis pm2 env $FOUND_ID (NON affichée) ==="
-KEY="$(pm2 env "$FOUND_ID" 2>/dev/null | awk -F= '/^LIFI_API_KEY=/{print $2}' | tail -n1)"
-[ -n "${KEY:-}" ] || { echo "KO: lecture valeur LIFI_API_KEY impossible"; exit 1; }
-echo "OK: KEY found (not printed) from pm2 id=$FOUND_ID"
-
-echo "=== 4) Patch nginx: X-API-KEY doit matcher EXACTEMENT LIFI_API_KEY ==="
 NG="/etc/nginx/sites-enabled/fireinners.online-ssl"
-cp -a "$NG" "$NG.bak.lock_exact_key.$(date +%s)"
+cp -a "$NG" "$NG.bak.lock_exact_$(date +%s)"
 
+echo "=== 1) Tenter via PM2 env 0 ==="
+KEY="$(pm2 env 0 2>/dev/null | awk -F= '/^LIFI_API_KEY=/{print $2}' | tail -n1 || true)"
+
+echo "=== 2) Fallback: chercher dans les .env (sans afficher la valeur) ==="
+if [ -z "${KEY:-}" ]; then
+  CWD="$(pm2 describe 0 2>/dev/null | awk -F': ' '/cwd/ {print $2; exit}' || true)"
+  [ -n "${CWD:-}" ] || CWD="/opt"
+
+  # Cherche un .env proche du cwd, sinon sous /opt
+  for f in "$CWD/.env" "$CWD/../.env" "$CWD/../../.env"; do
+    if [ -f "$f" ]; then
+      KEY="$(awk -F= '/^LIFI_API_KEY=/{print $2}' "$f" | tail -n1 | tr -d "\"'" || true)"
+      [ -n "${KEY:-}" ] && break
+    fi
+  done
+
+  if [ -z "${KEY:-}" ]; then
+    while IFS= read -r f; do
+      v="$(awk -F= '/^LIFI_API_KEY=/{print $2}' "$f" | tail -n1 | tr -d "\"'" || true)"
+      if [ -n "${v:-}" ]; then KEY="$v"; break; fi
+    done < <(find /opt -maxdepth 6 -type f -name ".env" 2>/dev/null)
+  fi
+fi
+
+[ -n "${KEY:-}" ] || { echo "KO: LIFI_API_KEY introuvable (ni PM2 env, ni .env)."; exit 1; }
+echo "OK: KEY found (not printed)"
+
+echo "=== 3) Lock Nginx: X-API-KEY doit matcher EXACTEMENT LIFI_API_KEY ==="
 python3 - <<'PY'
 from pathlib import Path
 import os,re
@@ -40,14 +38,19 @@ ng=Path("/etc/nginx/sites-enabled/fireinners.online-ssl")
 s=ng.read_text()
 KEY=os.environ["KEY"]
 
-# remplace check "vide" OU check != "..." existant
-s2 = re.sub(r'if\s*\(\s*\$http_x_api_key\s*=\s*""\s*\)\s*\{\s*return\s+403;\s*\}',
-            f'if ($http_x_api_key != "{KEY}") {{ return 403; }}', s)
-s2 = re.sub(r'if\s*\(\s*\$http_x_api_key\s*!=\s*"[^"]*"\s*\)\s*\{\s*return\s+403;\s*\}',
-            f'if ($http_x_api_key != "{KEY}") {{ return 403; }}', s2)
+s2 = re.sub(
+  r'if\s*\(\s*\$http_x_api_key\s*=\s*""\s*\)\s*\{\s*return\s+403;\s*\}',
+  f'if ($http_x_api_key != "{KEY}") {{ return 403; }}',
+  s
+)
+s2 = re.sub(
+  r'if\s*\(\s*\$http_x_api_key\s*!=\s*"[^"]*"\s*\)\s*\{\s*return\s+403;\s*\}',
+  f'if ($http_x_api_key != "{KEY}") {{ return 403; }}',
+  s2
+)
 
 if s2 == s:
-  raise SystemExit("KO: je ne trouve pas le check X-API-KEY dans nginx à remplacer.")
+  raise SystemExit("KO: aucun check X-API-KEY trouvé à remplacer dans nginx.")
 ng.write_text(s2)
 print("OK: nginx locked to exact key (not printed)")
 PY
@@ -55,10 +58,7 @@ PY
 nginx -t
 systemctl reload nginx
 
-echo "=== 5) Tests (attendu) ==="
-echo "--- /health (200 sans clé) ---"
+echo "=== 4) Tests ==="
 curl -sS -i https://fireinners.online/wolverine/traderone/api/health | head -n 6
-echo "--- /dexes (bad key => 403) ---"
 curl -sS -i https://fireinners.online/wolverine/traderone/api/dexes -H "X-API-KEY: test" | head -n 6
-echo "--- /dexes (good key => 200) ---"
 curl -sS -i https://fireinners.online/wolverine/traderone/api/dexes -H "X-API-KEY: $KEY" | head -n 6
