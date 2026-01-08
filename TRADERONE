@@ -1,9 +1,104 @@
+set -e
 cd /opt/traderone-opt
 
-# (optionnel) backup
-cp -v package.json package-lock.json /root/ 2>/dev/null || true
+echo "=== 0) Sanity ==="
+[ -f server.js ] || { echo "server.js introuvable dans /opt/traderone-opt"; exit 1; }
+[ -f .env ] || { echo ".env introuvable dans /opt/traderone-opt"; exit 1; }
 
-# si tu veux utiliser le SDK LI.FI (optionnel)
-npm i @lifi/sdk
+echo "=== 1) Backup ==="
+ts="$(date +%Y%m%d_%H%M%S)"
+mkdir -p /root/traderone_backups
+cp -v server.js "/root/traderone_backups/server.js.$ts.bak"
+cp -v .env "/root/traderone_backups/.env.$ts.bak"
 
-# sinon, si tu fais "API direct" (recommandé), tu n'as rien à installer (fetch existe déjà en Node 20)
+echo "=== 2) Set LI.FI env (sans afficher la clé) ==="
+# Si déjà présent, on ne redemande pas
+if grep -q '^LIFI_API_KEY=' .env; then
+  echo "LIFI_API_KEY déjà présent dans .env (OK)"
+else
+  echo -n "Colle ta LIFI_API_KEY (ne s'affiche pas) puis ENTER: "
+  read -s LIFIKEY; echo
+  [ -n "$LIFIKEY" ] || { echo "Clé vide, stop."; exit 1; }
+  umask 077
+  {
+    echo ""
+    echo "# LI.FI"
+    echo "LIFI_API_KEY=$LIFIKEY"
+    echo "LIFI_INTEGRATOR=traderone"
+  } >> .env
+  unset LIFIKEY
+  echo "OK: .env mis à jour"
+fi
+
+echo "=== 3) Patch server.js (ajout LI.FI + /api/lifi/quote + swap provider) ==="
+
+# 3a) Ajoute helpers LI.FI juste après app.use(express.json());
+if grep -q 'LI\.FI helpers' server.js; then
+  echo "Helpers LI.FI déjà présents (skip)"
+else
+  perl -0777 -i -pe 's#(app\.use\(express\.json\(\)\);\n)#$1\n// --- LI.FI helpers (Node 20 fetch OK) ---\nconst LIFI_BASE = \"https://li.quest/v1\";\n\nasync function lifiGet(path, params) {\n  const qs = new URLSearchParams(params).toString();\n  const url = `${LIFI_BASE}${path}?${qs}`;\n  const r = await fetch(url, {\n    headers: {\n      accept: \"application/json\",\n      \"x-lifi-api-key\": process.env.LIFI_API_KEY || \"\",\n    },\n  });\n  const text = await r.text();\n  if (!r.ok) throw new Error(`LI.FI ${r.status}: ${text.slice(0, 300)}`);\n  return JSON.parse(text);\n}\n\n#s' server.js
+  echo "OK: helpers LI.FI ajoutés"
+fi
+
+# 3b) Ajoute route /api/lifi/quote (on la met après /api/status si possible, sinon à la fin des routes API)
+if grep -q 'app\.post\(\"/api/lifi/quote\"' server.js; then
+  echo "Route /api/lifi/quote déjà présente (skip)"
+else
+  perl -0777 -i -pe 's#(app\.all\(\x27/api/status\x27[^\n]*\n\}\);\n)#${1}\napp.post(\"/api/lifi/quote\", async (req, res) => {\n  try {\n    if (!process.env.LIFI_API_KEY) {\n      return res.status(400).json({ ok: false, error: \"LIFI_API_KEY missing\" });\n    }\n    const b = req.body || {};\n    const out = await lifiGet(\"/quote\", {\n      fromChain: String(b.fromChain),\n      toChain: String(b.toChain),\n      fromToken: String(b.fromToken),\n      toToken: String(b.toToken),\n      fromAmount: String(b.fromAmount),\n      fromAddress: String(b.fromAddress),\n      toAddress: String(b.toAddress || b.fromAddress),\n      slippage: String(b.slippage ?? \"0.5\"),\n      integrator: process.env.LIFI_INTEGRATOR || \"traderone\",\n    });\n    return res.json({ ok: true, quote: out });\n  } catch (e) {\n    return res.status(502).json({ ok: false, error: \"lifi_quote_fail\", detail: String(e) });\n  }\n});\n\n#s' server.js
+  echo "OK: route /api/lifi/quote ajoutée"
+fi
+
+# 3c) Remplace l'ancien /api/swap simulé
+if grep -q 'provider: "lifi"' server.js; then
+  echo "/api/swap provider déjà patché (skip)"
+else
+  # remplace la ligne simulée exacte si elle existe
+  if grep -q "app.post('/api/swap'" server.js; then
+    perl -i -pe 's#app\.post\(\/api\/swap.*simulated.*\);#app.post(\"/api/swap\", async (req, res) => {\n  try {\n    const b = req.body || {};\n    const provider = String(b.provider || \"sim\");\n\n    if (provider !== \"lifi\") {\n      return res.json({ ok: true, simulated: true, request: b });\n    }\n\n    if (!process.env.LIFI_API_KEY) {\n      return res.status(400).json({ ok: false, error: \"LIFI_API_KEY missing\" });\n    }\n\n    const quote = await lifiGet(\"/quote\", {\n      fromChain: String(b.fromChain),\n      toChain: String(b.toChain),\n      fromToken: String(b.fromToken),\n      toToken: String(b.toToken),\n      fromAmount: String(b.fromAmount),\n      fromAddress: String(b.fromAddress),\n      toAddress: String(b.toAddress || b.fromAddress),\n      slippage: String(b.slippage ?? \"0.5\"),\n      integrator: process.env.LIFI_INTEGRATOR || \"traderone\",\n    });\n\n    // On renvoie la transactionRequest/steps à SIGNER côté wallet (sécurité ++)\n    return res.json({ ok: true, provider: \"lifi\", quote });\n  } catch (e) {\n    return res.status(502).json({ ok: false, error: \"swap_fail\", detail: String(e) });\n  }\n});#' server.js
+    echo "OK: /api/swap remplacé (provider lifi)"
+  else
+    echo "ATTENTION: je ne trouve pas la ligne app.post('/api/swap' simulée. Affiche la zone routes:"
+    nl -ba server.js | sed -n '130,170p'
+    exit 1
+  fi
+fi
+
+echo "=== 4) Restart TraderOne ==="
+if command -v pm2 >/dev/null 2>&1; then
+  pm2 restart traderone --update-env || pm2 restart all --update-env
+else
+  echo "pm2 introuvable. Dis-moi comment tu lances TraderOne (systemd / node server.js / autre)."
+  exit 1
+fi
+
+echo "=== 5) Tests locaux ==="
+echo "--- /api/lifi/quote (doit répondre ok:true ou lifi_quote_fail mais pas crash) ---"
+curl -sS -X POST "http://127.0.0.1:3000/api/lifi/quote" \
+  -H "content-type: application/json" \
+  --data '{
+    "fromChain": 101,
+    "toChain": 101,
+    "fromToken": "So11111111111111111111111111111111111111112",
+    "toToken": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "fromAmount": "1000000",
+    "fromAddress": "11111111111111111111111111111111",
+    "slippage": 0.5
+  }' | head -n 80
+
+echo
+echo "--- /api/swap provider=lifi (retourne quote + transactionRequest/steps à signer côté wallet) ---"
+curl -sS -X POST "http://127.0.0.1:3000/api/swap" \
+  -H "content-type: application/json" \
+  --data '{
+    "provider": "lifi",
+    "fromChain": 101,
+    "toChain": 101,
+    "fromToken": "So11111111111111111111111111111111111111112",
+    "toToken": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "fromAmount": "1000000",
+    "fromAddress": "11111111111111111111111111111111",
+    "slippage": 0.5
+  }' | head -n 80
+
+echo
+echo "DONE ✅"
