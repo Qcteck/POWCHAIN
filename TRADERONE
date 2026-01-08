@@ -1,92 +1,32 @@
 set -euo pipefail
 
+mkdir -p /etc/nginx/sites-disabled
 cd /etc/nginx/sites-enabled
 
-echo "=== 0) Snapshot fichiers sites-enabled ==="
+echo "=== 0) Avant ==="
 ls -lah | sed -n '1,200p'
 echo
 
-echo "=== 1) Désactiver tous les fireinners.online-ssl.* (bak/off/disabled/old) ==="
+echo "=== 1) Déplacer TOUT sauf le vrai vhost actif fireinners.online-ssl ==="
 TS=$(date +%s)
-for f in fireinners.online-ssl.*; do
-  [ -e "$f" ] || continue
-  echo "OFF: $f -> $f.DISABLED_$TS"
-  mv "$f" "$f.DISABLED_$TS"
+for f in *; do
+  [ -f "$f" ] || continue
+  if [ "$f" = "fireinners.online-ssl" ]; then
+    echo "KEEP: $f"
+  else
+    echo "MOVE: $f -> /etc/nginx/sites-disabled/$f.$TS"
+    mv "$f" "/etc/nginx/sites-disabled/$f.$TS"
+  fi
 done
-echo "OK: backups moved out of load"
+
+echo
+echo "=== 2) Après ==="
+ls -lah /etc/nginx/sites-enabled | sed -n '1,120p'
+echo
+ls -lah /etc/nginx/sites-disabled | tail -n 20 || true
 echo
 
-NG="/etc/nginx/sites-enabled/fireinners.online-ssl"
-[ -f "$NG" ] || { echo "KO: $NG introuvable"; exit 1; }
-
-echo "=== 2) Backup conf principale ==="
-cp -a "$NG" "$NG.bak.clean_wolverine.$TS"
-
-echo "=== 3) Nettoyer toutes les locations /wolverine* puis ré-injecter un seul bloc ==="
-python3 - <<'PY'
-from pathlib import Path
-import re, time
-
-ng = Path("/etc/nginx/sites-enabled/fireinners.online-ssl")
-s = ng.read_text()
-
-# remove any existing wolverine-related location blocks (all of them)
-patterns = [
-  r'\n\s*location\s*=\s*/wolverine\s*\{[\s\S]*?\n\s*\}\s*',
-  r'\n\s*location\s+\^~\s+/wolverine/\s*\{[\s\S]*?\n\s*\}\s*',
-  r'\n\s*location\s+\^~\s+/wolverine/traderone/api/\s*\{[\s\S]*?\n\s*\}\s*',
-]
-for pat in patterns:
-  s = re.sub(pat, "\n", s, flags=re.M)
-
-block = r'''
-# --- WOLVERINE_BLOCK_FINAL ---
-
-# UI: https://fireinners.online/wolverine
-location = /wolverine {
-  return 301 /wolverine/;
-}
-
-location ^~ /wolverine/ {
-  root /var/www;
-  index index.html;
-  try_files $uri $uri/ /wolverine/index.html;
-}
-
-# API: https://fireinners.online/wolverine/traderone/api/*  ->  http://127.0.0.1:3000/api/*
-location ^~ /wolverine/traderone/api/ {
-  # clé seulement sur l'API
-  if ($http_x_api_key = "") { return 403; }
-  # option: hardcode la clé (décommente)
-  # if ($http_x_api_key != "YOUR_KEY_HERE") { return 403; }
-
-  rewrite ^/wolverine/traderone/api/(.*)$ /api/$1 break;
-
-  proxy_pass http://127.0.0.1:3000;
-  proxy_http_version 1.1;
-  proxy_set_header Host $host;
-  proxy_set_header X-Real-IP $remote_addr;
-  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto $scheme;
-}
-'''
-
-# insert before last "}" (end of server block)
-idx = s.rfind("}")
-if idx == -1:
-  raise SystemExit("KO: pas de '}' trouvé dans le conf nginx")
-s = s[:idx] + "\n" + block + "\n" + s[idx:]
-ng.write_text(s)
-print("OK: cleaned + inserted single Wolverine block")
-PY
-
-echo "=== 4) nginx test + reload ==="
+echo "=== 3) Test + reload ==="
 nginx -t
 systemctl reload nginx
 echo "OK: nginx reloaded"
-echo
-
-echo "=== 5) Tests ==="
-curl -sS -i https://fireinners.online/wolverine/ | head -n 15 || true
-echo
-curl -sS -i https://fireinners.online/wolverine/traderone/api/health | head -n 15 || true
