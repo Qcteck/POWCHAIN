@@ -1,30 +1,103 @@
-# ROOT — DIAG + FIX soldes wallet
+# ROOT — Brancher tout le profil utilisateur au backend (scope user)
 set -e
 
 SRC="/opt/_wolverine_next_src"
 DIST="/var/www/wolverine"
 
-echo "=== 1) Vérifier que WalletBox est bien déployé ==="
-grep -R "On‑chain" -n "$DIST" || echo "⚠ WalletBox pas trouvé dans le build"
+echo "=== 1) Helper API ==="
+cat > "$SRC/lib/backend.js" <<'JS'
+export async function api(path, method="GET", body=null) {
+  const r = await fetch(`/wolverine/traderone/api/${path}`, {
+    method,
+    headers: { "Content-Type":"application/json" },
+    body: body ? JSON.stringify(body) : null
+  });
+  const t = await r.text();
+  try { return JSON.parse(t); } catch { return t; }
+}
+JS
 
-echo "=== 2) Vérifier que solanaWeb3 est chargé dans le HTML ==="
-if ! grep -R "solanaWeb3" -n "$DIST"; then
-  echo "⚠ solanaWeb3 manquant → injection du script"
-  # injecter solana web3 CDN dans index.html exporté
-  sed -i 's|</head>|<script src="https://unpkg.com/@solana/web3.js@latest/lib/index.iife.min.js"></script></head>|' "$DIST/index.html"
-fi
+echo "=== 2) Profile (scope user) ==="
+cat > "$SRC/components/ProfilePanel.jsx" <<'JSX'
+import { useEffect, useState } from "react";
+import { api } from "../lib/backend";
 
-echo "=== 3) Vérifier endpoint backend ==="
-TEST_ADDR="11111111111111111111111111111111"
-curl -sS -i "https://fireinners.online/wolverine/traderone/api/wallet/$TEST_ADDR" | head -n 10 || true
+export default function ProfilePanel({ wallet }) {
+  const [me, setMe] = useState(null);
+  useEffect(()=>{ api("me").then(setMe); }, []);
+  if (!me) return <div className="muted">Loading profile…</div>;
+  return (
+    <div className="card">
+      <h3>Profile</h3>
+      <div>ID: {me.id}</div>
+      <div>Status: {me.status}</div>
+      <div>Role: {me.role}</div>
+      <div>Wallet: {wallet || me.wallet}</div>
+    </div>
+  );
+}
+JSX
 
-echo "=== 4) Reload nginx (au cas où) ==="
-nginx -t
-systemctl reload nginx
+echo "=== 3) Trading data (user) ==="
+cat > "$SRC/components/TradingPanel.jsx" <<'JSX'
+import { useEffect, useState } from "react";
+import { api } from "../lib/backend";
 
-echo "=== 5) Résumé ==="
-echo "- Recharge la page"
-echo "- Clique Connect Phantom"
-echo "- Ouvre la console (F12) et dis-moi s’il y a une erreur JS"
+export default function TradingPanel() {
+  const [orders,setOrders]=useState([]);
+  const [positions,setPositions]=useState([]);
+  const [pnl,setPnl]=useState(null);
 
-echo "DONE ✅"
+  useEffect(()=>{
+    api("orders").then(setOrders);
+    api("positions").then(setPositions);
+    api("pnl").then(setPnl);
+  },[]);
+
+  return (
+    <div className="card">
+      <h3>Trading</h3>
+      <div className="muted small">PnL</div><pre>{JSON.stringify(pnl,null,2)}</pre>
+      <div className="muted small">Positions</div><pre>{JSON.stringify(positions,null,2)}</pre>
+      <div className="muted small">Open orders</div><pre>{JSON.stringify(orders,null,2)}</pre>
+    </div>
+  );
+}
+JSX
+
+echo "=== 4) Actions autorisées (user) ==="
+cat > "$SRC/components/ActionsPanel.jsx" <<'JSX'
+import { api } from "../lib/backend";
+
+export default function ActionsPanel({ wallet }) {
+  async function run(p) {
+    const r = await api(p,"POST", wallet?{wallet}:null);
+    alert(JSON.stringify(r,null,2));
+  }
+  return (
+    <div className="card">
+      <h3>Actions</h3>
+      <div className="btnRow">
+        <button className="btn" onClick={()=>run("sync-deposit")}>Sync deposit</button>
+        <button className="btn" onClick={()=>run("trader/start")}>Start trader</button>
+        <button className="btn" onClick={()=>run("trader/pause")}>Pause trader</button>
+        <button className="btn danger" onClick={()=>run("trader/stop")}>Stop trader</button>
+      </div>
+    </div>
+  );
+}
+JSX
+
+echo "=== 5) Injecter dans le dashboard ==="
+sed -i '1i import ProfilePanel from "../components/ProfilePanel";' "$SRC/pages/index.jsx"
+sed -i '1i import TradingPanel from "../components/TradingPanel";' "$SRC/pages/index.jsx"
+sed -i '1i import ActionsPanel from "../components/ActionsPanel";' "$SRC/pages/index.jsx"
+
+sed -i 's|</>|<ProfilePanel />\n<TradingPanel />\n<ActionsPanel />\n</>|' "$SRC/pages/index.jsx"
+
+echo "=== 6) Rebuild + deploy ==="
+cd "$SRC"
+npm run build
+rsync -a --delete "$SRC/out/" "$DIST/"
+
+echo "DONE ✅ — recharge la page"
