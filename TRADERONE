@@ -1,116 +1,50 @@
 set -e
 cd /opt/traderone-opt
 
-echo "=== 1) Snapshot ports ==="
-ss -ltnp | egrep ':3000|:3002|:8585' || true
+echo "=== 1) Quel fichier PM2 lance vraiment ? ==="
+pm2 describe traderone | egrep -i 'script path|script|exec|interpreter|cwd' || true
 echo
 
-echo "=== 2) Kill 8585 + identifier ce qui le lance ==="
-PID8585=$(ss -ltnp | sed -n 's/.*:8585.*pid=\([0-9]\+\).*/\1/p' | head -n1 || true)
-echo "PID8585=$PID8585"
-if [ -n "$PID8585" ]; then
-  ps -fp "$PID8585" || true
-  echo "--- cmdline ---"
-  tr '\0' ' ' < /proc/"$PID8585"/cmdline 2>/dev/null || true
-  echo
-  kill "$PID8585" || true
-  sleep 1
-  kill -9 "$PID8585" 2>/dev/null || true
-fi
-echo "After kill:"
-ss -ltnp | grep ':8585' || echo "OK: 8585 libéré"
+echo "=== 2) Est-ce que /api/dexes est dans server.js ? ==="
+grep -n "/api/dexes" -n server.js || echo "ABSENT dans server.js"
 echo
 
-echo "=== 3) Trouver le relaunch (systemd/cron) ==="
-echo "--- systemd grep server.js/8585 ---"
-grep -RIn --line-number -E 'server\.js|:8585|8585' /etc/systemd/system /lib/systemd/system 2>/dev/null | head -n 80 || true
-echo
-echo "--- cron grep traderone-opt/8585 ---"
-grep -RIn --line-number -E 'traderone-opt|server\.js|8585' /etc/cron.* /var/spool/cron/crontabs 2>/dev/null | head -n 80 || true
-echo
-
-echo "=== 4) DEX allowlist file ==="
-mkdir -p config
-cat > config/dex_allowlist.json <<'JSON'
-[
-  "sushiswap",
-  "jupiter",
-  "dflow",
-  "okx",
-  "mayan",
-  "chainflip",
-  "gasZipBridge",
-  "relaydepository",
-  "odos",
-  "fly",
-  "relay"
-]
-JSON
-echo "OK: config/dex_allowlist.json"
-echo
-
-echo "=== 5) Patch server.js (sans perl) ==="
+echo "=== 3) Patch SAFE: insérer /api/dexes avant la route catch-all ==="
 node <<'NODE'
 const fs = require("fs");
 const p = "/opt/traderone-opt/server.js";
-let s = fs.readFileSync(p, "utf8");
+let s = fs.readFileSync(p,"utf8");
 
-function has(x){ return s.includes(x); }
+if(!s.includes('app.get("/api/dexes"') && !s.includes("app.get('/api/dexes'")){
+  const marker = "app.get(/^\\/(?!api\\/).*/";
+  const idx = s.indexOf(marker);
+  if(idx === -1) throw new Error("Marker catch-all not found: " + marker);
 
-if(!has("DEX_ALLOWLIST_PATH")){
-  // On insère le helper juste après "app.use(express.json());" (ça existe chez toi)
-  const anchor = "app.use(express.json());";
-  const i = s.indexOf(anchor);
-  if(i === -1) throw new Error("Anchor not found: " + anchor);
-
-  const insert = `
-${anchor}
-
-// === DEX allowlist (TraderOne) ===
-const DEX_ALLOWLIST_PATH = process.env.DEX_ALLOWLIST_PATH || path.join(__dirname, "config", "dex_allowlist.json");
-function loadDexAllowlist(){
-  try{
-    const raw = fs.readFileSync(DEX_ALLOWLIST_PATH,"utf8");
-    const a = JSON.parse(raw);
-    return Array.isArray(a) ? a.map(x=>String(x).trim()).filter(Boolean) : [];
-  }catch(e){ return []; }
-}
-`;
-  s = s.slice(0, i) + insert + s.slice(i + anchor.length);
-}
-
-if(!has('app.get("/api/dexes"')){
-  // On insère la route juste après /api/health si elle existe
-  const anchor2 = "app.get('/api/health'";
-  const j = s.indexOf(anchor2);
-  if(j === -1) throw new Error("Anchor not found: /api/health route");
-
-  // Trouver la fin du handler /api/health (premier ");" après)
-  const end = s.indexOf(");", j);
-  if(end === -1) throw new Error("Could not find end of /api/health block");
+  // s'assurer que helper existe
+  if(!s.includes("function loadDexAllowlist")){
+    throw new Error("Helper loadDexAllowlist missing. (Il faut le bloc helper avant.)");
+  }
 
   const route = `
-
 app.get("/api/dexes", (req,res)=>{
   res.json({ ok:true, dexes: loadDexAllowlist() });
 });
-`;
-  s = s.slice(0, end+2) + route + s.slice(end+2);
-}
 
-fs.writeFileSync(p, s);
-console.log("OK: server.js patched (/api/dexes + helpers)");
+`;
+  s = s.slice(0, idx) + route + s.slice(idx);
+  fs.writeFileSync(p, s);
+  console.log("OK: inserted /api/dexes before catch-all");
+} else {
+  console.log("OK: /api/dexes already present in file");
+}
 NODE
 
 echo
-echo "=== 6) Restart PM2 + tests ==="
+echo "=== 4) Restart + tests ==="
 node --check server.js
 pm2 restart traderone --update-env
 sleep 1
-
-ss -ltnp | egrep ':3000|:3002|:8585' || true
-echo
-curl -sS -i http://127.0.0.1:3000/health | head -n 15 || true
+curl -sS -i http://127.0.0.1:3000/health | head -n 15
 echo
 curl -sS http://127.0.0.1:3000/api/dexes | head -c 400; echo
 echo "=== DONE ==="
