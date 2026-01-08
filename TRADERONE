@@ -1,59 +1,61 @@
 set -e
-cd /opt/traderone-opt
+APP="/opt/traderone-opt"
+cd "$APP"
 
-echo "=== 1) Qui écoute sur 8585 / 3000 ? ==="
-ss -ltnp | egrep ':8585|:3000' || true
+echo "=== 1) Ports 3000/8585 ==="
+ss -ltnp | egrep ':3000|:8585' || true
 echo
 
-echo "=== 2) Quel process prend 8585 (PID) ? ==="
-PID8585=$(ss -ltnp | awk '/:8585/ {print $NF}' | head -n1 | sed -n 's/.*pid=\([0-9]\+\).*/\1/p')
+echo "=== 2) Qui prend 8585 (PID + cmdline) ==="
+PID8585=$(ss -ltnp | sed -n 's/.*:8585.*pid=\([0-9]\+\).*/\1/p' | head -n1)
 echo "PID8585=$PID8585"
 if [ -n "$PID8585" ]; then
-  echo "--- process details ---"
   ps -fp "$PID8585" || true
   echo "--- cmdline ---"
   tr '\0' ' ' < /proc/"$PID8585"/cmdline 2>/dev/null || true
+  echo
 fi
 echo
 
-echo "=== 3) PM2 list ==="
-pm2 ls || true
-echo
-
-echo "=== 4) (Option) Stopper le process qui bloque 8585 s'il ressemble à un ancien node ==="
-# ATTENTION: si ce PID est nginx/caddy/autre service important, NE PAS tuer.
+echo "=== 3) Stopper 8585 si c'est un vieux /opt/traderone-opt/server.js ==="
 if [ -n "$PID8585" ]; then
-  if ps -fp "$PID8585" | grep -qiE 'node|server\.js|pm2'; then
-    echo "Killing PID $PID8585 (node-like)..."
+  if tr '\0' ' ' < /proc/"$PID8585"/cmdline 2>/dev/null | grep -qiE '/opt/traderone-opt/server\.js|/opt/traderone-opt/.*node'; then
+    echo "KILL old traderone on 8585 (PID $PID8585)"
     kill "$PID8585" || true
     sleep 1
     kill -9 "$PID8585" 2>/dev/null || true
   else
-    echo "PID $PID8585 ne ressemble pas à node. Je ne le tue pas automatiquement."
+    echo "⚠️ 8585 n'est pas clairement un vieux traderone -> je ne tue pas auto."
   fi
 fi
 echo
 
-echo "=== 5) Forcer TraderOne sur 3000 (env PM2) ==="
-# récupère l'id PM2 du process traderone
-PM2_ID=$(pm2 jlist | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{const a=JSON.parse(d);const p=a.find(x=>x.name==="traderone")||a[0];console.log(p?String(p.pm_id):"")})')
-echo "PM2_ID=$PM2_ID"
-[ -n "$PM2_ID" ] || { echo "KO: pas de process PM2 trouvé"; exit 1; }
-
-pm2 set traderone:PORT 3000 >/dev/null || true
-pm2 save >/dev/null || true
-pm2 restart "$PM2_ID" --update-env
-sleep 2
+echo "=== 4) PM2 status ==="
+pm2 ls || true
 echo
 
-echo "=== 6) Re-check ports ==="
-ss -ltnp | egrep ':8585|:3000' || true
+echo "=== 5) Nginx: vérifier proxy_pass (8585 vs 3000) ==="
+grep -RIn --line-number -E "proxy_pass|127\.0\.0\.1:8585|127\.0\.0\.1:3000" /etc/nginx/sites-enabled | head -n 120 || true
 echo
 
-echo "=== 7) Test local ==="
+echo "=== 6) Reload nginx (si config OK) ==="
+nginx -t
+systemctl reload nginx
+echo "nginx reloaded"
+echo
+
+echo "=== 7) Re-check ports ==="
+ss -ltnp | egrep ':3000|:8585' || true
+echo
+
+echo "=== 8) Tests locaux ==="
 curl -sS -i http://127.0.0.1:3000/health | head -n 20 || true
 echo
 
-echo "=== 8) Logs (30 lignes) ==="
-pm2 logs "$PM2_ID" --lines 30 --nostream | tail -n 30 || true
+curl -sS -i -X POST "http://127.0.0.1:3000/api/swap" \
+  -H "content-type: application/json" \
+  --data '{"provider":"lifi","fromChain":101,"toChain":101,"fromToken":"So11111111111111111111111111111111111111112","toToken":"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v","fromAmount":"1000000","fromAddress":"11111111111111111111111111111111","slippage":0.5}' \
+  | head -n 120 || true
+
+echo
 echo "=== FIN ==="
