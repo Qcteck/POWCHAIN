@@ -1,84 +1,59 @@
-# ROOT — FIX npm "must provide string spec" + rebuild/deploy Wolverine
+# ROOT — AUTO-FIND Next app dir + FIX npm spec + BUILD + DEPLOY
 set -euo pipefail
 
-UI_SRC="/opt/fireinners/WOLVERINE"
-UI_DIST="/var/www/wolverine"
+BASE="/opt/fireinners/WOLVERINE"
+DIST="/var/www/wolverine"
 
-echo "=== 0) Precheck ==="
-[ -d "$UI_SRC" ] || { echo "ERROR: missing $UI_SRC"; exit 1; }
-cd "$UI_SRC"
+echo "=== 0) Find app dir (package.json with build script) ==="
+[ -d "$BASE" ] || { echo "ERROR: missing $BASE"; exit 1; }
 
-echo "Node: $(node -v) | NPM: $(npm -v)"
-echo "PWD: $(pwd)"
+APP_DIR="$(find "$BASE" -maxdepth 5 -type f -name package.json -print0 \
+  | xargs -0 -I{} sh -c 'd=$(dirname "{}"); node -e "const p=require(\"'{}'\"); process.exit(p.scripts&&p.scripts.build?0:1)" 2>/dev/null && echo "$d"' \
+  | head -n 1)"
 
-echo "=== 1) Show package.json quick (top) ==="
+if [ -z "${APP_DIR:-}" ]; then
+  echo "ERROR: No package.json with scripts.build found under $BASE"
+  echo "DEBUG: package.json candidates:"
+  find "$BASE" -maxdepth 5 -type f -name package.json
+  exit 1
+fi
+
+echo "APP_DIR = $APP_DIR"
+mkdir -p "$DIST"
+
+echo "=== 1) Enter app dir ==="
+cd "$APP_DIR"
+pwd
 ls -lah package.json
-head -n 40 package.json || true
 
-echo "=== 2) Detect invalid dependency specs (empty/non-string) ==="
+echo "=== 2) Fix bad dependency specs (empty/non-string) ==="
 node - <<'NODE'
-const fs = require("fs");
-const p = JSON.parse(fs.readFileSync("package.json","utf8"));
-const bad = [];
+const fs=require("fs");
+const p=JSON.parse(fs.readFileSync("package.json","utf8"));
+let changed=false;
 for (const k of ["dependencies","devDependencies","optionalDependencies","peerDependencies"]) {
-  const o = p[k]; if (!o) continue;
+  const o=p[k]; if(!o) continue;
   for (const [name,val] of Object.entries(o)) {
-    if (typeof val !== "string" || val.trim() === "") bad.push({section:k,name,val});
+    if (typeof val!=="string" || val.trim()==="") { delete o[name]; changed=true; console.log("REMOVE",k,name,val); }
   }
 }
-if (!bad.length) {
-  console.log("OK: no empty/non-string specs found.");
-} else {
-  console.log("FOUND BAD SPECS:");
-  console.log(bad);
-  process.exit(12);
-}
-NODE || true
-
-echo "=== 3) Auto-fix: remove bad specs (empty/non-string) ==="
-node - <<'NODE'
-const fs = require("fs");
-const p = JSON.parse(fs.readFileSync("package.json","utf8"));
-let changed = false;
-
-for (const k of ["dependencies","devDependencies","optionalDependencies","peerDependencies"]) {
-  const o = p[k]; if (!o) continue;
-  for (const [name,val] of Object.entries(o)) {
-    if (typeof val !== "string" || val.trim() === "") {
-      console.log(`REMOVE ${k}.${name} =`, val);
-      delete o[name];
-      changed = true;
-    }
-  }
-}
-
-if (changed) {
-  fs.writeFileSync("package.json", JSON.stringify(p,null,2) + "\n");
-  console.log("package.json fixed ✅");
-} else {
-  console.log("No changes needed.");
-}
+if(changed) fs.writeFileSync("package.json", JSON.stringify(p,null,2)+"\n");
+console.log(changed ? "package.json fixed ✅" : "package.json OK ✅");
 NODE
 
-echo "=== 4) Clean install (wipe lock + modules + cache) ==="
+echo "=== 3) Clean install ==="
 rm -rf node_modules package-lock.json .next out || true
 npm cache clean --force || true
-
-echo "=== 5) Install deps (show output) ==="
 npm install --legacy-peer-deps
 
-echo "=== 6) Ensure solana web3 (quoted) ==="
-npm install --save "@solana/web3.js@1.98.4" --legacy-peer-deps || npm install --save "@solana/web3.js" --legacy-peer-deps
-
-echo "=== 7) Build ==="
+echo "=== 4) Build ==="
 npm run build
-[ -d out ] || { echo "ERROR: out/ missing after build"; exit 1; }
+[ -d out ] || { echo "ERROR: out/ missing after build (Next export failed)"; exit 1; }
 
-echo "=== 8) Deploy ==="
-mkdir -p "$UI_DIST"
-rsync -a --delete out/ "$UI_DIST/"
+echo "=== 5) Deploy ==="
+rsync -a --delete out/ "$DIST/"
 
-echo "=== 9) Reload nginx ==="
+echo "=== 6) Reload nginx ==="
 nginx -t
 systemctl reload nginx
 
