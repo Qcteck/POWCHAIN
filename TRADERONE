@@ -1,74 +1,37 @@
 set -e
 cd /opt/traderone-opt
 
-echo "=== 0) Infos process (pm2) ==="
-pm2 show traderone | sed -n '1,200p' || true
+echo "=== A) PM2 status ==="
+pm2 status || true
 echo
 
-echo "=== 1) Backup ==="
-ts="$(date +%Y%m%d_%H%M%S)"
-mkdir -p /root/traderone_backups
-cp -v server.js "/root/traderone_backups/server.js.$ts.bak"
-
-echo "=== 2) Ensure .env LI.FI (sans afficher la clé) ==="
-if [ ! -f .env ]; then
-  echo ".env introuvable"; exit 1
-fi
-
-if ! grep -q '^LIFI_API_KEY=' .env; then
-  echo -n "Colle ta LIFI_API_KEY (ne s'affiche pas) puis ENTER: "
-  read -s LIFIKEY; echo
-  [ -n "$LIFIKEY" ] || { echo "Clé vide, stop."; exit 1; }
-  umask 077
-  {
-    echo ""
-    echo "# LI.FI"
-    echo "LIFI_API_KEY=$LIFIKEY"
-    echo "LIFI_INTEGRATOR=traderone"
-  } >> .env
-  unset LIFIKEY
-  echo "OK: .env mis à jour"
-else
-  echo "OK: LIFI_API_KEY déjà présent"
-fi
-
-echo "=== 3) Patch server.js (helpers LI.FI) ==="
-if ! grep -q 'LI.FI helpers' server.js; then
-  perl -0777 -i -pe 's/(app\.use\(express\.json\(\)\);\n)/$1\n\/\/ --- LI.FI helpers (Node 20 fetch OK) ---\nconst LIFI_BASE = \"https:\/\/li.quest\/v1\";\n\nasync function lifiGet(path, params) {\n  const qs = new URLSearchParams(params).toString();\n  const url = LIFI_BASE + path + \"?\" + qs;\n  const r = await fetch(url, {\n    headers: {\n      accept: \"application\/json\",\n      \"x-lifi-api-key\": process.env.LIFI_API_KEY || \"\",\n    },\n  });\n  const text = await r.text();\n  if (!r.ok) throw new Error(\"LI.FI \" + r.status + \": \" + text.slice(0, 300));\n  return JSON.parse(text);\n}\n\n/s' server.js
-  echo "OK: helpers ajoutés"
-else
-  echo "OK: helpers déjà présents"
-fi
-
-echo "=== 4) Patch server.js (route /api/lifi/quote) ==="
-if ! grep -q '\/api\/lifi\/quote' server.js; then
-  perl -0777 -i -pe 's/(app\.all\((["\x27])\/api\/status\2,[\s\S]*?\n\}\);\n)/$1\napp.post(\"\/api\/lifi\/quote\", async (req, res) => {\n  try {\n    if (!process.env.LIFI_API_KEY) {\n      return res.status(400).json({ ok: false, error: \"LIFI_API_KEY missing\" });\n    }\n    const b = req.body || {};\n    const out = await lifiGet(\"\/quote\", {\n      fromChain: String(b.fromChain),\n      toChain: String(b.toChain),\n      fromToken: String(b.fromToken),\n      toToken: String(b.toToken),\n      fromAmount: String(b.fromAmount),\n      fromAddress: String(b.fromAddress),\n      toAddress: String(b.toAddress || b.fromAddress),\n      slippage: String(b.slippage ?? \"0.5\"),\n      integrator: process.env.LIFI_INTEGRATOR || \"traderone\",\n    });\n    return res.json({ ok: true, quote: out });\n  } catch (e) {\n    return res.status(502).json({ ok: false, error: \"lifi_quote_fail\", detail: String(e) });\n  }\n});\n\n/s' server.js
-  echo "OK: route /api/lifi/quote ajoutée"
-else
-  echo "OK: route /api/lifi/quote déjà présente"
-fi
-
-echo "=== 5) Patch /api/swap (provider=lifi) ==="
-perl -i -pe 's#app\.post\(\x27\/api\/swap\x27\s*,\s*\(req,\s*res\)\s*=>\s*res\.json\(\{\s*ok:\s*true,\s*simulated:\s*true,[^;]*\}\)\s*\)\s*;#app.post(\"/api/swap\", async (req, res) => {\n  try {\n    const b = req.body || {};\n    const provider = String(b.provider || \"sim\");\n\n    if (provider !== \"lifi\") {\n      return res.json({ ok: true, simulated: true, request: b });\n    }\n\n    if (!process.env.LIFI_API_KEY) {\n      return res.status(400).json({ ok: false, error: \"LIFI_API_KEY missing\" });\n    }\n\n    const quote = await lifiGet(\"/quote\", {\n      fromChain: String(b.fromChain),\n      toChain: String(b.toChain),\n      fromToken: String(b.fromToken),\n      toToken: String(b.toToken),\n      fromAmount: String(b.fromAmount),\n      fromAddress: String(b.fromAddress),\n      toAddress: String(b.toAddress || b.fromAddress),\n      slippage: String(b.slippage ?? \"0.5\"),\n      integrator: process.env.LIFI_INTEGRATOR || \"traderone\",\n    });\n\n    return res.json({ ok: true, provider: \"lifi\", quote });\n  } catch (e) {\n    return res.status(502).json({ ok: false, error: \"swap_fail\", detail: String(e) });\n  }\n});#' server.js
-
-echo "=== 6) Verify présence des routes dans server.js ==="
-grep -nE 'LI\.FI helpers|/api/lifi/quote|app\.post\(\"/api/swap\"' server.js | head -n 80
+echo "=== B) Quel script PM2 lance ? ==="
+pm2 show traderone | sed -n '1,220p' || true
 echo
 
-echo "=== 7) Restart pm2 ==="
+echo "=== C) Logs (les 120 dernières lignes) ==="
+pm2 logs traderone --lines 120 --nostream || true
+echo
+
+echo "=== D) Check si server.js est valide (syntax) ==="
+node -c server.js && echo "OK: syntax" || echo "ERR: syntax"
+echo
+
+echo "=== E) Qui écoute sur 3000 ? ==="
+ss -ltnp | egrep ':3000|:80|:443' || true
+echo
+
+echo "=== F) Démarre en mode foreground (10s) pour voir l'erreur ==="
+timeout 10s node server.js || true
+echo
+
+echo "=== G) Restart propre ==="
 pm2 restart traderone --update-env || pm2 restart all --update-env
+sleep 1
+pm2 status
 echo
 
-echo "=== 8) Tests local ==="
-echo "--- /api/lifi/quote ---"
-curl -sS -i -X POST "http://127.0.0.1:3000/api/lifi/quote" \
-  -H "content-type: application/json" \
-  --data '{"fromChain":101,"toChain":101,"fromToken":"So11111111111111111111111111111111111111112","toToken":"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v","fromAmount":"1000000","fromAddress":"11111111111111111111111111111111","slippage":0.5}' \
-  | head -n 40
-
+echo "=== H) Retest local /health et /api/status ==="
+curl -sS -i http://127.0.0.1:3000/health | head -n 20 || true
 echo
-echo "--- /api/swap provider=lifi ---"
-curl -sS -i -X POST "http://127.0.0.1:3000/api/swap" \
-  -H "content-type: application/json" \
-  --data '{"provider":"lifi","fromChain":101,"toChain":101,"fromToken":"So11111111111111111111111111111111111111112","toToken":"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v","fromAmount":"1000000","fromAddress":"11111111111111111111111111111111","slippage":0.5}' \
-  | head -n 40
+curl -sS -i http://127.0.0.1:3000/api/status | head -n 30 || true
