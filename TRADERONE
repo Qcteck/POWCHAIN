@@ -1,44 +1,150 @@
-# ROOT — AUDIT CIBLÉ PROJET (Wolverine / TraderOne)
-echo "========== PROJECT AUDIT =========="
+# ROOT — Wolverine/TraderOne: setup "single source of truth" + tools + deploy script
+set -euo pipefail
 
-echo
-echo "== Dossiers projet existants =="
-find /var/www /opt /srv /home -maxdepth 4 -type d \( -iname "*wolverine*" -o -iname "*trader*" -o -iname "*wolf*" \) 2>/dev/null
+TOOLS="/root/wolverine_tools"
+UI_SRC="/opt/fireinners/WOLVERINE"
+API_SRC="/opt/fireinners/wolverine-api"
+TRADER_SRC="/opt/traderone"
+BOT_SRC="/opt/bbtrader-jupiter"
+UI_DIST="/var/www/wolverine"
+ARCH_GLOB="/var/www/_ARCHIVE_WOLVERINE_*"
 
-echo
-echo "== Repos git du projet =="
-find /var/www /opt /srv /home -maxdepth 5 -type d -name ".git" 2>/dev/null | sed 's|/.git||' | grep -Ei "wolverine|trader|wolf"
+mkdir -p "$TOOLS"
 
+echo "=== 0) Quick map (truth) ==="
+echo "UI_SRC     = $UI_SRC"
+echo "API_SRC    = $API_SRC"
+echo "TRADER_SRC = $TRADER_SRC"
+echo "BOT_SRC    = $BOT_SRC"
+echo "UI_DIST    = $UI_DIST"
 echo
-echo "== Git status =="
-for d in $(find /var/www /opt /srv /home -maxdepth 5 -type d -name ".git" 2>/dev/null | sed 's|/.git||' | grep -Ei "wolverine|trader|wolf"); do
-  echo "--- $d"
-  (cd "$d" && git remote -v && git branch && git status -sb) || true
+
+echo "=== 1) Create helper: project_map.sh ==="
+cat > "$TOOLS/project_map.sh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+UI_SRC="/opt/fireinners/WOLVERINE"
+API_SRC="/opt/fireinners/wolverine-api"
+TRADER_SRC="/opt/traderone"
+BOT_SRC="/opt/bbtrader-jupiter"
+UI_DIST="/var/www/wolverine"
+ARCH_GLOB="/var/www/_ARCHIVE_WOLVERINE_*"
+
+echo "== EXISTENCE =="
+for p in "$UI_SRC" "$API_SRC" "$TRADER_SRC" "$BOT_SRC" "$UI_DIST"; do
+  if [ -e "$p" ]; then echo "[OK] $p"; else echo "[MISSING] $p"; fi
 done
 
 echo
-echo "== Services actifs liés au projet =="
-systemctl --type=service --state=running | grep -Ei "wolverine|trader|node|pm2|python"
+echo "== ACTIVE NGINX (wolverine only) =="
+nginx -T 2>/dev/null | grep -nE 'server_name|location|root' | grep -Ei 'wolverine|traderone' || true
 
 echo
-echo "== Ports ouverts liés au projet =="
-ss -tulpen | grep -Ei "3000|8000|9000|wolverine|trader"
+echo "== SERVICES/PROCS (project-ish) =="
+systemctl --type=service --state=running 2>/dev/null | grep -Ei "nginx|pm2|node|python|trader|wolverine|jupiter" || true
+echo
+ps aux | grep -Ei "traderone|wolverine|jupiter|node|python" | grep -v grep || true
 
 echo
-echo "== Process liés au projet =="
-ps aux | grep -Ei "wolverine|trader|node|python" | grep -v grep
+echo "== PORTS =="
+ss -tulpen | grep -E ":(80|443|3000|8000|8080|9000)\b" || true
 
 echo
-echo "== Vhosts Nginx projet =="
-nginx -T 2>/dev/null | grep -n -E "server_name|location|root" | grep -Ei "wolverine|trader"
+echo "== GIT (only real sources) =="
+for d in "$UI_SRC" "$API_SRC" "$TRADER_SRC" "$BOT_SRC"; do
+  if [ -d "$d/.git" ]; then
+    echo "--- $d"
+    (cd "$d" && git remote -v && git status -sb) || true
+  else
+    echo "--- $d (no .git)"
+  fi
+done
 
 echo
-echo "== Recherche endpoints API projet =="
-grep -R "traderone/api" -n /var/www /opt /srv 2>/dev/null | head -n 50
+echo "== ENV FILES (project) =="
+for f in "$TRADER_SRC/.env" "$BOT_SRC/.env" "$UI_SRC/.env.production" "$API_SRC/.env" "/opt/traderone-opt/.env"; do
+  [ -f "$f" ] && echo "[OK] $f" || true
+done
 
 echo
-echo "== Fichiers .env du projet =="
-find /var/www /opt /srv -name ".env*" 2>/dev/null | grep -Ei "wolverine|trader|wolf"
+echo "== ARCHIVES COUNT =="
+ls -d $ARCH_GLOB 2>/dev/null | wc -l || true
+SH
+chmod +x "$TOOLS/project_map.sh"
+
+echo "=== 2) Create helper: grep_project.sh (exclude archives) ==="
+cat > "$TOOLS/grep_project.sh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+PATTERN="${1:-}"
+[ -n "$PATTERN" ] || { echo "Usage: grep_project.sh 'pattern'"; exit 1; }
+
+UI_SRC="/opt/fireinners/WOLVERINE"
+API_SRC="/opt/fireinners/wolverine-api"
+TRADER_SRC="/opt/traderone"
+BOT_SRC="/opt/bbtrader-jupiter"
+
+grep -RIn --binary-files=without-match \
+  --exclude-dir=node_modules --exclude-dir=.next --exclude-dir=out --exclude-dir=.git \
+  "$PATTERN" "$UI_SRC" "$API_SRC" "$TRADER_SRC" "$BOT_SRC" 2>/dev/null | head -n 200
+SH
+chmod +x "$TOOLS/grep_project.sh"
+
+echo "=== 3) Create helper: deploy_ui.sh (standard build->deploy with archive) ==="
+cat > "$TOOLS/deploy_ui.sh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+UI_SRC="/opt/fireinners/WOLVERINE"
+UI_DIST="/var/www/wolverine"
+TS="$(date +%Y%m%d_%H%M%S)"
+ARCH="/var/www/_ARCHIVE_WOLVERINE_${TS}"
+
+# deps
+apt-get update -y >/dev/null
+apt-get install -y rsync curl >/dev/null
+if ! command -v node >/dev/null 2>&1; then
+  curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null
+  apt-get install -y nodejs >/dev/null
+fi
+
+echo "== BUILD UI =="
+cd "$UI_SRC"
+npm install --legacy-peer-deps >/dev/null
+npm run build
+
+# expect: out/
+[ -d "$UI_SRC/out" ] || { echo "ERROR: $UI_SRC/out missing (Next export failed)"; exit 1; }
+
+echo "== ARCHIVE current dist (if exists) =="
+if [ -d "$UI_DIST" ]; then
+  mkdir -p "$ARCH"
+  rsync -a "$UI_DIST/" "$ARCH/wolverine/"
+  echo "Archived -> $ARCH/wolverine/"
+fi
+
+echo "== DEPLOY out/ -> $UI_DIST =="
+mkdir -p "$UI_DIST"
+rsync -a --delete "$UI_SRC/out/" "$UI_DIST/"
+
+echo "== NGINX reload =="
+nginx -t
+systemctl reload nginx
+
+echo "== QUICK CHECK =="
+curl -LsS https://fireinners.online/wolverine/ | head -n 5 || true
+echo "DONE ✅"
+SH
+chmod +x "$TOOLS/deploy_ui.sh"
+
+echo "=== 4) Symlink convenience (optional, safe) ==="
+ln -sfn "$UI_DIST" /var/www/wolverine_current || true
+
+echo "=== 5) Run map now ==="
+"$TOOLS/project_map.sh"
 
 echo
-echo "== FIN AUDIT — rien n’a été modifié =="
+echo "TOOLS READY ✅"
+echo " - Map:    $TOOLS/project_map.sh"
+echo " - Grep:   $TOOLS/grep_project.sh 'balances2'"
+echo " - Deploy: $TOOLS/deploy_ui.sh"
