@@ -1,64 +1,31 @@
 set -e
 cd /opt/traderone-opt
 
-echo "=== A) Qui écoute sur 3000 (3 méthodes) ==="
-
-echo "-- ss:"
-ss -ltnp 2>/dev/null | grep ':3000' || true
+echo "=== 1) Ports (tout ce qui écoute) ==="
+ss -ltnp || true
 echo
 
-echo "-- lsof:"
-command -v lsof >/dev/null && lsof -nP -iTCP:3000 -sTCP:LISTEN || echo "lsof not installed"
-echo
-
-echo "-- fuser:"
-command -v fuser >/dev/null && fuser -n tcp 3000 -v 2>/dev/null || echo "fuser not available"
-echo
-
-echo "=== B) Extraire PID3000 de façon safe ==="
-PID3000=$(
-  (ss -ltnp 2>/dev/null | awk '/:3000/ && /pid=/{match($0,/pid=([0-9]+)/,m); if(m[1]!=""){print m[1]; exit}}') \
-  || true
-)
-if [ -z "${PID3000:-}" ] && command -v lsof >/dev/null; then
-  PID3000=$(lsof -t -iTCP:3000 -sTCP:LISTEN 2>/dev/null | head -n1 || true)
-fi
-if [ -z "${PID3000:-}" ] && command -v fuser >/dev/null; then
-  PID3000=$(fuser -n tcp 3000 2>/dev/null | tr ' ' '\n' | head -n1 || true)
-fi
-
-echo "PID3000=$PID3000"
-if [ -z "${PID3000:-}" ]; then
-  echo "KO: aucun PID trouvé sur 3000"
-  exit 1
-fi
-echo
-
-echo "=== C) Infos process (ce qui tourne vraiment) ==="
-ps -fp "$PID3000" || true
-echo "--- cmdline ---"
-tr '\0' ' ' < /proc/"$PID3000"/cmdline 2>/dev/null || true
-echo
-echo "--- cwd ---"
-readlink -f /proc/"$PID3000"/cwd 2>/dev/null || true
-echo
-echo "--- exe ---"
-readlink -f /proc/"$PID3000"/exe 2>/dev/null || true
-echo
-
-echo "=== D) PM2 (si présent) ==="
+echo "=== 2) PM2 état ==="
 pm2 ls || true
 echo
-pm2 jlist 2>/dev/null | node -e '
-let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{
-  try{
-    const j=JSON.parse(d);
-    const pid=Number(process.env.PID3000);
-    const p=j.find(x=>x && x.pid===pid);
-    console.log(p ? JSON.stringify({name:p.name, pm_id:p.pm_id, pid:p.pid, script:p.pm2_env?.pm_exec_path, cwd:p.pm2_env?.pm_cwd},null,2) : "NOT_MANAGED_BY_PM2");
-  }catch(e){ console.log("pm2 jlist parse err:", e.message); }
-})' PID3000="$PID3000" || true
 
+echo "=== 3) Si PM2 n'a rien -> resurrect (si dump existe) ==="
+pm2 resurrect || true
+sleep 1
+pm2 ls || true
 echo
-echo "=== E) systemd unit qui lance (si c’est systemd) ==="
-systemctl status --no-pager --full 2>/dev/null | head -n 60 || true
+
+echo "=== 4) S'il n'y a toujours rien -> (re)start server.js sous PM2 ==="
+if ! pm2 ls | grep -q "online"; then
+  echo "PM2 vide -> start server.js"
+  pm2 start /opt/traderone-opt/server.js --name traderone --update-env
+fi
+
+echo "=== 5) Vérif 3000 + tests ==="
+sleep 1
+ss -ltnp | grep ':3000' || echo "KO: 3000 toujours pas en écoute"
+echo
+curl -sS -i http://127.0.0.1:3000/health | head -n 12 || true
+echo
+curl -sS http://127.0.0.1:3000/api/dexes | head -c 400; echo
+echo "=== DONE ==="
