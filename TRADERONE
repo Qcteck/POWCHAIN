@@ -1,19 +1,32 @@
-# ROOT — FIX Phantom connect + soldes (on-chain SOL + backend balances2) + rebuild + deploy
+# ROOT — FULL FIX: Phantom connect + on-chain SOL + TraderOne balances2 + build + deploy
 set -euo pipefail
 
 UI_SRC="/opt/fireinners/WOLVERINE"
 UI_DIST="/var/www/wolverine"
 
-cd "$UI_SRC"
+echo "=== 0) Precheck paths ==="
+[ -d "$UI_SRC" ] || { echo "ERROR: UI_SRC missing: $UI_SRC"; exit 1; }
+mkdir -p "$UI_DIST"
 
-echo "=== 1) Assurer @solana/web3.js (plus de CDN unpkg) ==="
-if ! grep -q '"@solana/web3.js"' package.json 2>/dev/null; then
-  npm pkg set "dependencies.@solana/web3.js=^1.98.4" >/dev/null
+echo "=== 1) Ensure deps (rsync/curl/node/npm) ==="
+apt-get update -y >/dev/null
+apt-get install -y rsync curl >/dev/null
+
+if ! command -v node >/dev/null 2>&1; then
+  curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null
+  apt-get install -y nodejs >/dev/null
 fi
-npm install --legacy-peer-deps
 
-echo "=== 2) Lib: Phantom connect (robuste) ==="
-mkdir -p lib
+echo "Node: $(node -v)  NPM: $(npm -v)"
+
+echo "=== 2) Install @solana/web3.js (NO npm pkg set) ==="
+cd "$UI_SRC"
+npm install --legacy-peer-deps >/dev/null
+npm install @solana/web3.js@1.98.4 --save --legacy-peer-deps >/dev/null
+
+echo "=== 3) Write libs (Phantom + onchain + balances2) ==="
+mkdir -p lib components
+
 cat > lib/wallet.js <<'JS'
 export async function connectPhantom() {
   const sol = window?.solana;
@@ -26,7 +39,6 @@ export async function connectPhantom() {
 }
 JS
 
-echo "=== 3) Lib: on-chain SOL via @solana/web3.js (bundled) ==="
 cat > lib/onchain.js <<'JS'
 import { Connection, PublicKey, clusterApiUrl } from "@solana/web3.js";
 
@@ -37,7 +49,6 @@ export async function fetchOnchainBalances(pubkey) {
 }
 JS
 
-echo "=== 4) Lib: balances TraderOne via TON endpoint balances2 ==="
 cat > lib/balances.js <<'JS'
 export async function fetchInternalBalances(pubkey) {
   const r = await fetch(`/wolverine/traderone/api/balances2?wallet=${encodeURIComponent(pubkey)}`);
@@ -47,8 +58,7 @@ export async function fetchInternalBalances(pubkey) {
 }
 JS
 
-echo "=== 5) UI: WalletBox (affiche connect + onchain + traderone + delta + erreurs) ==="
-mkdir -p components
+echo "=== 4) WalletBox component ==="
 cat > components/WalletBox.jsx <<'JSX'
 import { useState } from "react";
 import { connectPhantom } from "../lib/wallet";
@@ -142,22 +152,39 @@ export default function WalletBox() {
 }
 JSX
 
-echo "=== 6) Assurer que Layout utilise WalletBox ==="
-# si Layout n'importe pas WalletBox, on l'ajoute
-if ! grep -q 'WalletBox' components/Layout.jsx 2>/dev/null; then
-  sed -i '1i import WalletBox from "./WalletBox";' components/Layout.jsx
+echo "=== 5) Ensure Layout uses WalletBox ==="
+if [ ! -f components/Layout.jsx ]; then
+  echo "ERROR: components/Layout.jsx not found in $UI_SRC"
+  exit 1
 fi
-# remplacer l'ancien bloc walletBox par <WalletBox />
-sed -i 's|<div className="walletBox">[[:space:][:print:]]*</div>|<WalletBox />|g' components/Layout.jsx || true
 
-echo "=== 7) Build + deploy ==="
+# add import if missing
+grep -q 'from "\.\/WalletBox"' components/Layout.jsx || sed -i '1i import WalletBox from "./WalletBox";' components/Layout.jsx
+
+# replace any existing walletBox block with <WalletBox />
+# (if it doesn't match, we still append WalletBox at top of layout body)
+if ! grep -q '<WalletBox' components/Layout.jsx; then
+  # try replace an existing walletBox div block
+  sed -i 's|<div className="walletBox">[[:space:][:print:]]*</div>|<WalletBox />|g' components/Layout.jsx || true
+fi
+
+# if still not present, insert WalletBox before first return wrapper closing
+grep -q '<WalletBox' components/Layout.jsx || sed -i 's|<main|<WalletBox />\n<main|g' components/Layout.jsx || true
+
+echo "=== 6) Build + deploy ==="
 npm run build
+[ -d "$UI_SRC/out" ] || { echo "ERROR: out/ missing after build"; exit 1; }
+
 rsync -a --delete "$UI_SRC/out/" "$UI_DIST/"
 
-echo "=== 8) Tests backend rapides ==="
-echo "--- local backend status (127.0.0.1:3000) ---"
-curl -sS -i http://127.0.0.1:3000/status 2>/dev/null | head -n 12 || true
-echo "--- public balances2 test (wallet=111..) ---"
-curl -sS -i "https://fireinners.online/wolverine/traderone/api/balances2?wallet=11111111111111111111111111111111" | head -n 12 || true
+echo "=== 7) Reload nginx ==="
+nginx -t
+systemctl reload nginx
 
-echo "DONE ✅ (refresh /wolverine et clique Connect Phantom)"
+echo "=== 8) Quick backend checks ==="
+echo "--- public health ---"
+curl -sS -i "https://fireinners.online/wolverine/traderone/api/health" | head -n 12 || true
+echo "--- balances2 test (wallet=111..) ---"
+curl -sS -i "https://fireinners.online/wolverine/traderone/api/balances2?wallet=11111111111111111111111111111111" | head -n 20 || true
+
+echo "DONE ✅  -> refresh https://fireinners.online/wolverine/ and click Connect Phantom"
