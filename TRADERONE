@@ -1,2 +1,85 @@
-head -n 15 /var/www/wolverine/index.html
-ls -lah /var/www/wolverine | head -n 25
+set -euo pipefail
+TS="$(date +%s)"
+
+# chemins
+REPO_URL="https://github.com/Qcteck/WOLVERINE"
+REPO_DIR="/opt/fireinners/WOLVERINE"
+WOLV_DIR="/var/www/wolverine"
+
+echo "=== 0) Backup de l'actuel /var/www/wolverine (Fireinners) ==="
+if [ -d "$WOLV_DIR" ]; then
+  mv "$WOLV_DIR" "/var/www/wolverine_fireinners_backup_$TS"
+fi
+mkdir -p "$WOLV_DIR"
+
+echo "=== 1) Pré-requis ==="
+apt-get update -y >/dev/null
+apt-get install -y git rsync curl >/dev/null
+
+# node (si absent)
+if ! command -v node >/dev/null 2>&1; then
+  curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null
+  apt-get install -y nodejs >/dev/null
+fi
+
+echo "=== 2) Clone / update repo WOLVERINE ==="
+if [ -d "$REPO_DIR/.git" ]; then
+  cd "$REPO_DIR"
+  git fetch --all --prune
+  git reset --hard origin/$(git remote show origin | awk '/HEAD branch/ {print $NF}')
+else
+  rm -rf "$REPO_DIR"
+  git clone "$REPO_URL" "$REPO_DIR"
+  cd "$REPO_DIR"
+fi
+
+echo "=== 3) Trouver le frontend (package.json avec script build) ==="
+PKG="$(find "$REPO_DIR" -type f -name package.json -not -path "*/node_modules/*" \
+  -exec sh -c 'grep -q "\"build\"" "$1" && echo "$1"' sh {} \; | head -n 1 || true)"
+
+if [ -z "${PKG:-}" ]; then
+  echo "KO: aucun frontend buildable trouvé dans $REPO_DIR (pas de script build)."
+  echo "Liste des package.json trouvés:"
+  find "$REPO_DIR" -type f -name package.json -not -path "*/node_modules/*" | head -n 30
+  exit 1
+fi
+
+APP_DIR="$(dirname "$PKG")"
+echo "OK: frontend détecté -> $APP_DIR"
+
+echo "=== 4) Build (base /wolverine/) ==="
+cd "$APP_DIR"
+
+# Vite/React: base via env. (si ton app ne l'utilise pas, ça ne casse rien)
+cat > .env.production <<'EOF'
+VITE_BASE=/wolverine/
+VITE_API_BASE=/wolverine/traderone/api
+EOF
+
+npm install
+npm run build
+
+OUT=""
+for d in dist build out; do
+  if [ -d "$APP_DIR/$d" ]; then OUT="$APP_DIR/$d"; break; fi
+done
+[ -n "$OUT" ] || { echo "KO: build fini mais pas de dist/build/out"; exit 1; }
+
+echo "=== 5) Deploy -> /var/www/wolverine ==="
+rsync -a --delete "$OUT/" "$WOLV_DIR/"
+
+chmod -R 755 /var/www
+find "$WOLV_DIR" -type f -exec chmod 644 {} \;
+
+echo "=== 6) Preuve locale ==="
+grep -nEi "title|wolverine|fireinners|traderone|lifi|phantom|wallet" "$WOLV_DIR/index.html" | head -n 30 || true
+
+echo "=== 7) Reload nginx + test HTTP ==="
+nginx -t
+systemctl reload nginx
+
+curl -sS -I https://fireinners.online/wolverine/ | head -n 12
+curl -LsS https://fireinners.online/wolverine/ | grep -i "<title>" | head -n 1 || true
+curl -sS -i https://fireinners.online/wolverine/traderone/api/health | head -n 12 || true
+
+echo "DONE ✅"
