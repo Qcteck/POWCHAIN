@@ -1,23 +1,34 @@
+# ROOT batch — trouver où est le vrai frontend (script build), build, deploy, reload nginx
 set -euo pipefail
 
 REPO="/opt/fireinners/WOLVERINE"
 DIST="/var/www/wolverine"
 NG="/etc/nginx/sites-enabled/fireinners.online-ssl"
 
-echo "=== 1) Node + deps ==="
-apt-get update -y
-apt-get install -y curl rsync git
-if ! command -v node >/dev/null 2>&1; then
-  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-  apt-get install -y nodejs
-fi
-node -v
-npm -v
-
-echo "=== 2) Build frontend ==="
+echo "=== 0) Sanity ==="
 cd "$REPO"
+ls -lah | head
 
-# Vite env (si tu n'es pas sur Vite, dis-moi et je te donne la variante)
+echo "=== 1) Trouver un package.json qui a un script 'build' (hors node_modules) ==="
+CANDIDATE_PKG="$(find "$REPO" -type f -name package.json \
+  -not -path "*/node_modules/*" \
+  -exec sh -c 'grep -q "\"build\"" "$1" && echo "$1"' sh {} \; \
+  | head -n 1)"
+
+if [ -z "${CANDIDATE_PKG:-}" ]; then
+  echo "KO: aucun package.json avec script build trouvé dans $REPO"
+  echo "INFO: scripts du package.json racine:"
+  (cat "$REPO/package.json" | sed -n '1,140p') || true
+  exit 1
+fi
+
+APP_DIR="$(dirname "$CANDIDATE_PKG")"
+echo "OK: build trouvé dans: $APP_DIR"
+
+echo "=== 2) Build (Node déjà OK) ==="
+cd "$APP_DIR"
+
+# Vite env (OK même si ignoré par un autre tooling)
 cat > .env.production <<'EOF'
 VITE_BASE=/wolverine/
 VITE_API_BASE=/wolverine/traderone/api
@@ -26,13 +37,23 @@ EOF
 npm ci
 npm run build
 
-echo "=== 3) Deploy dist => /var/www/wolverine ==="
+echo "=== 3) Détecter le dossier de sortie (dist/build/out) ==="
+OUT=""
+for d in dist build out; do
+  if [ -d "$APP_DIR/$d" ]; then OUT="$APP_DIR/$d"; break; fi
+done
+[ -n "$OUT" ] || { echo "KO: aucun dossier dist/build/out trouvé après build"; exit 1; }
+echo "OK: output=$OUT"
+
+echo "=== 4) Deploy vers /var/www/wolverine ==="
+apt-get update -y >/dev/null
+apt-get install -y rsync >/dev/null
 mkdir -p "$DIST"
-rsync -a --delete "$REPO/dist/" "$DIST/"
+rsync -a --delete "$OUT/" "$DIST/"
 chmod -R 755 /var/www
 find "$DIST" -type f -exec chmod 644 {} \;
 
-echo "=== 4) Nginx: UI /wolverine sert /var/www/wolverine (sans casser l'API existante) ==="
+echo "=== 5) Nginx: UI /wolverine => /var/www/wolverine (sans toucher à l'API) ==="
 cp -a "$NG" "$NG.bak.ui_deploy_$(date +%s)"
 
 python3 - <<'PY'
@@ -41,7 +62,7 @@ import re
 ng = Path("/etc/nginx/sites-enabled/fireinners.online-ssl")
 s = ng.read_text()
 
-# Supprime anciens blocs UI /wolverine (on ne touche pas à l'API)
+# enlève anciens blocs UI /wolverine
 for pat in [
   r'\n\s*location\s*=\s*/wolverine\s*\{[\s\S]*?\n\s*\}\s*',
   r'\n\s*location\s+\^~\s+/wolverine/\s*\{[\s\S]*?\n\s*\}\s*',
@@ -58,19 +79,18 @@ location ^~ /wolverine/ {
   try_files $uri $uri/ /wolverine/index.html;
 }
 '''
-
 i = s.rfind("}")
 if i == -1:
   raise SystemExit("KO: pas trouvé de '}' final dans le conf nginx")
 s = s[:i] + "\n" + block + "\n" + s[i:]
 ng.write_text(s)
-print("OK: UI bloc inserted")
+print("OK: UI bloc injected")
 PY
 
 nginx -t
 systemctl reload nginx
 
-echo "=== 5) Tests ==="
+echo "=== 6) Tests ==="
 curl -sS -I https://fireinners.online/wolverine/ | head -n 12
 curl -sS -i https://fireinners.online/wolverine/traderone/api/health | head -n 12
 echo "DONE ✅"
