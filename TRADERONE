@@ -1,31 +1,43 @@
 set -euo pipefail
-cd /opt/traderone-opt
 
-echo "=== 0) Backup ==="
-cp -a server.js "server.js.bak.dexes_alias.$(date +%s)"
+NG="/etc/nginx/sites-enabled/fireinners.online-ssl"
+[ -f "$NG" ] || { echo "KO: $NG introuvable"; exit 1; }
 
-echo "=== 1) Patch: /api/dexes -> also /wolverine/traderone/api/dexes ==="
-node <<'NODE'
-const fs = require("fs");
-const p = "/opt/traderone-opt/server.js";
-let s = fs.readFileSync(p, "utf8");
+echo "=== 0) Backup nginx conf ==="
+cp -a "$NG" "$NG.bak.$(date +%s)"
 
-// remplace uniquement la signature de route si elle existe
-// app.get("/api/dexes", ...) => app.get(["/api/dexes","/wolverine/traderone/api/dexes"], ...)
-s = s.replace(
-  /app\.get\(\s*["']\/api\/dexes["']\s*,/g,
-  'app.get(["/api/dexes","/wolverine/traderone/api/dexes"],'
-);
+echo "=== 1) Ajouter /wolverine (UI) + /wolverine/traderone/api (proxy API) si absent ==="
+grep -q "location ^~ /wolverine/traderone/api/" "$NG" || cat >> "$NG" <<'NGINX'
 
-fs.writeFileSync(p, s);
-console.log("OK: added alias route");
-NODE
+# --- Wolverine UI ---
+location ^~ /wolverine/ {
+  # si tu as un build front (vite/react) dans /var/www/wolverine
+  root /var/www;
+  try_files $uri $uri/ /wolverine/index.html;
+}
 
-echo "=== 2) Check + restart ==="
-node --check server.js
-pm2 restart 0 --update-env
-sleep 1
+# --- TraderOne API behind /wolverine/traderone/api ---
+location ^~ /wolverine/traderone/api/ {
+  # /wolverine/traderone/api/foo  ->  /api/foo sur Node
+  rewrite ^/wolverine/traderone/api/(.*)$ /api/$1 break;
 
-echo "=== 3) Tests local ==="
-curl -sS http://127.0.0.1:3000/api/dexes | head -c 300; echo
-curl -sS http://127.0.0.1:3000/wolverine/traderone/api/dexes | head -c 300; echo
+  proxy_pass http://127.0.0.1:3000;
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+}
+NGINX
+
+echo "=== 2) Test + reload nginx ==="
+nginx -t
+systemctl reload nginx
+echo "OK: nginx reloaded"
+
+echo "=== 3) Tests ==="
+curl -sS -i https://fireinners.online/wolverine/ | head -n 15 || true
+echo
+curl -sS -i https://fireinners.online/wolverine/traderone/api/health | head -n 20 || true
+echo
+curl -sS -i https://fireinners.online/wolverine/traderone/api/dexes | head -n 25 || true
