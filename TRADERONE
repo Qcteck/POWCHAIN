@@ -1,37 +1,102 @@
-# ROOT — FIX ALL : rebuild + deploy + reload nginx + verify
+# ROOT — FIX: afficher soldes Phantom + TraderOne + delta (rebuild + deploy)
 set -e
 
 SRC="/opt/_wolverine_next_src"
-OUT="/opt/_wolverine_next_src/out"
 DIST="/var/www/wolverine"
-BACK="/var/www/wolverine_backup_$(date +%s)"
 
-echo "=== 1) Vérifier que le build existe ==="
-[ -d "$SRC" ] || { echo "ERREUR: $SRC n'existe pas"; exit 1; }
+echo "=== 1) Ajouter libs on-chain + backend ==="
+mkdir -p "$SRC/lib"
 
-echo "=== 2) Rebuild (Next export statique) ==="
+cat > "$SRC/lib/onchain.js" <<'JS'
+export async function fetchOnchainBalances(pubkey) {
+  if (!window.solanaWeb3) throw new Error("solanaWeb3 not loaded");
+  const conn = new window.solanaWeb3.Connection(
+    window.solanaWeb3.clusterApiUrl("mainnet-beta")
+  );
+  const lamports = await conn.getBalance(new window.solanaWeb3.PublicKey(pubkey));
+  return { SOL: lamports / 1e9 };
+}
+JS
+
+cat > "$SRC/lib/balances.js" <<'JS'
+export async function fetchInternalBalances(pubkey) {
+  const r = await fetch(`/wolverine/traderone/api/wallet/${pubkey}`);
+  if (!r.ok) throw new Error("Backend balance error");
+  return r.json();
+}
+JS
+
+echo "=== 2) Patch WalletBox ==="
+cat > "$SRC/components/WalletBox.jsx" <<'JSX'
+import { useState } from "react";
+import { connectPhantom } from "../lib/wallet";
+import { fetchOnchainBalances } from "../lib/onchain";
+import { fetchInternalBalances } from "../lib/balances";
+
+export default function WalletBox() {
+  const [addr, setAddr] = useState("");
+  const [onchain, setOnchain] = useState(null);
+  const [internal, setInternal] = useState(null);
+  const [err, setErr] = useState("");
+
+  async function connect() {
+    try {
+      const a = await connectPhantom();
+      if (!a) return;
+      setAddr(a);
+
+      const oc = await fetchOnchainBalances(a);
+      setOnchain(oc);
+
+      const it = await fetchInternalBalances(a);
+      setInternal(it);
+    } catch (e) {
+      setErr(String(e.message || e));
+    }
+  }
+
+  function delta() {
+    if (!onchain || !internal) return null;
+    const out = {};
+    for (const k in onchain) out[k] = (onchain[k] || 0) - (internal[k] || 0);
+    return out;
+  }
+
+  const d = delta();
+
+  return (
+    <div className="walletBox">
+      <div className="walletTitle">Wallet</div>
+
+      {!addr ? (
+        <button className="btn ghost" onClick={connect}>Connect Phantom</button>
+      ) : (
+        <>
+          <div className="muted">Connected</div>
+          <code style={{fontSize:12,wordBreak:"break-all"}}>{addr}</code>
+
+          <h4>On‑chain (Phantom)</h4>
+          {onchain && Object.entries(onchain).map(([k,v]) => <div key={k}>{k}: {v}</div>)}
+
+          <h4>TraderOne</h4>
+          {internal && Object.entries(internal).map(([k,v]) => <div key={k}>{k}: {v}</div>)}
+
+          <h4>Δ non crédité</h4>
+          {d && Object.entries(d).map(([k,v]) => <div key={k}>{k}: {v}</div>)}
+        </>
+      )}
+
+      {err && <div className="bad small">{err}</div>}
+    </div>
+  );
+}
+JSX
+
+echo "=== 3) Rebuild UI ==="
 cd "$SRC"
-npm install --legacy-peer-deps
 npm run build
 
-echo "=== 3) Backup ancien UI ==="
-[ -d "$DIST" ] && mv "$DIST" "$BACK" || true
-mkdir -p "$DIST"
+echo "=== 4) Redeploy ==="
+rsync -a --delete "$SRC/out/" "$DIST/"
 
-echo "=== 4) Déployer le nouveau UI ==="
-rsync -a --delete "$OUT/" "$DIST/"
-
-echo "=== 5) Reload nginx ==="
-nginx -t
-systemctl reload nginx
-
-echo "=== 6) Vérification fichiers ==="
-ls -lah "$DIST" | head -n 30
-
-echo "=== 7) Vérification HTTP ==="
-echo "--- TITLE ---"
-curl -LsS https://fireinners.online/wolverine/ | grep -i "<title>" || true
-echo "--- HEALTH ---"
-curl -sS -i https://fireinners.online/wolverine/health/ | head -n 12 || true
-
-echo "DONE ✅"
+echo "DONE ✅ — recharge la page"
