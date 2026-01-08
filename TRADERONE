@@ -1,61 +1,60 @@
 set -e
-APP="/opt/traderone-opt"
-cd "$APP"
 
-echo "=== 1) Qui écoute sur 8585 (PID + cmdline) ==="
-ss -ltnp | grep ':8585' || echo "OK: rien sur 8585"
-PID8585=$(ss -ltnp | sed -n 's/.*:8585.*pid=\([0-9]\+\).*/\1/p' | head -n1 || true)
-echo "PID8585=$PID8585"
-if [ -n "$PID8585" ]; then
-  ps -fp "$PID8585" || true
-  echo "--- cmdline ---"
-  tr '\0' ' ' < /proc/"$PID8585"/cmdline 2>/dev/null || true
-  echo
-fi
-echo
-
-echo "=== 2) KILL ce qui prend 8585 (node) ==="
-if [ -n "$PID8585" ]; then
-  kill "$PID8585" || true
-  sleep 1
-  kill -9 "$PID8585" 2>/dev/null || true
-fi
-ss -ltnp | grep ':8585' || echo "OK: 8585 libéré"
-echo
-
-echo "=== 3) Trouver QUI le relance (pm2/systemd/cron) ==="
-echo "--- PM2 (tous users) ---"
-pm2 ls || true
-for u in root ubuntu debian; do sudo -u "$u" pm2 ls 2>/dev/null || true; done
-echo
-echo "--- systemd suspects ---"
-systemctl list-units --type=service --all | egrep -i 'trader|wolv|wolver|node|pm2' || true
-echo
-echo "--- cron suspects ---"
-grep -RIn --line-number -E '8585|server\.js|traderone-opt' /etc/cron.* /var/spool/cron/crontabs 2>/dev/null | head -n 80 || true
-echo
-
-echo "=== 4) NGINX: supprimer les vhosts .bak activés + vérifier server_name ==="
-echo "--- server_name fireinners ---"
-grep -RIn --line-number -E 'server_name\s+.*fireinners\.online' /etc/nginx/sites-enabled | head -n 200 || true
-echo
-echo "--- Désactive tout .bak / .disabled dans sites-enabled ---"
-ls -1 /etc/nginx/sites-enabled | egrep '\.bak|\.disabled' && \
-  for f in /etc/nginx/sites-enabled/*; do
-    case "$f" in
-      *.bak*|*.disabled*) mv "$f" "$f.off.$(date +%s)";;
-    esac
-  done || true
-echo
-
-echo "=== 5) Test + reload nginx ==="
-nginx -t
-systemctl reload nginx
-echo "nginx reloaded"
-echo
-
-echo "=== 6) Re-check ports ==="
+echo "=== 0) Snapshot ports ==="
 ss -ltnp | egrep ':3000|:3002|:8585' || true
 echo
+
+echo "=== 1) STOP/DISABLE services qui relancent (wolverine-*) ==="
+for s in wolverine-api.service wolverine-tg-monitor.service wolverine-tg-sentinel.service traderone.service traderone-watchdog.service; do
+  systemctl stop "$s" 2>/dev/null || true
+  systemctl disable "$s" 2>/dev/null || true
+done
+# (option “anti-retour”)
+systemctl mask wolverine-api.service 2>/dev/null || true
+echo "OK: services stoppés/désactivés (wolverine-api masqué)"
+echo
+
+echo "=== 2) Neutraliser CRON root qui relance /opt/traderone-opt/* (backup + comment) ==="
+CR="/var/spool/cron/crontabs/root"
+if [ -f "$CR" ]; then
+  cp -a "$CR" "$CR.bak.$(date +%s)"
+  sed -i 's#^\([^#].*/opt/traderone-opt/.*\)$#\# DISABLED_BY_CLEANUP \1#g' "$CR"
+  echo "OK: cron root patché (lignes /opt/traderone-opt commentées)"
+else
+  echo "INFO: pas de crontab root à $CR"
+fi
+echo
+
+echo "=== 3) NGINX: retirer les .bak dans sites-enabled (cause du conflicting server name) ==="
+for f in /etc/nginx/sites-enabled/*.bak*; do
+  [ -e "$f" ] || continue
+  mv "$f" "$f.off.$(date +%s)"
+  echo "OFF: $f"
+done
+nginx -t
+systemctl reload nginx
+echo "OK: nginx reloaded"
+echo
+
+echo "=== 4) Kill ports 8585 + 3002 si encore là ==="
+for p in 8585 3002; do
+  PID=$(ss -ltnp | sed -n "s/.*:$p.*pid=\([0-9]\+\).*/\1/p" | head -n1 || true)
+  if [ -n "$PID" ]; then
+    echo "KILL port $p pid=$PID"
+    ps -fp "$PID" || true
+    kill "$PID" || true
+    sleep 1
+    kill -9 "$PID" 2>/dev/null || true
+  fi
+done
+echo
+
+echo "=== 5) Re-check (on veut seulement 3000) ==="
+ss -ltnp | egrep ':3000|:3002|:8585' || true
+echo
+
+echo "=== 6) Tests ==="
 curl -sS -i http://127.0.0.1:3000/health | head -n 20 || true
+echo
+curl -sS -i https://fireinners.online/api/health | head -n 20 || true
 echo "=== FIN ==="
