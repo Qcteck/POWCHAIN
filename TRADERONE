@@ -1,103 +1,55 @@
-# ROOT BATCH COMPLET — remettre le “vrai WOLVERINE” sur https://fireinners.online/wolverine
-# Objectif:
-# 1) éviter que nginx serve un vieux front (doublons de conf)
-# 2) déployer un dist “WOLVERINE” (backup si dispo, sinon rebuild)
-# 3) forcer nginx à servir /var/www/wolverine pour /wolverine/
-# 4) tests finaux
-
+# ROOT — fireinners = / ; wolverine = /wolverine ; api = /wolverine/traderone/api
 set -euo pipefail
 
-APP="/opt/fireinners/frontend-react/app"
-DIST="/var/www/wolverine"
-KEEP="/etc/nginx/sites-enabled/fireinners.online-ssl"
+NG="/etc/nginx/sites-enabled/fireinners.online-ssl"
 DISABLED="/etc/nginx/sites-disabled"
 TS="$(date +%s)"
 
-echo "=== 0) Sanity ==="
-[ -d "$APP" ] || { echo "KO: APP introuvable: $APP"; exit 1; }
-[ -f "$KEEP" ] || { echo "KO: conf nginx KEEP introuvable: $KEEP"; exit 1; }
+WOLV_DIST="/var/www/wolverine"
+FIRE_DIST="/var/www/fireinners"
 
-echo "=== 1) PURGE des doublons nginx qui redéfinissent /wolverine ==="
+echo "=== 1) Désactiver les doublons nginx qui contiennent /wolverine (sauf le bon vhost) ==="
 mkdir -p "$DISABLED"
-mapfile -t FILES < <(grep -RIl -E 'location\s+\^~\s+/wolverine/|location\s+\^~\s+/wolverine/traderone/api/' \
-  /etc/nginx/sites-enabled /etc/nginx/sites-available /etc/nginx/conf.d 2>/dev/null | sort -u || true)
+mapfile -t FILES < <(grep -RIl -E 'location\s+\^~\s+/wolverine/' /etc/nginx/sites-enabled /etc/nginx/conf.d /etc/nginx/sites-available 2>/dev/null | sort -u || true)
+for f in "${FILES[@]}"; do
+  [ -f "$f" ] || continue
+  if [ "$f" != "$NG" ]; then
+    base="$(basename "$f")"
+    echo "MOVE DUP: $f -> $DISABLED/$base.$TS"
+    mv "$f" "$DISABLED/$base.$TS"
+  else
+    echo "KEEP: $f"
+  fi
+done
 
-if [ "${#FILES[@]}" -gt 0 ]; then
-  for f in "${FILES[@]}"; do
-    [ -f "$f" ] || continue
-    if [ "$f" != "$KEEP" ]; then
-      base="$(basename "$f")"
-      echo "MOVE DUP: $f -> $DISABLED/$base.$TS"
-      mv "$f" "$DISABLED/$base.$TS"
-    else
-      echo "KEEP: $f"
-    fi
-  done
-else
-  echo "INFO: aucun autre fichier nginx ne contient /wolverine"
-fi
-
-nginx -t
-
-echo "=== 2) Déployer un dist WOLVERINE (priorité: backup qui contient 'wolverine') ==="
-cd "$APP"
-
-# Trouve un dist*/index.html qui contient “wolverine”
-CAND="$(find . -maxdepth 2 -type f -path "./dist*/index.html" -print 2>/dev/null | sort -r | while read -r f; do
-  if grep -qi "wolverine" "$f"; then echo "$f"; break; fi
-done || true)"
-
-apt-get update -y >/dev/null
-apt-get install -y rsync >/dev/null
-
-if [ -n "${CAND:-}" ]; then
-  SRC_DIR="$(dirname "$CAND")"
-  echo "OK: Backup/build WOLVERINE trouvé: $SRC_DIR"
-  mkdir -p "$DIST"
-  rsync -a --delete "$SRC_DIR/" "$DIST/"
-else
-  echo "INFO: aucun dist*/index.html ne contient 'wolverine' -> on tente un rebuild (peut rester FIREINNERS si le code source = FIREINNERS)"
-  # vars prod Vite
-  cat > .env.production <<'EOF'
-VITE_BASE=/wolverine/
-VITE_API_BASE=/wolverine/traderone/api
-EOF
-
-  # lockfile/npm ci parfois foireux -> npm install robuste
-  npm install
-  npm run build
-
-  [ -d "$APP/dist" ] || { echo "KO: build terminé mais pas de $APP/dist"; exit 1; }
-  mkdir -p "$DIST"
-  rsync -a --delete "$APP/dist/" "$DIST/"
-fi
-
-chmod -R 755 /var/www
-find "$DIST" -type f -exec chmod 644 {} \;
-
-echo "=== 3) FORCER nginx: /wolverine => /var/www/wolverine (sans toucher l'API /wolverine/traderone/api) ==="
-cp -a "$KEEP" "$KEEP.bak.wolverine_ui.$TS"
+echo "=== 2) Forcer le mapping nginx (root => fireinners, /wolverine => wolverine) ==="
+cp -a "$NG" "$NG.bak.map_$TS"
 
 python3 - <<'PY'
 from pathlib import Path
 import re
-
 ng = Path("/etc/nginx/sites-enabled/fireinners.online-ssl")
 s = ng.read_text()
 
-# Retire TOUT bloc UI /wolverine existant (mais on laisse intact tout ce qui concerne /wolverine/traderone/api)
-patterns = [
-  r'\n\s*#\s*---\s*WOLVERINE UI[\s\S]*?location\s+\^~\s+/wolverine/[\s\S]*?\n\s*\}\s*',
+# retire les anciens blocs UI /wolverine (sans toucher à /wolverine/traderone/api)
+for pat in [
+  r'\n\s*# --- WOLVERINE UI[\s\S]*?location\s+\^~\s+/wolverine/[\s\S]*?\n\s*\}\s*',
   r'\n\s*location\s*=\s*/wolverine\s*\{[\s\S]*?\n\s*\}\s*',
   r'\n\s*location\s+\^~\s+/wolverine/\s*\{[\s\S]*?\n\s*\}\s*',
-]
-for pat in patterns:
+]:
   s = re.sub(pat, "\n", s, flags=re.M)
 
 block = r'''
-# --- WOLVERINE UI (served from /var/www/wolverine) ---
-location = /wolverine { return 301 /wolverine/; }
+# --- ROOT UI (FIREINNERS) ---
+location = / { try_files /index.html =404; }
+location ^~ / {
+  root /var/www/fireinners;
+  index index.html;
+  try_files $uri $uri/ /index.html;
+}
 
+# --- WOLVERINE UI ---
+location = /wolverine { return 301 /wolverine/; }
 location ^~ /wolverine/ {
   root /var/www;
   index index.html;
@@ -107,26 +59,23 @@ location ^~ /wolverine/ {
 
 i = s.rfind("}")
 if i == -1:
-  raise SystemExit("KO: conf nginx invalide (pas de } final)")
+  raise SystemExit("KO: nginx conf invalide")
 s = s[:i] + "\n" + block + "\n" + s[i:]
 ng.write_text(s)
-print("OK: bloc UI /wolverine réécrit")
+print("OK: mapping inserted")
 PY
 
 nginx -t
 systemctl reload nginx
 
-echo "=== 4) CHECK: est-ce que l’UI servie ressemble à WOLVERINE ? ==="
-echo "--- index.html (title + keywords) ---"
-grep -nEi "title|wolverine|fireinners" "$DIST/index.html" | head -n 40 || true
-echo "--- listing ---"
-ls -lah "$DIST" | head -n 30
+echo "=== 3) Vérifs fichiers servis ==="
+echo "--- /var/www/wolverine/index.html title ---"
+grep -nEi "title" "$WOLV_DIST/index.html" | head -n 3 || true
+echo "--- /var/www/fireinners/index.html title ---"
+grep -nEi "title" "$FIRE_DIST/index.html" | head -n 3 || true
 
-echo "=== 5) TESTS HTTP ==="
-echo "--- /wolverine/ (UI) ---"
-curl -sS -I https://fireinners.online/wolverine/ | head -n 12
-echo "--- /wolverine/traderone/api/health (API) ---"
-curl -sS -i https://fireinners.online/wolverine/traderone/api/health | head -n 12
-
+echo "=== 4) Tests HTTP ==="
+curl -sS -I https://fireinners.online/ | head -n 8
+curl -sS -I https://fireinners.online/wolverine/ | head -n 8
+curl -sS -i https://fireinners.online/wolverine/traderone/api/health | head -n 10
 echo "DONE ✅"
-echo "Si tu vois encore FIREINNERS dans le title, alors le code source actuel build FIREINNERS (pas un problème nginx)."
