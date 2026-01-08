@@ -1,87 +1,35 @@
 set -euo pipefail
 
+echo "=== 1) Trouver TOUS les server_name fireinners.online en conf effective ==="
+nginx -T 2>/dev/null | grep -nE 'conflicting server name|server_name (fireinners\.online|www\.fireinners\.online)' | head -n 200
+echo
+
+echo "=== 2) Trouver dans quels fichiers ça se trouve ==="
+grep -RIn --line-number -E 'server_name\s+(fireinners\.online|www\.fireinners\.online)\b' /etc/nginx | head -n 200
+echo
+
+echo "=== 3) Lister tous les vhosts qui écoutent 443 ==="
+grep -RIn --line-number -E 'listen\s+443\b' /etc/nginx/sites-enabled /etc/nginx/conf.d /etc/nginx/sites-available 2>/dev/null | head -n 200
+echo
+
+echo "=== 4) Désactiver les doublons (on garde fireinners.online-ssl uniquement) ==="
 mkdir -p /etc/nginx/sites-disabled
-cd /etc/nginx/sites-enabled
-
-echo "=== 1) Garder uniquement le vhost actif ==="
-TS=$(date +%s)
-for f in *; do
+# Désactive tout fichier (hors fireinners.online-ssl) qui contient server_name fireinners
+while IFS= read -r f; do
   [ -f "$f" ] || continue
-  if [ "$f" = "fireinners.online-ssl" ]; then
-    echo "KEEP: $f"
-  else
-    echo "MOVE: $f -> /etc/nginx/sites-disabled/$f.$TS"
-    mv "$f" "/etc/nginx/sites-disabled/$f.$TS"
+  base="$(basename "$f")"
+  if [ "$base" != "fireinners.online-ssl" ]; then
+    echo "MOVE DUP: $f -> /etc/nginx/sites-disabled/$base.$(date +%s)"
+    mv "$f" "/etc/nginx/sites-disabled/$base.$(date +%s)" || true
   fi
-done
+done < <(grep -RIl -E 'server_name\s+(fireinners\.online|www\.fireinners\.online)\b' /etc/nginx/sites-enabled /etc/nginx/conf.d /etc/nginx/sites-available 2>/dev/null | sort -u)
 
-NG="/etc/nginx/sites-enabled/fireinners.online-ssl"
-cp -a "$NG" "$NG.bak.clean_auth.$TS"
-
-echo "=== 2) Nettoyage auth_request + /_wolv_auth + anciens blocs API ==="
-python3 - <<'PY'
-from pathlib import Path
-import re
-
-ng = Path("/etc/nginx/sites-enabled/fireinners.online-ssl")
-s = ng.read_text()
-
-# remove any auth_request lines (anywhere)
-s = re.sub(r'^\s*auth_request\s+[^;]+;\s*\n', '', s, flags=re.M)
-
-# remove any /_wolv_auth location (even if injected badly; best-effort)
-s = re.sub(r'\n\s*location\s*=\s*/_wolv_auth\s*\{[\s\S]*?\n\s*\}\s*', '\n', s, flags=re.M)
-
-# remove any broken wolverine/traderone api locations so we reinsert clean ones
-for pat in [
-  r'\n\s*location\s*=\s*/wolverine/traderone/api/health\s*\{[\s\S]*?\n\s*\}\s*',
-  r'\n\s*location\s+\^~\s+/wolverine/traderone/api/\s*\{[\s\S]*?\n\s*\}\s*',
-]:
-  s = re.sub(pat, "\n", s, flags=re.M)
-
-block = r'''
-# --- WOLVERINE_API_FINAL ---
-
-# PUBLIC: /health (no key)
-location = /wolverine/traderone/api/health {
-  rewrite ^/wolverine/traderone/api/(.*)$ /api/$1 break;
-
-  proxy_pass http://127.0.0.1:3000;
-  proxy_http_version 1.1;
-  proxy_set_header Host $host;
-  proxy_set_header X-Real-IP $remote_addr;
-  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto $scheme;
-}
-
-# PROTECTED: everything else
-location ^~ /wolverine/traderone/api/ {
-  if ($http_x_api_key = "") { return 403; }
-
-  rewrite ^/wolverine/traderone/api/(.*)$ /api/$1 break;
-
-  proxy_pass http://127.0.0.1:3000;
-  proxy_http_version 1.1;
-  proxy_set_header Host $host;
-  proxy_set_header X-Real-IP $remote_addr;
-  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto $scheme;
-}
-'''
-
-idx = s.rfind("}")
-if idx == -1:
-  raise SystemExit("KO: pas trouvé de '}' final dans le conf nginx (server block incomplet)")
-s = s[:idx] + "\n" + block + "\n" + s[idx:]
-ng.write_text(s)
-print("OK: cleaned auth_request/_wolv_auth + inserted WOLVERINE_API_FINAL")
-PY
-
-echo "=== 3) nginx test + reload ==="
+echo "=== 5) Test + reload ==="
 nginx -t
 systemctl reload nginx
+echo "OK: nginx reloaded"
 
-echo "=== 4) Tests LOCAL avec bon SNI ==="
-curl -k -sS -i --resolve fireinners.online:443:127.0.0.1 https://fireinners.online/wolverine/traderone/api/health | head -n 12
+echo "=== 6) Re-test LOCAL avec SNI correct ==="
+curl -k -sS -i --resolve fireinners.online:443:127.0.0.1 https://fireinners.online/wolverine/ | head -n 8
 echo
-curl -k -sS -i --resolve fireinners.online:443:127.0.0.1 https://fireinners.online/wolverine/traderone/api/dexes  | head -n 8
+curl -k -sS -i --resolve fireinners.online:443:127.0.0.1 https://fireinners.online/wolverine/traderone/api/health | head -n 15
