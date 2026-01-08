@@ -1,55 +1,85 @@
 set -euo pipefail
 TS="$(date +%s)"
+DIS="/etc/nginx/sites-disabled"
+mkdir -p "$DIS"
 
-KEEP="/etc/nginx/sites-enabled/fireinners.online-ssl"
-NEW="/var/www/_wolverine_ui"
+echo "=== A) Être root ==="
+whoami
 
-echo "=== 1) Crée un dossier UI Wolverine séparé (sans toucher /var/www/fireinners ni /var/www/wolverine) ==="
-mkdir -p "$NEW"
-cat > "$NEW/index.html" <<'HTML'
+echo "=== B) Trouver TOUS les vhosts qui match fireinners.online ==="
+FILES="$(grep -RIl --include="*" -E 'server_name\s+.*(fireinners\.online|www\.fireinners\.online)' \
+  /etc/nginx/sites-enabled /etc/nginx/sites-available /etc/nginx/conf.d 2>/dev/null | sort -u || true)"
+echo "$FILES"
+
+echo "=== C) Garder UNIQUEMENT le vhost actif (celui dans sites-enabled) et désactiver le reste ==="
+KEEP="$(echo "$FILES" | grep -E '^/etc/nginx/sites-enabled/' | head -n 1 || true)"
+[ -n "$KEEP" ] || { echo "KO: aucun vhost fireinners.online dans sites-enabled"; exit 1; }
+echo "KEEP=$KEEP"
+
+while read -r f; do
+  [ -f "$f" ] || continue
+  if [ "$f" != "$KEEP" ]; then
+    echo "MOVE: $f -> $DIS/$(basename "$f").$TS"
+    mv "$f" "$DIS/$(basename "$f").$TS" || true
+  fi
+done <<< "$FILES"
+
+echo "=== D) Isoler /var/www/wolverine SANS toucher /var/www/fireinners ==="
+if [ -d /var/www/wolverine ]; then
+  mv /var/www/wolverine "/var/www/wolverine_BAD_$TS"
+fi
+mkdir -p /var/www/wolverine
+
+cat > /var/www/wolverine/index.html <<'HTML'
 <!doctype html><html><head><meta charset="utf-8"><title>WOLVERINE</title></head>
 <body style="background:#0b0f15;color:#e6edf6;font-family:system-ui;padding:24px">
-<h1>WOLVERINE UI (SAFE)</h1>
-<p>Si tu vois ça, nginx sert bien <code>/var/www/_wolverine_ui</code> pour <code>/wolverine/</code>.</p>
-<p>API health: <a href="/wolverine/traderone/api/health">/wolverine/traderone/api/health</a></p>
+<h1>WOLVERINE UI</h1>
+<p>OK: /wolverine sert bien /var/www/wolverine.</p>
+<p><a href="/wolverine/traderone/api/health">API health</a></p>
 </body></html>
 HTML
 
-echo "=== 2) Patch nginx: /wolverine => /var/www/_wolverine_ui (sans toucher /wolverine/traderone/api) ==="
-cp -a "$KEEP" "$KEEP.bak.safe_wolv.$TS"
+echo "=== E) Forcer nginx: /wolverine -> /var/www/wolverine (ne touche pas l'API) ==="
+cp -a "$KEEP" "$KEEP.bak.$TS"
 
 python3 - <<'PY'
 from pathlib import Path
 import re
+ng = Path(open("/tmp/keep_nginx","w").write("") or "")  # noop
+PY
 
-ng = Path("/etc/nginx/sites-enabled/fireinners.online-ssl")
-s = ng.read_text()
+python3 - <<PY
+from pathlib import Path
+import re
+keep = Path("$KEEP")
+s = keep.read_text()
 
-# retire anciens blocs UI /wolverine (sans toucher à /wolverine/traderone/api)
+# enlève blocs /wolverine UI existants (pas l'API)
 s = re.sub(r'\n\s*location\s*=\s*/wolverine\s*\{[\s\S]*?\n\s*\}\s*', '\n', s, flags=re.M)
 s = re.sub(r'\n\s*location\s+\^~\s+/wolverine/\s*\{[\s\S]*?\n\s*\}\s*', '\n', s, flags=re.M)
 
 block = r'''
-# --- WOLVERINE UI (SAFE DIR) ---
+# --- WOLVERINE UI ---
 location = /wolverine { return 301 /wolverine/; }
 location ^~ /wolverine/ {
   root /var/www;
-  try_files $uri $uri/ /_wolverine_ui/index.html;
+  index index.html;
+  try_files $uri $uri/ /wolverine/index.html;
 }
 '''
 i = s.rfind("}")
 if i == -1:
-  raise SystemExit("KO: nginx conf invalide")
+  raise SystemExit("KO: nginx conf invalide (pas de } final)")
 s = s[:i] + "\n" + block + "\n" + s[i:]
-ng.write_text(s)
-print("OK: bloc /wolverine SAFE injecté")
+keep.write_text(s)
+print("OK: bloc /wolverine injecté dans", keep)
 PY
 
 nginx -t
 systemctl reload nginx
 
-echo "=== 3) Preuves ==="
+echo "=== F) PREUVES ==="
 echo "--- title /wolverine/ ---"
 curl -LsS https://fireinners.online/wolverine/ | grep -i "<title>" | head -n 1 || true
-echo "--- api health ---"
+echo "--- API health ---"
 curl -sS -i https://fireinners.online/wolverine/traderone/api/health | head -n 12 || true
