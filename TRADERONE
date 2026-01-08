@@ -2,25 +2,19 @@ set -e
 cd /opt/traderone-opt
 
 echo "=== 0) Backup ==="
-cp -a server.js "server.js.bak.dedup_then_dexes.$(date +%s)"
+cp -a server.js "server.js.bak.fix_dexes_chainbreak.$(date +%s)"
 
-echo "=== 1) Dedup const path/fs (keep first only) ==="
-awk '
-  BEGIN{seen_path=0; seen_fs=0}
-  {
-    if ($0 ~ /^const[[:space:]]+path[[:space:]]*=[[:space:]]*require\((\"|\x27)path(\"|\x27)\);[[:space:]]*$/) {
-      if (seen_path==1) next; seen_path=1
-    }
-    if ($0 ~ /^const[[:space:]]+fs[[:space:]]*=[[:space:]]*require\((\"|\x27)fs(\"|\x27)\);[[:space:]]*$/) {
-      if (seen_fs==1) next; seen_fs=1
-    }
-    print
-  }
-' server.js > server.js.tmp && mv server.js.tmp server.js
+echo "=== 1) Remove the bad injected block (FORCED_DEXES_ROUTE_V3) ==="
+node <<'NODE'
+const fs = require("fs");
+const p = "/opt/traderone-opt/server.js";
+let s = fs.readFileSync(p,"utf8");
 
-echo "Occurrences now:"
-grep -nE '^const (path|fs) *= *require' server.js || true
-echo
+// remove V3 block if present
+s = s.replace(/\/\/ === FORCED_DEXES_ROUTE_V3 ===[\s\S]*?\n\}\);\n\n/g, "");
+fs.writeFileSync(p, s);
+console.log("OK: removed FORCED_DEXES_ROUTE_V3 if it existed");
+NODE
 
 echo "=== 2) Ensure allowlist file ==="
 mkdir -p config
@@ -31,28 +25,31 @@ test -f config/dex_allowlist.json || cat > config/dex_allowlist.json <<'JSON'
 ]
 JSON
 
-echo "=== 3) Insert forced /api/dexes BEFORE first .listen( (no extra requires) ==="
+echo "=== 3) Insert SAFE /api/dexes after app.use(express.json()); ==="
 node <<'NODE'
 const fs = require("fs");
 const p = "/opt/traderone-opt/server.js";
 let s = fs.readFileSync(p,"utf8");
 
-if (!s.match(/^const\s+path\s*=\s*require\(["']path["']\);/m)) {
-  throw new Error("Missing `const path = require('path');` in server.js (after dedup) — add it once at top then rerun.");
+function hasLine(re){ return re.test(s); }
+
+// ensure fs/path requires exist once
+if(!hasLine(/^const\s+path\s*=\s*require\(["']path["']\);\s*$/m)){
+  s = `const path = require("path");\n` + s;
 }
-if (!s.match(/^const\s+fs\s*=\s*require\(["']fs["']\);/m)) {
-  // si fs n'existe pas mais que tu utilises déjà fs ailleurs, ajoute-le une fois.
-  // Ici on n'injecte pas automatiquement pour éviter les doublons.
-  console.warn("WARN: missing `const fs = require('fs');` — route /api/dexes l'utilise. Ajoute-le 1 fois si nécessaire.");
+if(!hasLine(/^const\s+fs\s*=\s*require\(["']fs["']\);\s*$/m)){
+  s = `const fs = require("fs");\n` + s;
 }
 
-if (!s.includes("FORCED_DEXES_ROUTE_V3")) {
-  const m = s.match(/\.\s*listen\s*\(/);
-  if(!m) throw new Error("No .listen( found in server.js");
-  const idx = s.indexOf(m[0]);
+// insert route at safe anchor
+if(!s.includes('app.get("/api/dexes"')) && !s.includes("app.get('/api/dexes'")){
+  const anchor = "app.use(express.json());";
+  const i = s.indexOf(anchor);
+  if(i === -1) throw new Error("Anchor not found: app.use(express.json());");
 
-  const snippet = `
-// === FORCED_DEXES_ROUTE_V3 ===
+  const insert = `
+${anchor}
+
 app.get("/api/dexes", (req,res)=>{
   try{
     const raw = fs.readFileSync(path.join(__dirname,"config","dex_allowlist.json"),"utf8");
@@ -63,18 +60,21 @@ app.get("/api/dexes", (req,res)=>{
     return res.status(200).json({ ok:true, dexes: [], warn: String(e && e.message || e) });
   }
 });
-
 `;
-  s = s.slice(0, idx) + snippet + s.slice(idx);
-  fs.writeFileSync(p, s);
-  console.log("OK: inserted FORCED_DEXES_ROUTE_V3");
-} else {
-  console.log("OK: already has FORCED_DEXES_ROUTE_V3");
+  s = s.slice(0,i) + insert + s.slice(i + anchor.length);
 }
+
+fs.writeFileSync(p, s);
+console.log("OK: /api/dexes inserted safely");
 NODE
 
-echo "=== 4) Restart + test ==="
+echo "=== 4) Syntax check + restart ==="
 node --check server.js
+pm2 resurrect || true
 pm2 restart traderone --update-env || pm2 restart 0 --update-env
 sleep 1
+
+echo "=== 5) Test ==="
+curl -sS -i http://127.0.0.1:3000/health | head -n 12 || true
+echo
 curl -sS http://127.0.0.1:3000/api/dexes | head -c 400; echo
