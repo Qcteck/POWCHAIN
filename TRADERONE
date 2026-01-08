@@ -1,23 +1,36 @@
-# ROOT batch — vérifie UI (/wolverine) + assets + API proxy (/wolverine/traderone/api)
 set -euo pipefail
+NG="/etc/nginx/sites-enabled/fireinners.online-ssl"
+cp -a "$NG" "$NG.bak.health_public.$(date +%s)"
 
-echo "=== 1) UI (doit 200) ==="
-curl -sS -I https://fireinners.online/wolverine/ | head -n 20
-echo
+python3 - <<'PY'
+from pathlib import Path
+import re
+ng = Path("/etc/nginx/sites-enabled/fireinners.online-ssl")
+s = ng.read_text()
 
-echo "=== 2) Assets statiques (doit 200) ==="
-curl -sS -I https://fireinners.online/wolverine/index.html | head -n 20
-curl -sS -I https://fireinners.online/wolverine/vendor/solana-web3.min.js | head -n 20
-curl -sS -I https://fireinners.online/wolverine/app.js | head -n 20
-echo
+# Dans le bloc: location ^~ /wolverine/traderone/api/ { ... }
+# On remplace le check "if ($http_x_api_key = '') { return 403; }"
+# par un check qui bypass /health uniquement.
+pattern = r'(location\s+\^~\s+/wolverine/traderone/api/\s*\{[\s\S]*?)(\n\s*if\s*\(\s*\$http_x_api_key\s*=\s*""\s*\)\s*\{\s*return\s+403;\s*\}\s*)([\s\S]*?\n\s*\})'
+m = re.search(pattern, s, flags=re.M)
+if not m:
+    raise SystemExit("KO: bloc API ou check X-API-KEY introuvable (rien modifié).")
 
-echo "=== 3) API proxy (sans clé = 403 attendu) ==="
-curl -sS -i https://fireinners.online/wolverine/traderone/api/health | head -n 25
-echo
+replacement = m.group(1) + r'''
+  # clé UNIQUEMENT sauf /health
+  if ($request_uri !~ "^/wolverine/traderone/api/health$") {
+    if ($http_x_api_key = "") { return 403; }
+  }
+''' + m.group(3)
 
-echo "=== 4) API proxy (avec clé = 200 attendu) ==="
-KEY="TA_CLE_ICI"
-curl -sS -i https://fireinners.online/wolverine/traderone/api/dexes -H "X-API-KEY: $KEY" | head -n 40
-echo
+s2 = re.sub(pattern, replacement, s, flags=re.M)
+ng.write_text(s2)
+print("OK: /health public, reste protégé")
+PY
 
-echo "=== DONE ==="
+nginx -t
+systemctl reload nginx
+
+echo "=== TESTS ==="
+curl -sS -i https://fireinners.online/wolverine/traderone/api/health | head -n 15
+curl -sS -i https://fireinners.online/wolverine/traderone/api/dexes  | head -n 10
