@@ -1,2 +1,68 @@
-nginx -T 2>/dev/null | grep -nE 'server_name|location\s+\^~\s+/wolverine/|root\s+/var/www' | head -n 120
-ls -lah /var/www/wolverine | head -n 30
+set -euo pipefail
+
+APP="/opt/fireinners/frontend-react/app"
+DIST="/var/www/wolverine"
+KEEP="/etc/nginx/sites-enabled/fireinners.online-ssl"
+DISABLED="/etc/nginx/sites-disabled"
+TS="$(date +%s)"
+
+echo "=== A1) Trouver tous les fichiers nginx qui contiennent /wolverine ==="
+mkdir -p "$DISABLED"
+mapfile -t FILES < <(grep -RIl --line-number -E 'location\s+\^~\s+/wolverine/|location\s+\^~\s+/wolverine/traderone/api/' \
+  /etc/nginx/sites-enabled /etc/nginx/conf.d /etc/nginx/sites-available 2>/dev/null | sort -u)
+
+printf "%s\n" "${FILES[@]}" | sed 's/^/FOUND: /' || true
+echo
+
+echo "=== A2) Désactiver tous les doublons SAUF $KEEP ==="
+for f in "${FILES[@]}"; do
+  [ -f "$f" ] || continue
+  if [ "$f" != "$KEEP" ]; then
+    base="$(basename "$f")"
+    echo "MOVE DUP: $f -> $DISABLED/$base.$TS"
+    mv "$f" "$DISABLED/$base.$TS"
+  else
+    echo "KEEP: $f"
+  fi
+done
+
+echo
+echo "=== A3) nginx -t (doit être OK) ==="
+nginx -t
+
+echo
+echo "=== B1) Rebuild le VRAI frontend (dans $APP) ==="
+cd "$APP"
+
+cat > .env.production <<'EOF'
+VITE_BASE=/wolverine/
+VITE_API_BASE=/wolverine/traderone/api
+EOF
+
+# Fix npm ci qui bug (lockfile parfois foireux)
+npm install
+npm run build
+
+echo
+echo "=== B2) Redeploy dist -> $DIST (force overwrite) ==="
+apt-get update -y >/dev/null
+apt-get install -y rsync >/dev/null
+
+mkdir -p "$DIST"
+rsync -a --delete "$APP/dist/" "$DIST/"
+
+chmod -R 755 /var/www
+find "$DIST" -type f -exec chmod 644 {} \;
+
+echo
+echo "=== B3) Reload nginx ==="
+systemctl reload nginx
+
+echo
+echo "=== TESTS ==="
+echo "--- UI ---"
+curl -sS -I https://fireinners.online/wolverine/ | head -n 12
+echo "--- API health ---"
+curl -sS -i https://fireinners.online/wolverine/traderone/api/health | head -n 12
+echo
+echo "OK ✅"
