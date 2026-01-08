@@ -1,24 +1,49 @@
 set -e
 cd /opt/traderone-opt
 
+echo "=== 0) Backup ==="
+ts="$(date +%Y%m%d_%H%M%S)"
+mkdir -p /root/traderone_backups
+cp -v server.js "/root/traderone_backups/server.js.$ts.bak"
+
 echo "=== 1) Vérif .env contient LIFI_API_KEY (sans l'afficher) ==="
-grep -q '^LIFI_API_KEY=' .env && echo "OK: LIFI_API_KEY présent dans .env" || echo "KO: manque LIFI_API_KEY dans .env"
-echo "len="; (grep '^LIFI_API_KEY=' .env | head -n1 | cut -d= -f2- | tr -d '\r\n' | wc -c) || true
-echo
+grep -q '^LIFI_API_KEY=' .env && echo "OK: LIFI_API_KEY présent" || { echo "KO: LIFI_API_KEY manquant"; exit 1; }
 
 echo "=== 2) Installer dotenv si absent ==="
-node -e 'require("dotenv"); console.log("dotenv: ok")' 2>/dev/null || npm i dotenv
-echo
+node -e 'require("dotenv"); console.log("dotenv ok")' 2>/dev/null || npm i dotenv
 
-echo "=== 3) Injecter require(\"dotenv\").config() en haut de server.js (si absent) ==="
-grep -q 'dotenv' server.js || perl -0777 -i -pe 's/^(const express = require\(["\x27]express["\x27]\);\n)/$1const dotenv = require("dotenv");\ndotenv.config({ path: __dirname + "\\/\\.env" });\n\n/m' server.js
+echo "=== 3) Injecter dotenv.config() en haut de server.js (si absent) ==="
+if grep -q 'dotenv\.config' server.js; then
+  echo "OK: dotenv déjà présent dans server.js"
+else
+  awk '
+    BEGIN{done=0}
+    {
+      print
+      if(!done && $0 ~ /const express = require\((["\x27])express\1\);/){
+        print "const dotenv = require(\"dotenv\");"
+        print "dotenv.config({ path: __dirname + \"/.env\" });"
+        print ""
+        done=1
+      }
+    }
+    END{
+      if(!done){
+        print "ERROR: ligne \"const express = require(\\\"express\\\");\" introuvable" > "/dev/stderr"
+        exit 2
+      }
+    }
+  ' server.js > /tmp/server.js && mv /tmp/server.js server.js
+  echo "OK: dotenv injecté"
+fi
 
 echo "=== 4) Restart pm2 ==="
 pm2 restart traderone --update-env || pm2 restart all --update-env
 sleep 1
+pm2 status
 
-echo "=== 5) Test local (doit PLUS dire LIFI_API_KEY missing) ==="
+echo "=== 5) Test local swap (doit plus dire LIFI_API_KEY missing) ==="
 curl -sS -i -X POST "http://127.0.0.1:3000/api/swap" \
   -H "content-type: application/json" \
   --data '{"provider":"lifi","fromChain":101,"toChain":101,"fromToken":"So11111111111111111111111111111111111111112","toToken":"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v","fromAmount":"1000000","fromAddress":"11111111111111111111111111111111","slippage":0.5}' \
-  | head -n 40
+  | head -n 60
