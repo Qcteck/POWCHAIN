@@ -1,16 +1,62 @@
-# ROOT batch — test /dexes en “contournant” (ton nginx check seulement la présence du header)
 set -euo pipefail
 
-echo "=== PROD via Cloudflare (doit passer si header présent) ==="
-curl -sS -i https://fireinners.online/wolverine/traderone/api/dexes \
-  -H "X-API-KEY: test" | head -n 60
-echo
+NG="/etc/nginx/sites-enabled/fireinners.online-ssl"
+cp -a "$NG" "$NG.bak.lock_key.$(date +%s)"
 
-echo "=== ORIGIN local (bypass CF) avec bon SNI ==="
-curl -k -sS -i --resolve fireinners.online:443:127.0.0.1 \
-  https://fireinners.online/wolverine/traderone/api/dexes \
-  -H "X-API-KEY: test" | head -n 60
-echo
+echo "=== 1) Trouver la clé (PM2 env d'abord, sinon .env) ==="
+KEY="$(pm2 env 0 2>/dev/null | awk -F= '/^(X_API_KEY|API_KEY|TRADERONE_API_KEY)=/{print $2}' | tail -n1 | tr -d "\"'" || true)"
 
-echo "=== HEALTH (public) ==="
-curl -sS -i https://fireinners.online/wolverine/traderone/api/health | head -n 30
+if [ -z "${KEY:-}" ]; then
+  # ajuste ce chemin si ton .env est ailleurs
+  for f in /opt/traderone-opt/.env /opt/fireinners/.env /opt/*/.env; do
+    [ -f "$f" ] || continue
+    k="$(awk -F= '/^(X_API_KEY|API_KEY|TRADERONE_API_KEY)=/{print $2}' "$f" | tail -n1 | tr -d "\"'" || true)"
+    if [ -n "${k:-}" ]; then KEY="$k"; break; fi
+  done
+fi
+
+[ -n "${KEY:-}" ] || { echo "KO: clé introuvable (donne juste le NOM exact de la variable)"; exit 1; }
+echo "OK: KEY found (not printed)"
+
+echo "=== 2) Patcher nginx: /health public, le reste check valeur exacte ==="
+python3 - <<'PY'
+from pathlib import Path
+import re
+
+ng = Path("/etc/nginx/sites-enabled/fireinners.online-ssl")
+s = ng.read_text()
+
+# charge la clé depuis l'environnement (injectée via bash)
+import os
+KEY = os.environ["KEY"]
+
+# remplace le check "vide" par "valeur exacte"
+# (dans le bloc: location ^~ /wolverine/traderone/api/)
+pattern = r'if\s*\(\s*\$http_x_api_key\s*=\s*""\s*\)\s*\{\s*return\s+403;\s*\}'
+repl = f'if ($http_x_api_key != "{KEY}") {{ return 403; }}'
+
+if re.search(pattern, s):
+    s2 = re.sub(pattern, repl, s)
+else:
+    # fallback: si déjà un check existe, on le remplace aussi
+    s2 = re.sub(r'if\s*\(\s*\$http_x_api_key\s*!=\s*"[^"]*"\s*\)\s*\{\s*return\s+403;\s*\}', repl, s)
+    if s2 == s:
+        raise SystemExit("KO: check X-API-KEY introuvable dans le bloc /wolverine/traderone/api/")
+
+ng.write_text(s2)
+print("OK: nginx key check locked to exact value")
+PY
+
+nginx -t
+systemctl reload nginx
+echo "OK: reloaded"
+
+echo "=== 3) Tests ==="
+echo "--- /health (public) ---"
+curl -sS -i https://fireinners.online/wolverine/traderone/api/health | head -n 12
+echo
+echo "--- /dexes (mauvaise clé -> 403) ---"
+curl -sS -i https://fireinners.online/wolverine/traderone/api/dexes -H "X-API-KEY: test" | head -n 12
+echo
+echo "--- /dexes (bonne clé -> 200) ---"
+curl -sS -i https://fireinners.online/wolverine/traderone/api/dexes -H "X-API-KEY: $KEY" | head -n 12
