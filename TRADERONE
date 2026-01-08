@@ -1,4 +1,4 @@
-# ROOT — AUTO-FIND app dir (NO SIGPIPE) + CLEAN INSTALL + BUILD + DEPLOY
+# ROOT — FIND REAL NEXT APP (ignore node_modules) + BUILD + DEPLOY
 set -euo pipefail
 
 BASE="/opt/fireinners/WOLVERINE"
@@ -8,63 +8,67 @@ echo "=== 0) Precheck ==="
 [ -d "$BASE" ] || { echo "ERROR: missing $BASE"; exit 1; }
 mkdir -p "$DIST"
 
-echo "=== 1) Find APP_DIR (package.json with scripts.build) ==="
+echo "=== 1) Find REAL APP_DIR (exclude node_modules, require Next app) ==="
 APP_DIR=""
 
-# loop safely (no head/xargs pipes)
 while IFS= read -r -d '' pj; do
-  # does this package.json have scripts.build ?
+  d="$(dirname "$pj")"
+
+  # skip dependencies folders
+  case "$d" in
+    *"/node_modules/"*|*"/.git/"*|*"/out/"*|*"/.next/"*) continue;;
+  esac
+
+  # must look like a Next app (pages/ or app/ or next.config.js)
+  if [ ! -d "$d/pages" ] && [ ! -d "$d/app" ] && [ ! -f "$d/next.config.js" ]; then
+    continue
+  fi
+
+  # must have scripts.build that looks like next build/export
   if node -e '
     const p=require(process.argv[1]);
-    process.exit(p && p.scripts && typeof p.scripts.build==="string" && p.scripts.build.length ? 0 : 1);
+    const b=p?.scripts?.build || "";
+    process.exit(
+      typeof b==="string" &&
+      (b.includes("next ") || b.includes("next-build") || b.includes("next build") || b.includes("next export"))
+      ? 0 : 1
+    );
   ' "$pj" >/dev/null 2>&1; then
-    APP_DIR="$(dirname "$pj")"
+    APP_DIR="$d"
     break
   fi
-done < <(find "$BASE" -maxdepth 6 -type f -name package.json -print0)
+done < <(find "$BASE" -maxdepth 7 -type f -name package.json -print0)
 
 if [ -z "$APP_DIR" ]; then
-  echo "ERROR: No package.json with scripts.build found under $BASE"
-  echo "Candidates:"
-  find "$BASE" -maxdepth 6 -type f -name package.json
+  echo "ERROR: Could not find a Next app under $BASE"
+  echo "Candidates (package.json excluding node_modules):"
+  find "$BASE" -maxdepth 7 -type f -name package.json ! -path "*/node_modules/*"
   exit 1
 fi
 
 echo "APP_DIR = $APP_DIR"
 
-echo "=== 2) Enter app dir ==="
+echo "=== 2) Install + build (in real app dir) ==="
 cd "$APP_DIR"
 pwd
 ls -lah package.json
 
-echo "=== 3) Fix bad dependency specs (empty/non-string) ==="
-node - <<'NODE'
-const fs=require("fs");
-const p=JSON.parse(fs.readFileSync("package.json","utf8"));
-let changed=false;
-for (const k of ["dependencies","devDependencies","optionalDependencies","peerDependencies"]) {
-  const o=p[k]; if(!o) continue;
-  for (const [name,val] of Object.entries(o)) {
-    if (typeof val!=="string" || val.trim()==="") { delete o[name]; changed=true; console.log("REMOVE",k,name,val); }
-  }
-}
-if(changed) fs.writeFileSync("package.json", JSON.stringify(p,null,2)+"\n");
-console.log(changed ? "package.json fixed ✅" : "package.json OK ✅");
-NODE
-
-echo "=== 4) Clean install ==="
 rm -rf node_modules package-lock.json .next out || true
 npm cache clean --force || true
 npm install --legacy-peer-deps
-
-echo "=== 5) Build ==="
 npm run build
-[ -d out ] || { echo "ERROR: out/ missing after build"; exit 1; }
 
-echo "=== 6) Deploy ==="
+# require out/ for static deploy
+if [ ! -d out ]; then
+  echo "ERROR: out/ missing. Your build does not export static output."
+  echo "If this is Next static, you need 'next export' or output: export in next.config.js."
+  exit 1
+fi
+
+echo "=== 3) Deploy ==="
 rsync -a --delete out/ "$DIST/"
 
-echo "=== 7) Reload nginx ==="
+echo "=== 4) Reload nginx ==="
 nginx -t
 systemctl reload nginx
 
