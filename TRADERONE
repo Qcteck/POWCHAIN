@@ -1,16 +1,5 @@
-# ROOT BATCH — trouver automatiquement le bon dossier UI (avec scripts.build),
-# le build, et le déployer dans /var/www/wolverine
-
 set -euo pipefail
-TS="$(date +%s)"
-DIST="/var/www/wolverine"
-BACK="/var/www/wolverine_backup_$TS"
 
-echo "=== 0) Backup /var/www/wolverine ==="
-[ -d "$DIST" ] && mv "$DIST" "$BACK" || true
-mkdir -p "$DIST"
-
-echo "=== 1) Trouver un projet UI buildable dans /opt (package.json + scripts.build) ==="
 APP="$(python3 - <<'PY'
 import os, json
 hits=[]
@@ -20,74 +9,75 @@ for root in ["/opt"]:
       continue
     if "package.json" in fn:
       p=os.path.join(dp,"package.json")
-      try:
-        j=json.load(open(p,"r",encoding="utf-8"))
-      except Exception:
-        continue
+      try: j=json.load(open(p,"r",encoding="utf-8"))
+      except: continue
       scripts=j.get("scripts") or {}
       if "build" in scripts:
         name=(j.get("name") or "").lower()
-        # évite les backends
-        if any(x in name for x in ["backend","server","api"]):
+        if any(x in name for x in ["backend","server","api"]): 
           continue
-        d=dp.lower()
-        score=0
-        for k in ["wolverine","trader","traderone","front","ui","web","app"]:
-          if k in d: score += 3
-        hits.append((score, dp, j.get("name",""), scripts.get("build","")))
-hits.sort(reverse=True)  # meilleur score en premier
-if not hits:
-  print("")
-else:
-  print(hits[0][1])
+        hits.append(dp)
+print(hits[0] if hits else "")
 PY
 )"
 
-if [ -z "${APP:-}" ]; then
-  echo "KO: aucun projet UI avec script build trouvé dans /opt."
-  echo "Montre-moi ça:"
-  echo "find /opt -maxdepth 5 -name package.json -not -path '*/node_modules/*' | head -n 120"
-  exit 1
-fi
+DIST="/var/www/wolverine"
+TS="$(date +%s)"
 
-echo "OK: APP=$APP"
-echo "--- package.json (name + build) ---"
-python3 - <<PY
-import json, pathlib
-p=pathlib.Path("$APP")/"package.json"
-j=json.load(open(p,"r",encoding="utf-8"))
-print("name:", j.get("name"))
-print("build:", (j.get("scripts") or {}).get("build"))
-PY
+echo "=== 1) TEST ASSETS actuels (200 vs 404) ==="
+HTML="$(curl -LsS https://fireinners.online/wolverine/ || true)"
+echo "$HTML" | grep -i "<title>" | head -n 1 || true
+echo "$HTML" | grep -Eo '(src|href)="[^"]+"' | head -n 20
 
-echo "=== 2) Installer Node + rsync ==="
-apt-get update -y >/dev/null
-apt-get install -y rsync curl >/dev/null
-if ! command -v node >/dev/null 2>&1; then
-  curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null
-  apt-get install -y nodejs >/dev/null
-fi
+echo
+echo "Codes HTTP des 12 premiers assets:"
+echo "$HTML" | grep -Eo '(src|href)="[^"]+"' | cut -d'"' -f2 | head -n 12 | while read -r u; do
+  # si u est relatif, on le rend absolu
+  if echo "$u" | grep -qE '^https?://'; then URL="$u"
+  else URL="https://fireinners.online${u#/}"
+  fi
+  code=$(curl -sS -o /dev/null -w "%{http_code}" "$URL" || true)
+  echo "$code  $u"
+done
 
-echo "=== 3) Build (avec API /wolverine/traderone/api) ==="
+echo
+echo "=== 2) REBUILD avec base /wolverine/ (Vite) ==="
+[ -n "$APP" ] || { echo "KO: pas trouvé de projet UI buildable dans /opt"; exit 1; }
+echo "APP=$APP"
+
 cd "$APP"
+
+# Force base Vite (/wolverine/) sans casser le reste
+# (si tu as vite.config.* avec export default, on remplace/ajoute base)
+if [ -f vite.config.js ] || [ -f vite.config.mjs ] || [ -f vite.config.ts ]; then
+  for f in vite.config.js vite.config.mjs vite.config.ts; do
+    [ -f "$f" ] || continue
+    if grep -q "base:" "$f"; then
+      sed -i "s/base:\s*['\"][^'\"]*['\"]/base: '\/wolverine\/'/g" "$f"
+    else
+      # injecte base dans l'export default { ... }
+      sed -i "s/export default {/export default { base: '\/wolverine\/', /" "$f" || true
+    fi
+  done
+fi
+
 cat > .env.production <<'EOF'
 VITE_API_BASE=/wolverine/traderone/api
 EOF
 
-# si conflit deps (ERESOLVE), on force legacy
 npm install --legacy-peer-deps
 npm run build
 
 OUT=""
 for d in dist build out; do [ -d "$APP/$d" ] && OUT="$APP/$d" && break; done
-[ -n "$OUT" ] || { echo "KO: pas de dist/build/out après build"; exit 1; }
+[ -n "$OUT" ] || { echo "KO: pas de dist/build/out"; exit 1; }
 
-echo "=== 4) Deploy -> /var/www/wolverine ==="
+echo "=== 3) DEPLOY ==="
+mkdir -p "$DIST"
 rsync -a --delete "$OUT/" "$DIST/"
 
-echo "=== 5) Test ==="
-echo "--- TITLE ---"
-curl -LsS https://fireinners.online/wolverine/ | grep -i "<title>" | head -n 1 || true
-echo "--- API health ---"
-curl -sS -i https://fireinners.online/wolverine/traderone/api/health | head -n 12 || true
-echo "DONE ✅"
+echo "=== 4) RETEST ==="
+HTML2="$(curl -LsS https://fireinners.online/wolverine/ || true)"
+echo "$HTML2" | grep -i "<title>" | head -n 1 || true
+echo "First assets:"
+echo "$HTML2" | grep -Eo '(src|href)="[^"]+"' | head -n 10
