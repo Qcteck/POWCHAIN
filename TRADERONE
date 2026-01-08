@@ -1,54 +1,58 @@
-# ROOT — FIND REAL NEXT APP (ignore node_modules) + BUILD + DEPLOY
+# ROOT — FIND REAL NEXT UI ANYWHERE + BUILD + DEPLOY
 set -euo pipefail
 
-BASE="/opt/fireinners/WOLVERINE"
 DIST="/var/www/wolverine"
-
-echo "=== 0) Precheck ==="
-[ -d "$BASE" ] || { echo "ERROR: missing $BASE"; exit 1; }
 mkdir -p "$DIST"
 
-echo "=== 1) Find REAL APP_DIR (exclude node_modules, require Next app) ==="
+echo "=== 0) Searching for REAL Next.js app (excluding node_modules) ==="
+SEARCH_ROOTS=(/opt /var/www /srv /home)
+
 APP_DIR=""
 
-while IFS= read -r -d '' pj; do
-  d="$(dirname "$pj")"
+is_next_app () {
+  local d="$1"
+  # must have package.json
+  [ -f "$d/package.json" ] || return 1
+  # must have next markers
+  [ -d "$d/pages" ] || [ -d "$d/app" ] || [ -f "$d/next.config.js" ] || return 1
+  # must have next in deps OR scripts build mentioning next
+  node - <<'NODE' "$d/package.json" >/dev/null 2>&1
+const p=require(process.argv[1]);
+const deps=Object.assign({}, p.dependencies||{}, p.devDependencies||{});
+const hasNext=typeof deps.next==="string";
+const b=(p.scripts && p.scripts.build) ? String(p.scripts.build) : "";
+process.exit( (hasNext || b.includes("next")) ? 0 : 1 );
+NODE
+}
 
-  # skip dependencies folders
-  case "$d" in
-    *"/node_modules/"*|*"/.git/"*|*"/out/"*|*"/.next/"*) continue;;
-  esac
-
-  # must look like a Next app (pages/ or app/ or next.config.js)
-  if [ ! -d "$d/pages" ] && [ ! -d "$d/app" ] && [ ! -f "$d/next.config.js" ]; then
-    continue
-  fi
-
-  # must have scripts.build that looks like next build/export
-  if node -e '
-    const p=require(process.argv[1]);
-    const b=p?.scripts?.build || "";
-    process.exit(
-      typeof b==="string" &&
-      (b.includes("next ") || b.includes("next-build") || b.includes("next build") || b.includes("next export"))
-      ? 0 : 1
-    );
-  ' "$pj" >/dev/null 2>&1; then
-    APP_DIR="$d"
-    break
-  fi
-done < <(find "$BASE" -maxdepth 7 -type f -name package.json -print0)
+for root in "${SEARCH_ROOTS[@]}"; do
+  [ -d "$root" ] || continue
+  while IFS= read -r -d '' pj; do
+    d="$(dirname "$pj")"
+    case "$d" in
+      *"/node_modules/"*|*"/.git/"*|*"/out/"*|*"/.next/"*|*"/_ARCHIVE_"*) continue;;
+    esac
+    if is_next_app "$d"; then
+      APP_DIR="$d"
+      break 2
+    fi
+  done < <(find "$root" -maxdepth 8 -type f -name package.json -print0 2>/dev/null)
+done
 
 if [ -z "$APP_DIR" ]; then
-  echo "ERROR: Could not find a Next app under $BASE"
-  echo "Candidates (package.json excluding node_modules):"
-  find "$BASE" -maxdepth 7 -type f -name package.json ! -path "*/node_modules/*"
+  echo "❌ No Next.js app found on server."
+  echo "Here are package.json candidates (excluding node_modules):"
+  for root in "${SEARCH_ROOTS[@]}"; do
+    find "$root" -maxdepth 6 -type f -name package.json ! -path "*/node_modules/*" 2>/dev/null
+  done
   exit 1
 fi
 
+echo "✅ FOUND UI NEXT APP:"
 echo "APP_DIR = $APP_DIR"
+echo
 
-echo "=== 2) Install + build (in real app dir) ==="
+echo "=== 1) Build UI ==="
 cd "$APP_DIR"
 pwd
 ls -lah package.json
@@ -58,18 +62,17 @@ npm cache clean --force || true
 npm install --legacy-peer-deps
 npm run build
 
-# require out/ for static deploy
 if [ ! -d out ]; then
-  echo "ERROR: out/ missing. Your build does not export static output."
-  echo "If this is Next static, you need 'next export' or output: export in next.config.js."
+  echo "❌ out/ missing after build."
+  echo "Your project is not exporting static. If you need static deploy: add next export OR output: 'export' in next.config.js."
   exit 1
 fi
 
-echo "=== 3) Deploy ==="
+echo "=== 2) Deploy ==="
 rsync -a --delete out/ "$DIST/"
 
-echo "=== 4) Reload nginx ==="
+echo "=== 3) Reload nginx ==="
 nginx -t
 systemctl reload nginx
 
-echo "DONE ✅ -> refresh https://fireinners.online/wolverine/"
+echo "DONE ✅  -> refresh https://fireinners.online/wolverine/"
