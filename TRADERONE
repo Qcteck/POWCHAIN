@@ -1,59 +1,77 @@
-# ROOT batch — trouver où est le vrai frontend (script build), build, deploy, reload nginx
+# ROOT batch — detect frontend type (Vite/Node vs statique), deploy sous /wolverine
 set -euo pipefail
 
 REPO="/opt/fireinners/WOLVERINE"
 DIST="/var/www/wolverine"
 NG="/etc/nginx/sites-enabled/fireinners.online-ssl"
 
-echo "=== 0) Sanity ==="
 cd "$REPO"
-ls -lah | head
+echo "=== REPO ==="
+pwd
+ls -lah
 
-echo "=== 1) Trouver un package.json qui a un script 'build' (hors node_modules) ==="
-CANDIDATE_PKG="$(find "$REPO" -type f -name package.json \
+echo
+echo "=== 1) Cherche un package.json avec script build ==="
+PKG="$(find "$REPO" -type f -name package.json \
   -not -path "*/node_modules/*" \
-  -exec sh -c 'grep -q "\"build\"" "$1" && echo "$1"' sh {} \; \
-  | head -n 1)"
+  -exec sh -c 'grep -q "\"scripts\"" "$1" && grep -q "\"build\"" "$1" && echo "$1"' sh {} \; \
+  | head -n 1 || true)"
 
-if [ -z "${CANDIDATE_PKG:-}" ]; then
-  echo "KO: aucun package.json avec script build trouvé dans $REPO"
-  echo "INFO: scripts du package.json racine:"
-  (cat "$REPO/package.json" | sed -n '1,140p') || true
-  exit 1
-fi
+if [ -n "${PKG:-}" ]; then
+  APP_DIR="$(dirname "$PKG")"
+  echo "OK: frontend Node détecté -> $APP_DIR"
 
-APP_DIR="$(dirname "$CANDIDATE_PKG")"
-echo "OK: build trouvé dans: $APP_DIR"
+  # Node install si besoin
+  if ! command -v node >/dev/null 2>&1; then
+    apt-get update -y
+    apt-get install -y curl
+    curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+    apt-get install -y nodejs
+  fi
+  apt-get update -y
+  apt-get install -y rsync git
 
-echo "=== 2) Build (Node déjà OK) ==="
-cd "$APP_DIR"
+  cd "$APP_DIR"
 
-# Vite env (OK même si ignoré par un autre tooling)
-cat > .env.production <<'EOF'
+  # env Vite (si ignoré, pas grave)
+  cat > .env.production <<'EOF'
 VITE_BASE=/wolverine/
 VITE_API_BASE=/wolverine/traderone/api
 EOF
 
-npm ci
-npm run build
+  npm ci
+  npm run build
 
-echo "=== 3) Détecter le dossier de sortie (dist/build/out) ==="
-OUT=""
-for d in dist build out; do
-  if [ -d "$APP_DIR/$d" ]; then OUT="$APP_DIR/$d"; break; fi
-done
-[ -n "$OUT" ] || { echo "KO: aucun dossier dist/build/out trouvé après build"; exit 1; }
-echo "OK: output=$OUT"
+  OUT=""
+  for d in dist build out; do
+    [ -d "$APP_DIR/$d" ] && OUT="$APP_DIR/$d" && break
+  done
+  [ -n "$OUT" ] || { echo "KO: build OK mais aucun dist/build/out trouvé"; exit 1; }
 
-echo "=== 4) Deploy vers /var/www/wolverine ==="
-apt-get update -y >/dev/null
-apt-get install -y rsync >/dev/null
-mkdir -p "$DIST"
-rsync -a --delete "$OUT/" "$DIST/"
+  echo "Deploy output => $DIST"
+  mkdir -p "$DIST"
+  rsync -a --delete "$OUT/" "$DIST/"
+
+else
+  echo "INFO: aucun frontend Node détecté. On déploie en STATIQUE."
+
+  # Statique: on cherche index.html
+  HTML_DIR="$(find "$REPO" -maxdepth 4 -type f -name index.html -print | head -n 1 | xargs -r dirname || true)"
+  [ -n "${HTML_DIR:-}" ] || { echo "KO: aucun index.html trouvé dans $REPO"; exit 1; }
+
+  echo "OK: frontend statique détecté -> $HTML_DIR"
+  apt-get update -y
+  apt-get install -y rsync
+
+  mkdir -p "$DIST"
+  rsync -a --delete "$HTML_DIR/" "$DIST/"
+fi
+
 chmod -R 755 /var/www
 find "$DIST" -type f -exec chmod 644 {} \;
 
-echo "=== 5) Nginx: UI /wolverine => /var/www/wolverine (sans toucher à l'API) ==="
+echo
+echo "=== 2) Nginx: s'assurer que /wolverine sert /var/www/wolverine (sans toucher l'API) ==="
 cp -a "$NG" "$NG.bak.ui_deploy_$(date +%s)"
 
 python3 - <<'PY'
@@ -62,7 +80,7 @@ import re
 ng = Path("/etc/nginx/sites-enabled/fireinners.online-ssl")
 s = ng.read_text()
 
-# enlève anciens blocs UI /wolverine
+# retire anciens blocs UI /wolverine
 for pat in [
   r'\n\s*location\s*=\s*/wolverine\s*\{[\s\S]*?\n\s*\}\s*',
   r'\n\s*location\s+\^~\s+/wolverine/\s*\{[\s\S]*?\n\s*\}\s*',
@@ -90,7 +108,8 @@ PY
 nginx -t
 systemctl reload nginx
 
-echo "=== 6) Tests ==="
+echo
+echo "=== 3) Tests ==="
 curl -sS -I https://fireinners.online/wolverine/ | head -n 12
 curl -sS -i https://fireinners.online/wolverine/traderone/api/health | head -n 12
 echo "DONE ✅"
