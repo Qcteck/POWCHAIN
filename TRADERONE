@@ -1,1 +1,128 @@
-find /opt/fireinners -maxdepth 6 -type f -name index.html -not -path "*/node_modules/*" 2>/dev/null | head -n 80
+# ROOT BATCH — demeler / (Fireinners) vs /wolverine (WOLVERINE) + restore WOLVERINE dist
+set -euo pipefail
+
+NG="/etc/nginx/sites-enabled/fireinners.online-ssl"
+DISABLED="/etc/nginx/sites-disabled"
+TS="$(date +%s)"
+
+FIRE_DIR="/var/www/fireinners"
+WOLV_DIR="/var/www/wolverine"
+
+APP1="/opt/fireinners/frontend-react/app"     # ancien front (souvent Fireinners)
+APP2="/opt/fireinners/WOLVERINE"             # repo cloné (si pertinent)
+
+echo "=== 0) Pré-check ==="
+[ -f "$NG" ] || { echo "KO: nginx conf introuvable: $NG"; exit 1; }
+mkdir -p "$DISABLED" "$FIRE_DIR" "$WOLV_DIR"
+
+echo "=== 1) Stopper les doublons nginx qui redefinissent /wolverine (sauf $NG) ==="
+mapfile -t FILES < <(grep -RIl -E 'location\s+\^~\s+/wolverine/' \
+  /etc/nginx/sites-enabled /etc/nginx/conf.d /etc/nginx/sites-available 2>/dev/null | sort -u || true)
+
+for f in "${FILES[@]}"; do
+  [ -f "$f" ] || continue
+  if [ "$f" != "$NG" ]; then
+    base="$(basename "$f")"
+    echo "MOVE DUP: $f -> $DISABLED/$base.$TS"
+    mv "$f" "$DISABLED/$base.$TS"
+  else
+    echo "KEEP: $f"
+  fi
+done
+
+nginx -t
+
+echo "=== 2) Trouver un build WOLVERINE (cherche 'wolverine' dans index.html) ==="
+find_wolv() {
+  local ROOT="$1"
+  [ -d "$ROOT" ] || return 1
+  find "$ROOT" -maxdepth 3 -type f -path "*/dist*/index.html" -o -path "*/build*/index.html" -o -path "*/out*/index.html" 2>/dev/null \
+    | sort -r \
+    | while read -r f; do
+        if grep -qi "wolverine" "$f"; then
+          echo "$(dirname "$f")"
+          return 0
+        fi
+      done
+  return 1
+}
+
+SRC=""
+SRC="$(find_wolv "$APP1" || true)"
+[ -z "$SRC" ] && SRC="$(find_wolv "$APP2" || true)"
+[ -z "$SRC" ] && SRC="$(find_wolv /opt || true)"
+
+if [ -z "$SRC" ]; then
+  echo "KO: Aucun dist/build/out trouvé contenant 'wolverine' dans index.html."
+  echo "=> Ça veut dire: tu n'as PLUS le build WOLVERINE sur le serveur (ou il ne contient pas le mot 'wolverine')."
+  echo "   On devra le retrouver via une branche/commit git ou un backup externe."
+  exit 1
+fi
+
+echo "OK: WOLVERINE build trouvé: $SRC"
+
+echo "=== 3) Deployer WOLVERINE build -> $WOLV_DIR (force overwrite) ==="
+apt-get update -y >/dev/null
+apt-get install -y rsync >/dev/null
+rsync -a --delete "$SRC/" "$WOLV_DIR/"
+
+echo "=== 4) Verif: /var/www/wolverine/index.html doit mentionner WOLVERINE (et pas FIREINNERS) ==="
+grep -nEi "title|wolverine|fireinners" "$WOLV_DIR/index.html" | head -n 40 || true
+
+echo "=== 5) Ecrire un mapping nginx CLEAN: / -> fireinners ; /wolverine -> wolverine (sans toucher /wolverine/traderone/api) ==="
+cp -a "$NG" "$NG.bak.demele_$TS"
+
+python3 - <<'PY'
+from pathlib import Path
+import re
+
+ng = Path("/etc/nginx/sites-enabled/fireinners.online-ssl")
+s = ng.read_text()
+
+# retire anciens blocs UI root et /wolverine (mais on laisse intact tout ce qui concerne /wolverine/traderone/api)
+for pat in [
+  r'\n\s*# --- ROOT UI.*?---[\s\S]*?location\s+\^~\s+/\s*\{[\s\S]*?\n\s*\}\s*',
+  r'\n\s*# --- WOLVERINE UI.*?---[\s\S]*?location\s+\^~\s+/wolverine/\s*\{[\s\S]*?\n\s*\}\s*',
+  r'\n\s*location\s*=\s*/wolverine\s*\{[\s\S]*?\n\s*\}\s*',
+  r'\n\s*location\s+\^~\s+/wolverine/\s*\{[\s\S]*?\n\s*\}\s*',
+  r'\n\s*location\s+\^~\s+/\s*\{[\s\S]*?\n\s*\}\s*',
+]:
+  s = re.sub(pat, "\n", s, flags=re.M)
+
+block = r'''
+# --- ROOT UI (FIREINNERS) ---
+location = / { try_files /index.html =404; }
+location ^~ / {
+  root /var/www/fireinners;
+  index index.html;
+  try_files $uri $uri/ /index.html;
+}
+
+# --- WOLVERINE UI ---
+location = /wolverine { return 301 /wolverine/; }
+location ^~ /wolverine/ {
+  root /var/www;
+  index index.html;
+  try_files $uri $uri/ /wolverine/index.html;
+}
+'''
+
+i = s.rfind("}")
+if i == -1:
+  raise SystemExit("KO: nginx conf invalide (pas de } final)")
+s = s[:i] + "\n" + block + "\n" + s[i:]
+ng.write_text(s)
+print("OK: mapping root + /wolverine ecrit")
+PY
+
+nginx -t
+systemctl reload nginx
+
+echo "=== 6) Tests HTTP ==="
+echo "--- / (Fireinners) ---"
+curl -sS -I https://fireinners.online/ | head -n 10
+echo "--- /wolverine/ (Wolverine) ---"
+curl -sS -I https://fireinners.online/wolverine/ | head -n 10
+echo "--- API health (doit rester OK) ---"
+curl -sS -i https://fireinners.online/wolverine/traderone/api/health | head -n 12
+echo "DONE ✅"
