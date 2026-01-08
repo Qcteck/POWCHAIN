@@ -1,46 +1,64 @@
 set -e
 cd /opt/traderone-opt
 
-echo "=== 1) PID qui écoute sur 3000 ==="
-PID3000=$(ss -ltnp | sed -n 's/.*:3000.*pid=\([0-9]\+\).*/\1/p' | head -n1)
-echo "PID3000=$PID3000"
-ps -fp "$PID3000" || true
+echo "=== A) Qui écoute sur 3000 (3 méthodes) ==="
+
+echo "-- ss:"
+ss -ltnp 2>/dev/null | grep ':3000' || true
 echo
 
-echo "=== 2) Liste PM2 ==="
-pm2 ls || true
+echo "-- lsof:"
+command -v lsof >/dev/null && lsof -nP -iTCP:3000 -sTCP:LISTEN || echo "lsof not installed"
 echo
 
-echo "=== 3) Trouver le process PM2 qui a ce PID (et le restart) ==="
-PM2_INFO=$(pm2 jlist | node -e '
-let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{
-  const j=JSON.parse(d);
-  const pid=Number(process.env.PID3000);
-  const p=j.find(x=>x && x.pid===pid);
-  if(!p){ console.log("NOT_FOUND"); process.exit(0); }
-  console.log(JSON.stringify({name:p.name, pm_id:p.pm_id, pid:p.pid, cwd:(p.pm2_env&&p.pm2_env.pm_cwd)||null, script:(p.pm2_env&&p.pm2_env.pm_exec_path)||null},null,2));
-})' PID3000="$PID3000")
+echo "-- fuser:"
+command -v fuser >/dev/null && fuser -n tcp 3000 -v 2>/dev/null || echo "fuser not available"
+echo
 
-echo "$PM2_INFO"
-
-if echo "$PM2_INFO" | grep -q "NOT_FOUND"; then
-  echo "KO: Ce PID n'est pas géré par PM2. (Donc c'est lancé autrement.)"
-  echo "=> Donne la sortie de: ps -fp $PID3000"
-  exit 1
+echo "=== B) Extraire PID3000 de façon safe ==="
+PID3000=$(
+  (ss -ltnp 2>/dev/null | awk '/:3000/ && /pid=/{match($0,/pid=([0-9]+)/,m); if(m[1]!=""){print m[1]; exit}}') \
+  || true
+)
+if [ -z "${PID3000:-}" ] && command -v lsof >/dev/null; then
+  PID3000=$(lsof -t -iTCP:3000 -sTCP:LISTEN 2>/dev/null | head -n1 || true)
+fi
+if [ -z "${PID3000:-}" ] && command -v fuser >/dev/null; then
+  PID3000=$(fuser -n tcp 3000 2>/dev/null | tr ' ' '\n' | head -n1 || true)
 fi
 
-PM2_ID=$(echo "$PM2_INFO" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{console.log(JSON.parse(d).pm_id)})')
-echo "PM2_ID=$PM2_ID"
-
-pm2 restart "$PM2_ID" --update-env
-sleep 1
+echo "PID3000=$PID3000"
+if [ -z "${PID3000:-}" ]; then
+  echo "KO: aucun PID trouvé sur 3000"
+  exit 1
+fi
 echo
 
-echo "=== 4) Vérifs ==="
-node --check server.js
-ss -ltnp | egrep ':3000|:8585' || true
+echo "=== C) Infos process (ce qui tourne vraiment) ==="
+ps -fp "$PID3000" || true
+echo "--- cmdline ---"
+tr '\0' ' ' < /proc/"$PID3000"/cmdline 2>/dev/null || true
 echo
-curl -sS -i http://127.0.0.1:3000/health | head -n 12 || true
+echo "--- cwd ---"
+readlink -f /proc/"$PID3000"/cwd 2>/dev/null || true
 echo
-curl -sS http://127.0.0.1:3000/api/dexes | head -c 400; echo
-echo "=== DONE ==="
+echo "--- exe ---"
+readlink -f /proc/"$PID3000"/exe 2>/dev/null || true
+echo
+
+echo "=== D) PM2 (si présent) ==="
+pm2 ls || true
+echo
+pm2 jlist 2>/dev/null | node -e '
+let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{
+  try{
+    const j=JSON.parse(d);
+    const pid=Number(process.env.PID3000);
+    const p=j.find(x=>x && x.pid===pid);
+    console.log(p ? JSON.stringify({name:p.name, pm_id:p.pm_id, pid:p.pid, script:p.pm2_env?.pm_exec_path, cwd:p.pm2_env?.pm_cwd},null,2) : "NOT_MANAGED_BY_PM2");
+  }catch(e){ console.log("pm2 jlist parse err:", e.message); }
+})' PID3000="$PID3000" || true
+
+echo
+echo "=== E) systemd unit qui lance (si c’est systemd) ==="
+systemctl status --no-pager --full 2>/dev/null | head -n 60 || true
