@@ -2,68 +2,78 @@ set -euo pipefail
 TS="$(date +%s)"
 
 DIST="/var/www/wolverine"
+BACK="/var/www/wolverine_backup_$TS"
 
-echo "=== 0) Backup du /var/www/wolverine actuel ==="
-if [ -d "$DIST" ]; then
-  mv "$DIST" "/var/www/wolverine_backup_$TS"
-fi
+echo "=== 0) Backup /var/www/wolverine ==="
+[ -d "$DIST" ] && mv "$DIST" "$BACK" || true
 mkdir -p "$DIST"
 
-echo "=== 1) Chercher des apps (package.json) hors node_modules ==="
-mapfile -t PKGS < <(find /opt -maxdepth 5 -type f -name package.json \
-  -not -path "*/node_modules/*" 2>/dev/null | sort)
+echo "=== 1) Trouver le frontend buildable (scripts.build) dans /opt (hors node_modules) ==="
+APP_DIR="$(python3 - <<'PY'
+import os, json
+roots=["/opt"]
+hits=[]
+for root in roots:
+  for dp, dn, fn in os.walk(root):
+    if "node_modules" in dp: 
+      continue
+    if "package.json" in fn:
+      p=os.path.join(dp,"package.json")
+      try:
+        j=json.load(open(p,"r",encoding="utf-8"))
+      except Exception:
+        continue
+      scripts=(j.get("scripts") or {})
+      if "build" in scripts:
+        name=(j.get("name") or "").lower()
+        # évite backends évidents
+        if any(x in name for x in ["backend","server","api"]):
+          continue
+        hits.append((dp, j.get("name",""), scripts.get("build","")))
+# imprime la meilleure (la première)
+if not hits:
+  print("")
+else:
+  # préfère dossiers qui s'appellent wolverine/trader/traderone/front/ui
+  def score(h):
+    d=h[0].lower()
+    s=0
+    for k in ["wolverine","trader","traderone","front","ui","web","app"]:
+      if k in d: s+=3
+    return -s
+  hits.sort(key=score)
+  print(hits[0][0])
+PY
+)"
 
-if [ "${#PKGS[@]}" -eq 0 ]; then
-  echo "KO: aucun package.json trouvé dans /opt"
+if [ -z "${APP_DIR:-}" ]; then
+  echo "KO: aucun frontend avec script build trouvé dans /opt."
+  echo "Montre-moi la liste des package.json (hors node_modules):"
+  find /opt -maxdepth 5 -name package.json -not -path "*/node_modules/*" 2>/dev/null | head -n 80
   exit 1
 fi
-
-echo "=== 2) Garder seulement les apps qui ont un script build ==="
-CANDS=()
-for p in "${PKGS[@]}"; do
-  d="$(dirname "$p")"
-  if node -e "const j=require('$p'); process.exit(j.scripts&&j.scripts.build?0:1)" 2>/dev/null; then
-    # évite les backends évidents
-    if ! node -e "const j=require('$p'); const n=(j.name||'').toLowerCase(); process.exit(/backend|server|api/.test(n)?1:0)" 2>/dev/null; then
-      CANDS+=("$d")
-    fi
-  fi
-done
-
-if [ "${#CANDS[@]}" -eq 0 ]; then
-  echo "KO: aucun projet avec script build trouvé. Montre-moi:"
-  echo "find /opt -maxdepth 5 -name package.json -not -path '*/node_modules/*'"
-  exit 1
-fi
-
-echo "=== 3) Choisir le bon projet à build ==="
-i=1
-for d in "${CANDS[@]}"; do
-  echo "[$i] $d"
-  node -e "const j=require('$d/package.json'); console.log('   name:',j.name,'  build:',j.scripts?.build||'')"
-  i=$((i+1))
-done
-
-echo -n "Numéro du UI WOLVERINE à build: "
-read -r N
-APP_DIR="${CANDS[$((N-1))]:-}"
-[ -n "${APP_DIR:-}" ] || { echo "KO: choix invalide"; exit 1; }
 
 echo "OK: APP_DIR=$APP_DIR"
+echo "--- package.json scripts ---"
+python3 - <<PY
+import json, pathlib
+p=pathlib.Path("$APP_DIR")/"package.json"
+j=json.load(open(p,"r",encoding="utf-8"))
+print("name:", j.get("name"))
+print("build:", (j.get("scripts") or {}).get("build"))
+print("scripts:", list((j.get("scripts") or {}).keys()))
+PY
 
-echo "=== 4) Build + deploy -> /var/www/wolverine ==="
+echo "=== 2) Installer Node + deps ==="
 apt-get update -y >/dev/null
 apt-get install -y rsync curl >/dev/null
-
-# node (si absent)
 if ! command -v node >/dev/null 2>&1; then
   curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null
   apt-get install -y nodejs >/dev/null
 fi
 
+echo "=== 3) Build (base /wolverine/) ==="
 cd "$APP_DIR"
-
-# base pour servir sous /wolverine/
 cat > .env.production <<'EOF'
 VITE_BASE=/wolverine/
 VITE_API_BASE=/wolverine/traderone/api
@@ -73,11 +83,10 @@ npm install
 npm run build
 
 OUT=""
-for d in dist build out; do
-  [ -d "$APP_DIR/$d" ] && OUT="$APP_DIR/$d" && break
-done
+for d in dist build out; do [ -d "$APP_DIR/$d" ] && OUT="$APP_DIR/$d" && break; done
 [ -n "$OUT" ] || { echo "KO: pas de dist/build/out après build"; exit 1; }
 
+echo "=== 4) Deploy => /var/www/wolverine ==="
 rsync -a --delete "$OUT/" "$DIST/"
 
 echo "=== 5) Preuve ==="
