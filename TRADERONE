@@ -3,7 +3,7 @@ set -euo pipefail
 NG="/etc/nginx/sites-enabled/fireinners.online-ssl"
 TS="$(date +%s)"
 
-cp -a "$NG" "$NG.bak.fix_redirectloop.$TS"
+cp -a "$NG" "$NG.bak.clean_ui.$TS"
 
 python3 - <<'PY'
 from pathlib import Path
@@ -12,34 +12,61 @@ import re
 ng = Path("/etc/nginx/sites-enabled/fireinners.online-ssl")
 s = ng.read_text()
 
-# 1) Supprime la boucle exacte: location = / { return 301 /; }
+# 1) Supprime la boucle: location = / { return 301 /; }
 s = re.sub(r'\n\s*location\s*=\s*/\s*\{\s*return\s+301\s+/\s*;\s*\}\s*', "\n", s, flags=re.M)
 
-# 2) Supprime anciens blocs ROOT UI si présents (on va en réécrire un clean)
-s = re.sub(r'\n\s*# --- ROOT UI \(FIREINNERS\) ---[\s\S]*?^\s*}\s*', "\n", s, flags=re.M)
+# 2) Supprime les anciens blocs UI /wolverine et / (MAIS pas l'API /wolverine/traderone/api)
+patterns = [
+  r'\n\s*#\s*---\s*WOLVERINE UI[\s\S]*?^\s*}\s*',
+  r'\n\s*location\s*=\s*/wolverine\s*\{[\s\S]*?^\s*}\s*',
+  r'\n\s*location\s+\^~\s+/wolverine/\s*\{[\s\S]*?^\s*}\s*',
+
+  r'\n\s*#\s*---\s*ROOT UI[\s\S]*?^\s*}\s*',
+  r'\n\s*location\s+\^~\s+/\s*\{[\s\S]*?^\s*}\s*',
+]
+for pat in patterns:
+  s = re.sub(pat, "\n", s, flags=re.M)
 
 block = r'''
+# --- WOLVERINE UI ---
+location = /wolverine { return 301 /wolverine/; }
+location ^~ /wolverine/ {
+  root /var/www;
+  index index.html;
+  try_files $uri $uri/ /wolverine/index.html;
+  add_header Cache-Control "no-store" always;
+}
+
 # --- ROOT UI (FIREINNERS) ---
 location ^~ / {
   root /var/www/fireinners;
   index index.html;
   try_files $uri $uri/ /index.html;
+  add_header Cache-Control "no-store" always;
 }
 '''
+
 i = s.rfind("}")
 if i == -1:
   raise SystemExit("KO: nginx conf invalide (pas de } final)")
 s = s[:i] + "\n" + block + "\n" + s[i:]
 ng.write_text(s)
-print("OK: redirect loop removed + ROOT UI written")
+print("OK: blocs UI root + /wolverine écrits (sans toucher l'API)")
 PY
 
 nginx -t
 systemctl reload nginx
 
-echo "=== TESTS (doivent PLUS boucler) ==="
-curl -sS -I https://fireinners.online/ | head -n 15
-curl -LsS https://fireinners.online/ | head -n 20
-echo "--- wolverine (suivre 301) ---"
-curl -LsS https://fireinners.online/wolverine/ | head -n 20
-echo "DONE ✅"
+echo "=== TESTS (doivent être stables, pas de boucle) ==="
+echo "--- HEAD / ---"
+curl -sS -I https://fireinners.online/ | head -n 20
+echo "--- TITLE / ---"
+curl -sS https://fireinners.online/ | grep -i "<title>" | head -n 1 || true
+
+echo "--- HEAD /wolverine/ ---"
+curl -sS -I https://fireinners.online/wolverine/ | head -n 20
+echo "--- TITLE /wolverine/ ---"
+curl -sS https://fireinners.online/wolverine/ | grep -i "<title>" | head -n 1 || true
+
+echo "--- API health (ne doit pas changer) ---"
+curl -sS -i https://fireinners.online/wolverine/traderone/api/health | head -n 12 || true
