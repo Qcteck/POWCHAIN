@@ -1,128 +1,163 @@
-TOOLS="/root/wolverine_tools"
-UI_SRC="/opt/fireinners/WOLVERINE"
-API_SRC="/opt/fireinners/wolverine-api"
-TRADER_SRC="/opt/traderone"
-BOT_SRC="/opt/bbtrader-jupiter"
-UI_DIST="/var/www/wolverine"
-ARCH_GLOB="/var/www/_ARCHIVE_WOLVERINE_*"
-
-mkdir -p "$TOOLS"
-
-echo "=== 0) Quick map (truth) ==="
-echo "UI_SRC     = $UI_SRC"
-echo "API_SRC    = $API_SRC"
-echo "TRADER_SRC = $TRADER_SRC"
-echo "BOT_SRC    = $BOT_SRC"
-echo "UI_DIST    = $UI_DIST"
-echo
-
-echo "=== 1) Create helper: project_map.sh ==="
-cat > "$TOOLS/project_map.sh" <<'SH'
-#!/usr/bin/env bash
+# ROOT — FIX Phantom connect + soldes (on-chain SOL + backend balances2) + rebuild + deploy
 set -euo pipefail
+
 UI_SRC="/opt/fireinners/WOLVERINE"
-API_SRC="/opt/fireinners/wolverine-api"
-TRADER_SRC="/opt/traderone"
-BOT_SRC="/opt/bbtrader-jupiter"
 UI_DIST="/var/www/wolverine"
-ARCH_GLOB="/var/www/_ARCHIVE_WOLVERINE_*"
 
-echo "== EXISTENCE =="
-for p in "$UI_SRC" "$API_SRC" "$TRADER_SRC" "$BOT_SRC" "$UI_DIST"; do
-  if [ -e "$p" ]; then echo "[OK] $p"; else echo "[MISSING] $p"; fi
-done
+cd "$UI_SRC"
 
-echo
-echo "== ACTIVE NGINX (wolverine only) =="
-nginx -T 2>/dev/null | grep -nE 'server_name|location|root' | grep -Ei 'wolverine|traderone' || true
+echo "=== 1) Assurer @solana/web3.js (plus de CDN unpkg) ==="
+if ! grep -q '"@solana/web3.js"' package.json 2>/dev/null; then
+  npm pkg set "dependencies.@solana/web3.js=^1.98.4" >/dev/null
+fi
+npm install --legacy-peer-deps
 
-echo
-echo "== SERVICES/PROCS (project-ish) =="
-systemctl --type=service --state=running 2>/dev/null | grep -Ei "nginx|pm2|node|python|trader|wolverine|jupiter" || true
-echo
-ps aux | grep -Ei "traderone|wolverine|jupiter|node|python" | grep -v grep || true
+echo "=== 2) Lib: Phantom connect (robuste) ==="
+mkdir -p lib
+cat > lib/wallet.js <<'JS'
+export async function connectPhantom() {
+  const sol = window?.solana;
+  if (!sol || !sol.isPhantom) {
+    alert("Phantom wallet not found (install Phantom extension)");
+    return null;
+  }
+  const resp = await sol.connect({ onlyIfTrusted: false });
+  return resp.publicKey.toString();
+}
+JS
 
-echo
-echo " - Deploy: $TOOLS/deploy_ui.sh"sh 'balances2'"e"-n 5 || truexport failed)"; exit 1; }/traderone-opt/.env"; do
-=== 0) Quick map (truth) ===
-UI_SRC     = /opt/fireinners/WOLVERINE
-API_SRC    = /opt/fireinners/wolverine-api
-TRADER_SRC = /opt/traderone
-BOT_SRC    = /opt/bbtrader-jupiter
-UI_DIST    = /var/www/wolverine
+echo "=== 3) Lib: on-chain SOL via @solana/web3.js (bundled) ==="
+cat > lib/onchain.js <<'JS'
+import { Connection, PublicKey, clusterApiUrl } from "@solana/web3.js";
 
-=== 1) Create helper: project_map.sh ===
-=== 2) Create helper: grep_project.sh (exclude archives) ===
-=== 3) Create helper: deploy_ui.sh (standard build->deploy with archive) ===
-=== 4) Symlink convenience (optional, safe) ===
-=== 5) Run map now ===
-== EXISTENCE ==
-[OK] /opt/fireinners/WOLVERINE
-[OK] /opt/fireinners/wolverine-api
-[OK] /opt/traderone
-[OK] /opt/bbtrader-jupiter
-[OK] /var/www/wolverine
+export async function fetchOnchainBalances(pubkey) {
+  const conn = new Connection(clusterApiUrl("mainnet-beta"), "confirmed");
+  const lamports = await conn.getBalance(new PublicKey(pubkey));
+  return { SOL: lamports / 1e9 };
+}
+JS
 
-== ACTIVE NGINX (wolverine only) ==
-244:location = /wolverine/traderone/api/health {
-256:location ^~ /wolverine/traderone/api/ {
-286:location = /wolverine { return 301 /wolverine/; }
-287:location ^~ /wolverine/ {
-351:location = /wolverine/traderone/api/health {
-363:location ^~ /wolverine/traderone/api/ {
-393:location = /wolverine { return 301 /wolverine/; }
-394:location ^~ /wolverine/ {
-458:location = /wolverine/traderone/api/health {
-470:location ^~ /wolverine/traderone/api/ {
-500:location = /wolverine { return 301 /wolverine/; }
-501:location ^~ /wolverine/ {
-565:location = /wolverine/traderone/api/health {
-577:location ^~ /wolverine/traderone/api/ {
-607:location = /wolverine { return 301 /wolverine/; }
-608:location ^~ /wolverine/ {
+echo "=== 4) Lib: balances TraderOne via TON endpoint balances2 ==="
+cat > lib/balances.js <<'JS'
+export async function fetchInternalBalances(pubkey) {
+  const r = await fetch(`/wolverine/traderone/api/balances2?wallet=${encodeURIComponent(pubkey)}`);
+  const t = await r.text();
+  if (!r.ok) throw new Error(`balances2 error (${r.status}): ${t.slice(0,200)}`);
+  try { return JSON.parse(t); } catch { return { raw: t }; }
+}
+JS
 
-== SERVICES/PROCS (project-ish) ==
-  nginx.service                   loaded active running A high performance web server and a reverse proxy server
-  traderone.service               loaded active running TraderOne Backend (Wolverine)
+echo "=== 5) UI: WalletBox (affiche connect + onchain + traderone + delta + erreurs) ==="
+mkdir -p components
+cat > components/WalletBox.jsx <<'JSX'
+import { useState } from "react";
+import { connectPhantom } from "../lib/wallet";
+import { fetchOnchainBalances } from "../lib/onchain";
+import { fetchInternalBalances } from "../lib/balances";
 
-root         818  0.0  0.2 110048 21888 ?        Ssl   2025   0:00 /usr/bin/python3 /usr/share/unattended-upgrades/unattended-upgrade-shutdown --wait-for-signal
-root     1544982  0.1  0.8 1447248 65888 ?       Ssl  Jan05   9:18 /usr/bin/python3 /usr/bin/fail2ban-server -xf start
-root     2092152  0.0  0.2 104336 20480 ?        Ss    2025   1:47 /usr/bin/python3 -m http.server 9696 --bind 10.66.66.1 --directory /opt/neuroneone
-root     2775393  0.1  0.8 1042032 71748 ?       Ssl  12:22   0:53 node /opt/traderone-opt/server.js
-root     2775405  0.0  0.5 859440 43648 ?        Ssl  12:22   0:00 /usr/bin/node /opt/fireinners/solrpc-proxy/server.js
-root     2775423  0.0  0.5 990768 43180 ?        Ssl  12:22   0:00 /usr/bin/node /opt/probe/server.js
-root     2775424  0.0  0.6 992972 51988 ?        Ssl  12:22   0:00 /usr/bin/node /root/qplus-secure/signer.js
-root     2775461  0.0  0.8 1038120 68748 ?       Ssl  12:22   0:01 /usr/bin/node /opt/traderone-opt/server.js
-root     2918211  0.0  0.0   7740  3584 pts/0    S+   21:36   0:00 bash /root/wolverine_tools/project_map.sh
+export default function WalletBox() {
+  const [addr, setAddr] = useState("");
+  const [onchain, setOnchain] = useState(null);
+  const [internal, setInternal] = useState(null);
+  const [err, setErr] = useState("");
+  const [loading, setLoading] = useState(false);
 
-== PORTS ==
-Failed to open cgroup2 by ID
-Failed to open cgroup2 by ID
-tcp   LISTEN 0      511          0.0.0.0:443        0.0.0.0:*    users:(("nginx",pid=2775443,fd=5),("nginx",pid=2775442,fd=5),("nginx",pid=2775441,fd=5)) ino:21477026 sk:59 cgroup:/system.slice/nginx.service <->
-tcp   LISTEN 0      511        127.0.0.1:3000       0.0.0.0:*    users:(("node /opt/trade",pid=2775393,fd=20)) ino:21477883 sk:5a cgroup:/system.slice/cron.service <->                                            
+  async function connectAndLoad() {
+    setErr("");
+    setLoading(true);
+    try {
+      const a = await connectPhantom();
+      if (!a) return;
+      setAddr(a);
 
-== GIT (only real sources) ==
---- /opt/fireinners/WOLVERINE
-origin  git@github.com:Qcteck/WOLVERINE.git (fetch)
-origin  git@github.com:Qcteck/WOLVERINE.git (push)
-## main...origin/main
-?? .env.production
---- /opt/fireinners/wolverine-api (no .git)
---- /opt/traderone (no .git)
---- /opt/bbtrader-jupiter (no .git)
+      const [oc, it] = await Promise.all([
+        fetchOnchainBalances(a),
+        fetchInternalBalances(a),
+      ]);
 
-== ENV FILES (project) ==
-[OK] /opt/traderone/.env
-[OK] /opt/bbtrader-jupiter/.env
-[OK] /opt/fireinners/WOLVERINE/.env.production
-[OK] /opt/fireinners/wolverine-api/.env
-[OK] /opt/traderone-opt/.env
+      setOnchain(oc);
+      setInternal(it);
+    } catch (e) {
+      setErr(String(e?.message || e));
+    } finally {
+      setLoading(false);
+    }
+  }
 
-== ARCHIVES COUNT ==
-2
+  function calcDelta() {
+    if (!onchain || !internal || typeof internal !== "object") return null;
+    const d = {};
+    for (const k of Object.keys(onchain)) {
+      const a = Number(onchain[k] || 0);
+      const b = Number(internal[k] || 0);
+      d[k] = a - b;
+    }
+    return d;
+  }
 
-TOOLS READY ✅
- - Map:    /root/wolverine_tools/project_map.sh
- - Grep:   /root/wolverine_tools/grep_project.sh 'balances2'
- - Deploy: /root/wolverine_tools/deploy_ui.sh
-root@srv1195584:~# 
+  const delta = calcDelta();
+
+  return (
+    <div className="walletBox">
+      <div className="walletTitle">Wallet</div>
+
+      {!addr ? (
+        <button className="btn ghost" onClick={connectAndLoad} disabled={loading}>
+          {loading ? "Connecting..." : "Connect Phantom"}
+        </button>
+      ) : (
+        <>
+          <div className="muted">Connected</div>
+          <code style={{fontSize:12, wordBreak:"break-all"}}>{addr}</code>
+
+          <div style={{marginTop:10}}>
+            <div className="muted small">On‑chain</div>
+            <pre style={{margin:0}}>{JSON.stringify(onchain, null, 2)}</pre>
+          </div>
+
+          <div style={{marginTop:10}}>
+            <div className="muted small">TraderOne (balances2)</div>
+            <pre style={{margin:0}}>{JSON.stringify(internal, null, 2)}</pre>
+          </div>
+
+          <div style={{marginTop:10}}>
+            <div className="muted small">Δ non crédité</div>
+            <pre style={{margin:0}}>{JSON.stringify(delta, null, 2)}</pre>
+          </div>
+
+          <div style={{marginTop:10}}>
+            <button className="btn" onClick={connectAndLoad} disabled={loading}>
+              {loading ? "Refreshing..." : "Refresh"}
+            </button>
+          </div>
+        </>
+      )}
+
+      {err && <div className="bad small" style={{marginTop:10}}>{err}</div>}
+      <div className="muted small" style={{marginTop:10}}>
+        API: <code>/wolverine/traderone/api</code>
+      </div>
+    </div>
+  );
+}
+JSX
+
+echo "=== 6) Assurer que Layout utilise WalletBox ==="
+# si Layout n'importe pas WalletBox, on l'ajoute
+if ! grep -q 'WalletBox' components/Layout.jsx 2>/dev/null; then
+  sed -i '1i import WalletBox from "./WalletBox";' components/Layout.jsx
+fi
+# remplacer l'ancien bloc walletBox par <WalletBox />
+sed -i 's|<div className="walletBox">[[:space:][:print:]]*</div>|<WalletBox />|g' components/Layout.jsx || true
+
+echo "=== 7) Build + deploy ==="
+npm run build
+rsync -a --delete "$UI_SRC/out/" "$UI_DIST/"
+
+echo "=== 8) Tests backend rapides ==="
+echo "--- local backend status (127.0.0.1:3000) ---"
+curl -sS -i http://127.0.0.1:3000/status 2>/dev/null | head -n 12 || true
+echo "--- public balances2 test (wallet=111..) ---"
+curl -sS -i "https://fireinners.online/wolverine/traderone/api/balances2?wallet=11111111111111111111111111111111" | head -n 12 || true
+
+echo "DONE ✅ (refresh /wolverine et clique Connect Phantom)"
