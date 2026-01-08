@@ -1,73 +1,9 @@
-# ROOT BATCH — retrouver le VRAI UI WOLVERINE sur le serveur + le déployer dans /var/www/wolverine
-# + forcer nginx: / = fireinners ; /wolverine = wolverine (sans toucher /wolverine/traderone/api)
-
 set -euo pipefail
-TS="$(date +%s)"
 
 NG="/etc/nginx/sites-enabled/fireinners.online-ssl"
-DISABLED="/etc/nginx/sites-disabled"
-FIRE_DIR="/var/www/fireinners"
-WOLV_DIR="/var/www/wolverine"
+TS="$(date +%s)"
 
-echo "=== 0) Preuves (ce que renvoie le serveur) ==="
-echo "--- /wolverine (suivre 301) ---"
-curl -LsS https://fireinners.online/wolverine/ | grep -iE "<title>|wolverine|traderone|lifi|phantom|fireinners|wallet" | head -n 40 || true
-echo "--- / (root) ---"
-curl -LsS https://fireinners.online/ | grep -iE "<title>|wolverine|traderone|fireinners|wallet" | head -n 40 || true
-echo
-
-echo "=== 1) Désactiver doublons nginx qui redéfinissent /wolverine (sauf $NG) ==="
-mkdir -p "$DISABLED"
-mapfile -t FILES < <(grep -RIl -E 'location\s+\^~\s+/wolverine/|location\s*=\s*/wolverine' \
-  /etc/nginx/sites-enabled /etc/nginx/conf.d /etc/nginx/sites-available 2>/dev/null | sort -u || true)
-
-for f in "${FILES[@]}"; do
-  [ -f "$f" ] || continue
-  if [ "$f" != "$NG" ]; then
-    base="$(basename "$f")"
-    echo "MOVE DUP: $f -> $DISABLED/$base.$TS"
-    mv "$f" "$DISABLED/$base.$TS"
-  else
-    echo "KEEP: $f"
-  fi
-done
-
-nginx -t
-echo
-
-echo "=== 2) Trouver un index.html qui ressemble à WOLVERINE (scan large) ==="
-# IMPORTANT: on ne cherche PAS seulement "wolverine" (parfois le mot n'est pas dans le HTML),
-# on cherche des signatures /wolverine/, traderone, lifi, phantom, dashboard, positions, orders, etc.
-CAND="$(find /opt /var/www -type f -name index.html -not -path "*/node_modules/*" 2>/dev/null | \
-  while read -r f; do
-    if grep -qiE "/wolverine/|traderone|lifi|li\.fi|phantom|dashboard|positions|orders|trades|dex" "$f"; then
-      echo "$f"
-      break
-    fi
-  done)"
-
-if [ -z "${CAND:-}" ]; then
-  echo "KO: aucun index.html type WOLVERINE trouvé sur /opt ou /var/www."
-  echo "=> Dans ce cas, il faut rebuild depuis le bon repo/branche WOLVERINE."
-  exit 1
-fi
-
-SRC_DIR="$(dirname "$CAND")"
-echo "OK: WOLVERINE candidat trouvé -> $SRC_DIR"
-echo
-
-echo "=== 3) Deploy FORCE -> $WOLV_DIR ==="
-apt-get update -y >/dev/null
-apt-get install -y rsync >/dev/null
-mkdir -p "$WOLV_DIR"
-rsync -a --delete "$SRC_DIR/" "$WOLV_DIR/"
-
-echo "--- preuve locale /var/www/wolverine/index.html ---"
-grep -nEi "title|wolverine|traderone|lifi|phantom|fireinners|wallet" "$WOLV_DIR/index.html" | head -n 40 || true
-echo
-
-echo "=== 4) Forcer nginx: /wolverine AVANT / (sans toucher /wolverine/traderone/api) ==="
-cp -a "$NG" "$NG.bak.demele.$TS"
+cp -a "$NG" "$NG.bak.fix_redirectloop.$TS"
 
 python3 - <<'PY'
 from pathlib import Path
@@ -76,48 +12,34 @@ import re
 ng = Path("/etc/nginx/sites-enabled/fireinners.online-ssl")
 s = ng.read_text()
 
-# retire anciens blocs UI / et /wolverine (NE TOUCHE PAS aux blocs /wolverine/traderone/api)
-patterns = [
-  r'\n\s*#\s*---\s*WOLVERINE UI[\s\S]*?location\s+\^~\s+/wolverine/[\s\S]*?\n\s*\}\s*',
-  r'\n\s*#\s*---\s*ROOT UI[\s\S]*?location\s+\^~\s+/\s*\{[\s\S]*?\n\s*\}\s*',
-  r'\n\s*location\s*=\s*/wolverine\s*\{[\s\S]*?\n\s*\}\s*',
-  r'\n\s*location\s+\^~\s+/wolverine/\s*\{[\s\S]*?\n\s*\}\s*',
-  r'\n\s*location\s+\^~\s+/\s*\{[\s\S]*?\n\s*\}\s*',
-]
-for pat in patterns:
-  s = re.sub(pat, "\n", s, flags=re.M)
+# 1) Supprime la boucle exacte: location = / { return 301 /; }
+s = re.sub(r'\n\s*location\s*=\s*/\s*\{\s*return\s+301\s+/\s*;\s*\}\s*', "\n", s, flags=re.M)
+
+# 2) Supprime anciens blocs ROOT UI si présents (on va en réécrire un clean)
+s = re.sub(r'\n\s*# --- ROOT UI \(FIREINNERS\) ---[\s\S]*?^\s*}\s*', "\n", s, flags=re.M)
 
 block = r'''
-# --- WOLVERINE UI ---
-location = /wolverine { return 301 /wolverine/; }
-location ^~ /wolverine/ {
-  root /var/www;
-  index index.html;
-  try_files $uri $uri/ /wolverine/index.html;
-  add_header Cache-Control "no-store" always;
-}
-
 # --- ROOT UI (FIREINNERS) ---
 location ^~ / {
   root /var/www/fireinners;
   index index.html;
   try_files $uri $uri/ /index.html;
-  add_header Cache-Control "no-store" always;
 }
 '''
-
 i = s.rfind("}")
 if i == -1:
   raise SystemExit("KO: nginx conf invalide (pas de } final)")
 s = s[:i] + "\n" + block + "\n" + s[i:]
 ng.write_text(s)
-print("OK: mapping / et /wolverine écrit")
+print("OK: redirect loop removed + ROOT UI written")
 PY
 
 nginx -t
 systemctl reload nginx
 
-echo "=== 5) TEST FINAL ==="
-curl -LsS https://fireinners.online/wolverine/ | grep -iE "<title>|wolverine|traderone|lifi|phantom|fireinners|wallet" | head -n 40 || true
-curl -sS -i https://fireinners.online/wolverine/traderone/api/health | head -n 12 || true
+echo "=== TESTS (doivent PLUS boucler) ==="
+curl -sS -I https://fireinners.online/ | head -n 15
+curl -LsS https://fireinners.online/ | head -n 20
+echo "--- wolverine (suivre 301) ---"
+curl -LsS https://fireinners.online/wolverine/ | head -n 20
 echo "DONE ✅"
