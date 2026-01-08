@@ -1,2 +1,86 @@
-find /opt -maxdepth 5 -type d -name dist -o -name build -o -name out 2>/dev/null | head -n 80
-find /opt -type f -name index.html -not -path "*/node_modules/*" 2>/dev/null | head -n 80
+set -euo pipefail
+TS="$(date +%s)"
+
+DIST="/var/www/wolverine"
+
+echo "=== 0) Backup du /var/www/wolverine actuel ==="
+if [ -d "$DIST" ]; then
+  mv "$DIST" "/var/www/wolverine_backup_$TS"
+fi
+mkdir -p "$DIST"
+
+echo "=== 1) Chercher des apps (package.json) hors node_modules ==="
+mapfile -t PKGS < <(find /opt -maxdepth 5 -type f -name package.json \
+  -not -path "*/node_modules/*" 2>/dev/null | sort)
+
+if [ "${#PKGS[@]}" -eq 0 ]; then
+  echo "KO: aucun package.json trouvé dans /opt"
+  exit 1
+fi
+
+echo "=== 2) Garder seulement les apps qui ont un script build ==="
+CANDS=()
+for p in "${PKGS[@]}"; do
+  d="$(dirname "$p")"
+  if node -e "const j=require('$p'); process.exit(j.scripts&&j.scripts.build?0:1)" 2>/dev/null; then
+    # évite les backends évidents
+    if ! node -e "const j=require('$p'); const n=(j.name||'').toLowerCase(); process.exit(/backend|server|api/.test(n)?1:0)" 2>/dev/null; then
+      CANDS+=("$d")
+    fi
+  fi
+done
+
+if [ "${#CANDS[@]}" -eq 0 ]; then
+  echo "KO: aucun projet avec script build trouvé. Montre-moi:"
+  echo "find /opt -maxdepth 5 -name package.json -not -path '*/node_modules/*'"
+  exit 1
+fi
+
+echo "=== 3) Choisir le bon projet à build ==="
+i=1
+for d in "${CANDS[@]}"; do
+  echo "[$i] $d"
+  node -e "const j=require('$d/package.json'); console.log('   name:',j.name,'  build:',j.scripts?.build||'')"
+  i=$((i+1))
+done
+
+echo -n "Numéro du UI WOLVERINE à build: "
+read -r N
+APP_DIR="${CANDS[$((N-1))]:-}"
+[ -n "${APP_DIR:-}" ] || { echo "KO: choix invalide"; exit 1; }
+
+echo "OK: APP_DIR=$APP_DIR"
+
+echo "=== 4) Build + deploy -> /var/www/wolverine ==="
+apt-get update -y >/dev/null
+apt-get install -y rsync curl >/dev/null
+
+# node (si absent)
+if ! command -v node >/dev/null 2>&1; then
+  curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null
+  apt-get install -y nodejs >/dev/null
+fi
+
+cd "$APP_DIR"
+
+# base pour servir sous /wolverine/
+cat > .env.production <<'EOF'
+VITE_BASE=/wolverine/
+VITE_API_BASE=/wolverine/traderone/api
+EOF
+
+npm install
+npm run build
+
+OUT=""
+for d in dist build out; do
+  [ -d "$APP_DIR/$d" ] && OUT="$APP_DIR/$d" && break
+done
+[ -n "$OUT" ] || { echo "KO: pas de dist/build/out après build"; exit 1; }
+
+rsync -a --delete "$OUT/" "$DIST/"
+
+echo "=== 5) Preuve ==="
+grep -i "<title>" -n "$DIST/index.html" | head -n 3 || true
+curl -LsS https://fireinners.online/wolverine/ | grep -i "<title>" | head -n 1 || true
+echo "DONE ✅"
