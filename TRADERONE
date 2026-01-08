@@ -1,78 +1,26 @@
 set -euo pipefail
 
-NG="/etc/nginx/sites-enabled/fireinners.online-ssl"
-cp -a "$NG" "$NG.bak.lock_exact_key.$(date +%s)"
+PID="$(pm2 pid 0 | tr -d '[:space:]')"
+echo "PID=$PID"
 
-echo "=== 1) Trouver le PID Node (via PM2) ==="
-PID="$(pm2 pid 0 2>/dev/null | tr -d '[:space:]' || true)"
-if [ -z "${PID:-}" ] || [ "$PID" = "0" ]; then
-  # fallback si pm2 pid 0 ne marche pas
-  PID="$(pgrep -f 'node' | head -n1 || true)"
-fi
-[ -n "${PID:-}" ] || { echo "KO: PID node introuvable"; exit 1; }
-echo "OK: PID=$PID"
+echo "=== A) Infos PM2 (cwd, script, args) ==="
+pm2 describe 0 | sed -n '1,200p'
+echo
 
-echo "=== 2) Extraire une clé depuis /proc/$PID/environ (sans l'afficher) ==="
-KEY=""
-KNAME=""
-# cherche d'abord des noms standards
-for name in X_API_KEY API_KEY TRADERONE_API_KEY XAPIKEY; do
-  v="$(tr '\0' '\n' < /proc/$PID/environ | awk -F= -v n="$name" '$1==n{print substr($0,index($0,"=")+1)}' | tail -n1 || true)"
-  if [ -n "${v:-}" ]; then KEY="$v"; KNAME="$name"; break; fi
-done
-# fallback: n'importe quelle variable contenant KEY et API
-if [ -z "${KEY:-}" ]; then
-  line="$(tr '\0' '\n' < /proc/$PID/environ | grep -Ei 'api.*key|key.*api|x_api_key|traderone.*key' | head -n1 || true)"
-  if [ -n "${line:-}" ]; then
-    KNAME="${line%%=*}"
-    KEY="${line#*=}"
+echo "=== B) Cherche tous les .env possibles (chemins) ==="
+find /opt /var/www /etc /root -maxdepth 7 -type f -name ".env" 2>/dev/null | sed -n '1,200p'
+echo
+
+echo "=== C) Dans les .env: afficher UNIQUEMENT les NOMS des variables (pas les valeurs) ==="
+while IFS= read -r f; do
+  names="$(grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "$f" 2>/dev/null | cut -d= -f1 | grep -Ei 'api|key|token|secret|auth' || true)"
+  if [ -n "${names:-}" ]; then
+    echo "--- $f ---"
+    echo "$names" | sed -n '1,120p'
+    echo
   fi
-fi
-
-[ -n "${KEY:-}" ] || { echo "KO: clé introuvable dans l'env du process. Donne juste le NOM de la variable."; exit 1; }
-echo "OK: KEY FOUND (name=$KNAME) (not printed)"
-
-echo "=== 3) Patch nginx: check valeur exacte dans location ^~ /wolverine/traderone/api/ ==="
-python3 - <<'PY'
-from pathlib import Path
-import os, re
-
-ng = Path("/etc/nginx/sites-enabled/fireinners.online-ssl")
-s = ng.read_text()
-
-KEY = os.environ["KEY"]
-
-# Remplace un check "vide" par "valeur exacte"
-s2 = re.sub(
-    r'if\s*\(\s*\$http_x_api_key\s*=\s*""\s*\)\s*\{\s*return\s+403;\s*\}',
-    f'if ($http_x_api_key != "{KEY}") {{ return 403; }}',
-    s
-)
-
-# Si déjà un != "..." existe, on remplace aussi
-s2 = re.sub(
-    r'if\s*\(\s*\$http_x_api_key\s*!=\s*"[^"]*"\s*\)\s*\{\s*return\s+403;\s*\}',
-    f'if ($http_x_api_key != "{KEY}") {{ return 403; }}',
-    s2
-)
-
-if s2 == s:
-    raise SystemExit("KO: je n'ai trouvé aucun check X-API-KEY à remplacer dans nginx.")
-
-ng.write_text(s2)
-print("OK: nginx locked to exact key (not printed)")
-PY
-
-nginx -t
-systemctl reload nginx
-echo "OK: nginx reloaded"
-
-echo "=== 4) Tests ==="
-echo "--- /health (public) ---"
-curl -sS -i https://fireinners.online/wolverine/traderone/api/health | head -n 12
+done < <(find /opt /var/www /etc /root -maxdepth 7 -type f -name ".env" 2>/dev/null)
 echo
-echo "--- /dexes (mauvaise clé -> 403) ---"
-curl -sS -i https://fireinners.online/wolverine/traderone/api/dexes -H "X-API-KEY: test" | head -n 12
-echo
-echo "--- /dexes (bonne clé -> 200) ---"
-curl -sS -i https://fireinners.online/wolverine/traderone/api/dexes -H "X-API-KEY: $KEY" | head -n 12
+
+echo "=== D) Dans le code/config: où est checké X-API-KEY ==="
+grep -RIn --line-number -E 'x-api-key|X-API-KEY|api[_-]?key|token|secret|authorization' /opt 2>/dev/null | head -n 120 || true
