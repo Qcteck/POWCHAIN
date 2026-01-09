@@ -1,12 +1,43 @@
 set -euo pipefail
+TS="$(date +%Y%m%d_%H%M%S)"
+PAT='location[[:space:]]+(\^~|~\*?|=)?[[:space:]]*/wolverine/traderone/api/?'
+BACK="/etc/nginx.bak.$TS"
 
-echo "=== 1) ERREUR COMPLETE (fichier + ligne) ==="
-nginx -t 2>&1 | cat
+echo "=== 0) Backup /etc/nginx -> $BACK ==="
+cp -a /etc/nginx "$BACK"
 
 echo
-echo "=== 2) LES 2 (ou +) DEFINITIONS DANS LA CONFIG CHARGEE ==="
-nginx -T 2>/dev/null | grep -nE 'location\s+(\^~|~\*?|=)?\s*/wolverine/traderone/api/?' || true
+echo "=== 1) nginx -t (erreur complète) ==="
+nginx -t 2>&1 || true
 
 echo
-echo "=== 3) SUR DISQUE: QUELS FICHIERS CONTIENNENT CETTE LOCATION ==="
-grep -RIn --include="*.conf" -E 'location\s+(\^~|~\*?|=)?\s*/wolverine/traderone/api/?' /etc/nginx || true
+echo "=== 2) Tous les fichiers qui contiennent ce location ==="
+mapfile -t FILES < <(grep -RIn --include="*.conf" -E "$PAT" /etc/nginx 2>/dev/null | awk -F: '{print $1}' | sort -u)
+printf ' - %s\n' "${FILES[@]:-<none>}"
+[ "${#FILES[@]}" -gt 0 ] || { echo "❌ Aucun match trouvé"; exit 1; }
+
+echo
+echo "=== 3) On garde le 1er, on désactive le location dans les autres ==="
+KEEP="${FILES[0]}"
+echo "KEEP: $KEEP"
+
+i=0
+for f in "${FILES[@]}"; do
+  if [ "$f" = "$KEEP" ]; then
+    echo "✅ keep: $f"
+    continue
+  fi
+  i=$((i+1))
+  cp -a "$f" "$f.bak.dupe_traderone_api.$TS"
+  # remplace SEULEMENT le header du location pour le neutraliser (le bloc reste mais sur un path mort)
+  sed -i -E "s|$PAT|location ^~ /_disabled_dupe_traderone_api_${TS}_${i}/|g" "$f"
+  echo "🚫 disabled in: $f"
+done
+
+echo
+echo "=== 4) Test + reload ==="
+nginx -t
+systemctl reload nginx
+
+echo
+echo "✅ DONE. Backup: $BACK"
