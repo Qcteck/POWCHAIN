@@ -1,1 +1,84 @@
-sudo nginx -t && sudo systemctl reload nginx
+cat > /root/nginx_fireinners_batch.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+TS="$(date +%F_%H%M%S)"
+LOG="/root/nginx_fireinners_batch_${TS}.log"
+exec > >(tee -a "$LOG") 2>&1
+
+echo "=== LOG: $LOG ==="
+
+echo
+echo "=== 0) Host / OS ==="
+hostname -f || true
+uname -a || true
+date || true
+
+echo
+echo "=== 1) nginx status + unit ==="
+systemctl status nginx --no-pager || true
+systemctl cat nginx --no-pager || true
+
+echo
+echo "=== 2) nginx config test ==="
+nginx -t || true
+
+echo
+echo "=== 3) Who listens on 80/443 ==="
+ss -lntp | egrep ':(80|443)\s' || echo "!! Rien n'écoute sur 80/443"
+
+echo
+echo "=== 4) Show nginx includes and server_name matches ==="
+echo "--- nginx -T (server_name / listen / wolverine) ---"
+nginx -T 2>/dev/null | nl -ba | egrep -n "include|server_name|listen|root|location\s+/wolverine|proxy_pass|return 30|rewrite" | head -n 260 || true
+
+echo
+echo "=== 5) Nginx folders + enabled/available/disabled ==="
+for d in /etc/nginx /etc/nginx/sites-enabled /etc/nginx/sites-available /etc/nginx/sites-disabled /etc/nginx/conf.d /etc/nginx/snippets; do
+  echo "--- ls -la $d ---"
+  ls -la "$d" 2>/dev/null || true
+done
+
+echo
+echo "=== 6) Greps (fireinners + wolverine + try_files loops) ==="
+echo "--- server_name fireinners ---"
+grep -RIn --color=always "server_name.*fireinners" /etc/nginx 2>/dev/null || true
+echo "--- location /wolverine ---"
+grep -RIn --color=always "location\s\+/wolverine" /etc/nginx 2>/dev/null || true
+echo "--- try_files (possible loops) ---"
+grep -RIn --color=always "try_files" /etc/nginx 2>/dev/null | head -n 120 || true
+
+echo
+echo "=== 7) Check expected web files (adjust if needed) ==="
+test -f /var/www/wolverine/index.html && echo "OK: /var/www/wolverine/index.html exists" || echo "!! Missing: /var/www/wolverine/index.html"
+test -f /var/www/html/index.html && echo "OK: /var/www/html/index.html exists" || true
+
+echo
+echo "=== 8) Local curls (origin reachability) ==="
+echo "--- HTTP 80 ---"
+curl -sv --max-time 5 http://127.0.0.1/ -H 'Host: fireinners.online' 2>&1 | tail -n 40 || true
+echo "--- HTTP 80 /wolverine/api/ping ---"
+curl -sv --max-time 5 http://127.0.0.1/wolverine/api/ping -H 'Host: fireinners.online' 2>&1 | tail -n 40 || true
+echo "--- HTTPS 443 (no verify) ---"
+curl -skv --max-time 5 https://127.0.0.1/ -H 'Host: fireinners.online' 2>&1 | tail -n 50 || true
+
+echo
+echo "=== 9) Firewalls quick check ==="
+ufw status verbose || true
+iptables -S | head -n 120 || true
+
+echo
+echo "=== 10) Recent nginx errors ==="
+journalctl -u nginx -n 200 --no-pager || true
+test -f /var/log/nginx/error.log && tail -n 200 /var/log/nginx/error.log || true
+
+echo
+echo "=== 11) If nginx not listening, show master args + restart hint ==="
+ps auxww | egrep 'nginx: master|nginx: worker' || true
+
+echo
+echo "=== DONE ==="
+BASH
+
+chmod +x /root/nginx_fireinners_batch.sh
+bash /root/nginx_fireinners_batch.sh
