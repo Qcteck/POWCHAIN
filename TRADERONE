@@ -1,34 +1,61 @@
 set -euo pipefail
 TS="$(date +%Y%m%d_%H%M%S)"
 
-KEEP="/etc/nginx/sites-enabled/fireinners.online-ssl"
-DIR="/etc/nginx/snippets/_saved_$TS"
-mkdir -p "$DIR"
+PAT='location\s+(\^~\s+)?/wolverine/'
+echo "=== 1) Trouver tous les location /wolverine/ actifs (nginx -T) ==="
+nginx -T 2>/dev/null | grep -nE "$PAT" | head -n 200 || true
 
-echo "=== 0) Backup vhost ==="
-cp -a "$KEEP" "$KEEP.bak.$TS"
+echo
+echo "=== 2) Trouver les fichiers sources (/etc/nginx) qui contiennent location /wolverine/ ==="
+mapfile -t FILES < <(grep -RIn --include="*.conf" -E "$PAT" /etc/nginx 2>/dev/null | awk -F: '{print $1}' | sort -u)
+printf ' - %s\n' "${FILES[@]:-<none>}"
 
-echo "=== 1) Sauver les anciens snippets (sans les inclure) ==="
-for f in /etc/nginx/snippets/wolverine_prod.conf \
-         /etc/nginx/snippets/wolverine_routes.conf \
-         /etc/nginx/snippets/wolverine_auth_phantom.conf; do
-  [ -f "$f" ] && cp -a "$f" "$DIR/" && echo "Saved: $f -> $DIR/"
-done
-
-echo "=== 2) Ne laisser qu'UN seul include actif (wolverine_final.conf) ==="
-sed -i '\|include /etc/nginx/snippets/wolverine_prod\.conf;|d' "$KEEP"
-sed -i '\|include /etc/nginx/snippets/wolverine_routes\.conf;|d' "$KEEP"
-sed -i '\|include /etc/nginx/snippets/wolverine_auth_phantom\.conf;|d' "$KEEP"
-
-if ! grep -q "snippets/wolverine_final.conf" "$KEEP"; then
-  sed -i '0,/server[[:space:]]*{/s//server {\n    include \/etc\/nginx\/snippets\/wolverine_final.conf;/' "$KEEP"
+if [ "${#FILES[@]}" -le 1 ]; then
+  echo "✅ Un seul fichier trouvé, mais il peut y avoir 2 locations dans le même fichier."
+else
+  echo "ℹ️ Plusieurs fichiers contiennent /wolverine/ -> on va garder le 1er et neutraliser les autres."
 fi
 
-echo "=== 3) Test + reload ==="
+KEEPFILE="${FILES[0]:-/etc/nginx/sites-enabled/fireinners.online-ssl}"
+echo "KEEPFILE = $KEEPFILE"
+
+i=0
+for f in "${FILES[@]}"; do
+  # On garde le 1er fichier, on neutralise les autres
+  if [ "$f" = "$KEEPFILE" ]; then
+    echo "Keep: $f"
+    continue
+  fi
+  i=$((i+1))
+  cp -a "$f" "$f.bak.dupe_wolverine.$TS" || true
+
+  # Renomme location /wolverine/ pour éviter duplicate
+  sed -i -E "s|location[[:space:]]+(\^~[[:space:]]+)?/wolverine/|location ^~ /_disabled_dupe_wolverine_${TS}_${i}/|g" "$f"
+  echo "Disabled duplicate in: $f"
+done
+
+echo
+echo "=== 3) Cas spécial: 2 locations /wolverine/ dans le KEEPFILE lui-même ==="
+# Si le KEEPFILE contient 2 locations, on neutralise la 2e occurrence seulement
+cp -a "$KEEPFILE" "$KEEPFILE.bak.selfcheck.$TS" || true
+awk '
+  BEGIN{c=0}
+  /location[[:space:]]+(\^~[[:space:]]+)?\/wolverine\//{
+    c++
+    if(c>=2){
+      gsub(/location[[:space:]]+(\^~[[:space:]]+)?\/wolverine\//,
+           "location ^~ /_disabled_dupe_wolverine_self_'$TS'_2/")
+    }
+  }
+  {print}
+' "$KEEPFILE" > "$KEEPFILE.tmp.$TS" && mv "$KEEPFILE.tmp.$TS" "$KEEPFILE"
+
+echo
+echo "=== 4) Test + reload ==="
 nginx -t
 systemctl reload nginx
 
-echo "=== 4) Vérif includes ==="
-grep -n "include /etc/nginx/snippets/wolverine" -n "$KEEP" || true
-
-echo "DONE ✅ anciens snippets gardés ici: $DIR"
+echo
+echo "=== 5) Recheck ==="
+nginx -T 2>/dev/null | grep -nE "$PAT" | head -n 80 || echo "✅ plus aucun /wolverine/ dupliqué"
+echo "DONE ✅"
