@@ -1,51 +1,34 @@
 set -euo pipefail
 
 DOMAIN="fireinners.online"
-TEST="/var/www/fireinners-test"
-ULT="$TEST/ultimate"
-mkdir -p "$ULT"
+SNIP="/etc/nginx/snippets/fireinners_routes.conf"
 
-echo "=== 1) Test nginx ==="
+echo "=== 1) Où le snippet est inclus actuellement ? ==="
+grep -RIn --color=never "include .*fireinners_routes\.conf" /etc/nginx || true
+echo
+
+echo "=== 2) Trouver le server block pour $DOMAIN ==="
+CONF="$(grep -RIl "server_name.*${DOMAIN}" /etc/nginx/sites-enabled /etc/nginx/sites-available 2>/dev/null | head -n 1 || true)"
+echo "CONF=$CONF"
+[ -n "$CONF" ] || { echo "❌ server block introuvable pour $DOMAIN"; exit 1; }
+
+echo "=== 3) Retirer TOUS les includes du snippet (reset propre) ==="
+for f in $(grep -RIl "include .*fireinners_routes\.conf" /etc/nginx 2>/dev/null || true); do
+  cp -a "$f" "$f.bak.$(date +%s)" || true
+  sed -i '/include .*fireinners_routes\.conf;/d' "$f" || true
+  echo "Removed include from: $f"
+done
+
+echo "=== 4) Ajouter l'include UNIQUEMENT dans le bon server { } ==="
+cp -a "$CONF" "$CONF.bak.$(date +%s)"
+
+# insert juste après la ligne server_name ... fireinners.online
+awk -v inc="  include $SNIP;" '
+  {print}
+  $0 ~ /server_name/ && $0 ~ /fireinners\.online/ && !done {print inc; done=1}
+' "$CONF" > "$CONF.tmp" && mv "$CONF.tmp" "$CONF"
+
+echo "=== 5) Test + reload nginx ==="
 nginx -t
 systemctl reload nginx
-
-echo "=== 2) Trouver le dernier backup (tes 305 images) ==="
-BACK="$(ls -dt /var/www/fireinners-test-backup-* 2>/dev/null | head -n 1 || true)"
-echo "BACK=$BACK"
-[ -n "$BACK" ] || { echo "❌ Pas de backup trouvé"; exit 1; }
-
-echo "=== 3) Générer le BLEND 4K (median) ==="
-apt-get update -y
-apt-get install -y imagemagick
-
-TMP="/tmp/blend_work"
-rm -rf "$TMP"; mkdir -p "$TMP"
-
-i=0
-while IFS= read -r f; do
-  i=$((i+1))
-  printf -v out "$TMP/img_%04d.png" "$i"
-  convert "$f" -auto-orient -resize 3840x2160^ -gravity center -extent 3840x2160 "$out"
-done < <(find "$BACK" -maxdepth 1 -type f \( -iname "*.png" -o -iname "*.jpg" -o -iname "*.jpeg" \) -print | sort)
-
-echo "frames: $i"
-[ "$i" -gt 0 ] || { echo "❌ 0 image à fusionner"; exit 1; }
-
-convert "$TMP"/img_*.png -evaluate-sequence median "$ULT/blend_305_4k.png"
-rm -rf "$TMP"
-
-cat > "$ULT/index.html" <<'HTML'
-<!doctype html><meta charset="utf-8">
-<title>ultimate</title>
-<a href="blend_305_4k.png">blend_305_4k.png</a>
-<br><img src="blend_305_4k.png" style="max-width:100%;height:auto">
-HTML
-
-chown -R www-data:www-data "$ULT" || true
-chmod -R a+rX "$ULT" || true
-
-echo "=== 4) Test comme l'extérieur ==="
-curl -I https://127.0.0.1/test/ultimate/blend_305_4k.png --insecure -H "Host: $DOMAIN" | head -n 20 || true
-
-echo "✅ Ouvre:"
-echo "https://fireinners.online/test/ultimate/blend_305_4k.png"
+echo "✅ OK"
