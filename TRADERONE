@@ -1,26 +1,97 @@
 set -euo pipefail
 TS="$(date +%Y%m%d_%H%M%S)"
-DIR="/root/nginx_backups_$TS"
+
+DOMAIN="fireinners.online"
 KEEP="/etc/nginx/sites-enabled/fireinners.online-ssl"
+SNIP="/etc/nginx/snippets/wolverine_prod.conf"
 
-echo "=== 1) Sanity ==="
-nginx -T 2>/dev/null | grep -i "conflicting server name" || echo "✅ no more conflicts"
-[ -f "$KEEP" ] || { echo "❌ KEEP missing: $KEEP"; exit 1; }
+UI_PORT="3000"
+API_PORT="3005"
 
-echo "=== 2) Ranger les backups (sans rien casser) ==="
-mkdir -p "$DIR"
-shopt -s nullglob
-mv /etc/nginx/sites-enabled/fireinners.online-ssl.bak* "$DIR/" 2>/dev/null || true
-mv /etc/nginx/sites-enabled/*.disabled.* "$DIR/" 2>/dev/null || true
-echo "Backups moved to: $DIR"
+echo "=== 0) Precheck ==="
+[ -f "$KEEP" ] || { echo "❌ KEEP introuvable: $KEEP"; exit 1; }
+cp -a "$KEEP" "$KEEP.bak.$TS"
+
+echo "=== 1) Write prod snippet (UI + API) ==="
+mkdir -p /etc/nginx/snippets
+cat > "$SNIP" <<NGX
+# --------------------------
+# Wolverine PROD routing
+# UI:  http://127.0.0.1:${UI_PORT}
+# API: http://127.0.0.1:${API_PORT}
+# --------------------------
+
+# API MUST win (no SPA fallback)
+location ^~ /wolverine/traderone/api/ {
+  add_header X-Wolverine-API HIT always;
+
+  proxy_pass http://127.0.0.1:${API_PORT}/;
+  proxy_http_version 1.1;
+
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+
+  proxy_set_header Upgrade \$http_upgrade;
+  proxy_set_header Connection "upgrade";
+}
+
+# Next.js assets (served by UI, no rewrite)
+location ^~ /wolverine/_next/ {
+  add_header X-Wolverine-UI HIT always;
+
+  proxy_pass http://127.0.0.1:${UI_PORT}/wolverine/_next/;
+  proxy_http_version 1.1;
+
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+}
+
+# UI app (everything else under /wolverine/)
+location ^~ /wolverine/ {
+  add_header X-Wolverine-UI HIT always;
+
+  proxy_pass http://127.0.0.1:${UI_PORT}/wolverine/;
+  proxy_http_version 1.1;
+
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+
+  proxy_set_header Upgrade \$http_upgrade;
+  proxy_set_header Connection "upgrade";
+}
+NGX
+
+echo "=== 2) Ensure snippet included once in KEEP ==="
+if ! grep -q "snippets/wolverine_prod.conf" "$KEEP"; then
+  sed -i '0,/server[[:space:]]*{/s//server {\n    include \/etc\/nginx\/snippets\/wolverine_prod.conf;/' "$KEEP"
+  echo "✅ include added"
+else
+  echo "✅ include already present"
+fi
 
 echo "=== 3) Test + reload ==="
 nginx -t
 systemctl reload nginx
 
-echo "=== 4) Tests endpoints ==="
-curl -sk -I --resolve fireinners.online:443:127.0.0.1 \
-  https://fireinners.online/wolverine/traderone/api/auth/health | sed -n '1,30p'
+echo "=== 4) Smoke tests (origin bypass) ==="
+echo "--- API health ---"
+curl -sk -I --resolve ${DOMAIN}:443:127.0.0.1 \
+  https://${DOMAIN}/wolverine/traderone/api/auth/health | sed -n '1,30p'
 
-curl -sk --resolve fireinners.online:443:127.0.0.1 \
- "https://fireinners.online/wolverine/traderone/api/auth/phantom/challenge?pubkey=11111111111111111111111111111111" | head -c 260; echo
+echo
+echo "--- Phantom challenge ---"
+curl -sk --resolve ${DOMAIN}:443:127.0.0.1 \
+ "https://${DOMAIN}/wolverine/traderone/api/auth/phantom/challenge?pubkey=11111111111111111111111111111111" | head -c 260; echo
+
+echo
+echo "--- UI route (headers) ---"
+curl -sk -I --resolve ${DOMAIN}:443:127.0.0.1 \
+  https://${DOMAIN}/wolverine/ | sed -n '1,30p'
+
+echo "DONE ✅"
