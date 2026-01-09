@@ -1,57 +1,52 @@
 set -euo pipefail
 TS="$(date +%Y%m%d_%H%M%S)"
 
-SRC="/var/www/fireinners-test"
-ULT="$SRC/ultimate"
-BACK="/var/www/fireinners-test-backup-$TS"
+WEB="/var/www/fireinners-test"
+ULT="$WEB/ultimate"
+SNIP="/etc/nginx/snippets/fireinners_test.conf"
 
-mkdir -p "$ULT" "$BACK"
+echo "=== 1) Voir la vraie cause (logs) ==="
+tail -n 80 /var/log/nginx/error.log || true
 
-echo "=== 1) Dépendances ==="
-apt-get update -y
-apt-get install -y ffmpeg zip
+echo
+echo "=== 2) Fix permissions (403 classique) ==="
+mkdir -p "$ULT"
+chown -R www-data:www-data "$WEB" || true
+chmod 0755 /var /var/www "$WEB" "$ULT" || true
+chmod -R a+rX "$WEB" || true
 
-echo "=== 2) Compte images dans /test ==="
-COUNT="$(find "$SRC" -maxdepth 1 -type f \( -iname "*.png" -o -iname "*.jpg" -o -iname "*.jpeg" \) | wc -l)"
-echo "Images trouvées: $COUNT"
-[ "$COUNT" -gt 0 ] || { echo "❌ 0 image dans $SRC"; exit 1; }
+echo
+echo "=== 3) Si /ultimate/ n'a pas d'index, on en crée un (sinon 403 directory index forbidden) ==="
+if [ ! -f "$ULT/index.html" ]; then
+  cat > "$ULT/index.html" <<'HTML'
+<!doctype html><meta charset="utf-8">
+<title>ultimate</title>
+<ul>
+  <li><a href="ultimate.mp4">ultimate.mp4</a></li>
+  <li><a href="ultimate.zip">ultimate.zip</a></li>
+</ul>
+HTML
+fi
 
-echo "=== 3) Build ULTIMATE (ZIP + MP4) dans $ULT ==="
-rm -f "$ULT/ultimate.zip" "$ULT/ultimate.mp4" 2>/dev/null || true
-rm -rf "$ULT/frames" 2>/dev/null || true
-mkdir -p "$ULT/frames"
+echo
+echo "=== 4) Snippet nginx /test (autorise ultimate/) ==="
+cat > "$SNIP" <<'NGX'
+location = /test { return 301 /test/; }
 
-# ZIP
-( cd "$SRC" && zip -q -r "$ULT/ultimate.zip" . -i "*.png" "*.jpg" "*.jpeg" )
-ls -lah "$ULT/ultimate.zip"
+location ^~ /test/ {
+  alias /var/www/fireinners-test/;
+  index index.html;
+  try_files $uri $uri/ =404;
+  add_header Cache-Control "no-store" always;
+}
+NGX
 
-# MP4 (30 fps) à partir des images triées par nom
-n=0
-for f in $(find "$SRC" -maxdepth 1 -type f \( -iname "*.png" -o -iname "*.jpg" -o -iname "*.jpeg" \) -printf "%f\n" | sort); do
-  n=$((n+1))
-  printf -v frame "$ULT/frames/frame_%06d.png" "$n"
-  if echo "$f" | grep -Eiq '\.(jpg|jpeg)$'; then
-    ffmpeg -loglevel error -y -i "$SRC/$f" "$frame"
-  else
-    cp -a "$SRC/$f" "$frame"
-  fi
-done
+echo
+echo "=== 5) Test + reload ==="
+nginx -t
+systemctl reload nginx
 
-ffmpeg -y -loglevel error -framerate 30 -i "$ULT/frames/frame_%06d.png" \
-  -c:v libx264 -pix_fmt yuv420p -movflags +faststart "$ULT/ultimate.mp4"
-
-ls -lah "$ULT/ultimate.mp4"
-
-echo "=== 4) Backup + retirer toutes les images originales de /test (on garde index.html + ultimate/*) ==="
-# move seulement les images au root de /test
-shopt -s nullglob
-mv "$SRC"/*.png "$BACK"/ 2>/dev/null || true
-mv "$SRC"/*.jpg "$BACK"/ 2>/dev/null || true
-mv "$SRC"/*.jpeg "$BACK"/ 2>/dev/null || true
-shopt -u nullglob
-
-echo "=== 5) Résultat ==="
-echo "✅ ULTIME gardé: $ULT/ultimate.mp4 et $ULT/ultimate.zip"
-echo "✅ Anciennes images déplacées: $BACK"
-echo "➡️ URL: https://fireinners.online/test/ultimate/ultimate.mp4"
-echo "➡️ URL: https://fireinners.online/test/ultimate/ultimate.zip"
+echo
+echo "=== 6) Test local (reproduit l'extérieur) ==="
+curl -I https://127.0.0.1/test/ultimate/ --insecure -H "Host: fireinners.online" | head -n 20 || true
+curl -I https://127.0.0.1/test/ultimate/ultimate.mp4 --insecure -H "Host: fireinners.online" | head -n 20 || true
