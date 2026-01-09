@@ -1,194 +1,114 @@
-# ROOT — Visual index viewer (slideshow + grid) served from /wolverine/_index_versions/
 set -euo pipefail
 
 UI_DIST="/var/www/wolverine"
 ARCH_GLOB="/var/www/_ARCHIVE_WOLVERINE_*"
-OUT_DIR="${UI_DIST}/_index_versions"
+OUT_DIR="$UI_DIST/_index_versions"
 
 mkdir -p "$OUT_DIR"
 
-echo "=== 1) Collect index candidates ==="
+# 1) Liste des index (actuel + archives), triés newest -> oldest
 MAP="/tmp/_all_indexes.txt"
 : > "$MAP"
-
-# current deploy
-if [ -d "$UI_DIST" ]; then
-  find "$UI_DIST" -maxdepth 1 -type f -name "index.html*" -print >> "$MAP" || true
-fi
-
-# archives
+find "$UI_DIST" -maxdepth 1 -type f -name "index.html*" -print >> "$MAP" 2>/dev/null || true
 for a in $ARCH_GLOB; do
   [ -d "$a" ] || continue
-  find "$a" -maxdepth 3 -type f -name "index.html*" -print >> "$MAP" || true
+  find "$a" -maxdepth 3 -type f -name "index.html*" -print >> "$MAP" 2>/dev/null || true
 done
 
-# sort newest first
-python3 - <<'PY' "$MAP"
+python3 - <<'PY' "$MAP" > "${MAP}.sorted"
 import os,sys
-paths=[p.strip() for p in open(sys.argv[1]) if p.strip() and os.path.exists(p.strip())]
-paths.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-for p in paths: print(p)
-PY > "${MAP}.sorted"
-
-COUNT="$(wc -l < "${MAP}.sorted" | tr -d ' ')"
-echo "Found: $COUNT index files"
-
-echo "=== 2) Copy into web folder as v0001.html ... ==="
-# clean old versions, keep only viewer files (safe wipe)
-find "$OUT_DIR" -maxdepth 1 -type f -name "v*.html" -delete 2>/dev/null || true
-rm -f "$OUT_DIR/list.json" "$OUT_DIR/viewer.html" "$OUT_DIR/grid.html" 2>/dev/null || true
-
-i=0
-python3 - <<'PY' "${MAP}.sorted" "$OUT_DIR"
-import os,sys,shutil,time,json
-src_list=[l.strip() for l in open(sys.argv[1]) if l.strip()]
-out_dir=sys.argv[2]
-items=[]
-i=0
-for src in src_list:
-  i+=1
-  name=f"v{i:04d}.html"
-  dst=os.path.join(out_dir,name)
-  shutil.copy2(src,dst)
-  st=os.stat(src)
-  items.append({
-    "id": i,
-    "file": name,
-    "mtime": int(st.st_mtime),
-    "mtime_iso": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.st_mtime)),
-    "size": st.st_size,
-    "src": src
-  })
-with open(os.path.join(out_dir,"list.json"),"w") as f:
-  json.dump(items,f,indent=2)
-print(f"Copied {len(items)} versions into {out_dir}")
+p=[x.strip() for x in open(sys.argv[1]) if x.strip() and os.path.exists(x.strip())]
+p.sort(key=lambda f: os.path.getmtime(f), reverse=True)
+print("\n".join(p))
 PY
 
-echo "=== 3) Create slideshow viewer (10s rotate) ==="
-cat > "$OUT_DIR/viewer.html" <<'HTML'
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>Wolverine Index Viewer</title>
-  <style>
-    body{margin:0;font-family:system-ui,Arial}
-    .top{position:sticky;top:0;background:#111;color:#fff;padding:10px;display:flex;gap:10px;align-items:center;z-index:9}
-    button,select,input{padding:6px 10px}
-    .meta{opacity:.85;font-size:12px}
-    iframe{width:100%;height:calc(100vh - 62px);border:0;background:#fff}
-    .row{display:flex;flex-direction:column;gap:4px}
-  </style>
-</head>
-<body>
-  <div class="top">
-    <div class="row">
-      <div><b>Index Slideshow</b> — <span id="pos">0/0</span></div>
-      <div class="meta" id="meta">…</div>
-    </div>
-    <div style="flex:1"></div>
-    <label class="meta">Delay(s)</label>
-    <input id="delay" type="number" min="1" value="10" style="width:70px"/>
-    <button id="prev">Prev</button>
-    <button id="next">Next</button>
-    <button id="play">Pause</button>
-    <a class="meta" href="./grid.html" style="color:#9cf">Grid</a>
-  </div>
+# 2) Copie en v0001.html, v0002.html...
+rm -f "$OUT_DIR"/v*.html "$OUT_DIR/list.json" "$OUT_DIR/viewer.html" "$OUT_DIR/grid.html" 2>/dev/null || true
 
-  <iframe id="frame" src="about:blank"></iframe>
+python3 - <<'PY' "${MAP}.sorted" "$OUT_DIR"
+import os,sys,shutil,time,json
+src=[l.strip() for l in open(sys.argv[1]) if l.strip()]
+out=sys.argv[2]
+items=[]
+for i,s in enumerate(src, start=1):
+    name=f"v{i:04d}.html"
+    dst=os.path.join(out,name)
+    shutil.copy2(s,dst)
+    st=os.stat(s)
+    items.append({"file":name,"mtime_iso":time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.st_mtime)),"size":st.st_size})
+open(os.path.join(out,"list.json"),"w").write(json.dumps(items,indent=2))
+print("Copied",len(items),"files ->",out)
+PY
 
+# 3) Slideshow 10s
+cat > "$OUT_DIR/viewer.html" <<'EOF'
+<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Index Slideshow</title>
+<style>
+body{margin:0;font-family:system-ui} .top{position:sticky;top:0;background:#111;color:#fff;padding:10px;display:flex;gap:10px;align-items:center}
+iframe{width:100%;height:calc(100vh - 56px);border:0;background:#fff} .meta{opacity:.85;font-size:12px}
+button,input{padding:6px 10px}
+</style>
+<div class="top">
+  <b>Index Slideshow</b> <span id="pos" class="meta">0/0</span> <span id="meta" class="meta"></span>
+  <div style="flex:1"></div>
+  <span class="meta">Delay(s)</span><input id="delay" type="number" value="10" min="1" style="width:70px">
+  <button id="prev">Prev</button><button id="next">Next</button><button id="play">Pause</button>
+  <a class="meta" href="./grid.html" style="color:#9cf">Grid</a>
+</div>
+<iframe id="frame"></iframe>
 <script>
-let list=[], idx=0, timer=null, playing=true;
-
-function show(i){
+let list=[],i=0,t=null,playing=true;
+function show(n){
   if(!list.length) return;
-  idx = (i + list.length) % list.length;
-  const it = list[idx];
-  document.getElementById('frame').src = it.file;
-  document.getElementById('pos').textContent = `${idx+1}/${list.length}`;
-  document.getElementById('meta').textContent =
-    `${it.file} | ${it.mtime_iso} | ${it.size} bytes | src: ${it.src}`;
+  i=(n+list.length)%list.length;
+  const it=list[i];
+  frame.src=it.file;
+  pos.textContent=`${i+1}/${list.length}`;
+  meta.textContent=`${it.file} | ${it.mtime_iso} | ${it.size} bytes`;
 }
-function step(n){ show(idx+n); }
 function start(){
-  stop();
-  const ms = Math.max(1, Number(document.getElementById('delay').value||10)) * 1000;
-  timer = setInterval(()=>{ if(playing) step(1); }, ms);
+  if(t) clearInterval(t);
+  const ms=Math.max(1,Number(delay.value||10))*1000;
+  t=setInterval(()=>{ if(playing) show(i+1); },ms);
 }
-function stop(){ if(timer) clearInterval(timer); timer=null; }
-
-document.getElementById('prev').onclick=()=>step(-1);
-document.getElementById('next').onclick=()=>step(1);
-document.getElementById('play').onclick=()=>{
-  playing=!playing;
-  document.getElementById('play').textContent = playing ? "Pause" : "Play";
-};
-
-fetch('./list.json').then(r=>r.json()).then(j=>{
-  list=j;
-  show(0);
-  start();
-});
+prev.onclick=()=>show(i-1);
+next.onclick=()=>show(i+1);
+play.onclick=()=>{playing=!playing; play.textContent=playing?"Pause":"Play";}
+fetch("./list.json").then(r=>r.json()).then(j=>{list=j; show(0); start();});
 </script>
-</body>
-</html>
-HTML
+EOF
 
-echo "=== 4) Create grid viewer (all mini windows) ==="
-cat > "$OUT_DIR/grid.html" <<'HTML'
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>Wolverine Index Grid</title>
-  <style>
-    body{margin:0;font-family:system-ui,Arial;background:#0b0b0b;color:#fff}
-    .top{position:sticky;top:0;background:#111;padding:10px;z-index:9;display:flex;gap:10px;align-items:center}
-    .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:10px;padding:10px}
-    .card{background:#151515;border:1px solid #2a2a2a;border-radius:10px;overflow:hidden}
-    .meta{padding:8px;font-size:12px;opacity:.9;display:flex;justify-content:space-between;gap:10px}
-    iframe{width:100%;height:320px;border:0;background:#fff}
-    a{color:#9cf}
-  </style>
-</head>
-<body>
-  <div class="top">
-    <b>Index Grid</b>
-    <span id="count" style="opacity:.85">…</span>
-    <div style="flex:1"></div>
-    <a href="./viewer.html">Slideshow</a>
-  </div>
-  <div class="grid" id="grid"></div>
-
+# 4) Grid (toutes en petites fenêtres)
+cat > "$OUT_DIR/grid.html" <<'EOF'
+<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Index Grid</title>
+<style>
+body{margin:0;font-family:system-ui;background:#0b0b0b;color:#fff}
+.top{position:sticky;top:0;background:#111;padding:10px;display:flex;gap:10px;align-items:center}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:10px;padding:10px}
+.card{background:#151515;border:1px solid #2a2a2a;border-radius:10px;overflow:hidden}
+.meta{padding:8px;font-size:12px;opacity:.9;display:flex;justify-content:space-between}
+iframe{width:100%;height:320px;border:0;background:#fff}
+a{color:#9cf}
+</style>
+<div class="top"><b>Index Grid</b> <span id="count" style="opacity:.85"></span><div style="flex:1"></div><a href="./viewer.html">Slideshow</a></div>
+<div class="grid" id="g"></div>
 <script>
-fetch('./list.json').then(r=>r.json()).then(list=>{
-  document.getElementById('count').textContent = `${list.length} versions`;
-  const grid=document.getElementById('grid');
+fetch("./list.json").then(r=>r.json()).then(list=>{
+  count.textContent=list.length+" versions";
   for(const it of list){
-    const card=document.createElement('div');
-    card.className='card';
-    card.innerHTML = `
-      <div class="meta">
-        <span>${it.file}</span>
-        <span>${it.mtime_iso}</span>
-      </div>
-      <iframe loading="lazy" src="${it.file}"></iframe>
-      <div class="meta">
-        <a href="${it.file}" target="_blank">Open</a>
-        <span>${it.size} bytes</span>
-      </div>
-    `;
-    grid.appendChild(card);
+    const d=document.createElement("div");
+    d.className="card";
+    d.innerHTML=`<div class="meta"><span>${it.file}</span><span>${it.mtime_iso}</span></div>
+    <iframe loading="lazy" src="${it.file}"></iframe>
+    <div class="meta"><a target="_blank" href="${it.file}">Open</a><span>${it.size} bytes</span></div>`;
+    g.appendChild(d);
   }
 });
 </script>
-</body>
-</html>
-HTML
+EOF
 
-echo "=== 5) Permissions ==="
 chown -R www-data:www-data "$OUT_DIR" 2>/dev/null || true
 chmod -R a+rX "$OUT_DIR" || true
 
