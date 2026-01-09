@@ -1,63 +1,47 @@
 set -euo pipefail
+
 WORK="/root/phantom-docker"
 OUT="/root/phantom-out"
-URL="https://fireinners.online/test/"
-
 mkdir -p "$WORK" "$OUT"
 cd "$WORK"
 
-# JS render (si pas déjà là)
+# render.js (bypass cloudflare + ignore SSL)
 cat > render.js <<'JS'
 var page = require('webpage').create();
 var system = require('system');
 
-if (system.args.length < 3) { console.log("Usage: phantomjs render.js <url> <out.png>"); phantom.exit(1); }
 var url = system.args[1];
 var out = system.args[2];
 
 page.viewportSize = { width: 1400, height: 900 };
+page.settings.ignoreSslErrors = true;
+page.settings.webSecurityEnabled = false;
+page.settings.sslProtocol = "any";
+page.customHeaders = { "Host": "fireinners.online" };
+
+page.onConsoleMessage = function(msg){ console.log("[page]", msg); };
+page.onError = function(msg){ console.log("[error]", msg); };
+
 page.open(url, function(status) {
-  if (status !== 'success') { console.log("FAIL open:", status); phantom.exit(2); }
-  window.setTimeout(function(){ page.render(out); console.log("OK wrote", out); phantom.exit(0); }, 2000);
+  console.log("OPEN:", status, url);
+  if (status !== 'success') phantom.exit(2);
+
+  window.setTimeout(function() {
+    page.render(out);
+    console.log("OK wrote", out);
+    phantom.exit(0);
+  }, 2000);
 });
 JS
 
-# Dockerfile (OpenSSL conf neutralisée)
-cat > Dockerfile <<'DOCKER'
-FROM debian:bullseye-slim
+# Nettoie l'ancien output
+rm -f "$OUT/test.png" 2>/dev/null || true
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    wget ca-certificates bzip2 libfontconfig1 libfreetype6 \
- && rm -rf /var/lib/apt/lists/*
-
-# IMPORTANT: ignore la conf OpenSSL du container
-ENV OPENSSL_CONF=/dev/null
-ENV OPENSSL_MODULES=/dev/null
-
-WORKDIR /opt
-RUN wget -O phantomjs.tar.bz2 https://bitbucket.org/ariya/phantomjs/downloads/phantomjs-2.1.1-linux-x86_64.tar.bz2 \
- && tar -xjf phantomjs.tar.bz2 \
- && mv phantomjs-2.1.1-linux-x86_64/bin/phantomjs /usr/local/bin/phantomjs \
- && chmod +x /usr/local/bin/phantomjs \
- && rm -rf /opt/*
-
-CMD ["phantomjs","--version"]
-DOCKER
-
-echo "=== Build ==="
-docker build -t phantom-local:2.1.1 .
-
-echo "=== Check libs ==="
-docker run --rm phantom-local:2.1.1 sh -lc 'ldd /usr/local/bin/phantomjs | egrep -i "not found|ssl|crypto" || true'
-
-echo "=== Version (avec OpenSSL neutralisé) ==="
-docker run --rm -e OPENSSL_CONF=/dev/null -e OPENSSL_MODULES=/dev/null phantom-local:2.1.1 phantomjs --version
-
-echo "=== Render ==="
-docker run --rm \
+# IMPORTANT: --network host pour atteindre 127.0.0.1 du VPS
+timeout 40s docker run --rm --network host \
   -e OPENSSL_CONF=/dev/null -e OPENSSL_MODULES=/dev/null \
-  -v "$OUT":/out -v "$WORK":/work -w /work phantom-local:2.1.1 \
-  phantomjs render.js "$URL" /out/test.png
+  -v "$OUT":/out -v "$WORK":/work -w /work \
+  phantom-local:2.1.1 \
+  phantomjs render.js "https://127.0.0.1/test/" "/out/test.png" || true
 
-ls -lah "$OUT/test.png"
-echo "✅ Screenshot: $OUT/test.png"
+ls -lah "$OUT/test.png" || true
