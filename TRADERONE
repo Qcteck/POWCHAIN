@@ -1,80 +1,31 @@
 set -euo pipefail
 
-OUT="/root/nginx_conflicts_best"
-mkdir -p "$OUT"
-
-echo "=== Extract server blocks for fireinners.online ==="
-FILES="$(nginx -T 2>/dev/null | awk '
+echo "=== 1) Quels fichiers contiennent server_name fireinners.online ==="
+FILES=$(nginx -T 2>/dev/null | awk '
   /^# configuration file /{f=$4}
   /server_name[[:space:]]+(fireinners\.online|www\.fireinners\.online)/{print f}
-' | sort -u)"
+' | sort -u)
 
 echo "$FILES" | sed '/^$/d'
+echo
 
-i=0
+echo "=== 2) Résumé lisible de chaque fichier (listen/root/locations/proxy) ==="
 for f in $FILES; do
   [ -f "$f" ] || continue
-  base="$(basename "$f")"
-  awk -v OUTDIR="$OUT" -v BASENAME="$base" '
-    function flush(){
-      if(inblock && keep){
-        out=sprintf("%s/server_%02d__%s.conf", OUTDIR, ++IDX, BASENAME)
-        print buf > out
-        close(out)
-      }
-      buf=""; inblock=0; keep=0; lvl=0
-    }
-    {
-      line=$0
-      if(!inblock && line ~ /^[[:space:]]*server[[:space:]]*\{/){ inblock=1 }
-      if(inblock){
-        buf = buf line "\n"
-        if(line ~ /server_name[[:space:]]+(fireinners\.online|www\.fireinners\.online)/) keep=1
-        for(j=1;j<=length(line);j++){
-          c=substr(line,j,1)
-          if(c=="{") lvl++
-          else if(c=="}") lvl--
-        }
-        if(lvl==0){ flush() }
-      }
-    }
-    END{ flush() }
-  ' "$f"
+  echo "=============================="
+  echo "FILE: $f"
+  echo "---- KEY LINES ----"
+  grep -nE 'server_name|listen|root|index|return|rewrite|try_files|location|proxy_pass|ssl_certificate' "$f" \
+    | sed -n '1,260p'
+  echo
 done
 
-echo
-echo "=== Score candidates (keep highest) ==="
-best=""
-bestscore=-999
-
-for s in "$OUT"/server_*.conf; do
-  [ -f "$s" ] || continue
-  score=0
-
-  # MUST-HAVE vibes
-  grep -qiE 'listen[[:space:]]+443' "$s" && score=$((score+10))
-  grep -qiE 'ssl_certificate|ssl_certificate_key|listen[[:space:]]+443[[:space:]]+ssl' "$s" && score=$((score+10))
-
-  # what we want served
-  grep -qiE '/wolverine' "$s" && score=$((score+6))
-  grep -qiE 'traderone/api' "$s" && score=$((score+6))
-  grep -qiE '/_vpsmap' "$s" && score=$((score+4))
-
-  # red flags (loops / weird rewrites)
-  grep -qiE 'rewrite|try_files.*index\.html' "$s" && score=$((score-3))
-  grep -qiE 'return[[:space:]]+301[[:space:]]+https' "$s" && score=$((score-1))
-
-  echo "score=$score  $(basename "$s")"
-  if [ "$score" -gt "$bestscore" ]; then
-    bestscore="$score"
-    best="$s"
-  fi
+echo "=== 3) Diff rapide (fichier 1 vs les autres) ==="
+FIRST="$(echo "$FILES" | sed '/^$/d' | head -n 1)"
+for f in $(echo "$FILES" | sed '/^$/d' | tail -n +2); do
+  echo "######## DIFF: $FIRST  vs  $f ########"
+  diff -u "$FIRST" "$f" | head -n 220 || true
+  echo
 done
 
-echo
-echo "✅ BEST = $(basename "$best")  (score=$bestscore)"
-echo "File content summary:"
-grep -nE 'server_name|listen|root|index|location|proxy_pass|include|return|rewrite|try_files|ssl_certificate' "$best" | head -n 220
-
-echo
-echo "NEXT STEP (safe): I can give you a batch to DISABLE the others after you confirm this best one."
+echo "DONE ✅"
