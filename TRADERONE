@@ -1,24 +1,62 @@
+# Batch ROOT: publier toutes les PNG sur https://fireinners.online/test/
 set -euo pipefail
 TS="$(date +%Y%m%d_%H%M%S)"
 
 VHOST="/etc/nginx/sites-enabled/fireinners.online-ssl"
-SNIP="/etc/nginx/snippets/wolverine_final.conf"
+SNIP_TEST="/etc/nginx/snippets/fireinners_test.conf"
+WEB_DIR="/var/www/fireinners-test"
 
-cp -a "$VHOST" "$VHOST.bak.$TS"
+# 1) Trouver le dernier dossier PNG
+PNG_DIR="$(ls -d /root/bak_renders_machine_*/png 2>/dev/null | tail -n 1 || true)"
+[ -n "${PNG_DIR:-}" ] || { echo "❌ Aucun dossier PNG trouvé: /root/bak_renders_machine_*/png"; exit 1; }
 
-# Commente la ligne include (robuste)
-perl -pi -e 's~^(\s*)include\s+/etc/nginx/snippets/wolverine_final\.conf;\s*$~$1# include /etc/nginx/snippets/wolverine_final.conf;~' "$VHOST"
+echo "✅ PNG_DIR = $PNG_DIR"
 
-echo "=== verify include line ==="
-grep -n "wolverine_final.conf" "$VHOST" || true
+# 2) Dossier web + copie des images
+mkdir -p "$WEB_DIR"
+rm -f "$WEB_DIR"/*.png 2>/dev/null || true
+cp -a "$PNG_DIR"/*.png "$WEB_DIR"/
 
-echo "=== nginx test ==="
+# 3) Générer une galerie index.html
+python3 - <<'PY'
+import glob, html, os
+d="/var/www/fireinners-test"
+imgs=sorted(glob.glob(os.path.join(d,"*.png")))
+with open(os.path.join(d,"index.html"),"w",encoding="utf-8") as f:
+    f.write("<!doctype html><meta charset=utf-8><title>fireinners /test</title>")
+    f.write("<style>body{font-family:system-ui;background:#0b0f14;color:#e8eef6;margin:20px}"
+            ".g{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px}"
+            ".c{background:#121826;border:1px solid #223049;border-radius:12px;padding:10px}"
+            "img{width:100%;border-radius:10px} a{color:#7dd3fc}</style>")
+    f.write(f"<h2>/test — renders ({len(imgs)})</h2><div class=g>")
+    for p in imgs:
+        n=html.escape(os.path.basename(p))
+        f.write(f'<div class=c><a href="{n}"><img loading="lazy" src="{n}"></a>'
+                f'<div style="margin-top:6px;font-size:12px;opacity:.8">{n}</div></div>')
+    f.write("</div>")
+print("✅ index.html galerie créé")
+PY
+
+# 4) Permissions
+chown -R www-data:www-data "$WEB_DIR" || true
+chmod -R a+rX "$WEB_DIR"
+
+# 5) Snippet nginx /test/
+cat > "$SNIP_TEST" <<'NGX'
+location ^~ /test/ {
+  alias /var/www/fireinners-test/;
+  index index.html;
+  try_files $uri $uri/ =404;
+  add_header Cache-Control "no-store" always;
+}
+NGX
+
+# 6) Inclure le snippet dans le vhost (une seule fois)
+grep -q "include /etc/nginx/snippets/fireinners_test.conf;" "$VHOST" || \
+  sed -i '0,/server[[:space:]]*{/s//server {\n    include \/etc\/nginx\/snippets\/fireinners_test.conf;/' "$VHOST"
+
+# 7) Test + reload
 nginx -t
 systemctl reload nginx
-echo "✅ OK (backup: $VHOST.bak.$TS)"
 
-
-
-
-nginx -T 2>/dev/null | grep -n "include /etc/nginx/snippets/wolverine_final.conf" || echo "OK: plus inclus"
-
+echo "✅ OK: https://fireinners.online/test/  (deploy $TS)"
