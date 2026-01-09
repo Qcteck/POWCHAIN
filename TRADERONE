@@ -1,61 +1,45 @@
 set -euo pipefail
 
-TS="$(date +%Y%m%d_%H%M%S)"
+# SOURCE (ce que tu veux tester) : ici v0008 (stable)
+SRC="/var/www/wolverine/_index_versions/v0008.html"
 
-echo "=== 1) Fichiers qui déclarent fireinners.online / www.fireinners.online ==="
-mapfile -t FILES < <(nginx -T 2>/dev/null | awk '
+# DEST test
+TEST_DIR="/var/www/fireinners_test"
+mkdir -p "$TEST_DIR"
+
+[ -f "$SRC" ] || { echo "❌ Missing $SRC"; exit 1; }
+
+cp -a "$SRC" "$TEST_DIR/index.html"
+chown -R www-data:www-data "$TEST_DIR" 2>/dev/null || true
+chmod -R a+rX "$TEST_DIR" || true
+
+# nginx snippet pour /test/
+SNIP="/etc/nginx/snippets/fireinners_test.conf"
+mkdir -p /etc/nginx/snippets
+
+cat > "$SNIP" <<'NGX'
+location = /test { return 301 /test/; }
+location ^~ /test/ {
+  alias /var/www/fireinners_test/;
+  try_files $uri $uri/ /test/index.html;
+}
+NGX
+
+# Inject l'include dans le server fireinners.online (tous les fichiers qui le déclarent)
+FILES="$(nginx -T 2>/dev/null | awk '
   /^# configuration file /{f=$4}
-  /server_name[[:space:]]+(fireinners\.online|www\.fireinners\.online)/{print f}
-' | sort -u)
+  /server_name/ && /fireinners\.online/ {print f}
+' | sort -u)"
 
-if [ "${#FILES[@]}" -eq 0 ]; then
-  echo "❌ Aucun fichier trouvé avec server_name fireinners.online"
-  exit 1
-fi
-
-i=0
-for f in "${FILES[@]}"; do
-  i=$((i+1))
-  echo "[$i] $f"
-  echo "    --- key lines ---"
-  grep -nE 'server_name|listen|root|location|proxy_pass|try_files|return|rewrite|ssl_certificate' "$f" | head -n 40 || true
-  echo
+for f in $FILES; do
+  [ -f "$f" ] || continue
+  grep -q "snippets/fireinners_test.conf" "$f" && continue
+  cp -a "$f" "$f.bak.test.$(date +%Y%m%d_%H%M%S)"
+  sed -i '0,/server[[:space:]]*{/s//server {\n    include \/etc\/nginx\/snippets\/fireinners_test.conf;/' "$f"
 done
 
-echo "=== 2) Choisis le fichier à GARDER (numéro) ==="
-read -r -p "KEEP (1-${#FILES[@]}): " KEEP
+nginx -t && systemctl reload nginx
 
-if ! [[ "$KEEP" =~ ^[0-9]+$ ]] || [ "$KEEP" -lt 1 ] || [ "$KEEP" -gt "${#FILES[@]}" ]; then
-  echo "❌ Choix invalide."
-  exit 2
-fi
-
-KEEP_FILE="${FILES[$((KEEP-1))]}"
-echo "✅ KEEP = $KEEP_FILE"
-echo
-
-echo "=== 3) Backup + désactivation server_name des AUTRES (sans delete) ==="
-n=0
-for f in "${FILES[@]}"; do
-  [ "$f" = "$KEEP_FILE" ] && continue
-  n=$((n+1))
-  cp -a "$f" "$f.bak.$TS"
-
-  # remplace server_name fireinners.online / www.fireinners.online par un nom unique désactivé
-  sed -i -E \
-    -e "s/server_name[[:space:]]+fireinners\.online([^;]*);/server_name _disabled_${TS}_${n}.local;/g" \
-    -e "s/server_name[[:space:]]+www\.fireinners\.online([^;]*);/server_name _disabled_www_${TS}_${n}.local;/g" \
-    "$f"
-
-  echo "Disabled server_name in: $f"
-done
-
-echo
-echo "=== 4) Test + reload nginx ==="
-nginx -t
-systemctl reload nginx
-
-echo
-echo "=== 5) Vérif rapide warnings ==="
-nginx -T 2>/dev/null | grep -i "conflicting server name" | head -n 20 || echo "✅ No more conflicts"
-echo "DONE ✅"
+echo "✅ TEST LINK:"
+echo "https://fireinners.online/test/"
+curl -sS -I https://fireinners.online/test/ | head -n 12 || true
