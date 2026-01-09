@@ -1,112 +1,83 @@
+cat > /root/batch_wolverine_fix.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
 TS="$(date +%F_%H%M%S)"
-OUT="/root/nginx_wolverine_audit_${TS}.log"
+LOG="/root/wolverine_batch_${TS}.log"
+exec > >(tee -a "$LOG") 2>&1
 
-exec > >(tee -a "$OUT") 2>&1
+echo "=== Wolverine / NGINX batch (${TS}) ==="
 
-echo "=== NGINX/WOLVERINE AUDIT @ $TS ==="
-echo "Host: $(hostname)  User: $(whoami)"
 echo
+echo "== 1) Services & ports =="
+systemctl --no-pager status nginx || true
+systemctl --no-pager status firewalld || true
+ss -lntp | egrep ':(80|443)\s' || true
 
-echo "=== 0) OS / UPTIME ==="
-uname -a || true
-uptime || true
 echo
+echo "== 2) NGINX config test =="
+nginx -t
 
-echo "=== 1) SERVICES (nginx + app) ==="
-systemctl status nginx --no-pager -l || true
 echo
-# adapte si ton service s'appelle différemment
-systemctl status traderone --no-pager -l || true
-systemctl status wolverine --no-pager -l || true
-echo
-
-echo "=== 2) PORTS LISTEN (80/443 + 3000/8484 au cas où) ==="
-ss -lntp | egrep -n ":(80|443|3000|8484)\b" || true
-echo
-
-echo "=== 3) NGINX TEST CONFIG ==="
-nginx -t || true
-echo
-
-echo "=== 4) NGINX FULL DUMP (nginx -T) -> extrait fireinners + wolverine ==="
-NGT="/root/nginxT_${TS}.txt"
-nginx -T > "$NGT" 2>/dev/null || true
-echo "Saved: $NGT"
-echo
-
-echo "--- 4.a) server_name fireinners / www.fireinners ---"
-grep -nE "server_name .*fireinners|server_name.*www\.fireinners" "$NGT" || true
-echo
-
-echo "--- 4.b) locations /wolverine (détection doublons) ---"
-# affiche les lignes "location /wolverine" + un peu de contexte
-grep -nE "location\s+\^~?\s*/wolverine|location\s+/wolverine" "$NGT" -n || true
-echo
-
-echo "--- 4.c) try_files / rewrite / index.html suspects ---"
-grep -nE "try_files|rewrite|index\.html" "$NGT" | head -n 200 || true
-echo
-
-echo "=== 5) LOGS NGINX (erreurs récentes: rewrite cycle / index.html) ==="
-# chemins logs classiques
-ERR1="/var/log/nginx/error.log"
-ACC1="/var/log/nginx/access.log"
-if [ -f "$ERR1" ]; then
-  echo "--- last 200 error.log ---"
-  tail -n 200 "$ERR1" | sed -n '1,200p'
-  echo
-  echo "--- grep rewrite cycle /index.html (last 2000 lines) ---"
-  tail -n 2000 "$ERR1" | egrep -n "rewrite|internal redirection|/index\.html|wolverine" || true
-else
-  echo "No $ERR1"
-fi
-echo
-
-echo "=== 6) TESTS LOCAUX (curl direct) ==="
-set +e
-curl -I --max-time 5 http://127.0.0.1/ ; echo
-curl -I --max-time 5 http://127.0.0.1/wolverine/ ; echo
-curl -Ik --max-time 5 https://127.0.0.1/ ; echo
-curl -Ik --max-time 5 https://127.0.0.1/wolverine/ ; echo
-set -e
-echo
-
-echo "=== 7) QUICK CHECK : fichiers statiques next sous /var/www/wolverine ==="
-ls -lah /var/www/wolverine 2>/dev/null || true
-ls -lah /var/www/wolverine/_next 2>/dev/null || true
-echo
-
-echo "=== 8) SUGGEST FIX (snippet prêt à coller) ==="
-cat <<'SNIP'
-
---- A) Fix le plus fréquent (boucle): 1 seule location /wolverine + try_files correct ---
-
-Dans ton server { ... } pour fireinners.online, garde UNE SEULE location:
-
-location ^~ /wolverine/ {
-  root /var/www;                 # doit contenir /var/www/wolverine/...
-  try_files $uri $uri/ /wolverine/index.html;
+echo "== 3) Dump des blocs utiles (server_name /wolverine) =="
+nginx -T 2>/dev/null | awk '
+/^\s*server\s*\{/ {inserver=1; buf="server {\n"; next}
+inserver==1 {buf=buf $0 "\n"}
+inserver==1 && /^\s*\}\s*$/ {
+  inserver=0
+  if (buf ~ /server_name/ && (buf ~ /fireinners\.online/ || buf ~ /www\.fireinners\.online/)) {
+    print "----- MATCHED SERVER -----"
+    print buf
+  }
 }
+' || true
 
-# (optionnel) pour éviter que /wolverine/index.html retombe dans une autre règle,
-# NE PAS avoir de rewrite global qui force /index.html pour tout.
-
---- B) Si tu proxifies l’API derrière /wolverine/api/ ---
-location ^~ /wolverine/api/ {
-  proxy_pass http://127.0.0.1:3000/;  # adapte le port
-  proxy_set_header Host $host;
-  proxy_set_header X-Real-IP $remote_addr;
-  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto $scheme;
-}
-
---- C) Test & reload ---
-nginx -t && systemctl reload nginx
-
-SNIP
 echo
+echo "== 4) Recherche doublons location /wolverine =="
+nginx -T 2>/dev/null | awk '
+/server_name/ {sn=$0}
+/location\s+\/wolverine(\s|\/|\{)/ {print "HIT:", sn, " => ", $0}
+' || true
 
-echo "=== DONE. Log saved: $OUT ==="
+echo
+echo "== 5) Recherche règles try_files/rewrite vers /index.html =="
+nginx -T 2>/dev/null | egrep -n 'try_files|rewrite|index\.html' | head -n 200 || true
+
+echo
+echo "== 6) Backup configs nginx =="
+mkdir -p /root/nginx_backups_full_${TS}
+tar -czf /root/nginx_backups_full_${TS}/nginx_etc_${TS}.tgz /etc/nginx
+echo "Backup: /root/nginx_backups_full_${TS}/nginx_etc_${TS}.tgz"
+
+echo
+echo "== 7) Vérif accès local HTTP/HTTPS (si nginx écoute) =="
+curl -sS -I http://127.0.0.1/ || true
+curl -sS -I http://127.0.0.1/wolverine/ || true
+curl -k -sS -I https://127.0.0.1/ || true
+curl -k -sS -I https://127.0.0.1/wolverine/ || true
+
+echo
+echo "== 8) Restart nginx =="
+systemctl restart nginx
+sleep 1
+systemctl --no-pager status nginx || true
+ss -lntp | egrep ':(80|443)\s' || true
+
+echo
+echo "== 9) Logs erreurs nginx (dernieres 120 lignes) =="
+tail -n 120 /var/log/nginx/error.log || true
+
+echo
+echo "== 10) Firewall rapide =="
+# (Ubuntu/Debian) UFW si présent
+command -v ufw >/dev/null 2>&1 && ufw status verbose || true
+# (RHEL) firewalld si présent
+command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --list-all || true
+
+echo
+echo "=== FIN. Log: $LOG ==="
+echo "Si tu colles ici: (1) le bloc server{} fireinners.online + (2) la location /wolverine, je te donne la conf exacte corrigée."
+BASH
+
+chmod +x /root/batch_wolverine_fix.sh
+echo "Script prêt: /root/batch_wolverine_fix.sh"
