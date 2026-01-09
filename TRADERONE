@@ -1,24 +1,89 @@
-# Batch ROOT — enlève les 2 blocks /tests (location = /tests et location ^~ /tests/) puis reload
+# Batch ROOT COMPLET — publie toutes les PNG sur https://fireinners.online/test/
+# + désactive les vhosts .bak activés + enlève /tests + ajoute /test + test & reload
 set -euo pipefail
 TS="$(date +%Y%m%d_%H%M%S)"
+
 VHOST="/etc/nginx/sites-enabled/fireinners.online-ssl"
+SNIP_TEST="/etc/nginx/snippets/fireinners_test.conf"
+WEB_DIR="/var/www/fireinners-test"
 
+echo "=== 0) BACKUP /etc/nginx ==="
+cp -a /etc/nginx "/etc/nginx.bak.$TS"
+
+echo "=== 1) Désactiver tous les vhosts *.bak* dans sites-enabled (sinon nginx charge les bak !) ==="
+mkdir -p /etc/nginx/sites-disabled
+shopt -s nullglob
+for f in /etc/nginx/sites-enabled/*.bak*; do
+  echo "Disable: $f -> /etc/nginx/sites-disabled/"
+  mv "$f" /etc/nginx/sites-disabled/
+done
+shopt -u nullglob
+
+echo "=== 2) Enlever /tests (les 2 locations) si présent ==="
 [ -f "$VHOST" ] || { echo "❌ VHOST introuvable: $VHOST"; exit 1; }
-cp -a "$VHOST" "$VHOST.bak.rm_tests_$TS"
+cp -a "$VHOST" "$VHOST.bak.before_edit.$TS"
 
-# Supprime les 2 locations (même si espaces différents)
 perl -0777 -i -pe '
 s/^\s*#\s*\/tests\s*->\s*\/test\/\s*\R//mg;
 s/^\s*location\s*=\s*\/tests\s*\{\s*return\s+301\s+\/test\/;\s*\}\s*\R//mg;
 s/^\s*location\s*\^~\s*\/tests\/\s*\{\s*return\s+301\s+\/test\/;\s*\}\s*\R//mg;
 ' "$VHOST"
-
-# Nettoyage lignes vides (optionnel)
 perl -0777 -i -pe 's/\n{3,}/\n\n/g' "$VHOST"
 
-echo "=== Vérif: plus de /tests ==="
-grep -nE "location\s+(=|\^~)\s+/tests" "$VHOST" || echo "✅ OK: aucun /tests"
+echo "=== 3) Trouver le dernier dossier PNG généré ==="
+PNG_DIR="$(ls -d /root/bak_renders_machine_*/png 2>/dev/null | tail -n 1 || true)"
+[ -n "${PNG_DIR:-}" ] || { echo "❌ Aucun PNG_DIR trouvé: /root/bak_renders_machine_*/png"; exit 1; }
+echo "PNG_DIR=$PNG_DIR"
 
+echo "=== 4) Copier les PNG dans /var/www/fireinners-test + générer la galerie ==="
+mkdir -p "$WEB_DIR"
+rm -f "$WEB_DIR"/*.png 2>/dev/null || true
+cp -a "$PNG_DIR"/*.png "$WEB_DIR"/
+
+python3 - <<'PY'
+import glob, html, os
+d="/var/www/fireinners-test"
+imgs=sorted(glob.glob(os.path.join(d,"*.png")))
+with open(os.path.join(d,"index.html"),"w",encoding="utf-8") as f:
+    f.write("<!doctype html><meta charset=utf-8><title>fireinners /test</title>")
+    f.write("<style>body{font-family:system-ui;background:#0b0f14;color:#e8eef6;margin:20px}"
+            ".g{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px}"
+            ".c{background:#121826;border:1px solid #223049;border-radius:12px;padding:10px}"
+            "img{width:100%;border-radius:10px} a{color:#7dd3fc}</style>")
+    f.write(f"<h2>/test — renders ({len(imgs)})</h2><div class=g>")
+    for p in imgs:
+        n=html.escape(os.path.basename(p))
+        f.write(f'<div class=c><a href="{n}"><img loading="lazy" src="{n}"></a>'
+                f'<div style="margin-top:6px;font-size:12px;opacity:.8">{n}</div></div>')
+    f.write("</div>")
+print("✅ index.html créé (", len(imgs), "images )")
+PY
+
+chown -R www-data:www-data "$WEB_DIR" || true
+chmod -R a+rX "$WEB_DIR"
+
+echo "=== 5) Créer le snippet Nginx /test/ ==="
+cat > "$SNIP_TEST" <<'NGX'
+location ^~ /test/ {
+  alias /var/www/fireinners-test/;
+  index index.html;
+  try_files $uri $uri/ =404;
+  add_header Cache-Control "no-store" always;
+}
+NGX
+
+echo "=== 6) Inclure le snippet /test dans le vhost (une seule fois) ==="
+if ! grep -q "include /etc/nginx/snippets/fireinners_test.conf;" "$VHOST"; then
+  sed -i '0,/server[[:space:]]*{/s//server {\n    include \/etc\/nginx\/snippets\/fireinners_test.conf;/' "$VHOST"
+fi
+
+echo "=== 7) Test + reload nginx ==="
 nginx -t
 systemctl reload nginx
-echo "✅ DONE (backup: $VHOST.bak.rm_tests_$TS)"
+
+echo "=== 8) Tests locaux (sur le VPS) ==="
+curl -I https://127.0.0.1/test/ --insecure | head -n 20 || true
+curl -s  https://127.0.0.1/test/ --insecure | head -n 20 || true
+
+echo
+echo "✅ DONE: https://fireinners.online/test/  (deploy $TS)"
