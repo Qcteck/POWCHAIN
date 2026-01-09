@@ -1,4 +1,71 @@
+set -euo pipefail
+
+echo "=== 0) Detect main docroot (fireinners.online) ==="
+DOCROOT="$(nginx -T 2>/dev/null | awk '
+  $1=="server_name" && $0 ~ /fireinners\.online/ {in=1}
+  in && $1=="root" {gsub(";","",$2); print $2; exit}
+')"
+echo "DOCROOT=$DOCROOT"
+[ -n "${DOCROOT:-}" ] || DOCROOT="/var/www/fireinners"
+mkdir -p "$DOCROOT"
+
+echo
+echo "=== 1) Create a real /index.html in DOCROOT (prevents redirect loops) ==="
+if [ ! -f "$DOCROOT/index.html" ]; then
+  cat > "$DOCROOT/index.html" <<'HTML'
+<!doctype html><meta charset="utf-8">
+<title>fireinners.online</title>
+<h1>OK</h1>
+<p>Root index present. Use /wolverine/ and /_vpsmap/.</p>
+HTML
+fi
+chown -R www-data:www-data "$DOCROOT" 2>/dev/null || true
+chmod -R a+rX "$DOCROOT" || true
+
+echo
+echo "=== 2) Write SAFE snippet for static dashboards (overrides catch-all) ==="
+SNIP="/etc/nginx/snippets/_static_exceptions.conf"
+mkdir -p /etc/nginx/snippets
+
+cat > "$SNIP" <<'NGX'
+# Stop rewrite loops by serving these paths as real static content first.
+
+location ^~ /_vpsmap/ {
+  root /var/www;
+  try_files $uri $uri/ /_vpsmap/index.html;
+}
+
+location = /wolverine/_index_versions { return 301 /wolverine/_index_versions/; }
+location ^~ /wolverine/_index_versions/ {
+  alias /var/www/wolverine/_index_versions/;
+  try_files $uri $uri/ =404;
+}
+NGX
+
+echo
+echo "=== 3) Ensure snippet is included in fireinners.online server blocks ==="
+FILES="$(nginx -T 2>/dev/null | awk '
+  /^# configuration file / {f=$4}
+  /server_name/ && /fireinners\.online/ {print f}
+' | sort -u)"
+
+echo "Candidate nginx files:"
+echo "$FILES"
+
+for f in $FILES; do
+  [ -f "$f" ] || continue
+  cp -a "$f" "$f.bak.staticfix.$(date +%Y%m%d_%H%M%S)" || true
+  grep -q "_static_exceptions.conf" "$f" && continue
+  # inject include right after first server { in that file
+  sed -i '0,/server[[:space:]]*{/s//server {\n    include \/etc\/nginx\/snippets\/_static_exceptions.conf;/' "$f"
+done
+
+echo
+echo "=== 4) Reload nginx ==="
 nginx -t
-tail -n 60 /var/log/nginx/error.log
+systemctl reload nginx
 
-
+echo
+echo "=== 5) Quick tests ==="
+curl -sS -I https://fireinners.online/_vpsmap/ | head -n 12 || true
+curl -sS -I https://fireinners.online/wolverine/_index_versions/viewer.html | head -n 12 || true
