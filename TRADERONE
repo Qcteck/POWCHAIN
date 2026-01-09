@@ -1,1 +1,99 @@
-bash --noprofile --norc -lc 'set -euo pipefail;TS="$(date -u +%Y%m%d-%H%M%S)";LOG="/root/vps_menage_${TS}.log";Q="/opt/_quarantine_vps_${TS}";mkdir -p "$Q/baks" "$Q/mixed";say(){ echo "[$(date -u +%F\ %T)] $*"|tee -a "$LOG"; };say "MEGA VPS MENAGE NO-GIT TS=$TS";say "Quarantine: $Q";say "Before disk:";df -hT|tee -a "$LOG";say "1) apt cache clean (safe)";if command -v apt-get>/dev/null 2>&1;then apt-get -y clean>>"$LOG" 2>&1||true;apt-get -y autoclean>>"$LOG" 2>&1||true;else say "apt-get not found, skip";fi;say "2) journald vacuum (safe)";if command -v journalctl>/dev/null 2>&1;then journalctl --vacuum-time=14d>>"$LOG" 2>&1||true;else say "journalctl not found, skip";fi;say "3) Fix /root/.profile cargo spam (safe)";if [ -f /root/.profile ] && grep -q "/root/.cargo/env" /root/.profile;then cp -a /root/.profile "$Q/root.profile.backup_${TS}"||true;grep -v "/root/.cargo/env" /root/.profile > /root/.profile.tmp || true;printf "\n[ -f /root/.cargo/env ] && . /root/.cargo/env\n" >> /root/.profile.tmp;mv /root/.profile.tmp /root/.profile;say "Updated /root/.profile (backup: $Q/root.profile.backup_${TS})";else say "No cargo env line to fix";fi;TARGETS="/opt/fireinners/frontend-react/app/dist/wolverine /opt/fireinners/frontend-react/app/dist /opt/fireinners /opt/traderone-opt /TRADERONE /root";move_bak(){ f="$1";rel="${f#/}";dest="$Q/baks/$rel";mkdir -p "$(dirname "$dest")";mv -n "$f" "$dest" 2>>"$LOG"||true; };move_mix(){ f="$1";rel="${f#/}";dest="$Q/mixed/$rel";mkdir -p "$(dirname "$dest")";mv -n "$f" "$dest" 2>>"$LOG"||true; };say "4) Quarantine backups (*.bak*, *.old, *~)";for base in $TARGETS;do [ -d "$base" ]||continue;find "$base" -type f \( -name "*.bak" -o -name "*.bak*" -o -name "*.bakfix*" -o -name "*~" -o -name "*.old" \) 2>/dev/null | while IFS= read -r f;do case "$f" in /opt/fireinners/sentinel/*|/opt/fireinners/CHARTE_FIREINNERS.*) continue;; esac;move_bak "$f";done;done;say "5) Quarantine fichiers suspects (HTML + bash markers)";for base in $TARGETS;do [ -d "$base" ]||continue;find "$base" -type f \( -name "*.html" -o -name "*.html.*" -o -name "*.bakfix*" \) 2>/dev/null | while IFS= read -r f;do grep -aEq "(set -euo pipefail|apt-get|journalctl|#!/usr/bin/env bash|^#!/bin/bash|git checkout|git push|find /|mv -n)" "$f" 2>/dev/null && { case "$f" in /opt/fireinners/sentinel/*|/opt/fireinners/CHARTE_FIREINNERS.*) continue;; esac;move_mix "$f"; };done;done;say "After disk:";df -hT|tee -a "$LOG";say "Quarantine size:";du -sh "$Q" 2>/dev/null|tee -a "$LOG"||true;say "DONE";say "Log: $LOG";say "Quarantine: $Q";echo "$LOG"'
+bash --noprofile --norc -lc 'set -euo pipefail;
+TS="$(date -u +%Y%m%d-%H%M%S)";
+LOG="/root/MEGA_BATCH_MENAGE_ROOT_${TS}.log";
+Q="/opt/_quarantine_vps_${TS}";
+mkdir -p "$Q/baks" "$Q/mixed" "$Q/meta";
+say(){ echo "[$(date -u +%F\ %T)] $*" | tee -a "$LOG"; }
+run(){ say "+ $*"; "$@" >>"$LOG" 2>&1 || { say "WARN: failed: $*"; return 0; }; }
+
+say "MEGA BATCH MENAGE ROOT  TS=$TS";
+say "Log: $LOG";
+say "Quarantine: $Q";
+
+# 0) Preflight
+say "0) Preflight";
+say "User: $(id -u)  Host: $(hostname)  Kernel: $(uname -r)";
+say "PATH: $PATH";
+say "Disk before:";
+df -hT | tee -a "$LOG";
+
+# 1) Fix cargo spam (create missing file)
+say "1) Fix cargo spam (/root/.cargo/env)";
+run mkdir -p /root/.cargo;
+if [ ! -f /root/.cargo/env ]; then
+  run sh -lc ": > /root/.cargo/env";
+  run chmod 644 /root/.cargo/env;
+  say "Created /root/.cargo/env";
+else
+  say "/root/.cargo/env already exists";
+fi
+
+# 2) Locate where it is sourced (report only)
+say "2) Locate cargo env sourcing (report)";
+grep -RIn --exclude-dir=.git --exclude="*.log" "/root/.cargo/env" /root /etc 2>/dev/null | head -n 80 | tee -a "$LOG" || true;
+
+# 3) apt cache clean (absolute paths)
+say "3) apt cache clean (absolute paths)";
+if [ -x /usr/bin/apt-get ]; then
+  run /usr/bin/apt-get -y clean;
+  run /usr/bin/apt-get -y autoclean;
+else
+  say "apt-get not found at /usr/bin/apt-get (skip)";
+fi
+
+# 4) journald vacuum (absolute paths)
+say "4) journald vacuum (absolute paths)";
+if [ -x /usr/bin/journalctl ]; then
+  run /usr/bin/journalctl --vacuum-time=14d;
+else
+  say "journalctl not found at /usr/bin/journalctl (skip)";
+fi
+
+# 5) Quarantine backups + junk (safe move)
+TARGETS="/opt/fireinners/frontend-react/app/dist/wolverine /opt/fireinners/frontend-react/app/dist /opt/fireinners /opt/traderone-opt /TRADERONE /root";
+move_to(){ src="$1"; dst="$2"; mkdir -p "$(dirname "$dst")"; if [ ! -e "$dst" ]; then mv -n "$src" "$dst" 2>>"$LOG" || true; fi; }
+is_excluded(){ case "$1" in /opt/fireinners/sentinel/*|/opt/fireinners/CHARTE_FIREINNERS.*) return 0;; esac; return 1; }
+
+say "5) Quarantine backups (*.bak*, *.old, *~, *.tmp)";
+for base in $TARGETS; do
+  [ -d "$base" ] || continue;
+  say "Scan backups: $base";
+  find "$base" -type f \( -name "*.bak" -o -name "*.bak*" -o -name "*.bakfix*" -o -name "*~" -o -name "*.old" -o -name "*.tmp" \) 2>/dev/null \
+  | while IFS= read -r f; do
+      is_excluded "$f" && continue;
+      rel="${f#/}";
+      move_to "$f" "$Q/baks/$rel";
+    done;
+done
+
+# 6) Quarantine suspicious mixed files (HTML containing bash markers)
+say "6) Quarantine mixed files (HTML + bash markers)";
+PAT="(set -euo pipefail|apt-get|journalctl|#!/usr/bin/env bash|^#!/bin/bash|git checkout|git push|git commit|find /|mv -n)";
+for base in $TARGETS; do
+  [ -d "$base" ] || continue;
+  say "Scan mixed: $base";
+  find "$base" -type f \( -name "*.html" -o -name "*.html.*" -o -name "*.bakfix*" \) 2>/dev/null \
+  | while IFS= read -r f; do
+      is_excluded "$f" && continue;
+      if grep -aEq "$PAT" "$f" 2>/dev/null; then
+        rel="${f#/}";
+        move_to "$f" "$Q/mixed/$rel";
+      fi
+    done;
+done
+
+# 7) Save meta + summary
+say "7) Save meta + summary";
+( echo "TS=$TS"; echo "HOST=$(hostname)"; echo "KERNEL=$(uname -r)"; echo "DISK_BEFORE/AFTER are in log"; echo "TARGETS=$TARGETS"; ) > "$Q/meta/INFO.txt";
+say "Disk after:";
+df -hT | tee -a "$LOG";
+say "Quarantine size:";
+du -sh "$Q" 2>/dev/null | tee -a "$LOG" || true;
+
+say "Top quarantined files (by size):";
+(find "$Q" -type f -printf "%s\t%p\n" 2>/dev/null | sort -nr | head -n 40 | awk "{printf \"%.1fMB\t%s\n\",\$1/1024/1024,\$2}") | tee -a "$LOG" || true;
+
+say "DONE";
+say "Log: $LOG";
+say "Quarantine: $Q";
+echo "$LOG";'
