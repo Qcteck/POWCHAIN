@@ -1,1 +1,132 @@
-DOMAIN=fireinners.online HOST_HEADER=fireinners.online bash /root/fireinners_batch.sh
+cat >/root/fireinners_batch.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Usage:
+#   DOMAIN=fireinners.online HOST_HEADER=fireinners.online APPLY=0 bash /root/fireinners_batch.sh
+#   DOMAIN=fireinners.online HOST_HEADER=fireinners.online APPLY=1 bash /root/fireinners_batch.sh
+#
+# APPLY=0 => dry run (aucun changement)
+# APPLY=1 => applique (backup + écrit conf + nginx -t + reload)
+
+DOMAIN="${DOMAIN:-fireinners.online}"
+HOST_HEADER="${HOST_HEADER:-$DOMAIN}"
+APPLY="${APPLY:-0}"
+
+ts="$(date +%Y%m%d_%H%M%S)"
+backup_dir="/etc/nginx/sites-disabled/batchfix_${ts}"
+site_enabled="/etc/nginx/sites-enabled/${DOMAIN}-ssl"
+site_available="/etc/nginx/sites-available/${DOMAIN}-ssl"
+
+echo "== batchfix ${ts} =="
+echo "DOMAIN=${DOMAIN}  HOST_HEADER=${HOST_HEADER}  APPLY=${APPLY}"
+echo
+
+echo "== 1) locate active site file =="
+active=""
+if [ -L "$site_enabled" ]; then
+  active="$(readlink -f "$site_enabled")"
+elif [ -f "$site_enabled" ]; then
+  active="$site_enabled"
+elif [ -f "$site_available" ]; then
+  active="$site_available"
+fi
+
+if [ -z "$active" ]; then
+  echo "!! Cannot find nginx vhost for ${DOMAIN} (checked: ${site_enabled}, ${site_available})"
+  exit 1
+fi
+echo "ACTIVE: $active"
+echo
+
+echo "== 2) server block quick view (nginx -T grep best-effort) =="
+nginx -T 2>/dev/null | nl -ba | egrep -n "server_name|listen|root|location\s+/(wolverine|favicon\.ico)|try_files" | head -n 120 || true
+echo
+
+echo "== 3) quick filesystem checks =="
+[ -d /var/www/fireinners ] || echo "!! /var/www/fireinners absent"
+[ -d /var/www/wolverine ]  || echo "!! /var/www/wolverine absent"
+echo "ls -la /var/www | egrep 'fireinners|wolverine' (top) :"
+ls -la /var/www | egrep 'fireinners|wolverine|current' || true
+echo
+
+echo "== 4) local curl (via localhost + Host header) =="
+echo "-- /wolverine/ --"
+curl -sSik -H "Host: ${HOST_HEADER}" http://127.0.0.1/wolverine/ | head -n 25 || true
+echo "-- /favicon.ico --"
+curl -sSik -H "Host: ${HOST_HEADER}" http://127.0.0.1/favicon.ico | head -n 25 || true
+echo
+
+echo "== 5) public curl (cloudflare) =="
+echo "-- http => https (expect 301) --"
+curl -sSI "http://${DOMAIN}/wolverine/" | egrep -i 'HTTP/|location:' || true
+echo "-- https /wolverine/ (expect 200) --"
+curl -sSI "https://${DOMAIN}/wolverine/" | egrep -i 'HTTP/|server:|content-type:' || true
+echo "-- https /favicon.ico (expect 204/200, not 500) --"
+curl -sSI "https://${DOMAIN}/favicon.ico" | egrep -i 'HTTP/|server:' || true
+echo
+
+echo "== 6) show docroots (if root forbidden/debug) =="
+grep -RIn --color=never -E "^\s*root\s+" /etc/nginx 2>/dev/null | egrep "${DOMAIN}-ssl|server_name" || true
+echo
+
+echo "== 7) OPTIONAL APPLY: safe fixes =="
+echo "Goal: /wolverine/ => 200 ; favicon => 204/200 (NOT 500)"
+echo
+
+if [ "$APPLY" != "1" ]; then
+  echo "APPLY=0: no changes made."
+  echo "To apply: APPLY=1 DOMAIN=${DOMAIN} HOST_HEADER=${HOST_HEADER} bash /root/fireinners_batch.sh"
+  exit 0
+fi
+
+echo "APPLY=1: backing up + patching vhost"
+mkdir -p "$backup_dir"
+cp -a "$active" "$backup_dir/$(basename "$active").bak"
+echo "Backup: $backup_dir"
+
+# Patch: ensure /wolverine points to /var/www/wolverine and favicon doesn’t 500.
+# NOTE: This is conservative: we add/replace only if blocks are missing.
+tmp="$(mktemp)"
+cp -a "$active" "$tmp"
+
+# If there's no explicit /wolverine location, append a safe one.
+if ! grep -qE "location\s+/wolverine/?\s*\{" "$tmp"; then
+  echo "Injecting location /wolverine/ ..."
+  awk '
+    BEGIN{inserver=0;done=0}
+    /^\s*server\s*\{/ {inserver=1}
+    {print}
+    inserver && /^\s*\}\s*$/ && !done {
+      done=1
+      print "  # --- injected by batchfix ---"
+      print "  location ^~ /wolverine/ {"
+      print "    alias /var/www/wolverine/;"
+      print "    try_files $uri $uri/ /wolverine/index.html;"
+      print "  }"
+      print "  location = /favicon.ico {"
+      print "    access_log off;"
+      print "    log_not_found off;"
+      print "    try_files /favicon.ico =204;"
+      print "  }"
+      print "  # --- end injected ---"
+      print "}"
+    }
+  ' "$tmp" > "${tmp}.new"
+  mv "${tmp}.new" "$tmp"
+fi
+
+install -m 0644 "$tmp" "$active"
+rm -f "$tmp"
+
+echo "== nginx -t =="
+nginx -t
+
+echo "== reload nginx =="
+systemctl reload nginx
+
+echo "== DONE (retest local/public) =="
+BASH
+
+chmod +x /root/fireinners_batch.sh
+echo "OK: /root/fireinners_batch.sh créé"
