@@ -1,117 +1,41 @@
 set -euo pipefail
 
-UI_DIST="/var/www/wolverine"
-ARCH_GLOB="/var/www/_ARCHIVE_WOLVERINE_*"
-OUT_DIR="$UI_DIST/_index_versions"
+SNIP="/etc/nginx/snippets/wolverine_locations.conf"
+mkdir -p /etc/nginx/snippets
 
-mkdir -p "$OUT_DIR"
+cat > "$SNIP" <<'NGX'
+# Wolverine: TraderOne API behind /wolverine/traderone/api/
+location ^~ /wolverine/traderone/api/ {
+  proxy_pass http://127.0.0.1:3000/;
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+}
+NGX
 
-# 1) Liste des index (actuel + archives), triés newest -> oldest
-MAP="/tmp/_all_indexes.txt"
-: > "$MAP"
-find "$UI_DIST" -maxdepth 1 -type f -name "index.html*" -print >> "$MAP" 2>/dev/null || true
-for a in $ARCH_GLOB; do
-  [ -d "$a" ] || continue
-  find "$a" -maxdepth 3 -type f -name "index.html*" -print >> "$MAP" 2>/dev/null || true
+# inject include only into nginx files that already mention /wolverine (backup first)
+FILES="$(nginx -T 2>/dev/null | awk '
+  /^# configuration file / {f=$4}
+  /\/wolverine/ && /location/ {print f}
+' | sort -u)"
+
+echo "nginx files: "
+echo "$FILES"
+
+for f in $FILES; do
+  [ -f "$f" ] || continue
+  cp -a "$f" "$f.bak.$(date +%Y%m%d_%H%M%S)"
+  grep -q "snippets/wolverine_locations.conf" "$f" && continue
+  sed -i '0,/server[[:space:]]*{/s//server {\n    include \/etc\/nginx\/snippets\/wolverine_locations.conf;/' "$f"
 done
 
-python3 - <<'PY' "$MAP" > "${MAP}.sorted"
-import os,sys
-p=[x.strip() for x in open(sys.argv[1]) if x.strip() and os.path.exists(x.strip())]
-p.sort(key=lambda f: os.path.getmtime(f), reverse=True)
-print("\n".join(p))
-PY
+nginx -t
+systemctl reload nginx
 
-# 2) Copie en v0001.html, v0002.html...
-rm -f "$OUT_DIR"/v*.html "$OUT_DIR/list.json" "$OUT_DIR/viewer.html" "$OUT_DIR/grid.html" 2>/dev/null || true
-
-python3 - <<'PY' "${MAP}.sorted" "$OUT_DIR"
-import os,sys,shutil,time,json
-src=[l.strip() for l in open(sys.argv[1]) if l.strip()]
-out=sys.argv[2]
-items=[]
-for i,s in enumerate(src, start=1):
-    name=f"v{i:04d}.html"
-    dst=os.path.join(out,name)
-    shutil.copy2(s,dst)
-    st=os.stat(s)
-    items.append({"file":name,"mtime_iso":time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.st_mtime)),"size":st.st_size})
-open(os.path.join(out,"list.json"),"w").write(json.dumps(items,indent=2))
-print("Copied",len(items),"files ->",out)
-PY
-
-# 3) Slideshow 10s
-cat > "$OUT_DIR/viewer.html" <<'EOF'
-<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Index Slideshow</title>
-<style>
-body{margin:0;font-family:system-ui} .top{position:sticky;top:0;background:#111;color:#fff;padding:10px;display:flex;gap:10px;align-items:center}
-iframe{width:100%;height:calc(100vh - 56px);border:0;background:#fff} .meta{opacity:.85;font-size:12px}
-button,input{padding:6px 10px}
-</style>
-<div class="top">
-  <b>Index Slideshow</b> <span id="pos" class="meta">0/0</span> <span id="meta" class="meta"></span>
-  <div style="flex:1"></div>
-  <span class="meta">Delay(s)</span><input id="delay" type="number" value="10" min="1" style="width:70px">
-  <button id="prev">Prev</button><button id="next">Next</button><button id="play">Pause</button>
-  <a class="meta" href="./grid.html" style="color:#9cf">Grid</a>
-</div>
-<iframe id="frame"></iframe>
-<script>
-let list=[],i=0,t=null,playing=true;
-function show(n){
-  if(!list.length) return;
-  i=(n+list.length)%list.length;
-  const it=list[i];
-  frame.src=it.file;
-  pos.textContent=`${i+1}/${list.length}`;
-  meta.textContent=`${it.file} | ${it.mtime_iso} | ${it.size} bytes`;
-}
-function start(){
-  if(t) clearInterval(t);
-  const ms=Math.max(1,Number(delay.value||10))*1000;
-  t=setInterval(()=>{ if(playing) show(i+1); },ms);
-}
-prev.onclick=()=>show(i-1);
-next.onclick=()=>show(i+1);
-play.onclick=()=>{playing=!playing; play.textContent=playing?"Pause":"Play";}
-fetch("./list.json").then(r=>r.json()).then(j=>{list=j; show(0); start();});
-</script>
-EOF
-
-# 4) Grid (toutes en petites fenêtres)
-cat > "$OUT_DIR/grid.html" <<'EOF'
-<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Index Grid</title>
-<style>
-body{margin:0;font-family:system-ui;background:#0b0b0b;color:#fff}
-.top{position:sticky;top:0;background:#111;padding:10px;display:flex;gap:10px;align-items:center}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:10px;padding:10px}
-.card{background:#151515;border:1px solid #2a2a2a;border-radius:10px;overflow:hidden}
-.meta{padding:8px;font-size:12px;opacity:.9;display:flex;justify-content:space-between}
-iframe{width:100%;height:320px;border:0;background:#fff}
-a{color:#9cf}
-</style>
-<div class="top"><b>Index Grid</b> <span id="count" style="opacity:.85"></span><div style="flex:1"></div><a href="./viewer.html">Slideshow</a></div>
-<div class="grid" id="g"></div>
-<script>
-fetch("./list.json").then(r=>r.json()).then(list=>{
-  count.textContent=list.length+" versions";
-  for(const it of list){
-    const d=document.createElement("div");
-    d.className="card";
-    d.innerHTML=`<div class="meta"><span>${it.file}</span><span>${it.mtime_iso}</span></div>
-    <iframe loading="lazy" src="${it.file}"></iframe>
-    <div class="meta"><a target="_blank" href="${it.file}">Open</a><span>${it.size} bytes</span></div>`;
-    g.appendChild(d);
-  }
-});
-</script>
-EOF
-
-chown -R www-data:www-data "$OUT_DIR" 2>/dev/null || true
-chmod -R a+rX "$OUT_DIR" || true
-
-echo "DONE ✅"
-echo "Slideshow: https://fireinners.online/wolverine/_index_versions/viewer.html"
-echo "Grid:      https://fireinners.online/wolverine/_index_versions/grid.html"
+echo "=== TESTS ==="
+echo "--- local backend ---"
+curl -sS -i http://127.0.0.1:3000/positions 2>/dev/null | head -n 12 || true
+echo "--- public (must not be 403) ---"
+curl -sS -i https://fireinners.online/wolverine/traderone/api/positions | head -n 12 || true
