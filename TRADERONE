@@ -1,33 +1,162 @@
 set -euo pipefail
 
-echo "=== 0) Diagnose holds ==="
-apt-mark showhold || true
+APP_DIR="/opt/fireinners-auth-phantom"
+SERVICE="fireinners-auth-phantom"
+PORT="3005"
+TS="$(date +%Y%m%d_%H%M%S)"
 
-echo
-echo "=== 1) Unblock dpkg/apt ==="
-dpkg --configure -a || true
-apt-get -f install -y || true
-apt-get update -y
-
-echo
-echo "=== 2) Remove broken/conflicting node packages (if any) ==="
-apt-get remove -y nodejs npm libnode-dev libnode* node-* || true
-apt-get autoremove -y || true
-apt-get clean
-
-echo
-echo "=== 3) Install Node 20 from NodeSource (fresh) ==="
-# This script adds the correct repo for your Ubuntu version
-curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-
-apt-get update -y
-apt-get install -y nodejs
-
-echo
-echo "=== 4) Verify ==="
+echo "=== 0) Verify node/npm ==="
 node -v
 npm -v
-
-echo
-echo "=== 5) Optional: allow systemd services to run node from a stable path ==="
 command -v node
+command -v npm
+
+echo "=== 1) Create app dir ==="
+mkdir -p "$APP_DIR"
+cd "$APP_DIR"
+
+echo "=== 2) Write package.json + server.js ==="
+cat > package.json <<'JSON'
+{
+  "name": "fireinners-auth-phantom",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" }
+}
+JSON
+
+cat > server.js <<'JS'
+import express from "express";
+import nacl from "tweetnacl";
+import { PublicKey } from "@solana/web3.js";
+
+const app = express();
+app.use(express.json({ limit: "256kb" }));
+
+const nonces = new Map();
+const TTL = 5 * 60 * 1000;
+
+app.get("/health", (req, res) => res.json({ ok: true, service: "phantom-auth" }));
+
+app.get("/auth/phantom/challenge", (req, res) => {
+  const pubkey = String(req.query.pubkey || "").trim();
+  if (!pubkey) return res.status(400).json({ error: "missing pubkey" });
+
+  const nonce = Math.random().toString(36).slice(2) + "-" + Date.now();
+  const message =
+    "fireinners.online login\n" +
+    `pubkey: ${pubkey}\n` +
+    `nonce: ${nonce}\n` +
+    `ts: ${new Date().toISOString()}\n`;
+
+  nonces.set(pubkey, { message, createdAt: Date.now() });
+  res.json({ message });
+});
+
+app.post("/auth/phantom/verify", (req, res) => {
+  const { pubkey, message, signature } = req.body || {};
+  if (!pubkey || !message || !signature) {
+    return res.status(400).json({ error: "missing fields (pubkey,message,signature)" });
+  }
+
+  const saved = nonces.get(pubkey);
+  if (!saved) return res.status(401).json({ error: "no challenge" });
+  if (saved.message !== message) return res.status(401).json({ error: "message mismatch" });
+  if (Date.now() - saved.createdAt > TTL) return res.status(401).json({ error: "challenge expired" });
+
+  let sigBytes;
+  try {
+    if (Array.isArray(signature)) sigBytes = Uint8Array.from(signature);
+    else if (typeof signature === "string") sigBytes = Uint8Array.from(Buffer.from(signature, "base64"));
+    else return res.status(400).json({ error: "signature must be array or base64 string" });
+  } catch {
+    return res.status(400).json({ error: "bad signature format" });
+  }
+
+  try {
+    const pk = new PublicKey(pubkey);
+    const msgBytes = new TextEncoder().encode(message);
+    const ok = nacl.sign.detached.verify(msgBytes, sigBytes, pk.toBytes());
+    if (!ok) return res.status(401).json({ error: "bad signature" });
+
+    nonces.delete(pubkey);
+    res.json({ ok: true, pubkey });
+  } catch (e) {
+    res.status(400).json({ error: "invalid pubkey / verify error", details: String(e?.message || e) });
+  }
+});
+
+const port = Number(process.env.PORT || 3005);
+app.listen(port, "127.0.0.1", () => console.log(`Phantom auth on 127.0.0.1:${port}`));
+JS
+
+echo "=== 3) Install deps ==="
+npm install --silent express tweetnacl @solana/web3.js
+
+echo "=== 4) systemd service ==="
+cat > "/etc/systemd/system/${SERVICE}.service" <<EOF
+[Unit]
+Description=Fireinners Phantom Auth Service
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=${APP_DIR}
+Environment=PORT=${PORT}
+ExecStart=/usr/bin/node ${APP_DIR}/server.js
+Restart=always
+RestartSec=2
+User=www-data
+Group=www-data
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now "${SERVICE}.service"
+sleep 1
+
+echo "=== 5) Local test ==="
+curl -sS http://127.0.0.1:${PORT}/health | head -c 200; echo
+
+echo "=== 6) NGINX snippet (only this path) ==="
+SNIP="/etc/nginx/snippets/wolverine_auth_phantom.conf"
+mkdir -p /etc/nginx/snippets
+cat > "$SNIP" <<'NGX'
+location ^~ /wolverine/traderone/api/auth/ {
+  proxy_pass http://127.0.0.1:3005/;
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+}
+NGX
+
+# inject snippet into nginx files that mention /wolverine (skip fireinnerblockchain)
+FILES="$(nginx -T 2>/dev/null | awk '
+  /^# configuration file /{f=$4}
+  /fireinnerblockchain/ {next}
+  /\/wolverine/ {print f}
+' | sort -u)"
+
+echo "Inject in:"
+echo "$FILES"
+
+for f in $FILES; do
+  [ -f "$f" ] || continue
+  grep -q "wolverine_auth_phantom.conf" "$f" && continue
+  cp -a "$f" "$f.bak.phantom.$TS"
+  sed -i '0,/server[[:space:]]*{/s//server {\n    include \/etc\/nginx\/snippets\/wolverine_auth_phantom.conf;/' "$f"
+done
+
+nginx -t
+systemctl reload nginx
+
+echo "=== 7) Public test via nginx ==="
+curl -sS -I https://fireinners.online/wolverine/traderone/api/auth/health | head -n 12 || true
+
+echo "DONE ✅"
+echo "API base: https://fireinners.online/wolverine/traderone/api/auth/"
