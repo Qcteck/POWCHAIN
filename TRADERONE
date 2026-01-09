@@ -1,83 +1,161 @@
-cat > /root/batch_wolverine_fix.sh <<'BASH'
+cat > /root/wolv_nginx_batch.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-TS="$(date +%F_%H%M%S)"
-LOG="/root/wolverine_batch_${TS}.log"
-exec > >(tee -a "$LOG") 2>&1
+APPLY=0
+[[ "${1:-}" == "--apply" ]] && APPLY=1
 
-echo "=== Wolverine / NGINX batch (${TS}) ==="
+TS="$(date +%Y%m%d_%H%M%S)"
+BK="/root/nginx_backups_${TS}"
+SITE_DIR="/etc/nginx/sites-enabled"
+NGINX_CONF="/etc/nginx/nginx.conf"
+
+echo "=== WOLV NGINX BATCH ==="
+echo "Backup dir: $BK"
+mkdir -p "$BK"
 
 echo
-echo "== 1) Services & ports =="
-systemctl --no-pager status nginx || true
-systemctl --no-pager status firewalld || true
-ss -lntp | egrep ':(80|443)\s' || true
+echo "=== 1) Backup nginx confs ==="
+cp -a "$NGINX_CONF" "$BK/nginx.conf.bak"
+if [[ -d "$SITE_DIR" ]]; then
+  cp -a "$SITE_DIR" "$BK/sites-enabled.bak"
+fi
+echo "OK backup."
 
 echo
-echo "== 2) NGINX config test =="
+echo "=== 2) Nginx test ==="
+nginx -t || { echo "❌ nginx -t failed"; exit 1; }
+echo "✅ nginx -t OK"
+
+echo
+echo "=== 3) Listen ports (80/443) ==="
+if command -v ss >/dev/null 2>&1; then
+  ss -lntp | egrep ':(80|443)\s' || true
+else
+  netstat -lntp | egrep ':(80|443)\s' || true
+fi
+
+echo
+echo "=== 4) Find server blocks for fireinners ==="
+grep -RIn --color=always "server_name.*fireinners" /etc/nginx 2>/dev/null || true
+
+echo
+echo "=== 5) Find duplicate location /wolverine ==="
+# Affiche les fichiers et les lignes où apparait "location /wolverine"
+grep -RIn --color=always "location\s\+/wolverine" /etc/nginx 2>/dev/null || true
+
+echo
+echo "=== 6) Find try_files /index.html patterns (possible loop) ==="
+grep -RIn --color=always "try_files.*index\.html" /etc/nginx 2>/dev/null || true
+grep -RIn --color=always "rewrite.*index\.html" /etc/nginx 2>/dev/null || true
+
+echo
+echo "=== 7) Recent nginx errors about rewrite cycle ==="
+# Ajuste le path si logs ailleurs
+LOG1="/var/log/nginx/error.log"
+if [[ -f "$LOG1" ]]; then
+  tail -n 200 "$LOG1" | egrep -i "rewrite|internal redirection|cycle|wolverine|_next|favicon" || true
+else
+  echo "(no $LOG1)"
+fi
+
+echo
+echo "=== 8) Quick local curls (origin reachability) ==="
+set +e
+curl -sS -I http://127.0.0.1/ | head -n 5
+curl -sS -I http://127.0.0.1/wolverine/ | head -n 8
+curl -sS -k -I https://127.0.0.1/ | head -n 5
+curl -sS -k -I https://127.0.0.1/wolverine/ | head -n 8
+set -e
+
+echo
+echo "=== 9) Optional FIX (apply) ==="
+if [[ "$APPLY" -eq 0 ]]; then
+  echo "Mode SAFE: aucune modif appliquée."
+  echo "👉 Pour générer et appliquer une conf /wolverine safe: relance avec: bash /root/wolv_nginx_batch.sh --apply"
+  exit 0
+fi
+
+# On tente d'identifier le vhost fireinners* principal dans sites-enabled
+TARGET_FILE="$(grep -RIl "server_name.*fireinners" "$SITE_DIR" 2>/dev/null | head -n 1 || true)"
+if [[ -z "$TARGET_FILE" ]]; then
+  echo "❌ Impossible de trouver le fichier vhost fireinners* dans $SITE_DIR."
+  echo "   Applique manuellement le fix dans le bon server{}."
+  exit 1
+fi
+
+echo "Target vhost file: $TARGET_FILE"
+cp -a "$TARGET_FILE" "$BK/$(basename "$TARGET_FILE").preapply.bak"
+
+# On ajoute un bloc location /wolverine SAFE:
+# - sert la SPA Next build depuis /var/www/wolverine
+# - évite le loop: fallback vers /wolverine/index.html (pas /index.html global)
+# - bloque l'indexing de /_next/static si besoin
+# ⚠️ À adapter si ton root réel diffère
+WROOT="/var/www/wolverine"
+
+echo
+echo "Injecting /wolverine location block into $TARGET_FILE"
+echo "NOTE: backup saved in $BK"
+
+# On injecte à la fin du server{} (avant la dernière accolade)
+python3 - <<PY
+import re, pathlib
+p = pathlib.Path("$TARGET_FILE")
+s = p.read_text()
+
+block = r'''
+    # --- AUTO-FIX WOLVERINE (${TS}) ---
+    location ^~ /wolverine/ {
+        alias ''' + "$WROOT" + r'''/;
+        # Next static files
+        location ^~ /wolverine/_next/ {
+            try_files \$uri \$uri/ =404;
+            access_log off;
+            expires 30d;
+        }
+
+        # API pass-through example (si tu as un backend Node/pm2 sur 3000)
+        # Décommente si nécessaire :
+        # location ^~ /wolverine/api/ {
+        #     proxy_pass http://127.0.0.1:3000/;
+        #     proxy_set_header Host \$host;
+        #     proxy_set_header X-Real-IP \$remote_addr;
+        #     proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        #     proxy_set_header X-Forwarded-Proto \$scheme;
+        # }
+
+        # SPA fallback => IMPORTANT: on reste dans /wolverine/
+        try_files \$uri \$uri/ /wolverine/index.html;
+    }
+    # --- END AUTO-FIX WOLVERINE ---
+'''
+
+# vérifie si déjà injecté
+if "AUTO-FIX WOLVERINE" in s:
+    raise SystemExit("Already contains AUTO-FIX WOLVERINE block; aborting.")
+
+# injection avant la dernière "}" du fichier
+m = re.search(r"\}\s*$", s, re.M)
+if not m:
+    raise SystemExit("Cannot find closing brace to inject.")
+s2 = s[:m.start()] + block + "\n" + s[m.start():]
+p.write_text(s2)
+print("Injected block.")
+PY
+
+echo
+echo "Re-test nginx..."
 nginx -t
 
 echo
-echo "== 3) Dump des blocs utiles (server_name /wolverine) =="
-nginx -T 2>/dev/null | awk '
-/^\s*server\s*\{/ {inserver=1; buf="server {\n"; next}
-inserver==1 {buf=buf $0 "\n"}
-inserver==1 && /^\s*\}\s*$/ {
-  inserver=0
-  if (buf ~ /server_name/ && (buf ~ /fireinners\.online/ || buf ~ /www\.fireinners\.online/)) {
-    print "----- MATCHED SERVER -----"
-    print buf
-  }
-}
-' || true
+echo "Reload nginx..."
+systemctl reload nginx || service nginx reload
 
-echo
-echo "== 4) Recherche doublons location /wolverine =="
-nginx -T 2>/dev/null | awk '
-/server_name/ {sn=$0}
-/location\s+\/wolverine(\s|\/|\{)/ {print "HIT:", sn, " => ", $0}
-' || true
-
-echo
-echo "== 5) Recherche règles try_files/rewrite vers /index.html =="
-nginx -T 2>/dev/null | egrep -n 'try_files|rewrite|index\.html' | head -n 200 || true
-
-echo
-echo "== 6) Backup configs nginx =="
-mkdir -p /root/nginx_backups_full_${TS}
-tar -czf /root/nginx_backups_full_${TS}/nginx_etc_${TS}.tgz /etc/nginx
-echo "Backup: /root/nginx_backups_full_${TS}/nginx_etc_${TS}.tgz"
-
-echo
-echo "== 7) Vérif accès local HTTP/HTTPS (si nginx écoute) =="
-curl -sS -I http://127.0.0.1/ || true
-curl -sS -I http://127.0.0.1/wolverine/ || true
-curl -k -sS -I https://127.0.0.1/ || true
-curl -k -sS -I https://127.0.0.1/wolverine/ || true
-
-echo
-echo "== 8) Restart nginx =="
-systemctl restart nginx
-sleep 1
-systemctl --no-pager status nginx || true
-ss -lntp | egrep ':(80|443)\s' || true
-
-echo
-echo "== 9) Logs erreurs nginx (dernieres 120 lignes) =="
-tail -n 120 /var/log/nginx/error.log || true
-
-echo
-echo "== 10) Firewall rapide =="
-# (Ubuntu/Debian) UFW si présent
-command -v ufw >/dev/null 2>&1 && ufw status verbose || true
-# (RHEL) firewalld si présent
-command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --list-all || true
-
-echo
-echo "=== FIN. Log: $LOG ==="
-echo "Si tu colles ici: (1) le bloc server{} fireinners.online + (2) la location /wolverine, je te donne la conf exacte corrigée."
+echo "✅ Applied. Check again:"
+echo "  curl -I https://127.0.0.1/wolverine/ -k"
+echo "  tail -f /var/log/nginx/error.log"
 BASH
 
-chmod +x /root/batch_wolverine_fix.sh
-echo "Script prêt: /root/batch_wolverine_fix.sh"
+chmod +x /root/wolv_nginx_batch.sh
+echo "OK: /root/wolv_nginx_batch.sh"
