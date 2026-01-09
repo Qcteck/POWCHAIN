@@ -1,132 +1,124 @@
-cat >/root/fireinners_batch.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
-
-# Usage:
-#   DOMAIN=fireinners.online HOST_HEADER=fireinners.online APPLY=0 bash /root/fireinners_batch.sh
-#   DOMAIN=fireinners.online HOST_HEADER=fireinners.online APPLY=1 bash /root/fireinners_batch.sh
-#
-# APPLY=0 => dry run (aucun changement)
-# APPLY=1 => applique (backup + écrit conf + nginx -t + reload)
 
 DOMAIN="${DOMAIN:-fireinners.online}"
 HOST_HEADER="${HOST_HEADER:-$DOMAIN}"
 APPLY="${APPLY:-0}"
 
 ts="$(date +%Y%m%d_%H%M%S)"
-backup_dir="/etc/nginx/sites-disabled/batchfix_${ts}"
-site_enabled="/etc/nginx/sites-enabled/${DOMAIN}-ssl"
-site_available="/etc/nginx/sites-available/${DOMAIN}-ssl"
+backup_dir="/etc/nginx/sites-disabled/cleanup_${ts}"
+mkdir -p "$backup_dir"
 
-echo "== batchfix ${ts} =="
-echo "DOMAIN=${DOMAIN}  HOST_HEADER=${HOST_HEADER}  APPLY=${APPLY}"
+echo "=== batchfix ${ts} ==="
+echo "DOMAIN=${DOMAIN} HOST_HEADER=${HOST_HEADER} APPLY=${APPLY}"
 echo
 
-echo "== 1) locate active site file =="
+echo "=== 1) locate active site file (best-effort) ==="
 active=""
-if [ -L "$site_enabled" ]; then
-  active="$(readlink -f "$site_enabled")"
-elif [ -f "$site_enabled" ]; then
-  active="$site_enabled"
-elif [ -f "$site_available" ]; then
-  active="$site_available"
+if [[ -f "/etc/nginx/sites-enabled/${DOMAIN}-ssl" ]]; then
+  active="/etc/nginx/sites-enabled/${DOMAIN}-ssl"
+elif [[ -f "/etc/nginx/sites-enabled/${DOMAIN}" ]]; then
+  active="/etc/nginx/sites-enabled/${DOMAIN}"
+else
+  # fallback: grep in sites-enabled
+  active="$(grep -Rsl -- "server_name .*${DOMAIN}" /etc/nginx/sites-enabled 2>/dev/null | head -n1 || true)"
 fi
 
-if [ -z "$active" ]; then
-  echo "!! Cannot find nginx vhost for ${DOMAIN} (checked: ${site_enabled}, ${site_available})"
+if [[ -z "${active}" ]]; then
+  echo "!! Cannot find nginx vhost for ${DOMAIN} in sites-enabled."
+  echo "Checked: /etc/nginx/sites-enabled/${DOMAIN}(-ssl) + grep server_name."
   exit 1
 fi
-echo "ACTIVE: $active"
+
+echo "ACTIVE: ${active}"
 echo
 
-echo "== 2) server block quick view (nginx -T grep best-effort) =="
-nginx -T 2>/dev/null | nl -ba | egrep -n "server_name|listen|root|location\s+/(wolverine|favicon\.ico)|try_files" | head -n 120 || true
+echo "=== 2) show server block quick view (nginx -T grep best-effort) ==="
+nginx -T 2>/dev/null \
+  | awk '
+      BEGIN{p=0}
+      /server *\{/ {blk=""; p=0}
+      {blk=blk $0 "\n"}
+      /server_name/ { if ($0 ~ /'"${DOMAIN//./\\.}"'/) p=1 }
+      /\}/ { if (p==1) { print blk; exit } }
+    ' | sed -n '1,140p' || true
 echo
 
-echo "== 3) quick filesystem checks =="
-[ -d /var/www/fireinners ] || echo "!! /var/www/fireinners absent"
-[ -d /var/www/wolverine ]  || echo "!! /var/www/wolverine absent"
-echo "ls -la /var/www | egrep 'fireinners|wolverine' (top) :"
-ls -la /var/www | egrep 'fireinners|wolverine|current' || true
-echo
-
-echo "== 4) local curl (via localhost + Host header) =="
+echo "=== 3) local curl (host header via localhost) ==="
 echo "-- /wolverine/ --"
-curl -sSik -H "Host: ${HOST_HEADER}" http://127.0.0.1/wolverine/ | head -n 25 || true
+curl -sS -D- -o /dev/null -H "Host: ${HOST_HEADER}" "http://127.0.0.1/wolverine/" | sed -n '1,12p' || true
 echo "-- /favicon.ico --"
-curl -sSik -H "Host: ${HOST_HEADER}" http://127.0.0.1/favicon.ico | head -n 25 || true
+curl -sS -D- -o /dev/null -H "Host: ${HOST_HEADER}" "http://127.0.0.1/favicon.ico" | sed -n '1,12p' || true
 echo
 
-echo "== 5) public curl (cloudflare) =="
-echo "-- http => https (expect 301) --"
-curl -sSI "http://${DOMAIN}/wolverine/" | egrep -i 'HTTP/|location:' || true
-echo "-- https /wolverine/ (expect 200) --"
-curl -sSI "https://${DOMAIN}/wolverine/" | egrep -i 'HTTP/|server:|content-type:' || true
-echo "-- https /favicon.ico (expect 204/200, not 500) --"
-curl -sSI "https://${DOMAIN}/favicon.ico" | egrep -i 'HTTP/|server:' || true
+echo "=== 4) public curl ==="
+echo "-- http => https (should be 301) --"
+curl -sS -I "http://${DOMAIN}/wolverine/" | sed -n '1,8p' || true
+echo "-- https /wolverine/ (should be 200) --"
+curl -sS -I "https://${DOMAIN}/wolverine/" | sed -n '1,8p' || true
+echo "-- https /favicon.ico (should NOT be 500) --"
+curl -sS -I "https://${DOMAIN}/favicon.ico" | sed -n '1,8p' || true
 echo
 
-echo "== 6) show docroots (if root forbidden/debug) =="
-grep -RIn --color=never -E "^\s*root\s+" /etc/nginx 2>/dev/null | egrep "${DOMAIN}-ssl|server_name" || true
+echo "=== 5) if root path is forbidden, show docroots ==="
+grep -Rns -- "root " /etc/nginx/sites-enabled /etc/nginx/sites-available /etc/nginx/sites-disabled 2>/dev/null \
+  | grep -E "${DOMAIN}|fireinners|wolverine" \
+  | head -n 120 || true
 echo
 
-echo "== 7) OPTIONAL APPLY: safe fixes =="
-echo "Goal: /wolverine/ => 200 ; favicon => 204/200 (NOT 500)"
+echo "=== 6) OPTIONAL FIX: favicon.ico returning 500 ==="
+echo "APPLY=${APPLY}: $( [[ "$APPLY" == "1" ]] && echo 'will apply changes' || echo 'no changes made' )"
 echo
 
-if [ "$APPLY" != "1" ]; then
-  echo "APPLY=0: no changes made."
-  echo "To apply: APPLY=1 DOMAIN=${DOMAIN} HOST_HEADER=${HOST_HEADER} bash /root/fireinners_batch.sh"
+if [[ "$APPLY" != "1" ]]; then
+  echo "To apply favicon fix: APPLY=1 DOMAIN=${DOMAIN} HOST_HEADER=${HOST_HEADER} bash /root/fireinners_batch.sh"
+  echo "=== DONE (dry-run) ==="
   exit 0
 fi
 
-echo "APPLY=1: backing up + patching vhost"
-mkdir -p "$backup_dir"
-cp -a "$active" "$backup_dir/$(basename "$active").bak"
-echo "Backup: $backup_dir"
+echo "=== APPLY: backup + patch vhost ==="
+cp -a "$active" "${backup_dir}/$(basename "$active").bak"
+echo "Backed up to: ${backup_dir}/$(basename "$active").bak"
 
-# Patch: ensure /wolverine points to /var/www/wolverine and favicon doesn’t 500.
-# NOTE: This is conservative: we add/replace only if blocks are missing.
-tmp="$(mktemp)"
-cp -a "$active" "$tmp"
-
-# If there's no explicit /wolverine location, append a safe one.
-if ! grep -qE "location\s+/wolverine/?\s*\{" "$tmp"; then
-  echo "Injecting location /wolverine/ ..."
+# Patch strategy:
+# - If no explicit favicon location exists, add:
+#     location = /favicon.ico { access_log off; log_not_found off; return 204; }
+# This prevents 500/404 loops and is safe with Cloudflare.
+if grep -qE 'location\s*=\s*/favicon\.ico' "$active"; then
+  echo "favicon location already present -> no change."
+else
+  echo "Inserting favicon location (return 204) inside first server { ... }"
+  tmp="$(mktemp)"
   awk '
-    BEGIN{inserver=0;done=0}
-    /^\s*server\s*\{/ {inserver=1}
-    {print}
-    inserver && /^\s*\}\s*$/ && !done {
-      done=1
-      print "  # --- injected by batchfix ---"
-      print "  location ^~ /wolverine/ {"
-      print "    alias /var/www/wolverine/;"
-      print "    try_files $uri $uri/ /wolverine/index.html;"
-      print "  }"
-      print "  location = /favicon.ico {"
-      print "    access_log off;"
-      print "    log_not_found off;"
-      print "    try_files /favicon.ico =204;"
-      print "  }"
-      print "  # --- end injected ---"
-      print "}"
+    BEGIN{done=0}
+    {
+      print $0
+      if (done==0 && $0 ~ /server\s*\{/){
+        print "    # added by fireinners_batch.sh: avoid favicon 500"
+        print "    location = /favicon.ico {"
+        print "        access_log off;"
+        print "        log_not_found off;"
+        print "        return 204;"
+        print "    }"
+        done=1
+      }
     }
-  ' "$tmp" > "${tmp}.new"
-  mv "${tmp}.new" "$tmp"
+  ' "$active" > "$tmp"
+  cat "$tmp" > "$active"
+  rm -f "$tmp"
 fi
 
-install -m 0644 "$tmp" "$active"
-rm -f "$tmp"
-
-echo "== nginx -t =="
+echo
+echo "=== nginx -t && reload ==="
 nginx -t
-
-echo "== reload nginx =="
 systemctl reload nginx
 
-echo "== DONE (retest local/public) =="
-BASH
+echo
+echo "=== re-check (local + public) ==="
+echo "-- local /favicon.ico --"
+curl -sS -D- -o /dev/null -H "Host: ${HOST_HEADER}" "http://127.0.0.1/favicon.ico" | sed -n '1,12p' || true
+echo "-- public https /favicon.ico --"
+curl -sS -I "https://${DOMAIN}/favicon.ico" | sed -n '1,8p' || true
 
-chmod +x /root/fireinners_batch.sh
-echo "OK: /root/fireinners_batch.sh créé"
+echo
+echo "=== DONE (applied) ==="
