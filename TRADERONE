@@ -4,14 +4,12 @@ TS="$(date +%Y%m%d_%H%M%S)"
 VHOST="/etc/nginx/sites-enabled/fireinners.online-ssl"
 SNIP="/etc/nginx/snippets/wolverine_routes.conf"
 
-echo "=== 0) Backup ==="
-cp -a "$VHOST" "$VHOST.bak.$TS" || true
-cp -a "$SNIP" "$SNIP.bak.$TS" || true
+echo "=== 0) Backup vhost ==="
+cp -a "$VHOST" "$VHOST.bak.$TS"
 
-echo "=== 1) Rewrite snippet WITHOUT location /wolverine/ (fix duplicate) ==="
+echo "=== 1) Write snippet (NO location /wolverine/ to avoid duplicate) ==="
+mkdir -p /etc/nginx/snippets
 cat > "$SNIP" <<'NGX'
-# --- Wolverine routing (API + static) ---
-
 # Phantom auth API (must NOT fall back to index.html)
 location ^~ /wolverine/traderone/api/auth/ {
   auth_basic off;
@@ -35,27 +33,22 @@ location ^~ /wolverine/_next/ {
 }
 NGX
 
-echo "=== 2) Patch EXISTING location ^~ /wolverine/ in vhost (fix loops) ==="
-# dans le premier bloc location ^~ /wolverine/ { ... } :
-# - force root /var/www;
-# - force try_files $uri $uri/ /wolverine/index.html;
-sed -i -E '
-  0,/location[[:space:]]+\^~[[:space:]]+\/wolverine\/[[:space:]]*\{/,/^\}/{
-    s|^[[:space:]]*root[[:space:]]+.*;|  root /var/www;|g
-    s|^[[:space:]]*try_files[[:space:]]+.*;|  try_files $uri $uri/ /wolverine/index.html;|g
-  }
-' "$VHOST"
+echo "=== 2) Ensure include exists in SSL vhost (only once) ==="
+if ! grep -q "snippets/wolverine_routes.conf" "$VHOST"; then
+  cp -a "$VHOST" "$VHOST.bak.include.$TS"
+  sed -i '0,/server[[:space:]]*{/s//server {\n    include \/etc\/nginx\/snippets\/wolverine_routes.conf;/' "$VHOST"
+  echo "✅ Included snippet in $VHOST"
+else
+  echo "✅ Snippet already included"
+fi
 
-echo "=== 3) Ensure snippet include exists (once) ==="
-grep -n "wolverine_routes.conf" "$VHOST" || true
-
-echo "=== 4) Test + reload ==="
+echo "=== 3) Test + reload ==="
 nginx -t
 systemctl reload nginx
 
-echo "=== 5) ORIGIN bypass tests (should NOT be 403) ==="
-curl -sk --resolve fireinners.online:443:127.0.0.1 \
-  https://fireinners.online/wolverine/traderone/api/auth/health | head -n 20 || true
+echo "=== 4) ORIGIN bypass tests (should be 200 + JSON) ==="
+curl -sk -I --resolve fireinners.online:443:127.0.0.1 \
+  https://fireinners.online/wolverine/traderone/api/auth/health | head -n 20
 
 curl -sk --resolve fireinners.online:443:127.0.0.1 \
   "https://fireinners.online/wolverine/traderone/api/auth/phantom/challenge?pubkey=11111111111111111111111111111111" | head -c 260; echo
