@@ -1,105 +1,53 @@
-# ROOT — FIXED VPSMAP dashboard (no python/html syntax issues)
 set -euo pipefail
 
-OUT_WEB="/var/www/_vpsmap"
-BASE_DOMAIN="fireinners.online"
+echo "=== A) Sanity files ==="
+ls -lah /var/www/_vpsmap || true
+ls -lah /var/www/_vpsmap/index.html || true
+chmod -R a+rX /var/www/_vpsmap || true
+chown -R www-data:www-data /var/www/_vpsmap 2>/dev/null || true
 
-mkdir -p "$OUT_WEB"
-apt-get update -y
-apt-get install -y lsof curl jq net-tools >/dev/null
+echo
+echo "=== B) NGINX TEST (must be OK) ==="
+nginx -t || { echo "❌ nginx -t failed (syntax). Showing last 200 lines:"; nginx -T 2>/dev/null | tail -n 200; exit 1; }
 
-# 1) Collect ports
-ss -lntp > /tmp/_vpsmap_ss.txt 2>/dev/null || true
-nginx -T > /tmp/_vpsmap_nginx_T.txt 2>/dev/null || true
-systemctl --type=service --state=running > /tmp/_vpsmap_services.txt 2>/dev/null || true
+echo
+echo "=== C) Tail nginx error log (look for /_vpsmap/) ==="
+tail -n 120 /var/log/nginx/error.log || true
 
-# 2) Build ports.json (Python only for JSON)
-python3 - <<'PY' > "$OUT_WEB/ports.json"
-import re, json
-txt=open("/tmp/_vpsmap_ss.txt","r",errors="ignore").read()
-ports=set()
-for line in txt.splitlines():
-    m=re.search(r':(\d+)\s', line)
-    if m:
-        ports.add(int(m.group(1)))
+echo
+echo "=== D) HARD FIX: serve /_vpsmap/ as static (no alias traps) ==="
+SNIP="/etc/nginx/snippets/_vpsmap_static.conf"
+mkdir -p /etc/nginx/snippets
+cat > "$SNIP" <<'NGX'
+# VPSMAP static
+location ^~ /_vpsmap/ {
+  root /var/www;
+  try_files $uri $uri/ /_vpsmap/index.html;
+}
+NGX
 
-common=[80,443,3000,3001,5173,8080,8000,5000,4000,9696,9000,10000]
-ordered=[]
-for p in common:
-    if p in ports: ordered.append(p)
-for p in sorted(ports):
-    if p not in ordered: ordered.append(p)
+# ensure it's included in the main server{} that serves fireinners.online
+MAIN_FILES="$(nginx -T 2>/dev/null | awk '
+  /^# configuration file / {f=$4}
+  /server_name/ && /fireinners\.online/ {print f}
+' | sort -u)"
 
-items=[]
-for p in ordered:
-    if p==443:
-        url=f"https://{__import__('os').environ.get('BASE_DOMAIN','fireinners.online')}/"
-    elif p==80:
-        url=f"http://{__import__('os').environ.get('BASE_DOMAIN','fireinners.online')}/"
-    else:
-        url=f"http://{__import__('os').environ.get('BASE_DOMAIN','fireinners.online')}:{p}/"
-    items.append({"port":p,"url":url})
-print(json.dumps(items,indent=2))
-PY
-# inject env for python above
-sed -i "s/fireinners\.online/$BASE_DOMAIN/g" "$OUT_WEB/ports.json" || true
+echo "Server files for fireinners.online:"
+echo "$MAIN_FILES"
 
-# 3) NGINX summary (simple grep)
-grep -nE 'server_name|listen\s|root\s|location\s|proxy_pass' /tmp/_vpsmap_nginx_T.txt \
-  | head -n 6000 > "$OUT_WEB/nginx_summary.txt" || true
+for f in $MAIN_FILES; do
+  [ -f "$f" ] || continue
+  cp -a "$f" "$f.bak._vpsmapfix.$(date +%Y%m%d_%H%M%S)" || true
+  grep -q "_vpsmap_static.conf" "$f" && continue
+  sed -i '0,/server[[:space:]]*{/s//server {\n    include \/etc\/nginx\/snippets\/_vpsmap_static.conf;/' "$f"
+done
 
-cp -a /tmp/_vpsmap_ss.txt "$OUT_WEB/ports.txt" 2>/dev/null || true
-cp -a /tmp/_vpsmap_services.txt "$OUT_WEB/services.txt" 2>/dev/null || true
+echo
+echo "=== E) Reload nginx ==="
+nginx -t
+systemctl reload nginx
 
-# 4) Web dashboard HTML (NO python, so no syntax crash)
-cat > "$OUT_WEB/index.html" <<'EOF'
-<!doctype html>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>VPS Map</title>
-<style>
-body{font-family:system-ui,Arial;margin:0;background:#0b0b0b;color:#fff}
-.top{position:sticky;top:0;background:#111;padding:12px;display:flex;gap:10px;align-items:center;z-index:9}
-a{color:#9cf}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:10px;padding:10px}
-.card{background:#151515;border:1px solid #2a2a2a;border-radius:10px;overflow:hidden}
-.meta{padding:8px;font-size:12px;opacity:.9;display:flex;justify-content:space-between;gap:10px}
-iframe{width:100%;height:340px;border:0;background:#fff}
-.small{font-size:12px;opacity:.8}
-</style>
-
-<div class="top">
-  <b>VPS Map</b>
-  <span class="small">Ports ouverts + preview (best effort)</span>
-  <div style="flex:1"></div>
-  <a href="./nginx_summary.txt" target="_blank">nginx summary</a>
-  <a href="./ports.txt" target="_blank">ports</a>
-  <a href="./services.txt" target="_blank">services</a>
-</div>
-
-<div class="grid" id="g"></div>
-
-<script>
-fetch('./ports.json').then(r=>r.json()).then(list=>{
-  const g=document.getElementById('g');
-  for(const it of list){
-    const d=document.createElement('div');
-    d.className='card';
-    d.innerHTML =
-      '<div class="meta"><span>Port: '+it.port+'</span><a href="'+it.url+'" target="_blank">Open</a></div>'+
-      '<iframe loading="lazy" src="'+it.url+'"></iframe>'+
-      '<div class="meta"><span class="small">'+it.url+'</span><span class="small">preview</span></div>';
-    g.appendChild(d);
-  }
-}).catch(e=>{
-  document.getElementById('g').innerHTML =
-    '<div style="padding:10px">Failed to load ports.json</div>';
-});
-</script>
-EOF
-
-chown -R www-data:www-data "$OUT_WEB" 2>/dev/null || true
-chmod -R a+rX "$OUT_WEB" || true
-
-echo "✅ Files generated in $OUT_WEB"
-echo "Now ensure nginx serves /_vpsmap/ (if not already)."
+echo
+echo "=== F) Test ==="
+curl -sS -I https://fireinners.online/_vpsmap/ | head -n 20
+curl -sS https://fireinners.online/_vpsmap/ | head -n 5
