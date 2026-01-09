@@ -1,250 +1,63 @@
-# ROOT — FULL: map repo + find UI (Next) + patch wallet debug + build/export + deploy + nginx route/proxy
+# ROOT — list ALL index backups sequentially (sorted) + previews + optional diffs
 set -euo pipefail
 
-CLONE_DIR="/opt/fireinners/WOLVERINE_REPO"
-DIST="/var/www/wolverine"
-ARCH="/var/www/_ARCHIVE_WOLVERINE_$(date +%Y%m%d_%H%M%S)"
-SNIP="/etc/nginx/snippets/wolverine_locations.conf"
+UI_DIST="/var/www/wolverine"
+ARCH_GLOB="/var/www/_ARCHIVE_WOLVERINE_*"
 
-echo "=== 0) Precheck ==="
-[ -d "$CLONE_DIR/.git" ] || { echo "ERROR: missing repo clone at $CLONE_DIR"; exit 1; }
-mkdir -p "$DIST"
-
-echo "=== 1) Quick repo map ==="
-cd "$CLONE_DIR"
-echo "--- GIT ---"
-git status -sb || true
-echo "--- TOP LEVEL ---"
-ls -lah | sed -n '1,220p'
-
+echo "=== 0) Where ==="
+echo "UI_DIST   = $UI_DIST"
+echo "ARCH_GLOB = $ARCH_GLOB"
 echo
-echo "=== 2) Find UI dir (Next.js candidate) ==="
-APP_DIR=""
 
-is_next_app_dir () {
-  local d="$1"
-  [ -f "$d/package.json" ] || return 1
-  [ -d "$d/pages" ] || [ -d "$d/app" ] || [ -f "$d/next.config.js" ] || return 1
-  node - <<'NODE' "$d/package.json" >/dev/null 2>&1
-const p=require(process.argv[1]);
-const deps=Object.assign({}, p.dependencies||{}, p.devDependencies||{});
-const hasNext=typeof deps.next==="string";
-const b=String((p.scripts&&p.scripts.build)||"");
-process.exit((hasNext || b.includes("next")) ? 0 : 1);
-NODE
-}
-
-while IFS= read -r -d '' pj; do
-  d="$(dirname "$pj")"
-  case "$d" in
-    *"/node_modules/"*|*"/.git/"*|*"/.next/"*|*"/out/"*|*"/_ARCHIVE_"*) continue;;
-  esac
-  if is_next_app_dir "$d"; then
-    APP_DIR="$d"
-    break
-  fi
-done < <(find "$CLONE_DIR" -maxdepth 10 -type f -name package.json -print0)
-
-if [ -z "$APP_DIR" ]; then
-  echo "❌ No Next.js UI found inside this repo clone."
-  echo "package.json found (excluding node_modules):"
-  find "$CLONE_DIR" -maxdepth 8 -type f -name package.json ! -path "*/node_modules/*"
-  echo
-  echo "➡️ Conclusion: ce repo est probablement backend-only (ou l'UI est dans un autre repo)."
-  exit 2
-fi
-
-echo "✅ UI FOUND: APP_DIR=$APP_DIR"
-
-echo
-echo "=== 3) Ensure build tools ==="
-apt-get update -y
-apt-get install -y curl rsync jq
-if ! command -v node >/dev/null 2>&1; then
-  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-  apt-get install -y nodejs
-fi
-echo "Node: $(node -v) | NPM: $(npm -v)"
-
-echo
-echo "=== 4) Patch UI (WalletDebug + robust Phantom connect) ==="
-cd "$APP_DIR"
-mkdir -p components lib
-
-cat > components/WalletDebug.jsx <<'JSX'
-import { useEffect, useState } from "react";
-export default function WalletDebug() {
-  const [info, setInfo] = useState(null);
-  useEffect(() => {
-    const sol = window.solana;
-    const inIframe = window.top !== window.self;
-    setInfo({
-      url: window.location.href,
-      protocol: window.location.protocol,
-      inIframe,
-      hasSolana: !!sol,
-      isPhantom: !!sol?.isPhantom,
-      note:
-        window.location.protocol !== "https:" ? "NOT HTTPS -> Phantom won't inject" :
-        inIframe ? "IN IFRAME/VIEWER -> Phantom often will NOT inject window.solana" :
-        !sol ? "NO window.solana -> Phantom not injected (wrong browser/profile or extension disabled)" :
-        sol && !sol.isPhantom ? "window.solana exists, but not Phantom" :
-        "Phantom detected ✅",
-      userAgent: navigator.userAgent
-    });
-  }, []);
-  if (!info) return null;
-  return (
-    <div className="card">
-      <h3 style={{marginTop:0}}>Wallet Debug</h3>
-      <pre style={{margin:0, whiteSpace:"pre-wrap"}}>{JSON.stringify(info,null,2)}</pre>
-    </div>
-  );
-}
-JSX
-
-cat > lib/wallet.js <<'JS'
-export async function connectPhantom() {
-  if (window.location.protocol !== "https:") throw new Error("Not HTTPS. Phantom requires HTTPS.");
-  if (window.top !== window.self) throw new Error("Iframe/viewer detected. Open site directly in browser.");
-  const sol = window?.solana;
-  if (!sol) throw new Error("window.solana missing -> Phantom not injected.");
-  if (!sol.isPhantom) throw new Error("window.solana exists but is not Phantom.");
-  const resp = await sol.connect({ onlyIfTrusted: false });
-  return resp.publicKey.toString();
-}
-JS
-
-cat > components/WalletBox.jsx <<'JSX'
-import { useState } from "react";
-import { connectPhantom } from "../lib/wallet";
-
-export default function WalletBox() {
-  const [addr, setAddr] = useState("");
-  const [err, setErr] = useState("");
-  const [loading, setLoading] = useState(false);
-
-  async function connect() {
-    setErr(""); setLoading(true);
-    try { setAddr(await connectPhantom()); }
-    catch (e) { setErr(String(e?.message || e)); }
-    finally { setLoading(false); }
-  }
-
-  return (
-    <div className="walletBox">
-      <div className="walletTitle">Wallet</div>
-      {!addr ? (
-        <button className="btn ghost" onClick={connect} disabled={loading}>
-          {loading ? "Connecting..." : "Connect Phantom"}
-        </button>
-      ) : (
-        <>
-          <div className="muted">Connected</div>
-          <code style={{fontSize:12, wordBreak:"break-all"}}>{addr}</code>
-          <div style={{marginTop:10}}>
-            <button className="btn" onClick={connect} disabled={loading}>
-              {loading ? "Refreshing..." : "Reconnect/Refresh"}
-            </button>
-          </div>
-        </>
-      )}
-      {err && <div className="bad small" style={{marginTop:10}}>{err}</div>}
-    </div>
-  );
-}
-JSX
-
-# inject debug into pages/index.jsx if exists
-if [ -f pages/index.jsx ] && ! grep -q 'WalletDebug' pages/index.jsx; then
-  sed -i '1i import WalletDebug from "../components/WalletDebug";' pages/index.jsx
-  sed -i 's|</>|<WalletDebug />\n</>|' pages/index.jsx
-fi
-
-# ensure Layout shows WalletBox if Layout exists
-if [ -f components/Layout.jsx ]; then
-  grep -q 'from "\.\/WalletBox"' components/Layout.jsx || sed -i '1i import WalletBox from "./WalletBox";' components/Layout.jsx
-  grep -q '<WalletBox' components/Layout.jsx || sed -i 's|<main|<WalletBox />\n<main|g' components/Layout.jsx || true
-fi
-
-echo
-echo "=== 5) Clean install + build/export ==="
-rm -rf node_modules package-lock.json .next out || true
-npm cache clean --force || true
-npm install --legacy-peer-deps
-
-# If Next is configured for static export, build should create out/ (or use export)
-npm run build || true
-if [ ! -d out ]; then
-  echo "out/ missing after build -> trying: npm run export (if present)"
-  if jq -e '.scripts.export' package.json >/dev/null 2>&1; then
-    npm run export
-  fi
-fi
-
-[ -d out ] || { echo "❌ STILL no out/. This UI is not static-exported. Need next export or output:'export' in next.config.js."; exit 3; }
-
-echo
-echo "=== 6) Deploy (with archive) ==="
-if [ -d "$DIST" ] && [ "$(ls -A "$DIST" 2>/dev/null | wc -l)" -gt 0 ]; then
-  mkdir -p "$ARCH"
-  rsync -a "$DIST/" "$ARCH/"
-  echo "Archived old UI -> $ARCH"
-fi
-rsync -a --delete out/ "$DIST/"
-
-echo
-echo "=== 7) Nginx: force correct routes (UI + traderone api proxy) ==="
-mkdir -p /etc/nginx/snippets
-cat > "$SNIP" <<'NGX'
-# Wolverine routes (UI + TraderOne API)
-location = /wolverine { return 301 /wolverine/; }
-
-location ^~ /wolverine/traderone/api/ {
-  proxy_pass http://127.0.0.1:3000/;
-  proxy_http_version 1.1;
-  proxy_set_header Host $host;
-  proxy_set_header X-Real-IP $remote_addr;
-  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto $scheme;
-}
-NGX
-
-# Patch ONLY nginx files that already mention /wolverine (backup first)
-FILES="$(nginx -T 2>/dev/null | awk '
-  /^# configuration file / {file=$4}
-  /location/ && /\/wolverine/ {print file}
-' | sort -u)"
-
-echo "nginx files containing /wolverine:"
-echo "$FILES"
-
-if [ -n "$FILES" ]; then
-  for f in $FILES; do
-    [ -f "$f" ] || continue
-    ts="$(date +%Y%m%d_%H%M%S)"
-    cp -a "$f" "$f.bak.$ts"
-    grep -q "snippets/wolverine_locations.conf" "$f" && continue
-    sed -i '0,/server[[:space:]]*{/s//server {\n    include \/etc\/nginx\/snippets\/wolverine_locations.conf;/' "$f"
-    echo "[PATCHED] $f"
-  done
+echo "=== 1) Index files in UI_DIST (sorted newest first) ==="
+if [ -d "$UI_DIST" ]; then
+  find "$UI_DIST" -maxdepth 1 -type f -name "index.html*" -printf "%TY-%Tm-%Td %TH:%TM:%TS  %9s  %p\n" | sort -r
 else
-  echo "⚠️ Could not auto-locate wolverine server block. You'll need to include $SNIP manually in your server{}."
+  echo "MISSING: $UI_DIST"
 fi
 
-nginx -t
-systemctl reload nginx
+echo
+echo "=== 2) Index files inside archives (sorted newest first) ==="
+for a in $ARCH_GLOB; do
+  [ -d "$a" ] || continue
+  find "$a" -maxdepth 2 -type f -name "index.html*" -printf "%TY-%Tm-%Td %TH:%TM:%TS  %9s  %p\n" | sort -r || true
+done
 
 echo
-echo "=== 8) Smoke tests (must NOT be 403) ==="
-echo "--- UI ---"
-curl -sS -I https://fireinners.online/wolverine/ | head -n 20 || true
-echo "--- API health ---"
-curl -sS -i https://fireinners.online/wolverine/traderone/api/health | head -n 25 || true
-echo "--- API positions ---"
-curl -sS -i https://fireinners.online/wolverine/traderone/api/positions | head -n 25 || true
-echo "--- Backend direct ---"
-curl -sS -i http://127.0.0.1:3000/positions 2>/dev/null | head -n 25 || true
+echo "=== 3) Show each index (one after another) ==="
+MAP="/tmp/_index_list.txt"
+: > "$MAP"
+
+# collect candidates
+if [ -d "$UI_DIST" ]; then
+  find "$UI_DIST" -maxdepth 1 -type f -name "index.html*" -print >> "$MAP" || true
+fi
+for a in $ARCH_GLOB; do
+  [ -d "$a" ] || continue
+  find "$a" -maxdepth 2 -type f -name "index.html*" -print >> "$MAP" || true
+done
+
+# sort by mtime desc
+python3 - <<'PY' "$MAP"
+import os, sys
+paths=[p.strip() for p in open(sys.argv[1]) if p.strip() and os.path.exists(p.strip())]
+paths.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+for p in paths: print(p)
+PY > "$MAP.sorted"
+
+n=0
+while IFS= read -r f; do
+  n=$((n+1))
+  echo
+  echo "=============================="
+  echo "[$n] $(date -r "$f" '+%F %T')  $(stat -c '%s bytes' "$f")"
+  echo "$f"
+  echo "----- FIRST 40 LINES -----"
+  sed -n '1,40p' "$f" || true
+  echo "----- LAST 20 LINES -----"
+  tail -n 20 "$f" || true
+done < "$MAP.sorted"
 
 echo
-echo "DONE ✅  -> open https://fireinners.online/wolverine/ and check Wallet Debug box"
+echo "DONE ✅  Total files: $n"
+echo "Tip: open specific one:  less -N <path>"
