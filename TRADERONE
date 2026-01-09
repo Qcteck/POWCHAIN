@@ -1,68 +1,33 @@
 set -euo pipefail
 
-DOMAIN="fireinners.online"
-SNIPDIR="/etc/nginx/snippets"
+OLD="/etc/nginx/snippets/wolverine_renders.conf"
+NEW="/etc/nginx/snippets/wolverine_renders.server.inc"
 
-echo "=== 1) Trouver les includes globaux snippets/*.conf (cause) ==="
-grep -RIn --color=never "include\s\+/etc/nginx/snippets/\*\.conf" /etc/nginx || true
+echo "=== 1) Vérif fichiers ==="
+ls -lah "$OLD" "$NEW" 2>/dev/null || true
 echo
 
-echo "=== 2) Lister les snippets fireinners/wolverine qui finissent en .conf (dangereux) ==="
-ls -lah "$SNIPDIR" | egrep -i "fireinners|wolverine" || true
+echo "=== 2) Trouver qui inclut l'ancien fichier (cassé) ==="
+grep -RIn --color=never "include\s\+$OLD;" /etc/nginx || true
 echo
 
-echo "=== 3) Renommer TOUS les snippets qui contiennent des location{} et finissent en .conf (pour ne plus matcher *.conf) ==="
-# on renomme seulement s'ils contiennent "location"
-for f in "$SNIPDIR"/*.conf; do
-  [ -f "$f" ] || continue
-  if grep -qE '^\s*location\s' "$f"; then
-    nf="${f%.conf}.server.inc"
-    mv "$f" "$nf"
-    echo "Renamed: $f -> $nf"
-  fi
-done
-echo
-
-echo "=== 4) Trouver le server block de $DOMAIN ==="
-CONF="$(grep -RIl "server_name.*${DOMAIN}" /etc/nginx/sites-enabled /etc/nginx/sites-available 2>/dev/null | head -n 1 || true)"
-echo "CONF=$CONF"
-[ -n "$CONF" ] || { echo "❌ server block introuvable"; exit 1; }
-cp -a "$CONF" "$CONF.bak.$(date +%s)"
-
-echo "=== 5) Retirer les anciens include fireinners_routes (où qu'ils soient) ==="
-for f in $(grep -RIl "fireinners_routes" /etc/nginx 2>/dev/null || true); do
-  cp -a "$f" "$f.bak.$(date +%s)" || true
-  sed -i '/include .*fireinners_routes/d' "$f" || true
-  echo "Cleaned: $f"
-done
-echo
-
-echo "=== 6) Créer un snippet PROPRE pour servir /wolverine/_next depuis /var/www/wolverine/_next ==="
-SNIP="$SNIPDIR/wolverine_next_assets.server.inc"
-cat > "$SNIP" <<'NGX'
-location ^~ /wolverine/_next/ {
-  alias /var/www/wolverine/_next/;
-  try_files $uri =404;
-  add_header Cache-Control "public, max-age=31536000, immutable";
-}
-location = /favicon.ico {
-  try_files /favicon.ico =204;
-  access_log off;
-}
-NGX
-
-echo "=== 7) Inclure UNIQUEMENT ce snippet dans le server { } de $DOMAIN ==="
-if ! grep -qF "include $SNIP;" "$CONF"; then
-  awk -v inc="  include $SNIP;" '
-    {print}
-    $0 ~ /server_name/ && $0 ~ /fireinners\.online/ && !done {print inc; done=1}
-  ' "$CONF" > "$CONF.tmp" && mv "$CONF.tmp" "$CONF"
+echo "=== 3) Corriger: remplacer include OLD -> NEW si NEW existe, sinon supprimer l'include ==="
+if [ -f "$NEW" ]; then
+  while IFS= read -r f; do
+    cp -a "$f" "$f.bak.$(date +%s)"
+    sed -i "s|include $OLD;|include $NEW;|g" "$f"
+    echo "Patched: $f"
+  done < <(grep -RIl "include\s\+$OLD;" /etc/nginx || true)
+else
+  echo "⚠️ $NEW n'existe pas. Je supprime l'include cassé."
+  while IFS= read -r f; do
+    cp -a "$f" "$f.bak.$(date +%s)"
+    sed -i "\|include\s\+$OLD;|d" "$f"
+    echo "Removed include from: $f"
+  done < <(grep -RIl "include\s\+$OLD;" /etc/nginx || true)
 fi
 
-echo "=== 8) Test + reload ==="
+echo "=== 4) Test + reload ==="
 nginx -t
 systemctl reload nginx
-echo "✅ nginx reloaded"
-
-echo "=== 9) Retest _next (doit être 200/304, plus 500) ==="
-curl -I "https://127.0.0.1/wolverine/_next/static/chunks/pages/index-197ef316ae8e31d1.js" --insecure -H "Host: $DOMAIN" | head -n 20 || true
+echo "✅ OK"
