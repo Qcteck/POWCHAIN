@@ -1,9 +1,10 @@
 set -euo pipefail
 TS="$(date +%Y%m%d_%H%M%S)"
-SNIP="/etc/nginx/snippets/wolverine_auth_phantom.conf"
 
-echo "=== 1) Re-force le snippet (bypass auth/deny) ==="
+SNIP="/etc/nginx/snippets/wolverine_auth_phantom.conf"
 mkdir -p /etc/nginx/snippets
+
+# 1) Snippet (bypass + proxy)
 cat > "$SNIP" <<'NGX'
 location ^~ /wolverine/traderone/api/auth/ {
   auth_basic off;
@@ -19,73 +20,63 @@ location ^~ /wolverine/traderone/api/auth/ {
 }
 NGX
 
-echo "=== 2) Trouve tous les fichiers nginx qui déclarent fireinners.online sur 443 ==="
+echo "=== 1) Candidats 443 pour fireinners.online (vrais fichiers, pas le texte nginx -T) ==="
 mapfile -t CAND < <(nginx -T 2>/dev/null | awk '
   /^# configuration file /{f=$4}
   /server_name[[:space:]]+.*(fireinners\.online|www\.fireinners\.online)/{print f}
 ' | sort -u)
 
-echo "CANDIDATES:"
-printf ' - %s\n' "${CAND[@]}" | sed '/^- $/d'
-
-echo
-echo "=== 3) Choisit automatiquement LE fichier à garder (celui qui sert /wolverine/) ==="
-KEEP=""
-BEST=-999
-
+# filtre fichiers existants + qui ont listen 443
+REAL=()
 for f in "${CAND[@]}"; do
   [ -f "$f" ] || continue
   grep -qE 'listen[[:space:]]+443' "$f" || continue
-
-  score=0
-  grep -qiE 'server_name[[:space:]]+.*fireinners\.online' "$f" && score=$((score+5))
-  grep -qiE 'location[[:space:]]+\^~[[:space:]]+/wolverine/' "$f" && score=$((score+10))
-  grep -qiE '/var/www/wolverine' "$f" && score=$((score+6))
-  grep -qiE 'proxy_pass[[:space:]]+http://127\.0\.0\.1:3000' "$f" && score=$((score+3))
-  grep -qiE 'ssl_certificate|listen[[:space:]]+443[[:space:]]+ssl' "$f" && score=$((score+2))
-
-  echo "score=$score  $f"
-  if [ "$score" -gt "$BEST" ]; then BEST="$score"; KEEP="$f"; fi
+  REAL+=("$f")
 done
 
-if [ -z "${KEEP:-}" ]; then
-  echo "❌ Impossible de déterminer le bon fichier 443. Montre-moi la liste ci-dessus."
-  exit 2
+if [ "${#REAL[@]}" -eq 0 ]; then
+  echo "❌ Aucun fichier 443 trouvé pour fireinners.online"
+  exit 1
 fi
 
-echo
-echo "✅ KEEP FILE = $KEEP  (score=$BEST)"
+i=0
+for f in "${REAL[@]}"; do
+  i=$((i+1))
+  echo "[$i] $f"
+done
 
 echo
-echo "=== 4) Désactive les autres server_name fireinners.online (backup) ==="
+read -r -p "Quel fichier tu veux GARDER ? (ex: 1) : " KEEPIDX
+KEEPIDX="${KEEPIDX:-1}"
+
+KEEP="${REAL[$((KEEPIDX-1))]}"
+echo "✅ KEEP = $KEEP"
+
+echo
+echo "=== 2) Désactive les autres (backup + change server_name) ==="
 n=0
-for f in "${CAND[@]}"; do
-  [ -f "$f" ] || continue
+for f in "${REAL[@]}"; do
   [ "$f" = "$KEEP" ] && continue
-  grep -qE 'server_name[[:space:]]+.*(fireinners\.online|www\.fireinners\.online)' "$f" || continue
-
   n=$((n+1))
-  cp -a "$f" "$f.bak.fireinners.$TS"
-
+  cp -a "$f" "$f.bak.disabled.$TS"
   sed -i -E \
     -e "s/server_name[[:space:]]+.*(fireinners\.online|www\.fireinners\.online)[^;]*;/server_name _disabled_fireinners_${TS}_${n}.local;/g" \
     "$f"
-
-  echo "Disabled server_name in: $f"
+  echo "Disabled: $f"
 done
 
 echo
-echo "=== 5) Inject le snippet dans le KEEP (backup) ==="
+echo "=== 3) Inject le snippet dans KEEP (backup) ==="
 if ! grep -q "snippets/wolverine_auth_phantom.conf" "$KEEP"; then
-  cp -a "$KEEP" "$KEEP.bak.phantominclude.$TS"
+  cp -a "$KEEP" "$KEEP.bak.snip.$TS"
   sed -i '0,/server[[:space:]]*{/s//server {\n    include \/etc\/nginx\/snippets\/wolverine_auth_phantom.conf;/' "$KEEP"
-  echo "Injected include into KEEP."
+  echo "Injected include into KEEP"
 else
-  echo "KEEP already includes snippet."
+  echo "KEEP already includes snippet"
 fi
 
 echo
-echo "=== 6) Reload + TEST ORIGIN (bypass CF) ==="
+echo "=== 4) Reload + tests ORIGIN (bypass Cloudflare) ==="
 nginx -t
 systemctl reload nginx
 
@@ -98,6 +89,5 @@ curl -sk --resolve fireinners.online:443:127.0.0.1 \
   "https://fireinners.online/wolverine/traderone/api/auth/phantom/challenge?pubkey=11111111111111111111111111111111" | head -c 260; echo
 
 echo
-echo "=== 7) Si encore 403: dump la cause ==="
-echo "Run:"
-echo "  tail -n 120 /var/log/nginx/error.log"
+echo "=== 5) Check conflicts ==="
+nginx -T 2>/dev/null | grep -i "conflicting server name" | head -n 20 || echo "✅ no more conflicts"
