@@ -1,11 +1,67 @@
-# 1) Lancer le batch en log (diagnostic)
-cd /root/Wolverine
-bash /root/wolv_nginx_batch.sh 2>&1 | tee /root/wolv_nginx_batch.log
+cat > /root/wolv_nginx_batch.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
 
-# 2) Si le script propose un fix, applique-le (si ton script supporte --apply)
-bash /root/wolv_nginx_batch.sh --apply 2>&1 | tee /root/wolv_nginx_batch_apply.log
+TS="$(date +%F_%H%M%S)"
+LOG="/root/wolv_nginx_batch_${TS}.log"
+exec > >(tee -a "$LOG") 2>&1
 
-# 3) Redémarre nginx + vérifie qu’il écoute bien 80/443
-systemctl restart nginx
-systemctl status nginx --no-pager -l
-ss -lntp | egrep ':(80|443)\s'
+echo "=== LOG: $LOG ==="
+echo "=== 0) Host / OS ==="
+hostname -f || true
+uname -a || true
+
+echo
+echo "=== 1) nginx status ==="
+systemctl status nginx --no-pager || true
+echo
+echo "=== 2) nginx syntax test ==="
+nginx -t || true
+
+echo
+echo "=== 3) listeners 80/443 ==="
+ss -lntp | egrep ':(80|443)\s' || echo "!! Rien n'écoute sur 80/443"
+
+echo
+echo "=== 4) firewall quick check ==="
+ufw status verbose || true
+iptables -S | head -n 80 || true
+
+echo
+echo "=== 5) show nginx includes + find vhost fireinners ==="
+echo "--- nginx -T (where is server_name fireinners) ---"
+nginx -T 2>/dev/null | nl -ba | egrep -n "include|server_name|listen|root|location\s+/wolverine" | head -n 200 || true
+
+echo
+echo "=== 6) find vhost files on disk ==="
+ls -la /etc/nginx || true
+ls -la /etc/nginx/sites-enabled || true
+ls -la /etc/nginx/sites-available || true
+ls -la /etc/nginx/conf.d || true
+echo "--- grep server_name fireinners* ---"
+grep -RIn --color=always "server_name.*fireinners" /etc/nginx 2>/dev/null || true
+echo "--- grep location /wolverine (duplicates?) ---"
+grep -RIn --color=always "location\s\+/wolverine" /etc/nginx 2>/dev/null || true
+echo "--- grep try_files .*index.html (possible loop) ---"
+grep -RIn --color=always "try_files.*index\.html" /etc/nginx 2>/dev/null || true
+
+echo
+echo "=== 7) check wolverine files exist ==="
+ls -la /var/www/wolverine 2>/dev/null || true
+test -f /var/www/wolverine/index.html && echo "OK: /var/www/wolverine/index.html exists" || echo "!! Missing: /var/www/wolverine/index.html"
+
+echo
+echo "=== 8) local curls (origin reachability) ==="
+echo "--- HTTP 80 ---"
+curl -sv --max-time 3 http://127.0.0.1/ -H 'Host: fireinners.online' || true
+curl -sv --max-time 3 http://127.0.0.1/wolverine/ -H 'Host: fireinners.online' || true
+echo "--- HTTPS 443 (no cert verify) ---"
+curl -skv --max-time 3 https://127.0.0.1/ -H 'Host: fireinners.online' || true
+curl -skv --max-time 3 https://127.0.0.1/wolverine/ -H 'Host: fireinners.online' || true
+
+echo
+echo "=== DONE ==="
+BASH
+
+chmod +x /root/wolv_nginx_batch.sh
+bash /root/wolv_nginx_batch.sh
