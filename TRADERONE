@@ -1,78 +1,236 @@
-# ROOT — FIND REAL NEXT UI ANYWHERE + BUILD + DEPLOY
+# ROOT — 1-3: clone/update repo + find REAL Next UI + patch Phantom debug + build + deploy + map
 set -euo pipefail
 
-DIST="/var/www/wolverine"
-mkdir -p "$DIST"
+REPO_URL="https://github.com/Qcteck/WOLVERINE"
+CLONE_DIR="/opt/fireinners/WOLVERINE_REPO"     # repo source (clean)
+DIST="/var/www/wolverine"                      # deployed UI
+ARCH="/var/www/_ARCHIVE_WOLVERINE_$(date +%Y%m%d_%H%M%S)"
+NGX_RELOAD=1
 
-echo "=== 0) Searching for REAL Next.js app (excluding node_modules) ==="
-SEARCH_ROOTS=(/opt /var/www /srv /home)
+echo "=== 0) Packages ==="
+apt-get update -y
+apt-get install -y git rsync curl jq
 
+if ! command -v node >/dev/null 2>&1; then
+  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+  apt-get install -y nodejs
+fi
+echo "Node: $(node -v) | NPM: $(npm -v)"
+
+echo
+echo "=== 1) Clone/Update repo ==="
+if [ ! -d "$CLONE_DIR/.git" ]; then
+  rm -M -rf "$CLONE_DIR" 2>/dev/null || true
+  git clone "$REPO_URL" "$CLONE_DIR"
+else
+  cd "$CLONE_DIR"
+  git fetch --all --prune
+fi
+
+cd "$CLONE_DIR"
+echo "--- GIT ---"
+git remote -v
+git status -sb || true
+# try common branches
+git checkout main 2>/dev/null || git checkout master 2>/dev/null || true
+git pull --ff-only 2>/dev/null || true
+
+echo
+echo "=== 2) Find REAL Next.js UI dir (exclude node_modules) ==="
 APP_DIR=""
 
-is_next_app () {
+is_next_app_dir () {
   local d="$1"
-  # must have package.json
   [ -f "$d/package.json" ] || return 1
-  # must have next markers
+  # markers
   [ -d "$d/pages" ] || [ -d "$d/app" ] || [ -f "$d/next.config.js" ] || return 1
-  # must have next in deps OR scripts build mentioning next
+  # next in deps OR build script mentions next
   node - <<'NODE' "$d/package.json" >/dev/null 2>&1
 const p=require(process.argv[1]);
 const deps=Object.assign({}, p.dependencies||{}, p.devDependencies||{});
 const hasNext=typeof deps.next==="string";
-const b=(p.scripts && p.scripts.build) ? String(p.scripts.build) : "";
-process.exit( (hasNext || b.includes("next")) ? 0 : 1 );
+const b=String((p.scripts&&p.scripts.build)||"");
+process.exit((hasNext || b.includes("next")) ? 0 : 1);
 NODE
 }
 
-for root in "${SEARCH_ROOTS[@]}"; do
-  [ -d "$root" ] || continue
-  while IFS= read -r -d '' pj; do
-    d="$(dirname "$pj")"
-    case "$d" in
-      *"/node_modules/"*|*"/.git/"*|*"/out/"*|*"/.next/"*|*"/_ARCHIVE_"*) continue;;
-    esac
-    if is_next_app "$d"; then
-      APP_DIR="$d"
-      break 2
-    fi
-  done < <(find "$root" -maxdepth 8 -type f -name package.json -print0 2>/dev/null)
-done
+while IFS= read -r -d '' pj; do
+  d="$(dirname "$pj")"
+  case "$d" in
+    *"/node_modules/"*|*"/.git/"*|*"/.next/"*|*"/out/"*|*"/_ARCHIVE_"*) continue;;
+  esac
+  if is_next_app_dir "$d"; then
+    APP_DIR="$d"
+    break
+  fi
+done < <(find "$CLONE_DIR" -maxdepth 10 -type f -name package.json -print0)
 
 if [ -z "$APP_DIR" ]; then
-  echo "❌ No Next.js app found on server."
-  echo "Here are package.json candidates (excluding node_modules):"
-  for root in "${SEARCH_ROOTS[@]}"; do
-    find "$root" -maxdepth 6 -type f -name package.json ! -path "*/node_modules/*" 2>/dev/null
-  done
+  echo "❌ No Next.js UI found inside repo clone."
+  echo "package.json candidates (no node_modules):"
+  find "$CLONE_DIR" -maxdepth 8 -type f -name package.json ! -path "*/node_modules/*"
+  echo
+  echo "➡️ Ça veut dire: ce repo est backend-only OU l'UI est ailleurs."
   exit 1
 fi
 
-echo "✅ FOUND UI NEXT APP:"
+echo "✅ FOUND UI:"
 echo "APP_DIR = $APP_DIR"
+
 echo
-
-echo "=== 1) Build UI ==="
+echo "=== 3) Patch UI (Wallet Debug + robust Phantom connect) ==="
 cd "$APP_DIR"
-pwd
-ls -lah package.json
+mkdir -p components lib
 
+cat > components/WalletDebug.jsx <<'JSX'
+import { useEffect, useState } from "react";
+
+export default function WalletDebug() {
+  const [info, setInfo] = useState(null);
+
+  useEffect(() => {
+    const sol = window.solana;
+    const inIframe = window.top !== window.self;
+    setInfo({
+      url: window.location.href,
+      protocol: window.location.protocol,
+      inIframe,
+      hasSolana: !!sol,
+      isPhantom: !!sol?.isPhantom,
+      note:
+        window.location.protocol !== "https:" ? "NOT HTTPS -> Phantom won't inject" :
+        inIframe ? "IN IFRAME/VIEWER -> Phantom often will NOT inject window.solana" :
+        !sol ? "NO window.solana -> Phantom not injected (wrong browser/profile or extension disabled)" :
+        sol && !sol.isPhantom ? "window.solana exists, but not Phantom" :
+        "Phantom detected ✅",
+      userAgent: navigator.userAgent
+    });
+  }, []);
+
+  if (!info) return null;
+  return (
+    <div className="card">
+      <h3 style={{marginTop:0}}>Wallet Debug</h3>
+      <pre style={{margin:0, whiteSpace:"pre-wrap"}}>{JSON.stringify(info,null,2)}</pre>
+    </div>
+  );
+}
+JSX
+
+cat > lib/wallet.js <<'JS'
+export async function connectPhantom() {
+  if (window.top !== window.self) {
+    throw new Error("Opened in iframe/viewer. Open the site DIRECT in Chrome/Brave, not Hostinger/HTML viewer.");
+  }
+  if (window.location.protocol !== "https:") {
+    throw new Error("Not HTTPS. Phantom requires HTTPS.");
+  }
+  const sol = window?.solana;
+  if (!sol) throw new Error("window.solana missing -> Phantom not injected (wrong browser/profile or extension off).");
+  if (!sol.isPhantom) throw new Error("window.solana exists but is not Phantom.");
+  const resp = await sol.connect({ onlyIfTrusted: false });
+  return resp.publicKey.toString();
+}
+JS
+
+cat > components/WalletBox.jsx <<'JSX'
+import { useState } from "react";
+import { connectPhantom } from "../lib/wallet";
+
+export default function WalletBox() {
+  const [addr, setAddr] = useState("");
+  const [err, setErr] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  async function connect() {
+    setErr(""); setLoading(true);
+    try {
+      const a = await connectPhantom();
+      setAddr(a);
+    } catch (e) {
+      setErr(String(e?.message || e));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <div className="walletBox">
+      <div className="walletTitle">Wallet</div>
+      {!addr ? (
+        <button className="btn ghost" onClick={connect} disabled={loading}>
+          {loading ? "Connecting..." : "Connect Phantom"}
+        </button>
+      ) : (
+        <>
+          <div className="muted">Connected</div>
+          <code style={{fontSize:12, wordBreak:"break-all"}}>{addr}</code>
+          <div style={{marginTop:10}}>
+            <button className="btn" onClick={connect} disabled={loading}>
+              {loading ? "Refreshing..." : "Reconnect/Refresh"}
+            </button>
+          </div>
+        </>
+      )}
+      {err && <div className="bad small" style={{marginTop:10}}>{err}</div>}
+    </div>
+  );
+}
+JSX
+
+# Inject WalletDebug in pages/index.jsx if it exists
+if [ -f pages/index.jsx ]; then
+  if ! grep -q 'WalletDebug' pages/index.jsx; then
+    sed -i '1i import WalletDebug from "../components/WalletDebug";' pages/index.jsx
+    sed -i 's|</>|<WalletDebug />\n</>|' pages/index.jsx
+  fi
+fi
+
+# Ensure Layout shows WalletBox
+if [ -f components/Layout.jsx ]; then
+  grep -q 'from "\.\/WalletBox"' components/Layout.jsx || sed -i '1i import WalletBox from "./WalletBox";' components/Layout.jsx
+  grep -q '<WalletBox' components/Layout.jsx || sed -i 's|<main|<WalletBox />\n<main|g' components/Layout.jsx || true
+fi
+
+echo
+echo "=== 4) Install + Build (clean) ==="
 rm -rf node_modules package-lock.json .next out || true
 npm cache clean --force || true
 npm install --legacy-peer-deps
+
+# build
 npm run build
 
+# require static output (out/)
 if [ ! -d out ]; then
   echo "❌ out/ missing after build."
-  echo "Your project is not exporting static. If you need static deploy: add next export OR output: 'export' in next.config.js."
+  echo "➡️ Ton projet n'exporte pas en statique. Il faut: next export OU output:'export' dans next.config.js."
+  echo "Dump scripts:"
+  cat package.json | jq '.scripts' || true
   exit 1
 fi
 
-echo "=== 2) Deploy ==="
+echo
+echo "=== 5) Archive current deploy + Deploy ==="
+if [ -d "$DIST" ]; then
+  mkdir -p "$ARCH/wolverine"
+  rsync -a "$DIST/" "$ARCH/wolverine/"
+  echo "Archived -> $ARCH/wolverine/"
+fi
+
 rsync -a --delete out/ "$DIST/"
 
-echo "=== 3) Reload nginx ==="
-nginx -t
-systemctl reload nginx
+echo
+echo "=== 6) Reload nginx + show headers (iframe/CSP) ==="
+if [ "$NGX_RELOAD" = "1" ]; then
+  nginx -t
+  systemctl reload nginx
+fi
 
-echo "DONE ✅  -> refresh https://fireinners.online/wolverine/"
+echo "--- headers /wolverine/ ---"
+curl -sS -I https://fireinners.online/wolverine/ | egrep -i "HTTP/|content-security-policy|x-frame-options|permissions-policy" || true
+
+echo
+echo "DONE ✅"
+echo "Open DIRECT: https://fireinners.online/wolverine/ (NOT Hostinger/HTML viewer)"
+echo "Then read the 'Wallet Debug' box: inIframe / hasSolana / isPhantom"
