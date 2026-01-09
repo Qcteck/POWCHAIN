@@ -1,5 +1,85 @@
+set -euo pipefail
+TS="$(date +%Y%m%d_%H%M%S)"
+SNIP="/etc/nginx/snippets/wolverine_auth_phantom.conf"
+
+echo "=== 1) Show active 443 servers for fireinners.online ==="
+nginx -T 2>/dev/null | awk '
+  /^# configuration file /{f=$4}
+  /^[[:space:]]*server[[:space:]]*\{/ {in=1; block=""; file=f}
+  in { block=block $0 "\n" }
+  in && /^[[:space:]]*\}/ {
+    if (block ~ /listen[[:space:]]+443/ && block ~ /server_name[[:space:]]+.*fireinners\.online/) {
+      print "---- FILE:", file
+      print block
+      print "----------------------------------------"
+    }
+    in=0
+  }
+' | sed -n '1,220p'
+
+echo
+echo "=== 2) Rewrite snippet to OVERRIDE auth/deny for this API path ==="
+mkdir -p /etc/nginx/snippets
+cat > "$SNIP" <<'NGX'
+# Phantom auth proxy (force allow even if server has auth_basic/deny)
+location ^~ /wolverine/traderone/api/auth/ {
+  # bypass common blocks
+  auth_basic off;
+  satisfy any;
+  allow all;
+
+  proxy_pass http://127.0.0.1:3005/;
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+}
+NGX
+
+echo "Snippet written: $SNIP"
+
+echo
+echo "=== 3) Ensure snippet is included in the RIGHT 443 fireinners.online files ==="
+mapfile -t FILES < <(nginx -T 2>/dev/null | awk '
+  /^# configuration file /{f=$4}
+  /fireinnerblockchain/ {next}
+  /server_name/ && /fireinners\.online/ {seen[f]=1}
+  END{for (k in seen) print k}
+' | sort -u)
+
+echo "Candidate files:"
+printf '%s\n' "${FILES[@]}" | sed '/^$/d'
+
+for f in "${FILES[@]}"; do
+  [ -f "$f" ] || continue
+  # only touch files that really contain a 443 listener
+  grep -qE 'listen[[:space:]]+443' "$f" || continue
+
+  if ! grep -q "snippets/wolverine_auth_phantom.conf" "$f"; then
+    cp -a "$f" "$f.bak.phantomfix.$TS"
+    # inject include right after the first "server {" in that file
+    sed -i '0,/server[[:space:]]*{/s//server {\n    include \/etc\/nginx\/snippets\/wolverine_auth_phantom.conf;/' "$f"
+    echo "Injected into: $f"
+  else
+    echo "Already included: $f"
+  fi
+done
+
+echo
+echo "=== 4) Reload + tests ==="
+nginx -t
+systemctl reload nginx
+
+echo
+echo "=== ORIGIN BYPASS (should NOT be 403) ==="
 curl -sk --resolve fireinners.online:443:127.0.0.1 \
-  https://fireinners.online/wolverine/traderone/api/auth/health
+  https://fireinners.online/wolverine/traderone/api/auth/health | head -c 200; echo
 
 curl -sk --resolve fireinners.online:443:127.0.0.1 \
-  "https://fireinners.online/wolverine/traderone/api/auth/phantom/challenge?pubkey=11111111111111111111111111111111" | head -c 300; echo
+  "https://fireinners.online/wolverine/traderone/api/auth/phantom/challenge?pubkey=11111111111111111111111111111111" | head -c 260; echo
+
+echo
+echo "=== PUBLIC (may still be CF depending on rules) ==="
+curl -sS -A "Mozilla/5.0" -I \
+  https://fireinners.online/wolverine/traderone/api/auth/health | head -n 12 || true
