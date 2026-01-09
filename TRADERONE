@@ -1,18 +1,149 @@
-# 1) Dry-run (aucune modif)
-APPLY=0 bash /root/fireinners_batch.sh | tee /root/fireinners_batch_dryrun_$(date +%F_%H%M%S).log
+cat > /root/fireinners_batch.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
 
-# 2) Vérif nginx (syntax + reload si OK)
-nginx -t && systemctl reload nginx
+DOMAIN="${DOMAIN:-fireinners.online}"
+DOMAIN_WWW="${DOMAIN_WWW:-www.fireinners.online}"
+HOST_HEADER="${HOST_HEADER:-$DOMAIN}"
+APPLY="${APPLY:-0}"
 
-# 3) Vérif écoute ports
-ss -lntp | egrep ':(80|443)\s'
+TS="$(date +%F_%H%M%S)"
+NGX_DIR="/etc/nginx"
+SITES_AVAIL="$NGX_DIR/sites-available"
+SITES_EN="$NGX_DIR/sites-enabled"
 
-# 4) Vérifs HTTP/HTTPS côté VPS (Host header)
-curl -sI  http://127.0.0.1/wolverine/   -H 'Host: fireinners.online' | head -n 20
-curl -sI https://127.0.0.1/wolverine/   -H 'Host: fireinners.online' -k | head -n 20
-curl -sI https://127.0.0.1/favicon.ico  -H 'Host: fireinners.online' -k | head -n 20
+say(){ echo -e "\n=== $* ==="; }
 
-# 5) Vérifs publics (via Cloudflare)
-curl -sI  http://fireinners.online/wolverine/  | egrep -i 'HTTP/|location:'
-curl -sI https://fireinners.online/wolverine/  | egrep -i 'HTTP/|server:|content-type:'
-curl -sI https://fireinners.online/favicon.ico | egrep -i 'HTTP/|server:'
+say "0) context"
+echo "DOMAIN=$DOMAIN  DOMAIN_WWW=$DOMAIN_WWW  HOST_HEADER=$HOST_HEADER  APPLY=$APPLY"
+nginx -v 2>&1 || true
+
+say "1) find server blocks (names/listen/root/index/location wolverine)"
+nginx -T 2>/dev/null | nl -ba | egrep -n --color=always \
+  "server_name|listen|root|index|location\s+\^~\s+/wolverine/|location\s+/wolverine/|try_files|return\s+301|rewrite" \
+  | head -n 220 || true
+
+say "2) grep nginx configs for dangerous patterns (redirect loops)"
+grep -RIn --color=always "try_files.*index\.html|rewrite.*index\.html|return\s+3(0|1)1|error_page\s+404" "$NGX_DIR" 2>/dev/null | head -n 200 || true
+
+say "3) quick filesystem checks"
+ls -ld /var/www || true
+for p in /var/www/fireinners /var/www/wolverine ; do
+  if [ -d "$p" ]; then
+    echo "-- $p exists"
+    ls -la "$p" | head -n 30
+  else
+    echo "!! $p absent"
+  fi
+done
+
+say "4) local curl (Host header via localhost) — expect /wolverine/ = 200 ; favicon = 200/204 (NOT 500)"
+echo "-- /wolverine/ --"
+curl -sS -D- -o /dev/null -H "Host: ${HOST_HEADER}" http://127.0.0.1/wolverine/ | egrep -i "HTTP/|server:|location:|content-type:|content-length:"
+echo
+echo "-- /favicon.ico --"
+curl -sS -D- -o /dev/null -H "Host: ${HOST_HEADER}" http://127.0.0.1/favicon.ico | egrep -i "HTTP/|server:|location:|content-type:|content-length:"
+
+say "5) public curl — expect http=>https 301 ; https /wolverine/ = 200 ; https /favicon.ico NOT 500"
+echo "-- http => https (should be 301) --"
+curl -sS -I "http://${DOMAIN}/wolverine/" | egrep -i "HTTP/|location:"
+echo
+echo "-- https /wolverine/ (should be 200) --"
+curl -sS -I "https://${DOMAIN}/wolverine/" | egrep -i "HTTP/|server:|location:|content-type:"
+echo
+echo "-- https /favicon.ico (should NOT be 500) --"
+curl -sS -I "https://${DOMAIN}/favicon.ico" | egrep -i "HTTP/|server:|location:|content-type:"
+
+say "6) locate active site file for DOMAIN (best-effort)"
+ACTIVE_CONF=""
+# try symlink targets in sites-enabled
+while IFS= read -r f; do
+  if grep -qE "server_name\s+.*\b${DOMAIN}\b" "$f" 2>/dev/null; then
+    ACTIVE_CONF="$f"
+    break
+  fi
+done < <(find "$SITES_EN" -maxdepth 1 -type f -o -type l 2>/dev/null | sort)
+
+if [ -z "$ACTIVE_CONF" ]; then
+  # fallback: search everywhere in nginx dir
+  ACTIVE_CONF="$(grep -RIlE "server_name\s+.*\b${DOMAIN}\b" "$NGX_DIR" 2>/dev/null | head -n 1 || true)"
+fi
+
+echo "ACTIVE_CONF=${ACTIVE_CONF:-<not found>}"
+
+say "7) OPTIONAL APPLY — safe fixes (wolverine static + favicon 204 + index.html)"
+if [ "$APPLY" != "1" ]; then
+  echo "APPLY=0: no changes made."
+  echo "To apply: APPLY=1 DOMAIN=${DOMAIN} HOST_HEADER=${HOST_HEADER} bash /root/fireinners_batch.sh"
+  exit 0
+fi
+
+if [ -z "$ACTIVE_CONF" ] || [ ! -f "$ACTIVE_CONF" ]; then
+  echo "ERROR: could not find active nginx conf for ${DOMAIN}. Aborting apply."
+  exit 1
+fi
+
+BACKUP_DIR="$NGX_DIR/sites-disabled/cleanup_${TS}"
+mkdir -p "$BACKUP_DIR"
+cp -a "$ACTIVE_CONF" "$BACKUP_DIR/$(basename "$ACTIVE_CONF").bak"
+echo "Backup saved to: $BACKUP_DIR"
+
+# --- Ensure we have a wolverine location block that serves static from /var/www/wolverine ---
+# We’ll insert a ^~ /wolverine/ block near the top of the matching server { } (heuristic).
+# Also ensure root server has index index.html; (helps “directory index forbidden”).
+python3 - <<PY
+import re, pathlib, sys
+p = pathlib.Path("${ACTIVE_CONF}")
+txt = p.read_text(errors="ignore")
+
+domain = "${DOMAIN}"
+# Find server block containing server_name domain
+m = re.search(r"server\s*\\{.*?server_name\\s+[^;]*\\b"+re.escape(domain)+r"\\b[^;]*;.*?\\n\\}", txt, flags=re.S)
+if not m:
+    print("ERROR: server block not found for domain", domain)
+    sys.exit(2)
+
+block = m.group(0)
+
+# Ensure index index.html; exists
+if not re.search(r"\\bindex\\s+[^;]*index\\.html", block):
+    block = re.sub(r"(server\\s*\\{\\s*\\n)", r"\\1    index index.html;\\n", block, count=1)
+
+# Ensure favicon 204 block exists
+if "location = /favicon.ico" not in block:
+    insert = "\\n    location = /favicon.ico {\\n        access_log off;\\n        log_not_found off;\\n        return 204;\\n    }\\n"
+    block = re.sub(r"(index\\s+[^;]*;\\s*\\n)", r"\\1"+insert, block, count=1)
+
+# Ensure wolverine static block exists (prefer ^~)
+if not re.search(r"location\\s+\\^~\\s+/wolverine/", block):
+    wolv = (
+        "\\n    # Wolverine UI (static SPA)\\n"
+        "    location ^~ /wolverine/ {\\n"
+        "        alias /var/www/wolverine/;\\n"
+        "        try_files \\$uri \\$uri/ /index.html;\\n"
+        "    }\\n"
+    )
+    # Insert after favicon block if present, else after index
+    if "location = /favicon.ico" in block:
+        block = re.sub(r"(location\\s*=\\s*/favicon\\.ico\\s*\\{.*?\\n\\s*\\}\\s*\\n)", r"\\1"+wolv, block, flags=re.S, count=1)
+    else:
+        block = re.sub(r"(index\\s+[^;]*;\\s*\\n)", r"\\1"+wolv, block, count=1)
+
+# Replace back
+new_txt = txt[:m.start()] + block + txt[m.end():]
+p.write_text(new_txt)
+print("Patched:", p)
+PY
+
+say "8) nginx test + reload"
+nginx -t
+systemctl reload nginx || nginx -s reload || true
+
+say "9) post-apply local curl"
+curl -sS -D- -o /dev/null -H "Host: ${HOST_HEADER}" http://127.0.0.1/wolverine/ | egrep -i "HTTP/|server:|location:|content-type:|content-length:"
+curl -sS -D- -o /dev/null -H "Host: ${HOST_HEADER}" http://127.0.0.1/favicon.ico | egrep -i "HTTP/|server:|location:|content-type:|content-length:"
+
+say "DONE"
+BASH
+
+chmod +x /root/fireinners_batch.sh
