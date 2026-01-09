@@ -1,85 +1,38 @@
 set -euo pipefail
 TS="$(date +%Y%m%d_%H%M%S)"
 
-KEEP="/etc/nginx/sites-enabled/fireinners.online-ssl"
+PAT='location\s+\^~\s+/wolverine/traderone/api/'
 FINAL="/etc/nginx/snippets/wolverine_final.conf"
-API_PORT="3005"
-SAVED="/etc/nginx/snippets/_saved_$TS"
 
-echo "=== 0) Precheck ==="
-[ -f "$KEEP" ] || { echo "❌ Missing: $KEEP"; exit 1; }
-mkdir -p "$SAVED"
+echo "=== 1) Où est le duplicate (nginx -T source of truth) ==="
+nginx -T 2>/dev/null | grep -nE "$PAT" | head -n 200 || true
 
-echo "=== 1) Backups ==="
-cp -a "$KEEP" "$KEEP.bak.$TS"
-cp -a /etc/nginx/snippets "$SAVED/snippets_full_backup" 2>/dev/null || true
+echo
+echo "=== 2) Quels fichiers contiennent ce location ==="
+mapfile -t FILES < <(grep -RIn --include="*.conf" -E "$PAT" /etc/nginx 2>/dev/null | awk -F: '{print $1}' | sort -u)
+printf ' - %s\n' "${FILES[@]:-<none>}"
 
-echo "=== 2) Save old wolverine snippets (not included) ==="
-for f in /etc/nginx/snippets/wolverine_prod.conf \
-         /etc/nginx/snippets/wolverine_routes.conf \
-         /etc/nginx/snippets/wolverine_auth_phantom.conf \
-         /etc/nginx/snippets/wolverine_prod.conf.bak* \
-         /etc/nginx/snippets/wolverine_routes.conf.bak*; do
-  [ -f "$f" ] && cp -a "$f" "$SAVED/" && echo "Saved: $f"
+echo
+echo "=== 3) Désactiver tous les duplicates SAUF dans wolverine_final.conf ==="
+i=0
+for f in "${FILES[@]}"; do
+  if [ "$f" = "$FINAL" ]; then
+    echo "Keep (final): $f"
+    continue
+  fi
+  i=$((i+1))
+  cp -a "$f" "$f.bak.dupe_api.$TS" || true
+  # renomme la location pour éviter collision
+  sed -i -E "s|location[[:space:]]+\^~[[:space:]]+/wolverine/traderone/api/|location ^~ /_disabled_dupe_traderone_api_${TS}_${i}/|g" "$f"
+  echo "Disabled duplicate in: $f"
 done
 
-echo "=== 3) Write FINAL (API ONLY) ==="
-cat > "$FINAL" <<NGX
-# Wolverine FINAL - API ONLY (avoids duplicate /wolverine/)
-# API: http://127.0.0.1:${API_PORT}
-
-# Auth (must never fall back to UI)
-location ^~ /wolverine/traderone/api/auth/ {
-  add_header X-Wolverine-Auth HIT always;
-  proxy_pass http://127.0.0.1:${API_PORT}/;
-  proxy_http_version 1.1;
-
-  proxy_set_header Host \$host;
-  proxy_set_header X-Real-IP \$remote_addr;
-  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto \$scheme;
-
-  proxy_set_header Upgrade \$http_upgrade;
-  proxy_set_header Connection "upgrade";
-}
-
-# All API (priority)
-location ^~ /wolverine/traderone/api/ {
-  add_header X-Wolverine-API HIT always;
-  proxy_pass http://127.0.0.1:${API_PORT}/;
-  proxy_http_version 1.1;
-
-  proxy_set_header Host \$host;
-  proxy_set_header X-Real-IP \$remote_addr;
-  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto \$scheme;
-
-  proxy_set_header Upgrade \$http_upgrade;
-  proxy_set_header Connection "upgrade";
-}
-NGX
-
-echo "=== 4) Keep ONLY one include in vhost ==="
-# remove any old wolverine includes
-sed -i '\|include /etc/nginx/snippets/wolverine_.*\.conf;|d' "$KEEP"
-
-# ensure final include exists once
-if ! grep -q "snippets/wolverine_final.conf" "$KEEP"; then
-  sed -i '0,/server[[:space:]]*{/s//server {\n    include \/etc\/nginx\/snippets\/wolverine_final.conf;/' "$KEEP"
-fi
-
-echo "=== 5) Test + reload ==="
+echo
+echo "=== 4) Test + reload ==="
 nginx -t
 systemctl reload nginx
 
-echo "=== 6) Show active wolverine includes ==="
-grep -n "include /etc/nginx/snippets/wolverine" -n "$KEEP" || true
-
-echo "=== 7) Smoke tests (origin bypass) ==="
-curl -sk -I --resolve fireinners.online:443:127.0.0.1 \
-  https://fireinners.online/wolverine/traderone/api/auth/health | sed -n '1,30p'
-
-curl -sk --resolve fireinners.online:443:127.0.0.1 \
- "https://fireinners.online/wolverine/traderone/api/auth/phantom/challenge?pubkey=11111111111111111111111111111111" | head -c 260; echo
-
-echo "DONE ✅ saved old snippets in: $SAVED"
+echo
+echo "=== 5) Recheck ==="
+nginx -T 2>/dev/null | grep -nE "$PAT" | head -n 80 || echo "✅ plus aucun duplicate traderone/api"
+echo "DONE ✅"
