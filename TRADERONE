@@ -1,102 +1,73 @@
-cat > /root/BATCH_ROOT_FULL.sh <<'BASH'
-#!/usr/bin/env bash
 set -euo pipefail
 
-TS="$(date -u +%Y%m%d_%H%M%S)"
-OUT="/root/BATCH_ROOT_FULL_${TS}.log"
+OUT="/root/BATCH_FULL_$(date -u +%Y%m%d_%H%M%S).log"
 exec > >(tee -a "$OUT") 2>&1
 
-echo "=== BATCH ROOT FULL ==="
-echo "Time (UTC): $(date -u)"
-echo "Host: $(hostname)"
-echo "Kernel: $(uname -a)"
-echo "Output: $OUT"
+echo "=== BATCH FULL @ $(date -u) ==="
+echo "LOG: $OUT"
 echo
 
-echo "=== [1] Disks / RAM / Load ==="
-df -h || true
-echo
-free -h || true
-echo
+echo "=== 0) OS / uptime / IP ==="
+uname -a || true
 uptime || true
+echo "IPs:"; (ip -br a || true) | sed 's/^/  /'
 echo
 
-echo "=== [2] Repo check (top-level /root/* git) ==="
-for d in /root/*; do
-  [ -d "$d" ] || continue
-  if [ -d "$d/.git" ]; then
-    echo
-    echo "---- REPO: $d ----"
-    (cd "$d" && \
-      echo "Remote:" && git remote -v || true; \
-      echo "Branch:" && git rev-parse --abbrev-ref HEAD || true; \
-      echo "Last commit:" && git --no-pager log -1 --oneline || true; \
-      echo "Status:" && git status -sb || true)
-  fi
+echo "=== 1) GIT: scan repos sous /root (status + remote + branch + last commit) ==="
+mapfile -t REPOS < <(find /root -maxdepth 4 -type d -name .git -print 2>/dev/null | sed 's#/.git$##' | sort -u)
+echo "Repos trouvés: ${#REPOS[@]}"
+for r in "${REPOS[@]}"; do
+  echo
+  echo "----- REPO: $r -----"
+  cd "$r"
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "skip (not git)"; continue; }
+  echo "Remote(s):"; git remote -v || true
+  echo "Branch:"; git branch --show-current || true
+  echo "Dernier commit:"; git log -1 --oneline --decorate || true
+  echo "Status:"; git status -sb || true
+  echo "Diff stat (worktree):"; git diff --stat || true
 done
 echo
 
-echo "=== [3] NGINX status / config test ==="
-systemctl status nginx --no-pager || true
-echo
+echo "=== 2) NGINX: test config + warnings ==="
 nginx -t || true
 echo
 
-echo "=== [4] Ports listening (80/443) ==="
-ss -lntp | awk 'NR==1 || $4 ~ /:(80|443)$/'
+echo "=== 3) NGINX: ports listen 80/443 ==="
+(ss -lntp || true) | egrep ':(80|443)\b' || true
 echo
 
-echo "=== [5] List enabled sites + server_name duplicates ==="
-echo "--- sites-enabled ---"
-ls -la /etc/nginx/sites-enabled || true
-echo
-echo "--- grep server_name fireinners ---"
-grep -RIn --color=never 'server_name' /etc/nginx/sites-enabled /etc/nginx/sites-available 2>/dev/null | grep -i 'fireinners' || true
+echo "=== 4) NGINX: trouver conflits server_name fireinners* ==="
+grep -RIn --include='*.conf' 'server_name' /etc/nginx 2>/dev/null | egrep 'fireinners\.online|www\.fireinners\.online' || true
 echo
 
-echo "=== [6] Find DUPLICATE location /wolverine (cause nginx -t fail) ==="
-# Montre toutes les occurrences de "location /wolverine" (et variantes)
-grep -RIn --color=never 'location[[:space:]]\+/wolverine' /etc/nginx 2>/dev/null || true
-echo
-echo "--- Full nginx dump (only lines around /wolverine) ---"
-nginx -T 2>/dev/null | awk '
-  /server \{/ {srv++}
-  /location[[:space:]]+\/wolverine/ {print "---- server#",srv,"----"; for(i=NR-5;i<=NR+12;i++) print buf[i]; print $0; hit=12}
-  {buf[NR]=$0; if(hit>0){print $0; hit--}}
-' || true
+echo "=== 5) NGINX: doublons location /wolverine (c’est ton bug visible) ==="
+nginx -T 2>/dev/null \
+ | awk '
+   $1=="server_name"{sn=$0}
+   $1=="location"{loc=$2; gsub(/[{}]/,"",loc); print sn " | " $0}
+ ' | grep -E 'location[[:space:]]+/wolverine' || true
 echo
 
-echo "=== [7] Detect rewrite loop to /index.html ==="
-echo "--- grep rewrite/try_files/index.html in /etc/nginx ---"
-grep -RIn --color=never -E 'try_files|rewrite|index\.html' /etc/nginx 2>/dev/null | head -n 200 || true
+echo "=== 6) NGINX: erreurs récentes liées à wolverine/index.html (rewrite cycle) ==="
+tail -n 200 /var/log/nginx/error.log 2>/dev/null | egrep -i 'wolverine|rewrite|redirect|cycle|index\.html|_next|favicon' || true
 echo
 
-echo "=== [8] Local curl tests (bypass Cloudflare) ==="
-echo "--- HTTP localhost ---"
-curl -sS -o /dev/null -w "HTTP localhost: %{http_code}\n" http://127.0.0.1/ || true
-echo "--- HTTPS localhost (may fail if no local SSL bind) ---"
-curl -k -sS -o /dev/null -w "HTTPS localhost: %{http_code}\n" https://127.0.0.1/ || true
-echo "--- HTTP /wolverine ---"
-curl -sS -o /dev/null -w "/wolverine: %{http_code}\n" http://127.0.0.1/wolverine/ || true
-echo "--- HTTP /wolverine/api/ping ---"
-curl -sS -o /dev/null -w "/wolverine/api/ping: %{http_code}\n" http://127.0.0.1/wolverine/api/ping || true
+echo "=== 7) Tests locaux (HTTP/HTTPS) ==="
+echo "-- curl http://127.0.0.1/ --"
+curl -sv --max-time 3 http://127.0.0.1/ -o /dev/null || true
+echo "-- curl http://127.0.0.1/wolverine/ --"
+curl -sv --max-time 3 http://127.0.0.1/wolverine/ -o /dev/null || true
+echo "-- curl https://127.0.0.1/ (sans vérifier cert) --"
+curl -skv --max-time 3 https://127.0.0.1/ -o /dev/null || true
+echo "-- curl https://127.0.0.1/wolverine/ (sans vérifier cert) --"
+curl -skv --max-time 3 https://127.0.0.1/wolverine/ -o /dev/null || true
 echo
 
-echo "=== [9] Last nginx errors (200 lines) ==="
-tail -n 200 /var/log/nginx/error.log 2>/dev/null || true
+echo "=== 8) Résumé rapide ==="
+echo "Si tu vois:"
+echo " - 'duplicate location \"/wolverine\"' => tu as 2 blocs location /wolverine dans le même server{} -> en garder 1."
+echo " - 'rewrite or internal redirection cycle ... /index.html' => ta règle try_files/rewrite renvoie /index.html qui retombe dans la même règle."
+echo " - Cloudflare 522 => l’origin répond pas/timeout (nginx pas sur 443, firewall, ou boucle qui bloque)."
 echo
-
-echo "=== [10] Quick hint summary ==="
-echo "If you see: duplicate location \"/wolverine\" => tu as 2 blocs location /wolverine dans le MEME server {}."
-echo "Fix: garde UN seul bloc location /wolverine et supprime/merge l’autre (ou mets l’autre dans un autre server_name / port)."
-echo
-echo "If you see: rewrite or internal redirection cycle to /index.html =>"
-echo "souvent un try_files/rewrite qui renvoie vers /index.html mais /index.html repasse dans la même règle."
-echo "Fix classique: pour SPA, faire try_files \$uri \$uri/ /wolverine/index.html; MAIS seulement dans location /wolverine/."
-echo
-
 echo "=== DONE ==="
-BASH
-
-chmod +x /root/BATCH_ROOT_FULL.sh
-/root/BATCH_ROOT_FULL.sh
