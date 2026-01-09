@@ -1,96 +1,18 @@
-cat >/root/fireinners_fix_batch.sh <<'BASH'
-#!/usr/bin/env bash
-set -euo pipefail
+# 1) Dry-run (aucune modif)
+APPLY=0 bash /root/fireinners_batch.sh | tee /root/fireinners_batch_dryrun_$(date +%F_%H%M%S).log
 
-DOMAIN="${DOMAIN:-fireinners.online}"
-APPLY="${APPLY:-0}"
+# 2) Vérif nginx (syntax + reload si OK)
+nginx -t && systemctl reload nginx
 
-log(){ printf "\n== %s ==\n" "$*"; }
+# 3) Vérif écoute ports
+ss -lntp | egrep ':(80|443)\s'
 
-log "1) Find server blocks for ${DOMAIN}"
-nginx -T 2>/dev/null | nl -ba | egrep -n "server_name|listen|root|index|location\s+/wolverine|location\s+\^~\s+/wolverine|try_files" | head -n 200 || true
+# 4) Vérifs HTTP/HTTPS côté VPS (Host header)
+curl -sI  http://127.0.0.1/wolverine/   -H 'Host: fireinners.online' | head -n 20
+curl -sI https://127.0.0.1/wolverine/   -H 'Host: fireinners.online' -k | head -n 20
+curl -sI https://127.0.0.1/favicon.ico  -H 'Host: fireinners.online' -k | head -n 20
 
-log "2) Quick checks: docroots exist?"
-test -d /var/www/fireinners || echo "!! /var/www/fireinners absent"
-test -d /var/www/wolverine  || echo "!! /var/www/wolverine absent"
-test -L /var/www/wolverine_current && ls -l /var/www/wolverine_current || true
-
-log "3) Local curl (Host header) before any change"
-curl -sSI -H "Host: ${DOMAIN}" http://127.0.0.1/wolverine/ | egrep -i 'HTTP/|Location:|server:|content-type:' || true
-curl -sSI -H "Host: ${DOMAIN}" http://127.0.0.1/favicon.ico | egrep -i 'HTTP/|Location:|server:|content-type:' || true
-
-CONF="/etc/nginx/sites-available/${DOMAIN}-ssl"
-[ -f "$CONF" ] || CONF="/etc/nginx/sites-available/${DOMAIN}"
-if [ ! -f "$CONF" ]; then
-  log "ERROR: no vhost found in /etc/nginx/sites-available for ${DOMAIN}"
-  exit 1
-fi
-
-BK="/etc/nginx/sites-disabled/batchfix_$(date +%F_%H%M%S)"
-mkdir -p "$BK"
-cp -a "$CONF" "$BK/$(basename "$CONF")"
-
-log "4) Patch rules (SPA + favicon). APPLY=$APPLY"
-if [ "$APPLY" = "1" ]; then
-  # 4a) Ensure /wolverine uses try_files to /wolverine/index.html (SPA) to avoid internal redirect loop to /index.html
-  if ! grep -qE 'location\s+\^~\s+/wolverine/?\s*\{' "$CONF"; then
-    # inject a wolverine location inside the first server block (best-effort)
-    awk '
-      BEGIN{done=0}
-      {
-        print
-        if(!done && $0 ~ /server\s*\{/){
-          done=1
-          print "    # --- injected by fireinners_fix_batch ---"
-          print "    location ^~ /wolverine/ {"
-          print "        root /var/www;"
-          print "        try_files $uri $uri/ /wolverine/index.html;"
-          print "    }"
-          print "    # --- end injected ---"
-        }
-      }' "$CONF" >"${CONF}.tmp" && mv "${CONF}.tmp" "$CONF"
-  else
-    # if location exists, try to replace bad try_files pointing to /index.html
-    sed -i \
-      -e 's/try_files[[:space:]]\+\$uri[[:space:]]\+\$uri\/[[:space:]]\+\/index\.html;/try_files $uri $uri\/ \/wolverine\/index.html;/g' \
-      -e 's/try_files[[:space:]]\+\$uri[[:space:]]\+\$uri\/[[:space:]]\+\/index\.html[[:space:]]\+\(.*\);/try_files $uri $uri\/ \/wolverine\/index.html;\1;/g' \
-      "$CONF" || true
-  fi
-
-  # 4b) Handle /favicon.ico cleanly (return 204) to avoid 500s
-  if ! grep -qE 'location\s*=\s*/favicon\.ico' "$CONF"; then
-    awk '
-      BEGIN{done=0}
-      {
-        print
-        if(!done && $0 ~ /server\s*\{/){
-          done=1
-          print "    location = /favicon.ico { access_log off; log_not_found off; return 204; }"
-        }
-      }' "$CONF" >"${CONF}.tmp" && mv "${CONF}.tmp" "$CONF"
-  fi
-
-  # ensure site enabled
-  if [ -d /etc/nginx/sites-enabled ] && [ -f "$CONF" ]; then
-    ln -sf "$CONF" "/etc/nginx/sites-enabled/$(basename "$CONF")"
-  fi
-
-  log "5) Test & reload nginx"
-  nginx -t
-  systemctl reload nginx
-
-else
-  echo "APPLY=0: aucune modification. Pour appliquer: APPLY=1 bash /root/fireinners_fix_batch.sh"
-fi
-
-log "6) Post-checks (local)"
-curl -sSI -H "Host: ${DOMAIN}" http://127.0.0.1/wolverine/ | egrep -i 'HTTP/|Location:|server:|content-type:' || true
-curl -sSI -H "Host: ${DOMAIN}" http://127.0.0.1/favicon.ico | egrep -i 'HTTP/|Location:|server:|content-type:' || true
-
-log "DONE (backup in $BK)"
-BASH
-
-chmod +x /root/fireinners_fix_batch.sh
-
-# dry-run (aucun changement)
-APPLY=0 bash /root/fireinners_fix_batch.sh
+# 5) Vérifs publics (via Cloudflare)
+curl -sI  http://fireinners.online/wolverine/  | egrep -i 'HTTP/|location:'
+curl -sI https://fireinners.online/wolverine/  | egrep -i 'HTTP/|server:|content-type:'
+curl -sI https://fireinners.online/favicon.ico | egrep -i 'HTTP/|server:'
