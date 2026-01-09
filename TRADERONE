@@ -1,113 +1,45 @@
-# ROOT — FULL: clone repo (no prompt) + nginx map + fix 403 on /wolverine/traderone/api + perms + tests
 set -euo pipefail
 
-REPO_URL="https://github.com/Qcteck/WOLVERINE.git"
+REPO_SSH="git@github.com:Qcteck/WOLVERINE.git"
 CLONE_DIR="/opt/fireinners/WOLVERINE_REPO"
-UI_DIST="/var/www/wolverine"
-SNIP="/etc/nginx/snippets/wolverine_locations.conf"
+KEY="/root/.ssh/id_ed25519_wolverine"
 
-echo "=== 0) Tools ==="
 apt-get update -y
-apt-get install -y git curl rsync
+apt-get install -y git openssh-client
 
-echo "=== 1) Clone/Pull repo (NON-interactive) ==="
-export GIT_TERMINAL_PROMPT=0
+mkdir -p /root/.ssh
+chmod 700 /root/.ssh
+
+# 1) Crée une clé SSH dédiée (si pas déjà là)
+if [ ! -f "$KEY" ]; then
+  ssh-keygen -t ed25519 -N "" -f "$KEY" -C "wolverine-vps"
+fi
+
+# 2) Ajoute GitHub au known_hosts
+ssh-keyscan -H github.com >> /root/.ssh/known_hosts 2>/dev/null || true
+chmod 600 /root/.ssh/known_hosts
+
+echo
+echo "=== ✅ COPIE CETTE CLÉ PUBLIQUE DANS GITHUB (Deploy key) ==="
+cat "${KEY}.pub"
+echo "=== FIN ==="
+echo
+
+echo "Ensuite: GitHub repo -> Settings -> Deploy keys -> Add deploy key -> coche 'Allow write access' si tu veux push."
+echo "Quand c'est fait, rerun ce batch (même commande)."
+
+# 3) Test SSH (va échouer tant que la clé est pas ajoutée)
+ssh -i "$KEY" -o IdentitiesOnly=yes -T git@github.com || true
+
+# 4) Clone/Pull en SSH
 if [ ! -d "$CLONE_DIR/.git" ]; then
   rm -rf "$CLONE_DIR" 2>/dev/null || true
-  if ! git clone --depth 1 "$REPO_URL" "$CLONE_DIR"; then
-    echo "❌ Clone blocked (repo private ou auth required)."
-    echo "➡️ Fix: clone via SSH (git@github.com:Qcteck/WOLVERINE.git) avec clé SSH, ou PAT."
-    exit 1
-  fi
+  GIT_SSH_COMMAND="ssh -i $KEY -o IdentitiesOnly=yes" git clone "$REPO_SSH" "$CLONE_DIR"
 else
   cd "$CLONE_DIR"
-  git fetch --all --prune || true
+  GIT_SSH_COMMAND="ssh -i $KEY -o IdentitiesOnly=yes" git fetch --all --prune
   git checkout main 2>/dev/null || git checkout master 2>/dev/null || true
   git pull --ff-only || true
 fi
 
-echo
-echo "=== 2) Nginx: trouver où est /wolverine ==="
-nginx -T 2>/dev/null | grep -nE "configuration file|server_name|location\s+\^~\s+/wolverine/|location\s+=\s+/wolverine|proxy_pass|root" | head -n 260 || true
-
-echo
-echo "=== 3) Ecrire snippet (force proxy traderone/api -> 127.0.0.1:3000) ==="
-mkdir -p /etc/nginx/snippets
-cat > "$SNIP" <<'NGX'
-# Wolverine overrides (TraderOne API)
-location = /wolverine { return 301 /wolverine/; }
-
-location ^~ /wolverine/traderone/api/ {
-  proxy_pass http://127.0.0.1:3000/;
-  proxy_http_version 1.1;
-  proxy_set_header Host $host;
-  proxy_set_header X-Real-IP $remote_addr;
-  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto $scheme;
-}
-NGX
-
-echo
-echo "=== 4) Injecter le snippet dans le(s) fichier(s) nginx qui contiennent /wolverine ==="
-FILES="$(nginx -T 2>/dev/null | awk '
-  /^# configuration file / {file=$4}
-  /location/ && /\/wolverine/ {print file}
-' | sort -u)"
-
-if [ -z "${FILES:-}" ]; then
-  echo "❌ Impossible de trouver un fichier nginx contenant /wolverine."
-  echo "➡️ Run: nginx -T | grep -n wolverine"
-  exit 1
-fi
-
-echo "Candidate nginx files:"
-echo "$FILES"
-
-for f in $FILES; do
-  [ -f "$f" ] || continue
-  ts="$(date +%Y%m%d_%H%M%S)"
-  cp -a "$f" "$f.bak.$ts"
-
-  # si déjà inclus, skip
-  if grep -q "snippets/wolverine_locations.conf" "$f"; then
-    echo "[SKIP] already includes snippet: $f"
-    continue
-  fi
-
-  # injecte l'include dans le PREMIER server { du fichier
-  # (safe: backup + insertion unique)
-  sed -i '0,/server[[:space:]]*{/s//server {\n    include \/etc\/nginx\/snippets\/wolverine_locations.conf;/' "$f"
-  echo "[PATCHED] $f"
-done
-
-echo
-echo "=== 5) Fix permissions UI_DIST ==="
-mkdir -p "$UI_DIST"
-chown -R www-data:www-data "$UI_DIST" || true
-chmod -R a+rX "$UI_DIST" || true
-
-echo
-echo "=== 6) Reload nginx ==="
-nginx -t
-systemctl reload nginx
-
-echo
-echo "=== 7) Tests (le but: PLUS de 403) ==="
-echo "--- UI HEAD ---"
-curl -sS -I https://fireinners.online/wolverine/ | head -n 25 || true
-echo
-echo "--- API health ---"
-curl -sS -i https://fireinners.online/wolverine/traderone/api/health | head -n 40 || true
-echo
-echo "--- API status ---"
-curl -sS -i https://fireinners.online/wolverine/traderone/api/status | head -n 40 || true
-echo
-echo "--- API positions (celle qui te sort 403 dans l'UI) ---"
-curl -sS -i https://fireinners.online/wolverine/traderone/api/positions | head -n 40 || true
-echo
-echo "--- Backend direct (bypass nginx) ---"
-curl -sS -i http://127.0.0.1:3000/positions 2>/dev/null | head -n 40 || true
-
-echo
-echo "DONE ✅"
-echo "➡️ Ouvre https://fireinners.online/wolverine/ et check si les blocs 403 ont disparu."
+echo "CLONE OK ✅ -> $CLONE_DIR"
