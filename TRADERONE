@@ -1,60 +1,37 @@
 set -euo pipefail
+TS="$(date +%Y%m%d_%H%M%S)"
+FINAL="/etc/nginx/snippets/wolverine_final.conf"
+PAT='location[[:space:]]+(\^~|~\*?|=)?[[:space:]]*/wolverine/traderone/api/?'
 
-# 0) Trouver le dernier dossier PNG généré
-PNG_DIR="$(ls -d /root/bak_renders_machine_*/png 2>/dev/null | tail -n 1 || true)"
-[ -n "${PNG_DIR:-}" ] || { echo "❌ Aucun /root/bak_renders_machine_*/png trouvé"; exit 1; }
+echo "=== 0) Backup quick ==="
+cp -a /etc/nginx "/etc/nginx.bak.$TS"
 
-# 1) Dossier public
-WEB_DIR="/var/www/fireinners-test"
-mkdir -p "$WEB_DIR"
-cp -a "$PNG_DIR"/*.png "$WEB_DIR"/ 2>/dev/null || true
+echo "=== 1) Source of truth: qui définit traderone/api (nginx -T) ==="
+nginx -T 2>/dev/null | grep -nE "$PAT" | head -n 200 || true
 
-# 2) Générer une galerie HTML
-python3 - <<'PY'
-import glob, html, os
-web_dir="/var/www/fireinners-test"
-imgs=sorted(glob.glob(os.path.join(web_dir,"*.png")))
-with open(os.path.join(web_dir,"index.html"),"w",encoding="utf-8") as f:
-    f.write("<!doctype html><meta charset=utf-8><title>TEST</title>")
-    f.write("<style>body{font-family:system-ui;background:#0b0f14;color:#e8eef6}"
-            ".g{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px}"
-            ".c{background:#121826;border:1px solid #223049;border-radius:12px;padding:10px}"
-            "img{width:100%;border-radius:10px} a{color:#7dd3fc}</style>")
-    f.write(f"<h2>/test — renders ({len(imgs)})</h2><div class=g>")
-    for p in imgs:
-        name=os.path.basename(p)
-        n=html.escape(name)
-        f.write(f'<div class=c><a href="{n}"><img loading="lazy" src="{n}"></a>'
-                f'<div style="margin-top:6px;font-size:12px;opacity:.8">{n}</div></div>')
-    f.write("</div>")
-print("✅ Galerie index.html créée")
-PY
+echo
+echo "=== 2) Fichiers sur disque qui contiennent cette location ==="
+mapfile -t FILES < <(grep -RIn --include="*.conf" -E "$PAT" /etc/nginx 2>/dev/null | awk -F: '{print $1}' | sort -u)
+printf ' - %s\n' "${FILES[@]:-<none>}"
 
-# 3) Permissions lisibles par nginx
-chown -R www-data:www-data "$WEB_DIR" || true
-chmod -R a+rX "$WEB_DIR"
+echo
+echo "=== 3) Désactiver toutes les locations duplicate (sauf wolverine_final.conf) ==="
+i=0
+for f in "${FILES[@]}"; do
+  if [ "$f" = "$FINAL" ]; then
+    echo "Keep (final): $f"
+    continue
+  fi
+  i=$((i+1))
+  cp -a "$f" "$f.bak.dupe_traderone_api.$TS"
+  sed -i -E "s|location[[:space:]]+(\^~|~\*?|=)?[[:space:]]*/wolverine/traderone/api/?|location ^~ /_disabled_dupe_traderone_api_${TS}_${i}/|g" "$f"
+  echo "Disabled in: $f"
+done
 
-# 4) Conf Nginx: /test/ -> /var/www/fireinners-test/
-CONF="/etc/nginx/snippets/fireinners_test.conf"
-cat > "$CONF" <<'NGX'
-location ^~ /test/ {
-  alias /var/www/fireinners-test/;
-  index index.html;
-  try_files $uri $uri/ =404;
-  add_header Cache-Control "no-store" always;
-}
-NGX
-
-# 5) Inclure le snippet dans le vhost SSL fireinners (si pas déjà fait)
-VHOST="/etc/nginx/sites-enabled/fireinners.online-ssl"
-[ -f "$VHOST" ] || VHOST="$(ls -1 /etc/nginx/sites-enabled/*fireinners* 2>/dev/null | head -n 1 || true)"
-[ -n "${VHOST:-}" ] || { echo "❌ Vhost fireinners introuvable dans /etc/nginx/sites-enabled"; exit 1; }
-
-# Ajoute l'include une seule fois
-grep -q "fireinners_test.conf" "$VHOST" || sed -i '0,/server[[:space:]]*{/s//server {\n    include \/etc\/nginx\/snippets\/fireinners_test.conf;/' "$VHOST"
-
-# 6) Test + reload
+echo
+echo "=== 4) Test + reload ==="
 nginx -t
 systemctl reload nginx
 
-echo "✅ OK: https://fireinners.online/test/"
+echo
+echo "✅ OK - plus de duplicate. Backup: /etc/nginx.bak.$TS"
