@@ -1,59 +1,35 @@
 set -euo pipefail
 
-CONF="/etc/nginx/sites-enabled/fireinners.online-ssl"
+EN="/etc/nginx/sites-enabled"
+DIS="/etc/nginx/sites-disabled/cleanup_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$DIS"
 
-echo "=== 0) Show error context (line 92 + autour) ==="
-nl -ba "$CONF" | sed -n '70,115p'
+echo "=== AVANT (sites-enabled) ==="
+ls -lah "$EN" || true
 echo
 
-echo "=== 1) Où sont les location /wolverine (tous fichiers) ==="
-grep -RIn --color=never 'location\s\+\(^~\s\+\)\?/wolverine' /etc/nginx || true
+echo "=== 1) Déplacer tous les fichiers .bak* hors de sites-enabled ==="
+shopt -s nullglob
+for f in "$EN"/*bak* "$EN"/*before_edit* "$EN"/*rm_tests* "$EN"/*dupe*; do
+  mv "$f" "$DIS/" && echo "Moved: $f -> $DIS/"
+done
+shopt -u nullglob
 echo
 
-echo "=== 2) Dans le vhost, quels includes wolverine ? ==="
-grep -n --color=never 'include .*wolverine' "$CONF" || true
+echo "=== 2) Déplacer aussi tout fichier NORMAL (non-symlink) hors sites-enabled (les backups finissent souvent comme ça) ==="
+for f in "$EN"/*; do
+  [ -e "$f" ] || continue
+  if [ ! -L "$f" ]; then
+    mv "$f" "$DIS/" && echo "Moved non-symlink: $f -> $DIS/"
+  fi
+done
 echo
 
-echo "=== 3) Choisir 1 snippet wolverine à garder ==="
-KEEP="$(ls -1 /etc/nginx/snippets/wolverine*.server.inc 2>/dev/null | grep -E 'final|routes|prod' | head -n 1 || true)"
-if [ -z "$KEEP" ]; then
-  KEEP="$(ls -1 /etc/nginx/snippets/wolverine*.server.inc 2>/dev/null | head -n 1 || true)"
-fi
-echo "KEEP=$KEEP"
-[ -n "$KEEP" ] || { echo "❌ Aucun /etc/nginx/snippets/wolverine*.server.inc trouvé"; exit 1; }
+echo "=== APRES (sites-enabled) ==="
+ls -lah "$EN" || true
 echo
 
-echo "=== 4) Backup du vhost ==="
-cp -a "$CONF" "$CONF.bak.$(date +%s)"
-
-echo "=== 5) Supprimer dans le vhost tous les include wolverine SAUF KEEP ==="
-# supprime toutes les lignes include wolverine..., puis réinjecte KEEP une seule fois
-sed -i '/include .*wolverine.*;/d' "$CONF"
-
-# injecte KEEP après server_name (une seule fois)
-awk -v inc="  include $KEEP;" '
-  {print}
-  $0 ~ /server_name/ && !done {print inc; done=1}
-' "$CONF" > "$CONF.tmp" && mv "$CONF.tmp" "$CONF"
-
-echo "=== 6) Si le vhost contient encore 2x location /wolverine inline, commenter les doublons ==="
-awk '
-  BEGIN{seen=0; inblk=0}
-  {
-    if ($0 ~ /^[[:space:]]*location[[:space:]]+(\^~[[:space:]]+)?\/wolverine/ ) {
-      seen++
-      if (seen>=2) {inblk=1; print "#DUPLICATE_DISABLED " $0; next}
-    }
-    if (inblk==1) {
-      # on commente tout jusqu’à la fin du bloc (ligne contenant juste "}")
-      if ($0 ~ /^[[:space:]]*}\s*$/) { print "#DUPLICATE_DISABLED " $0; inblk=0; next }
-      print "#DUPLICATE_DISABLED " $0; next
-    }
-    print
-  }
-' "$CONF" > "$CONF.tmp" && mv "$CONF.tmp" "$CONF"
-
-echo "=== 7) Test + reload ==="
+echo "=== 3) Test nginx ==="
 nginx -t
 systemctl reload nginx
-echo "✅ OK: plus de duplicate location /wolverine"
+echo "✅ OK"
