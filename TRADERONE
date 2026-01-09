@@ -1,94 +1,148 @@
-bash -lc 'cat >/tmp/MEGA_GIT_PUSH_KEEP_KEY_2_COMMITS.sh <<'"'"'BASH'"'"'
+bash -lc 'cat >/root/MEGA_VPS_MENAGE_NO_GIT.sh <<'"'"'BASH'"'"'
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="/opt/wolverine"
+# SAFE DEFAULTS
+: "${VACUUM_JOURNAL_DAYS:=14}"
+: "${ALLOW_APT_AUTOREMOVE:=0}"   # 0=safe (no package removal)
+: "${QUARANTINE_BAKS:=1}"        # move backups to quarantine
+: "${QUARANTINE_MIXED:=1}"       # move suspicious "html+bash" files to quarantine
+
 TS="$(date -u +%Y%m%d-%H%M%S)"
-BR="cleanup-baks-${TS}"
-QUAR="/opt/_quarantine_git_${TS}"
-mkdir -p "$QUAR"
+LOG="/root/vps_menage_no_git_${TS}.log"
+Q="/opt/_quarantine_vps_${TS}"
+mkdir -p "$Q"
 
-die(){ echo "ERR: $*" >&2; exit 1; }
-say(){ echo "[$(date -u +%F\ %T)] $*"; }
+say(){ echo "[$(date -u +%F\ %T)] $*" | tee -a "$LOG"; }
+run(){ say "+ $*"; "$@" >>"$LOG" 2>&1 || { say "ERR: $*"; return 1; }; }
 
-[ "$(id -u)" -eq 0 ] || die "Run as root."
-[ -d "$REPO/.git" ] || die "Repo introuvable: $REPO/.git"
+[ "$(id -u)" -eq 0 ] || { echo "ERR: run as root" >&2; exit 1; }
 
-cd "$REPO"
-say "Repo: $REPO"
-say "Remote(s):"; git remote -v || true
+say "MEGA VPS MENAGE (NO GIT) TS=$TS"
+say "Quarantine: $Q"
+say "Before disk:"
+df -hT | tee -a "$LOG"
 
-CUR_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
-[ -n "${CUR_BRANCH:-}" ] || die "Impossible de détecter la branche courante."
-say "Branche courante: $CUR_BRANCH"
-
-say "Checkout new branch: $BR"
-git checkout -b "$BR"
-
-# COMMIT 1: .gitignore (NE TOUCHE PAS aux keys)
-say "COMMIT 1: chore(gitignore): ignore backups/junk only (keep keys)"
-GI=".gitignore"
-touch "$GI"
-add_line(){ grep -qxF "$1" "$GI" || echo "$1" >>"$GI"; }
-
-add_line ""
-add_line "# --- junk / backups ---"
-add_line "*.bak"
-add_line "*.bak*"
-add_line "*.bakfix*"
-add_line "*~"
-add_line "*.old"
-add_line "*.tmp"
-add_line ".DS_Store"
-add_line "Thumbs.db"
-add_line ""
-add_line "# --- build artifacts ---"
-add_line "node_modules/"
-add_line "dist/"
-add_line ".next/"
-add_line "out/"
-add_line "coverage/"
-
-git add "$GI" || true
-if ! git diff --cached --quiet; then
-  git commit -m "chore(gitignore): ignore backups and junk artifacts"
+# 1) apt cache (safe)
+say "1) apt cache clean (safe)"
+if command -v apt-get >/dev/null 2>&1; then
+  run apt-get -y clean || true
+  run apt-get -y autoclean || true
+  if [ "$ALLOW_APT_AUTOREMOVE" = "1" ]; then
+    say "ALLOW_APT_AUTOREMOVE=1 -> autoremove enabled"
+    run apt-get -y autoremove || true
+  else
+    say "Skipping apt-get autoremove (set ALLOW_APT_AUTOREMOVE=1 to enable)."
+  fi
 else
-  say "Commit 1: rien à committer."
+  say "apt-get not found, skipping."
 fi
 
-# COMMIT 2: remove tracked backups (move to quarantine)
-say "COMMIT 2: chore: remove backup artifacts from repository (quarantine)"
-TRACKED_BAKS="$(git ls-files | grep -E "(\.bak($|[^/])|\.bakfix|~$|\.old$)" || true)"
-if [ -n "${TRACKED_BAKS:-}" ]; then
-  while IFS= read -r f; do
-    [ -n "$f" ] || continue
-    if [ -f "$f" ]; then
-      mkdir -p "$QUAR/$(dirname "$f")"
-      mv -n "$f" "$QUAR/$f" 2>/dev/null || true
+# 2) journald vacuum (safe)
+say "2) journald vacuum (safe)"
+if command -v journalctl >/dev/null 2>&1; then
+  run journalctl --vacuum-time="${VACUUM_JOURNAL_DAYS}d" || true
+else
+  say "journalctl not found, skipping."
+fi
+
+# 3) fix /root/.profile cargo spam (safe)
+say "3) Fix /root/.profile cargo env spam (safe)"
+PROFILE="/root/.profile"
+CARGO_LINE='[ -f /root/.cargo/env ] && . /root/.cargo/env'
+if [ -f "$PROFILE" ]; then
+  if grep -q '/root/.cargo/env' "$PROFILE"; then
+    # remove bare source line(s) and replace with guarded line (idempotent)
+    tmp="$(mktemp)"
+    awk '
+      /\/root\/\.cargo\/env/ {next}
+      {print}
+    ' "$PROFILE" >"$tmp"
+    # append guarded line once
+    if ! grep -qxF "$CARGO_LINE" "$tmp"; then
+      echo "" >>"$tmp"
+      echo "$CARGO_LINE" >>"$tmp"
     fi
-    git rm -f --cached "$f" >/dev/null 2>&1 || true
-  done <<<"$TRACKED_BAKS"
+    cp -a "$PROFILE" "$Q/root.profile.backup_${TS}" || true
+    mv "$tmp" "$PROFILE"
+    say "Updated /root/.profile (backup in $Q/root.profile.backup_${TS})"
+  else
+    say "/root/.profile has no cargo env line."
+  fi
 else
-  say "Aucun fichier backup tracké trouvé."
+  say "/root/.profile not found."
 fi
 
-git add -A || true
-if ! git diff --cached --quiet; then
-  git commit -m "chore: remove backup artifacts from repository"
+# Targets to quarantine backups
+TARGETS=(
+  "/opt/fireinners/frontend-react/app/dist/wolverine"
+  "/opt/fireinners/frontend-react/app/dist"
+  "/opt/fireinners"
+  "/opt/traderone-opt"
+  "/TRADERONE"
+  "/root"
+)
+
+# 4) quarantine backups (*.bak*, *~, *.old)
+say "4) Quarantine backups (*.bak*, *~, *.old) (safe move)"
+if [ "$QUARANTINE_BAKS" = "1" ]; then
+  mkdir -p "$Q/baks"
+  for base in "${TARGETS[@]}"; do
+    [ -d "$base" ] || continue
+    say "Scan backups: $base"
+    while IFS= read -r f; do
+      # exclusions: do not touch sentinel/charte
+      case "$f" in
+        /opt/fireinners/sentinel/*) continue ;;
+        /opt/fireinners/CHARTE_FIREINNERS.*) continue ;;
+      esac
+      rel="${f#/}"
+      dest="$Q/baks/$rel"
+      mkdir -p "$(dirname "$dest")"
+      if [ ! -e "$dest" ]; then
+        say "MOVE backup -> $dest"
+        mv -n "$f" "$dest" 2>>"$LOG" || true
+      fi
+    done < <(find "$base" -type f \( -name "*.bak" -o -name "*.bak*" -o -name "*~" -o -name "*.old" \) 2>/dev/null)
+  done
 else
-  say "Commit 2: rien à committer."
+  say "QUARANTINE_BAKS=0 -> skipping."
 fi
 
-say "Résumé commits:"
-git --no-pager log --oneline -n 6 || true
+# 5) quarantine suspicious mixed files (html + bash markers)
+say "5) Quarantine suspicious mixed files (html + bash markers)"
+if [ "$QUARANTINE_MIXED" = "1" ]; then
+  mkdir -p "$Q/mixed"
+  for base in "${TARGETS[@]}"; do
+    [ -d "$base" ] || continue
+    say "Scan mixed: $base"
+    # look at .html* files for bash markers
+    while IFS= read -r f; do
+      # quick grep (safe)
+      if grep -aEq '(^|[[:space:]])(set -euo pipefail|apt-get|journalctl|#!/usr/bin/env bash|find /|mv -n|git )' "$f" 2>/dev/null; then
+        rel="${f#/}"
+        dest="$Q/mixed/$rel"
+        mkdir -p "$(dirname "$dest")"
+        if [ ! -e "$dest" ]; then
+          say "MOVE mixed -> $dest"
+          mv -n "$f" "$dest" 2>>"$LOG" || true
+        fi
+      fi
+    done < <(find "$base" -type f \( -name "*.html" -o -name "*.html.*" -o -name "*.bakfix*" \) 2>/dev/null)
+  done
+else
+  say "QUARANTINE_MIXED=0 -> skipping."
+fi
 
-say "Push branch -> origin/$BR"
-git push -u origin "$BR"
+say "After disk:"
+df -hT | tee -a "$LOG"
+
+say "Quarantine size:"
+du -sh "$Q" 2>/dev/null | tee -a "$LOG" || true
 
 say "DONE."
-say "Branche poussée: $BR"
-say "Quarantaine: $QUAR"
-say "Prochaine étape: PR $BR -> $CUR_BRANCH sur GitHub."
+say "Log: $LOG"
+say "Quarantine: $Q"
 BASH
-chmod +x /tmp/MEGA_GIT_PUSH_KEEP_KEY_2_COMMITS.sh
-/tmp/MEGA_GIT_PUSH_KEEP_KEY_2_COMMITS.sh'
+chmod +x /root/MEGA_VPS_MENAGE_NO_GIT.sh
+bash /root/MEGA_VPS_MENAGE_NO_GIT.sh'
