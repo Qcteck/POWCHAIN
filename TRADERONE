@@ -1,17 +1,37 @@
 set -euo pipefail
+TS="$(date +%Y%m%d_%H%M%S)"
+PAT='location[[:space:]]+(\^~|~\*?|=)?[[:space:]]*/wolverine/traderone/api/?'
+BACK="/etc/nginx.bak.$TS"
 
-echo "=== 1) Erreur complète nginx -t (fichier + ligne) ==="
-nginx -t 2>&1 | tail -n 60
+echo "=== Backup /etc/nginx -> $BACK ==="
+cp -a /etc/nginx "$BACK"
+
+echo "=== Files containing the duplicate location ==="
+mapfile -t FILES < <(grep -RIn --include="*.conf" -E "$PAT" /etc/nginx 2>/dev/null | awk -F: '{print $1}' | sort -u)
+
+printf ' - %s\n' "${FILES[@]}"
+[ "${#FILES[@]}" -gt 0 ] || { echo "❌ No match found in /etc/nginx"; exit 1; }
 
 echo
-echo "=== 2) Les 2 occurrences dans la config chargée (nginx -T) ==="
-nginx -T 2>/dev/null | grep -nE 'location\s+(\^~|~\*?|=)?\s*/wolverine/traderone/api/?' | head -n 50
+echo "=== Keep first file, disable the location in all others ==="
+KEEP="${FILES[0]}"
+echo "KEEP: $KEEP"
 
-echo
-echo "=== 3) Contexte autour de chaque occurrence (preuve) ==="
-for ln in $(nginx -T 2>/dev/null | grep -nE 'location\s+(\^~|~\*?|=)?\s*/wolverine/traderone/api/?' | cut -d: -f1 | head -n 10); do
-  echo "----- CONTEXT around nginx -T line $ln -----"
-  start=$((ln-35)); [ $start -lt 1 ] && start=1
-  end=$((ln+35))
-  nginx -T 2>/dev/null | sed -n "${start},${end}p"
+i=0
+for f in "${FILES[@]}"; do
+  if [ "$f" = "$KEEP" ]; then
+    echo "✅ keep: $f"
+    continue
+  fi
+  i=$((i+1))
+  cp -a "$f" "$f.bak.dupe_$TS"
+  sed -i -E "s|$PAT|location ^~ /_disabled_dupe_traderone_api_${TS}_${i}/|g" "$f"
+  echo "🚫 disabled in: $f"
 done
+
+echo
+echo "=== Test + reload ==="
+nginx -t
+systemctl reload nginx
+
+echo "✅ OK. Backup: $BACK"
