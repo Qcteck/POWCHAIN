@@ -1,43 +1,71 @@
 set -euo pipefail
 TS="$(date +%Y%m%d_%H%M%S)"
+SNIP="/etc/nginx/snippets/wolverine_final.conf"
+VHOST="/etc/nginx/sites-enabled/fireinners.online-ssl"
 PAT='location[[:space:]]+(\^~|~\*?|=)?[[:space:]]*/wolverine/traderone/api/?'
-BACK="/etc/nginx.bak.$TS"
 
-echo "=== 0) Backup /etc/nginx -> $BACK ==="
-cp -a /etc/nginx "$BACK"
+echo "=== 0) Backup ==="
+cp -a /etc/nginx "/etc/nginx.bak.$TS"
 
-echo
-echo "=== 1) nginx -t (erreur complète) ==="
-nginx -t 2>&1 || true
-
-echo
-echo "=== 2) Tous les fichiers qui contiennent ce location ==="
-mapfile -t FILES < <(grep -RIn --include="*.conf" -E "$PAT" /etc/nginx 2>/dev/null | awk -F: '{print $1}' | sort -u)
-printf ' - %s\n' "${FILES[@]:-<none>}"
-[ "${#FILES[@]}" -gt 0 ] || { echo "❌ Aucun match trouvé"; exit 1; }
+echo "=== 1) Combien de fois la location existe DANS le snippet ? ==="
+grep -nE "$PAT" "$SNIP" || true
+echo "Count in snippet:"
+grep -cE "$PAT" "$SNIP" || true
 
 echo
-echo "=== 3) On garde le 1er, on désactive le location dans les autres ==="
-KEEP="${FILES[0]}"
-echo "KEEP: $KEEP"
-
-i=0
-for f in "${FILES[@]}"; do
-  if [ "$f" = "$KEEP" ]; then
-    echo "✅ keep: $f"
-    continue
-  fi
-  i=$((i+1))
-  cp -a "$f" "$f.bak.dupe_traderone_api.$TS"
-  # remplace SEULEMENT le header du location pour le neutraliser (le bloc reste mais sur un path mort)
-  sed -i -E "s|$PAT|location ^~ /_disabled_dupe_traderone_api_${TS}_${i}/|g" "$f"
-  echo "🚫 disabled in: $f"
-done
+echo "=== 2) Combien de fois le snippet est inclus dans la conf chargée ? (nginx -T) ==="
+nginx -T 2>/dev/null | grep -n "include $SNIP" || true
+echo "Include count (nginx -T):"
+nginx -T 2>/dev/null | grep -c "include $SNIP" || true
 
 echo
-echo "=== 4) Test + reload ==="
+echo "=== 3) Où le snippet est inclus sur disque ? ==="
+grep -RIn --include="*.conf" "include $SNIP" /etc/nginx || true
+
+echo
+echo "=== 4) Vérif dans le vhost fireinners.online-ssl (include + location) ==="
+if [ -f "$VHOST" ]; then
+  echo "--- includes in $VHOST ---"
+  grep -n "include $SNIP" "$VHOST" || true
+  echo "--- any location traderone/api in $VHOST ---"
+  grep -nE "$PAT" "$VHOST" || true
+else
+  echo "❌ VHOST not found: $VHOST"
+fi
+
+echo
+echo "=== 5) FIX: si le snippet est inclus +1 fois, on garde la 1ère ligne et on supprime les autres ==="
+mapfile -t LINES < <(grep -n "include $SNIP" "$VHOST" 2>/dev/null | cut -d: -f1 || true)
+if [ "${#LINES[@]}" -gt 1 ]; then
+  echo "Found ${#LINES[@]} includes in $VHOST -> removing duplicates"
+  # supprimer toutes sauf la première (en partant du bas pour garder les numéros valides)
+  for ((i=${#LINES[@]}-1; i>=1; i--)); do
+    ln="${LINES[$i]}"
+    sed -i "${ln}d" "$VHOST"
+    echo "Removed duplicate include at line $ln"
+  done
+else
+  echo "OK: 0 ou 1 include dans $VHOST"
+fi
+
+echo
+echo "=== 6) FIX 2: si le snippet contient 2 locations, on renomme la 2e (désactive) ==="
+# si count >=2, on désactive toutes sauf la première en remplaçant les occurrences 2..n
+CNT="$(grep -cE "$PAT" "$SNIP" || echo 0)"
+if [ "$CNT" -ge 2 ]; then
+  echo "Snippet has $CNT locations -> disabling duplicates inside snippet"
+  cp -a "$SNIP" "$SNIP.bak.dupe_inside.$TS"
+  # remplace la 2e occurrence uniquement (approche simple: on change toutes, puis on remet la 1ère)
+  # 1) change toutes
+  sed -i -E "s|$PAT|location ^~ /_disabled_dupe_traderone_api_inside_${TS}/|g" "$SNIP"
+  # 2) remet la première occurrence à la bonne valeur
+  # (on prend la première ligne qui a été remplacée et on la remet)
+  perl -0777 -i -pe "s/location \^~ \/_disabled_dupe_traderone_api_inside_${TS}\//location ^~ \/wolverine\/traderone\/api\//" "$SNIP"
+fi
+
+echo
+echo "=== 7) Test + reload ==="
 nginx -t
 systemctl reload nginx
 
-echo
-echo "✅ DONE. Backup: $BACK"
+echo "✅ OK. Backup: /etc/nginx.bak.$TS"
