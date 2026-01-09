@@ -1,84 +1,183 @@
-cat > /root/nginx_fireinners_batch.sh <<'BASH'
+cat > /root/fireinners_fix_batch.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
 TS="$(date +%F_%H%M%S)"
-LOG="/root/nginx_fireinners_batch_${TS}.log"
+LOG="/root/fireinners_fix_${TS}.log"
 exec > >(tee -a "$LOG") 2>&1
 
 echo "=== LOG: $LOG ==="
-
-echo
-echo "=== 0) Host / OS ==="
+echo "=== Host / OS ==="
 hostname -f || true
 uname -a || true
-date || true
-
 echo
-echo "=== 1) nginx status + unit ==="
+
+echo "=== nginx status + syntax ==="
 systemctl status nginx --no-pager || true
-systemctl cat nginx --no-pager || true
-
-echo
-echo "=== 2) nginx config test ==="
 nginx -t || true
-
 echo
-echo "=== 3) Who listens on 80/443 ==="
+
+echo "=== listeners 80/443 ==="
 ss -lntp | egrep ':(80|443)\s' || echo "!! Rien n'écoute sur 80/443"
-
 echo
-echo "=== 4) Show nginx includes and server_name matches ==="
-echo "--- nginx -T (server_name / listen / wolverine) ---"
-nginx -T 2>/dev/null | nl -ba | egrep -n "include|server_name|listen|root|location\s+/wolverine|proxy_pass|return 30|rewrite" | head -n 260 || true
 
+echo "=== enabled vhosts ==="
+ls -la /etc/nginx/sites-enabled || true
 echo
-echo "=== 5) Nginx folders + enabled/available/disabled ==="
-for d in /etc/nginx /etc/nginx/sites-enabled /etc/nginx/sites-available /etc/nginx/sites-disabled /etc/nginx/conf.d /etc/nginx/snippets; do
-  echo "--- ls -la $d ---"
-  ls -la "$d" 2>/dev/null || true
-done
 
+echo "=== find server blocks for fireinners ==="
+nginx -T 2>/dev/null | nl -ba | egrep -n "server_name|listen|root|index|location\s+/wolverine|location\s+/wolverine/api|try_files|rewrite" | head -n 260 || true
 echo
-echo "=== 6) Greps (fireinners + wolverine + try_files loops) ==="
+
+echo "=== grep in /etc/nginx for dangerous patterns ==="
 echo "--- server_name fireinners ---"
 grep -RIn --color=always "server_name.*fireinners" /etc/nginx 2>/dev/null || true
-echo "--- location /wolverine ---"
-grep -RIn --color=always "location\s\+/wolverine" /etc/nginx 2>/dev/null || true
-echo "--- try_files (possible loops) ---"
-grep -RIn --color=always "try_files" /etc/nginx 2>/dev/null | head -n 120 || true
+echo "--- try_files -> /index.html (SPA) ---"
+grep -RIn --color=always "try_files.*\/index\.html" /etc/nginx 2>/dev/null || true
+echo "--- location /wolverine/api ---"
+grep -RIn --color=always "location\s\+/wolverine\/api" /etc/nginx 2>/dev/null || true
+echo
+
+echo "=== quick filesystem checks ==="
+echo "--- /var/www/fireinners ---"
+ls -la /var/www/fireinners 2>/dev/null || echo "!! /var/www/fireinners absent"
+echo "--- /var/www/wolverine ---"
+ls -la /var/www/wolverine 2>/dev/null || echo "!! /var/www/wolverine absent"
+echo
+
+echo "=== local curl (Host header) ==="
+curl -sS -I http://127.0.0.1/ -H 'Host: fireinners.online' | head -n 20 || true
+curl -sS -I http://127.0.0.1/wolverine/api/ping -H 'Host: fireinners.online' | head -n 20 || true
+echo
+
+echo "=== BACKUP nginx configs ==="
+BKDIR="/root/nginx_backup_${TS}"
+mkdir -p "$BKDIR"
+cp -a /etc/nginx "$BKDIR/"
+echo "Backup done: $BKDIR"
+echo
+
+# =========================================================
+# FIX PROPOSAL:
+# - Serve the Wolverine API without SPA fallback (NO /index.html)
+# - Serve the Wolverine UI as SPA under /wolverine with try_files -> /wolverine/index.html
+# - Ensure "/" has an index (or at least avoid forbidden directory listing)
+# =========================================================
+
+# Guess the active vhost file (best-effort):
+VHOST=""
+if [ -e /etc/nginx/sites-enabled/fireinners.online-ssl ]; then
+  VHOST="/etc/nginx/sites-enabled/fireinners.online-ssl"
+elif ls /etc/nginx/sites-enabled/*fireinners* >/dev/null 2>&1; then
+  VHOST="$(ls -1 /etc/nginx/sites-enabled/*fireinners* | head -n1)"
+fi
+
+echo "=== Detected VHOST: ${VHOST:-NONE} ==="
+echo
+
+if [ -z "${VHOST:-}" ]; then
+  echo "!! Aucun vhost fireinners trouvé dans sites-enabled."
+  echo "   Mets ton fichier vhost dans /etc/nginx/sites-enabled/ puis relance."
+  exit 1
+fi
+
+# Create a snippet to include (safe / clean)
+SNIP="/etc/nginx/snippets/fireinners_wolverine_fix.inc"
+cat > "$SNIP" <<'EOF'
+# --- fireinners/wolverine fix ---
+# IMPORTANT:
+# 1) API must NOT fall back to SPA index.html (otherwise rewrite loop)
+location ^~ /wolverine/api/ {
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_pass http://127.0.0.1:3000;  # <-- adapte si ton backend n'est pas sur 3000
+}
+
+# 2) UI as SPA under /wolverine (static)
+location ^~ /wolverine/ {
+    alias /var/www/wolverine/;
+    try_files $uri $uri/ /wolverine/index.html;
+}
+
+# 3) favicon (évite les 500 polluants)
+location = /favicon.ico {
+    access_log off;
+    log_not_found off;
+    return 204;
+}
+# --- end ---
+EOF
+
+echo "Snippet written: $SNIP"
+echo
+
+# Ensure site root has an index to avoid "directory index forbidden"
+# (Only creates a minimal index.html if missing)
+if [ -d /var/www/fireinners ] && [ ! -f /var/www/fireinners/index.html ]; then
+  echo "No /var/www/fireinners/index.html -> creating a minimal one to avoid 403 directory index forbidden"
+  cat > /var/www/fireinners/index.html <<'EOF'
+<!doctype html>
+<html><head><meta charset="utf-8"><title>fireinners</title></head>
+<body><h1>fireinners online</h1><p>OK</p></body></html>
+EOF
+fi
+
+echo "=== APPLY? (set APPLY=1 to modify vhost) ==="
+if [ "${APPLY:-0}" != "1" ]; then
+  echo "Dry-run: je n'ai rien modifié dans le vhost."
+  echo
+  echo "➡️ Pour appliquer automatiquement:"
+  echo "   APPLY=1 bash /root/fireinners_fix_batch.sh"
+  echo
+  echo "➡️ Sinon, ajoute manuellement dans ton server {}:"
+  echo "   include $SNIP;"
+  exit 0
+fi
+
+echo "=== Applying changes into vhost ==="
+# If snippet already included, do nothing. Otherwise insert include near top of server block.
+if grep -qF "include $SNIP;" "$VHOST"; then
+  echo "Vhost already includes snippet."
+else
+  # insert after first 'server {' occurrence
+  awk -v snip="    include $SNIP;" '
+    BEGIN{done=0}
+    {
+      print $0
+      if(!done && $0 ~ /^[[:space:]]*server[[:space:]]*\{/){
+        print snip
+        done=1
+      }
+    }
+  ' "$VHOST" > "${VHOST}.tmp"
+  mv "${VHOST}.tmp" "$VHOST"
+  echo "Inserted include into: $VHOST"
+fi
 
 echo
-echo "=== 7) Check expected web files (adjust if needed) ==="
-test -f /var/www/wolverine/index.html && echo "OK: /var/www/wolverine/index.html exists" || echo "!! Missing: /var/www/wolverine/index.html"
-test -f /var/www/html/index.html && echo "OK: /var/www/html/index.html exists" || true
+echo "=== Test + reload ==="
+nginx -t
+systemctl reload nginx
 
 echo
-echo "=== 8) Local curls (origin reachability) ==="
-echo "--- HTTP 80 ---"
-curl -sv --max-time 5 http://127.0.0.1/ -H 'Host: fireinners.online' 2>&1 | tail -n 40 || true
-echo "--- HTTP 80 /wolverine/api/ping ---"
-curl -sv --max-time 5 http://127.0.0.1/wolverine/api/ping -H 'Host: fireinners.online' 2>&1 | tail -n 40 || true
-echo "--- HTTPS 443 (no verify) ---"
-curl -skv --max-time 5 https://127.0.0.1/ -H 'Host: fireinners.online' 2>&1 | tail -n 50 || true
-
-echo
-echo "=== 9) Firewalls quick check ==="
-ufw status verbose || true
-iptables -S | head -n 120 || true
-
-echo
-echo "=== 10) Recent nginx errors ==="
-journalctl -u nginx -n 200 --no-pager || true
-test -f /var/log/nginx/error.log && tail -n 200 /var/log/nginx/error.log || true
-
-echo
-echo "=== 11) If nginx not listening, show master args + restart hint ==="
-ps auxww | egrep 'nginx: master|nginx: worker' || true
+echo "=== Post-check listeners + curls ==="
+ss -lntp | egrep ':(80|443)\s' || echo "!! Rien n'écoute sur 80/443"
+echo "--- / ---"
+curl -sS -I http://127.0.0.1/ -H 'Host: fireinners.online' | head -n 20 || true
+echo "--- /wolverine/ ---"
+curl -sS -I http://127.0.0.1/wolverine/ -H 'Host: fireinners.online' | head -n 20 || true
+echo "--- /wolverine/api/ping ---"
+curl -sS -I http://127.0.0.1/wolverine/api/ping -H 'Host: fireinners.online' | head -n 20 || true
 
 echo
 echo "=== DONE ==="
 BASH
 
-chmod +x /root/nginx_fireinners_batch.sh
-bash /root/nginx_fireinners_batch.sh
+chmod +x /root/fireinners_fix_batch.sh
+echo "OK. Lance:"
+echo "  bash /root/fireinners_fix_batch.sh"
+echo "Puis si tout te semble bon:"
+echo "  APPLY=1 bash /root/fireinners_fix_batch.sh"
