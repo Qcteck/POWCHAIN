@@ -1,43 +1,102 @@
+cat > /root/BATCH_ROOT_FULL.sh <<'BASH'
+#!/usr/bin/env bash
 set -euo pipefail
 
-echo "=== 0) Infos ==="
-hostname; date -u; nginx -v 2>&1 || true
+TS="$(date -u +%Y%m%d_%H%M%S)"
+OUT="/root/BATCH_ROOT_FULL_${TS}.log"
+exec > >(tee -a "$OUT") 2>&1
+
+echo "=== BATCH ROOT FULL ==="
+echo "Time (UTC): $(date -u)"
+echo "Host: $(hostname)"
+echo "Kernel: $(uname -a)"
+echo "Output: $OUT"
 echo
 
-echo "=== 1) Test nginx ==="
-nginx -t
+echo "=== [1] Disks / RAM / Load ==="
+df -h || true
+echo
+free -h || true
+echo
+uptime || true
 echo
 
-echo "=== 2) Ports 80/443 ==="
-ss -lntp | awk '$4 ~ /:80$|:443$/ {print}'
+echo "=== [2] Repo check (top-level /root/* git) ==="
+for d in /root/*; do
+  [ -d "$d" ] || continue
+  if [ -d "$d/.git" ]; then
+    echo
+    echo "---- REPO: $d ----"
+    (cd "$d" && \
+      echo "Remote:" && git remote -v || true; \
+      echo "Branch:" && git rev-parse --abbrev-ref HEAD || true; \
+      echo "Last commit:" && git --no-pager log -1 --oneline || true; \
+      echo "Status:" && git status -sb || true)
+  fi
+done
 echo
 
-echo "=== 3) Doublons location /wolverine (fichiers + lignes) ==="
-# Trouve TOUS les "location /wolverine" et variantes
-grep -RIn --binary-files=without-match -E '^\s*location\s+\^~?\s*/wolverine\b|^\s*location\s+=\s*/wolverine\b|^\s*location\s+/wolverine\b' \
-  /etc/nginx/sites-enabled /etc/nginx/conf.d /etc/nginx/snippets 2>/dev/null || true
+echo "=== [3] NGINX status / config test ==="
+systemctl status nginx --no-pager || true
+echo
+nginx -t || true
 echo
 
-echo "=== 4) Serveurs qui match fireinners.online (server_name) ==="
-grep -RIn --binary-files=without-match -E '^\s*server_name\s+.*(fireinners\.online|www\.fireinners\.online)' \
-  /etc/nginx/sites-enabled /etc/nginx/sites-available /etc/nginx/conf.d 2>/dev/null || true
+echo "=== [4] Ports listening (80/443) ==="
+ss -lntp | awk 'NR==1 || $4 ~ /:(80|443)$/'
 echo
 
-echo "=== 5) Includes effectifs (nginx -T) filtrés wolverine ==="
-nginx -T 2>/dev/null | grep -nE 'include .*wolverine|location /wolverine|server_name .*fireinners\.online' || true
+echo "=== [5] List enabled sites + server_name duplicates ==="
+echo "--- sites-enabled ---"
+ls -la /etc/nginx/sites-enabled || true
+echo
+echo "--- grep server_name fireinners ---"
+grep -RIn --color=never 'server_name' /etc/nginx/sites-enabled /etc/nginx/sites-available 2>/dev/null | grep -i 'fireinners' || true
 echo
 
-echo "=== 6) Snippets wolverine existants ==="
-ls -la /etc/nginx/snippets | grep -i wolverine || true
+echo "=== [6] Find DUPLICATE location /wolverine (cause nginx -t fail) ==="
+# Montre toutes les occurrences de "location /wolverine" (et variantes)
+grep -RIn --color=never 'location[[:space:]]\+/wolverine' /etc/nginx 2>/dev/null || true
+echo
+echo "--- Full nginx dump (only lines around /wolverine) ---"
+nginx -T 2>/dev/null | awk '
+  /server \{/ {srv++}
+  /location[[:space:]]+\/wolverine/ {print "---- server#",srv,"----"; for(i=NR-5;i<=NR+12;i++) print buf[i]; print $0; hit=12}
+  {buf[NR]=$0; if(hit>0){print $0; hit--}}
+' || true
 echo
 
-echo "=== 7) Erreurs récentes (cycles rewrite / forbidden / duplicate location) ==="
-tail -n 200 /var/log/nginx/error.log 2>/dev/null | grep -Ei 'rewrite|cycle|duplicate location|forbidden|cannot|open\(\)' || true
+echo "=== [7] Detect rewrite loop to /index.html ==="
+echo "--- grep rewrite/try_files/index.html in /etc/nginx ---"
+grep -RIn --color=never -E 'try_files|rewrite|index\.html' /etc/nginx 2>/dev/null | head -n 200 || true
 echo
 
-echo "=== 8) Test local HTTP (sans cloudflare) ==="
-curl -I --max-time 2 http://127.0.0.1/ 2>&1 | head -n 5 || true
-curl -I --max-time 2 http://127.0.0.1/wolverine/ 2>&1 | head -n 8 || true
+echo "=== [8] Local curl tests (bypass Cloudflare) ==="
+echo "--- HTTP localhost ---"
+curl -sS -o /dev/null -w "HTTP localhost: %{http_code}\n" http://127.0.0.1/ || true
+echo "--- HTTPS localhost (may fail if no local SSL bind) ---"
+curl -k -sS -o /dev/null -w "HTTPS localhost: %{http_code}\n" https://127.0.0.1/ || true
+echo "--- HTTP /wolverine ---"
+curl -sS -o /dev/null -w "/wolverine: %{http_code}\n" http://127.0.0.1/wolverine/ || true
+echo "--- HTTP /wolverine/api/ping ---"
+curl -sS -o /dev/null -w "/wolverine/api/ping: %{http_code}\n" http://127.0.0.1/wolverine/api/ping || true
 echo
 
-echo "=== FIN (audit only) ==="
+echo "=== [9] Last nginx errors (200 lines) ==="
+tail -n 200 /var/log/nginx/error.log 2>/dev/null || true
+echo
+
+echo "=== [10] Quick hint summary ==="
+echo "If you see: duplicate location \"/wolverine\" => tu as 2 blocs location /wolverine dans le MEME server {}."
+echo "Fix: garde UN seul bloc location /wolverine et supprime/merge l’autre (ou mets l’autre dans un autre server_name / port)."
+echo
+echo "If you see: rewrite or internal redirection cycle to /index.html =>"
+echo "souvent un try_files/rewrite qui renvoie vers /index.html mais /index.html repasse dans la même règle."
+echo "Fix classique: pour SPA, faire try_files \$uri \$uri/ /wolverine/index.html; MAIS seulement dans location /wolverine/."
+echo
+
+echo "=== DONE ==="
+BASH
+
+chmod +x /root/BATCH_ROOT_FULL.sh
+/root/BATCH_ROOT_FULL.sh
