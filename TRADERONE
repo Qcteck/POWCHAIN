@@ -2,7 +2,7 @@ set -euo pipefail
 TS="$(date +%Y%m%d_%H%M%S)"
 SNIP="/etc/nginx/snippets/wolverine_auth_phantom.conf"
 
-echo "=== 1) Ecris/force le snippet (bypass auth/deny) ==="
+echo "=== 1) Re-force le snippet (bypass auth/deny) ==="
 mkdir -p /etc/nginx/snippets
 cat > "$SNIP" <<'NGX'
 location ^~ /wolverine/traderone/api/auth/ {
@@ -18,46 +18,86 @@ location ^~ /wolverine/traderone/api/auth/ {
   proxy_set_header X-Forwarded-Proto $scheme;
 }
 NGX
-echo "OK: $SNIP"
+
+echo "=== 2) Trouve tous les fichiers nginx qui déclarent fireinners.online sur 443 ==="
+mapfile -t CAND < <(nginx -T 2>/dev/null | awk '
+  /^# configuration file /{f=$4}
+  /server_name[[:space:]]+.*(fireinners\.online|www\.fireinners\.online)/{print f}
+' | sort -u)
+
+echo "CANDIDATES:"
+printf ' - %s\n' "${CAND[@]}" | sed '/^- $/d'
 
 echo
-echo "=== 2) Liste fichiers nginx qui parlent de fireinners.online ==="
-FILES=$(nginx -T 2>/dev/null \
-  | grep -E '^# configuration file ' \
-  | awk '{print $4}' | sort -u)
+echo "=== 3) Choisit automatiquement LE fichier à garder (celui qui sert /wolverine/) ==="
+KEEP=""
+BEST=-999
 
-TARGETS=""
-for f in $FILES; do
+for f in "${CAND[@]}"; do
   [ -f "$f" ] || continue
-  if grep -qiE 'server_name[[:space:]]+.*fireinners\.online' "$f" && grep -qE 'listen[[:space:]]+443' "$f"; then
-    TARGETS="$TARGETS $f"
-  fi
+  grep -qE 'listen[[:space:]]+443' "$f" || continue
+
+  score=0
+  grep -qiE 'server_name[[:space:]]+.*fireinners\.online' "$f" && score=$((score+5))
+  grep -qiE 'location[[:space:]]+\^~[[:space:]]+/wolverine/' "$f" && score=$((score+10))
+  grep -qiE '/var/www/wolverine' "$f" && score=$((score+6))
+  grep -qiE 'proxy_pass[[:space:]]+http://127\.0\.0\.1:3000' "$f" && score=$((score+3))
+  grep -qiE 'ssl_certificate|listen[[:space:]]+443[[:space:]]+ssl' "$f" && score=$((score+2))
+
+  echo "score=$score  $f"
+  if [ "$score" -gt "$BEST" ]; then BEST="$score"; KEEP="$f"; fi
 done
 
-echo "Targets (443 + fireinners.online):"
-for f in $TARGETS; do echo " - $f"; done
+if [ -z "${KEEP:-}" ]; then
+  echo "❌ Impossible de déterminer le bon fichier 443. Montre-moi la liste ci-dessus."
+  exit 2
+fi
 
 echo
-echo "=== 3) Inject include dans ces fichiers (une seule fois) ==="
-for f in $TARGETS; do
-  if grep -q "snippets/wolverine_auth_phantom.conf" "$f"; then
-    echo "Already has include: $f"
-    continue
-  fi
-  cp -a "$f" "$f.bak.phantomfix.$TS"
-  sed -i '0,/server[[:space:]]*{/s//server {\n    include \/etc\/nginx\/snippets\/wolverine_auth_phantom.conf;/' "$f"
-  echo "Injected: $f"
+echo "✅ KEEP FILE = $KEEP  (score=$BEST)"
+
+echo
+echo "=== 4) Désactive les autres server_name fireinners.online (backup) ==="
+n=0
+for f in "${CAND[@]}"; do
+  [ -f "$f" ] || continue
+  [ "$f" = "$KEEP" ] && continue
+  grep -qE 'server_name[[:space:]]+.*(fireinners\.online|www\.fireinners\.online)' "$f" || continue
+
+  n=$((n+1))
+  cp -a "$f" "$f.bak.fireinners.$TS"
+
+  sed -i -E \
+    -e "s/server_name[[:space:]]+.*(fireinners\.online|www\.fireinners\.online)[^;]*;/server_name _disabled_fireinners_${TS}_${n}.local;/g" \
+    "$f"
+
+  echo "Disabled server_name in: $f"
 done
 
 echo
-echo "=== 4) Reload nginx ==="
+echo "=== 5) Inject le snippet dans le KEEP (backup) ==="
+if ! grep -q "snippets/wolverine_auth_phantom.conf" "$KEEP"; then
+  cp -a "$KEEP" "$KEEP.bak.phantominclude.$TS"
+  sed -i '0,/server[[:space:]]*{/s//server {\n    include \/etc\/nginx\/snippets\/wolverine_auth_phantom.conf;/' "$KEEP"
+  echo "Injected include into KEEP."
+else
+  echo "KEEP already includes snippet."
+fi
+
+echo
+echo "=== 6) Reload + TEST ORIGIN (bypass CF) ==="
 nginx -t
 systemctl reload nginx
 
-echo
-echo "=== 5) TEST ORIGIN (bypass CF) — doit plus etre 403 ==="
+echo "--- origin health ---"
 curl -sk --resolve fireinners.online:443:127.0.0.1 \
   https://fireinners.online/wolverine/traderone/api/auth/health | head -c 220; echo
 
+echo "--- origin challenge ---"
 curl -sk --resolve fireinners.online:443:127.0.0.1 \
   "https://fireinners.online/wolverine/traderone/api/auth/phantom/challenge?pubkey=11111111111111111111111111111111" | head -c 260; echo
+
+echo
+echo "=== 7) Si encore 403: dump la cause ==="
+echo "Run:"
+echo "  tail -n 120 /var/log/nginx/error.log"
