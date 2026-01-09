@@ -1,157 +1,60 @@
-bash --noprofile --norc -lc 'cat >/root/MEGA_TEST_PHANTOM_BACKEND_WOLVERINE.sh <<'"'"'BASH'"'"'
-#!/usr/bin/env bash
 set -euo pipefail
+DOMAIN="fireinners.online"
 
-DOMAIN="${DOMAIN:-fireinners.online}"
-BASE="https://${DOMAIN}"
-PATH_W="/wolverine"
-UI_DIR="/opt/fireinners/frontend-react/app/dist/wolverine"
-NG="/etc/nginx/sites-available/fireinners.online-ssl"
+echo "=== 1) Reproduire les 500 côté serveur ==="
+curl -I "https://127.0.0.1/wolverine/_next/static/chunks/pages/index-197ef316ae8e31d1.js" --insecure -H "Host: $DOMAIN" | head -n 20 || true
+curl -I "https://127.0.0.1/wolverine/_next/static/chMHq93EIaFhXXzepQBfj/_buildManifest.js" --insecure -H "Host: $DOMAIN" | head -n 20 || true
+curl -I "https://127.0.0.1/wolverine/_next/static/chMHq93EIaFhXXzepQBfj/_ssgManifest.js" --insecure -H "Host: $DOMAIN" | head -n 20 || true
+curl -I "https://127.0.0.1/favicon.ico" --insecure -H "Host: $DOMAIN" | head -n 20 || true
 
-TS="$(date -u +%Y%m%d-%H%M%S)"
-LOG="/root/MEGA_TEST_PHANTOM_BACKEND_${TS}.log"
-PASS=0; FAIL=0
+echo
+echo "=== 2) Voir l'erreur Nginx exacte (les dernières lignes) ==="
+tail -n 80 /var/log/nginx/error.log || true
 
-say(){ echo "[$(date -u +%F\ %T)] $*" | tee -a "$LOG"; }
-ok(){ PASS=$((PASS+1)); say "OK  - $*"; }
-bad(){ FAIL=$((FAIL+1)); say "ERR - $*"; }
-
-h(){ say "------------------------------"; say "$*"; }
-
-http_code(){ curl -ksS -o /dev/null -w "%{http_code}" "$1" || echo "000"; }
-head_req(){ curl -ksS -I "$1" 2>/dev/null | tr -d "\r" || true; }
-
-h "MEGA TEST PHANTOM + BACKEND (read-only)"
-say "Domain: $DOMAIN"
-say "Base:   $BASE"
-say "Log:    $LOG"
-say "Host:   $(hostname)  Kernel: $(uname -r)"
-say "User:   $(id -u)"
-say ""
-
-h "1) UI files present"
-if [ -d "$UI_DIR" ]; then
-  ok "UI dir exists: $UI_DIR"
-  ls -lah "$UI_DIR" | head -n 40 | tee -a "$LOG" >/dev/null || true
-else
-  bad "UI dir missing: $UI_DIR"
+echo
+echo "=== 3) Trouver où sont réellement les fichiers _next sur le disque ==="
+NEXTDIR="$(find /var/www /opt /srv -type d -path '*wolverine/_next' 2>/dev/null | head -n 1 || true)"
+echo "NEXTDIR=$NEXTDIR"
+if [ -z "$NEXTDIR" ]; then
+  echo "❌ Aucun dossier wolverine/_next trouvé. Ton build Next n'est peut-être pas au bon endroit."
+  exit 1
 fi
 
-if [ -f "$UI_DIR/index.html" ]; then
-  ok "index.html exists"
-  say "index.html size: $(stat -c%s "$UI_DIR/index.html" 2>/dev/null || echo "?") bytes"
-  sha256sum "$UI_DIR/index.html" 2>/dev/null | tee -a "$LOG" >/dev/null || true
-  # quick signals for Phantom/Solana
-  if grep -qiE "phantom|solana|wallet" "$UI_DIR/index.html"; then ok "index.html contains wallet/solana/phantom hints"; else bad "index.html does NOT contain obvious wallet/solana/phantom strings"; fi
-else
-  bad "index.html missing in $UI_DIR"
+APPROOT="$(dirname "$NEXTDIR")"
+echo "APPROOT=$APPROOT"
+ls -lah "$NEXTDIR/static" 2>/dev/null | head -n 50 || true
+
+echo
+echo "=== 4) Patch Nginx: forcer /wolverine/_next/ à servir depuis le bon dossier (alias) ==="
+SNIP="/etc/nginx/snippets/wolverine_next_assets.server.inc"
+cat > "$SNIP" <<NGX
+location ^~ /wolverine/_next/ {
+  alias $APPROOT/_next/;
+  try_files \$uri =404;
+  add_header Cache-Control "public, max-age=31536000, immutable";
+}
+location = /favicon.ico {
+  try_files /favicon.ico =204;
+  access_log off;
+}
+NGX
+
+echo "=== 5) Injecter l'include dans le server fireinners.online ==="
+CONF="$(grep -RIl "server_name.*${DOMAIN}" /etc/nginx/sites-enabled /etc/nginx/sites-available 2>/dev/null | head -n 1 || true)"
+echo "CONF=$CONF"
+[ -n "$CONF" ] || { echo "❌ server block introuvable pour $DOMAIN"; exit 1; }
+
+cp -a "$CONF" "$CONF.bak.$(date +%s)"
+if ! grep -qF "include $SNIP;" "$CONF"; then
+  awk -v inc="  include $SNIP;" '
+    {print}
+    $0 ~ /server_name/ && $0 ~ /fireinners\.online/ && !done {print inc; done=1}
+  ' "$CONF" > "$CONF.tmp" && mv "$CONF.tmp" "$CONF"
 fi
 
-h "2) Vendor libs (Phantom/Solana web3 locally)"
-if [ -d "$UI_DIR/vendor" ]; then
-  ok "vendor dir exists"
-  ls -lah "$UI_DIR/vendor" | tee -a "$LOG" >/dev/null || true
-else
-  bad "vendor dir missing (risk of CDN blocked): $UI_DIR/vendor"
-fi
+echo "=== 6) Reload + retest ==="
+nginx -t
+systemctl reload nginx
 
-# Common filenames to detect (best effort)
-VHITS=0
-for f in solana web3 spl token phantom; do
-  if find "$UI_DIR/vendor" -maxdepth 2 -type f -iname "*${f}*" 2>/dev/null | head -n 1 | grep -q .; then VHITS=$((VHITS+1)); fi
-done
-if [ "$VHITS" -ge 2 ]; then ok "vendor seems to contain solana/web3 related files (hits=$VHITS)"; else bad "vendor may be incomplete (hits=$VHITS)"; fi
-
-h "3) Nginx config sanity (read-only)"
-if [ -f "$NG" ]; then
-  ok "nginx vhost exists: $NG"
-  say "Show nginx locations mentioning wolverine/api/ws:"
-  grep -nE "wolverine|traderone|/ws|proxy_pass" "$NG" 2>/dev/null | head -n 120 | tee -a "$LOG" >/dev/null || true
-else
-  bad "nginx vhost missing: $NG"
-fi
-
-if command -v nginx >/dev/null 2>&1; then
-  if nginx -t >>"$LOG" 2>&1; then ok "nginx -t OK"; else bad "nginx -t FAILED (see log)"; fi
-else
-  bad "nginx command not found"
-fi
-
-h "4) Listening ports (does backend exist?)"
-if command -v ss >/dev/null 2>&1; then
-  ss -lntp 2>/dev/null | tee -a "$LOG" >/dev/null || true
-  # We expect 443 and one or more local node ports (3000/4001/etc.)
-  ss -lntp 2>/dev/null | grep -q ":443 " && ok "Port 443 listening" || bad "Port 443 NOT listening"
-  (ss -lntp 2>/dev/null | grep -qE ":(3000|4001|8484|9696|12701|12702)\b") && ok "Some Node ports listening (3000/4001/..)" || bad "No expected Node ports detected"
-else
-  bad "ss not found"
-fi
-
-h "5) HTTP/HTTPS tests (UI + API via public domain)"
-CODE_UI="$(http_code "${BASE}${PATH_W}/")"
-say "HTTP code UI: $CODE_UI  -> ${BASE}${PATH_W}/"
-[ "$CODE_UI" = "200" ] && ok "UI reachable (200)" || bad "UI not 200 (code=$CODE_UI)"
-
-CODE_UI_ASSET="$(http_code "${BASE}${PATH_W}/_next/static/")"
-say "HTTP code _next/static/: $CODE_UI_ASSET"
-# next/static may be 403/404 depending; informational only
-
-say "Headers UI:"
-head_req "${BASE}${PATH_W}/" | tee -a "$LOG" >/dev/null || true
-
-CODE_API="$(http_code "${BASE}${PATH_W}/traderone/api")"
-say "HTTP code API root: $CODE_API  -> ${BASE}${PATH_W}/traderone/api"
-[ "$CODE_API" = "200" ] && ok "API reachable (200)" || bad "API not 200 (code=$CODE_API) (common: 502 if upstream down)"
-
-say "Headers API:"
-head_req "${BASE}${PATH_W}/traderone/api" | tee -a "$LOG" >/dev/null || true
-
-# Try common health endpoints
-for ep in health status ping; do
-  u="${BASE}${PATH_W}/traderone/api/${ep}"
-  c="$(http_code "$u")"
-  say "HTTP code $ep: $c  -> $u"
-done
-
-h "6) Test same via local nginx (Host header)"
-# Useful to distinguish DNS/Cloudflare vs local service
-LC_UI="$(curl -ksS -o /dev/null -w "%{http_code}" -H "Host: ${DOMAIN}" "https://127.0.0.1${PATH_W}/" || echo "000")"
-say "Local HTTPS UI via 127.0.0.1 Host=${DOMAIN}: $LC_UI"
-[ "$LC_UI" = "200" ] && ok "Local nginx serves UI" || bad "Local nginx UI not 200 (code=$LC_UI)"
-
-LC_API="$(curl -ksS -o /dev/null -w "%{http_code}" -H "Host: ${DOMAIN}" "https://127.0.0.1${PATH_W}/traderone/api" || echo "000")"
-say "Local HTTPS API via 127.0.0.1 Host=${DOMAIN}: $LC_API"
-[ "$LC_API" = "200" ] && ok "Local nginx serves API (proxy works)" || bad "Local nginx API not 200 (code=$LC_API)"
-
-h "7) If API is 502/504, try to detect nginx upstream and probe it"
-UP="$(grep -nE "location[[:space:]]+${PATH_W}/traderone/api|proxy_pass" "$NG" 2>/dev/null | awk '"'"'BEGIN{u=""} /proxy_pass/{gsub(";","",$0); for(i=1;i<=NF;i++) if($i ~ /^http/) u=$i} END{print u}'"'"' || true)"
-say "Detected proxy upstream (best-effort): ${UP:-<unknown>}"
-if [ -n "${UP:-}" ]; then
-  # probe upstream quickly (if localhost http)
-  if echo "$UP" | grep -qE "^http://127\.0\.0\.1:|^http://localhost:"; then
-    say "Probe upstream directly: $UP"
-    curl -ksS -I "$UP" 2>/dev/null | head -n 30 | tee -a "$LOG" >/dev/null || true
-  fi
-fi
-
-h "8) Phantom manual test checklist (what to verify in browser)"
-cat <<EOF | tee -a "$LOG"
-A) Ouvre: ${BASE}${PATH_W}/
-B) Console DevTools:
-   - Aucun "Failed to fetch" sur /traderone/api/*
-   - Aucun CSP/blocked script (surtout si vendor absent)
-C) Clique "Connect Phantom":
-   - Phantom popup apparait
-   - Après accept: UI affiche pubkey et soldes
-D) Onglet Network:
-   - Requêtes vers ${PATH_W}/traderone/api/* = 200
-   - Si 502 -> backend pas vivant/proxy cassé
-EOF
-
-h "SUMMARY"
-say "PASS=$PASS  FAIL=$FAIL"
-say "Log saved: $LOG"
-[ "$FAIL" -eq 0 ] && exit 0 || exit 1
-BASH
-chmod +x /root/MEGA_TEST_PHANTOM_BACKEND_WOLVERINE.sh
-/root/MEGA_TEST_PHANTOM_BACKEND_WOLVERINE.sh'
+curl -I "https://127.0.0.1/wolverine/_next/static/chunks/pages/index-197ef316ae8e31d1.js" --insecure -H "Host: $DOMAIN" | head -n 20 || true
+echo "✅ Ouvre: https://fireinners.online/wolverine/"
