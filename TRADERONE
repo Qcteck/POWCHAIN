@@ -1,2 +1,61 @@
-grep -n "wolverine_routes.conf" -n /etc/nginx/sites-enabled/fireinners.online-ssl
-curl -sk -I --resolve fireinners.online:443:127.0.0.1 https://fireinners.online/wolverine/traderone/api/auth/health | head -n 20
+set -euo pipefail
+TS="$(date +%Y%m%d_%H%M%S)"
+
+VHOST="/etc/nginx/sites-enabled/fireinners.online-ssl"
+SNIP="/etc/nginx/snippets/wolverine_routes.conf"
+
+echo "=== 0) Backup ==="
+cp -a "$VHOST" "$VHOST.bak.$TS" || true
+cp -a "$SNIP" "$SNIP.bak.$TS" || true
+
+echo "=== 1) Rewrite snippet WITHOUT location /wolverine/ (fix duplicate) ==="
+cat > "$SNIP" <<'NGX'
+# --- Wolverine routing (API + static) ---
+
+# Phantom auth API (must NOT fall back to index.html)
+location ^~ /wolverine/traderone/api/auth/ {
+  auth_basic off;
+  satisfy any;
+  allow all;
+
+  proxy_pass http://127.0.0.1:3005/;
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+}
+
+# Next.js static assets (never rewrite to index.html)
+location ^~ /wolverine/_next/ {
+  root /var/www;
+  try_files $uri =404;
+  access_log off;
+  expires 1h;
+}
+NGX
+
+echo "=== 2) Patch EXISTING location ^~ /wolverine/ in vhost (fix loops) ==="
+# dans le premier bloc location ^~ /wolverine/ { ... } :
+# - force root /var/www;
+# - force try_files $uri $uri/ /wolverine/index.html;
+sed -i -E '
+  0,/location[[:space:]]+\^~[[:space:]]+\/wolverine\/[[:space:]]*\{/,/^\}/{
+    s|^[[:space:]]*root[[:space:]]+.*;|  root /var/www;|g
+    s|^[[:space:]]*try_files[[:space:]]+.*;|  try_files $uri $uri/ /wolverine/index.html;|g
+  }
+' "$VHOST"
+
+echo "=== 3) Ensure snippet include exists (once) ==="
+grep -n "wolverine_routes.conf" "$VHOST" || true
+
+echo "=== 4) Test + reload ==="
+nginx -t
+systemctl reload nginx
+
+echo "=== 5) ORIGIN bypass tests (should NOT be 403) ==="
+curl -sk --resolve fireinners.online:443:127.0.0.1 \
+  https://fireinners.online/wolverine/traderone/api/auth/health | head -n 20 || true
+
+curl -sk --resolve fireinners.online:443:127.0.0.1 \
+  "https://fireinners.online/wolverine/traderone/api/auth/phantom/challenge?pubkey=11111111111111111111111111111111" | head -c 260; echo
