@@ -1,31 +1,15 @@
 set -euo pipefail
+TS="$(date +%Y%m%d_%H%M%S)"
 
-VHOST="/etc/nginx/sites-enabled/fireinners.online-ssl"
-SNIP="/etc/nginx/snippets/fireinners_test.conf"
-WEB="/var/www/fireinners-test"
+SNIP_TEST="/etc/nginx/snippets/fireinners_test.conf"
+BACK="/etc/nginx.bak_fix403_$TS"
+mkdir -p "$BACK"
 
-echo "=== 1) Voir la cause exacte dans les logs ==="
-tail -n 60 /var/log/nginx/error.log || true
+echo "=== Backup ==="
+cp -a /etc/nginx "$BACK/"
 
-echo
-echo "=== 2) Vérifier fichiers + droits ==="
-ls -lah "$WEB" | head -n 30 || true
-namei -l "$WEB" || true
-
-echo
-echo "=== 3) Forcer des droits OK pour nginx ==="
-chown -R www-data:www-data "$WEB" || true
-chmod 0755 /var /var/www || true
-chmod 0755 "$WEB" || true
-chmod -R a+rX "$WEB" || true
-
-echo
-echo "=== 4) Vérifier que index.html existe ==="
-[ -f "$WEB/index.html" ] && echo "✅ index.html OK" || { echo "❌ index.html absent"; ls -lah "$WEB"; }
-
-echo
-echo "=== 5) Fix snippet /test/ (alias + index + autoindex off) ==="
-cat > "$SNIP" <<'NGX'
+echo "=== 1) Snippet /test (force) ==="
+cat > "$SNIP_TEST" <<'NGX'
 location ^~ /test/ {
   alias /var/www/fireinners-test/;
   index index.html;
@@ -34,11 +18,37 @@ location ^~ /test/ {
 }
 NGX
 
+echo "=== 2) Trouver les vhosts qui match fireinners/www (sites-enabled) ==="
+mapfile -t VHOSTS < <(grep -RIl --include="*.conf" -E '^\s*server_name\s+.*(fireinners\.online|www\.fireinners\.online)' /etc/nginx/sites-enabled 2>/dev/null | sort -u)
+
+printf ' - %s\n' "${VHOSTS[@]:-<none>}"
+[ "${#VHOSTS[@]}" -gt 0 ] || { echo "❌ Aucun vhost trouvé avec server_name fireinners.online/www"; exit 1; }
+
 echo
-echo "=== 6) Reload ==="
+echo "=== 3) Injecter include fireinners_test.conf dans chacun (si absent) ==="
+for f in "${VHOSTS[@]}"; do
+  cp -a "$f" "$BACK/$(basename "$f").bak.$TS"
+  if grep -q "include /etc/nginx/snippets/fireinners_test.conf;" "$f"; then
+    echo "OK already included: $f"
+  else
+    echo "Inject include: $f"
+    sed -i '0,/server[[:space:]]*{/s//server {\n    include \/etc\/nginx\/snippets\/fireinners_test.conf;/' "$f"
+  fi
+done
+
+echo
+echo "=== 4) Test nginx ==="
 nginx -t
+
+echo
+echo "=== 5) Reload nginx ==="
 systemctl reload nginx
 
 echo
-echo "=== 7) Test local ==="
-curl -I https://127.0.0.1/test/ --insecure | head -n 20
+echo "=== 6) Test EN LOCAL avec Host header (reproduit l’extérieur) ==="
+curl -I https://127.0.0.1/test/ --insecure -H "Host: fireinners.online" | head -n 20 || true
+curl -I https://127.0.0.1/test/ --insecure -H "Host: www.fireinners.online" | head -n 20 || true
+
+echo
+echo "✅ Done. Ouvre: https://fireinners.online/test/"
+echo "Backup: $BACK"
