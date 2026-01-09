@@ -1,7 +1,123 @@
-cd /root
+cat >/root/fireinners_batch_root.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
 
-# 1) DRY‑RUN (aucun changement)
-DOMAIN=fireinners.online HOST_HEADER=fireinners.online APPLY=0 bash /root/fireinners_batch.sh
+APPLY="${APPLY:-0}"
+SITE="/etc/nginx/sites-enabled/fireinners.online-ssl"
+TS="$(date +%Y%m%d_%H%M%S)"
+BK="/etc/nginx/sites-disabled/batchfix_${TS}"
+mkdir -p "$BK"
 
-# 2) Si le dry‑run est clean → APPLY (fait backup + patch + nginx -t + reload)
-DOMAIN=fireinners.online HOST_HEADER=fireinners.online APPLY=1 bash /root/fireinners_batch.sh
+echo "=== fireinners batch (root) ==="
+echo "APPLY=$APPLY"
+echo "SITE=$SITE"
+echo
+
+if [[ ! -f "$SITE" ]]; then
+  echo "ERROR: missing $SITE"
+  exit 1
+fi
+
+echo "== 1) show nginx -t =="
+set +e
+NGT="$(nginx -t 2>&1)"
+RC=$?
+set -e
+echo "$NGT"
+echo
+
+echo "== 2) show around line 10 (common error spot) =="
+nl -ba "$SITE" | sed -n '1,40p'
+echo
+
+echo "== 3) backup current vhost =="
+cp -a "$SITE" "$BK/$(basename "$SITE")"
+echo "Backup saved to: $BK/$(basename "$SITE")"
+echo
+
+echo "== 4) if config error contains: 'location directive is not allowed here' => patch safely =="
+if echo "$NGT" | grep -q 'location" directive is not allowed here'; then
+  echo "Detected bad 'location' context. Preparing patch..."
+
+  # 4a) Comment out any top-level 'location /wolverine/' lines (outside server)
+  # We do a conservative approach: only comment lines that start with 'location /wolverine'
+  # and are NOT already commented.
+  if [[ "$APPLY" == "1" ]]; then
+    sed -i -E 's/^[[:space:]]*(location[[:space:]]+\/wolverine\/)/# FIXED_OUT_OF_CONTEXT: \1/' "$SITE"
+  else
+    echo "[DRY] would comment out any:  location /wolverine/  lines (if present out of context)"
+  fi
+
+  # 4b) Inject a correct location block inside the first server {} if not already present (markers)
+  if grep -q 'BEGIN WOLVERINE FIX' "$SITE"; then
+    echo "Markers already present => skip injection."
+  else
+    echo "Injecting proper location block inside server{} (with markers)..."
+    if [[ "$APPLY" == "1" ]]; then
+      awk '
+        BEGIN{done=0; inserver=0}
+        {
+          print $0
+          if (!done && $0 ~ /^[[:space:]]*server[[:space:]]*\{/){ inserver=1 }
+          # Insert right after server { line (safe + predictable)
+          if (!done && inserver==1 && $0 ~ /^[[:space:]]*server[[:space:]]*\{/){
+            print "    # BEGIN WOLVERINE FIX"
+            print "    location /wolverine/ {"
+            print "        alias /var/www/wolverine/;"
+            print "        try_files $uri $uri/ =404;"
+            print "    }"
+            print ""
+            print "    # favicon should not 500"
+            print "    location = /favicon.ico {"
+            print "        access_log off;"
+            print "        log_not_found off;"
+            print "        return 204;"
+            print "    }"
+            print "    # END WOLVERINE FIX"
+            done=1
+          }
+        }
+      ' "$SITE" >"$SITE.tmp" && mv "$SITE.tmp" "$SITE"
+    else
+      echo "[DRY] would inject BEGIN/END WOLVERINE FIX block inside first server{}"
+    fi
+  fi
+
+  echo
+  echo "== 5) re-test nginx -t after patch =="
+  set +e
+  NGT2="$(nginx -t 2>&1)"
+  RC2=$?
+  set -e
+  echo "$NGT2"
+  echo
+
+  if [[ "$APPLY" == "1" && $RC2 -eq 0 ]]; then
+    echo "== 6) reload nginx =="
+    systemctl reload nginx
+    echo "Reload OK"
+  else
+    echo "No reload (APPLY=$APPLY or nginx -t failed)."
+  fi
+else
+  echo "No 'location directive is not allowed here' detected. Nothing to patch."
+fi
+
+echo
+echo "== 7) quick local checks =="
+echo "Local (host header):"
+echo "  curl -I -H 'Host: fireinners.online' http://127.0.0.1/wolverine/ | head"
+echo "  curl -I -H 'Host: fireinners.online' http://127.0.0.1/favicon.ico | head"
+echo
+echo "Public:"
+echo "  curl -I https://fireinners.online/wolverine/ | head"
+echo "  curl -I https://fireinners.online/favicon.ico | head"
+echo
+echo "=== DONE ==="
+BASH
+
+chmod +x /root/fireinners_batch_root.sh
+echo "Created: /root/fireinners_batch_root.sh"
+
+# Run dry by default:
+bash /root/fireinners_batch_root.sh
