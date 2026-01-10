@@ -1,4 +1,107 @@
-grep -RIn --color=always "server_name .*fireinners\.online" /etc/nginx/sites-enabled /etc/nginx/sites-available
+cat >/root/batch_root_fireinners.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
 
+DOMAIN="${1:-fireinners.online}"
+VHOST="${2:-/etc/nginx/sites-enabled/${DOMAIN}-ssl}"
+APPLY="${APPLY:-0}"
+TS="$(date +%F_%H%M%S)"
+BACKDIR="/etc/nginx/sites-disabled/cleanup_${TS}"
 
-nl -ba /etc/nginx/sites-enabled/fireinners.online-ssl | sed -n '1,220p'
+echo "[*] DOMAIN=$DOMAIN"
+echo "[*] VHOST=$VHOST"
+echo "[*] APPLY=$APPLY (0=dry-run, 1=apply)"
+
+if [[ ! -f "$VHOST" ]]; then
+  echo "[ERR] VHOST introuvable: $VHOST"
+  exit 1
+fi
+
+mkdir -p "$BACKDIR"
+cp -a "$VHOST" "$BACKDIR/$(basename "$VHOST")"
+echo "[OK] Backup -> $BACKDIR/$(basename "$VHOST")"
+
+echo "[*] Cleaning injected blocks (batchfix)…"
+CLEAN_CMD=(perl -0777 -i -pe 's/\n\s*# --- injected by batchfix ---.*?# --- end injected ---\s*\n/\n/sg' "$VHOST")
+if [[ "$APPLY" == "1" ]]; then
+  "${CLEAN_CMD[@]}"
+  echo "[OK] Injected blocks removed (if any)."
+else
+  echo "DRYRUN: ${CLEAN_CMD[*]}"
+fi
+
+echo "[*] Ensuring Wolverine+favicon+root redirect block present…"
+
+BLOCK_START="# === wolverine_root_batch START ==="
+BLOCK_END="# === wolverine_root_batch END ==="
+BLOCK_CONTENT=$(cat <<'EOF'
+# === wolverine_root_batch START ===
+
+# favicon: ne jamais 500 si absent
+location = /favicon.ico {
+  access_log off;
+  log_not_found off;
+  return 204;
+}
+
+# Redirige la home vers /wolverine/
+location = / {
+  return 302 /wolverine/;
+}
+
+# UI Wolverine sous /wolverine/
+# IMPORTANT: alias + try_files => évite les boucles /index.html
+location ^~ /wolverine/ {
+  alias /var/www/wolverine/;
+  index index.html;
+  try_files $uri $uri/ /wolverine/index.html;
+}
+
+# === wolverine_root_batch END ===
+EOF
+)
+
+# Replace or append block
+if grep -qF "$BLOCK_START" "$VHOST"; then
+  REPL_CMD=(perl -0777 -i -pe "s@\Q$BLOCK_START\E.*?\Q$BLOCK_END\E@$BLOCK_CONTENT@sg" "$VHOST")
+  if [[ "$APPLY" == "1" ]]; then
+    "${REPL_CMD[@]}"
+    echo "[OK] Block replaced."
+  else
+    echo "DRYRUN: ${REPL_CMD[*]}"
+  fi
+else
+  APP_CMD=(bash -lc "printf '\n%s\n' \"\$0\" >> \"$VHOST\"" "$BLOCK_CONTENT")
+  if [[ "$APPLY" == "1" ]]; then
+    "${APP_CMD[@]}"
+    echo "[OK] Block appended."
+  else
+    echo "DRYRUN: append block to $VHOST"
+  fi
+fi
+
+echo "[*] nginx -t (syntax check)…"
+if nginx -t; then
+  echo "[OK] nginx config OK."
+else
+  echo "[ERR] nginx -t failed."
+  echo "---- Quick debug helpers ----"
+  echo "1) nginx -t 2>&1 | tail -n 5"
+  echo "2) nginx -T 2>/dev/null | sed -n '1,220p' | nl -ba | sed -n '1,220p'"
+  echo "3) Ouvre le fichier indiqué et regarde autour de la ligne signalée."
+  exit 2
+fi
+
+if [[ "$APPLY" == "1" ]]; then
+  echo "[*] Reload nginx…"
+  systemctl reload nginx
+  echo "[OK] Reloaded."
+else
+  echo "[DRYRUN] Pas de reload (APPLY=0)."
+fi
+
+echo "[DONE] Backup: $BACKDIR"
+BASH
+
+chmod +x /root/batch_root_fireinners.sh
+echo "OK: /root/batch_root_fireinners.sh prêt"
