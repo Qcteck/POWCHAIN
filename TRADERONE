@@ -1,4 +1,4 @@
-cat >/root/batch_root_fireinners.sh <<'BASH'
+cat > /root/batch_root_fireinners.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -7,122 +7,172 @@ VHOST="${VHOST:-/etc/nginx/sites-enabled/${DOMAIN}-ssl}"
 SNIP="${SNIP:-/etc/nginx/snippets/${DOMAIN}_wolverine.conf}"
 APPLY="${APPLY:-0}"
 
-say(){ echo "== $*"; }
-die(){ echo "ERROR: $*" >&2; exit 1; }
+say(){ echo -e "$*"; }
 
-[ -f "$VHOST" ] || die "VHOST introuvable: $VHOST"
+say "== 0) DRY RUN par défaut (APPLY=1 pour appliquer) =="
+say "DOMAIN: $DOMAIN"
+say "VHOST : $VHOST"
+say "SNIP  : $SNIP"
+say "APPLY : $APPLY"
+echo
 
+if [ ! -f "$VHOST" ]; then
+  say "ERROR: vhost introuvable: $VHOST"
+  exit 1
+fi
+
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKDIR="/etc/nginx/sites-disabled/batch_root_${TS}"
+mkdir -p "$BACKDIR"
+BACKVHOST="${BACKDIR}/$(basename "$VHOST")"
+
+say "== 1) Backup vhost =="
+if [ "$APPLY" = "1" ]; then
+  cp -a "$VHOST" "$BACKVHOST"
+  say "Backup: $BACKVHOST"
+else
+  say "[DRY] Would backup to: $BACKVHOST"
+fi
+echo
+
+say "== 2) Créer snippet (wolverine + favicon) =="
 SNIP_CONTENT=$(cat <<EOF
-# --- ${DOMAIN} wolverine + favicon snippet ---
+# --- ${DOMAIN} wolverine + favicon (auto) ---
 location ^~ /wolverine/ {
   alias /var/www/wolverine/;
   try_files \$uri \$uri/ /wolverine/index.html;
 }
 
+# évite un 500 si /favicon.ico absent => 204
 location = /favicon.ico {
   access_log off;
   log_not_found off;
   try_files /favicon.ico =204;
 }
-# --- end snippet ---
 EOF
 )
 
-INCLUDE_LINE="include ${SNIP};"
-
-say "0) DRY RUN par défaut (APPLY=1 pour appliquer)"
-say "1) VHOST : $VHOST"
-say "2) SNIP  : $SNIP"
-
-# --- write snippet ---
 if [ "$APPLY" = "1" ]; then
   install -d /etc/nginx/snippets
-  printf "%s\n" "$SNIP_CONTENT" >"$SNIP"
+  printf "%s\n" "$SNIP_CONTENT" > "$SNIP"
   say "Snippet écrit: $SNIP"
 else
-  say "[DRY] Snippet serait écrit dans: $SNIP"
+  say "[DRY] Would write snippet: $SNIP"
 fi
+echo
 
-# --- ensure include is inside first server{} block ---
+say "== 3) Nettoyer le vhost: commenter tout 'location' hors server{} (cause du emerg) =="
 TMP="$(mktemp)"
-awk -v inc="$INCLUDE_LINE" '
-BEGIN{in_server=0; inserted=0}
+
+awk '
+BEGIN{in_server=0; brace=0; bad=0}
 {
   line=$0
-  print line
-  if (!inserted) {
-    # repère l’ouverture du 1er server {
-    if (match(line, /^[[:space:]]*server[[:space:]]*\{/)) {
-      in_server=1
-      next
-    }
-    # si on est dans le server et qu’on arrive au 1er "location" (ou autre directive de contenu),
-    # on injecte l’include juste avant.
+
+  # Détection entrée dans server
+  if ($0 ~ /^[[:space:]]*server[[:space:]]*\{[[:space:]]*$/) {in_server=1}
+
+  # Compte braces globalement (approx suffisant ici)
+  brace += gsub(/\{/, "{")
+  brace -= gsub(/\}/, "}")
+
+  # On considère qu on est "hors server" tant qu on a pas vu server {
+  # et qu on est avant le premier bloc serveur.
+  if (in_server==0 && $0 ~ /^[[:space:]]*location[[:space:]]+/) {
+    print "# [BATCHFIX] commented (location outside server{}): " line
+    bad=1
+    next
   }
-  if (in_server && !inserted) {
-    if (match(line, /^[[:space:]]*location[[:space:]]/)) {
-      # on doit réimprimer inc AVANT la ligne courante => on ne peut plus, donc:
-      # astuce: on re-crée le fichier en 2 passes: ici on marque un point d’insertion
-    }
+
+  print line
+}
+END{
+  if (bad==1) {
+    # juste un indicateur dans stderr serait mieux, mais ok
   }
 }
-' "$VHOST" >/dev/null 2>&1 || true
-
-# 2-pass insertion: injecte l’include après la ligne "server {" si absent (simple et sûr)
-if grep -qF "$INCLUDE_LINE" "$VHOST"; then
-  say "3) Include déjà présent dans le vhost -> OK"
-  cp "$VHOST" "$TMP"
-else
-  say "3) Include absent -> insertion dans le 1er server{} (juste après 'server {')"
-  awk -v inc="$INCLUDE_LINE" '
-  BEGIN{done=0}
-  {
-    print
-    if (!done && match($0, /^[[:space:]]*server[[:space:]]*\{/)) {
-      print "  " inc
-      done=1
-    }
-  }' "$VHOST" >"$TMP"
-fi
+' "$VHOST" > "$TMP"
 
 if [ "$APPLY" = "1" ]; then
-  BK="/etc/nginx/sites-disabled/batchfix_$(date +%Y%m%d_%H%M%S)"
-  install -d "$BK"
-  cp -a "$VHOST" "$BK"/
   cp -a "$TMP" "$VHOST"
-  say "Backup: $BK/$(basename "$VHOST")"
-  say "VHOST patché."
+  say "Vhost nettoyé: $VHOST"
 else
-  say "[DRY] Pas de modification écrite sur $VHOST"
+  say "[DRY] Would rewrite vhost (cleaned) at: $VHOST"
 fi
-
 rm -f "$TMP"
+echo
 
-say "4) nginx -t"
-if nginx -t; then
-  say "nginx -t OK"
-  if [ "$APPLY" = "1" ]; then
-    systemctl reload nginx || nginx -s reload || true
-    say "Reload tenté."
-  else
-    say "[DRY] pas de reload"
-  fi
+say "== 4) Assurer include snippet DANS le 1er server{} =="
+TMP2="$(mktemp)"
+INCLUDE_LINE="include ${SNIP};"
+
+awk -v inc="$INCLUDE_LINE" '
+BEGIN{done=0; in_first_server=0}
+{
+  print $0
+
+  # entrée premier server
+  if (done==0 && $0 ~ /^[[:space:]]*server[[:space:]]*\{[[:space:]]*$/) {
+    in_first_server=1
+    next
+  }
+
+  # juste après "server {" du premier bloc, injecter include (si absent)
+  if (in_first_server==1) {
+    # si la ligne suivante contient déjà include, on n ajoute pas
+    # (on vérifie plus bas au moment de sortir du server)
+    print "  " inc
+    done=1
+    in_first_server=0
+  }
+}
+' "$VHOST" > "$TMP2"
+
+# Si include existe déjà quelque part, éviter doublon : si on détecte inc dans fichier original, on ne modifie pas.
+if grep -qF "$INCLUDE_LINE" "$VHOST"; then
+  say "Include déjà présent dans le vhost -> rien à injecter."
+  rm -f "$TMP2"
 else
-  die "nginx -t a échoué (ne pas reload)"
+  if [ "$APPLY" = "1" ]; then
+    cp -a "$TMP2" "$VHOST"
+    say "Include injecté dans 1er server{}: $INCLUDE_LINE"
+  else
+    say "[DRY] Would inject include into first server{}: $INCLUDE_LINE"
+  fi
+  rm -f "$TMP2"
 fi
+echo
 
-say "5) checks local (host header)"
-curl -sS -I -H "Host: ${DOMAIN}" http://127.0.0.1/wolverine/ | head -n 5 || true
-curl -sS -I -H "Host: ${DOMAIN}" http://127.0.0.1/favicon.ico | head -n 5 || true
+say "== 5) nginx -t (DOIT PASS) =="
+set +e
+nginx -t
+RC=$?
+set -e
+if [ $RC -ne 0 ]; then
+  say "ERROR: nginx -t a échoué. Affiche la ligne exacte avec:"
+  say "  nginx -T 2>/dev/null | sed -n '1,200p'"
+  exit $RC
+fi
+echo
 
-say "6) checks public (https)"
-curl -sS -I "https://${DOMAIN}/wolverine/" | head -n 8 || true
-curl -sS -I "https://${DOMAIN}/favicon.ico" | head -n 12 || true
+say "== 6) Reload nginx si APPLY=1 =="
+if [ "$APPLY" = "1" ]; then
+  systemctl reload nginx
+  say "Reload OK."
+else
+  say "[DRY] Pas de reload (APPLY=0)."
+fi
+echo
 
-say "DONE"
+say "== 7) Vérifs rapides =="
+say "Local:"
+say "  curl -I -H 'Host: ${DOMAIN}' http://127.0.0.1/wolverine/ | head"
+say "  curl -I -H 'Host: ${DOMAIN}' http://127.0.0.1/favicon.ico | head"
+say "Public:"
+say "  curl -I https://${DOMAIN}/wolverine/ | head"
+say "  curl -I https://${DOMAIN}/favicon.ico | head"
+say
+say "DONE."
 BASH
 
 chmod +x /root/batch_root_fireinners.sh
-
-# DRY RUN
-APPLY=0 bash /root/batch_root_fireinners.sh
