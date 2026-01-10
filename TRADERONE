@@ -1,1 +1,129 @@
-/root/cleanup_wolverine_favicon.sh fireinners.online
+cat >/root/batch_root_fireinners.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+DOMAIN="${1:-fireinners.online}"
+VHOST="${2:-/etc/nginx/sites-enabled/${DOMAIN}-ssl}"
+SNIP="/etc/nginx/snippets/${DOMAIN}_wolverine.conf"
+APPLY="${APPLY:-0}"   # 0=dry-run, 1=apply
+
+ts(){ date "+%Y-%m-%d %H:%M:%S"; }
+say(){ echo "[$(ts)] $*"; }
+
+say "== batch_root (${DOMAIN}) =="
+say "APPLY=${APPLY} (0=dry-run, 1=apply)"
+say "VHOST=${VHOST}"
+say "SNIP=${SNIP}"
+
+[[ -f "$VHOST" ]] || { say "ERROR: vhost introuvable: $VHOST"; exit 1; }
+
+# 1) Build snippet
+SNIP_CONTENT="$(cat <<'EOF'
+# --- wolverine + favicon + root redirect (generated) ---
+
+# Home -> /wolverine/
+location = / {
+  return 302 /wolverine/;
+}
+
+# UI Wolverine sous /wolverine/
+# IMPORTANT: alias + try_files => évite les boucles /index.html
+location ^~ /wolverine/ {
+  alias /var/www/wolverine/;
+  index index.html;
+  try_files $uri $uri/ /wolverine/index.html;
+}
+
+# favicon: ne jamais 500 si absent
+location = /favicon.ico {
+  access_log off;
+  log_not_found off;
+  try_files /favicon.ico =204;
+}
+EOF
+)"
+
+say "== 1) Snippet =="
+if [[ "$APPLY" == "1" ]]; then
+  install -d /etc/nginx/snippets
+  printf "%s\n" "$SNIP_CONTENT" >"$SNIP"
+  say "OK: écrit -> $SNIP"
+else
+  say "[DRY] écrirait -> $SNIP"
+fi
+
+INCLUDE_LINE="include ${SNIP};"
+
+# 2) Inject include inside the HTTPS server{} (listen 443)
+say "== 2) Patch VHOST (safe) =="
+
+BACKDIR="/etc/nginx/sites-disabled/batch_root_$(date +%Y%m%d_%H%M%S)"
+BACKVHOST="${BACKDIR}/$(basename "$VHOST")"
+
+if [[ "$APPLY" == "1" ]]; then
+  install -d "$BACKDIR"
+  cp -a "$VHOST" "$BACKVHOST"
+  say "Backup -> $BACKVHOST"
+else
+  say "[DRY] ferait un backup -> $BACKVHOST"
+fi
+
+# If already included, do nothing
+if grep -Fq "$INCLUDE_LINE" "$VHOST"; then
+  say "OK: include déjà présent, skip injection."
+else
+  # Insert include right after the opening brace of the server block that has listen 443
+  # (avoids the “location not allowed here” caused by wrong placement)
+  if [[ "$APPLY" == "1" ]]; then
+    perl -0777 -i -pe '
+      my $inc = $ENV{INC_LINE};
+      my $done = 0;
+
+      # Replace the FIRST server{...} block that contains "listen 443"
+      s{
+        server\s*\{
+        ( .*? )
+        \}
+      }{
+        my $block = "server{".$1."}";
+        if (!$done && $block =~ /listen\s+443\b/s) {
+          $done = 1;
+          # inject include just after server {
+          $block =~ s/^server\s*\{\n?/server {\n  $inc\n/sm;
+        }
+        $block =~ s/^server\{/server {/;
+        $block =~ s/\}\z/\}/;
+        $block;
+      }gsex;
+
+      die "No HTTPS server block with listen 443 found\n" unless $done;
+    ' "$VHOST" INC_LINE="$INCLUDE_LINE"
+    say "OK: include injecté dans le server 443."
+  else
+    say "[DRY] injecterait: $INCLUDE_LINE dans le server{} qui contient 'listen 443'"
+  fi
+fi
+
+# 3) nginx -t
+say "== 3) nginx -t =="
+if nginx -t; then
+  say "OK: nginx -t"
+else
+  say "ERROR: nginx -t FAIL (aucun reload)."
+  exit 1
+fi
+
+# 4) reload
+say "== 4) reload =="
+if [[ "$APPLY" == "1" ]]; then
+  systemctl reload nginx
+  say "OK: reloaded"
+else
+  say "[DRY] ferait: systemctl reload nginx"
+fi
+
+say "=== DONE ==="
+BASH
+
+chmod +x /root/batch_root_fireinners.sh
+echo "OK: /root/batch_root_fireinners.sh prêt"
