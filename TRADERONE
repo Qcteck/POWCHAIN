@@ -1,21 +1,22 @@
-cat >/root/batch_root_fireinners.sh <<'BASH'
+cat > /root/batch_root_fireinners.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-DOMAIN="fireinners.online"
-APPLY="${APPLY:-0}"
-
-VHOST="/etc/nginx/sites-enabled/${DOMAIN}-ssl"
+DOMAIN="${1:-fireinners.online}"
+VHOST="${2:-/etc/nginx/sites-enabled/${DOMAIN}-ssl}"
 SNIP="/etc/nginx/snippets/${DOMAIN}_wolverine.conf"
-INCLUDE_LINE="include ${SNIP};"
+APPLY="${APPLY:-0}"   # 0=dry-run, 1=apply
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKDIR="/etc/nginx/sites-disabled/batch_root_${TS}"
+BACKVHOST="${BACKDIR}/$(basename "$VHOST")"
 
-ts(){ date "+%Y-%m-%d %H:%M:%S"; }
-say(){ echo "[$(ts)] $*"; }
+say(){ printf '%s\n' "$*"; }
 
-say "== batch root (${DOMAIN}) =="
+say "== batch_root (${DOMAIN}) =="
 say "APPLY=${APPLY} (0=dry-run, 1=apply)"
 say "VHOST=${VHOST}"
 say "SNIP=${SNIP}"
+echo
 
 if [[ ! -f "$VHOST" ]]; then
   say "ERROR: vhost introuvable: $VHOST"
@@ -23,7 +24,7 @@ if [[ ! -f "$VHOST" ]]; then
 fi
 
 # 1) Build snippet (wolverine + favicon)
-SNIP_CONTENT=$(cat <<'EOF'
+SNIP_CONTENT="$(cat <<'EOF'
 # --- wolverine + favicon snippet ---
 location ^~ /wolverine/ {
   alias /var/www/wolverine/;
@@ -36,87 +37,74 @@ location = /favicon.ico {
   try_files /favicon.ico =204;
 }
 EOF
-)
+)"
 
 say "== 1) Snippet =="
 if [[ "$APPLY" == "1" ]]; then
   install -d /etc/nginx/snippets
-  printf "%s\n" "$SNIP_CONTENT" >"$SNIP"
+  printf "%s\n" "$SNIP_CONTENT" > "$SNIP"
   say "OK: écrit -> $SNIP"
 else
   say "[DRY] écrirait -> $SNIP"
 fi
+echo
 
-# 2) Patch vhost: ensure include is inside FIRST server{} block
-say "== 2) Patch VHOST (include dans 1er server{}) =="
+# 2) Patch VHOST safely (insert include inside first server{ ... })
+INCLUDE_LINE="include ${SNIP};"
 
+say "== 2) Patch VHOST (safe) =="
 if grep -Fq "$INCLUDE_LINE" "$VHOST"; then
-  say "OK: include déjà présent, rien à faire."
+  say "OK: include déjà présent dans $VHOST"
 else
-  TMP="$(mktemp)"
-  awk -v inc="$INCLUDE_LINE" '
-    BEGIN{done=0}
-    {
-      print $0
-      if (!done && $0 ~ /^[[:space:]]*server[[:space:]]*\{[[:space:]]*$/) {
-        print "  " inc
-        done=1
-      }
-    }
-    END{
-      if (!done) {
-        # fallback: si "server {" est sur la même ligne avec du texte, tente une 2e passe simple
-      }
-    }
-  ' "$VHOST" >"$TMP"
-
-  # Vérif qu'on a bien inséré
-  if ! grep -Fq "$INCLUDE_LINE" "$TMP"; then
-    # fallback: insert après la première occurrence de "server {"
-    awk -v inc="$INCLUDE_LINE" '
-      BEGIN{done=0}
-      {
-        print $0
-        if (!done && $0 ~ /^[[:space:]]*server[[:space:]]*\{/) {
-          print "  " inc
-          done=1
-        }
-      }
-      END{ if(!done) exit 2 }
-    ' "$VHOST" >"$TMP"
+  # Trouver la 1ère ligne qui contient 'server' + '{'
+  SERVER_LINE="$(grep -nE '^[[:space:]]*server[[:space:]]*\{' "$VHOST" | head -n1 | cut -d: -f1 || true)"
+  if [[ -z "${SERVER_LINE}" ]]; then
+    say "ERROR: impossible de trouver 'server {' dans $VHOST"
+    exit 1
   fi
+
+  # Préparer patch en insérant l'include juste APRÈS la ligne "server {"
+  tmp="$(mktemp)"
+  awk -v sl="$SERVER_LINE" -v inc="$INCLUDE_LINE" '
+    NR==sl { print; print "  " inc; next }
+    { print }
+  ' "$VHOST" > "$tmp"
 
   if [[ "$APPLY" == "1" ]]; then
-    BACKDIR="/etc/nginx/sites-disabled/batch_root_$(date +%Y%m%d_%H%M%S)"
-    install -d "$BACKDIR"
-    cp -a "$VHOST" "$BACKDIR/$(basename "$VHOST")"
-    say "Backup: $BACKDIR/$(basename "$VHOST")"
-    cat "$TMP" >"$VHOST"
-    say "OK: vhost patché"
+    mkdir -p "$BACKDIR"
+    cp -a "$VHOST" "$BACKVHOST"
+    cp -a "$tmp" "$VHOST"
+    say "OK: backup -> $BACKVHOST"
+    say "OK: vhost patché -> $VHOST"
   else
-    say "[DRY] ferait un backup + patcherait $VHOST"
+    say "[DRY] insérerait l'include dans le 1er server{} (ligne $SERVER_LINE)"
+    say "[DRY] ferait un backup -> $BACKVHOST"
   fi
-  rm -f "$TMP"
-fi
 
-# 3) nginx -t and reload only if OK
+  rm -f "$tmp"
+fi
+echo
+
+# 3) nginx -t (must pass)
 say "== 3) nginx -t =="
 if nginx -t; then
   say "OK: nginx -t PASS"
-  if [[ "$APPLY" == "1" ]]; then
-    systemctl reload nginx
-    say "OK: nginx reloaded"
-  else
-    say "[DRY] reload nginx"
-  fi
 else
-  say "ERROR: nginx -t FAIL (pas de reload)"
-  say "Astuce: si APPLY=1 a été utilisé, restore le backup depuis /etc/nginx/sites-disabled/batch_root_*"
+  say "ERROR: nginx -t FAIL (aucun reload)"
   exit 1
+fi
+echo
+
+# 4) Reload if APPLY=1
+say "== 4) reload =="
+if [[ "$APPLY" == "1" ]]; then
+  systemctl reload nginx
+  say "OK: nginx reloaded"
+else
+  say "[DRY] pas de reload (APPLY=0)"
 fi
 
 say "== DONE =="
 BASH
 
 chmod +x /root/batch_root_fireinners.sh
-echo "OK: /root/batch_root_fireinners.sh prêt"
