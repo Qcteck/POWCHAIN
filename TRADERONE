@@ -1,12 +1,119 @@
-cd /root
+cat > /root/batch_root_fireinners.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
 
-# 1) dry-run (ne modifie rien)
-APPLY=0 bash /root/fireinners_batch.sh
+DOMAIN="fireinners.online"
+APPLY="${APPLY:-0}"
 
-# 2) si le dry-run est clean (et/ou que tu veux appliquer le fix)
-APPLY=1 bash /root/fireinners_batch.sh
+echo "== 0) Check root =="
+if [ "$(id -u)" -ne 0 ]; then
+  echo "ERROR: run as root"; exit 1
+fi
 
-# 3) vérif nginx + endpoints
-nginx -t && systemctl reload nginx
-curl -I https://fireinners.online/wolverine/ | head
-curl -I https://fireinners.online/favicon.ico | head
+echo "== 1) Find active nginx vhost (sites-enabled) =="
+VHOST="$(grep -RIl "server_name.*${DOMAIN}" /etc/nginx/sites-enabled 2>/dev/null | head -n1 || true)"
+if [ -z "$VHOST" ]; then
+  echo "ERROR: could not find vhost in /etc/nginx/sites-enabled for ${DOMAIN}"
+  echo "Hint: ls -la /etc/nginx/sites-enabled && grep -R \"server_name.*${DOMAIN}\" /etc/nginx"
+  exit 1
+fi
+echo "VHOST=${VHOST}"
+
+echo "== 2) Create snippet (wolverine + favicon) =="
+SNIP="/etc/nginx/snippets/${DOMAIN}_wolverine.conf"
+SNIP_CONTENT=$(cat <<'EOF'
+# --- wolverine + favicon snippet ---
+location ^~ /wolverine/ {
+  alias /var/www/wolverine/;
+  try_files $uri $uri/ /wolverine/index.html;
+}
+
+location = /favicon.ico {
+  access_log off;
+  log_not_found off;
+  try_files /favicon.ico =204;
+}
+# --- end snippet ---
+EOF
+)
+
+if [ "$APPLY" = "1" ]; then
+  install -d /etc/nginx/snippets
+  printf "%s\n" "$SNIP_CONTENT" > "$SNIP"
+  echo "Wrote: $SNIP"
+else
+  echo "[DRY] Would write: $SNIP"
+fi
+
+echo "== 3) Ensure snippet is included INSIDE the right server{} block =="
+# We insert: include /etc/nginx/snippets/<...>; just before the first '}' that closes the first server{} block
+# (works for most simple vhosts; safer than injecting raw 'location' at top-level).
+INCLUDE_LINE="include ${SNIP};"
+
+if grep -qF "$INCLUDE_LINE" "$VHOST"; then
+  echo "Include already present."
+else
+  if [ "$APPLY" = "1" ]; then
+    TS="$(date +%Y%m%d_%H%M%S)"
+    cp -a "$VHOST" "${VHOST}.bak.${TS}"
+    echo "Backup: ${VHOST}.bak.${TS}"
+
+    # Insert include line before the first standalone closing brace of the first server block.
+    # This avoids the 'location directive is not allowed here' error.
+    awk -v inc="$INCLUDE_LINE" '
+      BEGIN{inserver=0; inserted=0}
+      /^\s*server\s*\{/ && inserver==0 {inserver=1}
+      {
+        if(inserver==1 && inserted==0 && $0 ~ /^\s*\}\s*$/){
+          print "  " inc;
+          inserted=1;
+          inserver=0;
+        }
+        print
+      }
+      END{
+        if(inserted==0){
+          print "AWK_INSERT_FAILED" > "/dev/stderr";
+          exit 2
+        }
+      }
+    ' "$VHOST" > "${VHOST}.tmp"
+
+    mv "${VHOST}.tmp" "$VHOST"
+    echo "Inserted include into: $VHOST"
+  else
+    echo "[DRY] Would backup and insert include into: $VHOST"
+  fi
+fi
+
+echo "== 4) nginx -t (must PASS) =="
+nginx -t
+
+echo "== 5) Reload nginx if APPLY=1 =="
+if [ "$APPLY" = "1" ]; then
+  systemctl reload nginx
+  echo "nginx reloaded."
+else
+  echo "[DRY] No reload."
+fi
+
+echo "== 6) Quick checks (local host header + public) =="
+echo "-- Local (host header) --"
+curl -I -H "Host: ${DOMAIN}" http://127.0.0.1/wolverine/ | head
+curl -I -H "Host: ${DOMAIN}" http://127.0.0.1/favicon.ico | head
+
+echo "-- Public (https) --"
+curl -I "https://${DOMAIN}/wolverine/" | head
+curl -I "https://${DOMAIN}/favicon.ico" | head
+
+echo "== DONE =="
+BASH
+
+chmod +x /root/batch_root_fireinners.sh
+
+echo "DRY RUN:"
+bash /root/batch_root_fireinners.sh
+
+echo
+echo "To APPLY for real:"
+echo "APPLY=1 bash /root/batch_root_fireinners.sh"
