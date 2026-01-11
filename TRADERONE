@@ -1,27 +1,70 @@
-cat >/root/diag_wolverine_502.sh <<'BASH'
+cat >/root/fix_wolverine_next_service_v2.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
+
 PORT="${PORT:-3001}"
-DOMAIN="${1:-fireinners.online}"
 
-echo "== systemd =="
+# 1) récupère le WorkingDirectory du service existant
+WD="$(systemctl cat wolverine-next 2>/dev/null | awk -F= '/^WorkingDirectory=/{print $2; exit}')"
+if [[ -z "${WD:-}" ]]; then
+  echo "[ERR] Je ne trouve pas WorkingDirectory dans le service."
+  echo "Colle: systemctl cat wolverine-next"
+  exit 1
+fi
+
+echo "[*] WorkingDirectory=$WD"
+cd "$WD"
+
+# 2) s'assure que node_modules + build existent
+npm i
+npm run build
+
+# 3) écrit un service systemd robuste (next start direct)
+SERVICE="/etc/systemd/system/wolverine-next.service"
+ts="$(date +%Y%m%d_%H%M%S)"
+cp -a "$SERVICE" "${SERVICE}.bak_${ts}" 2>/dev/null || true
+
+NEXT_BIN="$WD/node_modules/next/dist/bin/next"
+if [[ ! -f "$NEXT_BIN" ]]; then
+  echo "[ERR] next binaire introuvable: $NEXT_BIN"
+  exit 1
+fi
+
+cat >"$SERVICE" <<EOF
+[Unit]
+Description=Wolverine Next.js Server
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=$WD
+Environment=NODE_ENV=production
+Environment=PORT=$PORT
+ExecStart=/usr/bin/node $NEXT_BIN start -p $PORT -H 127.0.0.1
+Restart=always
+RestartSec=2
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable wolverine-next >/dev/null 2>&1 || true
+systemctl restart wolverine-next
+
+echo
+echo "== status =="
 systemctl --no-pager status wolverine-next | sed -n '1,25p' || true
-echo
 
-echo "== listen port $PORT =="
+echo
+echo "== listening =="
 ss -lntp | grep ":$PORT" || echo "[ERR] rien n'écoute sur $PORT"
-echo
 
-echo "== curl upstream direct =="
-curl -sSI "http://127.0.0.1:$PORT/" | head -n 20 || echo "[ERR] curl upstream KO"
 echo
-
-echo "== nginx errors (recent) =="
-tail -n 80 /var/log/nginx/error.log | tail -n 40 || true
-echo
-
-echo "== curl via nginx local (bypass cloudflare) =="
-curl -k -sSI "https://127.0.0.1/wolverine/" -H "Host: $DOMAIN" | head -n 20 || true
+echo "== upstream curl =="
+curl -sSI "http://127.0.0.1:$PORT/" | head -n 20 || true
 BASH
-chmod +x /root/diag_wolverine_502.sh
-/root/diag_wolverine_502.sh fireinners.online
+
+chmod +x /root/fix_wolverine_next_service_v2.sh
+/root/fix_wolverine_next_service_v2.sh
