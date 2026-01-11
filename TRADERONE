@@ -1,60 +1,80 @@
-cat >/root/fix_traderone_api_auto.sh <<'BASH'
+cat >/root/fix_wolverine_api_and_loop.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
 DOMAIN="${1:-fireinners.online}"
 VHOST="/etc/nginx/sites-enabled/${DOMAIN}-ssl"
-API_UPSTREAM="${API_UPSTREAM:-}"   # optionnel: ex "http://127.0.0.1:3000"
-CANDIDATE_PORTS="${CANDIDATE_PORTS:-3000 3001 8080 8000 5000 4000 5173}"
+CANDIDATE_PORTS="${CANDIDATE_PORTS:-3000 3001 8080 8000 5000 4000}"
 
 ts="$(date +%Y%m%d_%H%M%S)"
 echo "[*] DOMAIN=$DOMAIN"
 echo "[*] VHOST=$VHOST"
 [[ -f "$VHOST" ]] || { echo "[ERR] vhost introuvable: $VHOST"; exit 1; }
 
-# 1) Auto-detect upstream if not provided
-if [[ -z "$API_UPSTREAM" ]]; then
-  # try to pick a listening port from a known list
-  PORT=""
-  for p in $CANDIDATE_PORTS; do
-    if ss -lntp 2>/dev/null | grep -qE "LISTEN.*:${p}\b"; then
-      PORT="$p"; break
-    fi
-  done
-
-  # fallback: pick first LISTEN port owned by node
-  if [[ -z "$PORT" ]]; then
-    PORT="$(ss -lntp 2>/dev/null | awk '
-      /LISTEN/ && /node/ {
-        match($4, /:([0-9]+)$/, m); if (m[1]!="") { print m[1]; exit }
-      }' || true)"
+# Detect backend port (prefer node)
+PORT=""
+for p in $CANDIDATE_PORTS; do
+  if ss -lntp 2>/dev/null | grep -qE "LISTEN.*:${p}\b"; then
+    PORT="$p"; break
   fi
-
-  [[ -n "$PORT" ]] || {
-    echo "[ERR] Aucun backend détecté. Donne la sortie de: ss -lntp | sed -n '1,160p'"
-    exit 1
-  }
-
-  API_UPSTREAM="http://127.0.0.1:${PORT}"
+done
+if [[ -z "$PORT" ]]; then
+  PORT="$(ss -lntp 2>/dev/null | awk '/LISTEN/ && /node/ {match($4, /:([0-9]+)$/, m); if(m[1]!=""){print m[1]; exit}}' || true)"
 fi
 
+if [[ -z "$PORT" ]]; then
+  echo "[WARN] Aucun port backend détecté. Je patch nginx quand même, mais il faudra démarrer le backend."
+  echo "       Donne-moi: ss -lntp | sed -n '1,160p'"
+  PORT="3000"
+fi
+
+API_UPSTREAM="http://127.0.0.1:${PORT}"
+export API_UPSTREAM
 echo "[*] API_UPSTREAM=$API_UPSTREAM"
 
-# 2) Backup
-BACKDIR="/etc/nginx/sites-disabled/backup_api_proxy_${ts}"
+# Backup
+BACKDIR="/etc/nginx/sites-disabled/backup_fix_loop_api_${ts}"
 mkdir -p "$BACKDIR"
 cp -a "$VHOST" "$BACKDIR/$(basename "$VHOST")"
 echo "[OK] Backup -> $BACKDIR/$(basename "$VHOST")"
 
-export API_UPSTREAM
-
-# 3) Patch (idempotent): insert proxy block before static /wolverine/ block
+# Patch:
+#  A) Fix static try_files when using alias: use /index.html (not /wolverine/index.html)
+#  B) Inject proxy blocks for /wolverine/api/ and /wolverine/traderone/api/ before static block
 perl -0777 -i -pe '
-my $up = $ENV{API_UPSTREAM} // die "missing API_UPSTREAM";
-# remove existing injected block if present
+my $up = $ENV{API_UPSTREAM};
+
+# 1) remove previous injected blocks
+s/\n\s*# --- wolverine api proxy \(injected\) ---.*?\n\s*# --- end wolverine api proxy ---\n//ms;
 s/\n\s*# --- traderone api proxy \(injected\) ---.*?\n\s*# --- end traderone api proxy ---\n//ms;
 
-my $block = qq{
+# 2) fix try_files in location ^~ /wolverine/ (alias case)
+# convert: try_files ... /wolverine/index.html;
+# to:      try_files ... /index.html;
+s/(location\s+\^\~\s+\/wolverine\/\s*\{.*?try_files\s+[^;]*?)\/wolverine\/index\.html;/${1}\/index.html;/ms;
+
+my $api_block = qq{
+  # --- wolverine api proxy (injected) ---
+  location ^~ /wolverine/api/ {
+    if (\$request_method = OPTIONS) {
+      add_header Access-Control-Allow-Origin "*" always;
+      add_header Access-Control-Allow-Methods "GET,POST,PUT,PATCH,DELETE,OPTIONS" always;
+      add_header Access-Control-Allow-Headers "Authorization,Content-Type,Accept" always;
+      return 204;
+    }
+    proxy_pass $up/;
+    proxy_http_version 1.1;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+    proxy_read_timeout 60s;
+    proxy_send_timeout 60s;
+  }
+  # --- end wolverine api proxy ---
+};
+
+my $trader_block = qq{
   # --- traderone api proxy (injected) ---
   location ^~ /wolverine/traderone/api/ {
     if (\$request_method = OPTIONS) {
@@ -63,23 +83,21 @@ my $block = qq{
       add_header Access-Control-Allow-Headers "Authorization,Content-Type,Accept" always;
       return 204;
     }
-
     proxy_pass $up/;
     proxy_http_version 1.1;
     proxy_set_header Host \$host;
     proxy_set_header X-Real-IP \$remote_addr;
     proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto \$scheme;
-
     proxy_read_timeout 60s;
     proxy_send_timeout 60s;
   }
   # --- end traderone api proxy ---
 };
 
-# insert before location ^~ /wolverine/
-s/\n(\s*location\s+\^\~\s+\/wolverine\/\s*\{)/\n$block\n$1/ms
-  or die "ERR: cannot find location ^~ /wolverine/ block to insert before\n";
+# 3) insert both blocks before static location ^~ /wolverine/
+s/\n(\s*location\s+\^\~\s+\/wolverine\/\s*\{)/\n$api_block\n$trader_block\n$1/ms
+  or die "ERR: cannot find location ^~ /wolverine/ block\n";
 ' "$VHOST"
 
 echo "[*] nginx -t"
@@ -88,18 +106,20 @@ systemctl reload nginx
 echo "[OK] nginx reloaded"
 
 echo
-echo "== Tests HTTP =="
-curl -sSI "https://${DOMAIN}/wolverine/traderone/api/" | head -n 20 || true
+echo "== Tests =="
+echo "-- /wolverine/api/ping"
+curl -sSI "https://${DOMAIN}/wolverine/api/ping" | head -n 12 || true
 echo
-curl -sSI -X POST "https://${DOMAIN}/wolverine/traderone/api/" | head -n 20 || true
+echo "-- /wolverine/traderone/api/"
+curl -sSI "https://${DOMAIN}/wolverine/traderone/api/" | head -n 12 || true
 echo
-echo "== Local upstream quick check =="
+echo "-- Local upstream /"
 curl -sS "${API_UPSTREAM}/" | head -n 5 || true
 
 echo
-echo "== If still failing, last logs =="
-tail -n 40 "/var/log/nginx/${DOMAIN}.error.log" 2>/dev/null || true
+echo "Si tu vois encore 502: le backend n\'est pas démarré / pas sur ce port."
+echo "Check: ss -lntp | sed -n \"1,160p\""
 BASH
 
-chmod +x /root/fix_traderone_api_auto.sh
-/root/fix_traderone_api_auto.sh fireinners.online
+chmod +x /root/fix_wolverine_api_and_loop.sh
+/root/fix_wolverine_api_and_loop.sh fireinners.online
