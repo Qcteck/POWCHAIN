@@ -1,11 +1,22 @@
-cat >/root/fix_solana_rpc_proxy_clean.sh <<'BASH'
+cat >/root/fix_cf_servername_and_rpc.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
 DOMAIN="fireinners.online"
+DIS="/etc/nginx/disabled-sites"
 SNIP="/etc/nginx/snippets/solana_rpc_proxy.conf"
+mkdir -p "$DIS" /etc/nginx/snippets
 
-# 1) Trouver le vhost SSL (443) qui sert fireinners.online
+echo "== 1) Move backups out of sites-enabled (stop conflicting server_name) =="
+shopt -s nullglob
+for f in /etc/nginx/sites-enabled/*.bak* /etc/nginx/sites-enabled/*_bak_* /etc/nginx/sites-enabled/*backup*; do
+  echo "MOVE $f -> $DIS/"
+  mv -f "$f" "$DIS"/
+done
+shopt -u nullglob
+
+echo
+echo "== 2) Find ACTIVE SSL vhost file for $DOMAIN (443) =="
 VHOST="$(
 nginx -T 2>/dev/null | awk -v dom="$DOMAIN" '
   /^# configuration file /{f=$4; sub(/:$/,"",f)}
@@ -14,16 +25,11 @@ nginx -T 2>/dev/null | awk -v dom="$DOMAIN" '
 '
 )"
 [[ -n "${VHOST:-}" && -f "$VHOST" ]] || { echo "[ERR] vhost 443 introuvable pour $DOMAIN"; exit 1; }
+echo "[OK] VHOST: $VHOST"
 
-ts="$(date +%Y%m%d_%H%M%S)"
-cp -a "$VHOST" "${VHOST}.bak_${ts}"
-echo "[OK] VHOST: $VHOST (backup ${VHOST}.bak_${ts})"
-
-mkdir -p /etc/nginx/snippets
-
-# 2) Snippet /solana-rpc (same-origin, CORS OK)
+echo
+echo "== 3) Write snippet /solana-rpc =="
 cat >"$SNIP" <<'NGINX'
-# Solana RPC proxy (avoid browser CORS)
 location = /solana-rpc {
   proxy_pass https://api.mainnet-beta.solana.com;
   proxy_ssl_server_name on;
@@ -37,27 +43,27 @@ location = /solana-rpc {
 NGINX
 echo "[OK] wrote $SNIP"
 
-# 3) Inject include inside the SSL server block (idempotent)
+echo
+echo "== 4) Ensure include is in the ACTIVE SSL vhost (not a .bak) =="
 if ! grep -qF "include /etc/nginx/snippets/solana_rpc_proxy.conf;" "$VHOST"; then
-  # Ajoute juste après la 1ère ligne server_name du vhost
   sed -i '/server_name .*fireinners\.online/ a\  include /etc/nginx/snippets/solana_rpc_proxy.conf;' "$VHOST"
-  echo "[OK] include injected in $VHOST"
+  echo "[OK] include injected"
 else
   echo "[OK] include already present"
 fi
 
-# 4) Test + reload
+echo
+echo "== 5) nginx test + reload =="
 nginx -t
 systemctl reload nginx
 echo "[OK] nginx reloaded"
 
-# 5) Test RPC local (doit répondre "ok")
 echo
-echo "RPC local test:"
-curl -sk https://127.0.0.1/solana-rpc \
+echo "== 6) CORRECT RPC test (with Host = $DOMAIN) =="
+curl -sk --resolve ${DOMAIN}:443:127.0.0.1 https://${DOMAIN}/solana-rpc \
   -H 'Content-Type: application/json' \
   --data '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' && echo
 BASH
 
-chmod +x /root/fix_solana_rpc_proxy_clean.sh
-/root/fix_solana_rpc_proxy_clean.sh
+chmod +x /root/fix_cf_servername_and_rpc.sh
+/root/fix_cf_servername_and_rpc.sh
