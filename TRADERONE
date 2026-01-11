@@ -1,63 +1,67 @@
-cat >/root/nginx_fix_stub_clean.sh <<'BASH'
+cat >/root/nginx_repair_include_stub.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
 SERVER_FILE="/etc/nginx/sites-enabled/fireinners.online-ssl"
-SNIP_DIR="/etc/nginx/snippets"
-SNIP="$SNIP_DIR/wolverine_traderone_stub_locations.conf"
+SNIP="/etc/nginx/snippets/wolverine_traderone_stub_locations.conf"
 
-[[ -f "$SERVER_FILE" ]] || { echo "[ERR] introuvable: $SERVER_FILE"; exit 1; }
+[[ -f "$SERVER_FILE" ]] || { echo "[ERR] $SERVER_FILE introuvable"; exit 1; }
 
-mkdir -p "$SNIP_DIR"
+ts="$(date +%Y%m%d_%H%M%S)"
+cp -a "$SERVER_FILE" "${SERVER_FILE}.bak_${ts}"
+echo "[OK] Backup -> ${SERVER_FILE}.bak_${ts}"
 
-# 1) snippet (les stubs)
+# 1) Supprime TOUTES les lignes include qui contiennent le stub (même si elles sont corrompues)
+# + supprime les "include snip" bizarres si présents
+sed -i \
+  -e '/include .*wolverine_traderone_stub_locations\.conf/d' \
+  -e '/include .*wolverine_traderone_stub_locations/d' \
+  -e '/include snip/d' \
+  "$SERVER_FILE"
+
+# 2) Crée le snippet au bon endroit
+mkdir -p /etc/nginx/snippets
 cat >"$SNIP" <<'NGINX'
-# TraderOne API stubs (prevent UI crash)
+# TraderOne API stubs to prevent UI crash when backend endpoints are missing
+
 location = /wolverine/traderone/api/me {
   default_type application/json;
   return 200 '{"ok":true,"me":{"id":"guest","wallet":null}}';
 }
+
 location = /wolverine/traderone/api/positions {
   default_type application/json;
   return 200 '{"ok":true,"positions":[]}';
 }
+
 location = /wolverine/traderone/api/orders {
   default_type application/json;
   return 200 '{"ok":true,"orders":[]}';
 }
+
 location = /wolverine/traderone/api/pnl {
   default_type application/json;
   return 200 '{"ok":true,"pnl":{"total":0,"daily":0}}';
 }
 NGINX
 
-# 2) backup du vhost
-ts="$(date +%Y%m%d_%H%M%S)"
-cp -a "$SERVER_FILE" "${SERVER_FILE}.bak_${ts}"
-echo "[OK] Backup -> ${SERVER_FILE}.bak_${ts}"
-
-# 3) supprimer anciens includes cassés liés à ce snippet
-# (ligne include qui contient wolverine_traderone_stub_locations)
-sed -i '/include .*wolverine_traderone_stub_locations\.conf.*/d' "$SERVER_FILE"
-
-# 4) injecter include propre juste après server_name fireinners.online (idempotent)
-if ! grep -qF "include $SNIP;" "$SERVER_FILE"; then
-  perl -i -pe '
-    if(!$done && /server_name\s+.*\bfireinners\.online\b.*;/){
-      print "  include '"$SNIP"';\n";
-      $done=1;
-    }
+# 3) Injecte un include PROPRE juste avant la dernière "}" (dans le server block)
+if ! grep -qF "$SNIP" "$SERVER_FILE"; then
+  perl -0777 -i -pe '
+    my $inc = "\n  include /etc/nginx/snippets/wolverine_traderone_stub_locations.conf;\n";
+    s/\n\}\s*\z/$inc\n}\n/s;
   ' "$SERVER_FILE"
 fi
 
+# 4) Test + reload
 nginx -t
 systemctl reload nginx
 
-echo "[OK] nginx reloaded"
+echo "[OK] nginx fixed + reloaded"
 echo "Tests:"
 echo "  curl -s https://fireinners.online/wolverine/traderone/api/me"
 echo "  curl -s https://fireinners.online/wolverine/traderone/api/orders"
 BASH
 
-chmod +x /root/nginx_fix_stub_clean.sh
-/root/nginx_fix_stub_clean.sh
+chmod +x /root/nginx_repair_include_stub.sh
+/root/nginx_repair_include_stub.sh
