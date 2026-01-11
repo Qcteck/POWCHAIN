@@ -1,125 +1,75 @@
-cat >/root/fix_wolverine_api_and_loop.sh <<'BASH'
+cat >/root/auto_map_traderone_api.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
 DOMAIN="${1:-fireinners.online}"
 VHOST="/etc/nginx/sites-enabled/${DOMAIN}-ssl"
-CANDIDATE_PORTS="${CANDIDATE_PORTS:-3000 3001 8080 8000 5000 4000}"
 
-ts="$(date +%Y%m%d_%H%M%S)"
+# Récupère l'upstream actuel depuis le vhost (proxy_pass ...;), sinon fallback
+UP="$(grep -oP 'proxy_pass\s+\Khttp[^;]+' "$VHOST" | head -n 1 || true)"
+UP="${UP:-http://127.0.0.1:9696}"
+
 echo "[*] DOMAIN=$DOMAIN"
 echo "[*] VHOST=$VHOST"
-[[ -f "$VHOST" ]] || { echo "[ERR] vhost introuvable: $VHOST"; exit 1; }
+echo "[*] UPSTREAM=$UP"
 
-# Detect backend port (prefer node)
-PORT=""
-for p in $CANDIDATE_PORTS; do
-  if ss -lntp 2>/dev/null | grep -qE "LISTEN.*:${p}\b"; then
-    PORT="$p"; break
+code() { curl -s -o /dev/null -w "%{http_code}" "$1" || echo "000"; }
+
+# On cherche une base qui existe réellement sur le backend
+CANDIDATES=(
+  "/" 
+  "/api/" "/api/ping" "/api/health" "/api/status"
+  "/health" "/ping" "/status"
+  "/traderone/api/" "/traderone/api/ping" "/traderone/api/health"
+  "/traderone/" "/traderone/ping"
+)
+
+BEST_BASE=""
+for p in "${CANDIDATES[@]}"; do
+  h="$(code "${UP}${p}")"
+  echo "  - probe ${UP}${p} => $h"
+  if [[ "$h" != "404" && "$h" != "000" ]]; then
+    # on préfère une base qui ressemble à l'API
+    if [[ "$p" == "/traderone/api/"* ]]; then BEST_BASE="/traderone/api/"; break; fi
+    if [[ "$p" == "/api/"* ]]; then BEST_BASE="/api/"; fi
+    [[ -z "$BEST_BASE" ]] && BEST_BASE="/"
   fi
 done
-if [[ -z "$PORT" ]]; then
-  PORT="$(ss -lntp 2>/dev/null | awk '/LISTEN/ && /node/ {match($4, /:([0-9]+)$/, m); if(m[1]!=""){print m[1]; exit}}' || true)"
-fi
 
-if [[ -z "$PORT" ]]; then
-  echo "[WARN] Aucun port backend détecté. Je patch nginx quand même, mais il faudra démarrer le backend."
-  echo "       Donne-moi: ss -lntp | sed -n '1,160p'"
-  PORT="3000"
-fi
-
-API_UPSTREAM="http://127.0.0.1:${PORT}"
-export API_UPSTREAM
-echo "[*] API_UPSTREAM=$API_UPSTREAM"
+BEST_BASE="${BEST_BASE:-/}"
+echo
+echo "[*] BEST_BASE=$BEST_BASE"
+echo "[*] On va proxy /wolverine/traderone/api/ -> ${UP}${BEST_BASE}"
 
 # Backup
-BACKDIR="/etc/nginx/sites-disabled/backup_fix_loop_api_${ts}"
+ts="$(date +%Y%m%d_%H%M%S)"
+BACKDIR="/etc/nginx/sites-disabled/backup_map_${ts}"
 mkdir -p "$BACKDIR"
 cp -a "$VHOST" "$BACKDIR/$(basename "$VHOST")"
 echo "[OK] Backup -> $BACKDIR/$(basename "$VHOST")"
 
-# Patch:
-#  A) Fix static try_files when using alias: use /index.html (not /wolverine/index.html)
-#  B) Inject proxy blocks for /wolverine/api/ and /wolverine/traderone/api/ before static block
+# Patch proxy_pass dans le bloc traderone injecté (ou remplace un bloc existant)
 perl -0777 -i -pe '
-my $up = $ENV{API_UPSTREAM};
+my $up = $ENV{UP};
+my $base = $ENV{BEST_BASE};
 
-# 1) remove previous injected blocks
-s/\n\s*# --- wolverine api proxy \(injected\) ---.*?\n\s*# --- end wolverine api proxy ---\n//ms;
-s/\n\s*# --- traderone api proxy \(injected\) ---.*?\n\s*# --- end traderone api proxy ---\n//ms;
+# remplace proxy_pass dans location /wolverine/traderone/api/
+s@(location\s+\^\~\s+/wolverine/traderone/api/\s*\{.*?proxy_pass\s+)(http[^;]+)(;.*?)@${1}$up$base${3}@ms;
 
-# 2) fix try_files in location ^~ /wolverine/ (alias case)
-# convert: try_files ... /wolverine/index.html;
-# to:      try_files ... /index.html;
-s/(location\s+\^\~\s+\/wolverine\/\s*\{.*?try_files\s+[^;]*?)\/wolverine\/index\.html;/${1}\/index.html;/ms;
+' UP="$UP" BEST_BASE="$BEST_BASE" "$VHOST"
 
-my $api_block = qq{
-  # --- wolverine api proxy (injected) ---
-  location ^~ /wolverine/api/ {
-    if (\$request_method = OPTIONS) {
-      add_header Access-Control-Allow-Origin "*" always;
-      add_header Access-Control-Allow-Methods "GET,POST,PUT,PATCH,DELETE,OPTIONS" always;
-      add_header Access-Control-Allow-Headers "Authorization,Content-Type,Accept" always;
-      return 204;
-    }
-    proxy_pass $up/;
-    proxy_http_version 1.1;
-    proxy_set_header Host \$host;
-    proxy_set_header X-Real-IP \$remote_addr;
-    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto \$scheme;
-    proxy_read_timeout 60s;
-    proxy_send_timeout 60s;
-  }
-  # --- end wolverine api proxy ---
-};
-
-my $trader_block = qq{
-  # --- traderone api proxy (injected) ---
-  location ^~ /wolverine/traderone/api/ {
-    if (\$request_method = OPTIONS) {
-      add_header Access-Control-Allow-Origin "*" always;
-      add_header Access-Control-Allow-Methods "GET,POST,PUT,PATCH,DELETE,OPTIONS" always;
-      add_header Access-Control-Allow-Headers "Authorization,Content-Type,Accept" always;
-      return 204;
-    }
-    proxy_pass $up/;
-    proxy_http_version 1.1;
-    proxy_set_header Host \$host;
-    proxy_set_header X-Real-IP \$remote_addr;
-    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto \$scheme;
-    proxy_read_timeout 60s;
-    proxy_send_timeout 60s;
-  }
-  # --- end traderone api proxy ---
-};
-
-# 3) insert both blocks before static location ^~ /wolverine/
-s/\n(\s*location\s+\^\~\s+\/wolverine\/\s*\{)/\n$api_block\n$trader_block\n$1/ms
-  or die "ERR: cannot find location ^~ /wolverine/ block\n";
-' "$VHOST"
-
-echo "[*] nginx -t"
 nginx -t
 systemctl reload nginx
 echo "[OK] nginx reloaded"
 
 echo
 echo "== Tests =="
-echo "-- /wolverine/api/ping"
-curl -sSI "https://${DOMAIN}/wolverine/api/ping" | head -n 12 || true
+echo "-- Public:"
+curl -sSI "https://${DOMAIN}/wolverine/traderone/api/" | head -n 20 || true
 echo
-echo "-- /wolverine/traderone/api/"
-curl -sSI "https://${DOMAIN}/wolverine/traderone/api/" | head -n 12 || true
-echo
-echo "-- Local upstream /"
-curl -sS "${API_UPSTREAM}/" | head -n 5 || true
-
-echo
-echo "Si tu vois encore 502: le backend n\'est pas démarré / pas sur ce port."
-echo "Check: ss -lntp | sed -n \"1,160p\""
+echo "-- Local (backend):"
+curl -sS "${UP}${BEST_BASE}" | head -n 5 || true
 BASH
 
-chmod +x /root/fix_wolverine_api_and_loop.sh
-/root/fix_wolverine_api_and_loop.sh fireinners.online
+chmod +x /root/auto_map_traderone_api.sh
+/root/auto_map_traderone_api.sh fireinners.online
