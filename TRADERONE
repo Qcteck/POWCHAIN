@@ -1,2 +1,205 @@
-nginx -t 2>&1 | sed -n '1,30p'
-grep -RIn 'location\s*=\s*/solana-rpc' /etc/nginx | head -n 50
+cat >/root/fix_rpc_and_front_final.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+DOMAIN="fireinners.online"
+CERT="/etc/ssl/fireinners/fullchain.pem"
+KEY="/etc/ssl/fireinners/privkey.pem"
+
+SNIP="/etc/nginx/snippets/solana_rpc_proxy.conf"
+HTTP_AV="/etc/nginx/sites-available/fireinners.online-http"
+HTTP_EN="/etc/nginx/sites-enabled/fireinners.online-http"
+SSL_AV="/etc/nginx/sites-available/fireinners.online-ssl"
+SSL_EN="/etc/nginx/sites-enabled/fireinners.online-ssl"
+
+ROOT="/var/www/wolverine"
+JS="$ROOT/phantom_patch.js"
+ts="$(date +%Y%m%d_%H%M%S)"
+
+mkdir -p /etc/nginx/snippets /etc/nginx/sites-available /etc/nginx/sites-enabled
+
+echo "== 1) Remove WRONG includes (nginx.conf / conf.d) =="
+# Supprime toute ligne include du snippet dans des fichiers globaux
+for f in /etc/nginx/nginx.conf /etc/nginx/conf.d/*.conf; do
+  [[ -f "$f" ]] || continue
+  if grep -q "solana_rpc_proxy.conf" "$f"; then
+    cp -a "$f" "${f}.bak_${ts}"
+    sed -i '/solana_rpc_proxy\.conf/d' "$f"
+    echo "  - removed include from $f"
+  fi
+done
+
+echo "== 2) Write canonical snippet (location) with trailing / =="
+cp -a "$SNIP" "${SNIP}.bak_${ts}" 2>/dev/null || true
+cat >"$SNIP" <<'NGINX'
+# Solana RPC proxy (avoid browser CORS)
+# NOTE: keep this file included INSIDE a server{} block.
+location = /solana-rpc {
+  proxy_pass https://api.mainnet-beta.solana.com/;
+  proxy_ssl_server_name on;
+  proxy_set_header Host api.mainnet-beta.solana.com;
+
+  add_header Access-Control-Allow-Origin * always;
+  add_header Access-Control-Allow-Headers * always;
+  add_header Access-Control-Allow-Methods "POST, OPTIONS" always;
+  if ($request_method = OPTIONS) { return 204; }
+}
+NGINX
+
+echo "== 3) Ensure cert exists (self-signed if missing) =="
+if [[ ! -f "$CERT" || ! -f "$KEY" ]]; then
+  mkdir -p /etc/ssl/fireinners
+  openssl req -x509 -nodes -newkey rsa:2048 -days 365 \
+    -keyout "$KEY" -out "$CERT" -subj "/CN=$DOMAIN"
+fi
+
+echo "== 4) Force clean HTTP/HTTPS vhosts (snippet included ONLY in SSL server) =="
+cat >"$HTTP_AV" <<NGINX
+server {
+  listen 80;
+  listen [::]:80;
+  server_name ${DOMAIN} www.${DOMAIN};
+  return 301 https://\$host\$request_uri;
+}
+NGINX
+ln -sf "$HTTP_AV" "$HTTP_EN"
+
+cat >"$SSL_AV" <<NGINX
+server {
+  listen 443 ssl http2;
+  listen [::]:443 ssl http2;
+  server_name ${DOMAIN} www.${DOMAIN};
+
+  ssl_certificate     ${CERT};
+  ssl_certificate_key ${KEY};
+
+  include /etc/nginx/snippets/solana_rpc_proxy.conf;
+
+  root /var/www;
+  index index.html;
+
+  location = / { return 301 /wolverine/; }
+  location = /wolverine { return 301 /wolverine/; }
+  location ^~ /wolverine/ {
+    try_files \$uri \$uri/ /wolverine/index.html;
+  }
+}
+NGINX
+ln -sf "$SSL_AV" "$SSL_EN"
+
+echo "== 5) Fix FRONT: force /solana-rpc and remove any direct Solana RPC URL usage =="
+mkdir -p "$ROOT"
+
+cat >"$JS" <<'JS'
+(function () {
+  const RPC = "/solana-rpc";
+  const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+  const REFRESH_MS = 15000;
+  const short = (s) => (s ? s.slice(0, 4) + "…" + s.slice(-4) : "");
+
+  function overlay() {
+    let el = document.getElementById("__wallet_overlay");
+    if (el) return el;
+    el = document.createElement("div");
+    el.id = "__wallet_overlay";
+    el.style.cssText="position:fixed;right:16px;bottom:16px;z-index:2147483647;background:rgba(0,0,0,.85);color:#fff;padding:10px 12px;border-radius:10px;font:12px/1.35 system-ui;max-width:80vw;white-space:pre-line";
+    el.textContent="Patch loaded";
+    document.body.appendChild(el);
+    return el;
+  }
+  const setOverlay = (m)=> (overlay().textContent=m);
+
+  async function rpc(method, params) {
+    const r = await fetch(RPC, {
+      method:"POST",
+      headers:{ "Content-Type":"application/json" },
+      body: JSON.stringify({ jsonrpc:"2.0", id:1, method, params })
+    });
+    const j = await r.json().catch(()=> ({}));
+    if (j.error) throw new Error(j.error.message || JSON.stringify(j.error));
+    return j.result;
+  }
+
+  async function balances(owner) {
+    const bal = await rpc("getBalance", [owner, {commitment:"confirmed"}]);
+    const sol = (bal.value||0)/1e9;
+
+    const tok = await rpc("getTokenAccountsByOwner", [
+      owner, { mint: USDC_MINT }, { encoding:"jsonParsed", commitment:"confirmed" }
+    ]);
+    let usdc=0;
+    for (const acc of (tok.value||[])) {
+      const amt = acc.account?.data?.parsed?.info?.tokenAmount?.uiAmount;
+      if (typeof amt==="number") usdc += amt;
+    }
+    return { sol, usdc };
+  }
+
+  async function refresh() {
+    const pk = window.solana?.publicKey?.toBase58?.() || window.__WALLET_PK__;
+    if (!pk) return;
+    try {
+      const {sol, usdc} = await balances(pk);
+      setOverlay(`Connected: ${short(pk)}\nSOL ${sol.toFixed(4)} | USDC ${usdc.toFixed(2)}`);
+    } catch(e) {
+      console.error(e);
+      setOverlay(`Connected: ${short(pk)}\nBalance: RPC error`);
+    }
+  }
+
+  async function connect() {
+    if (!window.solana || !window.solana.isPhantom) {
+      setOverlay("Phantom introuvable.\n➡️ Ouvre le site dans Phantom Browser.");
+      return;
+    }
+    const r = await window.solana.connect();
+    window.__WALLET_PK__ = r.publicKey.toBase58();
+    await refresh();
+  }
+
+  function hook() {
+    const nodes = Array.from(document.querySelectorAll("button,a,div,span"));
+    const btn = nodes.find(n => /connect phantom/i.test((n.textContent||"").trim()));
+    if (btn && !btn.__hooked_phantom) {
+      btn.__hooked_phantom = true;
+      btn.addEventListener("click",(ev)=>{ ev.preventDefault(); connect(); }, {passive:false});
+    }
+  }
+
+  window.addEventListener("load", () => {
+    overlay(); hook();
+    new MutationObserver(hook).observe(document.documentElement,{childList:true,subtree:true});
+    if (window.solana?.isPhantom && window.solana.publicKey) { window.__WALLET_PK__=window.solana.publicKey.toBase58(); refresh(); }
+    setInterval(refresh, REFRESH_MS);
+  });
+})();
+JS
+
+# Supprime toute référence directe au RPC Solana dans tes fichiers (si tu as d'autres scripts)
+grep -RIl "api.mainnet-beta.solana.com" "$ROOT" 2>/dev/null | while read -r f; do
+  cp -a "$f" "${f}.bak_${ts}"
+  sed -i 's@https://api\.mainnet-beta\.solana\.com@/solana-rpc@g' "$f" || true
+done
+
+# Inject script tag dans les html si absent
+find "$ROOT" -maxdepth 4 -type f -name "*.html" -print0 | while IFS= read -r -d '' f; do
+  if ! grep -q "phantom_patch.js" "$f"; then
+    cp -a "$f" "${f}.bak_${ts}"
+    perl -0777 -i -pe 's@(<head[^>]*>)@$1\n<script src="/wolverine/phantom_patch.js?v='"$ts"'" defer></script>\n@i;' "$f"
+  fi
+done
+
+echo "== 6) nginx test + reload =="
+nginx -t
+systemctl reload nginx
+
+echo "== 7) RPC test (must return solana-core version) =="
+curl -sk --resolve ${DOMAIN}:443:127.0.0.1 https://${DOMAIN}/solana-rpc \
+  -H 'Content-Type: application/json' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"getVersion"}' && echo
+
+echo "✅ DONE. Open: https://${DOMAIN}/wolverine/settings/?v=$ts"
+BASH
+
+chmod +x /root/fix_rpc_and_front_final.sh
+/root/fix_rpc_and_front_final.sh
