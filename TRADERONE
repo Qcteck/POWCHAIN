@@ -1,2 +1,156 @@
+cat >/root/phantom_patch_balance_walletbox.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="/var/www/wolverine"
+INDEX="$ROOT/index.html"
+JS="$ROOT/phantom_patch.js"
+[[ -f "$INDEX" ]] || { echo "[ERR] $INDEX introuvable"; exit 1; }
+
+ts="$(date +%Y%m%d_%H%M%S)"
+cp -a "$INDEX" "${INDEX}.bak_${ts}"
+
+cat >"$JS" <<'JS'
+(function(){
+  const RPC = "https://api.mainnet-beta.solana.com";
+  const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+
+  function ensureOverlay(){
+    let box = document.getElementById("__phantom_overlay");
+    if(box) return box;
+    box = document.createElement("div");
+    box.id="__phantom_overlay";
+    box.style.cssText="position:fixed;right:16px;bottom:16px;z-index:99999;background:rgba(0,0,0,.85);color:#fff;padding:10px 12px;border-radius:10px;font:12px/1.35 system-ui;max-width:70vw;white-space:pre-line";
+    document.body.appendChild(box);
+    return box;
+  }
+  function setMsg(msg){ ensureOverlay().textContent = msg; }
+  function short(pk){ return pk.slice(0,4)+"…"+pk.slice(-4); }
+
+  async function rpc(method, params){
+    const r = await fetch(RPC, {
+      method:"POST",
+      headers:{ "Content-Type":"application/json" },
+      body: JSON.stringify({ jsonrpc:"2.0", id:1, method, params })
+    });
+    const j = await r.json();
+    if(j.error) throw new Error(j.error.message || JSON.stringify(j.error));
+    return j.result;
+  }
+
+  async function fetchBalances(owner){
+    const bal = await rpc("getBalance", [owner, { commitment:"confirmed" }]);
+    const sol = bal.value / 1e9;
+
+    const tok = await rpc("getTokenAccountsByOwner", [
+      owner,
+      { mint: USDC_MINT },
+      { encoding:"jsonParsed", commitment:"confirmed" }
+    ]);
+
+    let usdc = 0;
+    for(const acc of (tok.value || [])){
+      const amt = acc.account?.data?.parsed?.info?.tokenAmount?.uiAmount;
+      if(typeof amt === "number") usdc += amt;
+    }
+    return { sol, usdc };
+  }
+
+  function tryWriteWalletBox(pk, sol, usdc){
+    // on évite de toucher #__next directement; on vise juste des zones texte existantes si trouvées
+    const root = document.querySelector(".walletBox") || document.querySelector('[class*="wallet"]');
+    if(!root) return;
+
+    const lines = Array.from(root.querySelectorAll("*")).filter(n => (n.textContent||"").trim().length < 60);
+
+    const statusEl = lines.find(n => /not connected|connected/i.test((n.textContent||"").trim())) || null;
+    const addrEl   = lines.find(n => /^wallet:/i.test((n.textContent||"").trim())) || null;
+
+    if(statusEl) statusEl.textContent = "Connected";
+    if(addrEl)   addrEl.textContent   = "Wallet: " + short(pk);
+
+    // ajoute (ou met à jour) une petite ligne balance dans le bloc wallet
+    let balEl = root.querySelector("#__wallet_balance_line");
+    if(!balEl){
+      balEl = document.createElement("div");
+      balEl.id="__wallet_balance_line";
+      balEl.style.cssText="margin-top:6px;opacity:.9;font-size:12px";
+      root.appendChild(balEl);
+    }
+    balEl.textContent = `Balance: ${sol.toFixed(4)} SOL | ${usdc.toFixed(2)} USDC`;
+  }
+
+  async function updateAll(pk){
+    setMsg(`Connected: ${short(pk)}\nBalance: …`);
+    try{
+      const b = await fetchBalances(pk);
+      setMsg(`Connected: ${short(pk)}\nBalance: ${b.sol.toFixed(4)} SOL | ${b.usdc.toFixed(2)} USDC`);
+      tryWriteWalletBox(pk, b.sol, b.usdc);
+    }catch(e){
+      console.error("balance error", e);
+      setMsg(`Connected: ${short(pk)}\nBalance: (error RPC)`);
+    }
+  }
+
+  async function connectPhantom(){
+    if(!window.solana || !window.solana.isPhantom){
+      setMsg("Phantom introuvable (extension)");
+      return;
+    }
+    const r = await window.solana.connect();
+    const pk = r.publicKey.toBase58();
+    window.__WALLET_PK__ = pk;
+    await updateAll(pk);
+  }
+
+  function findConnectEl(){
+    const direct = document.querySelector(".walletBox .btn.ghost");
+    if(direct) return direct;
+    const nodes = Array.from(document.querySelectorAll("button,a,div,span"));
+    return nodes.find(n => /connect phantom/i.test((n.textContent||"").trim()));
+  }
+
+  function hook(){
+    const el = findConnectEl();
+    if(el && !el.__phantom_hooked){
+      el.__phantom_hooked = true;
+      el.addEventListener("click", (ev)=>{
+        ev.preventDefault();
+        connectPhantom().catch(err => setMsg("Connect error: " + String(err?.message||err)));
+      }, { passive:false });
+      setMsg("Patch loaded — clique Connect Phantom");
+    }
+  }
+
+  window.addEventListener("load", ()=>{
+    setMsg("Patch loaded — searching button…");
+    hook();
+    const obs = new MutationObserver(()=>hook());
+    obs.observe(document.documentElement, { childList:true, subtree:true });
+
+    if(window.solana?.isPhantom && window.solana.publicKey){
+      updateAll(window.solana.publicKey.toBase58());
+    }
+    window.solana?.on?.("accountChanged", (pubkey)=>{
+      if(pubkey) updateAll(pubkey.toBase58());
+      else setMsg("Not connected");
+    });
+  });
+})();
+JS
+
+# s'assurer que index.html charge le JS externe
+if ! grep -q "phantom_patch.js" "$INDEX"; then
+  perl -0777 -i -pe '
+    my $tag = qq{\n<!-- PHANTOM_EXTERNAL_PATCH -->\n<script src="/wolverine/phantom_patch.js?v='${ts}'" defer></script>\n<!-- /PHANTOM_EXTERNAL_PATCH -->\n};
+    s@</head>@$tag</head>@i;
+  ' "$INDEX"
+fi
+
 nginx -t
-grep -n "include" /etc/nginx/sites-enabled/fireinners.online-ssl | head -n 80
+systemctl reload nginx
+echo "✅ OK. Test: https://fireinners.online/wolverine/?v=$ts"
+BASH
+
+chmod +x /root/phantom_patch_balance_walletbox.sh
+/root/phantom_patch_balance_walletbox.sh
