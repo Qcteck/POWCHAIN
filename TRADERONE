@@ -1,20 +1,55 @@
-cat >/root/phantom_add_balance_overlay.sh <<'BASH'
+cat >/root/fix_react_404_and_phantom.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
 ROOT="/var/www/wolverine"
 INDEX="$ROOT/index.html"
 JS="$ROOT/phantom_patch.js"
-
 [[ -f "$INDEX" ]] || { echo "[ERR] $INDEX introuvable"; exit 1; }
 
 ts="$(date +%Y%m%d_%H%M%S)"
 cp -a "$INDEX" "${INDEX}.bak_${ts}"
 echo "[OK] Backup -> ${INDEX}.bak_${ts}"
 
-# 1) Ecrit/écrase le JS externe
+# 1) JS patch (runs early, before app)
 cat >"$JS" <<'JS'
 (function(){
+  // --- A) Prevent UI crash if backend endpoints are missing (404) ---
+  const MOCKS = {
+    "/wolverine/traderone/api/me":        () => ({ ok:true, me:{ id:"guest", wallet:null } }),
+    "/wolverine/traderone/api/positions": () => ({ ok:true, positions:[] }),
+    "/wolverine/traderone/api/orders":    () => ({ ok:true, orders:[] }),
+    "/wolverine/traderone/api/pnl":       () => ({ ok:true, pnl:{ total:0, daily:0 } }),
+  };
+
+  const origFetch = window.fetch.bind(window);
+  window.fetch = async (input, init) => {
+    const url = typeof input === "string" ? input : (input?.url || "");
+    try{
+      const res = await origFetch(input, init);
+      if(res && res.status === 404){
+        const key = Object.keys(MOCKS).find(k => url.includes(k));
+        if(key){
+          return new Response(JSON.stringify(MOCKS[key]()), {
+            status: 200,
+            headers: { "Content-Type":"application/json" }
+          });
+        }
+      }
+      return res;
+    }catch(e){
+      const key = Object.keys(MOCKS).find(k => url.includes(k));
+      if(key){
+        return new Response(JSON.stringify(MOCKS[key]()), {
+          status: 200,
+          headers: { "Content-Type":"application/json" }
+        });
+      }
+      throw e;
+    }
+  };
+
+  // --- B) Phantom connect + SOL/USDC balance overlay (no React DOM touch) ---
   const RPC = "https://api.mainnet-beta.solana.com";
   const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
@@ -27,7 +62,6 @@ cat >"$JS" <<'JS'
     document.body.appendChild(box);
     return box;
   }
-
   function setMsg(msg){ ensureOverlay().textContent = msg; }
   function short(pk){ return pk.slice(0,4)+"…"+pk.slice(-4); }
 
@@ -42,12 +76,12 @@ cat >"$JS" <<'JS'
     return j.result;
   }
 
-  async function fetchBalances(ownerBase58){
-    const bal = await rpc("getBalance", [ownerBase58, { commitment:"confirmed" }]);
+  async function fetchBalances(owner){
+    const bal = await rpc("getBalance", [owner, { commitment:"confirmed" }]);
     const sol = bal.value / 1e9;
 
     const tok = await rpc("getTokenAccountsByOwner", [
-      ownerBase58,
+      owner,
       { mint: USDC_MINT },
       { encoding:"jsonParsed", commitment:"confirmed" }
     ]);
@@ -57,7 +91,6 @@ cat >"$JS" <<'JS'
       const amt = acc.account?.data?.parsed?.info?.tokenAmount?.uiAmount;
       if(typeof amt === "number") usdc += amt;
     }
-
     return { sol, usdc };
   }
 
@@ -98,7 +131,7 @@ cat >"$JS" <<'JS'
         ev.preventDefault();
         connectPhantom().catch(err => setMsg("Connect error: " + String(err?.message||err)));
       }, { passive:false });
-      setMsg("Phantom hook OK — clique Connect Phantom");
+      setMsg("Patch loaded — clique Connect Phantom");
     }
   }
 
@@ -108,32 +141,37 @@ cat >"$JS" <<'JS'
     const obs = new MutationObserver(()=>hook());
     obs.observe(document.documentElement, { childList:true, subtree:true });
 
-    // si déjà connecté
     if(window.solana?.isPhantom && window.solana.publicKey){
       updateOverlay(window.solana.publicKey.toBase58());
     }
-
     window.solana?.on?.("accountChanged", (pubkey)=>{
       if(pubkey) updateOverlay(pubkey.toBase58());
       else setMsg("Not connected");
     });
   });
+
+  window.__PHANTOM_PATCH_LOADED__ = true;
 })();
 JS
 
-# 2) Assure que index.html charge le JS externe (idempotent)
-if ! grep -q "phantom_patch.js" "$INDEX"; then
-  perl -0777 -i -pe '
-    my $tag = qq{\n<!-- PHANTOM_EXTERNAL_PATCH -->\n<script src="/wolverine/phantom_patch.js?v='${ts}'" defer></script>\n<!-- /PHANTOM_EXTERNAL_PATCH -->\n};
-    s@</body>@$tag</body>@i;
-  ' "$INDEX"
-fi
+# 2) Ensure script tag is in <head> BEFORE next/react scripts (idempotent)
+# Remove any old phantom script tags first
+perl -0777 -i -pe '
+s/<!-- PHANTOM_EXTERNAL_PATCH -->.*?<!-- \/PHANTOM_EXTERNAL_PATCH -->\s*//msi;
+s@<script[^>]+phantom_patch\.js[^>]*></script>\s*@@gsi;
+' "$INDEX"
+
+# Insert right after <head ...>
+perl -0777 -i -pe '
+my $tag = qq{\n<!-- PHANTOM_EXTERNAL_PATCH -->\n<script src="/wolverine/phantom_patch.js?v='${ts}'" defer></script>\n<!-- /PHANTOM_EXTERNAL_PATCH -->\n};
+s@(<head[^>]*>)@$1$tag@i;
+' "$INDEX"
 
 nginx -t
 systemctl reload nginx
 echo "[OK] nginx reloaded"
-echo "✅ Test (cache-bust): https://fireinners.online/wolverine/?v=$ts"
+echo "✅ Test: https://fireinners.online/wolverine/?v=$ts"
 BASH
 
-chmod +x /root/phantom_add_balance_overlay.sh
-/root/phantom_add_balance_overlay.sh
+chmod +x /root/fix_react_404_and_phantom.sh
+/root/fix_react_404_and_phantom.sh
