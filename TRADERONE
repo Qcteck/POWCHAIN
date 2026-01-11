@@ -1,29 +1,36 @@
-cat >/root/fix_ssl_cert_paths.sh <<'BASH'
+cat >/root/fix_ssl_443_clean.sh <<'BASH'
 #!/usr/bin/env bash
-set -euo pipefail
+set -e
 
 DOMAIN="fireinners.online"
 CERT_DIR="/etc/ssl/fireinners"
-CERT="$CERT_DIR/fullchain.pem"
-KEY="$CERT_DIR/privkey.pem"
+CERT="${CERT_DIR}/fullchain.pem"
+KEY="${CERT_DIR}/privkey.pem"
 
-SSL_AVAIL="/etc/nginx/sites-available/fireinners.online-ssl"
-SSL_ENABLED="/etc/nginx/sites-enabled/fireinners.online-ssl"
+HTTP_EN="/etc/nginx/sites-enabled/fireinners.online-http"
+SSL_AV="/etc/nginx/sites-available/fireinners.online-ssl"
+SSL_EN="/etc/nginx/sites-enabled/fireinners.online-ssl"
 
-mkdir -p "$CERT_DIR"
+mkdir -p "$CERT_DIR" /etc/nginx/disabled-sites
 
-echo "=== 1) Ensure self-signed exists ==="
-if [[ ! -f "$CERT" || ! -f "$KEY" ]]; then
+echo "== 1) Fix HTTP vhost (keep only 80) =="
+if [ -f "$HTTP_EN" ]; then
+  cp -a "$HTTP_EN" "${HTTP_EN}.bak_$(date +%Y%m%d_%H%M%S)"
+  sed -i -E '/listen[[:space:]]+(\[::\]:)?443/d' "$HTTP_EN"
+fi
+
+echo "== 2) Ensure cert exists (self-signed if needed) =="
+if [ ! -f "$CERT" ] || [ ! -f "$KEY" ]; then
   openssl req -x509 -nodes -newkey rsa:2048 -days 365 \
     -keyout "$KEY" -out "$CERT" \
     -subj "/CN=$DOMAIN"
   echo "[OK] self-signed created: $CERT_DIR"
 else
-  echo "[OK] cert already exists: $CERT / $KEY"
+  echo "[OK] cert already exists: $CERT_DIR"
 fi
 
-echo "=== 2) Write a CLEAN SSL vhost with REAL paths (no $VARS) ==="
-cat >"$SSL_AVAIL" <<NGINX
+echo "== 3) Write CLEAN SSL vhost (NO variables) =="
+cat >"$SSL_AV" <<NGINX
 server {
   listen 443 ssl http2;
   listen [::]:443 ssl http2;
@@ -33,40 +40,34 @@ server {
   ssl_certificate     ${CERT};
   ssl_certificate_key ${KEY};
 
-  # simple entrypoint
   location / {
     return 301 https://${DOMAIN}/wolverine/;
   }
 }
 NGINX
+ln -sf "$SSL_AV" "$SSL_EN"
 
-ln -sf "$SSL_AVAIL" "$SSL_ENABLED"
-
-echo "=== 3) Find any other broken 443 ssl servers (no ssl_certificate) ==="
-# List files that contain listen 443 ssl
-FILES="$(nginx -T 2>/dev/null | awk '
-  /^# configuration file /{f=$4; sub(/:$/,"",f)}
-  /listen\s+\[::\]:443|listen\s+443/ && /ssl/ {print f}
-' | sort -u)"
-
-for f in $FILES; do
-  [[ -f "$f" ]] || continue
-  # if file has listen 443 ssl but no ssl_certificate directive anywhere, disable it
+echo "== 4) Disable any OTHER enabled file that has listen 443 ssl but NO ssl_certificate =="
+for f in /etc/nginx/sites-enabled/*; do
+  [ -f "$f" ] || continue
   if grep -qE 'listen\s+(\[::\]:)?443.*ssl' "$f" && ! grep -qE '^\s*ssl_certificate\s+' "$f"; then
-    echo "[DISABLE] $f (has listen 443 ssl but no ssl_certificate)"
-    mv -f "$f" "/etc/nginx/disabled-sites/$(basename "$f").disabled_$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
+    echo "[DISABLE] $f"
+    mv -f "$f" "/etc/nginx/disabled-sites/$(basename "$f").disabled_$(date +%Y%m%d_%H%M%S)"
   fi
 done
 
-echo "=== 4) Test + restart ==="
+echo "== 5) Test + restart =="
 nginx -t
 systemctl restart nginx
 
 echo
-echo "=== 5) Ports + local https ==="
+echo "== PORTS =="
 ss -lntp | grep -E ':(80|443)\b' || true
+
+echo
+echo "== LOCAL HTTPS TEST =="
 curl -kI --max-time 5 https://127.0.0.1/ | head -n 12 || true
 BASH
 
-chmod +x /root/fix_ssl_cert_paths.sh
-/root/fix_ssl_cert_paths.sh
+chmod +x /root/fix_ssl_443_clean.sh
+/root/fix_ssl_443_clean.sh
