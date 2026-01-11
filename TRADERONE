@@ -1,18 +1,18 @@
-cat >/root/fix_wallet_ui_status_and_balances.sh <<'BASH'
+cat >/root/fix_react_safe_wallet_patch.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
 ROOT="/var/www/wolverine"
 JS="$ROOT/phantom_patch.js"
+INDEX="$ROOT/index.html"
 
 ts="$(date +%Y%m%d_%H%M%S)"
+
 mkdir -p "$ROOT"
 
-# backup si existe
-if [[ -f "$JS" ]]; then
-  cp -a "$JS" "${JS}.bak_${ts}"
-  echo "[OK] Backup -> ${JS}.bak_${ts}"
-fi
+# backup
+[[ -f "$JS" ]] && cp -a "$JS" "${JS}.bak_${ts}" || true
+[[ -f "$INDEX" ]] && cp -a "$INDEX" "${INDEX}.bak_${ts}" || true
 
 cat >"$JS" <<'JS'
 (function () {
@@ -21,6 +21,64 @@ cat >"$JS" <<'JS'
   const REFRESH_MS = 15000;
 
   const short = (s) => (s ? s.slice(0, 4) + "…" + s.slice(-4) : "");
+
+  // ---- overlay (hors React) ----
+  function ensureOverlay() {
+    let el = document.getElementById("__wallet_overlay");
+    if (el) return el;
+    el = document.createElement("div");
+    el.id = "__wallet_overlay";
+    el.style.cssText =
+      "position:fixed;right:16px;bottom:16px;z-index:2147483647;" +
+      "background:rgba(0,0,0,.85);color:#fff;padding:10px 12px;border-radius:10px;" +
+      "font:12px/1.35 system-ui;max-width:80vw;white-space:pre-line";
+    el.textContent = "Patch loaded";
+    document.body.appendChild(el);
+    return el;
+  }
+  function setOverlay(msg) { ensureOverlay().textContent = msg; }
+
+  // ---- badge “Connected” (hors React, positionné au-dessus du bloc Wallet) ----
+  function ensureBadge() {
+    let b = document.getElementById("__wallet_connected_badge");
+    if (b) return b;
+    b = document.createElement("div");
+    b.id = "__wallet_connected_badge";
+    b.style.cssText =
+      "position:fixed;z-index:2147483647;display:none;" +
+      "background:rgba(0,160,90,.90);color:#fff;padding:6px 10px;border-radius:999px;" +
+      "font:12px system-ui;box-shadow:0 6px 18px rgba(0,0,0,.25)";
+    b.textContent = "Connected";
+    document.body.appendChild(b);
+    return b;
+  }
+
+  function findWalletCard() {
+    // Cherche un container qui contient “Wallet” et “Connect Phantom” (sans modifier ses enfants)
+    const candidates = Array.from(document.querySelectorAll("div,section,aside"));
+    for (const c of candidates) {
+      const t = (c.textContent || "").toLowerCase();
+      if (t.includes("wallet") && t.includes("connect phantom")) return c;
+      if (t.includes("wallet") && t.includes("not connected")) return c;
+    }
+    return null;
+  }
+
+  function positionBadge(pk, sol, usdc) {
+    const card = findWalletCard();
+    const badge = ensureBadge();
+
+    if (!card) {
+      badge.style.display = "none";
+      return;
+    }
+
+    const r = card.getBoundingClientRect();
+    badge.style.left = Math.round(r.left + 12) + "px";
+    badge.style.top  = Math.round(r.top + 8) + "px";
+    badge.style.display = "block";
+    badge.textContent = `Connected ${short(pk)}  |  SOL ${sol.toFixed(4)}  USDC ${usdc.toFixed(2)}`;
+  }
 
   async function rpc(method, params) {
     const r = await fetch(RPC, {
@@ -48,66 +106,8 @@ cat >"$JS" <<'JS'
       const amt = acc.account?.data?.parsed?.info?.tokenAmount?.uiAmount;
       if (typeof amt === "number") usdc += amt;
     }
-
     return { sol, usdc };
   }
-
-  // ---- UI helpers (fix ton bug) ----
-  function findWalletCard() {
-    // Cherche la carte qui contient "Wallet" + le bouton Connect Phantom
-    const cards = Array.from(document.querySelectorAll("div,section,aside"));
-    for (const c of cards) {
-      const t = (c.textContent || "").toLowerCase();
-      if (t.includes("wallet") && t.includes("connect phantom")) return c;
-      if (t.includes("wallet") && t.includes("not connected")) return c;
-    }
-    return null;
-  }
-
-  function updateWalletCardConnected(pk, sol, usdc) {
-    const card = findWalletCard();
-    if (!card) return;
-
-    // 1) Remplace "Not connected" si trouvé
-    const nodes = Array.from(card.querySelectorAll("*"));
-    const statusNode = nodes.find(n => /not connected/i.test((n.textContent || "").trim()));
-    if (statusNode) statusNode.textContent = "Connected";
-
-    // 2) Bouton "Connect Phantom" -> "Connected" + disable
-    const btn = Array.from(card.querySelectorAll("button,a,div,span"))
-      .find(n => /connect phantom/i.test((n.textContent || "").trim()));
-    if (btn) {
-      btn.textContent = "Connected";
-      btn.style.pointerEvents = "none";
-      btn.style.opacity = "0.8";
-    }
-
-    // 3) Ajoute ligne balances dans la carte Wallet
-    let bal = card.querySelector("#__wallet_bal_line");
-    if (!bal) {
-      bal = document.createElement("div");
-      bal.id = "__wallet_bal_line";
-      bal.style.cssText = "margin-top:8px;font:12px system-ui;opacity:.95";
-      card.appendChild(bal);
-    }
-    bal.textContent = `SOL: ${sol.toFixed(4)} | USDC: ${usdc.toFixed(2)} | ${short(pk)}`;
-  }
-
-  // Overlay bas droite (optionnel mais utile)
-  function ensureOverlay() {
-    let el = document.getElementById("__wallet_overlay");
-    if (el) return el;
-    el = document.createElement("div");
-    el.id = "__wallet_overlay";
-    el.style.cssText =
-      "position:fixed;right:16px;bottom:16px;z-index:99999;" +
-      "background:rgba(0,0,0,.85);color:#fff;padding:10px 12px;" +
-      "border-radius:10px;font:12px/1.35 system-ui;max-width:80vw;white-space:pre-line";
-    el.textContent = "Patch loaded — searching button…";
-    document.body.appendChild(el);
-    return el;
-  }
-  function setOverlay(msg) { ensureOverlay().textContent = msg; }
 
   async function refreshAll() {
     const pk = window.solana?.publicKey?.toBase58?.() || window.__WALLET_PK__;
@@ -116,7 +116,7 @@ cat >"$JS" <<'JS'
     try {
       const { sol, usdc } = await fetchBalances(pk);
       setOverlay(`Connected: ${short(pk)}\nSOL ${sol.toFixed(4)} | USDC ${usdc.toFixed(2)}`);
-      updateWalletCardConnected(pk, sol, usdc);
+      positionBadge(pk, sol, usdc);
     } catch (e) {
       console.error(e);
       setOverlay(`Connected: ${short(pk)}\nBalance: RPC error`);
@@ -129,13 +129,12 @@ cat >"$JS" <<'JS'
       return;
     }
     const r = await window.solana.connect();
-    const pk = r.publicKey.toBase58();
-    window.__WALLET_PK__ = pk;
+    window.__WALLET_PK__ = r.publicKey.toBase58();
     await refreshAll();
   }
 
   function hookConnectButton() {
-    // Ton UI a un bouton "Connect Phantom"
+    // on ne change PAS le texte du bouton (React-safe) — on écoute juste le click
     const nodes = Array.from(document.querySelectorAll("button,a,div,span"));
     const btn = nodes.find(n => /connect phantom/i.test((n.textContent || "").trim()));
     if (btn && !btn.__hooked_phantom) {
@@ -147,22 +146,24 @@ cat >"$JS" <<'JS'
           setOverlay("Connect error");
         });
       }, { passive: false });
+      setOverlay("Patch loaded — waiting connect…");
     }
   }
 
   window.addEventListener("load", () => {
     ensureOverlay();
+    ensureBadge();
     hookConnectButton();
+
+    // DOM changes in React app: re-hook safely
+    const obs = new MutationObserver(() => hookConnectButton());
+    obs.observe(document.documentElement, { childList: true, subtree: true });
 
     // si déjà connecté
     if (window.solana?.isPhantom && window.solana.publicKey) {
       window.__WALLET_PK__ = window.solana.publicKey.toBase58();
       refreshAll();
     }
-
-    // observe DOM (pages settings etc)
-    const obs = new MutationObserver(() => hookConnectButton());
-    obs.observe(document.documentElement, { childList: true, subtree: true });
 
     // refresh auto
     setInterval(refreshAll, REFRESH_MS);
@@ -173,33 +174,32 @@ cat >"$JS" <<'JS'
         refreshAll();
       } else {
         setOverlay("Wallet: not connected");
+        const b = document.getElementById("__wallet_connected_badge");
+        if (b) b.style.display = "none";
       }
     });
+
+    // reposition badge on scroll/resize (sinon il se décale)
+    window.addEventListener("scroll", refreshAll, { passive: true });
+    window.addEventListener("resize", refreshAll);
   });
 
   window.__WALLET_PATCH_LOADED__ = true;
 })();
 JS
 
-echo "[OK] Patched $JS"
-
-# Inject le script dans toutes les pages html sous /var/www/wolverine (si pas déjà)
-echo "[*] Inject script tag into HTML pages (if missing)…"
-while IFS= read -r -d '' f; do
-  if ! grep -q "phantom_patch.js" "$f"; then
-    cp -a "$f" "${f}.bak_${ts}"
-    perl -0777 -i -pe '
-      my $tag = qq{\n<!-- WALLET_BALANCES_PATCH -->\n<script src="/wolverine/phantom_patch.js?v='"$ts"'" defer></script>\n<!-- /WALLET_BALANCES_PATCH -->\n};
-      s@(<head[^>]*>)@$1$tag@i;
-    ' "$f"
-    echo "  + injected -> $f"
-  fi
-done < <(find "$ROOT" -maxdepth 4 -type f -name "*.html" -print0)
+# inject script tag in index if missing
+if [[ -f "$INDEX" ]] && ! grep -q "phantom_patch.js" "$INDEX"; then
+  perl -0777 -i -pe '
+    my $tag = qq{\n<!-- WALLET_PATCH -->\n<script src="/wolverine/phantom_patch.js?v='"$ts"'" defer></script>\n<!-- /WALLET_PATCH -->\n};
+    s@(<head[^>]*>)@$1$tag@i;
+  ' "$INDEX"
+fi
 
 nginx -t
 systemctl reload nginx
 echo "✅ OK. Test: https://fireinners.online/wolverine/settings/?v=$ts"
 BASH
 
-chmod +x /root/fix_wallet_ui_status_and_balances.sh
-/root/fix_wallet_ui_status_and_balances.sh
+chmod +x /root/fix_react_safe_wallet_patch.sh
+/root/fix_react_safe_wallet_patch.sh
