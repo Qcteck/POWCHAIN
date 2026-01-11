@@ -1,2 +1,71 @@
-ss -lntp | grep -E ':(80|443)\b'
-curl -kI --max-time 5 https://127.0.0.1/ | head -n 12
+cat >/root/fix_443_selfsigned.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+DOMAIN="fireinners.online"
+HTTP_VHOST="/etc/nginx/sites-enabled/fireinners.online-http"
+SSL_AVAIL="/etc/nginx/sites-available/fireinners.online-ssl"
+SSL_ENABLED="/etc/nginx/sites-enabled/fireinners.online-ssl"
+CERT_DIR="/etc/ssl/fireinners"
+CERT="$CERT_DIR/fullchain.pem"
+KEY="$CERT_DIR/privkey.pem"
+
+echo "=== 1) Remove WRONG 443 from HTTP vhost (if present) ==="
+if [[ -f "$HTTP_VHOST" ]]; then
+  cp -a "$HTTP_VHOST" "${HTTP_VHOST}.bak_$(date +%Y%m%d_%H%M%S)"
+  # supprime les lignes listen 443 ssl... si elles existent
+  sed -i -E '/listen[[:space:]]+\[::\]:443/d; /listen[[:space:]]+443/d' "$HTTP_VHOST"
+  echo "[OK] cleaned $HTTP_VHOST"
+fi
+
+echo "=== 2) Create self-signed cert (only if missing) ==="
+mkdir -p "$CERT_DIR"
+if [[ ! -f "$CERT" || ! -f "$KEY" ]]; then
+  openssl req -x509 -nodes -newkey rsa:2048 -days 365 \
+    -keyout "$KEY" -out "$CERT" \
+    -subj "/CN=$DOMAIN"
+  echo "[OK] self-signed created at $CERT_DIR"
+else
+  echo "[OK] cert already exists"
+fi
+
+echo "=== 3) Create SSL vhost (443) ==="
+cat >"$SSL_AVAIL" <<NGINX
+server {
+  listen 443 ssl http2;
+  listen [::]:443 ssl http2;
+
+  server_name $DOMAIN www.$DOMAIN;
+
+  ssl_certificate     $CERT;
+  ssl_certificate_key $KEY;
+
+  # si tu veux servir le même contenu que /var/www/wolverine :
+  root /var/www;
+  index index.html;
+
+  # ton app est sous /wolverine/ :
+  location / {
+    return 301 https://$DOMAIN/wolverine/;
+  }
+}
+NGINX
+
+ln -sf "$SSL_AVAIL" "$SSL_ENABLED"
+
+echo "=== 4) Test + restart ==="
+nginx -t
+systemctl restart nginx
+
+echo
+echo "=== 5) Check ports ==="
+ss -lntp | grep -E ':(80|443)\b' || true
+
+echo
+echo "=== 6) Local tests ==="
+curl -I --max-time 5 http://127.0.0.1/ | head -n 8 || true
+curl -kI --max-time 5 https://127.0.0.1/ | head -n 12 || true
+BASH
+
+chmod +x /root/fix_443_selfsigned.sh
+/root/fix_443_selfsigned.sh
