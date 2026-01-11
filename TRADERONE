@@ -1,104 +1,52 @@
-cat >/root/discover_and_patch_traderone_api.sh <<'BASH'
+cat >/root/nginx_rollback_and_repair_traderone.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
 DOMAIN="${1:-fireinners.online}"
 VHOST="/etc/nginx/sites-enabled/${DOMAIN}-ssl"
-PORT="${PORT:-9696}"                         # ton backend actuel
-UPSTREAM="${UPSTREAM:-http://127.0.0.1:${PORT}}"
+API_UPSTREAM="${API_UPSTREAM:-http://127.0.0.1:9696}"
 
-ts(){ date +%Y%m%d_%H%M%S; }
-say(){ echo "[$(ts)] $*"; }
+echo "[*] DOMAIN=$DOMAIN"
+echo "[*] VHOST=$VHOST"
+echo "[*] API_UPSTREAM=$API_UPSTREAM"
 
-say "DOMAIN=$DOMAIN"
-say "VHOST=$VHOST"
-say "UPSTREAM=$UPSTREAM"
-[[ -f "$VHOST" ]] || { say "ERR vhost introuvable"; exit 1; }
+# 1) rollback automatique vers un backup qui passe nginx -t
+mapfile -t BAKS < <(ls -1t /etc/nginx/sites-disabled/backup_*/*"${DOMAIN}-ssl" 2>/dev/null || true)
 
-say "== 1) PID listening on :$PORT =="
-PID="$(ss -lntp 2>/dev/null | awk -v p=":${PORT}" '$0 ~ p && $0 ~ /users:\(\(".*",pid=/ {match($0,/pid=([0-9]+)/,m); print m[1]; exit}')"
-if [[ -z "${PID:-}" ]]; then
-  say "ERR: aucun process trouvé sur :$PORT"
-  ss -lntp | sed -n '1,140p'
+if [[ ${#BAKS[@]} -eq 0 ]]; then
+  echo "[ERR] Aucun backup trouvé dans /etc/nginx/sites-disabled/backup_*"
   exit 1
 fi
-say "PID=$PID"
-CMD="$(tr '\0' ' ' </proc/$PID/cmdline 2>/dev/null || true)"
-CWD="$(readlink -f /proc/$PID/cwd 2>/dev/null || true)"
-say "CMD=$CMD"
-say "CWD=$CWD"
-echo
 
-code(){ curl -s -o /dev/null -w "%{http_code}" "$1" || echo "000"; }
-probe(){
-  local p="$1"
-  local h; h="$(code "${UPSTREAM}${p}")"
-  printf "  - %s -> %s\n" "${p}" "${h}"
-}
-
-say "== 2) Probes HTTP sur backend =="
-CANDS=( "/" "/api" "/api/" "/api/ping" "/api/health" "/api/status"
-        "/v1" "/v1/" "/v1/health" "/v1/status"
-        "/health" "/ping" "/status"
-        "/docs" "/swagger" "/swagger.json" "/openapi.json" )
-for p in "${CANDS[@]}"; do probe "$p"; done
-echo
-
-say "== 3) Scan routes dans le code (si CWD dispo) =="
-BEST_SCAN=""
-if [[ -n "$CWD" && -d "$CWD" ]]; then
-  # Express/Fastify/Nest/Next API style quick grep
-  grep -RIn --exclude-dir=node_modules --exclude-dir=.git \
-    -E 'app\.(get|post|put|delete|patch)\(|router\.(get|post|put|delete|patch)\(|fastify\.(get|post|put|delete|patch)\(|@Controller\(|@Get\(|@Post\(|@Put\(|@Delete\(' \
-    "$CWD" 2>/dev/null | head -n 80 || true
-
-  echo
-  say "== 3b) Routes candidates extraites (approx) =="
-  grep -RIn --exclude-dir=node_modules --exclude-dir=.git \
-    -E 'app\.(get|post|put|delete|patch)\(|router\.(get|post|put|delete|patch)\(|fastify\.(get|post|put|delete|patch)\(' \
-    "$CWD" 2>/dev/null \
-    | sed -E 's/.*\(([^,]+).*/\1/' \
-    | tr -d '"' | tr -d "'" \
-    | sed -E 's/^[[:space:]]+//;s/[[:space:]]+$//' \
-    | grep -E '^/' | sort -u | head -n 120 || true
-fi
-echo
-
-say "== 4) Choisir BEST_BASE automatiquement =="
-# Choix: première base qui renvoie !=404/000 (préférence /api/, puis /v1/)
-BEST_BASE="/"
-for b in "/api/" "/api" "/v1/" "/v1" "/"; do
-  h="$(code "${UPSTREAM}${b}")"
-  if [[ "$h" != "404" && "$h" != "000" ]]; then
-    BEST_BASE="$b"
+OK_BAK=""
+for b in "${BAKS[@]}"; do
+  cp -a "$b" "$VHOST"
+  if nginx -t >/dev/null 2>&1; then
+    OK_BAK="$b"
     break
   fi
 done
-# normalisation
-[[ "$BEST_BASE" != "/" ]] && BEST_BASE="/$(echo "$BEST_BASE" | sed 's#^/*##;s#/*$##')/"
-say "BEST_BASE=$BEST_BASE"
-echo
 
-say "== 5) Patch nginx (idempotent, safe) =="
-BACKDIR="/etc/nginx/sites-disabled/backup_autopatch_${DOMAIN}_$(ts)"
-mkdir -p "$BACKDIR"
-cp -a "$VHOST" "$BACKDIR/$(basename "$VHOST")"
-say "Backup -> $BACKDIR/$(basename "$VHOST")"
+if [[ -z "$OK_BAK" ]]; then
+  echo "[ERR] Aucun backup ne passe nginx -t. Montre: nginx -t"
+  exit 1
+fi
 
-export UPSTREAM BEST_BASE
+echo "[OK] Restored working backup: $OK_BAK"
 
+# 2) inject proxy SAFE (idempotent)
+export API_UPSTREAM
 perl -0777 -i -pe '
-my $up = $ENV{UPSTREAM};
-my $base = $ENV{BEST_BASE};
+my $up = $ENV{API_UPSTREAM} // die "missing API_UPSTREAM";
 
-# remove previous injected traderone block
+# remove old injected block if exists
 s/\n\s*# --- traderone api proxy \(injected\) ---.*?\n\s*# --- end traderone api proxy ---\n//ms;
 
 my $block = qq{
   # --- traderone api proxy (injected) ---
   location ^~ /wolverine/traderone/api/ {
-    # strip prefix then forward to backend base
-    rewrite ^/wolverine/traderone/api/?(.*)\$ $base\$1 break;
+    # strip prefix: /wolverine/traderone/api/x -> /x
+    rewrite ^/wolverine/traderone/api/?(.*)\$ /\$1 break;
 
     if (\$request_method = OPTIONS) {
       add_header Access-Control-Allow-Origin "*" always;
@@ -124,18 +72,18 @@ s/\n(\s*location\s+\^\~\s+\/wolverine\/\s*\{)/\n$block\n$1/ms
   or die "ERR: cannot find location ^~ /wolverine/ block\n";
 ' "$VHOST"
 
+echo "[*] nginx -t"
 nginx -t
 systemctl reload nginx
-say "nginx reloaded"
+echo "[OK] nginx reloaded"
 
 echo
-say "== 6) Tests =="
-echo "-- Public:"
+echo "== Tests (public) =="
 curl -sSI "https://${DOMAIN}/wolverine/traderone/api/" | head -n 20 || true
 echo
-echo "-- Local:"
-curl -sS "${UPSTREAM}${BEST_BASE}" | head -n 20 || true
+echo "== Tests (local upstream) =="
+curl -sS "${API_UPSTREAM}/" | head -n 20 || true
 BASH
 
-chmod +x /root/discover_and_patch_traderone_api.sh
-/root/discover_and_patch_traderone_api.sh fireinners.online
+chmod +x /root/nginx_rollback_and_repair_traderone.sh
+API_UPSTREAM="http://127.0.0.1:9696" /root/nginx_rollback_and_repair_traderone.sh fireinners.online
