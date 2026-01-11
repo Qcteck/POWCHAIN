@@ -1,3 +1,106 @@
-curl -sS http://127.0.0.1:9696/ | head -n 50
-curl -sS http://127.0.0.1:9696/openapi.json | head -n 20
-curl -sS http://127.0.0.1:9696/swagger.json | head -n 20
+cat >/root/discover_routes_9696.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+PORT="${PORT:-9696}"
+UP="http://127.0.0.1:${PORT}"
+DOMAIN="${DOMAIN:-fireinners.online}"
+
+echo "[*] UP=$UP"
+echo "[*] DOMAIN=$DOMAIN"
+echo
+
+# PID listening on port
+PID="$(ss -lntp 2>/dev/null | awk -v p=":${PORT}" '$0 ~ p {match($0,/pid=([0-9]+)/,m); if(m[1]!=""){print m[1]; exit}}' || true)"
+if [[ -z "$PID" ]]; then
+  echo "[ERR] Aucun process écoute sur :$PORT"
+  ss -lntp | sed -n '1,160p'
+  exit 1
+fi
+
+CMD="$(tr '\0' ' ' </proc/$PID/cmdline 2>/dev/null || true)"
+CWD="$(readlink -f /proc/$PID/cwd 2>/dev/null || true)"
+EXE="$(readlink -f /proc/$PID/exe 2>/dev/null || true)"
+echo "[OK] PID=$PID"
+echo "[OK] EXE=$EXE"
+echo "[OK] CMD=$CMD"
+echo "[OK] CWD=$CWD"
+echo
+
+# Helper: show status + first bytes
+probe() {
+  local url="$1"
+  printf "%-55s -> " "$url"
+  curl -sS -i "$url" 2>/dev/null | awk 'NR==1{print $2}' || echo "000"
+}
+
+echo "== 1) Probes de base (status code) =="
+for p in "/" "/api" "/api/" "/v1" "/v1/" "/health" "/ping" "/status" "/docs" "/openapi.json" "/swagger.json"; do
+  probe "${UP}${p}"
+done
+echo
+
+echo "== 2) Scan routes dans le code (si CWD accessible) =="
+ROUTES_FILE="/tmp/routes_${PORT}.txt"
+: > "$ROUTES_FILE"
+
+if [[ -n "$CWD" && -d "$CWD" ]]; then
+  # Express / router / fastify
+  grep -RIn --exclude-dir=node_modules --exclude-dir=.git \
+    -E 'app\.(get|post|put|delete|patch)\(|router\.(get|post|put|delete|patch)\(|fastify\.(get|post|put|delete|patch)\(' \
+    "$CWD" 2>/dev/null \
+    | sed -E 's/.*\(([^,]+).*/\1/' \
+    | tr -d '"' | tr -d "'" \
+    | sed -E 's/^[[:space:]]+//;s/[[:space:]]+$//' \
+    | grep -E '^/' \
+    | sort -u > "$ROUTES_FILE" || true
+
+  # FastAPI / Starlette decorators
+  grep -RIn --exclude-dir=node_modules --exclude-dir=.git \
+    -E '@app\.(get|post|put|delete|patch)\(|APIRouter\(|@router\.(get|post|put|delete|patch)\(' \
+    "$CWD" 2>/dev/null | head -n 60 || true
+fi
+
+if [[ ! -s "$ROUTES_FILE" ]]; then
+  echo "[WARN] Aucune route extraite automatiquement depuis le code."
+  echo "      (soit CWD n'est pas le bon, soit binaire compilé, soit routes construites dynamiquement)"
+else
+  echo "[OK] Routes extraites (top 80):"
+  head -n 80 "$ROUTES_FILE"
+fi
+echo
+
+echo "== 3) Tests des routes extraites (local) =="
+if [[ -s "$ROUTES_FILE" ]]; then
+  head -n 40 "$ROUTES_FILE" | while read -r r; do
+    probe "${UP}${r}"
+  done
+else
+  echo "(skip)"
+fi
+echo
+
+echo "== 4) Tests public via nginx (/wolverine/traderone/api/...) =="
+if [[ -s "$ROUTES_FILE" ]]; then
+  head -n 20 "$ROUTES_FILE" | while read -r r; do
+    probe "https://${DOMAIN}/wolverine/traderone/api${r}"
+  done
+else
+  # fallback: show just base
+  probe "https://${DOMAIN}/wolverine/traderone/api/"
+fi
+
+echo
+echo "== 5) Indices utiles =="
+echo "Process tree:"
+ps -o pid,ppid,cmd -p "$PID" || true
+echo
+echo "Environment hints (BASE_PATH / PREFIX / API):"
+tr '\0' '\n' </proc/$PID/environ 2>/dev/null | egrep -i 'base|prefix|path|route|api|port' | head -n 60 || true
+
+echo
+echo "[DONE] Colle-moi ici la section 1 + 2 + 5 (ou une capture), et je te donne la route exacte à mettre."
+BASH
+
+chmod +x /root/discover_routes_9696.sh
+/root/discover_routes_9696.sh
