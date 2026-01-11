@@ -1,2 +1,60 @@
-nginx -t 2>&1 | head -n 30
-grep -RIn "solana_rpc_proxy.conf" /etc/nginx | head -n 60
+cat >/root/fix_nginx_bak_enabled_and_duplicate_rpc.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+DIS="/etc/nginx/disabled-sites"
+mkdir -p "$DIS"
+ts="$(date +%Y%m%d_%H%M%S)"
+
+echo "== 1) Move ANY backup/disabled files out of sites-enabled (they must NOT be loaded) =="
+shopt -s nullglob
+for f in /etc/nginx/sites-enabled/*.bak* /etc/nginx/sites-enabled/*bak* /etc/nginx/sites-enabled/*backup* /etc/nginx/sites-enabled/*.disabled*; do
+  echo "MOVE $f -> $DIS/"
+  mv -f "$f" "$DIS/$(basename "$f").moved_$ts"
+done
+shopt -u nullglob
+
+echo
+echo "== 2) Remove broken symlinks in sites-enabled (optional safety) =="
+find /etc/nginx/sites-enabled -xtype l -print -delete || true
+
+echo
+echo "== 3) Ensure solana snippet is included ONCE in the ACTIVE ssl vhost =="
+SSL="/etc/nginx/sites-available/fireinners.online-ssl"
+EN="/etc/nginx/sites-enabled/fireinners.online-ssl"
+
+if [[ -f "$SSL" ]]; then
+  cp -a "$SSL" "${SSL}.bak_${ts}"
+
+  # remove duplicate include lines
+  awk '{
+    if ($0 ~ /include[[:space:]]+\/etc\/nginx\/snippets\/solana_rpc_proxy\.conf;/) {
+      if(seen==1) next;
+      seen=1;
+    }
+    print
+  }' "$SSL" > /tmp/ssl.$$ && cat /tmp/ssl.$$ > "$SSL" && rm -f /tmp/ssl.$$
+
+  # add include if missing (after server_name)
+  if ! grep -q "solana_rpc_proxy.conf" "$SSL"; then
+    sed -i '/server_name .*fireinners\.online/ a\  include /etc/nginx/snippets/solana_rpc_proxy.conf;' "$SSL"
+  fi
+
+  ln -sf "$SSL" "$EN"
+else
+  echo "[WARN] $SSL not found (skip include dedupe)"
+fi
+
+echo
+echo "== 4) nginx test + reload =="
+nginx -t
+systemctl reload nginx
+echo "[OK] nginx reloaded"
+
+echo
+echo "== 5) Verify ONLY one include remains in ENABLED configs =="
+grep -RIn --line-number "solana_rpc_proxy.conf" /etc/nginx/sites-enabled | head -n 50 || true
+BASH
+
+chmod +x /root/fix_nginx_bak_enabled_and_duplicate_rpc.sh
+/root/fix_nginx_bak_enabled_and_duplicate_rpc.sh
