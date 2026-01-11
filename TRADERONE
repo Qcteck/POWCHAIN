@@ -1,34 +1,57 @@
-cat >/root/fix_wolverine_next_service_v2.sh <<'BASH'
+cat >/root/fix_wolverine_next_service_v3.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
 PORT="${PORT:-3001}"
 
-# 1) récupère le WorkingDirectory du service existant
-WD="$(systemctl cat wolverine-next 2>/dev/null | awk -F= '/^WorkingDirectory=/{print $2; exit}')"
-if [[ -z "${WD:-}" ]]; then
-  echo "[ERR] Je ne trouve pas WorkingDirectory dans le service."
-  echo "Colle: systemctl cat wolverine-next"
-  exit 1
-fi
+ts(){ date +%Y%m%d_%H%M%S; }
+say(){ echo "[$(ts)] $*"; }
 
-echo "[*] WorkingDirectory=$WD"
-cd "$WD"
+say "== Find correct Next app dir =="
 
-# 2) s'assure que node_modules + build existent
+# 1) cherche un dossier Next (package.json contient "next") hors node_modules
+mapfile -t PJS < <(
+  find /opt /var/www /srv -maxdepth 7 -name package.json \
+    -not -path '*/node_modules/*' -not -path '*/.git/*' 2>/dev/null
+)
+
+CAND=""
+for pj in "${PJS[@]}"; do
+  if grep -q '"next"' "$pj"; then
+    d="$(dirname "$pj")"
+    # prefer one that looks like a real app root
+    if [[ -d "$d/pages" || -d "$d/app" ]]; then
+      CAND="$d"
+      break
+    fi
+    [[ -z "$CAND" ]] && CAND="$d"
+  fi
+done
+
+[[ -n "$CAND" ]] || { echo "[ERR] No Next app found"; exit 1; }
+
+say "Candidate APP_DIR=$CAND"
+cd "$CAND"
+
+say "== Install + build =="
 npm i
 npm run build
 
-# 3) écrit un service systemd robuste (next start direct)
-SERVICE="/etc/systemd/system/wolverine-next.service"
-ts="$(date +%Y%m%d_%H%M%S)"
-cp -a "$SERVICE" "${SERVICE}.bak_${ts}" 2>/dev/null || true
-
-NEXT_BIN="$WD/node_modules/next/dist/bin/next"
-if [[ ! -f "$NEXT_BIN" ]]; then
-  echo "[ERR] next binaire introuvable: $NEXT_BIN"
+# sanity: ensure .next exists
+if [[ ! -d "$CAND/.next" ]]; then
+  echo "[ERR] .next not found after build in $CAND"
+  echo "=> Colle: ls -la $CAND ; cat $CAND/package.json | sed -n '/\"scripts\"/,/}/p'"
   exit 1
 fi
+
+# 2) write service
+SERVICE="/etc/systemd/system/wolverine-next.service"
+BACK="/etc/systemd/system/wolverine-next.service.bak_$(ts)"
+cp -a "$SERVICE" "$BACK" 2>/dev/null || true
+say "Backup service -> $BACK"
+
+NEXT_BIN="$CAND/node_modules/next/dist/bin/next"
+[[ -f "$NEXT_BIN" ]] || { echo "[ERR] next bin missing: $NEXT_BIN"; exit 1; }
 
 cat >"$SERVICE" <<EOF
 [Unit]
@@ -37,9 +60,8 @@ After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=$WD
+WorkingDirectory=$CAND
 Environment=NODE_ENV=production
-Environment=PORT=$PORT
 ExecStart=/usr/bin/node $NEXT_BIN start -p $PORT -H 127.0.0.1
 Restart=always
 RestartSec=2
@@ -53,18 +75,24 @@ systemctl daemon-reload
 systemctl enable wolverine-next >/dev/null 2>&1 || true
 systemctl restart wolverine-next
 
-echo
-echo "== status =="
-systemctl --no-pager status wolverine-next | sed -n '1,25p' || true
+sleep 1
 
 echo
-echo "== listening =="
+say "== status =="
+systemctl --no-pager status wolverine-next | sed -n '1,30p' || true
+
+echo
+say "== listening =="
 ss -lntp | grep ":$PORT" || echo "[ERR] rien n'écoute sur $PORT"
 
 echo
-echo "== upstream curl =="
+say "== upstream curl =="
 curl -sSI "http://127.0.0.1:$PORT/" | head -n 20 || true
+
+echo
+say "If still KO, show logs:"
+echo "  journalctl -u wolverine-next -n 120 --no-pager"
 BASH
 
-chmod +x /root/fix_wolverine_next_service_v2.sh
-/root/fix_wolverine_next_service_v2.sh
+chmod +x /root/fix_wolverine_next_service_v3.sh
+/root/fix_wolverine_next_service_v3.sh
