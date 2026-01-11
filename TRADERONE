@@ -1,20 +1,17 @@
-cat >/root/fix_solana_rpc_404.sh <<'BASH'
+cat >/root/fix_duplicate_solana_rpc.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
 DOMAIN="fireinners.online"
+SNIP="/etc/nginx/snippets/solana_rpc_proxy.conf"
 DIS="/etc/nginx/disabled-sites"
-mkdir -p "$DIS"
+mkdir -p "$DIS" /etc/nginx/snippets
 
-echo "== A) List ALL 443 server blocks that mention $DOMAIN =="
-nginx -T 2>/dev/null | awk -v dom="$DOMAIN" '
-  /^# configuration file /{f=$4; sub(/:$/,"",f)}
-  /listen\s+(\[::\]:)?443/ {in443=1}
-  /server_name/ && $0 ~ dom {print "FILE:",f,"\n  ",$0}
-' | sed -n '1,120p'
+echo "== 0) Show all occurrences of solana-rpc =="
+grep -RIn --line-number --color=never 'solana-rpc' /etc/nginx | head -n 200 || true
 echo
 
-echo "== B) Find the ACTIVE vhost file for $DOMAIN on 443 (first match) =="
+# Find ACTIVE SSL vhost file for DOMAIN on 443 (best effort)
 VHOST="$(
 nginx -T 2>/dev/null | awk -v dom="$DOMAIN" '
   /^# configuration file /{f=$4; sub(/:$/,"",f)}
@@ -27,53 +24,58 @@ nginx -T 2>/dev/null | awk -v dom="$DOMAIN" '
   }
 '
 )"
-[[ -n "${VHOST:-}" && -f "$VHOST" ]] || { echo "[ERR] can't find active 443 vhost for $DOMAIN"; exit 1; }
+[[ -n "${VHOST:-}" && -f "$VHOST" ]] || { echo "[ERR] Can't find active 443 vhost for $DOMAIN"; exit 1; }
 echo "[OK] ACTIVE 443 VHOST: $VHOST"
 cp -a "$VHOST" "${VHOST}.bak_$(date +%Y%m%d_%H%M%S)"
 
 echo
-echo "== C) Disable other enabled vhosts that also have server_name $DOMAIN (to avoid wrong match) =="
-for f in /etc/nginx/sites-enabled/*; do
-  [[ -f "$f" ]] || continue
-  [[ "$f" == "$VHOST" ]] && continue
-  if grep -qE "server_name .*${DOMAIN}" "$f"; then
-    echo "DISABLE: $f -> $DIS/"
-    mv -f "$f" "$DIS/$(basename "$f").disabled_$(date +%Y%m%d_%H%M%S)"
-  fi
-done
+echo "== 1) Rewrite snippet to ONE clean location =="
+cat >"$SNIP" <<'NGINX'
+# Solana RPC proxy (avoid browser CORS)
+location = /solana-rpc {
+  proxy_pass https://api.mainnet-beta.solana.com;
+  proxy_ssl_server_name on;
+  proxy_set_header Host api.mainnet-beta.solana.com;
+
+  add_header Access-Control-Allow-Origin * always;
+  add_header Access-Control-Allow-Headers * always;
+  add_header Access-Control-Allow-Methods "POST, OPTIONS" always;
+  if ($request_method = OPTIONS) { return 204; }
+}
+NGINX
+echo "[OK] wrote $SNIP"
 
 echo
-echo "== D) Force /solana-rpc location INSIDE the active 443 vhost (no include ambiguity) =="
-# remove any old /solana-rpc blocks in that file (best-effort)
-perl -0777 -i -pe 's/\n\s*location\s*=\s*\/solana-rpc\s*\{.*?\}\s*\n/\n/smg' "$VHOST"
-
-# insert our location right after server_name line
-sed -i "/server_name .*${DOMAIN}/a\\
-\\
-  location = /solana-rpc {\\
-    proxy_pass https://api.mainnet-beta.solana.com;\\
-    proxy_ssl_server_name on;\\
-    proxy_set_header Host api.mainnet-beta.solana.com;\\
-\\
-    add_header Access-Control-Allow-Origin * always;\\
-    add_header Access-Control-Allow-Headers * always;\\
-    add_header Access-Control-Allow-Methods \"POST, OPTIONS\" always;\\
-    if (\$request_method = OPTIONS) { return 204; }\\
-  }\\
+echo "== 2) Ensure vhost includes snippet ONCE =="
+# remove duplicate include lines
+awk '!seen[$0]++' "$VHOST" > /tmp/vhost_unique.$$ && cat /tmp/vhost_unique.$$ > "$VHOST" && rm -f /tmp/vhost_unique.$$
+# ensure include exists
+if ! grep -qF "include /etc/nginx/snippets/solana_rpc_proxy.conf;" "$VHOST"; then
+  sed -i "/server_name .*${DOMAIN}/a\\
+  include /etc/nginx/snippets/solana_rpc_proxy.conf;
 " "$VHOST"
+  echo "[OK] include added"
+else
+  echo "[OK] include already present"
+fi
 
 echo
-echo "== E) Test + reload =="
+echo "== 3) Remove any INLINE location = /solana-rpc blocks from vhost (avoid duplicates) =="
+perl -0777 -i -pe 's/\n\s*location\s*=\s*\/solana-rpc\s*\{.*?\}\s*\n/\n/sg' "$VHOST"
+echo "[OK] inline solana-rpc removed (if existed)"
+
+echo
+echo "== 4) nginx test + reload =="
 nginx -t
 systemctl reload nginx
 echo "[OK] nginx reloaded"
 
 echo
-echo "== F) CORRECT RPC test (SNI + Host) MUST return result:ok =="
+echo "== 5) RPC test (must return result: ok) =="
 curl -sk --resolve ${DOMAIN}:443:127.0.0.1 https://${DOMAIN}/solana-rpc \
   -H 'Content-Type: application/json' \
   --data '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' && echo
 BASH
 
-chmod +x /root/fix_solana_rpc_404.sh
-/root/fix_solana_rpc_404.sh
+chmod +x /root/fix_duplicate_solana_rpc.sh
+/root/fix_duplicate_solana_rpc.sh
