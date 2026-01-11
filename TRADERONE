@@ -1,3 +1,153 @@
-APPLY=1 NETWORK=mainnet \
-WOLVERINE_WALLET="DgpM2PXA9it1g8myWnVXeosu72GkwmjgpeGUigpyLkYC" \
-/root/batch_root_phantom_wolverine_fix.sh
+cat >/root/batch_root_wolverine_next_server.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+APPLY="${APPLY:-0}"                 # 0=dry-run, 1=apply
+DOMAIN="${1:-fireinners.online}"
+PORT="${PORT:-3001}"
+
+need(){ command -v "$1" >/dev/null 2>&1 || { echo "[ERR] missing: $1"; exit 1; }; }
+need node; need npm; need find; need grep; need sed; need awk; need systemctl
+
+ts(){ date "+%F_%H%M%S"; }
+say(){ echo "[$(ts)] $*"; }
+
+say "== Wolverine: Next server + Nginx proxy =="
+say "APPLY=$APPLY DOMAIN=$DOMAIN PORT=$PORT"
+echo
+
+# 1) Detect Next.js repo (exclude node_modules/.git)
+say "Searching Next.js repo..."
+mapfile -t PJS < <(
+  find /opt /var/www /srv -maxdepth 7 -name package.json \
+    -not -path '*/node_modules/*' -not -path '*/.git/*' 2>/dev/null
+)
+
+APP_DIR=""
+for pj in "${PJS[@]}"; do
+  if grep -q '"next"' "$pj"; then
+    d="$(dirname "$pj")"
+    # prefer repo root with pages/ or app/
+    if [[ -d "$d/pages" || -d "$d/app" ]]; then APP_DIR="$d"; break; fi
+    [[ -z "$APP_DIR" ]] && APP_DIR="$d"
+  fi
+done
+
+[[ -n "$APP_DIR" ]] || { echo "[ERR] Next repo introuvable"; exit 1; }
+say "APP_DIR=$APP_DIR"
+cd "$APP_DIR"
+
+# 2) Build
+if [[ "$APPLY" == "1" ]]; then
+  say "npm install (if needed) + build..."
+  npm i
+  npm run build
+else
+  say "[DRY] would run: npm i && npm run build"
+fi
+
+# 3) systemd service
+SERVICE="/etc/systemd/system/wolverine-next.service"
+say "Preparing systemd service: $SERVICE"
+
+SERVICE_CONTENT="[Unit]
+Description=Wolverine Next.js Server
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=$APP_DIR
+Environment=NODE_ENV=production
+Environment=PORT=$PORT
+ExecStart=/usr/bin/npm run start -- -p $PORT
+Restart=always
+RestartSec=2
+User=root
+
+[Install]
+WantedBy=multi-user.target
+"
+
+if [[ "$APPLY" == "1" ]]; then
+  echo "$SERVICE_CONTENT" > "$SERVICE"
+  systemctl daemon-reload
+  systemctl enable wolverine-next
+  systemctl restart wolverine-next
+  systemctl --no-pager status wolverine-next | sed -n '1,20p'
+else
+  say "[DRY] would write $SERVICE and start it"
+fi
+
+# 4) Patch Nginx vhost: add proxy for /wolverine/
+VHOST="$(grep -RIl --include='*' "server_name .*${DOMAIN}" /etc/nginx/sites-enabled /etc/nginx/sites-available 2>/dev/null | head -n 1 || true)"
+[[ -n "$VHOST" ]] || { echo "[ERR] vhost not found for $DOMAIN"; exit 1; }
+say "VHOST=$VHOST"
+
+BACKDIR="/etc/nginx/sites-disabled/backup_wolverine_next_$(ts)"
+if [[ "$APPLY" == "1" ]]; then
+  mkdir -p "$BACKDIR"
+  cp -a "$VHOST" "$BACKDIR/$(basename "$VHOST")"
+  say "Backup -> $BACKDIR/$(basename "$VHOST")"
+fi
+
+BLOCK_START="# === wolverine_next_proxy START ==="
+BLOCK_END="# === wolverine_next_proxy END ==="
+read -r -d '' BLOCK <<EOF || true
+    $BLOCK_START
+    location ^~ /wolverine/ {
+        proxy_pass http://127.0.0.1:${PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+    $BLOCK_END
+EOF
+
+if [[ "$APPLY" == "1" ]]; then
+  # remove old proxy block if exists
+  perl -0777 -i -pe "s/\\n\\s*\\Q$BLOCK_START\\E.*?\\Q$BLOCK_END\\E\\s*\\n/\\n/sg" "$VHOST"
+
+  # inject into SSL server (listen 443) before its closing brace
+  tmp="$(mktemp)"
+  awk -v block="$BLOCK" '
+  function cnt(s,c, i,n){n=0;for(i=1;i<=length(s);i++)if(substr(s,i,1)==c)n++;return n}
+  BEGIN{in=0;ssl=0;d=0;ins=0}
+  {
+    line=$0
+    if(line ~ /^[[:space:]]*server[[:space:]]*\{/){in=1;ssl=0;d=0}
+    if(in){
+      d += cnt(line,"{"); d -= cnt(line,"}")
+      if(line ~ /listen[[:space:]]+443/){ssl=1}
+    }
+    if(in && ssl && !ins && d==0 && line ~ /^[[:space:]]*\}/){
+      print block
+      ins=1
+      print line
+      in=0
+      next
+    }
+    print line
+    if(in && d==0 && line ~ /^[[:space:]]*\}/){in=0}
+  }
+  END{ if(!ins){ print "##ERR## could not inject into ssl server" > "/dev/stderr"; exit 3 } }
+  ' "$VHOST" > "$tmp"
+  cp -a "$tmp" "$VHOST"
+  rm -f "$tmp"
+
+  nginx -t && systemctl reload nginx
+  say "Nginx reloaded."
+else
+  say "[DRY] would inject proxy block into SSL server in $VHOST + nginx -t + reload"
+fi
+
+say "DONE. Tests:"
+echo "  curl -sSI https://${DOMAIN}/wolverine/ | head -n 12"
+echo "  curl -sSI https://${DOMAIN}/wolverine/_next/static/  | head -n 12   # directory may 403, ok"
+BASH
+
+chmod +x /root/batch_root_wolverine_next_server.sh
+echo "OK: /root/batch_root_wolverine_next_server.sh prêt"
