@@ -1,71 +1,72 @@
-cat >/root/fix_443_selfsigned.sh <<'BASH'
+cat >/root/fix_ssl_cert_paths.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
 DOMAIN="fireinners.online"
-HTTP_VHOST="/etc/nginx/sites-enabled/fireinners.online-http"
-SSL_AVAIL="/etc/nginx/sites-available/fireinners.online-ssl"
-SSL_ENABLED="/etc/nginx/sites-enabled/fireinners.online-ssl"
 CERT_DIR="/etc/ssl/fireinners"
 CERT="$CERT_DIR/fullchain.pem"
 KEY="$CERT_DIR/privkey.pem"
 
-echo "=== 1) Remove WRONG 443 from HTTP vhost (if present) ==="
-if [[ -f "$HTTP_VHOST" ]]; then
-  cp -a "$HTTP_VHOST" "${HTTP_VHOST}.bak_$(date +%Y%m%d_%H%M%S)"
-  # supprime les lignes listen 443 ssl... si elles existent
-  sed -i -E '/listen[[:space:]]+\[::\]:443/d; /listen[[:space:]]+443/d' "$HTTP_VHOST"
-  echo "[OK] cleaned $HTTP_VHOST"
-fi
+SSL_AVAIL="/etc/nginx/sites-available/fireinners.online-ssl"
+SSL_ENABLED="/etc/nginx/sites-enabled/fireinners.online-ssl"
 
-echo "=== 2) Create self-signed cert (only if missing) ==="
 mkdir -p "$CERT_DIR"
+
+echo "=== 1) Ensure self-signed exists ==="
 if [[ ! -f "$CERT" || ! -f "$KEY" ]]; then
   openssl req -x509 -nodes -newkey rsa:2048 -days 365 \
     -keyout "$KEY" -out "$CERT" \
     -subj "/CN=$DOMAIN"
-  echo "[OK] self-signed created at $CERT_DIR"
+  echo "[OK] self-signed created: $CERT_DIR"
 else
-  echo "[OK] cert already exists"
+  echo "[OK] cert already exists: $CERT / $KEY"
 fi
 
-echo "=== 3) Create SSL vhost (443) ==="
+echo "=== 2) Write a CLEAN SSL vhost with REAL paths (no $VARS) ==="
 cat >"$SSL_AVAIL" <<NGINX
 server {
   listen 443 ssl http2;
   listen [::]:443 ssl http2;
 
-  server_name $DOMAIN www.$DOMAIN;
+  server_name ${DOMAIN} www.${DOMAIN};
 
-  ssl_certificate     $CERT;
-  ssl_certificate_key $KEY;
+  ssl_certificate     ${CERT};
+  ssl_certificate_key ${KEY};
 
-  # si tu veux servir le même contenu que /var/www/wolverine :
-  root /var/www;
-  index index.html;
-
-  # ton app est sous /wolverine/ :
+  # simple entrypoint
   location / {
-    return 301 https://$DOMAIN/wolverine/;
+    return 301 https://${DOMAIN}/wolverine/;
   }
 }
 NGINX
 
 ln -sf "$SSL_AVAIL" "$SSL_ENABLED"
 
+echo "=== 3) Find any other broken 443 ssl servers (no ssl_certificate) ==="
+# List files that contain listen 443 ssl
+FILES="$(nginx -T 2>/dev/null | awk '
+  /^# configuration file /{f=$4; sub(/:$/,"",f)}
+  /listen\s+\[::\]:443|listen\s+443/ && /ssl/ {print f}
+' | sort -u)"
+
+for f in $FILES; do
+  [[ -f "$f" ]] || continue
+  # if file has listen 443 ssl but no ssl_certificate directive anywhere, disable it
+  if grep -qE 'listen\s+(\[::\]:)?443.*ssl' "$f" && ! grep -qE '^\s*ssl_certificate\s+' "$f"; then
+    echo "[DISABLE] $f (has listen 443 ssl but no ssl_certificate)"
+    mv -f "$f" "/etc/nginx/disabled-sites/$(basename "$f").disabled_$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
+  fi
+done
+
 echo "=== 4) Test + restart ==="
 nginx -t
 systemctl restart nginx
 
 echo
-echo "=== 5) Check ports ==="
+echo "=== 5) Ports + local https ==="
 ss -lntp | grep -E ':(80|443)\b' || true
-
-echo
-echo "=== 6) Local tests ==="
-curl -I --max-time 5 http://127.0.0.1/ | head -n 8 || true
 curl -kI --max-time 5 https://127.0.0.1/ | head -n 12 || true
 BASH
 
-chmod +x /root/fix_443_selfsigned.sh
-/root/fix_443_selfsigned.sh
+chmod +x /root/fix_ssl_cert_paths.sh
+/root/fix_ssl_cert_paths.sh
