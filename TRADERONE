@@ -1,1 +1,62 @@
-nginx -t 2>&1 | sed -n '1,15p'
+cat >/root/nginx_autofix_bad_include.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+max=6
+i=1
+
+while (( i <= max )); do
+  out="$(nginx -t 2>&1 || true)"
+
+  if echo "$out" | grep -qi "test is successful"; then
+    echo "[OK] nginx -t OK"
+    exit 0
+  fi
+
+  echo "---- nginx -t (attempt $i/$max) ----"
+  echo "$out" | sed -n '1,12p'
+
+  # Cherche "in /path:LINE"
+  loc="$(echo "$out" | sed -nE 's/.* in (\/[^:]+):([0-9]+).*/\1:\2/p' | head -n 1)"
+  if [[ -z "${loc:-}" ]]; then
+    echo "[ERR] Impossible d'extraire fichier:ligne depuis nginx -t"
+    exit 1
+  fi
+
+  file="${loc%:*}"
+  line="${loc##*:}"
+
+  echo "[*] Offending location: $file:$line"
+  if [[ ! -f "$file" ]]; then
+    echo "[ERR] Fichier introuvable: $file"
+    exit 1
+  fi
+
+  echo "[*] Line content:"
+  nl -ba "$file" | sed -n "${line}p"
+
+  # Backup
+  ts="$(date +%Y%m%d_%H%M%S)"
+  cp -a "$file" "${file}.bak_${ts}"
+  echo "[OK] Backup -> ${file}.bak_${ts}"
+
+  # Comment ONLY if it is an include line; otherwise stop
+  badline="$(sed -n "${line}p" "$file")"
+  if echo "$badline" | grep -Eq '^[[:space:]]*include\b'; then
+    # Comment the line (keep indentation)
+    sed -i "${line}s/^[[:space:]]*/&# /" "$file"
+    echo "[OK] Commented bad include line"
+  else
+    echo "[ERR] La ligne fautive n'est pas un include. Stop pour éviter d'abîmer la conf."
+    exit 1
+  fi
+
+  ((i++))
+done
+
+echo "[ERR] Toujours cassé après $max tentatives."
+exit 1
+BASH
+
+chmod +x /root/nginx_autofix_bad_include.sh
+/root/nginx_autofix_bad_include.sh
