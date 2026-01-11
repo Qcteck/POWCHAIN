@@ -1,1 +1,160 @@
-<div id="walletBalances" style="margin-top:12px;font:14px system-ui;color:#ddd;"></div>
+cat >/root/add_sol_usdc_balances.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="/var/www/wolverine"
+INDEX="$ROOT/index.html"
+JS="$ROOT/phantom_patch.js"
+
+[[ -f "$INDEX" ]] || { echo "[ERR] index introuvable: $INDEX"; exit 1; }
+
+ts="$(date +%Y%m%d_%H%M%S)"
+cp -a "$INDEX" "${INDEX}.bak_${ts}"
+echo "[OK] Backup -> ${INDEX}.bak_${ts}"
+
+cat >"$JS" <<'JS'
+(function () {
+  const RPC = "https://api.mainnet-beta.solana.com";
+  const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+  const REFRESH_MS = 15000;
+
+  function ensureBalancesBox() {
+    let el = document.getElementById("walletBalances");
+    if (el) return el;
+
+    el = document.createElement("div");
+    el.id = "walletBalances";
+    el.style.cssText =
+      "position:fixed;right:16px;bottom:16px;z-index:99999;" +
+      "background:rgba(0,0,0,.85);color:#fff;padding:10px 12px;" +
+      "border-radius:10px;font:13px/1.35 system-ui;max-width:80vw";
+    el.textContent = "Wallet: not connected";
+    document.body.appendChild(el);
+    return el;
+  }
+
+  function setBalancesText(sol, usdc, pk) {
+    const el = ensureBalancesBox();
+    const short = pk ? (pk.slice(0,4) + "…" + pk.slice(-4)) : "";
+    el.innerHTML =
+      `<div><b>Wallet</b> ${short}</div>` +
+      `<div>💠 SOL : <b>${sol.toFixed(4)}</b></div>` +
+      `<div>💵 USDC : <b>${usdc.toFixed(2)}</b></div>`;
+  }
+
+  async function rpc(method, params) {
+    const r = await fetch(RPC, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params })
+    });
+    const j = await r.json();
+    if (j.error) throw new Error(j.error.message || JSON.stringify(j.error));
+    return j.result;
+  }
+
+  async function fetchBalances(owner) {
+    const bal = await rpc("getBalance", [owner, { commitment: "confirmed" }]);
+    const sol = (bal.value || 0) / 1e9;
+
+    const tok = await rpc("getTokenAccountsByOwner", [
+      owner,
+      { mint: USDC_MINT },
+      { encoding: "jsonParsed", commitment: "confirmed" }
+    ]);
+
+    let usdc = 0;
+    for (const acc of (tok.value || [])) {
+      const amt = acc.account?.data?.parsed?.info?.tokenAmount?.uiAmount;
+      if (typeof amt === "number") usdc += amt;
+    }
+
+    return { sol, usdc };
+  }
+
+  async function refresh() {
+    const pk = window.solana?.publicKey?.toBase58?.() || window.__WALLET_PK__;
+    if (!pk) return;
+
+    try {
+      const { sol, usdc } = await fetchBalances(pk);
+      setBalancesText(sol, usdc, pk);
+    } catch (e) {
+      ensureBalancesBox().textContent = "Balance error (RPC)";
+      console.error(e);
+    }
+  }
+
+  async function connect() {
+    if (!window.solana || !window.solana.isPhantom) {
+      ensureBalancesBox().innerHTML =
+        `<div>Phantom introuvable.</div><div>➡️ Ouvre le site dans Phantom Browser.</div>`;
+      return;
+    }
+    const r = await window.solana.connect();
+    const pk = r.publicKey.toBase58();
+    window.__WALLET_PK__ = pk;
+    await refresh();
+  }
+
+  function hookConnectButton() {
+    // tente de trouver un bouton "Connect Phantom"
+    const nodes = Array.from(document.querySelectorAll("button,a,div,span"));
+    const btn = nodes.find(n => /connect phantom/i.test((n.textContent || "").trim()));
+    if (btn && !btn.__wallet_hooked) {
+      btn.__wallet_hooked = true;
+      btn.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        connect().catch(err => {
+          ensureBalancesBox().textContent = "Connect error";
+          console.error(err);
+        });
+      }, { passive: false });
+    }
+  }
+
+  window.addEventListener("load", () => {
+    ensureBalancesBox();
+    hookConnectButton();
+
+    const obs = new MutationObserver(() => hookConnectButton());
+    obs.observe(document.documentElement, { childList: true, subtree: true });
+
+    // si déjà connecté
+    if (window.solana?.isPhantom && window.solana.publicKey) refresh();
+
+    // refresh auto
+    setInterval(refresh, REFRESH_MS);
+
+    window.solana?.on?.("accountChanged", (pubkey) => {
+      if (pubkey) {
+        window.__WALLET_PK__ = pubkey.toBase58();
+        refresh();
+      } else {
+        ensureBalancesBox().textContent = "Wallet: not connected";
+      }
+    });
+  });
+
+  window.__WALLET_PATCH_LOADED__ = true;
+})();
+JS
+
+# Injecte le script (idempotent) dans <head>
+if ! grep -q "phantom_patch.js" "$INDEX"; then
+  perl -0777 -i -pe '
+    my $tag = qq{\n<!-- WALLET_BALANCES_PATCH -->\n<script src="/wolverine/phantom_patch.js?v='"$ts"'" defer></script>\n<!-- /WALLET_BALANCES_PATCH -->\n};
+    s@(<head[^>]*>)@$1$tag@i;
+  ' "$INDEX"
+  echo "[OK] Script tag injected"
+else
+  echo "[OK] Script tag already present"
+fi
+
+nginx -t
+systemctl reload nginx
+echo "✅ Done. Ouvre: https://fireinners.online/wolverine/?v=$ts"
+BASH
+
+chmod +x /root/add_sol_usdc_balances.sh
+/root/add_sol_usdc_balances.sh
