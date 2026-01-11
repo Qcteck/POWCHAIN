@@ -1,105 +1,59 @@
-cat >/root/fix_nginx_wolverine_static_level_safe_v4.sh <<'BASH'
+cat >/root/rebuild_nginx_fireinners_ssl.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
 DOMAIN="${1:-fireinners.online}"
-OUT_DIR="${OUT_DIR:-/var/www/wolverine}"
 VHOST="/etc/nginx/sites-enabled/${DOMAIN}-ssl"
-
 ts="$(date +%Y%m%d_%H%M%S)"
-echo "[*] VHOST=$VHOST"
-[[ -f "$VHOST" ]] || { echo "[ERR] missing: $VHOST"; exit 1; }
+BACKDIR="/etc/nginx/sites-disabled/backup_rebuild_${ts}"
 
-BACKDIR="/etc/nginx/sites-disabled/backup_wolverine_levelsafe_${ts}"
 mkdir -p "$BACKDIR"
-cp -a "$VHOST" "$BACKDIR/$(basename "$VHOST")"
-echo "[OK] Backup -> $BACKDIR/$(basename "$VHOST")"
+if [[ -f "$VHOST" ]]; then
+  cp -a "$VHOST" "$BACKDIR/$(basename "$VHOST")"
+  echo "[OK] Backup -> $BACKDIR/$(basename "$VHOST")"
+fi
 
-export OUT_DIR
+cat >"$VHOST" <<EOF
+# ${DOMAIN} - rebuilt ${ts}
 
-perl -0777 -i -pe '
-my $out_dir = $ENV{OUT_DIR} // "/var/www/wolverine";
-
-my @lines = split(/\n/, $_, -1);
-my @out;
-
-sub brace_delta {
-  my ($s)=@_;
-  my $o=()=($s=~/\{/g);
-  my $c=()=($s=~/\}/g);
-  return $o-$c;
+server {
+  listen 80;
+  listen [::]:80;
+  server_name ${DOMAIN} www.${DOMAIN};
+  return 301 https://\$host\$request_uri;
 }
 
-my $block =
-"    # --- wolverine static export (LEVEL-SAFE) ---\n".
-"    location ^~ /wolverine/ {\n".
-"        alias $out_dir/;\n".
-"        index index.html;\n".
-"        try_files \\$uri \\$uri/ /wolverine/index.html;\n".
-"    }\n";
+server {
+  listen 443 ssl http2;
+  listen [::]:443 ssl http2;
+  server_name ${DOMAIN} www.${DOMAIN};
 
-my $in_srv=0; my $srv_depth=0; my $is_ssl=0;
-my $in_loc=0; my $loc_depth=0;
-my $skip_wolv=0; my $wolv_depth=0;
-my $inserted=0;
+  ssl_certificate     /etc/letsencrypt/live/${DOMAIN}/fullchain.pem;
+  ssl_certificate_key /etc/letsencrypt/live/${DOMAIN}/privkey.pem;
 
-for (my $i=0; $i<@lines; $i++){
-  my $line = $lines[$i];
+  access_log /var/log/nginx/${DOMAIN}.access.log;
+  error_log  /var/log/nginx/${DOMAIN}.error.log;
 
-  # detect server start (loose)
-  if (!$in_srv && $line =~ /^\s*server\s*\{\s*$/) {
-    $in_srv=1; $srv_depth=1; $is_ssl=0;
-    push @out, $line;
-    next;
+  # favicon: never 500 if absent
+  location = /favicon.ico {
+    access_log off;
+    log_not_found off;
+    return 204;
   }
 
-  if ($in_srv) {
-    # mark ssl server if listen 443 appears anywhere inside
-    if ($line =~ /listen\s+443\b/) { $is_ssl=1; }
-
-    # track generic location nesting so we never inject inside it
-    if (!$in_loc && $line =~ /^\s*location\b.*\{\s*$/) {
-      $in_loc=1;
-      $loc_depth = 1 + brace_delta($line);  # usually 1, but be safe
-    } elsif ($in_loc) {
-      $loc_depth += brace_delta($line);
-      if ($loc_depth <= 0) { $in_loc=0; $loc_depth=0; }
-    }
-
-    # remove ANY /wolverine/ location block (even if wrongly nested)
-    if ($is_ssl && !$skip_wolv && $line =~ /^\s*location\b[^{]*\/wolverine\/[^{]*\{\s*$/) {
-      $skip_wolv=1;
-      $wolv_depth = 1 + brace_delta($line);
-      next;
-    }
-    if ($skip_wolv) {
-      $wolv_depth += brace_delta($line);
-      if ($wolv_depth <= 0) { $skip_wolv=0; $wolv_depth=0; }
-      next;
-    }
-
-    # inject ONLY at server level (depth==1), at closing brace, and NOT inside any location
-    if ($is_ssl && !$inserted && !$in_loc && $srv_depth==1 && $line =~ /^\s*\}\s*$/) {
-      push @out, $block;
-      $inserted=1;
-      push @out, $line;
-      $in_srv=0; $srv_depth=0; $is_ssl=0; $in_loc=0; $loc_depth=0;
-      next;
-    }
-
-    push @out, $line;
-    $srv_depth += brace_delta($line);
-    if ($srv_depth <= 0) { $in_srv=0; $srv_depth=0; $is_ssl=0; $in_loc=0; $loc_depth=0; }
-    next;
+  # redirect home to /wolverine/
+  location = / {
+    return 302 /wolverine/;
   }
 
-  push @out, $line;
+  # --- Wolverine static export ---
+  location ^~ /wolverine/ {
+    alias /var/www/wolverine/;
+    index index.html;
+    try_files \$uri \$uri/ /wolverine/index.html;
+  }
 }
-
-die "ERR: ssl server (listen 443) not found / injection failed\n" if !$inserted;
-
-$_ = join("\n", @out);
-' "$VHOST"
+EOF
 
 echo "[*] nginx -t"
 nginx -t
@@ -112,5 +66,5 @@ echo "  curl -k -sSI https://127.0.0.1/wolverine/ -H 'Host: ${DOMAIN}' | head -n
 echo "  curl -sSI https://${DOMAIN}/wolverine/ | head -n 15"
 BASH
 
-chmod +x /root/fix_nginx_wolverine_static_level_safe_v4.sh
-OUT_DIR="/var/www/wolverine" /root/fix_nginx_wolverine_static_level_safe_v4.sh fireinners.online
+chmod +x /root/rebuild_nginx_fireinners_ssl.sh
+/root/rebuild_nginx_fireinners_ssl.sh fireinners.online
