@@ -1,16 +1,93 @@
-APPLY=0 /root/batch_root_wolverine_next_server.sh fireinners.online
+cat >/root/patch_nginx_wolverine_proxy.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
 
+APPLY="${APPLY:-1}"                 # 0=dry-run, 1=apply
+DOMAIN="${1:-fireinners.online}"
+PORT="${PORT:-3001}"
 
+ts(){ date +%Y%m%d_%H%M%S; }
+say(){ echo "[$(ts)] $*"; }
 
+VHOST="/etc/nginx/sites-enabled/${DOMAIN}-ssl"
+[[ -f "$VHOST" ]] || { echo "[ERR] VHOST not found: $VHOST"; exit 1; }
 
-APPLY=1 /root/batch_root_wolverine_next_server.sh fireinners.online
+BACKDIR="/etc/nginx/sites-disabled/backup_wolverine_proxy_$(ts)"
+mkdir -p "$BACKDIR"
+cp -a "$VHOST" "$BACKDIR/$(basename "$VHOST")"
+say "Backup -> $BACKDIR/$(basename "$VHOST")"
 
+START="# === wolverine_next_proxy START ==="
+END="# === wolverine_next_proxy END ==="
 
+read -r -d '' BLOCK <<EOF || true
+    $START
+    location ^~ /wolverine/ {
+        proxy_pass http://127.0.0.1:${PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+    $END
+EOF
 
+# 1) remove old injected proxy block if exists (idempotent)
+perl -0777 -i -pe "s/\\n\\s*\\Q$START\\E.*?\\Q$END\\E\\s*\\n/\\n/sg" "$VHOST"
 
+# 2) inject into SSL server (first server{} that contains listen 443)
+tmp="$(mktemp)"
+awk -v block="$BLOCK" '
+function cnt(s,c, i,n){ n=0; for(i=1;i<=length(s);i++) if(substr(s,i,1)==c) n++; return n }
+BEGIN{ srv=0; ssl=0; depth=0; inserted=0 }
+{
+  line=$0
+  if(line ~ /^[[:space:]]*server[[:space:]]*\{/){ srv=1; ssl=0; depth=0 }
 
-systemctl status wolverine-next --no-pager | head -n 30
-curl -sSI https://fireinners.online/wolverine/ | head -n 12
+  if(srv){
+    depth += cnt(line,"{"); depth -= cnt(line,"}")
+    if(line ~ /listen[[:space:]]+443/){ ssl=1 }
+  }
 
+  # inject right before the closing brace of the ssl server
+  if(srv && ssl && !inserted && depth==0 && line ~ /^[[:space:]]*\}/){
+    print block
+    inserted=1
+    print line
+    srv=0
+    next
+  }
 
+  print line
 
+  if(srv && depth==0 && line ~ /^[[:space:]]*\}/){ srv=0 }
+}
+END{
+  if(!inserted){ print "##ERR## could not inject into ssl server" > "/dev/stderr"; exit 3 }
+}
+' "$VHOST" > "$tmp"
+
+if [[ "$APPLY" == "0" ]]; then
+  say "DRY-RUN diff:"
+  diff -u "$VHOST" "$tmp" || true
+  rm -f "$tmp"
+  exit 0
+fi
+
+cp -a "$tmp" "$VHOST"
+rm -f "$tmp"
+
+say "nginx -t ..."
+nginx -t
+systemctl reload nginx
+say "OK: nginx reloaded"
+
+say "Test:"
+echo "  curl -sSI https://${DOMAIN}/wolverine/ | head -n 12"
+BASH
+
+chmod +x /root/patch_nginx_wolverine_proxy.sh
+/root/patch_nginx_wolverine_proxy.sh fireinners.online
