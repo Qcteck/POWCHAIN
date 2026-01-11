@@ -1,2 +1,113 @@
-systemctl status wolverine-next --no-pager | head -n 25
-curl -sSI https://fireinners.online/wolverine/ | head -n 15
+cat >/root/fix_duplicate_wolverine_location.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+DOMAIN="${1:-fireinners.online}"
+PORT="${PORT:-3001}"
+
+VHOST="/etc/nginx/sites-enabled/${DOMAIN}-ssl"
+[[ -f "$VHOST" ]] || { echo "[ERR] VHOST not found: $VHOST"; exit 1; }
+
+ts(){ date +%Y%m%d_%H%M%S; }
+say(){ echo "[$(ts)] $*"; }
+
+BACKDIR="/etc/nginx/sites-disabled/backup_wolverine_loc_${ts}"
+mkdir -p "$BACKDIR"
+cp -a "$VHOST" "$BACKDIR/$(basename "$VHOST")"
+say "Backup -> $BACKDIR/$(basename "$VHOST")"
+
+START="# === wolverine_next_proxy START ==="
+END="# === wolverine_next_proxy END ==="
+
+read -r -d '' PROXY_BLOCK <<EOF || true
+    $START
+    location ^~ /wolverine/ {
+        proxy_pass http://127.0.0.1:${PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+    $END
+EOF
+
+tmp="$(mktemp)"
+
+awk -v proxy_block="$PROXY_BLOCK" -v start="$START" -v end="$END" '
+function cnt(s,c, i,n){ n=0; for(i=1;i<=length(s);i++) if(substr(s,i,1)==c) n++; return n }
+BEGIN{
+  in_srv=0; is_ssl=0; srv_depth=0;
+  in_loc_rm=0; loc_depth=0;
+  inserted=0;
+}
+{
+  line=$0
+
+  # remove old injected proxy block if present
+  if(line ~ start){ skip_proxy=1; next }
+  if(skip_proxy){
+    if(line ~ end){ skip_proxy=0 }
+    next
+  }
+
+  # detect server blocks
+  if(line ~ /^[[:space:]]*server[[:space:]]*\{/){
+    in_srv=1; is_ssl=0; srv_depth=0
+  }
+
+  if(in_srv){
+    srv_depth += cnt(line,"{") - cnt(line,"}")
+    if(line ~ /listen[[:space:]]+443/){ is_ssl=1 }
+  }
+
+  # within ssl server: remove existing location ^~ /wolverine/ { ... } (alias block)
+  if(in_srv && is_ssl && !in_loc_rm && line ~ /^[[:space:]]*location[[:space:]]+\^~[[:space:]]+\/wolverine\/[[:space:]]*\{/){
+    in_loc_rm=1
+    loc_depth = cnt(line,"{") - cnt(line,"}")
+    next
+  }
+  if(in_loc_rm){
+    loc_depth += cnt(line,"{") - cnt(line,"}")
+    if(loc_depth <= 0){ in_loc_rm=0 }
+    next
+  }
+
+  # inject proxy block before closing brace of ssl server
+  if(in_srv && is_ssl && !inserted && srv_depth==0 && line ~ /^[[:space:]]*\}/){
+    print proxy_block
+    inserted=1
+    print line
+    in_srv=0
+    next
+  }
+
+  print line
+
+  if(in_srv && srv_depth==0 && line ~ /^[[:space:]]*\}/){ in_srv=0 }
+}
+END{
+  if(!inserted){
+    print "##ERR## could not inject into ssl server" > "/dev/stderr"
+    exit 3
+  }
+}
+' "$VHOST" > "$tmp"
+
+cp -a "$tmp" "$VHOST"
+rm -f "$tmp"
+
+say "nginx -t ..."
+nginx -t
+systemctl reload nginx
+say "OK: nginx reloaded"
+
+say "Quick tests:"
+echo "  curl -sSI https://${DOMAIN}/wolverine/ | head -n 12"
+echo "  curl -sSI https://${DOMAIN}/favicon.ico | head -n 12"
+BASH
+
+chmod +x /root/fix_duplicate_wolverine_location.sh
+/root/fix_duplicate_wolverine_location.sh fireinners.online
