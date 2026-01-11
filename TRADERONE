@@ -1,14 +1,15 @@
-cat >/root/fix_solana_rpc_proxy_pass_path.sh <<'BASH'
+cat >/root/fix_duplicate_location_solana_rpc_global.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
+DOMAIN="fireinners.online"
 SNIP="/etc/nginx/snippets/solana_rpc_proxy.conf"
 ts="$(date +%Y%m%d_%H%M%S)"
 
 mkdir -p /etc/nginx/snippets
 
+echo "== 1) Write SINGLE canonical snippet (with trailing /) =="
 cp -a "$SNIP" "${SNIP}.bak_${ts}" 2>/dev/null || true
-
 cat >"$SNIP" <<'NGINX'
 # Solana RPC proxy (avoid browser CORS)
 # IMPORTANT: trailing "/" so upstream path becomes "/" (not "/solana-rpc")
@@ -23,16 +24,73 @@ location = /solana-rpc {
   if ($request_method = OPTIONS) { return 204; }
 }
 NGINX
-
-nginx -t
-systemctl reload nginx
+echo "[OK] snippet -> $SNIP"
 
 echo
-echo "RPC test (should return version):"
-curl -sk --resolve fireinners.online:443:127.0.0.1 https://fireinners.online/solana-rpc \
+echo "== 2) Remove ANY inline 'location = /solana-rpc { ... }' everywhere (keep snippet only) =="
+for f in /etc/nginx/sites-available/* /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf; do
+  [[ -f "$f" ]] || continue
+  if grep -qE 'location\s*=\s*/solana-rpc\s*\{' "$f"; then
+    cp -a "$f" "${f}.bak_${ts}"
+    perl -0777 -i -pe 's/\n\s*location\s*=\s*\/solana-rpc\s*\{.*?\}\s*\n/\n/sg' "$f"
+    echo "  - removed inline block from: $f"
+  fi
+done
+
+echo
+echo "== 3) Find ACTIVE SSL vhost for $DOMAIN (443) =="
+VHOST="$(
+nginx -T 2>/dev/null | awk -v dom="$DOMAIN" '
+  /^# configuration file /{f=$4; sub(/:$/,"",f)}
+  /server\s*\{/ {insrv=1; has443=0; hasdom=0; file=f}
+  insrv && /listen\s+(\[::\]:)?443/ {has443=1}
+  insrv && /server_name/ && $0 ~ dom {hasdom=1}
+  insrv && /\}/ { if(has443 && hasdom){ print file; exit } insrv=0 }
+'
+)"
+[[ -n "${VHOST:-}" && -f "$VHOST" ]] || { echo "[ERR] can't find active 443 vhost for $DOMAIN"; exit 1; }
+cp -a "$VHOST" "${VHOST}.bak_${ts}"
+echo "[OK] SSL VHOST: $VHOST"
+
+echo
+echo "== 4) Ensure snippet include exists ONCE in SSL vhost =="
+# remove duplicate include lines (exact)
+tmp="/tmp/vhost.$$"
+awk '{
+  if($0=="  include /etc/nginx/snippets/solana_rpc_proxy.conf;"){
+    if(seen){next} else {seen=1}
+  }
+  print
+}' "$VHOST" >"$tmp"
+cat "$tmp" >"$VHOST"
+rm -f "$tmp"
+
+# add include if missing
+if ! grep -qF "include /etc/nginx/snippets/solana_rpc_proxy.conf;" "$VHOST"; then
+  sed -i "/server_name .*${DOMAIN}/a\\
+  include /etc/nginx/snippets/solana_rpc_proxy.conf;
+" "$VHOST"
+  echo "[OK] include added"
+else
+  echo "[OK] include already present"
+fi
+
+echo
+echo "== 5) nginx test + reload =="
+nginx -t
+systemctl reload nginx
+echo "[OK] nginx reloaded"
+
+echo
+echo "== 6) RPC test (should return solana-core version) =="
+curl -sk --resolve ${DOMAIN}:443:127.0.0.1 https://${DOMAIN}/solana-rpc \
   -H 'Content-Type: application/json' \
   --data '{"jsonrpc":"2.0","id":1,"method":"getVersion"}' && echo
+
+echo
+echo "== 7) Quick audit (where solana-rpc still appears) =="
+grep -RIn --line-number 'solana-rpc' /etc/nginx | head -n 80 || true
 BASH
 
-chmod +x /root/fix_solana_rpc_proxy_pass_path.sh
-/root/fix_solana_rpc_proxy_pass_path.sh
+chmod +x /root/fix_duplicate_location_solana_rpc_global.sh
+/root/fix_duplicate_location_solana_rpc_global.sh
