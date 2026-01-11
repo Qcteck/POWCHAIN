@@ -1,13 +1,24 @@
-cat >/root/fix_cf_servername_and_rpc.sh <<'BASH'
+cat >/root/fix_ssl_vhost_and_solana_rpc.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
 DOMAIN="fireinners.online"
-DIS="/etc/nginx/disabled-sites"
-SNIP="/etc/nginx/snippets/solana_rpc_proxy.conf"
-mkdir -p "$DIS" /etc/nginx/snippets
+CERT="/etc/ssl/fireinners/fullchain.pem"
+KEY="/etc/ssl/fireinners/privkey.pem"
 
-echo "== 1) Move backups out of sites-enabled (stop conflicting server_name) =="
+HTTP_AV="/etc/nginx/sites-available/fireinners.online-http"
+HTTP_EN="/etc/nginx/sites-enabled/fireinners.online-http"
+
+SSL_AV="/etc/nginx/sites-available/fireinners.online-ssl"
+SSL_EN="/etc/nginx/sites-enabled/fireinners.online-ssl"
+
+SNIP="/etc/nginx/snippets/solana_rpc_proxy.conf"
+DIS="/etc/nginx/disabled-sites"
+ts="$(date +%Y%m%d_%H%M%S)"
+
+mkdir -p /etc/nginx/snippets /etc/nginx/sites-available /etc/nginx/sites-enabled "$DIS"
+
+echo "== 0) Move backups out of sites-enabled (avoid conflicts) =="
 shopt -s nullglob
 for f in /etc/nginx/sites-enabled/*.bak* /etc/nginx/sites-enabled/*_bak_* /etc/nginx/sites-enabled/*backup*; do
   echo "MOVE $f -> $DIS/"
@@ -16,19 +27,19 @@ done
 shopt -u nullglob
 
 echo
-echo "== 2) Find ACTIVE SSL vhost file for $DOMAIN (443) =="
-VHOST="$(
-nginx -T 2>/dev/null | awk -v dom="$DOMAIN" '
-  /^# configuration file /{f=$4; sub(/:$/,"",f)}
-  /server_name/ && $0 ~ dom {cand=f}
-  /listen\s+(\[::\]:)?443/ && cand!="" {print cand; exit}
-'
-)"
-[[ -n "${VHOST:-}" && -f "$VHOST" ]] || { echo "[ERR] vhost 443 introuvable pour $DOMAIN"; exit 1; }
-echo "[OK] VHOST: $VHOST"
+echo "== 1) Ensure HTTP vhost is ONLY :80 redirect to https =="
+cat >"$HTTP_AV" <<NGINX
+server {
+  listen 80;
+  listen [::]:80;
+  server_name ${DOMAIN} www.${DOMAIN};
+  return 301 https://\$host\$request_uri;
+}
+NGINX
+ln -sf "$HTTP_AV" "$HTTP_EN"
 
 echo
-echo "== 3) Write snippet /solana-rpc =="
+echo "== 2) Write /solana-rpc snippet =="
 cat >"$SNIP" <<'NGINX'
 location = /solana-rpc {
   proxy_pass https://api.mainnet-beta.solana.com;
@@ -41,16 +52,41 @@ location = /solana-rpc {
   if ($request_method = OPTIONS) { return 204; }
 }
 NGINX
-echo "[OK] wrote $SNIP"
 
 echo
-echo "== 4) Ensure include is in the ACTIVE SSL vhost (not a .bak) =="
-if ! grep -qF "include /etc/nginx/snippets/solana_rpc_proxy.conf;" "$VHOST"; then
-  sed -i '/server_name .*fireinners\.online/ a\  include /etc/nginx/snippets/solana_rpc_proxy.conf;' "$VHOST"
-  echo "[OK] include injected"
-else
-  echo "[OK] include already present"
+echo "== 3) Ensure cert exists (create self-signed if missing) =="
+if [[ ! -f "$CERT" || ! -f "$KEY" ]]; then
+  mkdir -p /etc/ssl/fireinners
+  openssl req -x509 -nodes -newkey rsa:2048 -days 365 \
+    -keyout "$KEY" -out "$CERT" \
+    -subj "/CN=$DOMAIN"
 fi
+
+echo
+echo "== 4) Create/force REAL SSL vhost :443 for $DOMAIN (and include solana-rpc) =="
+cat >"$SSL_AV" <<NGINX
+server {
+  listen 443 ssl http2;
+  listen [::]:443 ssl http2;
+  server_name ${DOMAIN} www.${DOMAIN};
+
+  ssl_certificate     ${CERT};
+  ssl_certificate_key ${KEY};
+
+  include /etc/nginx/snippets/solana_rpc_proxy.conf;
+
+  root /var/www;
+  index index.html;
+
+  location = / { return 301 /wolverine/; }
+  location = /wolverine { return 301 /wolverine/; }
+
+  location ^~ /wolverine/ {
+    try_files \$uri \$uri/ /wolverine/index.html;
+  }
+}
+NGINX
+ln -sf "$SSL_AV" "$SSL_EN"
 
 echo
 echo "== 5) nginx test + reload =="
@@ -59,11 +95,11 @@ systemctl reload nginx
 echo "[OK] nginx reloaded"
 
 echo
-echo "== 6) CORRECT RPC test (with Host = $DOMAIN) =="
+echo "== 6) RPC test (MUST be ok) =="
 curl -sk --resolve ${DOMAIN}:443:127.0.0.1 https://${DOMAIN}/solana-rpc \
   -H 'Content-Type: application/json' \
   --data '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' && echo
 BASH
 
-chmod +x /root/fix_cf_servername_and_rpc.sh
-/root/fix_cf_servername_and_rpc.sh
+chmod +x /root/fix_ssl_vhost_and_solana_rpc.sh
+/root/fix_ssl_vhost_and_solana_rpc.sh
