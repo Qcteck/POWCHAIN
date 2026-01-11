@@ -1,56 +1,47 @@
-cat >/root/patch_phantom_static_html.sh <<'BASH'
+cat >/root/patch_phantom_live_wolverine.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
 DOMAIN="${1:-fireinners.online}"
 
-echo "[*] Searching /wolverine index.html ..."
+# 1) trouver le vrai index servi
+TARGET=""
 
-# Cherche un index.html probable
-CANDIDATES=()
-while IFS= read -r f; do CANDIDATES+=("$f"); done < <(
-  find /var/www /usr/share/nginx/html /srv/www /opt /home -type f -name "index.html" 2>/dev/null \
-  | grep -E "/wolverine/|/wolverine$" || true
-)
+# priorité : emplacements classiques
+for f in \
+  /var/www/wolverine/index.html \
+  /usr/share/nginx/html/wolverine/index.html \
+  /srv/www/wolverine/index.html; do
+  if [[ -f "$f" ]]; then TARGET="$f"; break; fi
+done
 
-# Fallback: cherche n'importe quel index.html qui contient "Wolverine"
-if [[ ${#CANDIDATES[@]} -eq 0 ]]; then
-  while IFS= read -r f; do CANDIDATES+=("$f"); done < <(
-    grep -RIl --include="index.html" "Wolverine" /var/www /usr/share/nginx/html /srv/www /opt /home 2>/dev/null | head -n 30 || true
-  )
+# fallback : cherche un index.html qui contient "Wolverine" ET "Connect Phantom" (hors dossiers backup)
+if [[ -z "$TARGET" ]]; then
+  TARGET="$(grep -RIl --include="index.html" -E "Wolverine|TraderOne" /var/www /usr/share/nginx/html /srv/www 2>/dev/null \
+    | grep -vi "_backup" | while read -r f; do
+        if grep -qi "Connect Phantom" "$f" 2>/dev/null; then echo "$f"; break; fi
+      done)"
 fi
 
-if [[ ${#CANDIDATES[@]} -eq 0 ]]; then
-  echo "[ERR] Impossible de trouver index.html pour /wolverine."
-  echo "Donne-moi le path exact du fichier (ex: /var/www/wolverine/index.html)."
+if [[ -z "$TARGET" || ! -f "$TARGET" ]]; then
+  echo "[ERR] Impossible de trouver le vrai index.html servi pour /wolverine/"
+  echo "Donne-moi le path exact (ex: /var/www/wolverine/index.html)."
   exit 1
 fi
 
-# Choisit celui qui ressemble le plus à ta page (contient "Connect Phantom")
-TARGET=""
-for f in "${CANDIDATES[@]}"; do
-  if grep -qi "Connect Phantom" "$f" 2>/dev/null; then TARGET="$f"; break; fi
-done
-
-# Sinon prend le 1er
-[[ -n "$TARGET" ]] || TARGET="${CANDIDATES[0]}"
-
 echo "[*] TARGET=$TARGET"
 
-# Backup
+# 2) backup
 ts="$(date +%Y%m%d_%H%M%S)"
 cp -a "$TARGET" "${TARGET}.bak_${ts}"
 echo "[OK] Backup -> ${TARGET}.bak_${ts}"
 
-# Déjà patché ?
+# 3) patch idempotent
 if grep -q "PHANTOM_CONNECT_PATCH" "$TARGET"; then
-  echo "[OK] Patch déjà présent."
-  exit 0
-fi
-
-# Inject JS avant </body>
-perl -0777 -i -pe '
-my $js = qq{
+  echo "[OK] Patch déjà présent dans le fichier LIVE."
+else
+  perl -0777 -i -pe '
+  my $js = qq{
 <!-- PHANTOM_CONNECT_PATCH -->
 <script>
 (function(){
@@ -100,18 +91,19 @@ my $js = qq{
 </script>
 <!-- /PHANTOM_CONNECT_PATCH -->
 };
-s@</body>@$js\n</body>@i or die "ERR: </body> introuvable\n";
-' "$TARGET"
+  s@</body>@$js\n</body>@i or die "ERR: </body> introuvable\n";
+  ' "$TARGET"
+  echo "[OK] JS injecté dans le fichier LIVE."
+fi
 
-echo "[OK] JS injecté."
-
+# 4) reload nginx
 nginx -t
 systemctl reload nginx
 echo "[OK] nginx reloaded"
+
 echo
-echo "✅ Maintenant teste dans TON navigateur (avec l’extension Phantom):"
-echo "   https://${DOMAIN}/wolverine/"
+echo "✅ Test dans TON navigateur (avec Phantom): https://${DOMAIN}/wolverine/"
 BASH
 
-chmod +x /root/patch_phantom_static_html.sh
-/root/patch_phantom_static_html.sh fireinners.online
+chmod +x /root/patch_phantom_live_wolverine.sh
+/root/patch_phantom_live_wolverine.sh fireinners.online
