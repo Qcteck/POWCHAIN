@@ -1,55 +1,223 @@
-cat >/root/patch_wolverine_phantom_auto.sh <<'BASH'
+cat >/root/patch_walletphantom_toggle_devnet.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
 APP_DIR="${APP_DIR:-/opt/_wolverine_next_src}"
+OUT_DIR="${OUT_DIR:-/var/www/wolverine}"
+DOMAIN="${DOMAIN:-fireinners.online}"
+WOLVERINE_WALLET="${WOLVERINE_WALLET:-DgpM2PXA9it1g8myWnVXeosu72GkwmjgpeGUigpyLkYC}"
+
+# Devnet USDC mint (optionnel). Mets TON mint si tu en utilises un.
+USDC_DEVNET_MINT="${USDC_DEVNET_MINT:-}"
+
 cd "$APP_DIR"
 
-pick_target() {
-  local base="$1"
-  for ext in jsx js tsx ts; do
-    [[ -f "pages/${base}.${ext}" ]] && { echo "pages/${base}.${ext}"; return 0; }
-    [[ -f "pages/${base}/index.${ext}" ]] && { echo "pages/${base}/index.${ext}"; return 0; }
-  done
-  return 1
-}
+npm i @solana/web3.js @solana/spl-token
 
-TARGET=""
-TARGET="$(pick_target wallet || true)"
-[[ -n "$TARGET" ]] || TARGET="$(pick_target trade || true)"
+mkdir -p lib components
+ts="$(date +%Y%m%d_%H%M%S)"
+mkdir -p "/root/backup_toggle_$ts"
+cp -a components/WalletPhantom.jsx "/root/backup_toggle_$ts/WalletPhantom.jsx.bak" 2>/dev/null || true
+cp -a lib/solana.js "/root/backup_toggle_$ts/solana.js.bak" 2>/dev/null || true
 
-if [[ -z "$TARGET" ]]; then
-  echo "[ERR] Pas de page wallet/trade trouvée."
-  echo "Check: ls -la pages | sed -n '1,120p'"
-  exit 1
-fi
+cat > lib/solana.js <<EOF
+import { Connection, PublicKey } from "@solana/web3.js";
 
-echo "[OK] Target=$TARGET"
-cp -a "$TARGET" "/root/backup_$(date +%Y%m%d_%H%M%S)_$(basename "$TARGET")"
+export const MAINNET_RPC = "https://api.mainnet-beta.solana.com";
+export const DEVNET_RPC  = "https://api.devnet.solana.com";
 
-# Overwrite page to mount Phantom (client-only)
-cat > "$TARGET" <<'EOF'
-import dynamic from "next/dynamic";
-const WalletPhantom = dynamic(() => import("../components/WalletPhantom"), { ssr: false });
+export const WOLVERINE_WALLET = new PublicKey("${WOLVERINE_WALLET}");
 
-export default function Page() {
+// mainnet USDC officiel
+export const USDC_MAINNET_MINT = new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
+
+// devnet USDC (optionnel)
+export const USDC_DEVNET_MINT_STR = "${USDC_DEVNET_MINT}";
+EOF
+
+cat > components/WalletPhantom.jsx <<'EOF'
+"use client";
+import React, { useEffect, useMemo, useState } from "react";
+import { PublicKey, SystemProgram, Transaction, LAMPORTS_PER_SOL, Connection } from "@solana/web3.js";
+import {
+  getAssociatedTokenAddress,
+  createAssociatedTokenAccountInstruction,
+  createTransferInstruction,
+} from "@solana/spl-token";
+import {
+  MAINNET_RPC, DEVNET_RPC,
+  WOLVERINE_WALLET,
+  USDC_MAINNET_MINT,
+  USDC_DEVNET_MINT_STR
+} from "../lib/solana";
+
+const getPhantom = () => {
+  const w = window;
+  return w?.solana?.isPhantom ? w.solana : null;
+};
+
+export default function WalletPhantom() {
+  const phantom = useMemo(() => (typeof window !== "undefined" ? getPhantom() : null), []);
+  const [net, setNet] = useState("devnet"); // ✅ Devnet par défaut
+  const [connection, setConnection] = useState(new Connection(DEVNET_RPC, "confirmed"));
+  const [usdcMint, setUsdcMint] = useState(null);
+
+  const [pk, setPk] = useState("");
+  const [sol, setSol] = useState(0);
+  const [usdc, setUsdc] = useState(0);
+  const [loading, setLoading] = useState(false);
+  const [sendSolAmount, setSendSolAmount] = useState("0.01");
+  const [sendUsdcAmount, setSendUsdcAmount] = useState("1");
+
+  function applyNetwork(nextNet) {
+    const rpc = nextNet === "mainnet" ? MAINNET_RPC : DEVNET_RPC;
+    setNet(nextNet);
+    setConnection(new Connection(rpc, "confirmed"));
+
+    if (nextNet === "mainnet") {
+      setUsdcMint(USDC_MAINNET_MINT);
+    } else {
+      // devnet USDC optionnel
+      try {
+        setUsdcMint(USDC_DEVNET_MINT_STR ? new PublicKey(USDC_DEVNET_MINT_STR) : null);
+      } catch {
+        setUsdcMint(null);
+      }
+    }
+    try { localStorage.setItem("wolv_net", nextNet); } catch {}
+  }
+
+  async function refresh(owner) {
+    const lamports = await connection.getBalance(owner, "confirmed");
+    setSol(lamports / LAMPORTS_PER_SOL);
+
+    if (!usdcMint) { setUsdc(0); return; }
+    const ata = await getAssociatedTokenAddress(usdcMint, owner, false);
+    const bal = await connection.getTokenAccountBalance(ata).catch(() => null);
+    setUsdc(bal ? Number(bal.value.uiAmount ?? 0) : 0);
+  }
+
+  async function connect() {
+    if (!phantom) return alert("Phantom non détecté.");
+    const res = await phantom.connect();
+    setPk(res.publicKey.toBase58());
+    await refresh(res.publicKey);
+  }
+
+  async function sendSOL() {
+    if (!phantom?.publicKey) return;
+    setLoading(true);
+    try {
+      const from = phantom.publicKey;
+      const lamports = Math.round(Number(sendSolAmount) * LAMPORTS_PER_SOL);
+      const tx = new Transaction().add(
+        SystemProgram.transfer({ fromPubkey: from, toPubkey: WOLVERINE_WALLET, lamports })
+      );
+      tx.feePayer = from;
+      tx.recentBlockhash = (await connection.getLatestBlockhash("confirmed")).blockhash;
+      const { signature } = await phantom.signAndSendTransaction(tx);
+      await connection.confirmTransaction(signature, "confirmed");
+      await refresh(from);
+      alert(`SOL envoyé ✅ tx: ${signature}`);
+    } finally { setLoading(false); }
+  }
+
+  async function sendUSDC() {
+    if (!phantom?.publicKey) return;
+    if (!usdcMint) return alert("USDC devnet non configuré (mint manquant).");
+    setLoading(true);
+    try {
+      const owner = phantom.publicKey;
+      const fromAta = await getAssociatedTokenAddress(usdcMint, owner, false);
+      const toAta = await getAssociatedTokenAddress(usdcMint, WOLVERINE_WALLET, false);
+
+      const baseUnits = BigInt(Math.round(Number(sendUsdcAmount) * 1_000_000)); // 6 décimales
+      const ixs = [];
+      const toInfo = await connection.getAccountInfo(toAta).catch(() => null);
+      if (!toInfo) ixs.push(createAssociatedTokenAccountInstruction(owner, toAta, WOLVERINE_WALLET, usdcMint));
+      ixs.push(createTransferInstruction(fromAta, toAta, owner, baseUnits));
+
+      const tx = new Transaction().add(...ixs);
+      tx.feePayer = owner;
+      tx.recentBlockhash = (await connection.getLatestBlockhash("confirmed")).blockhash;
+      const { signature } = await phantom.signAndSendTransaction(tx);
+      await connection.confirmTransaction(signature, "confirmed");
+      await refresh(owner);
+      alert(`USDC envoyé ✅ tx: ${signature}`);
+    } finally { setLoading(false); }
+  }
+
+  useEffect(() => {
+    // init network from localStorage (sinon devnet)
+    try {
+      const saved = localStorage.getItem("wolv_net");
+      applyNetwork(saved === "mainnet" ? "mainnet" : "devnet");
+    } catch {
+      applyNetwork("devnet");
+    }
+
+    (async () => {
+      if (!phantom) return;
+      try {
+        const res = await phantom.connect({ onlyIfTrusted: true });
+        setPk(res.publicKey.toBase58());
+        await refresh(res.publicKey);
+      } catch {}
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   return (
-    <div style={{ padding: 12 }}>
-      <WalletPhantom />
-    </div>
+    <>
+      <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+        <button className={"btn " + (net==="devnet" ? "" : "ghost")} onClick={()=>applyNetwork("devnet")}>Devnet</button>
+        <button className={"btn " + (net==="mainnet" ? "" : "ghost")} onClick={()=>applyNetwork("mainnet")}>Mainnet</button>
+      </div>
+
+      {!pk ? (
+        <>
+          <div className="muted">Not connected</div>
+          <button className="btn ghost" onClick={connect}>Connect Phantom</button>
+          <div className="muted small" style={{ marginTop: 10 }}>Network: <code>{net}</code></div>
+        </>
+      ) : (
+        <>
+          <div className="muted small">Connected</div>
+          <div style={{ wordBreak: "break-all" }}><b>{pk}</b></div>
+          <div className="muted" style={{ marginTop: 8 }}>
+            <div><b>SOL:</b> {sol.toFixed(6)}</div>
+            <div><b>USDC:</b> {usdc.toFixed(2)} {net==="devnet" && !usdcMint ? "(mint devnet manquant)" : ""}</div>
+          </div>
+
+          <div className="muted small" style={{ marginTop: 10 }}>
+            Destination: <code style={{ wordBreak: "break-all" }}>{WOLVERINE_WALLET.toBase58()}</code>
+          </div>
+
+          <div style={{ marginTop: 10 }}>
+            <b>Send SOL</b><br />
+            <input value={sendSolAmount} onChange={(e)=>setSendSolAmount(e.target.value)} />
+            <button className="btn" disabled={loading} onClick={sendSOL} style={{ marginLeft: 8 }}>Send</button>
+          </div>
+
+          <div style={{ marginTop: 10 }}>
+            <b>Send USDC</b><br />
+            <input value={sendUsdcAmount} onChange={(e)=>setSendUsdcAmount(e.target.value)} />
+            <button className="btn" disabled={loading} onClick={sendUSDC} style={{ marginLeft: 8 }}>Send</button>
+          </div>
+        </>
+      )}
+    </>
   );
 }
 EOF
 
 npm run build
-rsync -a --delete out/ /var/www/wolverine/
+rsync -a --delete out/ "$OUT_DIR/"
 nginx -t && systemctl reload nginx
 
-echo "✅ OK: Phantom injecté dans $TARGET"
-echo "👉 Test:"
-echo "  https://fireinners.online/wolverine/wallet/"
-echo "  https://fireinners.online/wolverine/trade/"
+echo "✅ OK: toggle Devnet/Mainnet ajouté (Devnet par défaut)"
+echo "Test: https://${DOMAIN}/wolverine/"
 BASH
 
-chmod +x /root/patch_wolverine_phantom_auto.sh
-/root/patch_wolverine_phantom_auto.sh
+chmod +x /root/patch_walletphantom_toggle_devnet.sh
+/root/patch_walletphantom_toggle_devnet.sh
