@@ -1,38 +1,176 @@
-cat >/root/nginx_stub_traderone_api.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
+TS="$(date -u +%Y%m%d-%H%M%S)"
+OUT="/root/asan_report_${TS}.json"
 
-CONF="/etc/nginx/conf.d/wolverine_traderone_api_stub.conf"
+HOST="$(hostname 2>/dev/null || echo unknown)"
+KERNEL="$(uname -sr 2>/dev/null || echo unknown)"
+UPTIME="$(uptime -p 2>/dev/null || echo unknown)"
 
-cat >"$CONF" <<'NGINX'
-# Stub endpoints to prevent UI crash when backend isn't ready yet
-location = /wolverine/traderone/api/me {
-  default_type application/json;
-  return 200 '{"ok":true,"me":{"id":"guest","wallet":null}}';
+want_files=(
+  "/etc/nginx/nginx.conf"
+  "/etc/nginx/sites-available/fireinners.online-ssl"
+  "/opt/fireinners/CHARTE_FIREINNERS.md"
+  "/opt/fireinners/CHARTE_FIREINNERS.sha256"
+  "/opt/fireinners/frontend-react/app/dist/wolverine/index.html"
+  "/var/www/wolverine/index.html"
+)
+want_services=( "nginx" "fail2ban" )
+want_ports_tcp=( 22 80 443 3000 8484 )
+want_ports_udp=( 51820 )
+public_urls=(
+  "https://fireinners.online/"
+  "https://fireinners.online/wolverine/"
+)
+
+json_escape(){ python3 - <<'PY' "$1"
+import json,sys;print(json.dumps(sys.argv[1])[1:-1])
+PY
 }
 
-location = /wolverine/traderone/api/positions {
-  default_type application/json;
-  return 200 '{"ok":true,"positions":[]}';
+now_iso(){ date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+
+port_list_tcp(){ ss -lntp 2>/dev/null || true; }
+port_list_udp(){ ss -lnup 2>/dev/null || true; }
+
+svc_state(){
+  local s="$1"
+  systemctl is-active "$s" 2>/dev/null || echo "unknown"
 }
 
-location = /wolverine/traderone/api/orders {
-  default_type application/json;
-  return 200 '{"ok":true,"orders":[]}';
+file_stat(){
+  local f="$1"
+  if [ -f "$f" ]; then
+    local sz mt sh la
+    sz="$(stat -c %s "$f" 2>/dev/null || echo 0)"
+    mt="$(stat -c %Y "$f" 2>/dev/null || echo 0)"
+    sh="$(sha256sum "$f" 2>/dev/null | awk '{print $1}' || echo "")"
+    la="$(lsattr "$f" 2>/dev/null | awk '{print $1}' || echo "")"
+    echo "{\"path\":\"$(json_escape "$f")\",\"exists\":true,\"size\":$sz,\"mtime\":$mt,\"sha256\":\"$sh\",\"lsattr\":\"$(json_escape "$la")\"}"
+  else
+    echo "{\"path\":\"$(json_escape "$f")\",\"exists\":false}"
+  fi
 }
 
-location = /wolverine/traderone/api/pnl {
-  default_type application/json;
-  return 200 '{"ok":true,"pnl":{"total":0,"daily":0}}';
+check_ports(){
+  local proto="$1"; shift
+  local want=("$@")
+  local seen=""
+  if [ "$proto" = "tcp" ]; then
+    seen="$(ss -lntH 2>/dev/null | awk '{print $4}' | sed 's/.*://g' | sort -n | uniq | tr '\n' ' ' || true)"
+  else
+    seen="$(ss -lnuH 2>/dev/null | awk '{print $4}' | sed 's/.*://g' | sort -n | uniq | tr '\n' ' ' || true)"
+  fi
+  local miss=()
+  for p in "${want[@]}"; do
+    if ! echo " $seen " | grep -q " $p "; then miss+=("$p"); fi
+  done
+  python3 - <<PY "${miss[@]}"
+import json,sys;print(json.dumps(sys.argv[1:]))
+PY
 }
-NGINX
 
-nginx -t
-systemctl reload nginx
-echo "OK: stubs installed -> $CONF"
-echo "Test:"
-echo "  curl -s https://fireinners.online/wolverine/traderone/api/me"
-BASH
+curl_head(){
+  local u="$1"
+  local code="000"
+  local time="0"
+  if command -v curl >/dev/null 2>&1; then
+    local out
+    out="$(curl -k -I -m 6 -s -o /dev/null -w "%{http_code} %{time_total}" "$u" 2>/dev/null || true)"
+    code="$(echo "$out" | awk '{print $1}' || echo 000)"
+    time="$(echo "$out" | awk '{print $2}' || echo 0)"
+  fi
+  echo "{\"url\":\"$(json_escape "$u")\",\"http_code\":$code,\"time_total\":$time}"
+}
 
-chmod +x /root/nginx_stub_traderone_api.sh
-/root/nginx_stub_traderone_api.sh
+nginx_test(){
+  if command -v nginx >/dev/null 2>&1; then
+    if nginx -t >/dev/null 2>&1; then echo "{\"ok\":true}"
+    else echo "{\"ok\":false}"; fi
+  else
+    echo "{\"ok\":false}"
+  fi
+}
+
+score_compute(){
+  # score simple: base 100, pénalités sur manques/états
+  local score=100
+  local miss_files="$1" miss_tcp="$2" miss_udp="$3" bad_svcs="$4" bad_nginx="$5" bad_urls="$6"
+  score=$((score - miss_files*12 - miss_tcp*6 - miss_udp*6 - bad_svcs*10 - bad_nginx*15 - bad_urls*8))
+  if [ "$score" -lt 0 ]; then score=0; fi
+  echo "$score"
+}
+
+# Collect
+files_json=()
+miss_files=0
+for f in "${want_files[@]}"; do
+  j="$(file_stat "$f")"
+  files_json+=("$j")
+  if echo "$j" | grep -q '"exists":false'; then miss_files=$((miss_files+1)); fi
+done
+
+svcs_json=()
+bad_svcs=0
+for s in "${want_services[@]}"; do
+  st="$(svc_state "$s")"
+  svcs_json+=("{\"name\":\"$(json_escape "$s")\",\"state\":\"$(json_escape "$st")\"}")
+  if [ "$st" != "active" ]; then bad_svcs=$((bad_svcs+1)); fi
+done
+
+miss_tcp_json="$(check_ports tcp "${want_ports_tcp[@]}")"
+miss_udp_json="$(check_ports udp "${want_ports_udp[@]}")"
+miss_tcp_count="$(python3 - <<PY "$miss_tcp_json"
+import json,sys;print(len(json.loads(sys.argv[1])))
+PY
+)"
+miss_udp_count="$(python3 - <<PY "$miss_udp_json"
+import json,sys;print(len(json.loads(sys.argv[1])))
+PY
+)"
+
+ng_ok="$(nginx_test)"
+bad_nginx=0
+echo "$ng_ok" | grep -q '"ok":true' || bad_nginx=1
+
+urls_json=()
+bad_urls=0
+for u in "${public_urls[@]}"; do
+  r="$(curl_head "$u")"
+  urls_json+=("$r")
+  code="$(echo "$r" | python3 -c 'import sys,json;print(json.load(sys.stdin)["http_code"])')"
+  if [ "$code" -lt 200 ] || [ "$code" -ge 400 ]; then bad_urls=$((bad_urls+1)); fi
+done
+
+SCORE="$(score_compute "$miss_files" "$miss_tcp_count" "$miss_udp_count" "$bad_svcs" "$bad_nginx" "$bad_urls")"
+LEVEL="info"
+if [ "$SCORE" -lt 60 ]; then LEVEL="critical"
+elif [ "$SCORE" -lt 80 ]; then LEVEL="important"
+fi
+
+# Write JSON
+{
+  echo "{"
+  echo "\"ts\":\"$(now_iso)\","
+  echo "\"host\":\"$(json_escape "$HOST")\","
+  echo "\"kernel\":\"$(json_escape "$KERNEL")\","
+  echo "\"uptime\":\"$(json_escape "$UPTIME")\","
+  echo "\"score\":$SCORE,"
+  echo "\"level\":\"$LEVEL\","
+  echo "\"nginx_test\":$ng_ok,"
+  echo "\"services\":["
+  (IFS=,; echo "${svcs_json[*]}") || true
+  echo "],"
+  echo "\"wanted_files\":["
+  (IFS=,; echo "${files_json[*]}") || true
+  echo "],"
+  echo "\"missing_ports\":{\"tcp\":$miss_tcp_json,\"udp\":$miss_udp_json},"
+  echo "\"listen_tcp\":\"$(json_escape "$(port_list_tcp | head -n 200)")\","
+  echo "\"listen_udp\":\"$(json_escape "$(port_list_udp | head -n 200)")\","
+  echo "\"public\":["
+  (IFS=,; echo "${urls_json[*]}") || true
+  echo "]"
+  echo "}"
+} > "$OUT"
+
+echo "ASAN OK -> $OUT"
