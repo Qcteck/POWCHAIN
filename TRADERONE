@@ -1,75 +1,80 @@
-cat >/root/auto_map_traderone_api.sh <<'BASH'
+cat >/root/repair_nginx_traderone.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
 DOMAIN="${1:-fireinners.online}"
 VHOST="/etc/nginx/sites-enabled/${DOMAIN}-ssl"
 
-# Récupère l'upstream actuel depuis le vhost (proxy_pass ...;), sinon fallback
-UP="$(grep -oP 'proxy_pass\s+\Khttp[^;]+' "$VHOST" | head -n 1 || true)"
-UP="${UP:-http://127.0.0.1:9696}"
+# upstream actuel (si tu sais le port: API_UPSTREAM="http://127.0.0.1:9696")
+API_UPSTREAM="${API_UPSTREAM:-http://127.0.0.1:9696}"
 
 echo "[*] DOMAIN=$DOMAIN"
 echo "[*] VHOST=$VHOST"
-echo "[*] UPSTREAM=$UP"
+echo "[*] API_UPSTREAM=$API_UPSTREAM"
 
-code() { curl -s -o /dev/null -w "%{http_code}" "$1" || echo "000"; }
+# 1) Restore last backup of this vhost
+LAST_BAK="$(ls -1t /etc/nginx/sites-disabled/backup_*/*${DOMAIN}-ssl 2>/dev/null | head -n 1 || true)"
+if [[ -z "$LAST_BAK" ]]; then
+  echo "[ERR] Aucun backup trouvé dans /etc/nginx/sites-disabled/backup_*"
+  exit 1
+fi
+cp -a "$LAST_BAK" "$VHOST"
+echo "[OK] Restored from: $LAST_BAK"
 
-# On cherche une base qui existe réellement sur le backend
-CANDIDATES=(
-  "/" 
-  "/api/" "/api/ping" "/api/health" "/api/status"
-  "/health" "/ping" "/status"
-  "/traderone/api/" "/traderone/api/ping" "/traderone/api/health"
-  "/traderone/" "/traderone/ping"
-)
-
-BEST_BASE=""
-for p in "${CANDIDATES[@]}"; do
-  h="$(code "${UP}${p}")"
-  echo "  - probe ${UP}${p} => $h"
-  if [[ "$h" != "404" && "$h" != "000" ]]; then
-    # on préfère une base qui ressemble à l'API
-    if [[ "$p" == "/traderone/api/"* ]]; then BEST_BASE="/traderone/api/"; break; fi
-    if [[ "$p" == "/api/"* ]]; then BEST_BASE="/api/"; fi
-    [[ -z "$BEST_BASE" ]] && BEST_BASE="/"
-  fi
-done
-
-BEST_BASE="${BEST_BASE:-/}"
-echo
-echo "[*] BEST_BASE=$BEST_BASE"
-echo "[*] On va proxy /wolverine/traderone/api/ -> ${UP}${BEST_BASE}"
-
-# Backup
-ts="$(date +%Y%m%d_%H%M%S)"
-BACKDIR="/etc/nginx/sites-disabled/backup_map_${ts}"
-mkdir -p "$BACKDIR"
-cp -a "$VHOST" "$BACKDIR/$(basename "$VHOST")"
-echo "[OK] Backup -> $BACKDIR/$(basename "$VHOST")"
-
-# Patch proxy_pass dans le bloc traderone injecté (ou remplace un bloc existant)
+# 2) Patch SAFE: proxy /wolverine/traderone/api/ -> upstream, en stripant le prefix
+export API_UPSTREAM
 perl -0777 -i -pe '
-my $up = $ENV{UP};
-my $base = $ENV{BEST_BASE};
+my $up = $ENV{API_UPSTREAM} // die "missing API_UPSTREAM";
 
-# remplace proxy_pass dans location /wolverine/traderone/api/
-s@(location\s+\^\~\s+/wolverine/traderone/api/\s*\{.*?proxy_pass\s+)(http[^;]+)(;.*?)@${1}$up$base${3}@ms;
+# remove previous injected traderone blocks (if any)
+s/\n\s*# --- traderone api proxy \(injected\) ---.*?\n\s*# --- end traderone api proxy ---\n//ms;
 
-' UP="$UP" BEST_BASE="$BEST_BASE" "$VHOST"
+my $block = qq{
+  # --- traderone api proxy (injected) ---
+  location ^~ /wolverine/traderone/api/ {
+    # strip prefix so backend receives "/..." instead of "/wolverine/traderone/api/..."
+    rewrite ^/wolverine/traderone/api/?(.*)\$ /\$1 break;
 
+    if (\$request_method = OPTIONS) {
+      add_header Access-Control-Allow-Origin "*" always;
+      add_header Access-Control-Allow-Methods "GET,POST,PUT,PATCH,DELETE,OPTIONS" always;
+      add_header Access-Control-Allow-Headers "Authorization,Content-Type,Accept" always;
+      return 204;
+    }
+
+    proxy_pass $up;
+    proxy_http_version 1.1;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+
+    proxy_read_timeout 60s;
+    proxy_send_timeout 60s;
+  }
+  # --- end traderone api proxy ---
+};
+
+# insert before static /wolverine/ block
+s/\n(\s*location\s+\^\~\s+\/wolverine\/\s*\{)/\n$block\n$1/ms
+  or die "ERR: cannot find location ^~ /wolverine/ block\n";
+' "$VHOST"
+
+echo "[*] nginx -t"
 nginx -t
 systemctl reload nginx
 echo "[OK] nginx reloaded"
 
 echo
 echo "== Tests =="
-echo "-- Public:"
-curl -sSI "https://${DOMAIN}/wolverine/traderone/api/" | head -n 20 || true
+curl -sSI "https://${DOMAIN}/wolverine/traderone/api/" | head -n 12 || true
+curl -sSI -X POST "https://${DOMAIN}/wolverine/traderone/api/" | head -n 12 || true
 echo
-echo "-- Local (backend):"
-curl -sS "${UP}${BEST_BASE}" | head -n 5 || true
+echo "== Local upstream quick check =="
+curl -sS "${API_UPSTREAM}/" | head -n 5 || true
 BASH
 
-chmod +x /root/auto_map_traderone_api.sh
-/root/auto_map_traderone_api.sh fireinners.online
+chmod +x /root/repair_nginx_traderone.sh
+
+# lance (si ton backend est bien sur 9696)
+API_UPSTREAM="http://127.0.0.1:9696" /root/repair_nginx_traderone.sh fireinners.online
