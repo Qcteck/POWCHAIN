@@ -1,198 +1,63 @@
-cat >/root/fix_rpc_and_wallet_badge.sh <<'BASH'
+cat >/root/fix_solana_rpc_proxy_clean.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
 DOMAIN="fireinners.online"
-ROOT="/var/www/wolverine"
-JS="$ROOT/phantom_patch.js"
+SNIP="/etc/nginx/snippets/solana_rpc_proxy.conf"
 
-# 1) Trouver le vhost SSL qui sert fireinners.online
+# 1) Trouver le vhost SSL (443) qui sert fireinners.online
 VHOST="$(
 nginx -T 2>/dev/null | awk -v dom="$DOMAIN" '
-  /^# configuration file /{file=$4; sub(/:$/,"",file)}
-  /server_name/ && $0 ~ dom {cand=file}
+  /^# configuration file /{f=$4; sub(/:$/,"",f)}
+  /server_name/ && $0 ~ dom {cand=f}
   /listen\s+(\[::\]:)?443/ && cand!="" {print cand; exit}
 '
 )"
 [[ -n "${VHOST:-}" && -f "$VHOST" ]] || { echo "[ERR] vhost 443 introuvable pour $DOMAIN"; exit 1; }
 
 ts="$(date +%Y%m%d_%H%M%S)"
-cp -a "$VHOST" "${VHOST}.bak_${ts}" || true
-mkdir -p "$ROOT"
+cp -a "$VHOST" "${VHOST}.bak_${ts}"
+echo "[OK] VHOST: $VHOST (backup ${VHOST}.bak_${ts})"
 
-echo "[OK] SSL VHOST: $VHOST"
+mkdir -p /etc/nginx/snippets
 
-# 2) Injecter un endpoint SAME-ORIGIN /solana-rpc (évite CORS)
-#    (idempotent : on supprime l’ancien bloc si présent puis on remet propre)
-perl -0777 -i -pe '
-  s@\n\s*#\s*BEGIN_SOLANA_RPC_PROXY.*?#\s*END_SOLANA_RPC_PROXY\s*@@sg;
-' "$VHOST"
+# 2) Snippet /solana-rpc (same-origin, CORS OK)
+cat >"$SNIP" <<'NGINX'
+# Solana RPC proxy (avoid browser CORS)
+location = /solana-rpc {
+  proxy_pass https://api.mainnet-beta.solana.com;
+  proxy_ssl_server_name on;
+  proxy_set_header Host api.mainnet-beta.solana.com;
 
-perl -0777 -i -pe '
-  if($done==0){
-    s@(server\s*\{)@$1\n  # BEGIN_SOLANA_RPC_PROXY\n  location = /solana-rpc {\n    # Proxy Solana RPC (avoid browser CORS)\n    proxy_pass https://api.mainnet-beta.solana.com;\n    proxy_ssl_server_name on;\n    proxy_set_header Host api.mainnet-beta.solana.com;\n\n    # CORS\n    add_header Access-Control-Allow-Origin * always;\n    add_header Access-Control-Allow-Headers * always;\n    add_header Access-Control-Allow-Methods "POST, OPTIONS" always;\n    if ($request_method = OPTIONS) { return 204; }\n  }\n  # END_SOLANA_RPC_PROXY\n@se;
-    $done=1;
-  }
-' "$VHOST"
+  add_header Access-Control-Allow-Origin * always;
+  add_header Access-Control-Allow-Headers * always;
+  add_header Access-Control-Allow-Methods "POST, OPTIONS" always;
+  if ($request_method = OPTIONS) { return 204; }
+}
+NGINX
+echo "[OK] wrote $SNIP"
 
-# 3) Patch JS: utiliser /solana-rpc + badge safe (pas de modif DOM React)
-cat >"$JS" <<'JS'
-(function () {
-  const RPC = "/solana-rpc";              // <-- SAME ORIGIN (CORS OK)
-  const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-  const REFRESH_MS = 15000;
-  const short = (s) => (s ? s.slice(0, 4) + "…" + s.slice(-4) : "");
+# 3) Inject include inside the SSL server block (idempotent)
+if ! grep -qF "include /etc/nginx/snippets/solana_rpc_proxy.conf;" "$VHOST"; then
+  # Ajoute juste après la 1ère ligne server_name du vhost
+  sed -i '/server_name .*fireinners\.online/ a\  include /etc/nginx/snippets/solana_rpc_proxy.conf;' "$VHOST"
+  echo "[OK] include injected in $VHOST"
+else
+  echo "[OK] include already present"
+fi
 
-  function ensureOverlay() {
-    let el = document.getElementById("__wallet_overlay");
-    if (el) return el;
-    el = document.createElement("div");
-    el.id = "__wallet_overlay";
-    el.style.cssText =
-      "position:fixed;right:16px;bottom:16px;z-index:2147483647;" +
-      "background:rgba(0,0,0,.85);color:#fff;padding:10px 12px;border-radius:10px;" +
-      "font:12px/1.35 system-ui;max-width:80vw;white-space:pre-line";
-    el.textContent = "Patch loaded";
-    document.body.appendChild(el);
-    return el;
-  }
-  function setOverlay(msg) { ensureOverlay().textContent = msg; }
-
-  function ensureBadge() {
-    let b = document.getElementById("__wallet_connected_badge");
-    if (b) return b;
-    b = document.createElement("div");
-    b.id = "__wallet_connected_badge";
-    b.style.cssText =
-      "position:fixed;z-index:2147483647;display:none;" +
-      "background:rgba(0,160,90,.92);color:#fff;padding:6px 10px;border-radius:999px;" +
-      "font:12px system-ui;box-shadow:0 6px 18px rgba(0,0,0,.25)";
-    document.body.appendChild(b);
-    return b;
-  }
-
-  function findWalletCard() {
-    // plus robuste : on trouve le bouton "Connect Phantom" puis on remonte au container
-    const nodes = Array.from(document.querySelectorAll("button,a,div,span"));
-    const btn = nodes.find(n => /connect phantom/i.test((n.textContent || "").trim()));
-    if (!btn) return null;
-    let p = btn;
-    for (let i=0; i<8 && p; i++) {
-      if ((p.textContent || "").toLowerCase().includes("wallet")) return p;
-      p = p.parentElement;
-    }
-    return btn.parentElement;
-  }
-
-  function positionBadge(pk, sol, usdc) {
-    const badge = ensureBadge();
-    const card = findWalletCard();
-
-    if (!card) { badge.style.display = "none"; return; }
-
-    const r = card.getBoundingClientRect();
-    badge.style.left = Math.round(r.left + 12) + "px";
-    badge.style.top  = Math.round(r.top + 8) + "px";
-    badge.style.display = "block";
-    badge.textContent = `Connected ${short(pk)} | SOL ${sol.toFixed(4)} | USDC ${usdc.toFixed(2)}`;
-  }
-
-  async function rpc(method, params) {
-    const r = await fetch(RPC, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
-    });
-    const j = await r.json().catch(() => ({}));
-    if (j.error) throw new Error(j.error.message || JSON.stringify(j.error));
-    if (!j.result) throw new Error("RPC no result");
-    return j.result;
-  }
-
-  async function fetchBalances(owner) {
-    const bal = await rpc("getBalance", [owner, { commitment: "confirmed" }]);
-    const sol = (bal.value || 0) / 1e9;
-
-    const tok = await rpc("getTokenAccountsByOwner", [
-      owner,
-      { mint: USDC_MINT },
-      { encoding: "jsonParsed", commitment: "confirmed" },
-    ]);
-
-    let usdc = 0;
-    for (const acc of (tok.value || [])) {
-      const amt = acc.account?.data?.parsed?.info?.tokenAmount?.uiAmount;
-      if (typeof amt === "number") usdc += amt;
-    }
-    return { sol, usdc };
-  }
-
-  async function refreshAll() {
-    const pk = window.solana?.publicKey?.toBase58?.() || window.__WALLET_PK__;
-    if (!pk) return;
-
-    try {
-      const { sol, usdc } = await fetchBalances(pk);
-      setOverlay(`Connected: ${short(pk)}\nSOL ${sol.toFixed(4)} | USDC ${usdc.toFixed(2)}`);
-      positionBadge(pk, sol, usdc);
-    } catch (e) {
-      console.error(e);
-      setOverlay(`Connected: ${short(pk)}\nBalance: RPC error`);
-    }
-  }
-
-  async function connect() {
-    if (!window.solana || !window.solana.isPhantom) {
-      setOverlay("Phantom introuvable.\n➡️ Ouvre le site dans Phantom Browser.");
-      return;
-    }
-    const r = await window.solana.connect();
-    window.__WALLET_PK__ = r.publicKey.toBase58();
-    await refreshAll();
-  }
-
-  function hookConnectButton() {
-    const nodes = Array.from(document.querySelectorAll("button,a,div,span"));
-    const btn = nodes.find(n => /connect phantom/i.test((n.textContent || "").trim()));
-    if (btn && !btn.__hooked_phantom) {
-      btn.__hooked_phantom = true;
-      btn.addEventListener("click", (ev) => {
-        ev.preventDefault();
-        connect().catch(err => { console.error(err); setOverlay("Connect error"); });
-      }, { passive: false });
-      setOverlay("Patch loaded — waiting connect…");
-    }
-  }
-
-  window.addEventListener("load", () => {
-    ensureOverlay(); ensureBadge(); hookConnectButton();
-    const obs = new MutationObserver(() => hookConnectButton());
-    obs.observe(document.documentElement, { childList: true, subtree: true });
-
-    if (window.solana?.isPhantom && window.solana.publicKey) {
-      window.__WALLET_PK__ = window.solana.publicKey.toBase58();
-      refreshAll();
-    }
-
-    setInterval(refreshAll, REFRESH_MS);
-    window.addEventListener("scroll", refreshAll, { passive: true });
-    window.addEventListener("resize", refreshAll);
-
-    window.solana?.on?.("accountChanged", (pubkey) => {
-      if (pubkey) { window.__WALLET_PK__ = pubkey.toBase58(); refreshAll(); }
-      else { setOverlay("Wallet: not connected"); const b=document.getElementById("__wallet_connected_badge"); if(b) b.style.display="none"; }
-    });
-  });
-})();
-JS
-
+# 4) Test + reload
 nginx -t
 systemctl reload nginx
+echo "[OK] nginx reloaded"
 
-echo "✅ OK."
-echo "Test: https://fireinners.online/wolverine/settings/?v=$ts"
-echo "RPC test: curl -s https://127.0.0.1/solana-rpc -k -H 'Content-Type: application/json' --data '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getHealth\"}'"
+# 5) Test RPC local (doit répondre "ok")
+echo
+echo "RPC local test:"
+curl -sk https://127.0.0.1/solana-rpc \
+  -H 'Content-Type: application/json' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' && echo
 BASH
 
-chmod +x /root/fix_rpc_and_wallet_badge.sh
-/root/fix_rpc_and_wallet_badge.sh
+chmod +x /root/fix_solana_rpc_proxy_clean.sh
+/root/fix_solana_rpc_proxy_clean.sh
