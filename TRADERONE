@@ -1,16 +1,18 @@
-cat >/root/add_sol_usdc_balances.sh <<'BASH'
+cat >/root/fix_wallet_ui_status_and_balances.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
 ROOT="/var/www/wolverine"
-INDEX="$ROOT/index.html"
 JS="$ROOT/phantom_patch.js"
 
-[[ -f "$INDEX" ]] || { echo "[ERR] index introuvable: $INDEX"; exit 1; }
-
 ts="$(date +%Y%m%d_%H%M%S)"
-cp -a "$INDEX" "${INDEX}.bak_${ts}"
-echo "[OK] Backup -> ${INDEX}.bak_${ts}"
+mkdir -p "$ROOT"
+
+# backup si existe
+if [[ -f "$JS" ]]; then
+  cp -a "$JS" "${JS}.bak_${ts}"
+  echo "[OK] Backup -> ${JS}.bak_${ts}"
+fi
 
 cat >"$JS" <<'JS'
 (function () {
@@ -18,35 +20,13 @@ cat >"$JS" <<'JS'
   const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
   const REFRESH_MS = 15000;
 
-  function ensureBalancesBox() {
-    let el = document.getElementById("walletBalances");
-    if (el) return el;
-
-    el = document.createElement("div");
-    el.id = "walletBalances";
-    el.style.cssText =
-      "position:fixed;right:16px;bottom:16px;z-index:99999;" +
-      "background:rgba(0,0,0,.85);color:#fff;padding:10px 12px;" +
-      "border-radius:10px;font:13px/1.35 system-ui;max-width:80vw";
-    el.textContent = "Wallet: not connected";
-    document.body.appendChild(el);
-    return el;
-  }
-
-  function setBalancesText(sol, usdc, pk) {
-    const el = ensureBalancesBox();
-    const short = pk ? (pk.slice(0,4) + "…" + pk.slice(-4)) : "";
-    el.innerHTML =
-      `<div><b>Wallet</b> ${short}</div>` +
-      `<div>💠 SOL : <b>${sol.toFixed(4)}</b></div>` +
-      `<div>💵 USDC : <b>${usdc.toFixed(2)}</b></div>`;
-  }
+  const short = (s) => (s ? s.slice(0, 4) + "…" + s.slice(-4) : "");
 
   async function rpc(method, params) {
     const r = await fetch(RPC, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params })
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
     });
     const j = await r.json();
     if (j.error) throw new Error(j.error.message || JSON.stringify(j.error));
@@ -60,7 +40,7 @@ cat >"$JS" <<'JS'
     const tok = await rpc("getTokenAccountsByOwner", [
       owner,
       { mint: USDC_MINT },
-      { encoding: "jsonParsed", commitment: "confirmed" }
+      { encoding: "jsonParsed", commitment: "confirmed" },
     ]);
 
     let usdc = 0;
@@ -72,66 +52,127 @@ cat >"$JS" <<'JS'
     return { sol, usdc };
   }
 
-  async function refresh() {
+  // ---- UI helpers (fix ton bug) ----
+  function findWalletCard() {
+    // Cherche la carte qui contient "Wallet" + le bouton Connect Phantom
+    const cards = Array.from(document.querySelectorAll("div,section,aside"));
+    for (const c of cards) {
+      const t = (c.textContent || "").toLowerCase();
+      if (t.includes("wallet") && t.includes("connect phantom")) return c;
+      if (t.includes("wallet") && t.includes("not connected")) return c;
+    }
+    return null;
+  }
+
+  function updateWalletCardConnected(pk, sol, usdc) {
+    const card = findWalletCard();
+    if (!card) return;
+
+    // 1) Remplace "Not connected" si trouvé
+    const nodes = Array.from(card.querySelectorAll("*"));
+    const statusNode = nodes.find(n => /not connected/i.test((n.textContent || "").trim()));
+    if (statusNode) statusNode.textContent = "Connected";
+
+    // 2) Bouton "Connect Phantom" -> "Connected" + disable
+    const btn = Array.from(card.querySelectorAll("button,a,div,span"))
+      .find(n => /connect phantom/i.test((n.textContent || "").trim()));
+    if (btn) {
+      btn.textContent = "Connected";
+      btn.style.pointerEvents = "none";
+      btn.style.opacity = "0.8";
+    }
+
+    // 3) Ajoute ligne balances dans la carte Wallet
+    let bal = card.querySelector("#__wallet_bal_line");
+    if (!bal) {
+      bal = document.createElement("div");
+      bal.id = "__wallet_bal_line";
+      bal.style.cssText = "margin-top:8px;font:12px system-ui;opacity:.95";
+      card.appendChild(bal);
+    }
+    bal.textContent = `SOL: ${sol.toFixed(4)} | USDC: ${usdc.toFixed(2)} | ${short(pk)}`;
+  }
+
+  // Overlay bas droite (optionnel mais utile)
+  function ensureOverlay() {
+    let el = document.getElementById("__wallet_overlay");
+    if (el) return el;
+    el = document.createElement("div");
+    el.id = "__wallet_overlay";
+    el.style.cssText =
+      "position:fixed;right:16px;bottom:16px;z-index:99999;" +
+      "background:rgba(0,0,0,.85);color:#fff;padding:10px 12px;" +
+      "border-radius:10px;font:12px/1.35 system-ui;max-width:80vw;white-space:pre-line";
+    el.textContent = "Patch loaded — searching button…";
+    document.body.appendChild(el);
+    return el;
+  }
+  function setOverlay(msg) { ensureOverlay().textContent = msg; }
+
+  async function refreshAll() {
     const pk = window.solana?.publicKey?.toBase58?.() || window.__WALLET_PK__;
     if (!pk) return;
 
     try {
       const { sol, usdc } = await fetchBalances(pk);
-      setBalancesText(sol, usdc, pk);
+      setOverlay(`Connected: ${short(pk)}\nSOL ${sol.toFixed(4)} | USDC ${usdc.toFixed(2)}`);
+      updateWalletCardConnected(pk, sol, usdc);
     } catch (e) {
-      ensureBalancesBox().textContent = "Balance error (RPC)";
       console.error(e);
+      setOverlay(`Connected: ${short(pk)}\nBalance: RPC error`);
     }
   }
 
   async function connect() {
     if (!window.solana || !window.solana.isPhantom) {
-      ensureBalancesBox().innerHTML =
-        `<div>Phantom introuvable.</div><div>➡️ Ouvre le site dans Phantom Browser.</div>`;
+      setOverlay("Phantom introuvable.\n➡️ Ouvre le site dans Phantom Browser.");
       return;
     }
     const r = await window.solana.connect();
     const pk = r.publicKey.toBase58();
     window.__WALLET_PK__ = pk;
-    await refresh();
+    await refreshAll();
   }
 
   function hookConnectButton() {
-    // tente de trouver un bouton "Connect Phantom"
+    // Ton UI a un bouton "Connect Phantom"
     const nodes = Array.from(document.querySelectorAll("button,a,div,span"));
     const btn = nodes.find(n => /connect phantom/i.test((n.textContent || "").trim()));
-    if (btn && !btn.__wallet_hooked) {
-      btn.__wallet_hooked = true;
+    if (btn && !btn.__hooked_phantom) {
+      btn.__hooked_phantom = true;
       btn.addEventListener("click", (ev) => {
         ev.preventDefault();
         connect().catch(err => {
-          ensureBalancesBox().textContent = "Connect error";
           console.error(err);
+          setOverlay("Connect error");
         });
       }, { passive: false });
     }
   }
 
   window.addEventListener("load", () => {
-    ensureBalancesBox();
+    ensureOverlay();
     hookConnectButton();
 
+    // si déjà connecté
+    if (window.solana?.isPhantom && window.solana.publicKey) {
+      window.__WALLET_PK__ = window.solana.publicKey.toBase58();
+      refreshAll();
+    }
+
+    // observe DOM (pages settings etc)
     const obs = new MutationObserver(() => hookConnectButton());
     obs.observe(document.documentElement, { childList: true, subtree: true });
 
-    // si déjà connecté
-    if (window.solana?.isPhantom && window.solana.publicKey) refresh();
-
     // refresh auto
-    setInterval(refresh, REFRESH_MS);
+    setInterval(refreshAll, REFRESH_MS);
 
     window.solana?.on?.("accountChanged", (pubkey) => {
       if (pubkey) {
         window.__WALLET_PK__ = pubkey.toBase58();
-        refresh();
+        refreshAll();
       } else {
-        ensureBalancesBox().textContent = "Wallet: not connected";
+        setOverlay("Wallet: not connected");
       }
     });
   });
@@ -140,21 +181,25 @@ cat >"$JS" <<'JS'
 })();
 JS
 
-# Injecte le script (idempotent) dans <head>
-if ! grep -q "phantom_patch.js" "$INDEX"; then
-  perl -0777 -i -pe '
-    my $tag = qq{\n<!-- WALLET_BALANCES_PATCH -->\n<script src="/wolverine/phantom_patch.js?v='"$ts"'" defer></script>\n<!-- /WALLET_BALANCES_PATCH -->\n};
-    s@(<head[^>]*>)@$1$tag@i;
-  ' "$INDEX"
-  echo "[OK] Script tag injected"
-else
-  echo "[OK] Script tag already present"
-fi
+echo "[OK] Patched $JS"
+
+# Inject le script dans toutes les pages html sous /var/www/wolverine (si pas déjà)
+echo "[*] Inject script tag into HTML pages (if missing)…"
+while IFS= read -r -d '' f; do
+  if ! grep -q "phantom_patch.js" "$f"; then
+    cp -a "$f" "${f}.bak_${ts}"
+    perl -0777 -i -pe '
+      my $tag = qq{\n<!-- WALLET_BALANCES_PATCH -->\n<script src="/wolverine/phantom_patch.js?v='"$ts"'" defer></script>\n<!-- /WALLET_BALANCES_PATCH -->\n};
+      s@(<head[^>]*>)@$1$tag@i;
+    ' "$f"
+    echo "  + injected -> $f"
+  fi
+done < <(find "$ROOT" -maxdepth 4 -type f -name "*.html" -print0)
 
 nginx -t
 systemctl reload nginx
-echo "✅ Done. Ouvre: https://fireinners.online/wolverine/?v=$ts"
+echo "✅ OK. Test: https://fireinners.online/wolverine/settings/?v=$ts"
 BASH
 
-chmod +x /root/add_sol_usdc_balances.sh
-/root/add_sol_usdc_balances.sh
+chmod +x /root/fix_wallet_ui_status_and_balances.sh
+/root/fix_wallet_ui_status_and_balances.sh
