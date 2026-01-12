@@ -1,29 +1,41 @@
-cat >/root/fix_traderone_api_proxy_full.sh <<'BASH'
+cat >/root/fix_api_health_proxy_autodetect.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
 DOMAIN="fireinners.online"
 SSL="/etc/nginx/sites-available/fireinners.online-ssl"
 EN="/etc/nginx/sites-enabled/fireinners.online-ssl"
-SNIP_API="/etc/nginx/snippets/traderone_api_proxy.conf"
-SNIP_RPC="/etc/nginx/snippets/solana_rpc_proxy.conf"
+SNIP="/etc/nginx/snippets/traderone_api_proxy.conf"
 ts="$(date +%Y%m%d_%H%M%S)"
 
-BACKEND_HOST="127.0.0.1"
-BACKEND_PORT="3000"   # <-- si ton backend écoute ailleurs, change ici
+echo "== 0) Autodetect backend port (looking for /api/health) =="
+PORT=""
+for p in 3000 3001 3100 8080 8000 5000; do
+  code="$(curl -s -o /tmp/h.$$ -w "%{http_code}" "http://127.0.0.1:$p/api/health" || true)"
+  if [[ "$code" == "200" ]]; then
+    head -c 200 /tmp/h.$$ | tr -d '\n' | grep -qiE '^\{|"status"|health|ok' && PORT="$p" && break
+  fi
+done
+rm -f /tmp/h.$$ 2>/dev/null || true
 
-echo "== Backups =="
+if [[ -z "$PORT" ]]; then
+  echo "[ERR] Backend introuvable sur les ports testés."
+  echo "Lance ça et colle-moi la sortie :"
+  echo "  ss -lntp | grep -E 'node|:3000|:3001|:3100|:8080|:8000|:5000'"
+  exit 1
+fi
+echo "[OK] Backend found on 127.0.0.1:$PORT"
+
+echo "== 1) Backup nginx files =="
 cp -a "$SSL" "${SSL}.bak_${ts}" 2>/dev/null || true
-cp -a "$SNIP_API" "${SNIP_API}.bak_${ts}" 2>/dev/null || true
-cp -a "$SNIP_RPC" "${SNIP_RPC}.bak_${ts}" 2>/dev/null || true
+cp -a "$SNIP" "${SNIP}.bak_${ts}" 2>/dev/null || true
 
+echo "== 2) Write API proxy snippet (HIGH priority, beats SPA) =="
 mkdir -p /etc/nginx/snippets
-
-echo "== 1) Snippet API: /wolverine/traderone/api/* -> http://127.0.0.1:3000/api/* =="
-cat >"$SNIP_API" <<NGINX
+cat >"$SNIP" <<NGINX
 # Include INSIDE server{} only.
 
-# Health exact (avoid being swallowed by SPA routes)
+# Exact health (must hit backend, never SPA)
 location = /wolverine/traderone/api/health {
   proxy_http_version 1.1;
   proxy_set_header Host \$host;
@@ -32,10 +44,10 @@ location = /wolverine/traderone/api/health {
   proxy_set_header X-Forwarded-Proto \$scheme;
 
   rewrite ^/wolverine/traderone/api/(.*)$ /api/\$1 break;
-  proxy_pass http://${BACKEND_HOST}:${BACKEND_PORT};
+  proxy_pass http://127.0.0.1:${PORT};
 }
 
-# API general
+# All API routes
 location ^~ /wolverine/traderone/api/ {
   proxy_http_version 1.1;
   proxy_set_header Host \$host;
@@ -43,56 +55,28 @@ location ^~ /wolverine/traderone/api/ {
   proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
   proxy_set_header X-Forwarded-Proto \$scheme;
 
-  # optional websockets/sse safe
   proxy_set_header Upgrade \$http_upgrade;
   proxy_set_header Connection "upgrade";
 
   rewrite ^/wolverine/traderone/api/(.*)$ /api/\$1 break;
-  proxy_pass http://${BACKEND_HOST}:${BACKEND_PORT};
+  proxy_pass http://127.0.0.1:${PORT};
 }
 NGINX
 
-echo "== 2) Snippet RPC: keep /wolverine/rpc, kill /srpc =="
-cat >"$SNIP_RPC" <<'NGINX'
-# Include INSIDE server{} only.
-
-location = /wolverine/rpc {
-  auth_basic off; allow all;
-
-  add_header Access-Control-Allow-Origin "*" always;
-  add_header Access-Control-Allow-Headers "*" always;
-  add_header Access-Control-Allow-Methods "POST, OPTIONS" always;
-  if ($request_method = OPTIONS) { return 204; }
-
-  proxy_pass https://api.mainnet-beta.solana.com/;
-  proxy_ssl_server_name on;
-  proxy_set_header Host api.mainnet-beta.solana.com;
-}
-
-location = /srpc { return 404; }
-location = /solana-rpc { return 404; }
-NGINX
-
-echo "== 3) Ensure both snippets included ONCE in SSL vhost =="
-# Dedup includes if already present
+echo "== 3) Ensure snippet included ONCE (and before SPA fallback) =="
 awk '
   {
     if ($0 ~ /include[[:space:]]+\/etc\/nginx\/snippets\/traderone_api_proxy\.conf;/) {
-      if (seen_api==1) next; seen_api=1;
-    }
-    if ($0 ~ /include[[:space:]]+\/etc\/nginx\/snippets\/solana_rpc_proxy\.conf;/) {
-      if (seen_rpc==1) next; seen_rpc=1;
+      if (seen==1) next;
+      seen=1;
     }
     print
   }
 ' "$SSL" > /tmp/ssl.$$ && cat /tmp/ssl.$$ > "$SSL" && rm -f /tmp/ssl.$$
 
-# Add includes if missing (after server_name line)
 if ! grep -q "traderone_api_proxy.conf" "$SSL"; then
+  # insert right after server_name line (safe, early in server{})
   sed -i '/server_name .*fireinners\.online/ a\  include /etc/nginx/snippets/traderone_api_proxy.conf;' "$SSL"
-fi
-if ! grep -q "solana_rpc_proxy.conf" "$SSL"; then
-  sed -i '/server_name .*fireinners\.online/ a\  include /etc/nginx/snippets/solana_rpc_proxy.conf;' "$SSL"
 fi
 
 ln -sf "$SSL" "$EN"
@@ -103,26 +87,22 @@ systemctl reload nginx
 echo "[OK] nginx reloaded"
 
 echo
-echo "== 5) Tests BACKEND (local) =="
-echo "-- http://${BACKEND_HOST}:${BACKEND_PORT}/api/health"
-curl -sS "http://${BACKEND_HOST}:${BACKEND_PORT}/api/health" | head -c 300 || true
+echo "== 5) TEST local backend =="
+curl -sS "http://127.0.0.1:${PORT}/api/health" | head -c 400
 echo
 
 echo
-echo "== 6) Tests PUBLIC (should be backend JSON, NOT HTML) =="
-echo "-- https://${DOMAIN}/wolverine/traderone/api/health"
+echo "== 6) TEST public (MUST NOT be HTML) =="
+echo "-- headers:"
 curl -sk -i "https://${DOMAIN}/wolverine/traderone/api/health" | sed -n '1,25p'
-
 echo
-echo "-- https://${DOMAIN}/wolverine/rpc getVersion"
-curl -sk -i "https://${DOMAIN}/wolverine/rpc" \
-  -H 'Content-Type: application/json' \
-  --data '{"jsonrpc":"2.0","id":1,"method":"getVersion"}' | sed -n '1,18p'
+echo "-- body (first 400 chars):"
+curl -sk "https://${DOMAIN}/wolverine/traderone/api/health" | head -c 400
+echo
 
 echo
 echo "DONE ✅"
-echo "Open: https://${DOMAIN}/wolverine/health/?v=$ts"
 BASH
 
-chmod +x /root/fix_traderone_api_proxy_full.sh
-/root/fix_traderone_api_proxy_full.sh
+chmod +x /root/fix_api_health_proxy_autodetect.sh
+/root/fix_api_health_proxy_autodetect.sh
