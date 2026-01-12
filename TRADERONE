@@ -1,94 +1,28 @@
-cat >/root/force_patch_use_srpc_no_cache.sh <<'BASH'
+cat >/root/fix_try_files_invalid_phantom_patch_block.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-DOMAIN="fireinners.online"
-ROOT="/var/www/wolverine"
-JS="$ROOT/phantom_patch.js"
-SNIP="/etc/nginx/snippets/solana_rpc_proxy.conf"
 SSL="/etc/nginx/sites-available/fireinners.online-ssl"
 ts="$(date +%Y%m%d_%H%M%S)"
 
-echo "== 1) Patch phantom_patch.js to use /srpc =="
-if [[ -f "$JS" ]]; then
-  cp -a "$JS" "${JS}.bak_${ts}"
-  # remplace toutes les variantes possibles
-  sed -i 's@const RPC = "/solana-rpc"@const RPC = "/srpc"@g' "$JS" || true
-  sed -i "s@const RPC = '/solana-rpc'@const RPC = '/srpc'@g" "$JS" || true
-  # au cas où c'est écrit en dur ailleurs
-  sed -i 's@/solana-rpc@/srpc@g' "$JS" || true
-else
-  echo "[WARN] missing $JS"
-fi
+[[ -f "$SSL" ]] || { echo "[ERR] missing $SSL"; exit 1; }
+cp -a "$SSL" "${SSL}.bak_${ts}"
 
-echo "== 2) Ensure nginx snippet serves /srpc (and keep /solana-rpc optional) =="
-cp -a "$SNIP" "${SNIP}.bak_${ts}" 2>/dev/null || true
-cat >"$SNIP" <<'NGINX'
-# Include INSIDE server{} only.
+echo "== 1) Remove any previously injected phantom_patch.js location blocks (even broken ones) =="
+perl -0777 -i -pe 's@\n\s*location\s*=\s*/wolverine/phantom_patch\.js\s*\{.*?\}\s*\n@\n@sg' "$SSL"
 
-# NEW public endpoint (avoid WAF blocking "/solana-rpc")
-location = /srpc {
-  auth_basic off;
-  allow all;
+echo "== 2) Re-add a CLEAN no-cache block (with escaped \$uri) before server close =="
+perl -0777 -i -pe 's@\n\}\s*$@\n  # Serve wallet patch with no-cache (avoid stale JS)\n  location = /wolverine/phantom_patch.js {\n    add_header Cache-Control "no-store" always;\n    try_files \\$uri =404;\n  }\n}\n@sg' "$SSL"
 
-  add_header Access-Control-Allow-Origin * always;
-  add_header Access-Control-Allow-Headers * always;
-  add_header Access-Control-Allow-Methods "POST, OPTIONS" always;
-  if ($request_method = OPTIONS) { return 204; }
-
-  proxy_pass https://api.mainnet-beta.solana.com/;
-  proxy_ssl_server_name on;
-  proxy_set_header Host api.mainnet-beta.solana.com;
-}
-
-# Keep legacy path (may still be blocked by WAF, but harmless)
-location = /solana-rpc {
-  auth_basic off;
-  allow all;
-
-  add_header Access-Control-Allow-Origin * always;
-  add_header Access-Control-Allow-Headers * always;
-  add_header Access-Control-Allow-Methods "POST, OPTIONS" always;
-  if ($request_method = OPTIONS) { return 204; }
-
-  proxy_pass https://api.mainnet-beta.solana.com/;
-  proxy_ssl_server_name on;
-  proxy_set_header Host api.mainnet-beta.solana.com;
-}
-NGINX
-
-echo "== 3) Disable cache for phantom_patch.js at nginx level =="
-# ajoute un bloc location si pas déjà là
-if ! grep -q 'location = /wolverine/phantom_patch.js' "$SSL"; then
-  cp -a "$SSL" "${SSL}.bak_${ts}"
-  # inject juste après la ligne "location ^~ /wolverine/ {"
-  perl -0777 -i -pe 's@(location\s+\^\~\s+/wolverine/\s*\{\s*\n)@$1  # no-cache wallet patch\n@' "$SSL"
-  # ajoute un bloc dédié (dans server{})
-  perl -0777 -i -pe 's@(\n\})@\n  location = /wolverine/phantom_patch.js {\n    add_header Cache-Control "no-store" always;\n    try_files $uri =404;\n  }\n$1@' "$SSL"
-fi
-
-echo "== 4) Cache-bust: force HTML to load new phantom_patch.js?v=TS =="
-find "$ROOT" -maxdepth 4 -type f -name "*.html" -print0 | while IFS= read -r -d '' f; do
-  cp -a "$f" "${f}.bak_${ts}"
-  # retire anciens tags phantom_patch.js
-  perl -0777 -i -pe 's@<script[^>]+phantom_patch\.js[^>]*></script>@@gsi' "$f"
-  # inject dans <head>
-  perl -0777 -i -pe 's@(<head[^>]*>)@$1\n<script src="/wolverine/phantom_patch.js?v='"$ts"'" defer></script>\n@i' "$f"
-done
-
-echo "== 5) nginx test + reload =="
+echo "== 3) nginx test + reload =="
 nginx -t
 systemctl reload nginx
+echo "[OK] nginx reloaded"
 
 echo
-echo "== 6) Public test /srpc (must be 200) =="
-curl -sk -i "https://${DOMAIN}/srpc" \
-  -H 'Content-Type: application/json' \
-  --data '{"jsonrpc":"2.0","id":1,"method":"getVersion"}' | sed -n '1,18p'
-
-echo
-echo "Open: https://${DOMAIN}/wolverine/?v=$ts"
+echo "Show the block:"
+grep -n "location = /wolverine/phantom_patch.js" -A5 -B2 "$SSL" || true
 BASH
 
-chmod +x /root/force_patch_use_srpc_no_cache.sh
-/root/force_patch_use_srpc_no_cache.sh
+chmod +x /root/fix_try_files_invalid_phantom_patch_block.sh
+/root/fix_try_files_invalid_phantom_patch_block.sh
