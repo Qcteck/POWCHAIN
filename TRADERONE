@@ -1,1 +1,111 @@
-curl -sk -i https://fireinners.online/wolverine/traderone/api/health | sed -n '1,20p'
+cat >/root/finalize_wolverine_nginx.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+DOMAIN="fireinners.online"
+AV="/etc/nginx/sites-available/fireinners.online-ssl"
+EN="/etc/nginx/sites-enabled/fireinners.online-ssl"
+SNIP_API="/etc/nginx/snippets/traderone_api_proxy.conf"
+SNIP_RPC="/etc/nginx/snippets/solana_rpc_proxy.conf"
+ts="$(date +%Y%m%d_%H%M%S)"
+
+echo "== 0) sanity =="
+nginx -t
+
+echo "== 1) detect backend port for /api/health =="
+PORT=""
+for p in 8585 3005 8484 9696 12703 3000 3001 3100 8080 8000 5000; do
+  code="$(curl -s -o /tmp/h.$$ -w "%{http_code}" "http://127.0.0.1:$p/api/health" || true)"
+  if [[ "$code" == "200" ]]; then
+    head -c 80 /tmp/h.$$ | tr -d '\n' | grep -qv "<!DOCTYPE html" && PORT="$p" && break
+  fi
+done
+rm -f /tmp/h.$$ 2>/dev/null || true
+if [[ -z "$PORT" ]]; then
+  echo "[ERR] backend not found on localhost for /api/health"
+  ss -lntp | grep -E "node|:8585|:3005|:8484|:9696|:12703|:3000" || true
+  exit 1
+fi
+echo "[OK] PORT=$PORT"
+
+echo "== 2) backup vhost =="
+cp -a "$AV" "${AV}.bak_${ts}"
+ln -sf "$AV" "$EN"
+
+echo "== 3) enforce: /srpc always 404 (ONE place only) =="
+# remove any /srpc blocks from RPC snippet (avoid duplicates)
+if [[ -f "$SNIP_RPC" ]]; then
+  cp -a "$SNIP_RPC" "${SNIP_RPC}.bak_${ts}"
+  perl -0777 -i -pe 's@\n\s*location\s*=\s*/srpc\s*\{.*?\}\s*\n@\n@sg' "$SNIP_RPC"
+  perl -0777 -i -pe 's@\n\s*location\s*\^~\s*/srpc\s*\{.*?\}\s*\n@\n@sg' "$SNIP_RPC"
+fi
+# ensure vhost has /srpc once
+if ! grep -qE "location\s*=\s*/srpc" "$AV"; then
+  sed -i '/server_name .*fireinners\.online/ a\  location = /srpc { return 404; }' "$AV"
+fi
+
+echo "== 4) write API proxy snippet with correct PORT (no 3000 leftovers) =="
+mkdir -p /etc/nginx/snippets
+cat >"$SNIP_API" <<NGINX
+# /wolverine/traderone/api/* -> http://127.0.0.1:${PORT}/api/*
+
+location = /wolverine/traderone/api/health {
+  proxy_http_version 1.1;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+
+  rewrite ^/wolverine/traderone/api/(.*)$ /api/\$1 break;
+  proxy_pass http://127.0.0.1:${PORT};
+}
+
+location ^~ /wolverine/traderone/api/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+
+  proxy_set_header Upgrade \$http_upgrade;
+  proxy_set_header Connection "upgrade";
+
+  rewrite ^/wolverine/traderone/api/(.*)$ /api/\$1 break;
+  proxy_pass http://127.0.0.1:${PORT};
+}
+NGINX
+
+# ensure include exists once
+if ! grep -q "traderone_api_proxy.conf" "$AV"; then
+  sed -i '/server_name .*fireinners\.online/ a\  include /etc/nginx/snippets/traderone_api_proxy.conf;' "$AV"
+fi
+
+echo "== 5) make phantom_patch.js non-cache (avoid old /srpc references) =="
+# remove old block then re-add clean
+perl -0777 -i -pe 's@\n\s*location\s*=\s*/wolverine/phantom_patch\.js\s*\{.*?\}\s*\n@\n@sg' "$AV"
+perl -0777 -i -pe 's@\n\}\s*$@\n  location = /wolverine/phantom_patch.js {\n    add_header Cache-Control "no-store" always;\n    try_files \\$uri =404;\n  }\n}\n@sg' "$AV"
+
+echo "== 6) reload nginx =="
+nginx -t
+systemctl reload nginx
+echo "[OK] nginx reloaded"
+
+echo
+echo "== 7) tests =="
+echo "-- POST /srpc (must be 404):"
+curl -sk -i -X POST "https://${DOMAIN}/srpc" -H 'Content-Type: application/json' --data '{"jsonrpc":"2.0","id":1,"method":"getVersion"}' | sed -n '1,12p'
+echo
+echo "-- /wolverine/rpc getVersion:"
+curl -sk -i "https://${DOMAIN}/wolverine/rpc" -H 'Content-Type: application/json' --data '{"jsonrpc":"2.0","id":1,"method":"getVersion"}' | sed -n '1,15p'
+echo
+echo "-- /wolverine/traderone/api/health (must be JSON 200):"
+curl -sk -i "https://${DOMAIN}/wolverine/traderone/api/health" | sed -n '1,20p'
+echo
+echo "-- phantom_patch.js should NOT contain /srpc:"
+curl -sk "https://${DOMAIN}/wolverine/phantom_patch.js?v=${ts}" | grep -n "/srpc" || echo "OK: no /srpc ✅"
+echo
+echo "Open UI with cache-bust: https://${DOMAIN}/wolverine/?v=${ts}"
+BASH
+
+chmod +x /root/finalize_wolverine_nginx.sh
+/root/finalize_wolverine_nginx.sh
