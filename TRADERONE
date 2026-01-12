@@ -1,23 +1,59 @@
-cat >/root/fix_srpc_called_by_phantom_patch.sh <<'BASH'
+cat >/root/fix_traderone_api_proxy_full.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
 DOMAIN="fireinners.online"
-ROOT="/var/www/wolverine"
-JS_MAIN="$ROOT/phantom_patch.js"
 SSL="/etc/nginx/sites-available/fireinners.online-ssl"
 EN="/etc/nginx/sites-enabled/fireinners.online-ssl"
-SNIP="/etc/nginx/snippets/solana_rpc_proxy.conf"
+SNIP_API="/etc/nginx/snippets/traderone_api_proxy.conf"
+SNIP_RPC="/etc/nginx/snippets/solana_rpc_proxy.conf"
 ts="$(date +%Y%m%d_%H%M%S)"
+
+BACKEND_HOST="127.0.0.1"
+BACKEND_PORT="3000"   # <-- si ton backend écoute ailleurs, change ici
 
 echo "== Backups =="
 cp -a "$SSL" "${SSL}.bak_${ts}" 2>/dev/null || true
-cp -a "$SNIP" "${SNIP}.bak_${ts}" 2>/dev/null || true
-[[ -f "$JS_MAIN" ]] && cp -a "$JS_MAIN" "${JS_MAIN}.bak_${ts}" || true
+cp -a "$SNIP_API" "${SNIP_API}.bak_${ts}" 2>/dev/null || true
+cp -a "$SNIP_RPC" "${SNIP_RPC}.bak_${ts}" 2>/dev/null || true
 
-echo "== 1) Nginx: keep /wolverine/rpc, kill /srpc & /solana-rpc =="
 mkdir -p /etc/nginx/snippets
-cat >"$SNIP" <<'NGINX'
+
+echo "== 1) Snippet API: /wolverine/traderone/api/* -> http://127.0.0.1:3000/api/* =="
+cat >"$SNIP_API" <<NGINX
+# Include INSIDE server{} only.
+
+# Health exact (avoid being swallowed by SPA routes)
+location = /wolverine/traderone/api/health {
+  proxy_http_version 1.1;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+
+  rewrite ^/wolverine/traderone/api/(.*)$ /api/\$1 break;
+  proxy_pass http://${BACKEND_HOST}:${BACKEND_PORT};
+}
+
+# API general
+location ^~ /wolverine/traderone/api/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+
+  # optional websockets/sse safe
+  proxy_set_header Upgrade \$http_upgrade;
+  proxy_set_header Connection "upgrade";
+
+  rewrite ^/wolverine/traderone/api/(.*)$ /api/\$1 break;
+  proxy_pass http://${BACKEND_HOST}:${BACKEND_PORT};
+}
+NGINX
+
+echo "== 2) Snippet RPC: keep /wolverine/rpc, kill /srpc =="
+cat >"$SNIP_RPC" <<'NGINX'
 # Include INSIDE server{} only.
 
 location = /wolverine/rpc {
@@ -33,77 +69,60 @@ location = /wolverine/rpc {
   proxy_set_header Host api.mainnet-beta.solana.com;
 }
 
-# Stop old endpoints (avoid WAF 403 spam)
 location = /srpc { return 404; }
 location = /solana-rpc { return 404; }
 NGINX
 
-# Ensure snippet include exists once
+echo "== 3) Ensure both snippets included ONCE in SSL vhost =="
+# Dedup includes if already present
 awk '
   {
+    if ($0 ~ /include[[:space:]]+\/etc\/nginx\/snippets\/traderone_api_proxy\.conf;/) {
+      if (seen_api==1) next; seen_api=1;
+    }
     if ($0 ~ /include[[:space:]]+\/etc\/nginx\/snippets\/solana_rpc_proxy\.conf;/) {
-      if (seen==1) next;
-      seen=1;
+      if (seen_rpc==1) next; seen_rpc=1;
     }
     print
   }
 ' "$SSL" > /tmp/ssl.$$ && cat /tmp/ssl.$$ > "$SSL" && rm -f /tmp/ssl.$$
 
+# Add includes if missing (after server_name line)
+if ! grep -q "traderone_api_proxy.conf" "$SSL"; then
+  sed -i '/server_name .*fireinners\.online/ a\  include /etc/nginx/snippets/traderone_api_proxy.conf;' "$SSL"
+fi
 if ! grep -q "solana_rpc_proxy.conf" "$SSL"; then
   sed -i '/server_name .*fireinners\.online/ a\  include /etc/nginx/snippets/solana_rpc_proxy.conf;' "$SSL"
 fi
 
-echo "== 2) Patch ALL phantom_patch*.js to never call /srpc and never hard-crash UI =="
-mapfile -t JSFILES < <(find "$ROOT" -maxdepth 6 -type f -name "phantom_patch*.js" -print)
-((${#JSFILES[@]})) || { echo "[ERR] no phantom_patch*.js under $ROOT"; exit 1; }
-
-for f in "${JSFILES[@]}"; do
-  cp -a "$f" "${f}.bak_${ts}" 2>/dev/null || true
-
-  # Normalize endpoints
-  sed -i 's@/wolverine/wolverine/rpc@/wolverine/rpc@g' "$f"
-  sed -i 's@/srpc@/wolverine/rpc@g' "$f"
-  sed -i 's@/solana-rpc@/wolverine/rpc@g' "$f"
-  sed -i 's@"/rpc"@"/wolverine/rpc"@g' "$f"
-
-  # Force const RPC if present
-  if grep -qE 'const[[:space:]]+RPC[[:space:]]*=' "$f"; then
-    sed -i -E 's@const[[:space:]]+RPC[[:space:]]*=[[:space:]]*["'\''][^"'\'']*["'\'']@const RPC = "/wolverine/rpc"@' "$f"
-  fi
-
-  # Fail-safe: if code throws "Access forbidden", downgrade to warning + return null
-  sed -i 's@throw new Error("Access forbidden");@console.warn("RPC forbidden (non-fatal)"); return null;@g' "$f" || true
-  sed -i "s@throw new Error('Access forbidden');@console.warn(\"RPC forbidden (non-fatal)\"); return null;@g" "$f" || true
-done
-
-echo "== 3) Force HTML to load fresh phantom_patch.js?v=TS =="
-find "$ROOT" -maxdepth 6 -type f -name "*.html" -print0 | while IFS= read -r -d '' h; do
-  cp -a "$h" "${h}.bak_${ts}" 2>/dev/null || true
-  perl -0777 -i -pe 's@<script[^>]+phantom_patch[^>]*></script>@@gsi' "$h"
-  perl -0777 -i -pe 's@(<head[^>]*>)@$1\n<script src="/wolverine/phantom_patch.js?v='"$ts"'" defer></script>\n@i' "$h"
-done
-
-echo "== 4) No-store on phantom_patch.js (nginx) =="
-perl -0777 -i -pe 's@\n\s*location\s*=\s*/wolverine/phantom_patch\.js\s*\{.*?\}\s*\n@\n@sg' "$SSL"
-perl -0777 -i -pe 's@\n\}\s*$@\n  location = /wolverine/phantom_patch.js {\n    add_header Cache-Control "no-store" always;\n    try_files \\$uri =404;\n  }\n}\n@sg' "$SSL"
-
 ln -sf "$SSL" "$EN"
 
-echo "== 5) nginx test + reload =="
+echo "== 4) nginx test + reload =="
 nginx -t
 systemctl reload nginx
+echo "[OK] nginx reloaded"
 
 echo
-echo "== 6) Verify SERVER file has no /srpc =="
-grep -RIn "/srpc" "$ROOT"/phantom_patch*.js || echo "OK: no /srpc in phantom_patch*.js ✅"
+echo "== 5) Tests BACKEND (local) =="
+echo "-- http://${BACKEND_HOST}:${BACKEND_PORT}/api/health"
+curl -sS "http://${BACKEND_HOST}:${BACKEND_PORT}/api/health" | head -c 300 || true
+echo
 
 echo
-echo "== 7) Verify what is SERVED over HTTPS (should contain NO /srpc) =="
-curl -sk "https://${DOMAIN}/wolverine/phantom_patch.js?v=$ts" | grep -n "/srpc" || echo "OK: served JS has no /srpc ✅"
+echo "== 6) Tests PUBLIC (should be backend JSON, NOT HTML) =="
+echo "-- https://${DOMAIN}/wolverine/traderone/api/health"
+curl -sk -i "https://${DOMAIN}/wolverine/traderone/api/health" | sed -n '1,25p'
 
 echo
-echo "OPEN (private): https://${DOMAIN}/wolverine/?v=$ts"
+echo "-- https://${DOMAIN}/wolverine/rpc getVersion"
+curl -sk -i "https://${DOMAIN}/wolverine/rpc" \
+  -H 'Content-Type: application/json' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"getVersion"}' | sed -n '1,18p'
+
+echo
+echo "DONE ✅"
+echo "Open: https://${DOMAIN}/wolverine/health/?v=$ts"
 BASH
 
-chmod +x /root/fix_srpc_called_by_phantom_patch.sh
-/root/fix_srpc_called_by_phantom_patch.sh
+chmod +x /root/fix_traderone_api_proxy_full.sh
+/root/fix_traderone_api_proxy_full.sh
