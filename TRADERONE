@@ -1,1 +1,81 @@
-grep -RIn "location .*wolverine/traderone/api" /etc/nginx/sites-enabled /etc/nginx/snippets | head -n 80
+cat >/root/fix_dupes_and_awk.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+VHOST="/etc/nginx/sites-enabled/fireinners.online-ssl"
+SNIP_SOL="/etc/nginx/snippets/solana_rpc_proxy.conf"
+TS="$(date +%Y%m%d_%H%M%S)"
+
+bak(){ [[ -f "$1" ]] && cp -a "$1" "$1.bak_${TS}"; }
+
+echo "== Backup =="
+bak "$VHOST"
+bak "$SNIP_SOL"
+
+echo
+echo "== 1) Show ALL ACTIVE definitions of /solana-rpc (exclude backups) =="
+grep -RIn --exclude='*.bak*' --exclude-dir='_saved_*' \
+  -E 'location[[:space:]]+[^#]*\/solana-rpc' \
+  /etc/nginx/sites-enabled /etc/nginx/snippets || true
+
+echo
+echo "== 2) Ensure solana_rpc_proxy.conf is included ONLY ONCE (exclude backups) =="
+MAPFILE=()
+while IFS= read -r line; do MAPFILE+=("$line"); done < <(
+  grep -RIn --exclude='*.bak*' --exclude-dir='_saved_*' \
+    "include /etc/nginx/snippets/solana_rpc_proxy.conf;" \
+    /etc/nginx/sites-enabled /etc/nginx/snippets || true
+)
+
+echo "Found includes:"
+printf '%s\n' "${MAPFILE[@]}" || true
+
+# If included more than once, comment out all but first occurrence in-place (safe)
+if (( ${#MAPFILE[@]} > 1 )); then
+  echo "== Commenting duplicate includes (keep first) =="
+  first=1
+  for hit in "${MAPFILE[@]}"; do
+    file="${hit%%:*}"
+    lineno_rest="${hit#*:}"
+    lineno="${lineno_rest%%:*}"
+    if (( first == 1 )); then
+      first=0
+      continue
+    fi
+    # comment the exact include line at that line number
+    sed -i "${lineno}s@^\s*include /etc/nginx/snippets/solana_rpc_proxy\.conf;@  # DISABLED_DUP_${TS} include /etc/nginx/snippets/solana_rpc_proxy.conf;@" "$file"
+    echo "Disabled in $file:$lineno"
+  done
+fi
+
+echo
+echo "== 3) If solana_rpc_proxy.conf itself contains duplicate location /solana-rpc, keep first only =="
+# Keep first 'location ... /solana-rpc' block, drop subsequent identical ones.
+# This is conservative: only removes extra blocks that start with 'location ... /solana-rpc'
+awk '
+  BEGIN{inblk=0; seen=0}
+  /^[[:space:]]*location[[:space:]].*\/solana-rpc/{
+    if(seen==0){seen=1; inblk=1; print; next}
+    # drop this duplicate block
+    inblk=2; next
+  }
+  # end of a block
+  inblk==2 && /^[[:space:]]*\}/ {inblk=0; next}
+  inblk==2 {next}
+  {print}
+' "$SNIP_SOL" > /tmp/solana_rpc_proxy.conf.fixed
+mv /tmp/solana_rpc_proxy.conf.fixed "$SNIP_SOL"
+
+echo
+echo "== 4) nginx -t =="
+nginx -t
+
+echo
+echo "== reload nginx =="
+systemctl reload nginx
+
+echo "DONE ✅"
+BASH
+
+chmod +x /root/fix_dupes_and_awk.sh
+/root/fix_dupes_and_awk.sh
