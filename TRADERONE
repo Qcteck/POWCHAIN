@@ -1,18 +1,32 @@
-cat >/root/fix_public_waf_403_by_changing_path.sh <<'BASH'
+cat >/root/force_patch_use_srpc_no_cache.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
 DOMAIN="fireinners.online"
+ROOT="/var/www/wolverine"
+JS="$ROOT/phantom_patch.js"
 SNIP="/etc/nginx/snippets/solana_rpc_proxy.conf"
-JS="/var/www/wolverine/phantom_patch.js"
+SSL="/etc/nginx/sites-available/fireinners.online-ssl"
 ts="$(date +%Y%m%d_%H%M%S)"
 
-cp -a "$SNIP" "${SNIP}.bak_${ts}" 2>/dev/null || true
-cp -a "$JS" "${JS}.bak_${ts}" 2>/dev/null || true
+echo "== 1) Patch phantom_patch.js to use /srpc =="
+if [[ -f "$JS" ]]; then
+  cp -a "$JS" "${JS}.bak_${ts}"
+  # remplace toutes les variantes possibles
+  sed -i 's@const RPC = "/solana-rpc"@const RPC = "/srpc"@g' "$JS" || true
+  sed -i "s@const RPC = '/solana-rpc'@const RPC = '/srpc'@g" "$JS" || true
+  # au cas où c'est écrit en dur ailleurs
+  sed -i 's@/solana-rpc@/srpc@g' "$JS" || true
+else
+  echo "[WARN] missing $JS"
+fi
 
+echo "== 2) Ensure nginx snippet serves /srpc (and keep /solana-rpc optional) =="
+cp -a "$SNIP" "${SNIP}.bak_${ts}" 2>/dev/null || true
 cat >"$SNIP" <<'NGINX'
 # Include INSIDE server{} only.
-# Public endpoint /srpc (avoid WAF blocking "/solana-rpc")
+
+# NEW public endpoint (avoid WAF blocking "/solana-rpc")
 location = /srpc {
   auth_basic off;
   allow all;
@@ -27,7 +41,7 @@ location = /srpc {
   proxy_set_header Host api.mainnet-beta.solana.com;
 }
 
-# Keep /solana-rpc too (optional)
+# Keep legacy path (may still be blocked by WAF, but harmless)
 location = /solana-rpc {
   auth_basic off;
   allow all;
@@ -43,23 +57,32 @@ location = /solana-rpc {
 }
 NGINX
 
-# Patch JS to use /srpc
-if [[ -f "$JS" ]]; then
-  sed -i 's@const RPC = "/solana-rpc"@const RPC = "/srpc"@' "$JS" || true
+echo "== 3) Disable cache for phantom_patch.js at nginx level =="
+# ajoute un bloc location si pas déjà là
+if ! grep -q 'location = /wolverine/phantom_patch.js' "$SSL"; then
+  cp -a "$SSL" "${SSL}.bak_${ts}"
+  # inject juste après la ligne "location ^~ /wolverine/ {"
+  perl -0777 -i -pe 's@(location\s+\^\~\s+/wolverine/\s*\{\s*\n)@$1  # no-cache wallet patch\n@' "$SSL"
+  # ajoute un bloc dédié (dans server{})
+  perl -0777 -i -pe 's@(\n\})@\n  location = /wolverine/phantom_patch.js {\n    add_header Cache-Control "no-store" always;\n    try_files $uri =404;\n  }\n$1@' "$SSL"
 fi
 
+echo "== 4) Cache-bust: force HTML to load new phantom_patch.js?v=TS =="
+find "$ROOT" -maxdepth 4 -type f -name "*.html" -print0 | while IFS= read -r -d '' f; do
+  cp -a "$f" "${f}.bak_${ts}"
+  # retire anciens tags phantom_patch.js
+  perl -0777 -i -pe 's@<script[^>]+phantom_patch\.js[^>]*></script>@@gsi' "$f"
+  # inject dans <head>
+  perl -0777 -i -pe 's@(<head[^>]*>)@$1\n<script src="/wolverine/phantom_patch.js?v='"$ts"'" defer></script>\n@i' "$f"
+done
+
+echo "== 5) nginx test + reload =="
 nginx -t
 systemctl reload nginx
 
 echo
-echo "== Public test /srpc =="
+echo "== 6) Public test /srpc (must be 200) =="
 curl -sk -i "https://${DOMAIN}/srpc" \
-  -H 'Content-Type: application/json' \
-  --data '{"jsonrpc":"2.0","id":1,"method":"getVersion"}' | sed -n '1,18p'
-
-echo
-echo "== Localhost forced test /srpc =="
-curl -sk -i --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/srpc" \
   -H 'Content-Type: application/json' \
   --data '{"jsonrpc":"2.0","id":1,"method":"getVersion"}' | sed -n '1,18p'
 
@@ -67,5 +90,5 @@ echo
 echo "Open: https://${DOMAIN}/wolverine/?v=$ts"
 BASH
 
-chmod +x /root/fix_public_waf_403_by_changing_path.sh
-/root/fix_public_waf_403_by_changing_path.sh
+chmod +x /root/force_patch_use_srpc_no_cache.sh
+/root/force_patch_use_srpc_no_cache.sh
