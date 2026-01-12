@@ -1,2 +1,83 @@
-ls -la /etc/nginx/sites-enabled
-nginx -t 2>&1 | head -n 25
+cat >/root/fix_blank_ui_rpc403.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+DOMAIN="fireinners.online"
+ROOT="/var/www/wolverine"
+JS="$ROOT/phantom_patch.js"
+SNIP="/etc/nginx/snippets/solana_rpc_proxy.conf"
+SSL="/etc/nginx/sites-available/fireinners.online-ssl"
+ts="$(date +%Y%m%d_%H%M%S)"
+
+cp -a "$SNIP" "${SNIP}.bak_${ts}" 2>/dev/null || true
+cp -a "$JS"   "${JS}.bak_${ts}"  2>/dev/null || true
+cp -a "$SSL"  "${SSL}.bak_${ts}" 2>/dev/null || true
+
+echo "== 1) Nginx: expose Solana RPC under /wolverine/rpc =="
+cat >"$SNIP" <<'NGINX'
+# Include INSIDE server{} only.
+
+location = /wolverine/rpc {
+  auth_basic off;
+  allow all;
+
+  add_header Access-Control-Allow-Origin * always;
+  add_header Access-Control-Allow-Headers * always;
+  add_header Access-Control-Allow-Methods "POST, OPTIONS" always;
+  if ($request_method = OPTIONS) { return 204; }
+
+  proxy_pass https://api.mainnet-beta.solana.com/;
+  proxy_ssl_server_name on;
+  proxy_set_header Host api.mainnet-beta.solana.com;
+}
+
+# Old endpoints disabled (avoid hitting WAF rules)
+location = /srpc { return 404; }
+location = /solana-rpc { return 404; }
+NGINX
+
+echo "== 2) Make phantom_patch.js use /wolverine/rpc and never break UI if RPC fails =="
+if [[ -f "$JS" ]]; then
+  # Ensure RPC path
+  sed -i 's@/solana-rpc@/wolverine/rpc@g' "$JS" || true
+  sed -i 's@/srpc@/wolverine/rpc@g' "$JS" || true
+
+  # If it throws "Access forbidden", make it non-fatal by downgrading throws to warnings (simple & effective)
+  # (This is a blunt but safe guardrail to stop blank page.)
+  sed -i 's@throw new Error("Access forbidden");@console.warn("RPC forbidden (non-fatal): continuing UI"); return null;@g' "$JS" || true
+  sed -i 's@throw new Error(\x27Access forbidden\x27);@console.warn("RPC forbidden (non-fatal): continuing UI"); return null;@g' "$JS" || true
+fi
+
+echo "== 3) Ensure phantom_patch.js is no-cache (avoid stale JS) =="
+# remove any existing block then add clean one (with $uri intact)
+perl -0777 -i -pe 's@\n\s*location\s*=\s*/wolverine/phantom_patch\.js\s*\{.*?\}\s*\n@\n@sg' "$SSL"
+perl -0777 -i -pe 's@\n\}\s*$@\n  location = /wolverine/phantom_patch.js {\n    add_header Cache-Control "no-store" always;\n    try_files \$uri =404;\n  }\n}\n@sg' "$SSL"
+
+echo "== 4) nginx test + reload =="
+nginx -t
+systemctl reload nginx
+
+echo
+echo "== 5) Tests (public + localhost forced) =="
+echo "-- Public:"
+curl -sk -i "https://${DOMAIN}/wolverine/rpc" \
+  -H 'Content-Type: application/json' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"getVersion"}' | sed -n '1,18p'
+
+echo "-- Localhost forced:"
+curl -sk -i --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/rpc" \
+  -H 'Content-Type: application/json' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"getVersion"}' | sed -n '1,18p'
+
+echo
+echo "Open: https://${DOMAIN}/wolverine/?v=$ts"
+BASH
+
+chmod +x /root/fix_blank_ui_rpc403.sh
+/root/fix_blank_ui_rpc403.sh
+
+
+
+
+
+
