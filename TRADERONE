@@ -1,63 +1,77 @@
-ast login: Mon Jan 12 20:22:40 2026 from 169.254.0.1
-root@srv1195584:~# nginx -T 2>/dev/null | grep -n "/solana-rpc" | head -n 80
-sed -n '1,220p' /etc/nginx/snippets/solana_rpc_proxy.conf
-sed -n '1,220p' /etc/nginx/snippets/traderone_api_proxy.conf
+cat >/root/clean_solana_rpc_conf.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+TS="$(date +%Y%m%d_%H%M%S)"
+
+SNIP="/etc/nginx/snippets/solana_rpc_proxy.conf"
+
+echo "== Backup =="
+cp -a "$SNIP" "${SNIP}.bak_${TS}"
+echo "Saved: ${SNIP}.bak_${TS}"
+
+echo
+echo "== Rewrite solana_rpc_proxy.conf (ONLY /wolverine/rpc) =="
+cat >"$SNIP" <<'EOF'
 # Include INSIDE server{} only.
 
+# Solana JSON-RPC proxy for the UI / Phantom
 location = /wolverine/rpc {
-  auth_basic off; allow all;
+  auth_basic off;
+  allow all;
 
   add_header Access-Control-Allow-Origin "*" always;
   add_header Access-Control-Allow-Headers "*" always;
   add_header Access-Control-Allow-Methods "POST, OPTIONS" always;
+
   if ($request_method = OPTIONS) { return 204; }
 
-  proxy_pass https://api.mainnet-beta.solana.com/;
-  proxy_http_version 1.1;
-  proxy_ssl_server_name on;
-  proxy_set_header Host api.mainnet-beta.solana.com;
-}
-location = /solana-rpc { return 404; }
-
-  # --- PATCH: avoid upstream WAF rejecting browser/Phantom headers ---
-  # Many Solana RPC providers block browser origins / wallet UAs.
-  proxy_set_header Origin "";
-  proxy_set_header Referer "";
-  # If still 403, uncomment next line to force a neutral UA:
-  # proxy_set_header User-Agent "curl/8.5.0";
-  # --- END PATCH ---
-
-  # CHATGPT_STRIP_ORIGIN (avoid upstream provider blocking browser-like requests)
+  # Avoid upstream WAF rejecting browser / Phantom headers
   proxy_set_header Origin "";
   proxy_set_header Referer "";
   proxy_set_header Sec-Fetch-Site "";
   proxy_set_header Sec-Fetch-Mode "";
   proxy_set_header Sec-Fetch-Dest "";
   proxy_set_header Connection "";
-# /wolverine/traderone/api/* -> http://127.0.0.1:8585/api/*
+  # proxy_set_header User-Agent "curl/8.5.0";
 
-location = /wolverine/traderone/api/health {
+  proxy_pass https://api.mainnet-beta.solana.com/;
   proxy_http_version 1.1;
-  proxy_set_header Host $host;
-  proxy_set_header X-Real-IP $remote_addr;
-  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto $scheme;
-
-  rewrite ^/wolverine/traderone/api/(.*)$ /api/$1 break;
-  proxy_pass http://127.0.0.1:8585;
+  proxy_ssl_server_name on;
+  proxy_set_header Host api.mainnet-beta.solana.com;
 }
+EOF
 
-location ^~ /wolverine/traderone/api/ {
-  proxy_http_version 1.1;
-  proxy_set_header Host $host;
-  proxy_set_header X-Real-IP $remote_addr;
-  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto $scheme;
+echo
+echo "== Kill /solana-rpc duplicates (comment them everywhere, keep none) =="
+# If you still need /solana-rpc later, we can re-add it ONCE in the vhost.
+grep -RIn --exclude='*.bak*' --exclude-dir='_saved_*' \
+  -E '^[[:space:]]*location[[:space:]].*/solana-rpc' \
+  /etc/nginx/sites-enabled /etc/nginx/snippets /etc/nginx/conf.d 2>/dev/null || true
 
-  proxy_set_header Upgrade $http_upgrade;
-  proxy_set_header Connection "upgrade";
+# comment any active /solana-rpc location lines
+while IFS= read -r hit; do
+  file="${hit%%:*}"
+  rest="${hit#*:}"
+  line="${rest%%:*}"
+  cp -a "$file" "${file}.bak_${TS}"
+  sed -i "${line}s@^[[:space:]]*@# DISABLED_SOLANA_RPC_${TS} @" "$file"
+  echo "Disabled: $file:$line"
+done < <(
+  grep -RIn --exclude='*.bak*' --exclude-dir='_saved_*' \
+    -E '^[[:space:]]*location[[:space:]].*/solana-rpc' \
+    /etc/nginx/sites-enabled /etc/nginx/snippets /etc/nginx/conf.d 2>/dev/null || true
+)
 
-  rewrite ^/wolverine/traderone/api/(.*)$ /api/$1 break;
-  proxy_pass http://127.0.0.1:8585;
-}
-root@srv1195584:~# 
+echo
+echo "== nginx -t =="
+nginx -t
+
+echo
+echo "== reload nginx =="
+systemctl reload nginx
+
+echo "DONE ✅"
+BASH
+
+chmod +x /root/clean_solana_rpc_conf.sh
+/root/clean_solana_rpc_conf.sh
