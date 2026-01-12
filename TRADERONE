@@ -1,4 +1,4 @@
-cat >/root/verify_and_fix_api_now.sh <<'BASH'
+cat >/root/fix_port_and_srpc_now.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -6,53 +6,35 @@ DOMAIN="fireinners.online"
 AV="/etc/nginx/sites-available/fireinners.online-ssl"
 EN="/etc/nginx/sites-enabled/fireinners.online-ssl"
 SNIP="/etc/nginx/snippets/traderone_api_proxy.conf"
+ts="$(date +%Y%m%d_%H%M%S)"
 
-echo "== 1) nginx -t (sanity) =="
+echo "== 0) nginx sanity =="
 nginx -t
 
-echo "== 2) reload nginx =="
-systemctl reload nginx
-echo "[OK] reloaded"
-
-echo
-echo "== 3) show key nginx lines =="
-nl -ba "$EN" | sed -n '1,80p' | grep -nE "server_name|include /etc/nginx/snippets/traderone_api_proxy.conf|location \^~ /wolverine/|location \^~ /wolverine/traderone/api/|location = /wolverine/traderone/api/health|try_files" || true
-
-echo
-echo "== 4) show snippet content (API proxy) =="
-if [[ -f "$SNIP" ]]; then
-  echo "--- $SNIP ---"
-  sed -n '1,160p' "$SNIP"
-else
-  echo "[WARN] $SNIP missing"
-fi
-
-echo
-echo "== 5) autodetect backend port (from your node ports) =="
+echo "== 1) Detect backend port (from your node ports) =="
 PORT=""
-for p in 3005 8484 8585 9696 12703 3000 3001 8080 8000 5000; do
+for p in 8585 3005 8484 9696 12703 3000 3001 3100 8080 8000 5000; do
   code="$(curl -s -o /tmp/h.$$ -w "%{http_code}" "http://127.0.0.1:$p/api/health" || true)"
   if [[ "$code" == "200" ]]; then
-    head -c 80 /tmp/h.$$ | tr -d '\n' | grep -qv "<!DOCTYPE html" && PORT="$p" && break
+    head -c 60 /tmp/h.$$ | tr -d '\n' | grep -qv "<!DOCTYPE html" && PORT="$p" && break
   fi
 done
 rm -f /tmp/h.$$ 2>/dev/null || true
-echo "PORT=${PORT:-NONE}"
 
-echo
-echo "== 6) public test (should NOT be HTML) =="
-echo "-- headers:"
-curl -sk -i "https://${DOMAIN}/wolverine/traderone/api/health" | sed -n '1,25p'
-echo "-- body first 120 bytes:"
-curl -sk "https://${DOMAIN}/wolverine/traderone/api/health" | head -c 120; echo
+if [[ -z "$PORT" ]]; then
+  echo "[ERR] No backend found responding to http://127.0.0.1:PORT/api/health"
+  ss -lntp | grep -E "node|:8585|:3005|:8484|:9696|:12703|:3000" || true
+  exit 1
+fi
+echo "[OK] PORT=$PORT"
 
-# If still HTML and we found a backend port, write/overwrite the snippet and reload.
-BODY="$(curl -sk "https://${DOMAIN}/wolverine/traderone/api/health" | head -c 40 || true)"
-if echo "$BODY" | grep -q "<!DOCTYPE html" && [[ -n "${PORT:-}" ]]; then
-  echo
-  echo "== 7) Still HTML -> write proper API proxy snippet and reload =="
-  mkdir -p /etc/nginx/snippets
-  cat >"$SNIP" <<NGINX
+echo "== 2) Backup + write API proxy snippet with correct PORT =="
+cp -a "$AV" "${AV}.bak_${ts}"
+mkdir -p /etc/nginx/snippets
+
+cat >"$SNIP" <<NGINX
+# /wolverine/traderone/api/* -> http://127.0.0.1:${PORT}/api/*
+
 location = /wolverine/traderone/api/health {
   proxy_http_version 1.1;
   proxy_set_header Host \$host;
@@ -79,26 +61,49 @@ location ^~ /wolverine/traderone/api/ {
 }
 NGINX
 
-  # ensure include exists
-  if ! grep -q "traderone_api_proxy.conf" "$AV"; then
-    sed -i '/server_name .*fireinners\.online/ a\  include /etc/nginx/snippets/traderone_api_proxy.conf;' "$AV"
-  fi
-  ln -sf "$AV" "$EN"
-
-  nginx -t
-  systemctl reload nginx
-  echo "[OK] reloaded with API proxy"
-
-  echo
-  echo "== 8) public re-test =="
-  curl -sk -i "https://${DOMAIN}/wolverine/traderone/api/health" | sed -n '1,25p'
-  echo "-- body first 120 bytes:"
-  curl -sk "https://${DOMAIN}/wolverine/traderone/api/health" | head -c 120; echo
+# ensure include exists in vhost
+if ! grep -q "traderone_api_proxy.conf" "$AV"; then
+  sed -i '/server_name .*fireinners\.online/ a\  include /etc/nginx/snippets/traderone_api_proxy.conf;' "$AV"
 fi
+
+# hard-stop /srpc for ALL methods (avoid CF/WAF hits once JS stops calling it)
+if ! grep -q "location = /srpc" "$AV"; then
+  sed -i '/server_name .*fireinners\.online/ a\  location = /srpc { return 404; }' "$AV"
+fi
+
+ln -sf "$AV" "$EN"
+
+echo "== 3) reload nginx =="
+nginx -t
+systemctl reload nginx
+echo "[OK] nginx reloaded"
+
+echo
+echo "== 4) LOCAL tests =="
+echo "-- http://127.0.0.1:${PORT}/api/health"
+curl -sS -i "http://127.0.0.1:${PORT}/api/health" | sed -n '1,25p'
+echo
+
+echo
+echo "== 5) PUBLIC tests (health) =="
+curl -sk -i "https://${DOMAIN}/wolverine/traderone/api/health" | sed -n '1,25p'
+echo "-- body first 120:"
+curl -sk "https://${DOMAIN}/wolverine/traderone/api/health" | head -c 120; echo
+
+echo
+echo "== 6) Check what phantom_patch.js SERVED contains (srpc?) =="
+curl -sk "https://${DOMAIN}/wolverine/phantom_patch.js?v=${ts}" | grep -nE "/srpc|/wolverine/rpc" || true
+
+echo
+echo "== 7) PUBLIC POST /srpc (should be 404, not 403) =="
+curl -sk -i -X POST "https://${DOMAIN}/srpc" \
+  -H 'Content-Type: application/json' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"getVersion"}' | sed -n '1,20p'
 
 echo
 echo "DONE ✅"
+echo "Tip: open https://${DOMAIN}/wolverine/?v=${ts} to bypass cache."
 BASH
 
-chmod +x /root/verify_and_fix_api_now.sh
-/root/verify_and_fix_api_now.sh
+chmod +x /root/fix_port_and_srpc_now.sh
+/root/fix_port_and_srpc_now.sh
