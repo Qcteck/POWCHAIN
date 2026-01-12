@@ -1,4 +1,178 @@
-cat >/root/find_wolverine_code.sh <<'BASH'
+
+location = /wolverine/rpc {
+  auth_basic off; allow all;
+
+  add_header Access-Control-Allow-Origin "*" always;
+  add_header Access-Control-Allow-Headers "*" always;
+  add_header Access-Control-Allow-Methods "POST, OPTIONS" always;
+  if ($request_method = OPTIONS) { return 204; }
+
+  proxy_pass https://api.mainnet-beta.solana.com/;
+  proxy_http_version 1.1;
+  proxy_ssl_server_name on;
+  proxy_set_header Host api.mainnet-beta.solana.com;
+}
+location = /solana-rpc { return 404; }
+
+  # --- PATCH: avoid upstream WAF rejecting browser/Phantom headers ---
+  # Many Solana RPC providers block browser origins / wallet UAs.
+  proxy_set_header Origin "";
+  proxy_set_header Referer "";
+  # If still 403, uncomment next line to force a neutral UA:
+  # proxy_set_header User-Agent "curl/8.5.0";
+  # --- END PATCH ---
+
+  # CHATGPT_STRIP_ORIGIN (avoid upstream provider blocking browser-like requests)
+  proxy_set_header Origin "";
+  proxy_set_header Referer "";
+  proxy_set_header Sec-Fetch-Site "";
+  proxy_set_header Sec-Fetch-Mode "";
+  proxy_set_header Sec-Fetch-Dest "";
+  proxy_set_header Connection "";
+# /wolverine/traderone/api/* -> http://127.0.0.1:8585/api/*
+
+location = /wolverine/traderone/api/health {
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+
+  rewrite ^/wolverine/traderone/api/(.*)$ /api/$1 break;
+  proxy_pass http://127.0.0.1:8585;
+}
+
+location ^~ /wolverine/traderone/api/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+
+  proxy_set_header Upgrade $http_upgrade;
+  proxy_set_header Connection "upgrade";
+
+  rewrite ^/wolverine/traderone/api/(.*)$ /api/$1 break;
+  proxy_pass http://127.0.0.1:8585;
+}
+root@srv1195584:~# cat >/root/clean_solana_rpc_conf.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+TS="$(date +%Y%m%d_%H%M%S)"
+
+SNIP="/etc/nginx/snippets/solana_rpc_proxy.conf"
+
+echo "== Backup =="
+cp -a "$SNIP" "${SNIP}.bak_${TS}"
+echo "Saved: ${SNIP}.bak_${TS}"
+
+echo
+echo "== Rewrite solana_rpc_proxy.conf (ONLY /wolverine/rpc) =="
+cat >"$SNIP" <<'EOF'
+# Include INSIDE server{} only.
+
+# Solana JSON-RPC proxy for the UI / Phantom
+location = /wolverine/rpc {
+  auth_basic off;
+  allow all;
+
+  add_header Access-Control-Allow-Origin "*" always;
+  add_header Access-Control-Allow-Headers "*" always;
+  add_header Access-Control-Allow-Methods "POST, OPTIONS" always;
+
+  if ($request_method = OPTIONS) { return 204; }
+
+  # Avoid upstream WAF rejecting browser / Phantom headers
+  proxy_set_header Origin "";
+  proxy_set_header Referer "";
+  proxy_set_header Sec-Fetch-Site "";
+  proxy_set_header Sec-Fetch-Mode "";
+  proxy_set_header Sec-Fetch-Dest "";
+  proxy_set_header Connection "";
+  # proxy_set_header User-Agent "curl/8.5.0";
+
+  proxy_pass https://api.mainnet-beta.solana.com/;
+  proxy_http_version 1.1;
+  proxy_ssl_server_name on;
+  proxy_set_header Host api.mainnet-beta.solana.com;
+}
+EOF
+
+echo
+echo "== Kill /solana-rpc duplicates (comment them everywhere, keep none) =="
+# If you still need /solana-rpc later, we can re-add it ONCE in the vhost.
+grep -RIn --exclude='*.bak*' --exclude-dir='_saved_*' \
+  -E '^[[:space:]]*location[[:space:]].*/solana-rpc' \
+/root/clean_solana_rpc_conf.shc_conf.sh/snippets /etc/nginx/conf.d 2>/dev/null || true
+== Backup ==
+Saved: /etc/nginx/snippets/solana_rpc_proxy.conf.bak_20260112_212518
+
+== Rewrite solana_rpc_proxy.conf (ONLY /wolverine/rpc) ==
+
+== Kill /solana-rpc duplicates (comment them everywhere, keep none) ==
+
+== nginx -t ==
+2026/01/12 21:25:18 [emerg] 379582#379582: duplicate location "/wolverine/rpc" in /etc/nginx/snippets/solana_rpc_proxy.conf:4
+nginx: configuration file /etc/nginx/nginx.conf test failed
+root@srv1195584:~# cat >/root/fix_dup_wolverine_rpc.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+TS="$(date +%Y%m%d_%H%M%S)"
+
+echo "== 1) Source-of-truth: where /wolverine/rpc is defined (ACTIVE conf) =="
+nginx -T 2>/dev/null | grep -n "/wolverine/rpc" | head -n 120 || true
+
+echo
+echo "== 2) Find ALL FILE occurrences (exclude backups/_saved) =="
+mapfile -t HITS < <(
+  grep -RIn --exclude='*.bak*' --exclude-dir='_saved_*' \
+    -E '^[[:space:]]*location[[:space:]].*/wolverine/rpc' \
+    /etc/nginx/sites-enabled /etc/nginx/snippets /etc/nginx/conf.d 2>/dev/null || true
+)
+
+printf '%s\n' "${HITS[@]:-<none>}"
+echo
+
+if ((${#HITS[@]} <= 1)); then
+  echo "OK: 0 or 1 definition only. Nothing to dedupe."
+else
+  echo "== 3) Comment duplicates (KEEP FIRST ONLY) =="
+  keep=1
+  for hit in "${HITS[@]}"; do
+    file="${hit%%:*}"
+    rest="${hit#*:}"
+    line="${rest%%:*}"
+
+    if (( keep==1 )); then
+      echo "KEEP: $file:$line"
+      keep=0
+      continue
+    fi
+
+    cp -a "$file" "${file}.bak_${TS}"
+    sed -i "${line}s@^[[:space:]]*@# DISABLED_DUP_WOLVERINE_RPC_${TS} @" "$file"
+    echo "DISABLED: $file:$line"
+  done
+fi
+
+echo
+echo "== 4) nginx -t =="
+nginx -t
+
+echo
+echo "== 5) reload nginx =="
+/root/fix_dup_wolverine_rpc.shne_rpc.sh
+== 1) Source-of-truth: where /wolverine/rpc is defined (ACTIVE conf) ==
+
+== 2) Find ALL FILE occurrences (exclude backups/_saved) ==
+/etc/nginx/snippets/solana_rpc_proxy.conf:4:location = /wolverine/rpc {
+
+OK: 0 or 1 definition only. Nothing to dedupe.
+
+== 4) nginx -t ==
+2026/01/12 21:26:55 [emerg] 380014#380014: duplicate location "/wolverine/rpc" in /etc/nginx/snippets/solana_rpc_proxy.conf:4
+nginx: configuration file /etc/nginx/nginx.conf test failed
+root@srv1195584:~# cat >/root/find_wolverine_code.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -34,3 +208,118 @@ BASH
 
 chmod +x /root/find_wolverine_code.sh
 /root/find_wolverine_code.sh
+
+========== 1) /var/www (top level) ==========
+
+total 240K
+drwxr-xr-x 34 root     root     4.0K Jan 11 05:16 .
+drwxr-xr-x 14 root     root     4.0K Dec 13 01:22 ..
+drwxr-xr-x  4 root     root     4.0K Jan  8 10:04 _ARCHIVE_WOLVERINE_20260108_100440
+drwxr-xr-x  2 root     root     4.0K Jan  8 10:06 _ARCHIVE_WOLVERINE_20260108_100633
+drwxr-xr-x  2 root     root     4.0K Jan  8 11:07 _BACKUP_PHANTOM_ONLY_20260108_110758
+drwxr-xr-x  2 root     root     4.0K Jan  8 11:41 _BACKUP_PHANTOM_ONLY_20260108_114135
+drwxr-xr-x  2 root     root     4.0K Jan  8 10:59 _BACKUP_WOLVERINE_PHANTOM_20260108_105939
+drwxr-xr-x  2 root     root     4.0K Jan  8 10:26 _BACKUP_WOLVERINE_UI_20260108_102649
+drwxr-xr-x  2 root     root     4.0K Jan  8 10:45 _BACKUP_WOLVERINE_UI_20260108_104532
+drwxr-xr-x  2 root     root     4.0K Jan  8 10:30 _BACKUP_WOLVERINE_UI_V3_20260108_103030
+drwxr-xr-x  2 root     root     4.0K Jan  8 10:35 _BACKUP_WOLVERINE_UI_V4_20260108_103536
+drwxr-xr-x  2 root     root     4.0K Jan 11 08:40 _BACKUP_WOLVERINE_UI_V4_20260108_103604
+drwxr-xr-x  2 www-data www-data 4.0K Jan  9 02:29 _vpsmap
+drwxr-xr-x  3 www-data www-data 4.0K Dec 13 02:41 certbot
+drwxr-xr-x  3 root     root     4.0K Jan  8 10:04 fireinners
+drwxr-xr-x  3 www-data www-data  36K Jan  9 17:03 fireinners-test
+drwxr-xr-x  2 root     root      36K Jan  9 17:03 fireinners-test-backup-20260109_170326
+drwxr-xr-x  3 root     root     4.0K Jan  3 09:17 fireinners.BACKUP_20251217_040258
+drwxr-xr-x  2 www-data www-data 4.0K Jan  3 09:17 fireinners.BACKUP_OK_20251217_035415
+drwxr-xr-x  2 www-data www-data 4.0K Jan  9 03:36 fireinners_test
+drwxr-xr-x  2 root     root     4.0K Jan  8 10:04 html
+drwxr-xr-x  2 root     root     4.0K Dec 19 01:23 price
+drwxr-xr-x 11 root     root     4.0K Jan 12 18:46 wolverine
+drwxr-xr-x  2 www-data www-data  36K Jan  9 14:07 wolverine-renders
+drwxr-xr-x  3 root     root     4.0K Jan  8 08:24 wolverine_BAD_1767861732
+drwxr-xr-x  2 root     root     4.0K Jan  8 07:52 wolverine_backup_1767859191
+drwxr-xr-x  3 root     root     4.0K Jan  8 07:59 wolverine_backup_1767859436
+drwxr-xr-x  2 root     root     4.0K Jan  8 08:03 wolverine_backup_1767859576
+drwxr-xr-x  2 root     root     4.0K Jan  8 08:06 wolverine_backup_1767860545
+drwxr-xr-x  2 root     root     4.0K Jan  8 08:42 wolverine_backup_1767863104
+drwxr-xr-x 14 www-data www-data 4.0K Jan  9 03:48 wolverine_backup_20260111_051641
+lrwxrwxrwx  1 root     root       18 Jan  8 21:36 wolverine_current -> /var/www/wolverine
+drwxr-xr-x  4 root     root     4.0K Jan  8 07:10 wolverine_fireinners_backup_1767858427
+drwxr-xr-x  2 root     root     4.0K Jan  8 07:47 wolverine_fireinners_backup_1767858738
+drwxr-xr-x  2 www-data www-data 4.0K Jan  9 03:43 wolverine_test
+
+========== 2) Biggest candidates under /var/www (depth 3) ==========
+
+20K     /var/www/_BACKUP_WOLVERINE_UI_20260108_104532
+20K     /var/www/certbot
+20K     /var/www/wolverine/health
+20K     /var/www/wolverine/history
+20K     /var/www/wolverine/orders
+20K     /var/www/wolverine/positions
+20K     /var/www/wolverine/settings
+20K     /var/www/wolverine/trade
+20K     /var/www/wolverine/wallet
+28K     /var/www/html
+32K     /var/www/_BACKUP_WOLVERINE_UI_V4_20260108_103604
+44K     /var/www/_vpsmap
+52K     /var/www/wolverine/404
+76K     /var/www/fireinners.BACKUP_OK_20251217_035415
+200K    /var/www/wolverine_fireinners_backup_1767858427/assets
+212K    /var/www/wolverine_backup_20260111_051641/vendor
+400K    /var/www/wolverine_backup_20260111_051641/_index_versions
+432K    /var/www/wolverine_BAD_1767861732/assets
+432K    /var/www/wolverine_backup_1767859436/assets
+500K    /var/www/fireinners.BACKUP_20251217_040258
+524K    /var/www/wolverine_backup_20260111_051641/_next/static
+528K    /var/www/_ARCHIVE_WOLVERINE_20260108_100440/_wolverine_ui/_next
+532K    /var/www/wolverine_backup_20260111_051641/_next
+644K    /var/www/_ARCHIVE_WOLVERINE_20260108_100440/_wolverine_ui
+820K    /var/www/wolverine/_next/static
+828K    /var/www/wolverine/_next
+920K    /var/www/wolverine_BAD_1767861732
+920K    /var/www/wolverine_backup_1767859436
+1.3M    /var/www/wolverine_backup_20260111_051641
+1.4M    /var/www/wolverine
+1.6M    /var/www/wolverine_fireinners_backup_1767858427
+1.9M    /var/www/_ARCHIVE_WOLVERINE_20260108_100440/wolverine/wolverine
+2.0M    /var/www/_ARCHIVE_WOLVERINE_20260108_100440/wolverine
+2.6M    /var/www/_ARCHIVE_WOLVERINE_20260108_100440
+20M     /var/www/fireinners-test-backup-20260109_170326
+20M     /var/www/fireinners-test/ultimate/frames
+20M     /var/www/wolverine-renders
+38M     /var/www/fireinners-test
+38M     /var/www/fireinners-test/ultimate
+87M     /var/www
+
+========== 3) Find Node/Next projects (package.json / next.config.js) ==========
+
+
+========== 4) Find Python projects (requirements.txt / pyproject.toml) ==========
+
+
+========== 5) Find running node services (ports -> PID -> cmdline) ==========
+
+LISTEN 0      511        127.0.0.1:9696       0.0.0.0:*    users:(("node",pid=3063692,fd=18))                                                    
+LISTEN 0      511        127.0.0.1:12703      0.0.0.0:*    users:(("node",pid=3063681,fd=18))                                                    
+LISTEN 0      511        127.0.0.1:8585       0.0.0.0:*    users:(("node",pid=3063715,fd=18))                                                    
+LISTEN 0      511        127.0.0.1:8484       0.0.0.0:*    users:(("node",pid=3063693,fd=18))                                                    
+LISTEN 0      5         10.66.66.1:9696       0.0.0.0:*    users:(("python3",pid=2092152,fd=3))                                                  
+LISTEN 0      511        127.0.0.1:3005       0.0.0.0:*    users:(("node",pid=3065616,fd=18))                                                    
+
+PID 3063692:
+/usr/bin/node /opt/probe/server.js 
+
+PID 3063681:
+/usr/bin/node /opt/fireinners/solrpc-proxy/server.js 
+
+PID 3063715:
+/usr/bin/node /opt/traderone-opt/server.js 
+
+PID 3063693:
+/usr/bin/node /root/qplus-secure/signer.js 
+
+PID 3065616:
+/usr/bin/node /opt/fireinners-auth-phantom/server.js 
+
+
+========== DONE ✅  -> paste output here ==========
