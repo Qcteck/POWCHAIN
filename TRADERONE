@@ -1,34 +1,49 @@
-cat >/root/find_balance_rpc_error_source.sh <<'BASH'
+cat >/root/quick_audit_balance.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 DOMAIN="fireinners.online"
 ROOT="/var/www/wolverine"
+ts="$(date +%s)"
 
 hr(){ echo -e "\n========== $* ==========\n"; }
 
-hr "1) What does the browser receive for phantom_patch.js (cache + srpc/rpc refs)?"
-curl -skI "https://${DOMAIN}/wolverine/phantom_patch.js" | sed -n '1,25p'
-echo
-curl -sk "https://${DOMAIN}/wolverine/phantom_patch.js?v=$(date +%s)" \
-  | grep -nE "/srpc|/wolverine/rpc|/rpc" || echo "No /srpc or /rpc strings found ✅"
+hr "1) API health (must be 200 JSON)"
+curl -sk -i "https://${DOMAIN}/wolverine/traderone/api/health" | sed -n '1,15p'
+echo "-- body(120):"; curl -sk "https://${DOMAIN}/wolverine/traderone/api/health" | head -c 120; echo
 
-hr "2) Ensure phantom_patch.js is not cached by nginx (vhost check)"
-grep -nE "location = /wolverine/phantom_patch\.js|Cache-Control" /etc/nginx/sites-enabled/fireinners.online-ssl || true
-
-hr "3) Search ANY /srpc leftovers on disk (frontend + backend)"
-grep -RIn --exclude-dir=node_modules --exclude-dir=.next --exclude='*.map' "/srpc" "$ROOT" /etc/nginx/snippets 2>/dev/null || echo "No /srpc leftovers found ✅"
-
-hr "4) Search RPC URL / env settings in backend (common names)"
-grep -RIn --exclude-dir=node_modules --exclude-dir=.next -E "SOLANA_RPC|RPC_URL|QUICKNODE|HELIUS|ALCHEMY|ANKR|CHAINSTACK|getBalance" \
-  /var/www 2>/dev/null | head -n 120 || true
-
-hr "5) Confirm /wolverine/rpc works exactly like browser (POST + headers)"
+hr "2) RPC getVersion (must be 200 JSON)"
 curl -sk -i "https://${DOMAIN}/wolverine/rpc" \
   -H 'Content-Type: application/json' \
-  --data '{"jsonrpc":"2.0","id":1,"method":"getVersion"}' | sed -n '1,40p'
+  --data '{"jsonrpc":"2.0","id":1,"method":"getVersion"}' | sed -n '1,25p'
 
-hr "DONE - paste output of sections 1 + 3 + 4"
+hr "3) CORS preflight OPTIONS /wolverine/rpc (should be 204/200 + allow-*)"
+curl -sk -i -X OPTIONS "https://${DOMAIN}/wolverine/rpc" \
+  -H "Origin: https://${DOMAIN}" \
+  -H "Access-Control-Request-Method: POST" \
+  -H "Access-Control-Request-Headers: content-type" | sed -n '1,25p'
+
+hr "4) phantom_patch.js headers (cache?)"
+curl -skI "https://${DOMAIN}/wolverine/phantom_patch.js" | sed -n '1,30p'
+
+hr "5) phantom_patch.js contains /srpc ? (NO FLOOD)"
+if curl -sk "https://${DOMAIN}/wolverine/phantom_patch.js?v=${ts}" | grep -n "/srpc" >/tmp/srpc_hits.$$ 2>/dev/null; then
+  echo "[BAD] /srpc still referenced in phantom_patch.js:"
+  head -n 10 /tmp/srpc_hits.$$
+else
+  echo "OK: no /srpc ✅"
+fi
+rm -f /tmp/srpc_hits.$$ 2>/dev/null || true
+
+hr "6) disk scan for /srpc leftovers (limited)"
+grep -RIn --exclude-dir=node_modules --exclude-dir=.next --exclude='*.map' "/srpc" \
+  "$ROOT" /etc/nginx/snippets 2>/dev/null | head -n 50 || true
+
+hr "7) show nginx definitions for /srpc and /wolverine/rpc (to avoid surprises)"
+grep -RIn "location.*srpc" /etc/nginx/sites-enabled /etc/nginx/snippets 2>/dev/null || true
+grep -RIn "location.*wolverine/rpc" /etc/nginx/sites-enabled /etc/nginx/snippets 2>/dev/null || true
+
+hr "DONE ✅ (paste sections 4 + 5 + 6)"
 BASH
 
-chmod +x /root/find_balance_rpc_error_source.sh
-/root/find_balance_rpc_error_source.sh
+chmod +x /root/quick_audit_balance.sh
+/root/quick_audit_balance.sh
