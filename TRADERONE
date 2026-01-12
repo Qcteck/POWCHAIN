@@ -1,1 +1,104 @@
-# proxy_set_header User-Agent "curl/8.5.0";
+cat >/root/fix_wolverine_now.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+DOMAIN="fireinners.online"
+SSL_AV="/etc/nginx/sites-available/fireinners.online-ssl"
+SSL_EN="/etc/nginx/sites-enabled/fireinners.online-ssl"
+
+backup() {
+  local f="$1"
+  if [[ -f "$f" ]]; then
+    cp -a "$f" "${f}.bak_$(date +%Y%m%d_%H%M%S)"
+  fi
+}
+
+echo "== 0) Backup nginx files =="
+backup "$SSL_AV"
+backup "$SSL_EN"
+backup /etc/nginx/snippets/solana_rpc_proxy.conf
+backup /etc/nginx/snippets/traderone_api_proxy.conf
+
+echo "== 1) FIX: try_files invalid (remove bad line / make it valid) =="
+# On supprime toute ligne foireuse du style: try_files \ =404;
+# et on remplace par une ligne correcte si nécessaire.
+sed -i -E \
+  -e 's/^\s*try_files\s*\\\s*=404;.*$/    try_files $uri $uri\/ =404;/g' \
+  -e 's/^\s*try_files\s*=404;.*$/    try_files $uri $uri\/ =404;/g' \
+  "$SSL_AV"
+
+echo "== 2) Ensure API locations are ABOVE SPA fallback in ssl vhost =="
+# Si ton vhost est déjà structuré, on évite de tout casser :
+# On injecte un bloc "API+RPC overrides" juste avant location ^~ /wolverine/ si pas déjà présent.
+if ! grep -q "## CHATGPT_OVERRIDES_BEGIN" "$SSL_AV"; then
+  awk '
+    BEGIN{done=0}
+    {
+      if(!done && $0 ~ /location\s+\^\~\s+\/wolverine\/\s*\{/){
+        print "  ## CHATGPT_OVERRIDES_BEGIN"
+        print "  # API must NOT be swallowed by SPA try_files"
+        print "  location ^~ /wolverine/traderone/api/ {"
+        print "    rewrite ^/wolverine/traderone/api/(.*)$ /api/$1 break;"
+        print "    include /etc/nginx/snippets/traderone_api_proxy.conf;"
+        print "  }"
+        print ""
+        print "  # RPC proxy (strip browser headers to avoid upstream 403)"
+        print "  location = /wolverine/rpc {"
+        print "    include /etc/nginx/snippets/solana_rpc_proxy.conf;"
+        print "  }"
+        print "  ## CHATGPT_OVERRIDES_END"
+        print ""
+        done=1
+      }
+      print
+    }
+  ' "$SSL_AV" > /tmp/fireinners.online-ssl.new
+  mv /tmp/fireinners.online-ssl.new "$SSL_AV"
+fi
+
+echo "== 3) Patch solana_rpc_proxy.conf to strip Origin/Referer (Phantom 403 fix) =="
+# IMPORTANT: on neutralise Origin/Referer (et on force Connection/HTTP1.1 safe).
+# On ne touche pas à ton proxy_pass existant : juste headers.
+if ! grep -q "CHATGPT_STRIP_ORIGIN" /etc/nginx/snippets/solana_rpc_proxy.conf; then
+  cat >>/etc/nginx/snippets/solana_rpc_proxy.conf <<'NGX'
+
+  # CHATGPT_STRIP_ORIGIN (avoid upstream provider blocking browser-like requests)
+  proxy_set_header Origin "";
+  proxy_set_header Referer "";
+  proxy_set_header Sec-Fetch-Site "";
+  proxy_set_header Sec-Fetch-Mode "";
+  proxy_set_header Sec-Fetch-Dest "";
+  proxy_set_header Connection "";
+  proxy_http_version 1.1;
+NGX
+fi
+
+echo "== 4) nginx test + reload =="
+nginx -t
+systemctl reload nginx
+
+echo "== 5) Tests =="
+echo "-- API health should be JSON (not HTML):"
+curl -sk -D- "https://$DOMAIN/wolverine/traderone/api/health" | head -n 25
+echo
+
+echo "-- RPC server-style should be 200:"
+curl -sk -D- "https://$DOMAIN/wolverine/rpc" \
+  -H 'content-type: application/json' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"getVersion"}' | head -n 25
+echo
+
+echo "-- RPC Phantom-style should NOW be 200 (was 403):"
+curl -sk -D- "https://$DOMAIN/wolverine/rpc" \
+  -H 'content-type: application/json' \
+  -H "origin: https://$DOMAIN" \
+  -H "referer: https://$DOMAIN/wolverine/" \
+  -H 'user-agent: Mozilla/5.0 (iPhone; CPU iPhone OS 18_6_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 Phantom/ios/25.46.3.39417' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"getVersion"}' | head -n 25
+echo
+
+echo "DONE ✅"
+BASH
+
+chmod +x /root/fix_wolverine_now.sh
+/root/fix_wolverine_now.sh
