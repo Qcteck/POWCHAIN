@@ -1,71 +1,73 @@
-cat >/root/fix_github_push_403.sh <<'BASH'
+cat >/root/debug_github_403_and_push.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="Qcteck/WOLVERINE1"
-REPO_URL="https://github.com/${REPO}.git"
+REPO_OWNER="Qcteck"
+REPO_NAME="WOLVERINE1"
+REPO="${REPO_OWNER}/${REPO_NAME}"
 EXPORT="/opt/WOLVERINE1_export"
+REPO_URL="https://github.com/${REPO}.git"
 
-echo "== 0) Pre-check =="
+echo "== 0) Preconditions =="
 command -v git >/dev/null || { echo "git missing"; exit 1; }
+command -v curl >/dev/null || { echo "curl missing"; exit 1; }
 test -d "$EXPORT" || { echo "Missing $EXPORT"; exit 1; }
 
 cd "$EXPORT"
 
 echo
-echo "== 1) Show repo + branch =="
+echo "== 1) Local repo status =="
 git status -sb || true
-echo "Remote (before):"
+echo "Remote:"
 git remote -v || true
+echo
+
+echo "== 2) Enter GitHub PAT (hidden) =="
+read -s -p "PAT: " PAT
+echo
+if [ -z "${PAT}" ]; then echo "Empty PAT. abort"; exit 2; fi
 
 echo
-echo "== 2) Ensure clean monorepo (remove nested .git that breaks add/push) =="
-# (safe even if nothing exists)
-find . -name .git -type d -prune -exec rm -rf {} + 2>/dev/null || true
-find . -name .git -type f -delete 2>/dev/null || true
+echo "== 3) Verify token identity =="
+curl -sS -H "Authorization: Bearer ${PAT}" -H "Accept: application/vnd.github+json" \
+  https://api.github.com/user | egrep -i '"login"|\"id\"' || {
+    echo "Token invalid? (cannot read /user)"; exit 3;
+  }
 
 echo
-echo "== 3) Ensure repo initialized + commit exists =="
-if [ ! -d ".git" ]; then
-  git init
+echo "== 4) Check repo access (must be 200) =="
+HTTP_CODE="$(curl -sS -o /tmp/repo_check.json -w "%{http_code}" \
+  -H "Authorization: Bearer ${PAT}" \
+  -H "Accept: application/vnd.github+json" \
+  "https://api.github.com/repos/${REPO}")"
+
+echo "HTTP: ${HTTP_CODE}"
+if [ "$HTTP_CODE" != "200" ]; then
+  echo "❌ No access to repo ${REPO} with this token."
+  echo "Response:"
+  cat /tmp/repo_check.json
+  echo
+  echo "Fix: create a NEW PAT with proper permissions:"
+  echo "- Fine-grained: select repo ${REPO_NAME} + Contents: Read and write"
+  echo "- Classic: scope 'repo'"
+  echo "Also ensure the repo exists under your account or you are collaborator."
+  exit 4
 fi
-git branch -M main 2>/dev/null || true
-
-# If no commits yet, create one
-if ! git rev-parse --verify HEAD >/dev/null 2>&1; then
-  git add -A
-  git commit -m "server export snapshot" || true
-fi
 
 echo
-echo "== 4) Set remote origin correctly =="
+echo "== 5) Ensure origin correct =="
 git remote remove origin 2>/dev/null || true
 git remote add origin "$REPO_URL"
-echo "Remote (after):"
-git remote -v
+git branch -M main 2>/dev/null || true
 
 echo
-echo "== 5) Quick permission test (will prompt for user+PAT) =="
-echo "-> Username: ton username GitHub (ex: Qcteck)"
-echo "-> Password: COLLE TON PAT (pas ton mot de passe)"
-echo
-git ls-remote "$REPO_URL" HEAD || {
-  echo
-  echo "❌ GitHub refuse l'accès (403/denied). Causes fréquentes:"
-  echo "1) Repo ${REPO} n'existe pas ou tu n'es pas owner/collaborator"
-  echo "2) PAT pas autorisé sur ce repo (fine-grained: repo non sélectionné)"
-  echo "3) Permissions insuffisantes (classic: scope 'repo' manquant)"
-  echo
-  exit 2
-}
+echo "== 6) Push using PAT (no prompt) =="
+# Use http.extraheader so token is not written in remote URL
+git -c http.extraheader="AUTHORIZATION: bearer ${PAT}" push -u origin main
 
 echo
-echo "== 6) Push main (will prompt for user+PAT) =="
-git push -u origin main
-
-echo
-echo "DONE ✅ Repo push OK"
+echo "DONE ✅ push OK"
 BASH
 
-chmod +x /root/fix_github_push_403.sh
-/root/fix_github_push_403.sh
+chmod +x /root/debug_github_403_and_push.sh
+/root/debug_github_403_and_push.sh
