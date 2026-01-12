@@ -1,210 +1,124 @@
-Last login: Mon Jan 12 17:45:43 2026 from 169.254.0.1
-root@srv1195584:~# cat >/root/audit_wolverine_stack.sh <<'BASH'
+cat >/root/fix_tryfiles_and_api_proxy_FINAL.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
 DOMAIN="fireinners.online"
-SSL_AV="/etc/nginx/sites-available/fireinners.online-ssl"
-SSL_EN="/etc/nginx/sites-enabled/fireinners.online-ssl"
-ROOT="/var/www/wolverine"
+AV="/etc/nginx/sites-available/fireinners.online-ssl"
+EN="/etc/nginx/sites-enabled/fireinners.online-ssl"
+SNIP_API="/etc/nginx/snippets/traderone_api_proxy.conf"
+ts="$(date +%Y%m%d_%H%M%S)"
 
-hr(){ echo -e "\n========== $* ==========\n"; }
+echo "== 0) Backup =="
+cp -a "$AV" "${AV}.bak_${ts}"
 
-hr "0) Basics"
-date
-nginx -v 2>&1 || true
+echo "== 1) Fix the broken try_files line(s) in SSL vhost =="
+# Replace any broken variants like: try_files \ =404;  or try_files  =404;
+sed -i 's@try_files \\ =404;@try_files $uri =404;@g' "$AV"
+sed -i 's@try_files  =404;@try_files $uri =404;@g' "$AV"
 
-hr "1) Nginx config test (must be OK)"
-nginx -t 2>&1 | tail -n 40 || true
+# Ensure we have a proper phantom_patch location block (and only one)
+perl -0777 -i -pe 's@\n\s*location\s*=\s*/wolverine/phantom_patch\.js\s*\{.*?\}\s*\n@\n@sg' "$AV"
+perl -0777 -i -pe 's@\n\}\s*$@\n  location = /wolverine/phantom_patch.js {\n    add_header Cache-Control "no-store" always;\n    try_files \\$uri =404;\n  }\n}\n@sg' "$AV"
 
-hr "2) Enabled vhosts + conflicts on 443"
-ls -la /etc/nginx/sites-enabled || true
-echo
-nginx -T 2>/dev/null | grep -i "conflicting server name" || echo "No conflicting server name ✅"
+ln -sf "$AV" "$EN"
 
-hr "3) Which server{} blocks match ${DOMAIN} on 443 (source-of-truth)"
-nginx -T 2>/dev/null | awk '
-  /server\s*\{/ {in=1; buf=""; file=FILENAME}
-  { if(in){ buf=buf $0 "\n" } }
-  in && /listen\s+.*443/ {has443=1}
-  in && /server_name/ { if($0 ~ /fireinners\.online/ || $0 ~ /www\.fireinners\.online/) hasname=1 }
-  in && /\}/ {
-    if(has443 && hasname){
-      print "----- MATCHING SERVER BLOCK -----"
-      print buf
-    }
-    in=0; has443=0; hasname=0; buf=""
-  }
-' || true
+echo "== 2) nginx test (must be successful) =="
+nginx -t
 
-hr "4) Show key locations from the ACTIVE ssl vhost file (sites-enabled)"
-if [[ -e "$SSL_EN" ]]; then
-  echo "File: $SSL_EN"
-  grep -nE "server_name|listen .*443|location\s+\^~\s+/wolverine/|location\s+=\s+/wolverine/traderone/api/health|location\s+\^~\s+/wolverine/traderone/api/|location\s+=\s+/wolverine/rpc|location\s+=\s+/srpc|solana_rpc_proxy|traderone_api_proxy|try_files" \
-    -n "$SSL_EN" || true
-else
-  echo "[WARN] $SSL_EN not found"
+echo "== 3) Autodetect backend port for /api/health =="
+PORT=""
+# From your ss output, these are the likely Node ports:
+for p in 3005 8484 8585 9696 12703 3000 3001 3100 8080 8000 5000; do
+  code="$(curl -s -o /tmp/h.$$ -w "%{http_code}" "http://127.0.0.1:$p/api/health" || true)"
+  if [[ "$code" == "200" ]]; then
+    body="$(head -c 120 /tmp/h.$$ | tr -d '\n')"
+    # accept JSON-ish (not HTML)
+    if echo "$body" | grep -qv "<!DOCTYPE html"; then
+      PORT="$p"
+      break
+    fi
+  fi
+done
+rm -f /tmp/h.$$ 2>/dev/null || true
+
+if [[ -z "$PORT" ]]; then
+  echo
+  echo "[WARN] Could not find a backend answering /api/health on localhost."
+  echo "Run and paste:"
+  echo "  ss -lntp | grep -E 'node|:3005|:8484|:8585|:9696|:12703'"
+  echo "  curl -sS http://127.0.0.1:3005/api/health ; echo"
+  echo "  curl -sS http://127.0.0.1:8484/api/health ; echo"
+  echo
+  echo "Reloading nginx anyway (try_files fix is done)."
+  systemctl reload nginx
+  exit 0
 fi
 
-/root/audit_wolverine_stack.sh_stack.shraderone/api/health" | head -n 3." try_files?)"OT/phantom_patch*.js ✅" ✅"
+echo "[OK] Backend seems to be on 127.0.0.1:${PORT}"
 
-========== 0) Basics ==========
+echo "== 4) Write API proxy snippet (HIGH priority, beats SPA) =="
+mkdir -p /etc/nginx/snippets
+cat >"$SNIP_API" <<NGINX
+# Include INSIDE server{} only.
 
-Mon Jan 12 19:05:09 UTC 2026
-nginx version: nginx/1.24.0 (Ubuntu)
+location = /wolverine/traderone/api/health {
+  proxy_http_version 1.1;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
 
-========== 1) Nginx config test (must be OK) ==========
+  rewrite ^/wolverine/traderone/api/(.*)$ /api/\$1 break;
+  proxy_pass http://127.0.0.1:${PORT};
+}
 
-2026/01/12 19:05:09 [emerg] 342698#342698: invalid number of arguments in "try_files" directive in /etc/nginx/sites-enabled/fireinners.online-ssl:25
-nginx: configuration file /etc/nginx/nginx.conf test failed
+location ^~ /wolverine/traderone/api/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
 
-========== 2) Enabled vhosts + conflicts on 443 ==========
+  proxy_set_header Upgrade \$http_upgrade;
+  proxy_set_header Connection "upgrade";
 
-total 16
-drwxr-xr-x  2 root root 12288 Jan 12 18:52 .
-drwxr-xr-x 15 root root  4096 Jan 12 05:53 ..
-lrwxrwxrwx  1 root root    48 Jan 12 18:52 fireinners.online-ssl -> /etc/nginx/sites-available/fireinners.online-ssl
+  rewrite ^/wolverine/traderone/api/(.*)$ /api/\$1 break;
+  proxy_pass http://127.0.0.1:${PORT};
+}
+NGINX
 
-No conflicting server name ✅
+echo "== 5) Ensure snippet include exists ONCE in SSL vhost =="
+awk '
+  {
+    if ($0 ~ /include[[:space:]]+\/etc\/nginx\/snippets\/traderone_api_proxy\.conf;/) {
+      if (seen==1) next;
+      seen=1;
+    }
+    print
+  }
+' "$AV" > /tmp/ssl.$$ && cat /tmp/ssl.$$ > "$AV" && rm -f /tmp/ssl.$$
 
-========== 3) Which server{} blocks match fireinners.online on 443 (source-of-truth) ==========
+if ! grep -q "traderone_api_proxy.conf" "$AV"; then
+  sed -i '/server_name .*fireinners\.online/ a\  include /etc/nginx/snippets/traderone_api_proxy.conf;' "$AV"
+fi
 
-awk: cmd. line:2:   /server\s*\{/ {in=1; buf=""; file=FILENAME}
-awk: cmd. line:2:                  ^ syntax error
+echo "== 6) nginx test + reload =="
+nginx -t
+systemctl reload nginx
+echo "[OK] nginx reloaded"
 
-========== 4) Show key locations from the ACTIVE ssl vhost file (sites-enabled) ==========
+echo
+echo "== 7) Tests =="
+echo "-- LOCAL backend:"
+curl -sS "http://127.0.0.1:${PORT}/api/health" | head -c 300; echo
+echo "-- PUBLIC (must NOT be HTML):"
+curl -sk -i "https://${DOMAIN}/wolverine/traderone/api/health" | sed -n '1,25p'
+echo "-- PUBLIC body (first 120 bytes):"
+curl -sk "https://${DOMAIN}/wolverine/traderone/api/health" | head -c 120; echo
 
-File: /etc/nginx/sites-enabled/fireinners.online-ssl
-2:  listen 443 ssl http2;
-3:  listen [::]:443 ssl http2;
-4:  server_name fireinners.online www.fireinners.online;
-5:  include /etc/nginx/snippets/traderone_api_proxy.conf;
-10:  include /etc/nginx/snippets/solana_rpc_proxy.conf;
-17:  location ^~ /wolverine/ {
-19:    try_files $uri $uri/ /wolverine/index.html;
-25:    try_files \ =404;
+echo
+echo "DONE ✅  Open: https://${DOMAIN}/wolverine/health/?v=$ts"
+BASH
 
-========== 5) Reality check via HTTP headers (what server answers) - PUBLIC ==========
-
--- /wolverine/traderone/api/health (should be JSON, not HTML)
-HTTP/2 200 
-date: Mon, 12 Jan 2026 19:05:09 GMT
-content-type: text/html
-server: cloudflare
-last-modified: Mon, 12 Jan 2026 18:46:22 GMT
-nel: {"report_to":"cf-nel","success_fraction":0.0,"max_age":604800}
-report-to: {"group":"cf-nel","max_age":604800,"endpoints":[{"url":"https://a.nel.cloudflare.com/report/v4?s=wHRQ2QWYG6TlqKApscOFDTFG2dP81sSH5TnznvkVWOVBXQEVH%2Bzc3xOZTef0ej5uZlrQy%2F1VwaZU9r8c4tIvMqrelWAtw1vnATygKf42fy0JOilZ3crJpSXujMMG"}]}
-cf-cache-status: DYNAMIC
-vary: accept-encoding
-cf-ray: 9bceec7c4903d93c-EWR
-alt-svc: h3=":443"; ma=86400
-
-<!DOCTYPE html><html><head>
-<script src="/wolverine/phantom_patch.js?v=20260112_184622" defer></script>
-
-
-
-
-
-
-
-<!-- WALLET_BALANCES_PATCH -->
-
-<!-- /WALLET_BALANCES_PATCH -->
-<meta charSet="utf-8"/><meta name="viewport" content="width=device-width"/><meta name="next-head-count" content="2"/><link rel="preload" href="/wolverine/_next/static/css/5c5a959b216a7db2.css" as="style"/><link rel="stylesheet" href="/wolverine/_next/static/css/5c5a959b216a7db2.css" data-n-g=""/><noscript data-n-css=""></noscript><script defer="" nomodule="" src="/wolverine/_next/static/chunks/polyfills-42372ed130431b0a.js"></script><script src="/wolverine/_next/static/chunks/webpack-f118db865047c73a.js" defer=""></script><script src="/wolverine/_next/static/chunks/framework-69fcce2ef4b07977.js" defer=""></script><script src="/wolverine/_next/static/chunks/main-98e64c097e738a1c.js" defer=""></script><script src="/wolverine/_next/static/chunks/pages/_app-f19bb434f0cd9be0.js" defer=""></script><script src="/wolverine/_next/static/chunks/pages/settings-56de3ed254b5e2a4.js" defer=""></script><script src="/wolverine/_next/static/RlLWII2-uzUltIvVIfxCE/_buildManifest.js" defer=""></script><script src="/wolverine/_next/static/RlLWII2-uzUltIvVIfxCE/_ssgManifest.js" defer=""></script></head><body><div id="__next"><div class="app"><aside class="sidebar"><div class="brand"><div class="logoW">W</div><div><div class="brandTop">Wolverine</div><div class="brandSub">TraderOne</div></div></div><nav class="nav"><a class="navItem" href="/wolverine/">Dashboard</a><a class="navItem" href="/wolverine/trade/">Trade</a><a class="navItem" href="/wolverine/positions/">Positions</a><a class="navItem" href="/wolverine/orders/">Orders</a><a class="navItem" href="/wolverine/history/">History</a><a class="navItem" href="/wolverine/wallet/">Wallet</a><a class="navItem active" href="/wolverine/settings/">Settings</a><a class="navItem" href="/wolverine/health/">Health</a></nav><div class="walletBox"><div class="walletTitle">Wallet</div><div class="muted">Not connected</div><button class="btn ghost">Connect Phantom</button><div class="muted small" style="margin-top:10px">API: <code>/wolverine/traderone/api</code></div></div></aside><main class="main"><div class="card"><h2 style="margin-top:0">Coming soon</h2><p class="muted">UI stub — à brancher au backend.</p></div></main></div></div><script id="__NEXT_DATA__" type="application/json">{"props":{"pageProps":{}},"page":"/settings","query":{},"buildId":"RlLWII2-uzUltIvVIfxCE","assetPrefix":"/wolverine","nextExport":true,"autoExport":true,"isFallback":false,"scriptLoader":[]}</script></body></html>
--- first 120 bytes body:
-<!DOCTYPE html><html><head>
-<script src="/wolverine/phantom_patch.js?v=20260112_184622" defer></script>
-
-
-
-
-
-
-
-<!-- WALL
-
-========== 6) Backend discovery (what listens on localhost) ==========
-
-LISTEN 0      511        127.0.0.1:9696       0.0.0.0:*    users:(("node",pid=3063692,fd=18))                                                    
-LISTEN 0      128          0.0.0.0:2222       0.0.0.0:*    users:(("sshd",pid=854017,fd=3))                                                      
-LISTEN 0      511        127.0.0.1:12703      0.0.0.0:*    users:(("node",pid=3063681,fd=18))                                                    
-LISTEN 0      511        127.0.0.1:8585       0.0.0.0:*    users:(("node",pid=3063715,fd=18))                                                    
-LISTEN 0      511        127.0.0.1:8484       0.0.0.0:*    users:(("node",pid=3063693,fd=18))                                                    
-LISTEN 0      4096       127.0.0.1:9050       0.0.0.0:*    users:(("tor",pid=230833,fd=6))                                                       
-LISTEN 0      511          0.0.0.0:443        0.0.0.0:*    users:(("nginx",pid=4176036,fd=7),("nginx",pid=335802,fd=7),("nginx",pid=335801,fd=7))
-LISTEN 0      4096       127.0.0.1:65529      0.0.0.0:*    users:(("monarx-agent",pid=772,fd=7))                                                 
-LISTEN 0      4096         0.0.0.0:631        0.0.0.0:*    users:(("cupsd",pid=3119259,fd=9))                                                    
-LISTEN 0      5         10.66.66.1:9696       0.0.0.0:*    users:(("python3",pid=2092152,fd=3))                                                  
-LISTEN 0      511        127.0.0.1:6379       0.0.0.0:*    users:(("redis-server",pid=2106232,fd=6))                                             
-LISTEN 0      511        127.0.0.1:3005       0.0.0.0:*    users:(("node",pid=3065616,fd=18))                                                    
-LISTEN 0      128             [::]:2222          [::]:*    users:(("sshd",pid=854017,fd=4))                                                      
-LISTEN 0      511             [::]:443           [::]:*    users:(("nginx",pid=4176036,fd=8),("nginx",pid=335802,fd=8),("nginx",pid=335801,fd=8))
-LISTEN 0      4096            [::]:631           [::]:*    users:(("cupsd",pid=3119259,fd=10))                                                   
-
--- try common backend health endpoints locally:
-
-========== 7) RPC endpoint check ==========
-
--- /wolverine/rpc getVersion
-HTTP/2 200 
-date: Mon, 12 Jan 2026 19:05:10 GMT
-content-type: application/json; charset=utf-8
-content-length: 84
-server: cloudflare
-x-rpc-node: pit37
-x-ratelimit-tier: free
-x-ratelimit-method-limit: 40
-x-ratelimit-method-remaining: 39
-x-ratelimit-rps-limit: 100
-x-ratelimit-rps-remaining: 99
-x-ratelimit-endpoint-limit: unlimited
-x-ratelimit-endpoint-remaining: -1176
-x-ratelimit-conn-limit: 40
-x-ratelimit-conn-remaining: 39
-x-ratelimit-connrate-limit: 40
-x-ratelimit-connrate-remaining: 39
-x-ratelimit-pubsub-limit: 5
-x-ratelimit-pubsub-remaining: 5
-access-control-allow-origin: backend_traffic
-access-control-allow-origin: *
-access-control-allow-methods: OPTIONS, POST, GET
-access-control-allow-methods: POST, OPTIONS
-access-control-allow-headers: authorization, *
-access-control-allow-headers: *
-
--- /srpc should be 404 (NOT 403)
-HTTP/2 404 
-date: Mon, 12 Jan 2026 19:05:10 GMT
-content-type: text/html
-server: cloudflare
-report-to: {"group":"cf-nel","max_age":604800,"endpoints":[{"url":"https://a.nel.cloudflare.com/report/v4?s=XkG3HoJUdJt8ijjODvHv41m%2FrmtTVmIzUc3X2Ds7Z6I%2FFNax163aMTAtgPsFepwWl72d2EzmW5sg%2B8gITFezAnuWlzgDFOa%2BNsI6p8aucuOFGNIL2vaJGu8AalcS"}]}
-cf-cache-status: DYNAMIC
-vary: accept-encoding
-nel: {"report_to":"cf-nel","success_fraction":0.0,"max_age":604800}
-cf-ray: 9bceec7f183142cc-EWR
-alt-svc: h3=":443"; ma=86400
-
-<html>
-<head><title>404 Not Found</title></head>
-<body>
-<center><h1>404 Not Found</h1></center>
-
-========== 8) phantom_patch.js check (served + filesystem) ==========
-
--- Served phantom_patch.js contains /srpc ?
-OK: served JS has no /srpc ✅
-
--- Filesystem phantom_patch*.js contains /srpc ?
-OK: no /srpc in /var/www/wolverine/phantom_patch*.js ✅
-
-========== 9) SPA fallback check (does /wolverine/traderone/api/health fall into try_files?) ==========
-
-If this prints HTML, your API is being swallowed by SPA try_files.
-<!DOCTYPE html><html><head>
-<script src="/wolverine/phantom_patch.js?v=20260112_184622" defer></script>
-
-
-========== DONE - paste the output here ==========
-
-root@srv1195584:~# 
+chmod +x /root/fix_tryfiles_and_api_proxy_FINAL.sh
+/root/fix_tryfiles_and_api_proxy_FINAL.sh
