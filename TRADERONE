@@ -1,56 +1,98 @@
-cat >/root/hardfix_traderone_api_health_proxy.sh <<'BASH'
+cat >/root/audit_wolverine_stack.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
 DOMAIN="fireinners.online"
-SSL="/etc/nginx/sites-available/fireinners.online-ssl"
-EN="/etc/nginx/sites-enabled/fireinners.online-ssl"
-ts="$(date +%Y%m%d_%H%M%S)"
+SSL_AV="/etc/nginx/sites-available/fireinners.online-ssl"
+SSL_EN="/etc/nginx/sites-enabled/fireinners.online-ssl"
+ROOT="/var/www/wolverine"
 
-# --- autodetect backend port (best effort) ---
-PORT=""
-for p in 3000 3001 3100 8080 8000 5000; do
-  code="$(curl -s -o /tmp/h.$$ -w "%{http_code}" "http://127.0.0.1:$p/api/health" || true)"
-  if [[ "$code" == "200" ]]; then PORT="$p"; break; fi
-done
-rm -f /tmp/h.$$ 2>/dev/null || true
+hr(){ echo -e "\n========== $* ==========\n"; }
 
-if [[ -z "$PORT" ]]; then
-  echo "[ERR] Backend /api/health pas trouvé sur 3000/3001/3100/8080/8000/5000"
-  echo "Colle-moi: ss -lntp | grep -E 'node|:3000|:3001|:3100|:8080|:8000|:5000'"
-  exit 1
+hr "0) Basics"
+date
+nginx -v 2>&1 || true
+
+hr "1) Nginx config test (must be OK)"
+nginx -t 2>&1 | tail -n 40 || true
+
+hr "2) Enabled vhosts + conflicts on 443"
+ls -la /etc/nginx/sites-enabled || true
+echo
+nginx -T 2>/dev/null | grep -i "conflicting server name" || echo "No conflicting server name ✅"
+
+hr "3) Which server{} blocks match ${DOMAIN} on 443 (source-of-truth)"
+nginx -T 2>/dev/null | awk '
+  /server\s*\{/ {in=1; buf=""; file=FILENAME}
+  { if(in){ buf=buf $0 "\n" } }
+  in && /listen\s+.*443/ {has443=1}
+  in && /server_name/ { if($0 ~ /fireinners\.online/ || $0 ~ /www\.fireinners\.online/) hasname=1 }
+  in && /\}/ {
+    if(has443 && hasname){
+      print "----- MATCHING SERVER BLOCK -----"
+      print buf
+    }
+    in=0; has443=0; hasname=0; buf=""
+  }
+' || true
+
+hr "4) Show key locations from the ACTIVE ssl vhost file (sites-enabled)"
+if [[ -e "$SSL_EN" ]]; then
+  echo "File: $SSL_EN"
+  grep -nE "server_name|listen .*443|location\s+\^~\s+/wolverine/|location\s+=\s+/wolverine/traderone/api/health|location\s+\^~\s+/wolverine/traderone/api/|location\s+=\s+/wolverine/rpc|location\s+=\s+/srpc|solana_rpc_proxy|traderone_api_proxy|try_files" \
+    -n "$SSL_EN" || true
+else
+  echo "[WARN] $SSL_EN not found"
 fi
-echo "[OK] Backend: 127.0.0.1:$PORT"
 
-echo "== Backup =="
-cp -a "$SSL" "${SSL}.bak_${ts}"
-ln -sf "$SSL" "$EN"
-
-echo "== Remove any old traderone api blocks (to avoid duplicates) =="
-perl -0777 -i -pe 's@\n\s*#\s*BEGIN_TRADERONE_API_PROXY.*?#\s*END_TRADERONE_API_PROXY\s*\n@@sg' "$SSL"
-
-echo "== Inject API proxy block inside SSL server{} (high priority) =="
-perl -0777 -i -pe 's@(server_name\s+[^;]*fireinners\.online[^;]*;\s*)@$1\n  # BEGIN_TRADERONE_API_PROXY\n  # /wolverine/traderone/api/* -> http://127.0.0.1:'"$PORT"'/api/*\n  location = /wolverine/traderone/api/health {\n    proxy_http_version 1.1;\n    proxy_set_header Host $host;\n    proxy_set_header X-Real-IP $remote_addr;\n    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n    proxy_set_header X-Forwarded-Proto $scheme;\n\n    rewrite ^/wolverine/traderone/api/(.*)$ /api/$1 break;\n    proxy_pass http://127.0.0.1:'"$PORT"';\n  }\n\n  location ^~ /wolverine/traderone/api/ {\n    proxy_http_version 1.1;\n    proxy_set_header Host $host;\n    proxy_set_header X-Real-IP $remote_addr;\n    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n    proxy_set_header X-Forwarded-Proto $scheme;\n\n    proxy_set_header Upgrade $http_upgrade;\n    proxy_set_header Connection \"upgrade\";\n\n    rewrite ^/wolverine/traderone/api/(.*)$ /api/$1 break;\n    proxy_pass http://127.0.0.1:'"$PORT"';\n  }\n  # END_TRADERONE_API_PROXY\n\n@sg' "$SSL"
-
-echo "== nginx test + reload =="
-nginx -t
-systemctl reload nginx
-echo "[OK] nginx reloaded"
-
+hr "5) Reality check via HTTP headers (what server answers) - PUBLIC"
+echo "-- /wolverine/traderone/api/health (should be JSON, not HTML)"
+curl -sk -i "https://${DOMAIN}/wolverine/traderone/api/health" | sed -n '1,30p'
 echo
-echo "== LOCAL test =="
-curl -sS "http://127.0.0.1:${PORT}/api/health" | head -c 300 || true
-echo
+echo "-- first 120 bytes body:"
+curl -sk "https://${DOMAIN}/wolverine/traderone/api/health" | head -c 120; echo
 
+hr "6) Backend discovery (what listens on localhost)"
+ss -lntp | grep -E "LISTEN|:3000|:3001|:3100|:8080|:8000|:5000|node" || true
 echo
-echo "== PUBLIC test (must NOT be HTML) =="
-echo "-- headers:"
-curl -sk -i "https://${DOMAIN}/wolverine/traderone/api/health" | sed -n '1,25p'
+echo "-- try common backend health endpoints locally:"
+for p in 3000 3001 3100 8080 8000 5000; do
+  for path in /api/health /health /healthz; do
+    code="$(curl -s -o /tmp/a.$$ -w "%{http_code}" "http://127.0.0.1:${p}${path}" || true)"
+    if [[ "$code" != "000" ]]; then
+      head="$(head -c 80 /tmp/a.$$ | tr -d '\n')"
+      echo "127.0.0.1:${p}${path} -> $code :: ${head}"
+    fi
+  done
+done
+rm -f /tmp/a.$$ 2>/dev/null || true
+
+hr "7) RPC endpoint check"
+echo "-- /wolverine/rpc getVersion"
+curl -sk -i "https://${DOMAIN}/wolverine/rpc" \
+  -H 'Content-Type: application/json' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"getVersion"}' | sed -n '1,25p'
 echo
-echo "-- body (first 200 chars):"
-curl -sk "https://${DOMAIN}/wolverine/traderone/api/health" | head -c 200
+echo "-- /srpc should be 404 (NOT 403)"
+curl -sk -i "https://${DOMAIN}/srpc" | sed -n '1,15p'
+
+hr "8) phantom_patch.js check (served + filesystem)"
+echo "-- Served phantom_patch.js contains /srpc ?"
+curl -sk "https://${DOMAIN}/wolverine/phantom_patch.js" | grep -n "/srpc" || echo "OK: served JS has no /srpc ✅"
 echo
+echo "-- Filesystem phantom_patch*.js contains /srpc ?"
+if [[ -d "$ROOT" ]]; then
+  grep -RIn "/srpc" "$ROOT"/phantom_patch*.js 2>/dev/null || echo "OK: no /srpc in $ROOT/phantom_patch*.js ✅"
+else
+  echo "[WARN] $ROOT not found"
+fi
+
+hr "9) SPA fallback check (does /wolverine/traderone/api/health fall into try_files?)"
+echo "If this prints HTML, your API is being swallowed by SPA try_files."
+curl -sk "https://${DOMAIN}/wolverine/traderone/api/health" | head -n 3
+
+hr "DONE - paste the output here"
 BASH
 
-chmod +x /root/hardfix_traderone_api_health_proxy.sh
-/root/hardfix_traderone_api_health_proxy.sh
+chmod +x /root/audit_wolverine_stack.sh
+/root/audit_wolverine_stack.sh
