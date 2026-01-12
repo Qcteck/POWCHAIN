@@ -1,1 +1,116 @@
-grep -nE "/srpc|/solana-rpc|/wolverine/rpc|/rpc" /var/www/wolverine/phantom_patch.js | head -n 40
+cat >/root/fix_rpc_path_and_patch_js.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+DOMAIN="fireinners.online"
+ROOT="/var/www/wolverine"
+JS="$ROOT/phantom_patch.js"
+SSL="/etc/nginx/sites-available/fireinners.online-ssl"
+SNIP="/etc/nginx/snippets/solana_rpc_proxy.conf"
+ts="$(date +%Y%m%d_%H%M%S)"
+
+echo "== 0) Backups =="
+cp -a "$JS"  "${JS}.bak_${ts}" 2>/dev/null || true
+cp -a "$SSL" "${SSL}.bak_${ts}" 2>/dev/null || true
+cp -a "$SNIP" "${SNIP}.bak_${ts}" 2>/dev/null || true
+
+echo "== 1) Ensure RPC endpoints exist (/wolverine/rpc + /rpc) =="
+mkdir -p /etc/nginx/snippets
+cat >"$SNIP" <<'NGINX'
+# Include INSIDE server{} only.
+
+location = /wolverine/rpc {
+  auth_basic off;
+  allow all;
+
+  add_header Access-Control-Allow-Origin "*" always;
+  add_header Access-Control-Allow-Headers "*" always;
+  add_header Access-Control-Allow-Methods "POST, OPTIONS" always;
+  if ($request_method = OPTIONS) { return 204; }
+
+  proxy_pass https://api.mainnet-beta.solana.com/;
+  proxy_ssl_server_name on;
+  proxy_set_header Host api.mainnet-beta.solana.com;
+}
+
+location = /rpc {
+  auth_basic off;
+  allow all;
+
+  add_header Access-Control-Allow-Origin "*" always;
+  add_header Access-Control-Allow-Headers "*" always;
+  add_header Access-Control-Allow-Methods "POST, OPTIONS" always;
+  if ($request_method = OPTIONS) { return 204; }
+
+  proxy_pass https://api.mainnet-beta.solana.com/;
+  proxy_ssl_server_name on;
+  proxy_set_header Host api.mainnet-beta.solana.com;
+}
+NGINX
+
+echo "== 2) Ensure snippet include exists ONCE in SSL vhost =="
+awk '
+  {
+    if ($0 ~ /include[[:space:]]+\/etc\/nginx\/snippets\/solana_rpc_proxy\.conf;/) {
+      if (seen==1) next;
+      seen=1;
+    }
+    print
+  }
+' "$SSL" > /tmp/ssl.$$ && cat /tmp/ssl.$$ > "$SSL" && rm -f /tmp/ssl.$$
+
+if ! grep -q "solana_rpc_proxy.conf" "$SSL"; then
+  sed -i '/server_name .*fireinners\.online/ a\  include /etc/nginx/snippets/solana_rpc_proxy.conf;' "$SSL"
+fi
+
+echo "== 3) Fix phantom_patch.js (remove double /wolverine and force RPC=/wolverine/rpc) =="
+if [[ -f "$JS" ]]; then
+  # Remove double prefix anywhere
+  sed -i 's@/wolverine/wolverine/@/wolverine/@g' "$JS"
+  # Normalize any previous endpoints to /wolverine/rpc
+  sed -i 's@/srpc@/wolverine/rpc@g' "$JS" || true
+  sed -i 's@/solana-rpc@/wolverine/rpc@g' "$JS" || true
+  # If the code defines const RPC = "...", force it
+  if grep -qE 'const[[:space:]]+RPC[[:space:]]*=' "$JS"; then
+    sed -i -E 's@const[[:space:]]+RPC[[:space:]]*=[[:space:]]*["'\''][^"'\'']*["'\'']@const RPC = "/wolverine/rpc"@' "$JS"
+  else
+    # If not present, prepend it (safe)
+    sed -i '1i const RPC = "/wolverine/rpc";' "$JS"
+  fi
+else
+  echo "[ERR] missing $JS"
+  exit 1
+fi
+
+echo "== 4) No-cache phantom_patch.js (avoid stale JS) =="
+# Remove any existing block then add a clean one (must keep $uri intact)
+perl -0777 -i -pe 's@\n\s*location\s*=\s*/wolverine/phantom_patch\.js\s*\{.*?\}\s*\n@\n@sg' "$SSL"
+perl -0777 -i -pe 's@\n\}\s*$@\n  location = /wolverine/phantom_patch.js {\n    add_header Cache-Control "no-store" always;\n    try_files $uri =404;\n  }\n}\n@sg' "$SSL"
+
+echo "== 5) nginx test + reload =="
+nginx -t
+systemctl reload nginx
+echo "[OK] nginx reloaded"
+
+echo
+echo "== 6) Tests (should be HTTP/2 200) =="
+echo "-- /wolverine/rpc:"
+curl -sk -i "https://${DOMAIN}/wolverine/rpc" \
+  -H 'Content-Type: application/json' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"getVersion"}' | sed -n '1,18p'
+
+echo "-- /rpc:"
+curl -sk -i "https://${DOMAIN}/rpc" \
+  -H 'Content-Type: application/json' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"getVersion"}' | sed -n '1,18p'
+
+echo
+echo "== 7) Confirm JS RPC line =="
+grep -nE 'const[[:space:]]+RPC|/wolverine/.*/rpc' "$JS" | head -n 20
+
+echo
+echo "Open (private / cache-bust): https://${DOMAIN}/wolverine/?v=$ts"
+BASH
+
+chmod +x /root/fix_rpc_path_and_patch_js.sh
+/root/fix_rpc_path_and_patch_js.sh
