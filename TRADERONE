@@ -1,62 +1,62 @@
-B) Cherche les causes classiques de 403 (deny/allow/return 403/if/auth) ==
-/etc/nginx/snippets/solana_rpc_proxy.conf:4:  auth_basic off; allow all;
-/etc/nginx/snippets/solana_rpc_proxy.conf:9:  if ($request_method = OPTIONS) { return 204; }
-/etc/nginx/snippets/_saved_20260109_055901/wolverine_routes.conf:4:  auth_basic off;
-/etc/nginx/snippets/_saved_20260109_055901/wolverine_routes.conf:5:  satisfy any;
-/etc/nginx/snippets/_saved_20260109_055901/wolverine_routes.conf:6:  allow all;
-/etc/nginx/snippets/_saved_20260109_055901/wolverine_auth_phantom.conf:2:  auth_basic off;
-/etc/nginx/snippets/_saved_20260109_055901/wolverine_auth_phantom.conf:3:  satisfy any;
-/etc/nginx/snippets/_saved_20260109_055901/wolverine_auth_phantom.conf:4:  allow all;
-/etc/nginx/snippets/_saved_20260109_061251/wolverine_routes.conf:4:  auth_basic off;
-/etc/nginx/snippets/_saved_20260109_061251/wolverine_routes.conf:5:  satisfy any;
-/etc/nginx/snippets/_saved_20260109_061251/wolverine_routes.conf:6:  allow all;
-/etc/nginx/snippets/_saved_20260109_061251/wolverine_auth_phantom.conf:2:  auth_basic off;
-/etc/nginx/snippets/_saved_20260109_061251/wolverine_auth_phantom.conf:3:  satisfy any;
-/etc/nginx/snippets/_saved_20260109_061251/wolverine_auth_phantom.conf:4:  allow all;
-/etc/nginx/snippets/_saved_20260109_061251/snippets_full_backup/wolverine_routes.conf:4:  auth_basic off;
-/etc/nginx/snippets/_saved_20260109_061251/snippets_full_backup/wolverine_routes.conf:5:  satisfy any;
-/etc/nginx/snippets/_saved_20260109_061251/snippets_full_backup/wolverine_routes.conf:6:  allow all;
-/etc/nginx/snippets/_saved_20260109_061251/snippets_full_backup/wolverine_auth_phantom.conf:2:  auth_basic off;
-/etc/nginx/snippets/_saved_20260109_061251/snippets_full_backup/wolverine_auth_phantom.conf:3:  satisfy any;
-/etc/nginx/snippets/_saved_20260109_061251/snippets_full_backup/wolverine_auth_phantom.conf:4:  allow all;
-/etc/nginx/snippets/wolverine_auth_phantom.server.inc:2:  auth_basic off;
-/etc/nginx/snippets/wolverine_auth_phantom.server.inc:3:  satisfy any;
-/etc/nginx/snippets/wolverine_auth_phantom.server.inc:4:  allow all;
-/etc/nginx/snippets/wolverine_routes.server.inc:4:  auth_basic off;
-/etc/nginx/snippets/wolverine_routes.server.inc:5:  satisfy any;
-/etc/nginx/snippets/wolverine_routes.server.inc:6:  allow all;
+cat >/root/fix_wolverine_rpc_403.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
 
-== C) Reproduire le POST comme Phantom (doit être 200, sinon on a trouvé la cause) ==
-HTTP/2 403 
-date: Mon, 12 Jan 2026 20:25:53 GMT
-content-type: application/json
-content-length: 82
-server: cloudflare
-access-control-max-age: 86400
-access-control-allow-methods: POST, GET, OPTIONS
-access-control-allow-methods: POST, OPTIONS
-cache-control: no-cache
-access-control-allow-origin: *
-access-control-allow-origin: *
-x-rpc-node: pit36
-x-ratelimit-tier: 
-x-ratelimit-method-limit: 
-x-ratelimit-method-remaining: 
-x-ratelimit-rps-limit: 
-x-ratelimit-rps-remaining: 
-x-ratelimit-endpoint-limit: 
-x-ratelimit-endpoint-remaining: 
-x-ratelimit-conn-limit: 
-x-ratelimit-conn-remaining: 
-x-ratelimit-connrate-limit: 
-x-ratelimit-connrate-remaining: 
-x-ratelimit-pubsub-limit: 
-x-ratelimit-pubsub-remaining: 
-access-control-allow-headers: *
-cf-cache-status: DYNAMIC
-nel: {"report_to":"cf-nel","success_fraction":0.0,"max_age":604800}
-report-to: {"group":"cf-nel","max_age":604800,"endpoints":[{"url":"https://a.nel.cloudflare.com/report/v4?s=w9w0oVpmvl%2FiA17y0G3Pluul3Lcbw9uJpK7ygtuwPXedj6wUi%2FCyjGaTAzJ4i54Khhrw8f0pCWj0IC497mXlmtSHdYBYezZaJiVdTl8JVdM7OGyzDNZ2QQ8Nqg7s"}]}
-cf-ray: 9bcf62bf7dccb17b-EWR
-alt-svc: h3=":443"; ma=86400
+DOMAIN="fireinners.online"
+SNIP="/etc/nginx/snippets/solana_rpc_proxy.conf"
+TS="$(date +%Y%m%d_%H%M%S)"
 
- {"jsonrpc":"2.0","error":{"code": 403,"message":"Access forbidden"}, "id": 1 } 
+echo "== Backup =="
+cp -a "$SNIP" "${SNIP}.bak_${TS}"
+echo "Saved: ${SNIP}.bak_${TS}"
+
+echo
+echo "== Patch solana_rpc_proxy.conf (strip Origin/Referer; optional UA) =="
+# On ajoute les headers si pas déjà présents
+grep -q 'proxy_set_header Origin' "$SNIP" || cat >>"$SNIP" <<'EOF'
+
+  # --- PATCH: avoid upstream WAF rejecting browser/Phantom headers ---
+  # Many Solana RPC providers block browser origins / wallet UAs.
+  proxy_set_header Origin "";
+  proxy_set_header Referer "";
+  # If still 403, uncomment next line to force a neutral UA:
+  # proxy_set_header User-Agent "curl/8.5.0";
+  # --- END PATCH ---
+EOF
+
+echo "== nginx -t =="
+nginx -t
+
+echo
+echo "== reload nginx =="
+systemctl reload nginx
+
+echo
+echo "== Tests =="
+echo "-- 1) Server-style (should be 200) --"
+curl -sS -D- https://$DOMAIN/wolverine/rpc \
+  -H 'content-type: application/json' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"getVersion"}' | head -n 30
+
+echo
+echo "-- 2) Phantom-style (currently 403) --"
+curl -sS -D- https://$DOMAIN/wolverine/rpc \
+  -H 'content-type: application/json' \
+  -H 'origin: https://'"$DOMAIN" \
+  -H 'referer: https://'"$DOMAIN"'/wolverine/' \
+  -H 'user-agent: Mozilla/5.0 (iPhone; CPU iPhone OS 18_6_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 Phantom/ios/25.46.3.39417' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"getVersion"}' | head -n 40
+
+echo
+echo "-- 3) Phantom UA but NO Origin/Referer (should become 200 if WAF was the issue) --"
+curl -sS -D- https://$DOMAIN/wolverine/rpc \
+  -H 'content-type: application/json' \
+  -H 'user-agent: Mozilla/5.0 (iPhone; CPU iPhone OS 18_6_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 Phantom/ios/25.46.3.39417' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"getVersion"}' | head -n 40
+
+echo
+echo "DONE ✅  (if #3 is 200, the culprit was Origin/Referer forwarded to upstream)"
+BASH
+
+chmod +x /root/fix_wolverine_rpc_403.sh
+/root/fix_wolverine_rpc_403.sh
