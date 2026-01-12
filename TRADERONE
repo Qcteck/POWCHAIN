@@ -1,40 +1,109 @@
-cat >/root/fix_conflict_443_keep_fireinners_ssl.sh <<'BASH'
+cat >/root/fix_srpc_called_by_phantom_patch.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
+
+DOMAIN="fireinners.online"
+ROOT="/var/www/wolverine"
+JS_MAIN="$ROOT/phantom_patch.js"
+SSL="/etc/nginx/sites-available/fireinners.online-ssl"
+EN="/etc/nginx/sites-enabled/fireinners.online-ssl"
+SNIP="/etc/nginx/snippets/solana_rpc_proxy.conf"
 ts="$(date +%Y%m%d_%H%M%S)"
-DIS="/etc/nginx/disabled-sites"
-mkdir -p "$DIS"
 
-echo "== Enabled vhosts =="
-ls -la /etc/nginx/sites-enabled
+echo "== Backups =="
+cp -a "$SSL" "${SSL}.bak_${ts}" 2>/dev/null || true
+cp -a "$SNIP" "${SNIP}.bak_${ts}" 2>/dev/null || true
+[[ -f "$JS_MAIN" ]] && cp -a "$JS_MAIN" "${JS_MAIN}.bak_${ts}" || true
 
-echo
-echo "== Enabled files that contain server_name fireinners.online =="
-mapfile -t files < <(grep -RIl "server_name" /etc/nginx/sites-enabled | xargs -r grep -lE "fireinners\.online|www\.fireinners\.online" || true)
-printf '%s\n' "${files[@]}" | nl -ba || true
+echo "== 1) Nginx: keep /wolverine/rpc, kill /srpc & /solana-rpc =="
+mkdir -p /etc/nginx/snippets
+cat >"$SNIP" <<'NGINX'
+# Include INSIDE server{} only.
 
-KEEP="/etc/nginx/sites-enabled/fireinners.online-ssl"
-echo
-echo "== Keeping: $KEEP =="
-for f in "${files[@]}"; do
-  [[ -e "$f" ]] || continue
-  if [[ "$f" != "$KEEP" ]]; then
-    echo "DISABLE $f -> $DIS/"
-    mv -f "$f" "$DIS/$(basename "$f").disabled_$ts"
+location = /wolverine/rpc {
+  auth_basic off; allow all;
+
+  add_header Access-Control-Allow-Origin "*" always;
+  add_header Access-Control-Allow-Headers "*" always;
+  add_header Access-Control-Allow-Methods "POST, OPTIONS" always;
+  if ($request_method = OPTIONS) { return 204; }
+
+  proxy_pass https://api.mainnet-beta.solana.com/;
+  proxy_ssl_server_name on;
+  proxy_set_header Host api.mainnet-beta.solana.com;
+}
+
+# Stop old endpoints (avoid WAF 403 spam)
+location = /srpc { return 404; }
+location = /solana-rpc { return 404; }
+NGINX
+
+# Ensure snippet include exists once
+awk '
+  {
+    if ($0 ~ /include[[:space:]]+\/etc\/nginx\/snippets\/solana_rpc_proxy\.conf;/) {
+      if (seen==1) next;
+      seen=1;
+    }
+    print
+  }
+' "$SSL" > /tmp/ssl.$$ && cat /tmp/ssl.$$ > "$SSL" && rm -f /tmp/ssl.$$
+
+if ! grep -q "solana_rpc_proxy.conf" "$SSL"; then
+  sed -i '/server_name .*fireinners\.online/ a\  include /etc/nginx/snippets/solana_rpc_proxy.conf;' "$SSL"
+fi
+
+echo "== 2) Patch ALL phantom_patch*.js to never call /srpc and never hard-crash UI =="
+mapfile -t JSFILES < <(find "$ROOT" -maxdepth 6 -type f -name "phantom_patch*.js" -print)
+((${#JSFILES[@]})) || { echo "[ERR] no phantom_patch*.js under $ROOT"; exit 1; }
+
+for f in "${JSFILES[@]}"; do
+  cp -a "$f" "${f}.bak_${ts}" 2>/dev/null || true
+
+  # Normalize endpoints
+  sed -i 's@/wolverine/wolverine/rpc@/wolverine/rpc@g' "$f"
+  sed -i 's@/srpc@/wolverine/rpc@g' "$f"
+  sed -i 's@/solana-rpc@/wolverine/rpc@g' "$f"
+  sed -i 's@"/rpc"@"/wolverine/rpc"@g' "$f"
+
+  # Force const RPC if present
+  if grep -qE 'const[[:space:]]+RPC[[:space:]]*=' "$f"; then
+    sed -i -E 's@const[[:space:]]+RPC[[:space:]]*=[[:space:]]*["'\''][^"'\'']*["'\'']@const RPC = "/wolverine/rpc"@' "$f"
   fi
+
+  # Fail-safe: if code throws "Access forbidden", downgrade to warning + return null
+  sed -i 's@throw new Error("Access forbidden");@console.warn("RPC forbidden (non-fatal)"); return null;@g' "$f" || true
+  sed -i "s@throw new Error('Access forbidden');@console.warn(\"RPC forbidden (non-fatal)\"); return null;@g" "$f" || true
 done
 
-ln -sf /etc/nginx/sites-available/fireinners.online-ssl /etc/nginx/sites-enabled/fireinners.online-ssl
+echo "== 3) Force HTML to load fresh phantom_patch.js?v=TS =="
+find "$ROOT" -maxdepth 6 -type f -name "*.html" -print0 | while IFS= read -r -d '' h; do
+  cp -a "$h" "${h}.bak_${ts}" 2>/dev/null || true
+  perl -0777 -i -pe 's@<script[^>]+phantom_patch[^>]*></script>@@gsi' "$h"
+  perl -0777 -i -pe 's@(<head[^>]*>)@$1\n<script src="/wolverine/phantom_patch.js?v='"$ts"'" defer></script>\n@i' "$h"
+done
 
-echo
-echo "== Test + reload =="
+echo "== 4) No-store on phantom_patch.js (nginx) =="
+perl -0777 -i -pe 's@\n\s*location\s*=\s*/wolverine/phantom_patch\.js\s*\{.*?\}\s*\n@\n@sg' "$SSL"
+perl -0777 -i -pe 's@\n\}\s*$@\n  location = /wolverine/phantom_patch.js {\n    add_header Cache-Control "no-store" always;\n    try_files \\$uri =404;\n  }\n}\n@sg' "$SSL"
+
+ln -sf "$SSL" "$EN"
+
+echo "== 5) nginx test + reload =="
 nginx -t
 systemctl reload nginx
 
 echo
-echo "== Recheck warnings =="
-nginx -t 2>&1 | grep -i "conflicting server name" || echo "No conflicts ✅"
+echo "== 6) Verify SERVER file has no /srpc =="
+grep -RIn "/srpc" "$ROOT"/phantom_patch*.js || echo "OK: no /srpc in phantom_patch*.js ✅"
+
+echo
+echo "== 7) Verify what is SERVED over HTTPS (should contain NO /srpc) =="
+curl -sk "https://${DOMAIN}/wolverine/phantom_patch.js?v=$ts" | grep -n "/srpc" || echo "OK: served JS has no /srpc ✅"
+
+echo
+echo "OPEN (private): https://${DOMAIN}/wolverine/?v=$ts"
 BASH
 
-chmod +x /root/fix_conflict_443_keep_fireinners_ssl.sh
-/root/fix_conflict_443_keep_fireinners_ssl.sh
+chmod +x /root/fix_srpc_called_by_phantom_patch.sh
+/root/fix_srpc_called_by_phantom_patch.sh
