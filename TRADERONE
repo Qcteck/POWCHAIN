@@ -1,1 +1,72 @@
-curl.exe -i -X POST "https://fireinners.online/wolverine/rpc" -H "Content-Type: application/json" --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getHealth\"}"
+cat >/root/fix_wolverine_rpc_browserproof.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+INC="/etc/nginx/includes/wolverine_routes.inc"
+TS="$(date +%Y%m%d_%H%M%S)"
+
+test -f "$INC" || { echo "❌ Missing $INC"; exit 1; }
+cp -a "$INC" "${INC}.bak_${TS}"
+
+python3 - <<'PY'
+import re, pathlib
+p = pathlib.Path("/etc/nginx/includes/wolverine_routes.inc")
+s = p.read_text(errors="ignore")
+
+# remove old rpc blocks (marker or raw)
+s = re.sub(r"\n?#\s*WOLVERINE_RPC_PROXY_BEGIN.*?#\s*WOLVERINE_RPC_PROXY_END\s*\n?", "\n", s, flags=re.S)
+s = re.sub(r"\n\s*location\s*=\s*/wolverine/rpc\s*\{.*?\n\s*\}\s*\n", "\n", s, flags=re.S)
+
+block = r'''
+# WOLVERINE_RPC_PROXY_BEGIN
+# Solana JSON-RPC proxy (same-origin) - browser-proof
+location = /wolverine/rpc {
+  # Handle preflight (some browsers/libraries do OPTIONS)
+  if ($request_method = OPTIONS) {
+    add_header Access-Control-Allow-Origin "*" always;
+    add_header Access-Control-Allow-Methods "POST, OPTIONS" always;
+    add_header Access-Control-Allow-Headers "Content-Type, Authorization" always;
+    add_header Content-Length 0;
+    return 204;
+  }
+
+  add_header Access-Control-Allow-Origin "*" always;
+  add_header Access-Control-Allow-Methods "POST, OPTIONS" always;
+  add_header Access-Control-Allow-Headers "Content-Type, Authorization" always;
+
+  proxy_http_version 1.1;
+  proxy_ssl_server_name on;
+
+  proxy_set_header Host api.mainnet-beta.solana.com;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+
+  proxy_pass https://api.mainnet-beta.solana.com/;
+}
+
+# normalize trailing slash
+location ^~ /wolverine/rpc/ {
+  return 301 /wolverine/rpc;
+}
+# WOLVERINE_RPC_PROXY_END
+'''
+s = s.rstrip() + "\n\n" + block + "\n"
+p.write_text(s)
+print("OK: installed browser-proof /wolverine/rpc")
+PY
+
+nginx -t
+systemctl reload nginx || service nginx reload
+
+echo
+echo "== ORIGIN test (POST) =="
+curl -sk --resolve fireinners.online:443:127.0.0.1 -i \
+  -X POST https://fireinners.online/wolverine/rpc \
+  -H 'Content-Type: application/json' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' | sed -n '1,25p'
+echo
+echo "DONE ✅"
+BASH
+
+chmod +x /root/fix_wolverine_rpc_browserproof.sh
+/root/fix_wolverine_rpc_browserproof.sh
