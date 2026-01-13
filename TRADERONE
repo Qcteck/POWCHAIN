@@ -1,38 +1,107 @@
-cat >/root/fix_phantom_balances_live.sh <<'BASH'
+cat >/root/recreate_and_deploy_phantom_balances.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
-
-SRC="/opt/WOLVERINE1_export/ui/phantom_balances.js"
-LIVE="/var/www/wolverine"
-IDX="$LIVE/index.html"
 TS="$(date +%Y%m%d_%H%M%S)"
 
-echo "== 1) Check source file =="
-test -f "$SRC" || { echo "Missing source: $SRC"; exit 1; }
+EXPORT_UI="/opt/WOLVERINE1_export/ui"
+LIVE="/var/www/wolverine"
+IDX="$LIVE/index.html"
+JS_EXPORT="$EXPORT_UI/phantom_balances.js"
+JS_LIVE="$LIVE/phantom_balances.js"
+
+echo "== 0) Ensure dirs =="
+mkdir -p "$EXPORT_UI" "$LIVE"
+test -f "$IDX" || { echo "Missing $IDX"; exit 1; }
+
+echo "== 1) Create phantom_balances.js in EXPORT =="
+cat > "$JS_EXPORT" <<'JS'
+(() => {
+  const RPC = "https://fireinners.online/wolverine/rpc";
+  const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+
+  async function rpc(method, params) {
+    const r = await fetch(RPC, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+    });
+    const j = await r.json();
+    if (j.error) throw new Error(j.error.message || JSON.stringify(j.error));
+    return j.result;
+  }
+
+  async function getBalances(pubkey) {
+    const bal = await rpc("getBalance", [pubkey]);
+    const sol = bal.value / 1e9;
+
+    const ta = await rpc("getTokenAccountsByOwner", [
+      pubkey,
+      { mint: USDC_MINT },
+      { encoding: "jsonParsed" },
+    ]);
+
+    const usdc = (ta.value || []).reduce((sum, it) => {
+      const uiAmt = it?.account?.data?.parsed?.info?.tokenAmount?.uiAmount || 0;
+      return sum + uiAmt;
+    }, 0);
+
+    return { sol, usdc };
+  }
+
+  function setText(id, txt) {
+    const el = document.getElementById(id);
+    if (el) el.textContent = txt;
+  }
+
+  async function onConnected(pubkey) {
+    try {
+      setText("wolv_wallet", pubkey);
+      setText("wolv_sol", "…");
+      setText("wolv_usdc", "…");
+      const { sol, usdc } = await getBalances(pubkey);
+      setText("wolv_sol", sol.toFixed(6));
+      setText("wolv_usdc", usdc.toFixed(2));
+    } catch (e) {
+      console.error("balance fetch failed", e);
+      setText("wolv_sol", "ERR");
+      setText("wolv_usdc", "ERR");
+    }
+  }
+
+  function installHook() {
+    if (!window.solana || !window.solana.isPhantom) return;
+    const orig = window.solana.connect.bind(window.solana);
+    window.solana.connect = async (...args) => {
+      const res = await orig(...args);
+      const pk = window.solana.publicKey?.toBase58?.() || window.solana.publicKey?.toString?.();
+      if (pk) onConnected(pk);
+      return res;
+    };
+    const pk0 = window.solana.publicKey?.toBase58?.() || window.solana.publicKey?.toString?.();
+    if (pk0) onConnected(pk0);
+  }
+
+  window.addEventListener("load", () => setTimeout(installHook, 300));
+})();
+JS
 
 echo "== 2) Copy to LIVE =="
-cp -v "$SRC" "$LIVE/phantom_balances.js"
-chmod 644 "$LIVE/phantom_balances.js"
+cp -v "$JS_EXPORT" "$JS_LIVE"
+chmod 644 "$JS_LIVE"
 
-echo "== 3) Ensure index.html references /wolverine/phantom_balances.js =="
-test -f "$IDX" || { echo "Missing live index: $IDX"; exit 1; }
+echo "== 3) Backup + fix index.html script src + add tag if missing =="
 cp -a "$IDX" "$IDX.bak_${TS}"
-
-# remove wrong path if present
 sed -i 's@src="/phantom_balances.js"@src="/wolverine/phantom_balances.js"@g' "$IDX"
-
-# add tag if missing
 if ! grep -q 'phantom_balances.js' "$IDX"; then
   sed -i 's@</body>@<script src="/wolverine/phantom_balances.js"></script>\n</body>@' "$IDX"
 fi
 
-echo "== 4) Verify file exists + served 200 =="
-ls -lah "$LIVE/phantom_balances.js"
+echo "== 4) Verify served 200 =="
 curl -sk -D- https://fireinners.online/wolverine/phantom_balances.js | head -n 20
 
 echo
-echo "DONE ✅  -> Hard refresh Ctrl+F5 then connect Phantom"
+echo "DONE ✅  -> Ctrl+F5 puis connect Phantom"
 BASH
 
-chmod +x /root/fix_phantom_balances_live.sh
-/root/fix_phantom_balances_live.sh
+chmod +x /root/recreate_and_deploy_phantom_balances.sh
+/root/recreate_and_deploy_phantom_balances.sh
