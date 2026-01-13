@@ -1,99 +1,58 @@
-cat >/root/fix_inc_in_wrong_context.sh <<'BASH'
+cat >/root/fix_missing_conf_include_use_inc.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
+
 HOST="fireinners.online"
 VHOST="/etc/nginx/sites-enabled/${HOST}-ssl"
-INC="/etc/nginx/snippets/wolverine_routes.inc"
+DIR="/etc/nginx/snippets"
+CONF="${DIR}/wolverine_routes.conf"
+INC="${DIR}/wolverine_routes.inc"
 TS="$(date +%Y%m%d_%H%M%S)"
 
 test -f "$VHOST" || { echo "Missing $VHOST"; exit 1; }
-test -f "$INC"   || { echo "Missing $INC"; exit 1; }
-
-echo "== 1) Find EVERY include of wolverine_routes.inc =="
-grep -RIn --binary-files=without-match \
-  -E "include\s+.*wolverine_routes\.inc" \
-  /etc/nginx/nginx.conf /etc/nginx/conf.d /etc/nginx/sites-enabled 2>/dev/null \
-| grep -vE '\.bak|\.broken|sites-disabled' || true
-echo
-
-echo "== 2) Backup =="
 cp -a "$VHOST" "$VHOST.bak_$TS"
 
-echo "== 3) Disable includes of wolverine_routes.inc OUTSIDE the vhost =="
-while IFS= read -r hit; do
-  FILE="${hit%%:*}"
-  [ "$FILE" = "$VHOST" ] && continue
-  [ -f "$FILE" ] || continue
-  cp -a "$FILE" "$FILE.bak_$TS"
-  sed -i -E 's@^([[:space:]]*)include([[:space:]]+.*wolverine_routes\.inc.*);@\1# DISABLED_WRONG_CONTEXT include\2;@' "$FILE"
-  echo "disabled include in $FILE"
-done < <(
-  grep -RIn --binary-files=without-match \
-    -E "include\s+.*wolverine_routes\.inc" \
-    /etc/nginx/nginx.conf /etc/nginx/conf.d /etc/nginx/sites-enabled 2>/dev/null \
-  | grep -vE '\.bak|\.broken|sites-disabled' || true
-)
+# Ensure INC exists (clean)
+if [ ! -f "$INC" ]; then
+  cat > "$INC" <<'NGX'
+# Wolverine routes (clean)
 
-echo
-echo "== 4) Ensure include is INSIDE the first server{} in the vhost (and comment any include outside) =="
-python3 - <<PY
-import re
-VHOST="${VHOST}"
-INC="${INC}"
+location = /wolverine/traderone/api {
+  return 301 /wolverine/traderone/api/;
+}
 
-lines=open(VHOST,"r",errors="ignore").read().splitlines(True)
+location ^~ /wolverine/traderone/api/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
 
-# find first server block
-start=None
-for i,l in enumerate(lines):
-    if re.search(r'^\s*server\s*\{', l):
-        start=i; break
-if start is None:
-    raise SystemExit("No server { found in vhost")
+  rewrite ^/wolverine/traderone/api/(.*)$ /api/$1 break;
+  proxy_pass http://127.0.0.1:8585;
+}
+NGX
+fi
 
-depth=0
-end=None
-for i in range(start, len(lines)):
-    depth += lines[i].count("{")
-    depth -= lines[i].count("}")
-    if depth==0 and i>start:
-        end=i
-        break
-if end is None:
-    raise SystemExit("Could not find end of first server block (brace mismatch)")
+# If old .conf exists, move it away to avoid wildcard includes
+if [ -f "$CONF" ]; then
+  mv -v "$CONF" "${CONF}.disabled_${TS}"
+fi
 
-before = lines[:start]
-server = lines[start:end+1]
-after  = lines[end+1:]
+# Replace any include to .conf -> .inc (and comment stale ones)
+sed -i -E "s@include[[:space:]]+${DIR}/wolverine_routes\.conf;@include ${INC};@g" "$VHOST"
+sed -i -E 's@^([[:space:]]*)include([[:space:]]+.*wolverine_routes\.conf.*);@\1# DISABLED_MISSING include\2;@' "$VHOST"
 
-# comment include lines outside server
-def comment_inc(block):
-    out=[]
-    for l in block:
-        if INC in l and re.search(r'^\s*include\b', l):
-            out.append("# DISABLED_OUTSIDE_SERVER " + l)
-        else:
-            out.append(l)
-    return out
+# Ensure include .inc exists at least once
+if ! grep -q "wolverine_routes\.inc" "$VHOST"; then
+  echo "  include ${INC};" >> "$VHOST"
+fi
 
-before = comment_inc(before)
-after  = comment_inc(after)
-
-# remove include duplicates inside server, then re-add exactly once
-server = [l for l in server if not (INC in l and re.search(r'^\s*include\b', l))]
-inc_line = f"  include {INC};\n"
-server.insert(len(server)-1, inc_line)
-
-open(VHOST,"w").writelines(before + server + after)
-PY
-
-echo
-echo "== 5) nginx -t && reload =="
 nginx -t
 systemctl reload nginx || service nginx reload
 
 echo "DONE ✅"
 BASH
 
-chmod +x /root/fix_inc_in_wrong_context.sh
-/root/fix_inc_in_wrong_context.sh
+chmod +x /root/fix_missing_conf_include_use_inc.sh
+/root/fix_missing_conf_include_use_inc.sh
