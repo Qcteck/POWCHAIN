@@ -1,21 +1,31 @@
-cat >/root/fix_buffer_from_final_and_balance_rpc.sh <<'BASH'
+cat >/root/fix_blob_encode_lamports_buffer.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 TS="$(date +%Y%m%d_%H%M%S)"
-
 DIR="/var/www/wolverine"
 HTML="$DIR/index.html"
-BAL="$DIR/phantom_balances.js"
 
 test -f "$HTML" || { echo "❌ Missing $HTML"; exit 1; }
 cp -a "$HTML" "${HTML}.bak_${TS}"
 
-echo "== 1) Install LOCAL buffer.min.js from a working CDN (jsDelivr) =="
-curl -fsSL "https://cdn.jsdelivr.net/npm/buffer@6.0.3/index.min.js" -o "$DIR/buffer.min.js"
-chmod 0644 "$DIR/buffer.min.js"
-ls -lah "$DIR/buffer.min.js"
+echo "== 1) Download a REAL buffer polyfill locally (try multiple CDNs) =="
+OUT="$DIR/buffer.real.min.js"
+urls=(
+  "https://cdn.jsdelivr.net/npm/buffer@6.0.3/umd/buffer.min.js"
+  "https://cdn.jsdelivr.net/npm/buffer@6.0.3/index.min.js"
+  "https://unpkg.com/buffer@6.0.3/index.min.js"
+  "https://cdnjs.cloudflare.com/ajax/libs/buffer/6.0.3/buffer.min.js"
+)
+ok=0
+for u in "${urls[@]}"; do
+  echo "TRY: $u"
+  if curl -fsSL "$u" -o "$OUT"; then ok=1; echo "OK: $u"; break; else echo "FAIL"; fi
+done
+[ "$ok" -eq 1 ] || { echo "❌ Could not download buffer polyfill"; exit 1; }
+chmod 0644 "$OUT"
+ls -lah "$OUT"
 
-echo "== 2) Inject ONE robust Buffer polyfill early in <head> + better button placement =="
+echo "== 2) Patch index.html: remove all old Buffer hacks + inject ONE clean polyfill in <head> =="
 python3 - <<'PY'
 from pathlib import Path
 import re
@@ -23,98 +33,61 @@ import re
 p=Path("/var/www/wolverine/index.html")
 s=p.read_text(errors="ignore")
 
-# remove any previous injected blocks + any <script ...buffer...>
+# remove any previous injected polyfills and any script tags containing "buffer"
 s = re.sub(r"<!--\s*WOLVERINE_BUFFER_POLYFILL\s*-->.*?(?=</head>)", "", s, flags=re.S|re.I)
 s = re.sub(r'<script[^>]+src=["\'][^"\']*buffer[^"\']*["\'][^>]*>\s*</script>\s*', '', s, flags=re.I)
 
 poly = r"""
 <!-- WOLVERINE_BUFFER_POLYFILL -->
-<style>
-  /* buttons: clean + visible */
-  #sendSolBtn{position:fixed;bottom:18px;right:18px;z-index:99999;padding:10px 14px;border-radius:10px}
-  #connectPhantomBtn{position:fixed;bottom:18px;right:160px;z-index:99999;padding:10px 14px;border-radius:10px}
-</style>
-
 <script>
+  // minimal globals expected by some bundles
   window.global = window;
   window.process = window.process || { env: {} };
 </script>
-
-<script src="/wolverine/buffer.min.js"></script>
+<script src="/wolverine/buffer.real.min.js"></script>
 <script>
-  // Make Buffer.from always available (handles different export shapes)
-  (function(){
-    function pickRealBuffer(){
-      if (window.Buffer && typeof window.Buffer.from === "function") return window.Buffer;
-      if (window.buffer && window.buffer.Buffer && typeof window.buffer.Buffer.from === "function") return window.buffer.Buffer;
-      if (window.buffer && typeof window.buffer.from === "function") return window.buffer;
-      return null;
-    }
-
-    var B = pickRealBuffer();
-    if (!B) {
-      // last-resort minimal Buffer.from for common cases (string / Uint8Array / Array)
-      var enc = new TextEncoder();
-      B = {
-        from: function(input){
-          if (typeof input === "string") return enc.encode(input);
-          if (input instanceof Uint8Array) return input;
-          if (Array.isArray(input)) return new Uint8Array(input);
-          throw new Error("Unsupported Buffer.from input");
-        }
-      };
-    }
-
-    // lock it so other scripts can't overwrite with a broken Buffer
-    Object.defineProperty(window, "Buffer", { value: B, writable: false, configurable: false });
-  })();
+  // buffer package exposes window.buffer.Buffer (the real one with Buffer.from, alloc, etc.)
+  if (window.buffer && window.buffer.Buffer) {
+    window.Buffer = window.buffer.Buffer;
+  }
 </script>
 """
 
 if "</head>" in s:
-  s = s.replace("</head>", poly + "\n</head>", 1)
+    s = s.replace("</head>", poly + "\n</head>", 1)
 else:
-  s = poly + "\n" + s
-
-# ensure buttons exist (in case)
-if 'id="sendSolBtn"' not in s:
-  s = re.sub(r"(<body[^>]*>)", r'\1\n<button id="sendSolBtn">Envoyer SOL</button>\n', s, count=1)
-if 'id="connectPhantomBtn"' not in s:
-  s = re.sub(r"(<body[^>]*>)", r'\1\n<button id="connectPhantomBtn">Connect Phantom</button>\n', s, count=1)
+    s = poly + "\n" + s
 
 p.write_text(s)
-print("OK: robust Buffer polyfill + buttons placed")
+print("OK: clean Buffer polyfill injected")
 PY
 
-echo "== 3) Reduce balance spam (avoid RPC error / rate-limit) =="
-if [ -f "$BAL" ]; then
-  cp -a "$BAL" "${BAL}.bak_${TS}"
-  python3 - <<'PY'
+echo "== 3) Patch the Send SOL script: force lamports to BigInt (u64) =="
+python3 - <<'PY'
 from pathlib import Path
 import re
-p=Path("/var/www/wolverine/phantom_balances.js")
+p=Path("/var/www/wolverine/index.html")
 s=p.read_text(errors="ignore")
 
-# common: setInterval(fn, 1000) / 500 / etc -> set to 5000ms
-s = re.sub(r"setInterval\(([^,]+),\s*(\d+)\s*\)", lambda m: f"setInterval({m.group(1)}, 5000)", s)
-
-# ensure RPC is absolute if referenced as /wolverine/rpc
-s = re.sub(r'(["\'])/wolverine/rpc\1', r'window.location.origin + "/wolverine/rpc"', s)
-s = re.sub(r'const\s+RPC\s*=\s*["\']/wolverine/rpc["\']\s*;', 'const RPC = window.location.origin + "/wolverine/rpc";', s)
+# replace lamports calc if present
+s = re.sub(
+  r"lamports:\s*Math\.round\(\s*amountSol\s*\*\s*solanaWeb3\.LAMPORTS_PER_SOL\s*\)",
+  r"lamports: BigInt(Math.round(amountSol * solanaWeb3.LAMPORTS_PER_SOL))",
+  s
+)
 
 p.write_text(s)
-print("OK: phantom_balances.js slowed + RPC absolute")
+print("OK: lamports now BigInt")
 PY
-fi
 
 systemctl reload nginx || service nginx reload
 
 echo
 echo "== ORIGIN checks =="
 curl -sk --resolve fireinners.online:443:127.0.0.1 https://fireinners.online/wolverine/ | grep -n "WOLVERINE_BUFFER_POLYFILL" && echo "HTML OK ✅" || echo "HTML NOT OK ❌"
-curl -sk --resolve fireinners.online:443:127.0.0.1 -I https://fireinners.online/wolverine/buffer.min.js | sed -n '1,12p'
+curl -sk --resolve fireinners.online:443:127.0.0.1 -I https://fireinners.online/wolverine/buffer.real.min.js | sed -n '1,12p'
 echo "DONE ✅"
 BASH
 
-chmod +x /root/fix_buffer_from_final_and_balance_rpc.sh
-/root/fix_buffer_from_final_and_balance_rpc.sh
+chmod +x /root/fix_blob_encode_lamports_buffer.sh
+/root/fix_blob_encode_lamports_buffer.sh
