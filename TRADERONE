@@ -1,4 +1,4 @@
-cat >/root/retest_rpc_cf_vs_origin.sh <<'BASH'
+cat >/root/debug_origin_rpc_403_full.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -6,31 +6,49 @@ HOST="fireinners.online"
 PATH_="/wolverine/rpc"
 PAY='{"jsonrpc":"2.0","id":1,"method":"getVersion"}'
 
-echo "== 1) PUBLIC (via Cloudflare) =="
-curl -sk "https://${HOST}${PATH_}" -D- \
-  -H 'content-type: application/json' \
-  -H "Origin: https://${HOST}" \
-  -H "Referer: https://${HOST}/wolverine/" \
-  --data "$PAY" | head -n 60
-echo
+echo "== 1) Find nginx location for /wolverine/rpc (with context) =="
+nginx -T 2>/tmp/nginxT.txt >/dev/null || true
+# show lines around any /wolverine/rpc
+awk '
+  /location/ {loc_line=NR}
+  /wolverine\/rpc/ {hit=NR}
+  {lines[NR]=$0}
+  END{
+    for(i=1;i<=NR;i++){
+      if(lines[i] ~ /wolverine\/rpc/){
+        s=i-25; if(s<1)s=1; e=i+60; if(e>NR)e=NR;
+        print "\n---- CONTEXT " s "-" e " ----";
+        for(j=s;j<=e;j++) print j ":" lines[j];
+      }
+    }
+  }' /tmp/nginxT.txt | head -n 260
 
-echo "== 2) DIRECT ORIGIN (bypass Cloudflare) =="
+echo
+echo "== 2) Direct ORIGIN test (HTTPS localhost + Host header) =="
 curl -sk "https://127.0.0.1${PATH_}" -D- \
   -H "Host: ${HOST}" \
   -H 'content-type: application/json' \
-  -H "Origin: https://${HOST}" \
-  -H "Referer: https://${HOST}/wolverine/" \
-  --data "$PAY" | head -n 60
+  --data "$PAY" | head -n 80
+
 echo
-
-echo "== 3) If public is 403, show CF headers =="
-curl -sk -o /dev/null -D- "https://${HOST}${PATH_}" \
+echo "== 3) Same but WITHOUT Origin/Referer (in case upstream blocks those) =="
+curl -sk "https://127.0.0.1${PATH_}" -D- \
+  -H "Host: ${HOST}" \
   -H 'content-type: application/json' \
-  -H "Origin: https://${HOST}" \
-  --data "$PAY" | egrep -i 'HTTP/|server:|cf-ray:|cf-cache-status:|cache-control:' || true
+  --data "$PAY" | head -n 80
 
+echo
+echo "== 4) Tail nginx logs for /wolverine/rpc (last 50 lines) =="
+# best-effort paths
+for f in /var/log/nginx/access.log /var/log/nginx/error.log /var/log/nginx/*access*.log /var/log/nginx/*error*.log; do
+  [ -f "$f" ] || continue
+  echo "--- $f ---"
+  tail -n 200 "$f" | grep -E "wolverine/rpc|403" | tail -n 50 || true
+done
+
+echo
 echo "DONE ✅"
 BASH
 
-chmod +x /root/retest_rpc_cf_vs_origin.sh
-/root/retest_rpc_cf_vs_origin.sh
+chmod +x /root/debug_origin_rpc_403_full.sh
+/root/debug_origin_rpc_403_full.sh
