@@ -1,20 +1,50 @@
-cat >/root/force_traderone_location_debug_and_bypass_cf.sh <<'BASH'
+cat >/root/clean_traderone_routes_once.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
+TS="$(date +%Y%m%d_%H%M%S)"
 
 VHOST="/etc/nginx/sites-enabled/fireinners.online-ssl"
 INC="/etc/nginx/includes/wolverine_routes.inc"
-TS="$(date +%Y%m%d_%H%M%S)"
 
-test -f "$VHOST" || { echo "Missing $VHOST"; exit 1; }
-test -f "$INC" || { echo "Missing $INC"; exit 1; }
+echo "== 0) Backup =="
+cp -a "$VHOST" "$VHOST.bak_$TS"
+[ -f "$INC" ] && cp -a "$INC" "$INC.bak_$TS" || true
 
-echo "== 1) Backup =="
-cp -a "$INC" "$INC.bak_$TS"
+echo "== 1) Où sont les locations traderone (fichiers) ? =="
+grep -RIn --binary-files=without-match \
+  -E '^\s*location\b.*(/wolverine/traderone/api)|rewrite\s+\^/wolverine/traderone/api' \
+  /etc/nginx/nginx.conf /etc/nginx/conf.d /etc/nginx/sites-enabled /etc/nginx/snippets /etc/nginx/includes 2>/dev/null \
+| grep -vE '\.bak|sites-disabled' || true
+echo
 
-echo "== 2) Rewrite INC with ROOT routes + debug headers + access_log =="
+echo "== 2) Désactiver TOUT traderone dans le vhost (on gardera seulement l'include) =="
+python3 - <<'PY'
+import re
+p="/etc/nginx/sites-enabled/fireinners.online-ssl"
+lines=open(p,"r",errors="ignore").read().splitlines(True)
+out=[]
+in_loc=False
+d=0
+for l in lines:
+    if not in_loc and re.search(r'^\s*location\b.*?/wolverine/traderone/api', l):
+        out.append("# DISABLED_TRADERONE_DUP " + l)
+        in_loc=True
+        d = l.count("{") - l.count("}")
+        continue
+    if in_loc:
+        out.append("# DISABLED_TRADERONE_DUP " + l)
+        d += l.count("{") - l.count("}")
+        if d <= 0 and "}" in l:
+            in_loc=False
+        continue
+    out.append(l)
+open(p,"w").writelines(out)
+PY
+
+echo "== 3) Écrire LE SEUL fichier de routes traderone (root /$1) + debug headers =="
+mkdir -p /etc/nginx/includes
 cat > "$INC" <<'NGX'
-# Wolverine routes (traderone) - DEBUG
+# Wolverine routes (TRADERONE) - SINGLE SOURCE OF TRUTH
 
 location = /wolverine/traderone/api {
   return 301 /wolverine/traderone/api/;
@@ -27,7 +57,7 @@ location ^~ /wolverine/traderone/api/ {
   proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
   proxy_set_header X-Forwarded-Proto $scheme;
 
-  # DEBUG
+  # DEBUG (doit apparaître même en 404)
   add_header X-Wolverine-Route "traderone" always;
   add_header X-Wolverine-Upstream "$upstream_addr" always;
   access_log /var/log/nginx/traderone_access.log combined;
@@ -38,30 +68,76 @@ location ^~ /wolverine/traderone/api/ {
 }
 NGX
 
-echo "== 3) Ensure log path exists =="
-touch /var/log/nginx/traderone_access.log
-chown www-data:adm /var/log/nginx/traderone_access.log 2>/dev/null || true
+touch /var/log/nginx/traderone_access.log || true
 
-echo "== 4) nginx -t && reload =="
+echo "== 4) S'assurer que l'include est présent UNE fois dans le vhost =="
+# commenter d'anciens includes (snippets/conf)
+sed -i -E 's@^([[:space:]]*)include([[:space:]]+.*wolverine_routes\.(conf|inc).*\s*);@\1# DISABLED_OLD \0@' "$VHOST"
+# enlever doublons include /etc/nginx/includes/wolverine_routes.inc; puis en remettre un seul
+python3 - <<'PY'
+import re
+VHOST="/etc/nginx/sites-enabled/fireinners.online-ssl"
+INC="/etc/nginx/includes/wolverine_routes.inc"
+lines=open(VHOST,"r",errors="ignore").read().splitlines(True)
+
+# find first server block
+start=None
+for i,l in enumerate(lines):
+    if re.search(r'^\s*server\s*\{', l):
+        start=i; break
+if start is None:
+    raise SystemExit("No server { found")
+
+depth=0
+end=None
+for i in range(start, len(lines)):
+    depth += lines[i].count("{")
+    depth -= lines[i].count("}")
+    if depth==0 and i>start:
+        end=i
+        break
+if end is None:
+    raise SystemExit("Brace mismatch in vhost")
+
+before=lines[:start]
+server=lines[start:end+1]
+after=lines[end+1:]
+
+def strip_inc(block):
+    out=[]
+    for l in block:
+        if re.search(r'^\s*include\b', l) and ("wolverine_routes" in l or INC in l):
+            out.append("# DISABLED_DUP_INCLUDE " + l)
+        else:
+            out.append(l)
+    return out
+
+before=strip_inc(before)
+after=strip_inc(after)
+server=strip_inc(server)
+
+# inject include just before closing brace of server
+inc_line=f"  include {INC};\n"
+server.insert(len(server)-1, inc_line)
+
+open(VHOST,"w").writelines(before+server+after)
+PY
+
+echo "== 5) nginx -t && reload =="
 nginx -t
 systemctl reload nginx || service nginx reload
 
-echo "== 5) What nginx THINKS is loaded (grep in nginx -T) =="
-nginx -T 2>/dev/null | grep -nE 'location \^~ /wolverine/traderone/api/|wolverine_routes\.inc|wolverine/traderone/api' | head -n 80 || true
-echo
-
-echo "== 6) BYPASS Cloudflare (hit origin locally with Host header) =="
+echo "== 6) BYPASS Cloudflare tests (must show X-Wolverine-Route) =="
 for p in /wolverine/traderone/api/health /wolverine/traderone/api/me /wolverine/traderone/api/orders; do
-  echo "--- ORIGIN $p ---"
+  echo "--- $p ---"
   curl -sk --resolve fireinners.online:443:127.0.0.1 -D- -o /dev/null "https://fireinners.online$p" | sed -n '1,35p'
 done
 
 echo
-echo "== 7) Tail traderone access log =="
+echo "== 7) Tail traderone log =="
 tail -n 30 /var/log/nginx/traderone_access.log || true
-
 echo "DONE ✅"
 BASH
 
-chmod +x /root/force_traderone_location_debug_and_bypass_cf.sh
-/root/force_traderone_location_debug_and_bypass_cf.sh
+chmod +x /root/clean_traderone_routes_once.sh
+/root/clean_traderone_routes_once.sh
