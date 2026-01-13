@@ -1,28 +1,28 @@
-cat >/root/wolverine_fix_all_and_add_send_sol.sh <<'BASH'
+cat >/root/fix_location_not_allowed_wolverine.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
-TS="$(date +%Y%m%d_%H%M%S)"
 
 HOST="fireinners.online"
 VHOST="/etc/nginx/sites-enabled/${HOST}-ssl"
-WEB="/var/www/wolverine"
-IDX="${WEB}/index.html"
+SNIP="/etc/nginx/snippets/wolverine_routes.conf"
+TS="$(date +%Y%m%d_%H%M%S)"
 
-echo "== 0) Sanity =="
 test -f "$VHOST" || { echo "Missing $VHOST"; exit 1; }
-test -d "$WEB" || { echo "Missing $WEB"; exit 1; }
-test -f "$IDX" || { echo "Missing $IDX"; exit 1; }
 
-echo "== 1) Backup UI =="
-tar -C "$WEB" -czf "/root/wolverine_ui_backup_${TS}.tgz" .
-cp -a "$IDX" "$IDX.bak_${TS}"
+echo "== 1) Backup =="
+cp -a "$VHOST" "$VHOST.bak_$TS"
 
-echo "== 2) NGINX: fix traderone 404 under /wolverine/traderone/api/* =="
-if ! grep -q "/wolverine/traderone/api" "$VHOST"; then
-  cp -a "$VHOST" "$VHOST.bak_${TS}"
-  cat >> "$VHOST" <<'NGX'
+echo "== 2) Write snippet with wolverine routes =="
+cat > "$SNIP" <<'NGX'
+# ---- Wolverine routes (included inside server {}) ----
 
-# --- traderone API (under /wolverine) ---
+# UI under /wolverine/
+location ^~ /wolverine/ {
+  alias /var/www/wolverine/;
+  try_files $uri $uri/ /wolverine/index.html;
+}
+
+# Traderone API under /wolverine/traderone/api/
 location = /wolverine/traderone/api {
   return 301 /wolverine/traderone/api/;
 }
@@ -38,187 +38,62 @@ location ^~ /wolverine/traderone/api/ {
   proxy_pass http://127.0.0.1:8585;
 }
 NGX
-fi
 
-echo "== 3) nginx -t + reload =="
+echo "== 3) Patch vhost: ensure include is INSIDE server{} and comment any trailing location blocks outside =="
+python3 - <<PY
+import re
+VHOST="${VHOST}"
+SNIP="${SNIP}"
+lines=open(VHOST,"r",errors="ignore").read().splitlines(True)
+
+# find first "server {" and its matching closing brace
+start=None
+for i,l in enumerate(lines):
+    if re.search(r'^\s*server\s*\{', l):
+        start=i; break
+if start is None:
+    raise SystemExit("No server { found in vhost")
+
+depth=0
+end=None
+for i in range(start, len(lines)):
+    depth += lines[i].count("{")
+    depth -= lines[i].count("}")
+    if depth==0 and i>start:
+        end=i
+        break
+if end is None:
+    raise SystemExit("Could not find end of server block (brace mismatch)")
+
+server_block = lines[:end+1]
+trailing = lines[end+1:]
+
+# ensure include inside server block (before its final "}")
+inc_line = f"  include {SNIP};\n"
+if not any(SNIP in l for l in server_block):
+    # insert right before end brace
+    server_block.insert(len(server_block)-1, inc_line)
+
+# comment out any 'location' directives that are trailing (outside server)
+new_trailing=[]
+for l in trailing:
+    if re.search(r'^\s*location\b', l) or '/wolverine/' in l:
+        new_trailing.append("# DISABLED_OUTSIDE_SERVER " + l)
+    else:
+        new_trailing.append(l)
+
+open(VHOST,"w").writelines(server_block + new_trailing)
+PY
+
+echo "== 4) nginx -t && reload =="
 nginx -t
 systemctl reload nginx || service nginx reload
 
-echo "== 4) UI: add RPC throttle to avoid 429 (phantom_patch.js + phantom_balances.js) =="
-for f in "$WEB/phantom_patch.js" "$WEB/phantom_balances.js"; do
-  [ -f "$f" ] || continue
-  cp -a "$f" "$f.bak_${TS}"
-  if ! grep -q "__RPC_THROTTLE__" "$f"; then
-    sed -i '1i\
-/* __RPC_THROTTLE__ */\
-let __rpc_inflight = Promise.resolve();\
-let __rpc_last = 0;\
-async function rpcThrottled(fn){\
-  __rpc_inflight = __rpc_inflight.then(async () => {\
-    const wait = Math.max(0, 650 - (Date.now() - __rpc_last));\
-    if (wait) await new Promise(r=>setTimeout(r, wait));\
-    __rpc_last = Date.now();\
-    let delay = 400;\
-    for (let i=0;i<5;i++){\
-      try { return await fn(); }\
-      catch(e){\
-        const msg = (e && (e.message||e.toString())) || \"\";\
-        if (!/429|Too many requests/i.test(msg)) throw e;\
-        await new Promise(r=>setTimeout(r, delay));\
-        delay *= 2;\
-      }\
-    }\
-    throw new Error(\"RPC throttled: still 429\");\
-  });\
-  return __rpc_inflight;\
-}\
-' "$f"
-  fi
-done
-
-# Best-effort auto-wrap: replace "return rpc(" with "return rpcThrottled(() => rpc("
-# (Safe if your code has a function named rpc(...))
-for f in "$WEB/phantom_patch.js" "$WEB/phantom_balances.js"; do
-  [ -f "$f" ] || continue
-  if grep -q "function rpc" "$f" && ! grep -q "rpcThrottled(() => rpc" "$f"; then
-    sed -i -E 's@return[[:space:]]+rpc\(@return rpcThrottled(() => rpc(@g' "$f" || true
-    # close the added paren in common patterns ");"  -> "));"
-    sed -i -E 's@\)\s*;@));@g' "$f" || true
-  fi
-done
-
-echo "== 5) Add Send SOL button (Phantom) =="
-cat > "$WEB/send_sol.js" <<'JS'
-(async () => {
-  function el(id){ return document.getElementById(id); }
-  function ensureUI(){
-    if (el("sendSolBtn")) return;
-
-    const wrap = document.createElement("div");
-    wrap.style.cssText = "position:fixed;right:18px;bottom:18px;z-index:9999;font-family:system-ui;";
-    wrap.innerHTML = `
-      <button id="sendSolBtn" style="padding:10px 14px;border-radius:10px;border:1px solid #333;background:#111;color:#fff;cursor:pointer;">
-        Envoyer SOL
-      </button>
-
-      <div id="sendSolModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);">
-        <div style="max-width:420px;margin:10vh auto;background:#0f0f10;color:#fff;border:1px solid #333;border-radius:12px;padding:16px;">
-          <div style="display:flex;justify-content:space-between;align-items:center;">
-            <div style="font-weight:700;">Envoyer SOL</div>
-            <button id="sendSolClose" style="background:transparent;border:0;color:#fff;font-size:18px;cursor:pointer;">✕</button>
-          </div>
-
-          <div style="margin-top:12px;font-size:13px;opacity:.9;">
-            Tu vas confirmer dans Phantom (adresse + montant + frais).
-          </div>
-
-          <label style="display:block;margin-top:12px;font-size:12px;">Adresse destinataire</label>
-          <input id="sendSolTo" placeholder="Ex: 2uHq...Lx1z" style="width:100%;padding:10px;border-radius:10px;border:1px solid #333;background:#151517;color:#fff;">
-
-          <label style="display:block;margin-top:12px;font-size:12px;">Montant (SOL)</label>
-          <input id="sendSolAmt" placeholder="Ex: 0.01" inputmode="decimal" style="width:100%;padding:10px;border-radius:10px;border:1px solid #333;background:#151517;color:#fff;">
-
-          <div style="display:flex;gap:10px;margin-top:14px;">
-            <button id="sendSolDo" style="flex:1;padding:10px 12px;border-radius:10px;border:1px solid #2b8a3e;background:#143a1f;color:#fff;cursor:pointer;">Envoyer</button>
-            <button id="sendSolCancel" style="padding:10px 12px;border-radius:10px;border:1px solid #333;background:#1a1a1c;color:#fff;cursor:pointer;">Annuler</button>
-          </div>
-
-          <pre id="sendSolLog" style="margin-top:12px;background:#0b0b0c;border:1px solid #222;border-radius:10px;padding:10px;white-space:pre-wrap;word-break:break-word;max-height:160px;overflow:auto;"></pre>
-        </div>
-      </div>
-    `;
-    document.body.appendChild(wrap);
-
-    const modal = el("sendSolModal");
-    const log = (m) => { el("sendSolLog").textContent = m; };
-    const open = () => { modal.style.display = "block"; log(""); };
-    const close = () => { modal.style.display = "none"; };
-
-    el("sendSolBtn").onclick = open;
-    el("sendSolClose").onclick = close;
-    el("sendSolCancel").onclick = close;
-    modal.addEventListener("click", (e) => { if (e.target === modal) close(); });
-
-    el("sendSolDo").onclick = async () => {
-      try {
-        log("Préparation...");
-        if (!window.solana || !window.solana.isPhantom) {
-          log("Phantom non détecté. Installe/active Phantom puis refresh.");
-          return;
-        }
-
-        const to = (el("sendSolTo").value || "").trim();
-        const amt = parseFloat((el("sendSolAmt").value || "").trim());
-
-        if (!to || to.length < 32) { log("Adresse destinataire invalide."); return; }
-        if (!amt || amt <= 0) { log("Montant invalide."); return; }
-
-        // Use Solana web3 (loaded by phantom balances UI in many setups).
-        // If not present, we try dynamic import from a CDN-free approach isn't possible here,
-        // so we require web3 to exist.
-        const web3 = window.solanaWeb3 || window.web3 || window.solanaWeb3Js || window.solanaWeb3;
-        if (!web3 || !web3.PublicKey || !web3.Transaction || !web3.SystemProgram) {
-          log("solanaWeb3 introuvable dans la page. (Il faut charger @solana/web3.js dans l'UI)");
-          return;
-        }
-
-        await window.solana.connect();
-        const fromPubkey = window.solana.publicKey;
-        const toPubkey = new web3.PublicKey(to);
-        const lamports = Math.round(amt * 1e9);
-
-        // Use your own RPC (same as balances)
-        const RPC = "https://fireinners.online/wolverine/rpc";
-        const conn = new web3.Connection(RPC, "confirmed");
-
-        const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash("confirmed");
-
-        const tx = new web3.Transaction({
-          recentBlockhash: blockhash,
-          feePayer: fromPubkey
-        }).add(
-          web3.SystemProgram.transfer({
-            fromPubkey,
-            toPubkey,
-            lamports
-          })
-        );
-
-        log("Signature Phantom...");
-        const signed = await window.solana.signTransaction(tx);
-
-        log("Envoi...");
-        const sig = await conn.sendRawTransaction(signed.serialize(), { skipPreflight: false });
-
-        log("Confirmation...");
-        await conn.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, "confirmed");
-
-        log("✅ Envoyé !\nTX: " + sig);
-      } catch (e) {
-        log("❌ Erreur:\n" + (e?.message || e?.toString() || e));
-      }
-    };
-  }
-
-  if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", ensureUI);
-  } else ensureUI();
-})();
-JS
-
-# Ensure send_sol.js is loaded
-if ! grep -q "send_sol.js" "$IDX"; then
-  sed -i 's@</body>@<script src="/wolverine/send_sol.js"></script>\n</body>@' "$IDX"
-fi
-
-echo "== 6) Quick HTTP checks =="
-curl -sk -o /dev/null -w "UI /wolverine/ : %{http_code}\n" "https://${HOST}/wolverine/"
-curl -sk -o /dev/null -w "RPC : %{http_code}\n" "https://${HOST}/wolverine/rpc"
-curl -sk -o /dev/null -w "Traderone health : %{http_code}\n" "https://${HOST}/wolverine/traderone/api/health"
-curl -sk -o /dev/null -w "send_sol.js : %{http_code}\n" "https://${HOST}/wolverine/send_sol.js"
-
-echo "DONE ✅ Backup: /root/wolverine_ui_backup_${TS}.tgz"
+echo "== 5) Quick tests =="
+curl -sk -o /dev/null -w "UI /wolverine/ : %{http_code}\n" https://fireinners.online/wolverine/
+curl -sk -o /dev/null -w "Traderone health : %{http_code}\n" https://fireinners.online/wolverine/traderone/api/health
+echo "DONE ✅"
 BASH
 
-chmod +x /root/wolverine_fix_all_and_add_send_sol.sh
-/root/wolverine_fix_all_and_add_send_sol.sh
+chmod +x /root/fix_location_not_allowed_wolverine.sh
+/root/fix_location_not_allowed_wolverine.sh
