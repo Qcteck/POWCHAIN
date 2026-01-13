@@ -1,82 +1,94 @@
-cat >/root/fix_wolverine_ui_patch_correct_file.sh <<'BASH'
+cat >/root/inject_wolverine_send_sol_script_safe.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
+
+FILE="/var/www/wolverine/index.html"
 TS="$(date +%Y%m%d_%H%M%S)"
 
-echo "== 1) Dump HTML served by origin (bypass Cloudflare) =="
-curl -sk --resolve fireinners.online:443:127.0.0.1 "https://fireinners.online/wolverine/" -o /tmp/wolverine_served.html
-echo "saved: /tmp/wolverine_served.html"
-echo
+test -f "$FILE" || { echo "❌ Missing $FILE"; exit 1; }
+cp -a "$FILE" "${FILE}.bak_${TS}"
 
-echo "== 2) Quick grep in served HTML =="
-grep -nE 'sendSolBtn|WOLVERINE_SEND_SOL_SCRIPT' /tmp/wolverine_served.html || echo "NOT FOUND in served HTML"
-echo
-
-echo "== 3) Locate candidates index.html and compare hashes =="
-CANDS=$(find /var/www /usr/share/nginx/html -maxdepth 6 -type f -name index.html 2>/dev/null || true)
-SERV_HASH=$(sha256sum /tmp/wolverine_served.html | awk '{print $1}')
-echo "served sha256: $SERV_HASH"
-echo
-
-MATCH=""
-while IFS= read -r f; do
-  [ -f "$f" ] || continue
-  h=$(sha256sum "$f" | awk '{print $1}')
-  if [ "$h" = "$SERV_HASH" ]; then
-    MATCH="$f"
-    break
-  fi
-done <<< "$CANDS"
-
-if [ -z "$MATCH" ]; then
-  echo "== No exact hash match. We'll locate /wolverine/ webroot from nginx -T =="
-  nginx -T 2>/dev/null | grep -nE 'location\s+/?/wolverine/?|alias\s+|root\s+|try_files' | head -n 220 || true
-  echo
-  echo "Candidates (top 20):"
-  echo "$CANDS" | head -n 20
-  echo
-  echo "❌ Pas de match exact. Dis-moi ce que renvoie le grep nginx -T ci-dessus (bloc /wolverine/)."
-  exit 2
-fi
-
-echo "== 4) Found served file =="
-echo "MATCH=$MATCH"
-cp -a "$MATCH" "${MATCH}.bak_${TS}"
-
-echo
-echo "== 5) Patch MATCH (add button + script if missing) =="
-if ! grep -q 'id="sendSolBtn"' "$MATCH"; then
-  sed -i -E '0,/<body[^>]*>/s//&\n  <button id="sendSolBtn" style="position:fixed;bottom:18px;right:18px;z-index:9999;">Envoyer SOL au wallet WOLVERINE<\/button>\n/' "$MATCH"
-  echo "button added"
-else
-  echo "button already present"
-fi
-
-# read VPS pubkey (best effort)
+# Trouver la pubkey Solana sur le VPS (best effort)
 KEYFILE=""
 for f in /root/.config/solana/id.json /home/*/.config/solana/id.json; do
   [ -f "$f" ] && KEYFILE="$f" && break
 done
-if [ -z "$KEYFILE" ]; then
-  echo "❌ No Solana key found at default paths (/root/.config/solana/id.json)."
-  echo "   Put your pubkey manually below (WOLVERINE_WALLET)."
-  PUBKEY="REMPLACE_PAR_PUBLIC_KEY_WOLVERINE"
-else
+if [ -n "$KEYFILE" ]; then
   PUBKEY="$(solana-keygen pubkey "$KEYFILE")"
-fi
-
-if ! grep -q 'WOLVERINE_SEND_SOL_SCRIPT' "$MATCH"; then
-  perl -0777 -i -pe 's@</body>@<script type="module">\n/* WOLVERINE_SEND_SOL_SCRIPT */\nimport { Connection, PublicKey, SystemProgram, Transaction, LAMPORTS_PER_SOL } from "https://cdn.skypack.dev/@solana/web3.js";\nconst RPC = "https://api.mainnet-beta.solana.com";\nconst WOLVERINE_WALLET = new PublicKey("'"$PUBKEY"'");\nasync function sendSol(amountSol){\n  const provider = window.solana;\n  if(!provider?.isPhantom) throw new Error("Phantom non détecté");\n  await provider.connect();\n  const connection = new Connection(RPC,"confirmed");\n  const fromPubkey = provider.publicKey;\n  const tx = new Transaction().add(SystemProgram.transfer({fromPubkey,toPubkey:WOLVERINE_WALLET,lamports:Math.round(amountSol*LAMPORTS_PER_SOL)}));\n  tx.feePayer = fromPubkey;\n  const {blockhash} = await connection.getLatestBlockhash("finalized");\n  tx.recentBlockhash = blockhash;\n  const signed = await provider.signTransaction(tx);\n  const sig = await connection.sendRawTransaction(signed.serialize());\n  await connection.confirmTransaction(sig,"confirmed");\n  return sig;\n}\ndocument.getElementById("sendSolBtn")?.addEventListener("click",async()=>{\n  const amount = Number(prompt("Montant en SOL à envoyer :")||"0");\n  if(!amount||amount<=0) return;\n  try{ const sig = await sendSol(amount); alert("Envoyé ✅ Tx: "+sig); }\n  catch(e){ alert("Erreur: "+(e?.message||e)); }\n});\n</script>\n</body>@s' "$MATCH"
-  echo "script added (wallet=$PUBKEY)"
 else
-  echo "script already present"
+  PUBKEY="REMPLACE_PAR_PUBLIC_KEY_WOLVERINE"
 fi
 
-echo
-echo "== 6) Verify served HTML now contains marker (origin bypass) =="
+python3 - <<PY
+from pathlib import Path
+
+p=Path("$FILE")
+s=p.read_text(errors="ignore")
+
+if "WOLVERINE_SEND_SOL_SCRIPT" in s:
+    print("ℹ️ Script déjà présent")
+else:
+    script = f'''
+<script type="module">
+/* WOLVERINE_SEND_SOL_SCRIPT */
+import {{ Connection, PublicKey, SystemProgram, Transaction, LAMPORTS_PER_SOL }} from "https://cdn.skypack.dev/@solana/web3.js";
+
+const RPC = "https://api.mainnet-beta.solana.com";
+const WOLVERINE_WALLET = new PublicKey("{PUBKEY}");
+
+async function sendSol(amountSol) {{
+  const provider = window.solana;
+  if (!provider?.isPhantom) throw new Error("Phantom non détecté");
+  await provider.connect();
+
+  const connection = new Connection(RPC, "confirmed");
+  const fromPubkey = provider.publicKey;
+
+  const tx = new Transaction().add(
+    SystemProgram.transfer({{
+      fromPubkey,
+      toPubkey: WOLVERINE_WALLET,
+      lamports: Math.round(amountSol * LAMPORTS_PER_SOL),
+    }})
+  );
+
+  tx.feePayer = fromPubkey;
+  const {{ blockhash }} = await connection.getLatestBlockhash("finalized");
+  tx.recentBlockhash = blockhash;
+
+  const signed = await provider.signTransaction(tx);
+  const sig = await connection.sendRawTransaction(signed.serialize());
+  await connection.confirmTransaction(sig, "confirmed");
+  return sig;
+}}
+
+document.getElementById("sendSolBtn")?.addEventListener("click", async () => {{
+  const amount = Number(prompt("Montant en SOL à envoyer :") || "0");
+  if (!amount || amount <= 0) return;
+  try {{
+    const sig = await sendSol(amount);
+    alert("Envoyé ✅ Tx: " + sig);
+  }} catch (e) {{
+    alert("Erreur: " + (e?.message || e));
+  }}
+}});
+</script>
+'''
+    if "</body>" in s:
+        s = s.replace("</body>", script + "\n</body>", 1)
+    else:
+        s = s + "\n" + script
+    p.write_text(s)
+    print("✅ Script injecté")
+PY
+
 systemctl reload nginx || service nginx reload
+
+echo "== ORIGIN check (bypass CF) =="
 curl -sk --resolve fireinners.online:443:127.0.0.1 https://fireinners.online/wolverine/ | grep -nE 'sendSolBtn|WOLVERINE_SEND_SOL_SCRIPT' && echo "OK ✅" || echo "STILL NOT FOUND ❌"
+
+echo "Wallet utilisé: $PUBKEY"
 BASH
 
-chmod +x /root/fix_wolverine_ui_patch_correct_file.sh
-/root/fix_wolverine_ui_patch_correct_file.sh
+chmod +x /root/inject_wolverine_send_sol_script_safe.sh
+/root/inject_wolverine_send_sol_script_safe.sh
