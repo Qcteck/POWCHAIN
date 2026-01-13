@@ -1,80 +1,46 @@
-cat >/root/fix_wolverine_nocache_location_scope.sh <<'BASH'
+cat >/root/purge_all_sites_enabled_backups.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-VHOST="/etc/nginx/sites-enabled/fireinners.online-ssl"
-TS="$(date +%Y%m%d_%H%M%S)"
+EN="/etc/nginx/sites-enabled"
+DST="/etc/nginx/sites-disabled/cleanup_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$DST"
 
-test -f "$VHOST" || { echo "❌ Missing $VHOST"; exit 1; }
-cp -a "$VHOST" "$VHOST.bak_${TS}"
+echo "== BEFORE =="
+ls -lah "$EN"
 
-python3 - <<'PY'
-import re
-p="/etc/nginx/sites-enabled/fireinners.online-ssl"
-s=open(p,"r",errors="ignore").read()
+echo
+echo "== Move ALL backups/variants out of sites-enabled =="
+shopt -s nullglob
+for f in "$EN"/*.bak* "$EN"/*_bak* "$EN"/*.broken* "$EN"/*.old* "$EN"/*~; do
+  [ -e "$f" ] || continue
+  echo "MOVE: $f -> $DST/"
+  mv -v "$f" "$DST/"
+done
 
-# 1) Remove any previously appended block (even if broken)
-s = re.sub(r"\n?\s*#\s*WOLVERINE_NOCACHE_BEGIN.*?#\s*WOLVERINE_NOCACHE_END\s*\n?", "\n", s, flags=re.S)
+echo
+echo "== Also move any fireinners.* variants except the exact live file =="
+KEEP="$EN/fireinners.online-ssl"
+for f in "$EN"/fireinners.online-ssl*; do
+  [ -e "$f" ] || continue
+  [ "$f" = "$KEEP" ] && continue
+  echo "MOVE: $f -> $DST/"
+  mv -v "$f" "$DST/"
+done
 
-# 2) Find first server block bounds
-lines=s.splitlines(True)
-start=None
-for i,l in enumerate(lines):
-    if re.search(r'^\s*server\s*\{', l):
-        start=i; break
-if start is None:
-    raise SystemExit("No server { found in vhost")
+echo
+echo "== AFTER (should show only fireinners.online-ssl + maybe other real vhosts) =="
+ls -lah "$EN"
 
-depth=0
-end=None
-for i in range(start, len(lines)):
-    depth += lines[i].count("{")
-    depth -= lines[i].count("}")
-    if depth==0 and i>start:
-        end=i
-        break
-if end is None:
-    raise SystemExit("Brace mismatch in server block")
-
-before=lines[:start]
-server=lines[start:end+1]
-after=lines[end+1:]
-
-block = """
-  # WOLVERINE_NOCACHE_BEGIN
-  # Empêche HTML SPA d'être caché (Cloudflare / navigateurs)
-  location = /wolverine/ {
-    add_header Cache-Control "no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0" always;
-    add_header Pragma "no-cache" always;
-    add_header Expires "0" always;
-    return 301 /wolverine/index.html;
-  }
-
-  location = /wolverine/index.html {
-    add_header Cache-Control "no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0" always;
-    add_header Pragma "no-cache" always;
-    add_header Expires "0" always;
-    try_files /wolverine/index.html =404;
-  }
-  # WOLVERINE_NOCACHE_END
-"""
-
-# 3) Inject block just before the closing brace of server
-server.insert(len(server)-1, block + "\n")
-
-open(p,"w").write("".join(before+server+after))
-print("OK: nocache block re-injected inside server{}")
-PY
-
+echo
+echo "== nginx -t =="
 nginx -t
-systemctl reload nginx || service nginx reload
 
 echo
-echo "== ORIGIN headers (bypass CF) =="
-curl -skI --resolve fireinners.online:443:127.0.0.1 https://fireinners.online/wolverine/index.html | sed -n '1,25p'
-echo
+echo "== reload =="
+systemctl reload nginx || service nginx reload
 echo "DONE ✅"
 BASH
 
-chmod +x /root/fix_wolverine_nocache_location_scope.sh
-/root/fix_wolverine_nocache_location_scope.sh
+chmod +x /root/purge_all_sites_enabled_backups.sh
+/root/purge_all_sites_enabled_backups.sh
