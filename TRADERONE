@@ -1,1 +1,126 @@
-nl -ba /etc/nginx/sites-enabled/fireinners.online-ssl | sed -n '35,55p'
+cat >/root/fix_wolverine_include_inside_server_only.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+VHOST="/etc/nginx/sites-enabled/fireinners.online-ssl"
+SNIP="/etc/nginx/snippets/wolverine_routes.conf"
+TS="$(date +%Y%m%d_%H%M%S)"
+
+test -f "$VHOST" || { echo "Missing $VHOST"; exit 1; }
+
+echo "== 1) Backup vhost =="
+cp -a "$VHOST" "$VHOST.bak_fix_${TS}"
+
+echo "== 2) Ensure snippet exists (routes live HERE only) =="
+cat > "$SNIP" <<'NGX'
+# ---- Wolverine routes (MUST be included inside server {}) ----
+
+location ^~ /wolverine/ {
+  alias /var/www/wolverine/;
+  try_files $uri $uri/ /wolverine/index.html;
+}
+
+location = /wolverine/traderone/api {
+  return 301 /wolverine/traderone/api/;
+}
+
+location ^~ /wolverine/traderone/api/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+
+  rewrite ^/wolverine/traderone/api/(.*)$ /api/$1 break;
+  proxy_pass http://127.0.0.1:8585;
+}
+NGX
+
+echo "== 3) Patch vhost: remove any wolverine/traderone locations OUTSIDE server, and move include INSIDE server =="
+python3 - <<'PY'
+import re
+
+VHOST="/etc/nginx/sites-enabled/fireinners.online-ssl"
+SNIP="/etc/nginx/snippets/wolverine_routes.conf"
+
+lines=open(VHOST,"r",errors="ignore").read().splitlines(True)
+
+# find first server { ... }
+start=None
+for i,l in enumerate(lines):
+    if re.search(r'^\s*server\s*\{', l):
+        start=i; break
+if start is None:
+    raise SystemExit("No server { found in vhost")
+
+depth=0
+end=None
+for i in range(start, len(lines)):
+    depth += lines[i].count("{")
+    depth -= lines[i].count("}")
+    if depth==0 and i>start:
+        end=i
+        break
+if end is None:
+    raise SystemExit("Could not find end of first server block (brace mismatch)")
+
+server = lines[start:end+1]
+before = lines[:start]
+after  = lines[end+1:]
+
+# remove any existing includes of our snippet anywhere (we'll re-add correctly)
+def strip_includes(block):
+    out=[]
+    for l in block:
+        if SNIP in l and re.search(r'^\s*include\b', l):
+            continue
+        out.append(l)
+    return out
+
+before = strip_includes(before)
+server = strip_includes(server)
+after  = strip_includes(after)
+
+# helper: comment out any wolverine/traderone location blocks outside server
+def comment_wolverine_locations(block):
+    out=[]
+    in_loc=0
+    loc_depth=0
+    for l in block:
+        if in_loc==0 and re.search(r'^\s*location\b', l) and ('/wolverine/' in l or '/wolverine/traderone/api' in l):
+            out.append("# DISABLED_OUTSIDE_SERVER " + l)
+            in_loc=1
+            loc_depth = l.count("{") - l.count("}")
+            continue
+        if in_loc==1:
+            out.append("# DISABLED_OUTSIDE_SERVER " + l)
+            loc_depth += l.count("{") - l.count("}")
+            if loc_depth <= 0 and "}" in l:
+                in_loc=0
+            continue
+        out.append(l)
+    return out
+
+before = comment_wolverine_locations(before)
+after  = comment_wolverine_locations(after)
+
+# ensure include inside server (right before the closing brace of that server block)
+inc = f"  include {SNIP};\n"
+if not any(SNIP in l for l in server):
+    server.insert(len(server)-1, inc)
+
+open(VHOST,"w").writelines(before + server + after)
+PY
+
+echo "== 4) nginx -t && reload =="
+nginx -t
+systemctl reload nginx || service nginx reload
+
+echo "== 5) Quick tests =="
+curl -sk -o /dev/null -w "UI /wolverine/ : %{http_code}\n" https://fireinners.online/wolverine/
+curl -sk -o /dev/null -w "Traderone health : %{http_code}\n" https://fireinners.online/wolverine/traderone/api/health
+echo "DONE ✅"
+BASH
+
+chmod +x /root/fix_wolverine_include_inside_server_only.sh
+/root/fix_wolverine_include_inside_server_only.sh
