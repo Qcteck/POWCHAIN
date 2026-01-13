@@ -1,47 +1,19 @@
-cat >/root/fix_location_not_allowed_fireinners_ssl.sh <<'BASH'
+cat >/root/move_wolverine_location_inside_server.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 VHOST="/etc/nginx/sites-enabled/fireinners.online-ssl"
-SNIP="/etc/nginx/snippets/wolverine_routes.conf"
 TS="$(date +%Y%m%d_%H%M%S)"
 
 test -f "$VHOST" || { echo "Missing $VHOST"; exit 1; }
+cp -a "$VHOST" "$VHOST.bak_move_${TS}"
 
-echo "== Context around line 55 =="
-nl -ba "$VHOST" | sed -n '45,70p'
-
-echo "== Backup =="
-cp -a "$VHOST" "$VHOST.bak_${TS}"
-
-# Ensure snippet exists (can be included safely inside server)
-cat > "$SNIP" <<'NGX'
-# Wolverine routes (include INSIDE server {})
-
-# Traderone API under /wolverine/traderone/api/
-location = /wolverine/traderone/api {
-  return 301 /wolverine/traderone/api/;
-}
-location ^~ /wolverine/traderone/api/ {
-  proxy_http_version 1.1;
-  proxy_set_header Host $host;
-  proxy_set_header X-Real-IP $remote_addr;
-  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto $scheme;
-
-  rewrite ^/wolverine/traderone/api/(.*)$ /api/$1 break;
-  proxy_pass http://127.0.0.1:8585;
-}
-NGX
-
-echo "== Patch: comment any location blocks OUTSIDE the first server{} and ensure include INSIDE server =="
 python3 - <<'PY'
 import re
-VHOST="/etc/nginx/sites-enabled/fireinners.online-ssl"
-SNIP="/etc/nginx/snippets/wolverine_routes.conf"
 
+VHOST="/etc/nginx/sites-enabled/fireinners.online-ssl"
 lines=open(VHOST,"r",errors="ignore").read().splitlines(True)
 
-# find first server { ... }
+# 1) Find first server { ... } range
 start=None
 for i,l in enumerate(lines):
     if re.search(r'^\s*server\s*\{', l):
@@ -60,65 +32,62 @@ for i in range(start, len(lines)):
 if end is None:
     raise SystemExit("Could not find end of first server block (brace mismatch)")
 
-before = lines[:start]
-server = lines[start:end+1]
-after  = lines[end+1:]
+# 2) Extract ANY location ^~ /wolverine/ { ... } block found ANYWHERE
+block=[]
+out=[]
+i=0
+while i < len(lines):
+    l=lines[i]
+    if re.search(r'^\s*location\s+\^~\s+/wolverine/\s*\{', l):
+        # capture full block by brace depth
+        b=[l]
+        d = l.count("{") - l.count("}")
+        i += 1
+        while i < len(lines) and d > 0:
+            b.append(lines[i])
+            d += lines[i].count("{") - lines[i].count("}")
+            i += 1
+        block = b  # keep last found (fine)
+        continue
+    out.append(l)
+    i += 1
 
-# remove any existing includes of snippet anywhere (we'll re-add once)
-def drop_include(block):
-    out=[]
-    for l in block:
-        if SNIP in l and re.search(r'^\s*include\b', l):
-            continue
-        out.append(l)
-    return out
+if not block:
+    raise SystemExit("No 'location ^~ /wolverine/ {' block found to move")
 
-before = drop_include(before)
-server = drop_include(server)
-after  = drop_include(after)
+# 3) Recompute server range after removal
+lines=out
+start=None
+for i,l in enumerate(lines):
+    if re.search(r'^\s*server\s*\{', l):
+        start=i; break
+depth=0
+end=None
+for i in range(start, len(lines)):
+    depth += lines[i].count("{")
+    depth -= lines[i].count("}")
+    if depth==0 and i>start:
+        end=i
+        break
 
-# comment out ANY location blocks outside server (to stop nginx error)
-def comment_locations(block):
-    out=[]
-    in_loc=False
-    d=0
-    for l in block:
-        if not in_loc and re.search(r'^\s*location\b', l):
-            out.append("# DISABLED_OUTSIDE_SERVER " + l)
-            in_loc=True
-            d += l.count("{") - l.count("}")
-            continue
-        if in_loc:
-            out.append("# DISABLED_OUTSIDE_SERVER " + l)
-            d += l.count("{") - l.count("}")
-            if d <= 0 and "}" in l:
-                in_loc=False
-            continue
-        out.append(l)
-    return out
+# 4) Insert block right before closing brace of server
+server = lines[:end]
+close = lines[end:end+1]
+rest  = lines[end+1:]
 
-before = comment_locations(before)
-after  = comment_locations(after)
+# Avoid duplicates: remove any existing /wolverine_DISABLED/ etc not needed
+server.append("\n")
+server.extend(block)
+server.append("\n")
 
-# ensure include inside server (right before its closing brace)
-inc = f"  include {SNIP};\n"
-if not any(SNIP in l for l in server):
-    server.insert(len(server)-1, inc)
-
-open(VHOST,"w").writelines(before + server + after)
+open(VHOST,"w").writelines(server + close + rest)
 PY
 
-echo "== nginx -t =="
 nginx -t
-
-echo "== reload =="
 systemctl reload nginx || service nginx reload
 
-echo "== Quick tests =="
-curl -sk -o /dev/null -w "UI /wolverine/ : %{http_code}\n" https://fireinners.online/wolverine/
-curl -sk -o /dev/null -w "Traderone health : %{http_code}\n" https://fireinners.online/wolverine/traderone/api/health
 echo "DONE ✅"
 BASH
 
-chmod +x /root/fix_location_not_allowed_fireinners_ssl.sh
-/root/fix_location_not_allowed_fireinners_ssl.sh
+chmod +x /root/move_wolverine_location_inside_server.sh
+/root/move_wolverine_location_inside_server.sh
