@@ -1,1 +1,100 @@
+cat >/root/fix_duplicate_traderone_location.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+TS="$(date -u +%Y%m%d_%H%M%S)"
+
+CFG="/etc/nginx/sites-enabled/fireinners.online-ssl"
+SNIP="/etc/nginx/snippets/traderone_api_lockdown.conf"
+
+test -f "$CFG" || { echo "❌ Missing $CFG"; exit 1; }
+
+echo "== 0) Backup =="
+cp -a "$CFG" "${CFG}.bak_${TS}"
+[ -f "$SNIP" ] && cp -a "$SNIP" "${SNIP}.bak_${TS}" || true
+echo "Backup: ${CFG}.bak_${TS}"
+[ -f "$SNIP" ] && echo "Backup: ${SNIP}.bak_${TS}"
+echo
+
+echo "== 1) Show duplicate location occurrences =="
+grep -nE 'location\s+(\^~\s+)?=*\s*/wolverine/traderone/api' "$CFG" || true
+[ -f "$SNIP" ] && grep -nE 'location\s+(\^~\s+)?=*\s*/wolverine/traderone/api' "$SNIP" || true
+echo
+
+echo "== 2) Rewrite snippet to NOT declare a location (only directives) =="
+mkdir -p /etc/nginx/snippets
+cat >"$SNIP" <<'NG'
+# TraderOne API lockdown directives (include INSIDE the existing location block)
+add_header Cache-Control "no-store" always;
+allow 127.0.0.1;
+deny all;
+NG
+chmod 0644 "$SNIP"
+echo "Wrote $SNIP (directives only)"
+echo
+
+echo "== 3) Remove server-level include line if present (we will include inside location) =="
+sed -i '/include \/etc\/nginx\/snippets\/traderone_api_lockdown\.conf;/d' "$CFG"
+echo "Removed any server-level include (if it existed)."
+echo
+
+echo "== 4) Inject include INSIDE the existing /wolverine/traderone/api location block (if missing) =="
+python3 - <<'PY'
+from pathlib import Path
+import re
+
+cfg = Path("/etc/nginx/sites-enabled/fireinners.online-ssl")
+s = cfg.read_text(errors="ignore")
+
+inc = "include /etc/nginx/snippets/traderone_api_lockdown.conf;"
+
+# find the existing location block for /wolverine/traderone/api/ (any of: location ^~ /..., location /..., location = /...)
+m = re.search(r"(location\s+(\^~\s+)?=?\s*/wolverine/traderone/api/?\s*\{)", s)
+if not m:
+    raise SystemExit("❌ Could not find an existing location block for /wolverine/traderone/api in site config")
+
+start = m.start(1)
+# find the opening brace position and inject after it, but only if not already inside that block
+brace_pos = s.find("{", start)
+if brace_pos == -1:
+    raise SystemExit("❌ Malformed location block (no '{')")
+
+# find end of this location block (simple brace matching)
+i = brace_pos
+depth = 0
+end = None
+while i < len(s):
+    if s[i] == "{":
+        depth += 1
+    elif s[i] == "}":
+        depth -= 1
+        if depth == 0:
+            end = i
+            break
+    i += 1
+
+if end is None:
+    raise SystemExit("❌ Could not find end of location block")
+
+block = s[brace_pos+1:end]
+if inc in block:
+    print("OK: include already inside location block")
+else:
+    new_block = "\n  " + inc + "\n" + block
+    s2 = s[:brace_pos+1] + new_block + s[end:]
+    cfg.write_text(s2)
+    print("OK: include injected inside location block")
+PY
+echo
+
+echo "== 5) Test + reload nginx =="
+nginx -t
+systemctl reload nginx || service nginx reload
+echo
+
+echo "== 6) ORIGIN check (bypass Cloudflare) should now be 403 =="
 curl -skI --resolve fireinners.online:443:127.0.0.1 https://fireinners.online/wolverine/traderone/api/ | head -n 12
+echo "DONE ✅"
+BASH
+
+chmod +x /root/fix_duplicate_traderone_location.sh
+/root/fix_duplicate_traderone_location.sh
