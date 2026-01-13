@@ -1,4 +1,200 @@
-systemctl status wolverine-traderone-api.service --no-pager || true
-journalctl -u wolverine-traderone-api.service -n 80 --no-pager || true
-ss -lntp | grep ':3000' || true
-tail -n 80 /var/log/nginx/error.log || true
+cat >/root/MEGA_TRADERONE_ROOT.sh<<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+log(){ printf "\n[%s] %s\n" "$(date +'%F %T')" "$*"; }
+die(){ echo "ERROR: $*" >&2; exit 1; }
+[ "$(id -u)" -eq 0 ] || die "Lance en root."
+
+# Fixes/refs
+ASK_LIB="/opt/fireinners/sentinel/lib/askorupdate.sh"
+NGINX_SITE="/etc/nginx/sites-available/fireinners.online-ssl"
+API_DIR="/opt/wolverine/traderone_api"
+SERVICE="wolverine-traderone-api"
+API_BASE="/wolverine/traderone/api"
+API_BIND="127.0.0.1"
+API_PORT="3000"
+CORRUPT="/opt/wolverine/node_modules/node-fetch/node_modules/@solana/web3.js/package.json"
+
+# Fallback si askorupdate absent
+askorupdate_file(){ local p="$1"; shift; local c="$1"; shift; mkdir -p "$(dirname "$p")"; [ -f "$p" ] && cp -a "$p" "$p.bak.$(date +%s)"; printf "%s" "$c" >"$p"; }
+askorupdate_yesno(){ local prompt="$1"; shift; local yn; read -r -p "$prompt [y/N] " yn || true; case "${yn,,}" in y|yes) return 0;; *) return 1;; esac; }
+
+if [ -f "$ASK_LIB" ]; then
+  # shellcheck disable=SC1090
+  source "$ASK_LIB" || true
+fi
+
+log "0) Preflight paquets de base"
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -y >/dev/null
+apt-get install -y ca-certificates curl git >/dev/null
+
+log "1) Node.js (règle: pas apt npm/nodejs)."
+need_node=0
+if ! command -v node >/dev/null 2>&1; then need_node=1; fi
+if [ "$need_node" -eq 0 ]; then
+  major="$(node -v | sed 's/^v//' | cut -d. -f1 || echo 0)"
+  if [ "${major:-0}" -lt 20 ]; then need_node=1; fi
+fi
+if [ "$need_node" -eq 1 ]; then
+  curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null
+  apt-get install -y nodejs >/dev/null
+fi
+command -v node >/dev/null || die "Node absent"
+command -v npm >/dev/null || die "npm absent"
+log "Node: $(node -v) | npm: $(npm -v)"
+
+log "2) Rollback node_modules cassé (si corrompu)"
+if [ -f "$CORRUPT" ] && grep -q "import express" "$CORRUPT" 2>/dev/null; then
+  bak="$(ls -1t "${CORRUPT}.bak."* 2>/dev/null | head -n1 || true)"
+  if [ -n "${bak:-}" ]; then
+    cp -a "$bak" "$CORRUPT"
+    log "Restore: $bak -> $CORRUPT"
+  else
+    log "Pas de backup: reinstall node_modules /opt/wolverine (best-effort)"
+    if [ -f /opt/wolverine/package.json ]; then (cd /opt/wolverine && npm install --omit=dev) >/dev/null || true; fi
+  fi
+fi
+
+log "3) Installer backend TraderOne API (sans toucher au front /var/www/wolverine)"
+mkdir -p "$API_DIR"
+
+PKG='{"name":"traderone-api","version":"1.0.0","private":true,"type":"module","main":"server.js","scripts":{"start":"node server.js"},"dependencies":{"express":"^4.19.2"}}'
+askorupdate_file "$API_DIR/package.json" "$PKG"
+
+SERVER_JS=$(cat <<'JS'
+import express from "express";
+const app=express();app.disable("x-powered-by");app.use(express.json({limit:"256kb"}));
+const BIND=process.env.BIND||"127.0.0.1";
+const PORT=parseInt(process.env.PORT||"3000",10);
+const API_BASE=(process.env.API_BASE||"/wolverine/traderone/api").replace(/\/+$/,"");
+const now=()=>new Date().toISOString();
+const ok=(res,obj)=>res.json({ok:true,service:"traderone",ts:now(),...obj});
+const bad=(res,msg,code=400)=>res.status(code).json({ok:false,service:"traderone",ts:now(),error:String(msg||"bad_request")});
+
+app.get(`${API_BASE}/health`,(req,res)=>ok(res,{base:API_BASE,bind:BIND,port:PORT}));
+app.get(`${API_BASE}/version`,(req,res)=>ok(res,{version:"1.0.0"}));
+app.get(`${API_BASE}/dashboard`,(req,res)=>ok(res,{page:"dashboard",summary:{invested_usdc:0,pnl_usdc:0,positions:0,orders:0}}));
+app.get(`${API_BASE}/trade`,(req,res)=>ok(res,{page:"trade",status:"ready"}));
+app.get(`${API_BASE}/positions`,(req,res)=>ok(res,{page:"positions",items:[]}));
+app.get(`${API_BASE}/orders`,(req,res)=>ok(res,{page:"orders",items:[]}));
+app.get(`${API_BASE}/history`,(req,res)=>ok(res,{page:"history",items:[]}));
+app.get(`${API_BASE}/wallet`,(req,res)=>ok(res,{page:"wallet",balances:{sol:0,usdc:0,tokens:[]}}));
+app.get(`${API_BASE}/settings`,(req,res)=>ok(res,{page:"settings",strategies:["default","conservative","balanced","aggressive"],risk_pct_default:5}));
+
+app.post(`${API_BASE}/start`,(req,res)=>{
+  const {pub,budget_usdc,strategy,risk_pct}=req.body||{};
+  if(!pub) return bad(res,"pub_required");
+  const budget=Number(budget_usdc||0); if(!Number.isFinite(budget)||budget<=0) return bad(res,"budget_usdc_invalid");
+  const risk=Number(risk_pct||0); if(!Number.isFinite(risk)||risk<0||risk>100) return bad(res,"risk_pct_invalid");
+  const job_id=`job_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  ok(res,{accepted:true,job_id,pub,budget_usdc:budget,strategy:String(strategy||"default"),risk_pct:risk});
+});
+app.post(`${API_BASE}/mode`,(req,res)=>{
+  const {pub,mode}=req.body||{};
+  if(!pub) return bad(res,"pub_required");
+  ok(res,{accepted:true,pub,mode:String(mode||"observe")});
+});
+app.post(`${API_BASE}/withdraw`,(req,res)=>{
+  const {pub,mint,amount,to}=req.body||{};
+  if(!pub) return bad(res,"pub_required");
+  const amt=Number(amount||0); if(!Number.isFinite(amt)||amt<=0) return bad(res,"amount_invalid");
+  ok(res,{accepted:true,pub,mint:String(mint||""),amount:amt,to:String(to||"")});
+});
+app.get(`${API_BASE}/invested`,(req,res)=>{
+  const pub=String(req.query.pub||"");
+  if(!pub) return bad(res,"pub_required");
+  ok(res,{pub,invested_usdc:0,pnl_usdc:0,positions:[]});
+});
+
+app.use((req,res)=>bad(res,"not_found",404));
+app.listen(PORT,BIND,()=>console.log(`[traderone] ${now()} listening http://${BIND}:${PORT}${API_BASE}`));
+JS
+)
+askorupdate_file "$API_DIR/server.js" "$SERVER_JS"
+
+log "4) npm install backend"
+(cd "$API_DIR" && npm install --omit=dev) >/dev/null
+
+log "5) systemd service $SERVICE"
+UNIT=$(cat <<UNIT
+[Unit]
+Description=WOLVERINE TraderOne API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=$API_DIR
+Environment=NODE_ENV=production
+Environment=BIND=$API_BIND
+Environment=PORT=$API_PORT
+Environment=API_BASE=$API_BASE
+ExecStart=/usr/bin/node $API_DIR/server.js
+Restart=always
+RestartSec=2
+User=root
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+)
+askorupdate_file "/etc/systemd/system/${SERVICE}.service" "$UNIT"
+systemctl daemon-reload
+systemctl enable --now "${SERVICE}.service" >/dev/null
+systemctl restart "${SERVICE}.service" >/dev/null
+
+log "6) Vérif écoute :$API_PORT"
+sleep 1
+ss -lntp | grep ":${API_PORT}" || true
+
+log "7) Nginx proxy API (sans changer l'UI) + logs dédiés"
+[ -f "$NGINX_SITE" ] || die "nginx site introuvable: $NGINX_SITE"
+chattr -i /etc/nginx/nginx.conf "$NGINX_SITE" 2>/dev/null || true
+
+if ! grep -qE "location\s+\^~\s+${API_BASE}/" "$NGINX_SITE"; then
+  cp -a "$NGINX_SITE" "${NGINX_SITE}.bak.$(date +%s)"
+  PATCH=$(cat <<'NGX'
+  # --- WOLVERINE TraderOne API (auto) ---
+  location ^~ /wolverine/traderone/api/ {
+    access_log /var/log/nginx/wolverine_api_access.log;
+    proxy_pass http://127.0.0.1:3000;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+  }
+  # --- /WOLVERINE TraderOne API ---
+NGX
+)
+  if tail -n 1 "$NGINX_SITE" | grep -q "}$"; then
+    tmp="$(mktemp)"; head -n -1 "$NGINX_SITE" >"$tmp"; printf "%s\n" "$PATCH" >>"$tmp"; echo "}" >>"$tmp"; mv "$tmp" "$NGINX_SITE"
+  else
+    printf "\n%s\n" "$PATCH" >>"$NGINX_SITE"
+  fi
+fi
+
+nginx -t >/dev/null
+systemctl reload nginx
+chattr +i /etc/nginx/nginx.conf "$NGINX_SITE" 2>/dev/null || true
+
+log "8) Tests publics (doivent être 200)"
+BASE="https://fireinners.online${API_BASE}"
+curl -sS "${BASE}/health" | head -c 220; echo
+for p in version dashboard trade positions orders history wallet settings; do
+  printf "%s: " "$p"
+  curl -sS -o /dev/null -w "%{http_code}\n" "${BASE}/${p}" || true
+done
+printf "invested?pub=TEST: "
+curl -sS -o /dev/null -w "%{http_code}\n" "${BASE}/invested?pub=TEST" || true
+
+log "9) Commandes utiles"
+echo "systemctl status ${SERVICE}.service --no-pager"
+echo "journalctl -u ${SERVICE}.service -n 80 --no-pager"
+echo "tail -n 80 /var/log/nginx/wolverine_api_access.log"
+BASH
+chmod +x /root/MEGA_TRADERONE_ROOT.sh
+bash /root/MEGA_TRADERONE_ROOT.sh
