@@ -1,2 +1,99 @@
-nginx -T 2>/dev/null | grep -nE "listen 443|server_name (fireinners\.online|www\.fireinners\.online)" | head -n 200
-ls -lah /etc/nginx/sites-enabled
+cat >/root/fix_wolverine_page.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+CFG="/etc/nginx/sites-enabled/fireinners.online-ssl"
+TS="$(date -u +%Y%m%d_%H%M%S)"
+
+echo "=== 1) Quick checks (origin) ==="
+curl -skI --resolve fireinners.online:443:127.0.0.1 https://fireinners.online/wolverine/ | head -n 12 || true
+curl -skI --resolve fireinners.online:443:127.0.0.1 https://fireinners.online/wolverine/traderone/api/ | head -n 12 || true
+echo
+
+echo "=== 2) Show all wolverine locations + where the include is ==="
+echo "--- locations containing 'wolverine' ---"
+grep -nE 'location|wolverine' "$CFG" | sed -n '1,220p' || true
+echo
+echo "--- include lines (if any) ---"
+grep -n "traderone_api_lockdown.conf" "$CFG" || true
+echo
+
+echo "=== 3) If include appears inside the WRONG block, remove it from /wolverine/ and keep it only in /wolverine/traderone/api ==="
+cp -a "$CFG" "${CFG}.bak_fix_wolverine_${TS}"
+
+python3 - <<'PY'
+from pathlib import Path
+import re
+
+cfg = Path("/etc/nginx/sites-enabled/fireinners.online-ssl")
+s = cfg.read_text(errors="ignore")
+
+inc = "include /etc/nginx/snippets/traderone_api_lockdown.conf;"
+
+def find_block(text, pattern):
+    m = re.search(pattern, text)
+    if not m: return None
+    start = m.start()
+    brace = text.find("{", start)
+    if brace == -1: return None
+    i = brace
+    depth = 0
+    end = None
+    while i < len(text):
+        if text[i] == "{": depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                end = i
+                break
+        i += 1
+    if end is None: return None
+    return (start, end+1)
+
+# blocks
+api_pat = r'location\s+(\^~\s+)?=?\s*/wolverine/traderone/api/?\s*\{'
+wol_pat = r'location\s+(\^~\s+)?=?\s*/wolverine/?\s*\{'
+
+api = find_block(s, api_pat)
+wol = find_block(s, wol_pat)
+
+if not api:
+    print("WARN: no /wolverine/traderone/api location found (manual check needed)")
+else:
+    a0,a1 = api
+    api_block = s[a0:a1]
+    if inc not in api_block:
+        # inject include right after first {
+        api_block2 = re.sub(r'\{\s*', '{\n    ' + inc + '\n', api_block, count=1)
+        s = s[:a0] + api_block2 + s[a1:]
+        print("OK: injected include into /wolverine/traderone/api location")
+    else:
+        print("OK: include already in /wolverine/traderone/api location")
+
+# Remove include from /wolverine/ block if present
+wol = find_block(s, wol_pat)
+if wol:
+    w0,w1 = wol
+    wol_block = s[w0:w1]
+    if inc in wol_block:
+        wol_block2 = wol_block.replace(inc, "")
+        s = s[:w0] + wol_block2 + s[w1:]
+        print("OK: removed include from /wolverine location (to restore page)")
+    else:
+        print("OK: no include inside /wolverine location")
+
+cfg.write_text(s)
+PY
+
+echo "=== 4) Test + reload nginx ==="
+nginx -t
+systemctl reload nginx || service nginx reload
+echo
+
+echo "=== 5) Re-check (origin) ==="
+curl -skI --resolve fireinners.online:443:127.0.0.1 https://fireinners.online/wolverine/ | head -n 12 || true
+curl -skI --resolve fireinners.online:443:127.0.0.1 https://fireinners.online/wolverine/traderone/api/ | head -n 12 || true
+echo "DONE ✅"
+BASH
+
+chmod +x /root/fix_wolverine_page.sh
+/root/fix_wolverine_page.sh
