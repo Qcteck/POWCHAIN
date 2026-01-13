@@ -1,43 +1,55 @@
-cat >/root/cleanup_sites_enabled_fireinners.sh <<'BASH'
+cat >/root/fix_duplicate_traderone_location.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
+VHOST="/etc/nginx/sites-enabled/fireinners.online-ssl"
+SNIP="/etc/nginx/snippets/wolverine_routes.conf"
 TS="$(date +%Y%m%d_%H%M%S)"
-DST="/etc/nginx/sites-disabled/cleanup_${TS}"
-mkdir -p "$DST"
 
-echo "== BEFORE =="
-ls -lah /etc/nginx/sites-enabled
-
+echo "== 1) Show where traderone locations are defined =="
+grep -RIn --binary-files=without-match \
+  -E '^\s*location\b.*(/wolverine/traderone/api)' \
+  /etc/nginx/sites-enabled /etc/nginx/snippets /etc/nginx/conf.d /etc/nginx/nginx.conf 2>/dev/null \
+  | grep -vE '\.bak|\.broken|sites-disabled' || true
 echo
-echo "== Move ALL variants of fireinners.online-ssl.* out of sites-enabled (keep only exact fireinners.online-ssl) =="
-shopt -s nullglob
-for f in /etc/nginx/sites-enabled/fireinners.online-ssl.*; do
-  echo "MOVE: $f -> $DST/"
-  mv -v "$f" "$DST/"
-done
 
-echo
-echo "== Also move any generic *.bak* / *.broken* just in case =="
-for f in /etc/nginx/sites-enabled/*.bak* /etc/nginx/sites-enabled/*.broken*; do
-  [ -e "$f" ] || continue
-  echo "MOVE: $f -> $DST/"
-  mv -v "$f" "$DST/"
-done
+echo "== 2) Backup vhost =="
+cp -a "$VHOST" "$VHOST.bak_traderonefix_$TS"
 
-echo
-echo "== AFTER =="
-ls -lah /etc/nginx/sites-enabled
+echo "== 3) Disable traderone locations in vhost (keep them in snippet) =="
+python3 - <<'PY'
+import re
+VHOST="/etc/nginx/sites-enabled/fireinners.online-ssl"
+lines=open(VHOST,"r",errors="ignore").read().splitlines(True)
 
-echo
-echo "== nginx -t =="
+# comment any traderone location blocks in THIS file
+out=[]
+in_loc=False
+d=0
+for l in lines:
+    if not in_loc and re.search(r'^\s*location\b.*?/wolverine/traderone/api', l):
+        out.append("# DISABLED_DUP_TRADERONE " + l)
+        in_loc=True
+        d = l.count("{") - l.count("}")
+        continue
+    if in_loc:
+        out.append("# DISABLED_DUP_TRADERONE " + l)
+        d += l.count("{") - l.count("}")
+        if d <= 0 and "}" in l:
+            in_loc=False
+        continue
+    out.append(l)
+
+open(VHOST,"w").writelines(out)
+PY
+
+echo "== 4) nginx -t && reload =="
 nginx -t
-
-echo
-echo "== reload =="
 systemctl reload nginx || service nginx reload
 
+echo "== 5) tests =="
+curl -sk -o /dev/null -w "Traderone health : %{http_code}\n" https://fireinners.online/wolverine/traderone/api/health
 echo "DONE ✅"
 BASH
 
-chmod +x /root/cleanup_sites_enabled_fireinners.sh
-/root/cleanup_sites_enabled_fireinners.sh
+chmod +x /root/fix_duplicate_traderone_location.sh
+/root/fix_duplicate_traderone_location.sh
