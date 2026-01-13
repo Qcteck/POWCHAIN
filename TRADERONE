@@ -1,35 +1,69 @@
-cat >/root/cleanup_fireinners_enabled_variants_now.sh <<'BASH'
+cat >/root/fix_wolverine_inc_loaded_twice_by_moving_out_of_snippets.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
-EN="/etc/nginx/sites-enabled"
-DST="/etc/nginx/sites-disabled/cleanup_$(date +%Y%m%d_%H%M%S)"
-mkdir -p "$DST"
+TS="$(date +%Y%m%d_%H%M%S)"
 
-echo "== BEFORE =="
-ls -lah "$EN"
+VHOST="/etc/nginx/sites-enabled/fireinners.online-ssl"
+SRC="/etc/nginx/snippets/wolverine_routes.inc"
+DST_DIR="/etc/nginx/includes"
+DST="${DST_DIR}/wolverine_routes.inc"
 
+echo "== 1) Grep includes that may double-load snippets =="
+grep -RIn --binary-files=without-match \
+  -E 'include\s+/etc/nginx/snippets/\*|include\s+/etc/nginx/snippets/.*\*' \
+  /etc/nginx/nginx.conf /etc/nginx/conf.d /etc/nginx/sites-enabled 2>/dev/null || true
 echo
-echo "== Move ALL fireinners.online-ssl.* out of sites-enabled =="
-shopt -s nullglob
-for f in "$EN"/fireinners.online-ssl.*; do
-  echo "MOVE: $f -> $DST/"
-  mv -v "$f" "$DST/"
-done
-
+echo "== 2) Grep where wolverine_routes.inc is included =="
+grep -RIn --binary-files=without-match \
+  -E 'include\s+.*wolverine_routes\.inc' \
+  /etc/nginx/nginx.conf /etc/nginx/conf.d /etc/nginx/sites-enabled 2>/dev/null || true
 echo
-echo "== AFTER (should show only fireinners.online-ssl) =="
-ls -lah "$EN"
 
-echo
-echo "== nginx -t =="
+echo "== 3) Backup vhost =="
+cp -a "$VHOST" "$VHOST.bak_$TS"
+
+echo "== 4) Move inc out of /etc/nginx/snippets (avoid wildcard includes) =="
+mkdir -p "$DST_DIR"
+if [ -f "$SRC" ]; then
+  cp -a "$SRC" "$DST"
+  mv -v "$SRC" "${SRC}.moved_${TS}"
+else
+  echo "WARN: $SRC not found; creating $DST clean"
+  cat > "$DST" <<'NGX'
+# Wolverine routes (clean)
+
+location = /wolverine/traderone/api {
+  return 301 /wolverine/traderone/api/;
+}
+
+location ^~ /wolverine/traderone/api/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+
+  rewrite ^/wolverine/traderone/api/(.*)$ /api/$1 break;
+  proxy_pass http://127.0.0.1:8585;
+}
+NGX
+fi
+
+echo "== 5) Replace any include of the old snippets path -> new includes path =="
+# Replace exact old path
+sed -i -E "s@include[[:space:]]+/etc/nginx/snippets/wolverine_routes\.inc;@include ${DST};@g" "$VHOST"
+# If still missing, append inside vhost (best effort)
+if ! grep -q "include ${DST}" "$VHOST"; then
+  echo "" >> "$VHOST"
+  echo "  include ${DST};" >> "$VHOST"
+fi
+
+echo "== 6) nginx -t && reload =="
 nginx -t
-
-echo
-echo "== reload =="
 systemctl reload nginx || service nginx reload
 
 echo "DONE ✅"
 BASH
 
-chmod +x /root/cleanup_fireinners_enabled_variants_now.sh
-/root/cleanup_fireinners_enabled_variants_now.sh
+chmod +x /root/fix_wolverine_inc_loaded_twice_by_moving_out_of_snippets.sh
+/root/fix_wolverine_inc_loaded_twice_by_moving_out_of_snippets.sh
