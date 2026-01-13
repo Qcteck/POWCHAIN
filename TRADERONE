@@ -1,50 +1,99 @@
-cat >/root/fix_snippet_loaded_twice.sh <<'BASH'
+cat >/root/fix_inc_in_wrong_context.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 HOST="fireinners.online"
 VHOST="/etc/nginx/sites-enabled/${HOST}-ssl"
-
-SNIP_DIR="/etc/nginx/snippets"
-SNIP_CONF="${SNIP_DIR}/wolverine_routes.conf"
-SNIP_INC="${SNIP_DIR}/wolverine_routes.inc"
-
+INC="/etc/nginx/snippets/wolverine_routes.inc"
 TS="$(date +%Y%m%d_%H%M%S)"
 
-echo "== 1) Backup =="
-cp -a "$VHOST" "$VHOST.bak_$TS"
-[ -f "$SNIP_CONF" ] && cp -a "$SNIP_CONF" "$SNIP_CONF.bak_$TS" || true
-[ -f "$SNIP_INC" ] && cp -a "$SNIP_INC" "$SNIP_INC.bak_$TS" || true
+test -f "$VHOST" || { echo "Missing $VHOST"; exit 1; }
+test -f "$INC"   || { echo "Missing $INC"; exit 1; }
 
-echo "== 2) Rename snippet .conf -> .inc (so it won't be included by snippets/*.conf) =="
-if [ -f "$SNIP_CONF" ]; then
-  mv -v "$SNIP_CONF" "$SNIP_INC"
-fi
-
-echo "== 3) Update vhost include to point to .inc (and remove any .conf include) =="
-# comment any include wolverine_routes.conf
-sed -i -E 's@^([[:space:]]*)include([[:space:]]+.*wolverine_routes\.conf.*);@\1# DISABLED_OLD include\2;@' "$VHOST"
-
-# ensure include .inc exists inside vhost (append if missing)
-if ! grep -q "wolverine_routes\.inc" "$VHOST"; then
-  echo "" >> "$VHOST"
-  echo "  include ${SNIP_INC};" >> "$VHOST"
-fi
-
-echo "== 4) Show any wildcard includes that might have caused the double-load =="
+echo "== 1) Find EVERY include of wolverine_routes.inc =="
 grep -RIn --binary-files=without-match \
-  -E 'include\s+/etc/nginx/snippets/\*|include\s+/etc/nginx/snippets/\*\.conf' \
-  /etc/nginx/nginx.conf /etc/nginx/conf.d /etc/nginx/sites-enabled 2>/dev/null || true
+  -E "include\s+.*wolverine_routes\.inc" \
+  /etc/nginx/nginx.conf /etc/nginx/conf.d /etc/nginx/sites-enabled 2>/dev/null \
+| grep -vE '\.bak|\.broken|sites-disabled' || true
+echo
+
+echo "== 2) Backup =="
+cp -a "$VHOST" "$VHOST.bak_$TS"
+
+echo "== 3) Disable includes of wolverine_routes.inc OUTSIDE the vhost =="
+while IFS= read -r hit; do
+  FILE="${hit%%:*}"
+  [ "$FILE" = "$VHOST" ] && continue
+  [ -f "$FILE" ] || continue
+  cp -a "$FILE" "$FILE.bak_$TS"
+  sed -i -E 's@^([[:space:]]*)include([[:space:]]+.*wolverine_routes\.inc.*);@\1# DISABLED_WRONG_CONTEXT include\2;@' "$FILE"
+  echo "disabled include in $FILE"
+done < <(
+  grep -RIn --binary-files=without-match \
+    -E "include\s+.*wolverine_routes\.inc" \
+    /etc/nginx/nginx.conf /etc/nginx/conf.d /etc/nginx/sites-enabled 2>/dev/null \
+  | grep -vE '\.bak|\.broken|sites-disabled' || true
+)
+
+echo
+echo "== 4) Ensure include is INSIDE the first server{} in the vhost (and comment any include outside) =="
+python3 - <<PY
+import re
+VHOST="${VHOST}"
+INC="${INC}"
+
+lines=open(VHOST,"r",errors="ignore").read().splitlines(True)
+
+# find first server block
+start=None
+for i,l in enumerate(lines):
+    if re.search(r'^\s*server\s*\{', l):
+        start=i; break
+if start is None:
+    raise SystemExit("No server { found in vhost")
+
+depth=0
+end=None
+for i in range(start, len(lines)):
+    depth += lines[i].count("{")
+    depth -= lines[i].count("}")
+    if depth==0 and i>start:
+        end=i
+        break
+if end is None:
+    raise SystemExit("Could not find end of first server block (brace mismatch)")
+
+before = lines[:start]
+server = lines[start:end+1]
+after  = lines[end+1:]
+
+# comment include lines outside server
+def comment_inc(block):
+    out=[]
+    for l in block:
+        if INC in l and re.search(r'^\s*include\b', l):
+            out.append("# DISABLED_OUTSIDE_SERVER " + l)
+        else:
+            out.append(l)
+    return out
+
+before = comment_inc(before)
+after  = comment_inc(after)
+
+# remove include duplicates inside server, then re-add exactly once
+server = [l for l in server if not (INC in l and re.search(r'^\s*include\b', l))]
+inc_line = f"  include {INC};\n"
+server.insert(len(server)-1, inc_line)
+
+open(VHOST,"w").writelines(before + server + after)
+PY
 
 echo
 echo "== 5) nginx -t && reload =="
 nginx -t
 systemctl reload nginx || service nginx reload
 
-echo "== 6) verify locations loaded (optional) =="
-nginx -T 2>/dev/null | grep -n "location .*wolverine/traderone/api" || true
-
 echo "DONE ✅"
 BASH
 
-chmod +x /root/fix_snippet_loaded_twice.sh
-/root/fix_snippet_loaded_twice.sh
+chmod +x /root/fix_inc_in_wrong_context.sh
+/root/fix_inc_in_wrong_context.sh
