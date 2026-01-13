@@ -1,9 +1,116 @@
-# 1) retrouve quel index.html a été patché (si tu ne sais plus)
-find /var/www/wolverine /var/www /usr/share/nginx/html -maxdepth 4 -type f -name index.html 2>/dev/null | head -n 5
+cat >/root/wolverine_fix_404_429.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
 
-# 2) check que le bouton + le script sont bien dedans
-grep -RIn 'id="sendSolBtn"|WOLVERINE_SEND_SOL_SCRIPT|WOLVERINE_WALLET' \
-  /var/www/wolverine /var/www /usr/share/nginx/html 2>/dev/null | head -n 40
+SNIP1="/etc/nginx/includes/wolverine_routes.inc"
+SNIP2="/etc/nginx/snippets/wolverine_routes.inc"
+VHOST="/etc/nginx/sites-enabled/fireinners.online-ssl"
+TS="$(date +%Y%m%d_%H%M%S)"
 
-# 3) vérif que le site sert bien le bon fichier
-curl -sk https://fireinners.online/wolverine/ | grep -n 'sendSolBtn\|WOLVERINE_SEND_SOL_SCRIPT' || echo "Pas trouvé dans le HTML servi"
+echo "== A) Show nginx routes file in use =="
+for f in "$SNIP1" "$SNIP2"; do
+  if [ -f "$f" ]; then
+    echo "--- $f ---"
+    nl -ba "$f" | sed -n '1,120p'
+  fi
+done
+echo
+
+echo "== B) Check traderone is listening (8585) =="
+ss -lntp | grep ':8585' || echo "WARN: nothing on 8585"
+echo
+
+echo "== C) Direct local tests (find correct base path) =="
+set +e
+for p in /health /api/health /me /api/me /orders /api/orders /positions /api/positions /pnl /api/pnl ; do
+  code=$(curl -sS -o /dev/null -w "%{http_code}" "http://127.0.0.1:8585$p")
+  echo "localhost:8585$p => $code"
+done
+set -e
+echo
+
+echo "== D) Public path tests =="
+set +e
+for p in /wolverine/traderone/api/health /wolverine/traderone/api/me /wolverine/traderone/api/orders ; do
+  code=$(curl -sk -o /dev/null -w "%{http_code}" "https://fireinners.online$p")
+  echo "https://fireinners.online$p => $code"
+done
+set -e
+echo
+
+echo "== E) Auto-fix traderone rewrite based on what works locally =="
+ROUTES=""
+if curl -sS -o /dev/null -w "%{http_code}" http://127.0.0.1:8585/health | grep -q '^200$'; then
+  ROUTES="root"   # backend endpoints are /health /me /orders ...
+elif curl -sS -o /dev/null -w "%{http_code}" http://127.0.0.1:8585/api/health | grep -q '^200$'; then
+  ROUTES="api"    # backend endpoints are /api/health /api/me ...
+else
+  echo "❌ Can't detect backend base path. Check traderone service / routes."
+  exit 1
+fi
+
+echo "Detected backend base: $ROUTES"
+USE_SNIP=""
+if [ -f "$SNIP1" ]; then USE_SNIP="$SNIP1"; elif [ -f "$SNIP2" ]; then USE_SNIP="$SNIP2"; fi
+if [ -z "$USE_SNIP" ]; then echo "❌ No wolverine_routes.inc found"; exit 1; fi
+
+cp -a "$USE_SNIP" "$USE_SNIP.bak_$TS"
+
+if [ "$ROUTES" = "root" ]; then
+  cat > "$USE_SNIP" <<'NGX'
+# Wolverine routes (clean) - traderone backend expects /health, /me, /orders, ...
+
+location = /wolverine/traderone/api {
+  return 301 /wolverine/traderone/api/;
+}
+
+location ^~ /wolverine/traderone/api/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+
+  rewrite ^/wolverine/traderone/api/(.*)$ /$1 break;
+  proxy_pass http://127.0.0.1:8585;
+}
+NGX
+else
+  cat > "$USE_SNIP" <<'NGX'
+# Wolverine routes (clean) - traderone backend expects /api/health, /api/me, ...
+
+location = /wolverine/traderone/api {
+  return 301 /wolverine/traderone/api/;
+}
+
+location ^~ /wolverine/traderone/api/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+
+  rewrite ^/wolverine/traderone/api/(.*)$ /api/$1 break;
+  proxy_pass http://127.0.0.1:8585;
+}
+NGX
+fi
+
+echo "== F) nginx -t && reload =="
+nginx -t
+systemctl reload nginx || service nginx reload
+
+echo "== G) Re-test public endpoints after reload =="
+for p in /wolverine/traderone/api/health /wolverine/traderone/api/me /wolverine/traderone/api/orders ; do
+  code=$(curl -sk -o /dev/null -w "%{http_code}" "https://fireinners.online$p")
+  echo "https://fireinners.online$p => $code"
+done
+
+echo
+echo "== H) RPC 429 quick note =="
+echo "If /wolverine/rpc returns 429, you need a better RPC endpoint (paid) or add caching/throttling. We'll fix next after traderone 404 is solved."
+echo "DONE ✅"
+BASH
+
+chmod +x /root/wolverine_fix_404_429.sh
+/root/wolverine_fix_404_429.sh
