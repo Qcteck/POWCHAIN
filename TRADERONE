@@ -1,38 +1,48 @@
-cat >/root/debug_wolverine_served_vs_file.sh <<'BASH'
+cat >/root/wolverine_no_cache_ui.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-FILE="/var/www/wolverine/index.html"
+VHOST="/etc/nginx/sites-enabled/fireinners.online-ssl"
+TS="$(date +%Y%m%d_%H%M%S)"
 
-echo "== FILE hash =="
-sha256sum "$FILE" || exit 1
+test -f "$VHOST" || { echo "❌ Missing $VHOST"; exit 1; }
+
+cp -a "$VHOST" "$VHOST.bak_$TS"
+
+# Ajoute des règles no-cache (si pas déjà présentes)
+if ! grep -q 'WOLVERINE_NOCACHE_BEGIN' "$VHOST"; then
+  cat >> "$VHOST" <<'NGX'
+
+  # WOLVERINE_NOCACHE_BEGIN
+  # Empêche HTML SPA d'être caché (Cloudflare / navigateurs)
+  location = /wolverine/ {
+    add_header Cache-Control "no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0" always;
+    add_header Pragma "no-cache" always;
+    add_header Expires "0" always;
+    return 301 /wolverine/index.html;
+  }
+
+  location = /wolverine/index.html {
+    add_header Cache-Control "no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0" always;
+    add_header Pragma "no-cache" always;
+    add_header Expires "0" always;
+    try_files /wolverine/index.html =404;
+  }
+  # WOLVERINE_NOCACHE_END
+NGX
+fi
+
+nginx -t
+systemctl reload nginx || service nginx reload
+
 echo
-
-echo "== ORIGIN headers (force identity) =="
-curl -skI --resolve fireinners.online:443:127.0.0.1 -H 'Accept-Encoding: identity' https://fireinners.online/wolverine/ | sed -n '1,25p'
+echo "== ORIGIN check (bypass CF) =="
+curl -sk --resolve fireinners.online:443:127.0.0.1 -I https://fireinners.online/wolverine/index.html | sed -n '1,25p'
 echo
-
-echo "== ORIGIN body (first lines) =="
-curl -sk --resolve fireinners.online:443:127.0.0.1 -H 'Accept-Encoding: identity' https://fireinners.online/wolverine/ | head -n 40
-echo
-
-echo "== ORIGIN grep markers =="
-curl -sk --resolve fireinners.online:443:127.0.0.1 -H 'Accept-Encoding: identity' https://fireinners.online/wolverine/ \
- | grep -nE 'sendSolBtn|WOLVERINE_SEND_SOL_SCRIPT' || echo "NOT FOUND in served HTML"
-echo
-
-echo "== ORIGIN hash =="
-curl -sk --resolve fireinners.online:443:127.0.0.1 -H 'Accept-Encoding: identity' https://fireinners.online/wolverine/ | sha256sum
-echo
-
-echo "== If hashes differ, show nginx wolverine block =="
-nginx -T 2>/dev/null | awk '
-  /location[[:space:]]+(\^~[[:space:]]+)?\/wolverine\/|location[[:space:]]+=?[[:space:]]\/wolverine/ {p=1}
-  p{print}
-  p && /\}/{c++}
-  p && c>=2{exit}
-' || true
+echo "== PUBLIC check (cache-bust) =="
+curl -sk "https://fireinners.online/wolverine/index.html?v=$(date +%s)" | grep -nE 'sendSolBtn|WOLVERINE_SEND_SOL_SCRIPT' \
+  && echo "PUBLIC OK ✅" || echo "PUBLIC STILL OLD ❌"
 BASH
 
-chmod +x /root/debug_wolverine_served_vs_file.sh
-/root/debug_wolverine_served_vs_file.sh
+chmod +x /root/wolverine_no_cache_ui.sh
+/root/wolverine_no_cache_ui.sh
