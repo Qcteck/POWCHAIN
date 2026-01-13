@@ -1,54 +1,51 @@
-cat >/root/debug_origin_rpc_403_full.sh <<'BASH'
+cat >/root/unlock_wolverine_rpc_public.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-HOST="fireinners.online"
-PATH_="/wolverine/rpc"
-PAY='{"jsonrpc":"2.0","id":1,"method":"getVersion"}'
-
-echo "== 1) Find nginx location for /wolverine/rpc (with context) =="
-nginx -T 2>/tmp/nginxT.txt >/dev/null || true
-# show lines around any /wolverine/rpc
-awk '
-  /location/ {loc_line=NR}
-  /wolverine\/rpc/ {hit=NR}
-  {lines[NR]=$0}
-  END{
-    for(i=1;i<=NR;i++){
-      if(lines[i] ~ /wolverine\/rpc/){
-        s=i-25; if(s<1)s=1; e=i+60; if(e>NR)e=NR;
-        print "\n---- CONTEXT " s "-" e " ----";
-        for(j=s;j<=e;j++) print j ":" lines[j];
-      }
-    }
-  }' /tmp/nginxT.txt | head -n 260
+echo "== 1) Find where the 403 JSON is defined (Access forbidden) =="
+HITS="$(grep -RIn --binary-files=without-match -E 'Access forbidden|wolverine/rpc' /etc/nginx 2>/dev/null || true)"
+echo "$HITS" | head -n 200
 
 echo
-echo "== 2) Direct ORIGIN test (HTTPS localhost + Host header) =="
-curl -sk "https://127.0.0.1${PATH_}" -D- \
-  -H "Host: ${HOST}" \
-  -H 'content-type: application/json' \
-  --data "$PAY" | head -n 80
+echo "== 2) Locate exact file(s) containing 'Access forbidden' =="
+FILES="$(echo "$HITS" | awk -F: '/Access forbidden/ {print $1}' | sort -u)"
+[ -n "$FILES" ] || { echo "No 'Access forbidden' string found in /etc/nginx. Paste your /wolverine/rpc location block."; exit 1; }
+echo "$FILES"
 
 echo
-echo "== 3) Same but WITHOUT Origin/Referer (in case upstream blocks those) =="
-curl -sk "https://127.0.0.1${PATH_}" -D- \
-  -H "Host: ${HOST}" \
-  -H 'content-type: application/json' \
-  --data "$PAY" | head -n 80
+echo "== 3) Backup and patch (remove localhost-only remote_addr check if present) =="
+TS="$(date +%Y%m%d_%H%M%S)"
+for f in $FILES; do
+  echo "--- patching: $f ---"
+  cp -a "$f" "$f.bak_$TS"
 
-echo
-echo "== 4) Tail nginx logs for /wolverine/rpc (last 50 lines) =="
-# best-effort paths
-for f in /var/log/nginx/access.log /var/log/nginx/error.log /var/log/nginx/*access*.log /var/log/nginx/*error*.log; do
-  [ -f "$f" ] || continue
-  echo "--- $f ---"
-  tail -n 200 "$f" | grep -E "wolverine/rpc|403" | tail -n 50 || true
+  # Comment the common blocker: remote_addr != 127.0.0.1 returning 403 JSON
+  # (handles variants with spaces and braces on same line)
+  sed -i -E \
+    's@^[[:space:]]*(if[[:space:]]*\([[:space:]]*\$remote_addr[[:space:]]*!=[[:space:]]*127\.0\.0\.1[[:space:]]*\)[[:space:]]*\{[[:space:]]*return[[:space:]]*403[[:space:]]*.*Access forbidden.*\}[[:space:]]*)@# DISABLED: \1@g' \
+    "$f" || true
+
+  # Also comment "allow 127.0.0.1; deny all;" if it exists in that file
+  sed -i -E 's@^[[:space:]]*allow[[:space:]]+127\.0\.0\.1;@# DISABLED: allow 127.0.0.1;@g' "$f" || true
+  sed -i -E 's@^[[:space:]]*deny[[:space:]]+all;@# DISABLED: deny all;@g' "$f" || true
 done
 
 echo
+echo "== 4) nginx config test =="
+nginx -t
+
+echo
+echo "== 5) reload nginx =="
+systemctl reload nginx || service nginx reload
+
+echo
+echo "== 6) Retest public endpoint (should be 200 now) =="
+curl -sk -D- https://fireinners.online/wolverine/rpc \
+  -H 'content-type: application/json' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"getVersion"}' | head -n 40
+
 echo "DONE ✅"
 BASH
 
-chmod +x /root/debug_origin_rpc_403_full.sh
-/root/debug_origin_rpc_403_full.sh
+chmod +x /root/unlock_wolverine_rpc_public.sh
+/root/unlock_wolverine_rpc_public.sh
