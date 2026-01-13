@@ -1,388 +1,63 @@
-<!DOCTYPE html>
-<html lang="fr">
-<head>
-<meta charset="UTF-8">
-<title>CryptoNews POD OF WHEELS – Telegram WebView</title>
-<style>
-body{margin:0;background:#020617;color:#e5e7eb;font-family:Arial,Helvetica,sans-serif;}
-#top{padding:10px;background:#020617;display:flex;justify-content:space-between;align-items:center;}
-#log{height:300px;overflow:auto;border-top:1px solid #334155;padding:10px;font-size:14px;}
-button{background:#1e293b;color:#e5e7eb;border:1px solid #334155;padding:6px 12px;cursor:pointer;margin-left:5px;}
-#aiArticle{border:1px solid #334155;padding:10px;margin:10px 0;background:#1e293b;white-space:pre-wrap;}
-</style>
-</head>
-<body>
+cat >/root/fix_wolverine_js_and_rpc_405.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+TS="$(date +%Y%m%d_%H%M%S)"
 
-<div id="top">
-  <div>📡 CryptoNews POD OF WHEELS — RADIO AUTONOME</div>
-  <div>
-    <button onclick="toggleLang()">FR / EN</button>
-    <button onclick="generateAIArticle()">🧠 Analyse IA Marchés</button>
-    <button onclick="copyAIArticle()">📋 Copier</button>
-  </div>
-</div>
+HTML="/var/www/wolverine/index.html"
+INC="/etc/nginx/includes/wolverine_routes.inc"
 
-<div id="log"></div>
-<div id="aiArticle"></div>
+echo "== 1) Fix JS 'or' syntax in index.html =="
+test -f "$HTML" || { echo "Missing $HTML"; exit 1; }
+cp -a "$HTML" "${HTML}.bak_${TS}"
 
-<audio id="jingle" preload="auto" src="https://cdn.pixabay.com/audio/2022/03/15/audio_9b0d33a9f0.mp3"></audio>
-<audio id="bed" preload="auto" loop src="https://cdn.pixabay.com/audio/2022/10/03/audio_946bfa4c59.mp3"></audio>
+python3 - <<'PY'
+from pathlib import Path
+p=Path("/var/www/wolverine/index.html")
+s=p.read_text(errors="ignore")
 
-<script>
-/* ================== CONFIG ================== */
-const SHOW_DURATION = 26 * 60 * 1000;
-const PAUSE_DURATION = 4 * 60 * 1000;
-let LANG = "fr";
+# remplace l'expression python injectée par du JS valide
+s = s.replace('getattr(e,"message",None) or str(e)', '(e && e.message) ? e.message : String(e)')
+s = s.replace("getattr(e,'message',None) or str(e)", "(e && e.message) ? e.message : String(e)")
 
-/* ================== LOG ================== */
-const logDiv = document.getElementById("log");
-function log(t){logDiv.innerHTML+=t+"<br>";logDiv.scrollTop=logDiv.scrollHeight;}
+p.write_text(s)
+print("OK: index.html patched")
+PY
 
-/* ================== LANG ================== */
-function toggleLang(){ LANG = LANG==="fr"?"en":"fr"; log("🌐 Langue : "+LANG); }
+echo "== 2) Ensure /wolverine/rpc is a real JSON-RPC proxy (fix 405/HTML) =="
+test -f "$INC" || { echo "Missing $INC"; exit 1; }
+cp -a "$INC" "${INC}.bak_${TS}"
 
-/* ================== VOICES ================== */
-const VOICES = {
-  HOST:{pitch:1.1,rate:1.02},
-  ANALYST:{pitch:0.95,rate:1},
-  CORTEX:{pitch:1.2,rate:1.05}
-};
-function speak(agent,text){
-  const u=new SpeechSynthesisUtterance(text);
-  u.lang = LANG==="fr"?"fr-FR":"en-US";
-  u.pitch = agent.pitch;
-  u.rate = agent.rate;
-  speechSynthesis.speak(u);
-  log("🎙️ "+text);
+# ajoute le bloc rpc si absent
+if ! grep -q 'WOLVERINE_RPC_PROXY' "$INC"; then
+cat >> "$INC" <<'NGX'
+
+# WOLVERINE_RPC_PROXY
+# Proxy JSON-RPC Solana (same-origin) for the UI
+location = /wolverine/rpc {
+  proxy_http_version 1.1;
+  proxy_ssl_server_name on;
+
+  proxy_set_header Host api.mainnet-beta.solana.com;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+
+  proxy_pass https://api.mainnet-beta.solana.com/;
 }
+NGX
+fi
 
-/* ================== TEXT POOLS ================== */
-const INTRO_FR=[
-  "Bonjour et bienvenue, installez-vous, on fait le point ensemble.",
-  "Ravi de vous retrouver, voyons ce qui bouge sur le marché.",
-  "Nouvelle édition, regardons ensemble l’actualité crypto."
-];
-const USER_TALK_FR=[
-  "Si vous suivez le marché, cette information mérite un regard attentif.",
-  "De votre côté, vous avez peut-être déjà remarqué ce mouvement.",
-  "Prenons un instant pour comprendre ce que cela implique pour vous."
-];
-function pick(arr){return arr[Math.floor(Math.random()*arr.length)];}
+echo "== 3) nginx -t && reload =="
+nginx -t
+systemctl reload nginx || service nginx reload
 
-/* ================== RSS ================== */
-const RSS_SOURCES=[
-  "https://cryptoast.fr/feed",
-  "https://journalducoin.com/feed",
-  "https://bitcoin.fr/feed"
-];
-async function loadRSS(){
-  let stock = JSON.parse(localStorage.getItem("rssStock")||"[]");
-  for(const src of RSS_SOURCES){
-    try{
-      const r=await fetch("https://api.rss2json.com/v1/api.json?rss_url="+encodeURIComponent(src));
-      const j=await r.json();
-      if(j.items){
-        j.items.forEach(it=>{
-          if(!stock.find(s=>s.title===it.title)){
-            stock.push(it);
-          }
-        });
-      }
-    }catch(e){console.warn("RSS fail",src,e);}
-  }
-  if(stock.length>50) stock = stock.slice(-50);
-  localStorage.setItem("rssStock",JSON.stringify(stock));
-  return stock;
-}
+echo "== 4) Test RPC (POST) should return JSON =="
+curl -sk -X POST https://fireinners.online/wolverine/rpc \
+  -H 'Content-Type: application/json' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' | head -c 200
+echo
+echo "DONE ✅"
+BASH
 
-/* ================== RADIO LOOP ================== */
-async function radioLoop(){
-  const jingle = document.getElementById("jingle");
-  const bed = document.getElementById("bed");
-  jingle.play().catch(()=>{});
-  bed.volume = 0.15; bed.play().catch(()=>{});
-
-  speak(VOICES.HOST,pick(INTRO_FR));
-
-  const startTime = Date.now();
-  while(Date.now()-startTime<SHOW_DURATION){
-    let rss = await loadRSS();
-    if(!rss.length){ await new Promise(r=>setTimeout(r,5000)); continue; }
-    const article = rss[Math.floor(Math.random()*rss.length)];
-    speak(VOICES.HOST,pick(USER_TALK_FR));
-    speak(VOICES.HOST,article.title);
-    speak(VOICES.ANALYST,(article.description||"").replace(/<[^>]+>/g,"").slice(0,180));
-    await new Promise(r=>setTimeout(r,12000));
-  }
-
-  speak(VOICES.HOST,"Pause musicale, on se retrouve très bientôt.");
-  await new Promise(r=>setTimeout(r,PAUSE_DURATION));
-  radioLoop();
-}
-
-/* ================== IA ANALYSE MARCHÉ ================== */
-const aiArticleDiv = document.getElementById("aiArticle");
-const TELEGRAM_BOT_TOKEN = "<!DOCTYPE html>
-<html lang="fr">
-<head>
-<meta charset="UTF-8">
-<title>CryptoNews POD OF WHEELS – Telegram WebView</title>
-<style>
-body{margin:0;background:#020617;color:#e5e7eb;font-family:Arial,Helvetica,sans-serif;}
-#top{padding:10px;background:#020617;display:flex;justify-content:space-between;align-items:center;}
-#log{height:300px;overflow:auto;border-top:1px solid #334155;padding:10px;font-size:14px;}
-button{background:#1e293b;color:#e5e7eb;border:1px solid #334155;padding:6px 12px;cursor:pointer;margin-left:5px;}
-#aiArticle{border:1px solid #334155;padding:10px;margin:10px 0;background:#1e293b;white-space:pre-wrap;}
-</style>
-</head>
-<body>
-
-<div id="top">
-  <div>📡 CryptoNews POD OF WHEELS — RADIO AUTONOME</div>
-  <div>
-    <button onclick="toggleLang()">FR / EN</button>
-    <button onclick="generateAIArticle()">🧠 Analyse IA Marchés</button>
-    <button onclick="copyAIArticle()">📋 Copier</button>
-  </div>
-</div>
-
-<div id="log"></div>
-<div id="aiArticle"></div>
-
-<audio id="jingle" preload="auto" src="https://cdn.pixabay.com/audio/2022/03/15/audio_9b0d33a9f0.mp3"></audio>
-<audio id="bed" preload="auto" loop src="https://cdn.pixabay.com/audio/2022/10/03/audio_946bfa4c59.mp3"></audio>
-
-<script>
-/* ================== CONFIG ================== */
-const SHOW_DURATION = 26 * 60 * 1000;
-const PAUSE_DURATION = 4 * 60 * 1000;
-let LANG = "fr";
-
-/* ================== LOG ================== */
-const logDiv = document.getElementById("log");
-function log(t){logDiv.innerHTML+=t+"<br>";logDiv.scrollTop=logDiv.scrollHeight;}
-
-/* ================== LANG ================== */
-function toggleLang(){ LANG = LANG==="fr"?"en":"fr"; log("🌐 Langue : "+LANG); }
-
-/* ================== VOICES ================== */
-const VOICES = {
-  HOST:{pitch:1.1,rate:1.02},
-  ANALYST:{pitch:0.95,rate:1},
-  CORTEX:{pitch:1.2,rate:1.05}
-};
-function speak(agent,text){
-  const u=new SpeechSynthesisUtterance(text);
-  u.lang = LANG==="fr"?"fr-FR":"en-US";
-  u.pitch = agent.pitch;
-  u.rate = agent.rate;
-  speechSynthesis.speak(u);
-  log("🎙️ "+text);
-}
-
-/* ================== TEXT POOLS ================== */
-const INTRO_FR=[
-  "Bonjour et bienvenue, installez-vous, on fait le point ensemble.",
-  "Ravi de vous retrouver, voyons ce qui bouge sur le marché.",
-  "Nouvelle édition, regardons ensemble l’actualité crypto."
-];
-const USER_TALK_FR=[
-  "Si vous suivez le marché, cette information mérite un regard attentif.",
-  "De votre côté, vous avez peut-être déjà remarqué ce mouvement.",
-  "Prenons un instant pour comprendre ce que cela implique pour vous."
-];
-function pick(arr){return arr[Math.floor(Math.random()*arr.length)];}
-
-/* ================== RSS ================== */
-const RSS_SOURCES=[
-  "https://cryptoast.fr/feed",
-  "https://journalducoin.com/feed",
-  "https://bitcoin.fr/feed"
-];
-async function loadRSS(){
-  let stock = JSON.parse(localStorage.getItem("rssStock")||"[]");
-  for(const src of RSS_SOURCES){
-    try{
-      const r=await fetch("https://api.rss2json.com/v1/api.json?rss_url="+encodeURIComponent(src));
-      const j=await r.json();
-      if(j.items){
-        j.items.forEach(it=>{
-          if(!stock.find(s=>s.title===it.title)){
-            stock.push(it);
-          }
-        });
-      }
-    }catch(e){console.warn("RSS fail",src,e);}
-  }
-  if(stock.length>50) stock = stock.slice(-50);
-  localStorage.setItem("rssStock",JSON.stringify(stock));
-  return stock;
-}
-
-/* ================== RADIO LOOP ================== */
-async function radioLoop(){
-  const jingle = document.getElementById("jingle");
-  const bed = document.getElementById("bed");
-  jingle.play().catch(()=>{});
-  bed.volume = 0.15; bed.play().catch(()=>{});
-
-  speak(VOICES.HOST,pick(INTRO_FR));
-
-  const startTime = Date.now();
-  while(Date.now()-startTime<SHOW_DURATION){
-    let rss = await loadRSS();
-    if(!rss.length){ await new Promise(r=>setTimeout(r,5000)); continue; }
-    const article = rss[Math.floor(Math.random()*rss.length)];
-    speak(VOICES.HOST,pick(USER_TALK_FR));
-    speak(VOICES.HOST,article.title);
-    speak(VOICES.ANALYST,(article.description||"").replace(/<[^>]+>/g,"").slice(0,180));
-    await new Promise(r=>setTimeout(r,12000));
-  }
-
-  speak(VOICES.HOST,"Pause musicale, on se retrouve très bientôt.");
-  await new Promise(r=>setTimeout(r,PAUSE_DURATION));
-  radioLoop();
-}
-
-/* ================== IA ANALYSE MARCHÉ ================== */
-const aiArticleDiv = document.getElementById("aiArticle");
-const TELEGRAM_BOT_TOKEN = "TON_TOKEN_ICI"; // Remplace
-const TELEGRAM_CHAT_ID = "TON_CHAT_ID_ICI"; // Remplace
-
-async function sendTelegramMessage(message){
-  try{
-    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-    await fetch(url,{
-      method:"POST",
-      headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({
-        chat_id: TELEGRAM_CHAT_ID,
-        text: message,
-        parse_mode:"Markdown"
-      })
-    });
-    log("📡 Article IA envoyé sur Telegram");
-  }catch(e){console.warn("Erreur Telegram :",e);}
-}
-
-function generateAIArticle(){
-  const stock = JSON.parse(localStorage.getItem("rssStock")||"[]");
-  if(stock.length < 5){log("⛔ Pas assez de données pour analyse IA"); return;}
-  const sample = stock.slice(-8);
-  let keywords = {}, sentiment = 0;
-
-  sample.forEach(a=>{
-    const text = (a.title+" "+(a.description||"")).toLowerCase();
-    if(text.match(/hausse|bull|record|adoption|approve/)) sentiment++;
-    if(text.match(/baisse|bear|chute|crise|hack/)) sentiment--;
-    text.split(/\W+/).forEach(w=>{
-      if(w.length>5) keywords[w]=(keywords[w]||0)+1;
-    });
-  });
-
-  const trend = sentiment>2?"tendance haussière progressive":sentiment<-2?"pression baissière persistante":"phase d’hésitation et de consolidation";
-  const mainWords = Object.entries(keywords).sort((a,b)=>b[1]-a[1]).slice(0,5).map(e=>e[0]).join(", ");
-
-  const articleFR = `
-Analyse des marchés crypto
-
-Les données récentes indiquent une ${trend}.
-Les sujets dominants actuellement sont : ${mainWords}.
-
-Cette configuration suggère que les investisseurs ajustent leurs positions
-en fonction de la liquidité et du sentiment global.
-À court terme, la prudence reste recommandée.
-`;
-
-  aiArticleDiv.textContent = articleFR.trim();
-  speak(VOICES.CORTEX, articleFR);
-
-  sendTelegramMessage(articleFR.trim());
-}
-
-/* ================== COPIER ================== */
-function copyAIArticle(){
-  const text = aiArticleDiv.textContent;
-  navigator.clipboard.writeText(text).then(()=>log("📋 Article IA copié dans le presse-papiers."));
-}
-
-/* ================== AUTO START ================== */
-window.onload = ()=>{
-  radioLoop();
-  generateAIArticle(); // Génération initiale immédiate
-  setInterval(generateAIArticle, 30*60*1000); // 30 minutes
-};
-</script>
-
-</body>
-</html>
-"; // Remplace
-const TELEGRAM_CHAT_ID = "TON_CHAT_ID_ICI"; // Remplace
-
-async function sendTelegramMessage(message){
-  try{
-    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-    await fetch(url,{
-      method:"POST",
-      headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({
-        chat_id: TELEGRAM_CHAT_ID,
-        text: message,
-        parse_mode:"Markdown"
-      })
-    });
-    log("📡 Article IA envoyé sur Telegram");
-  }catch(e){console.warn("Erreur Telegram :",e);}
-}
-
-function generateAIArticle(){
-  const stock = JSON.parse(localStorage.getItem("rssStock")||"[]");
-  if(stock.length < 5){log("⛔ Pas assez de données pour analyse IA"); return;}
-  const sample = stock.slice(-8);
-  let keywords = {}, sentiment = 0;
-
-  sample.forEach(a=>{
-    const text = (a.title+" "+(a.description||"")).toLowerCase();
-    if(text.match(/hausse|bull|record|adoption|approve/)) sentiment++;
-    if(text.match(/baisse|bear|chute|crise|hack/)) sentiment--;
-    text.split(/\W+/).forEach(w=>{
-      if(w.length>5) keywords[w]=(keywords[w]||0)+1;
-    });
-  });
-
-  const trend = sentiment>2?"tendance haussière progressive":sentiment<-2?"pression baissière persistante":"phase d’hésitation et de consolidation";
-  const mainWords = Object.entries(keywords).sort((a,b)=>b[1]-a[1]).slice(0,5).map(e=>e[0]).join(", ");
-
-  const articleFR = `
-Analyse des marchés crypto
-
-Les données récentes indiquent une ${trend}.
-Les sujets dominants actuellement sont : ${mainWords}.
-
-Cette configuration suggère que les investisseurs ajustent leurs positions
-en fonction de la liquidité et du sentiment global.
-À court terme, la prudence reste recommandée.
-`;
-
-  aiArticleDiv.textContent = articleFR.trim();
-  speak(VOICES.CORTEX, articleFR);
-
-  sendTelegramMessage(articleFR.trim());
-}
-
-/* ================== COPIER ================== */
-function copyAIArticle(){
-  const text = aiArticleDiv.textContent;
-  navigator.clipboard.writeText(text).then(()=>log("📋 Article IA copié dans le presse-papiers."));
-}
-
-/* ================== AUTO START ================== */
-window.onload = ()=>{
-  radioLoop();
-  generateAIArticle(); // Génération initiale immédiate
-  setInterval(generateAIArticle, 30*60*1000); // 30 minutes
-};
-</script>
-
-</body>
-</html>
+chmod +x /root/fix_wolverine_js_and_rpc_405.sh
+/root/fix_wolverine_js_and_rpc_405.sh
