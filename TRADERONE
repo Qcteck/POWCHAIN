@@ -1,1 +1,66 @@
-<button id="sendSolBtn">Envoyer SOL au wallet WOLVERINE</button>
+cat >/root/add_send_sol_button_wolverine.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ✅ REMPLACE ICI par la public key du wallet WOLVERINE (Solana)
+WOLVERINE_WALLET="REMPLACE_PAR_PUBLIC_KEY_WOLVERINE"
+
+# RPC (tu peux mettre ton RPC privé si tu veux)
+RPC_URL="https://api.mainnet-beta.solana.com"
+
+# Où chercher l'UI
+SEARCH_DIRS=(/var/www/wolverine /var/www /usr/share/nginx/html)
+
+echo "== 1) Find index.html =="
+TARGET=""
+for d in "${SEARCH_DIRS[@]}"; do
+  if [ -f "$d/index.html" ]; then TARGET="$d/index.html"; break; fi
+done
+
+if [ -z "${TARGET}" ]; then
+  TARGET="$(find "${SEARCH_DIRS[@]}" -maxdepth 4 -type f -name index.html 2>/dev/null | head -n 1 || true)"
+fi
+
+if [ -z "${TARGET}" ]; then
+  echo "❌ Aucun index.html trouvé. Montre: ls -lah /var/www/wolverine"
+  exit 1
+fi
+
+echo "TARGET=$TARGET"
+echo
+
+echo "== 2) Backup =="
+TS="$(date +%Y%m%d_%H%M%S)"
+cp -a "$TARGET" "${TARGET}.bak_${TS}"
+
+echo "== 3) Ensure button exists =="
+if ! grep -q 'id="sendSolBtn"' "$TARGET"; then
+  # insère juste après <body ...>
+  sed -i -E '0,/<body[^>]*>/s//&\n  <button id="sendSolBtn">Envoyer SOL au wallet WOLVERINE<\/button>\n/' "$TARGET"
+  echo "✅ Bouton ajouté"
+else
+  echo "ℹ️ Bouton déjà présent"
+fi
+
+echo
+echo "== 4) Ensure SOL script exists (Phantom) =="
+if ! grep -q 'WOLVERINE_SEND_SOL_SCRIPT' "$TARGET"; then
+  # injecte avant </body>
+  perl -0777 -i -pe 's@</body>@<script type="module">\n/* WOLVERINE_SEND_SOL_SCRIPT */\nimport { Connection, PublicKey, SystemProgram, Transaction, LAMPORTS_PER_SOL } from "https://cdn.skypack.dev/@solana/web3.js";\n\nconst RPC = "'"$RPC_URL"'";\nconst WOLVERINE_WALLET = new PublicKey("'"$WOLVERINE_WALLET"'");\n\nasync function sendSol(amountSol) {\n  const provider = window.solana;\n  if (!provider?.isPhantom) throw new Error(\"Phantom non détecté\");\n  await provider.connect();\n\n  const connection = new Connection(RPC, \"confirmed\");\n  const fromPubkey = provider.publicKey;\n\n  const tx = new Transaction().add(\n    SystemProgram.transfer({\n      fromPubkey,\n      toPubkey: WOLVERINE_WALLET,\n      lamports: Math.round(amountSol * LAMPORTS_PER_SOL),\n    })\n  );\n\n  tx.feePayer = fromPubkey;\n  const { blockhash } = await connection.getLatestBlockhash(\"finalized\");\n  tx.recentBlockhash = blockhash;\n\n  const signed = await provider.signTransaction(tx);\n  const sig = await connection.sendRawTransaction(signed.serialize());\n  await connection.confirmTransaction(sig, \"confirmed\");\n  return sig;\n}\n\ndocument.getElementById(\"sendSolBtn\")?.addEventListener(\"click\", async () => {\n  const amount = Number(prompt(\"Montant en SOL à envoyer :\") || \"0\");\n  if (!amount || amount <= 0) return;\n  try {\n    const sig = await sendSol(amount);\n    alert(\"Envoyé ✅ Tx: \" + sig);\n  } catch (e) {\n    alert(\"Erreur: \" + (e?.message || e));\n  }\n});\n</script>\n</body>@s' "$TARGET"
+  echo "✅ Script ajouté"
+else
+  echo "ℹ️ Script déjà présent"
+fi
+
+echo
+echo "== 5) Reload nginx =="
+systemctl reload nginx || service nginx reload
+
+echo
+echo "== 6) Quick check =="
+curl -sk -o /dev/null -w "UI /wolverine/ : %{http_code}\n" https://fireinners.online/wolverine/
+echo "DONE ✅"
+BASH
+
+chmod +x /root/add_send_sol_button_wolverine.sh
+/root/add_send_sol_button_wolverine.sh
