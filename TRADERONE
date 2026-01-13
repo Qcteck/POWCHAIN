@@ -1,61 +1,124 @@
-cat >/root/fix_dup_wolverine_by_disabling_snippet_ui_location.sh <<'BASH'
+cat >/root/fix_location_not_allowed_fireinners_ssl.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
+VHOST="/etc/nginx/sites-enabled/fireinners.online-ssl"
+SNIP="/etc/nginx/snippets/wolverine_routes.conf"
 TS="$(date +%Y%m%d_%H%M%S)"
 
-SNIP="/etc/nginx/snippets/wolverine_routes.conf"
-VHOST="/etc/nginx/sites-enabled/fireinners.online-ssl"
-
-test -f "$SNIP" || { echo "Missing $SNIP"; exit 1; }
 test -f "$VHOST" || { echo "Missing $VHOST"; exit 1; }
 
-cp -a "$SNIP"  "$SNIP.bak_$TS"
-cp -a "$VHOST" "$VHOST.bak_$TS"
+echo "== Context around line 55 =="
+nl -ba "$VHOST" | sed -n '45,70p'
 
-echo "== 1) Disable ONLY the UI location in the snippet to avoid duplicate /wolverine/ =="
+echo "== Backup =="
+cp -a "$VHOST" "$VHOST.bak_${TS}"
 
-python3 - <<'PY'
-import re
-SNIP="/etc/nginx/snippets/wolverine_routes.conf"
-lines=open(SNIP,"r",errors="ignore").read().splitlines(True)
+# Ensure snippet exists (can be included safely inside server)
+cat > "$SNIP" <<'NGX'
+# Wolverine routes (include INSIDE server {})
 
-out=[]
-in_block=False
-depth=0
-for l in lines:
-    if not in_block and re.search(r'^\s*location\b.*\s/wolverine/\s*\{', l):
-        out.append("# DISABLED_DUPLICATE " + l)
-        in_block=True
-        depth = l.count("{") - l.count("}")
-        continue
-    if in_block:
-        out.append("# DISABLED_DUPLICATE " + l)
-        depth += l.count("{") - l.count("}")
-        if depth <= 0 and "}" in l:
-            in_block=False
-        continue
-    out.append(l)
+# Traderone API under /wolverine/traderone/api/
+location = /wolverine/traderone/api {
+  return 301 /wolverine/traderone/api/;
+}
+location ^~ /wolverine/traderone/api/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
 
-open(SNIP,"w").writelines(out)
-PY
-
-echo "== 2) Ensure vhost has the UI /wolverine/ location (if not, add) =="
-if ! grep -qE '^\s*location\s+\^~\s+/wolverine/' "$VHOST"; then
-  cat >> "$VHOST" <<'NGX'
-
-location ^~ /wolverine/ {
-  alias /var/www/wolverine/;
-  try_files $uri $uri/ /wolverine/index.html;
+  rewrite ^/wolverine/traderone/api/(.*)$ /api/$1 break;
+  proxy_pass http://127.0.0.1:8585;
 }
 NGX
-fi
 
-echo "== 3) nginx -t && reload =="
+echo "== Patch: comment any location blocks OUTSIDE the first server{} and ensure include INSIDE server =="
+python3 - <<'PY'
+import re
+VHOST="/etc/nginx/sites-enabled/fireinners.online-ssl"
+SNIP="/etc/nginx/snippets/wolverine_routes.conf"
+
+lines=open(VHOST,"r",errors="ignore").read().splitlines(True)
+
+# find first server { ... }
+start=None
+for i,l in enumerate(lines):
+    if re.search(r'^\s*server\s*\{', l):
+        start=i; break
+if start is None:
+    raise SystemExit("No server { found")
+
+depth=0
+end=None
+for i in range(start, len(lines)):
+    depth += lines[i].count("{")
+    depth -= lines[i].count("}")
+    if depth==0 and i>start:
+        end=i
+        break
+if end is None:
+    raise SystemExit("Could not find end of first server block (brace mismatch)")
+
+before = lines[:start]
+server = lines[start:end+1]
+after  = lines[end+1:]
+
+# remove any existing includes of snippet anywhere (we'll re-add once)
+def drop_include(block):
+    out=[]
+    for l in block:
+        if SNIP in l and re.search(r'^\s*include\b', l):
+            continue
+        out.append(l)
+    return out
+
+before = drop_include(before)
+server = drop_include(server)
+after  = drop_include(after)
+
+# comment out ANY location blocks outside server (to stop nginx error)
+def comment_locations(block):
+    out=[]
+    in_loc=False
+    d=0
+    for l in block:
+        if not in_loc and re.search(r'^\s*location\b', l):
+            out.append("# DISABLED_OUTSIDE_SERVER " + l)
+            in_loc=True
+            d += l.count("{") - l.count("}")
+            continue
+        if in_loc:
+            out.append("# DISABLED_OUTSIDE_SERVER " + l)
+            d += l.count("{") - l.count("}")
+            if d <= 0 and "}" in l:
+                in_loc=False
+            continue
+        out.append(l)
+    return out
+
+before = comment_locations(before)
+after  = comment_locations(after)
+
+# ensure include inside server (right before its closing brace)
+inc = f"  include {SNIP};\n"
+if not any(SNIP in l for l in server):
+    server.insert(len(server)-1, inc)
+
+open(VHOST,"w").writelines(before + server + after)
+PY
+
+echo "== nginx -t =="
 nginx -t
+
+echo "== reload =="
 systemctl reload nginx || service nginx reload
 
+echo "== Quick tests =="
+curl -sk -o /dev/null -w "UI /wolverine/ : %{http_code}\n" https://fireinners.online/wolverine/
+curl -sk -o /dev/null -w "Traderone health : %{http_code}\n" https://fireinners.online/wolverine/traderone/api/health
 echo "DONE ✅"
 BASH
 
-chmod +x /root/fix_dup_wolverine_by_disabling_snippet_ui_location.sh
-/root/fix_dup_wolverine_by_disabling_snippet_ui_location.sh
+chmod +x /root/fix_location_not_allowed_fireinners_ssl.sh
+/root/fix_location_not_allowed_fireinners_ssl.sh
