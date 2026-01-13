@@ -1,80 +1,50 @@
-cat >/root/fix_traderone_dup_include_and_locations.sh <<'BASH'
+cat >/root/fix_snippet_loaded_twice.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
-SNIP="/etc/nginx/snippets/wolverine_routes.conf"
+HOST="fireinners.online"
+VHOST="/etc/nginx/sites-enabled/${HOST}-ssl"
+
+SNIP_DIR="/etc/nginx/snippets"
+SNIP_CONF="${SNIP_DIR}/wolverine_routes.conf"
+SNIP_INC="${SNIP_DIR}/wolverine_routes.inc"
+
 TS="$(date +%Y%m%d_%H%M%S)"
 
-echo "== 1) Find ALL includes of wolverine_routes.conf =="
-mapfile -t INCS < <(
-  grep -RIn --binary-files=without-match \
-    -E 'include\s+.*wolverine_routes\.conf' \
-    /etc/nginx/nginx.conf /etc/nginx/conf.d /etc/nginx/sites-enabled 2>/dev/null \
-  | grep -vE '\.bak|\.broken|sites-disabled' || true
-)
-printf "%s\n" "${INCS[@]}"
-echo
+echo "== 1) Backup =="
+cp -a "$VHOST" "$VHOST.bak_$TS"
+[ -f "$SNIP_CONF" ] && cp -a "$SNIP_CONF" "$SNIP_CONF.bak_$TS" || true
+[ -f "$SNIP_INC" ] && cp -a "$SNIP_INC" "$SNIP_INC.bak_$TS" || true
 
-echo "== 2) Disable duplicate includes (keep first) =="
-if [ "${#INCS[@]}" -gt 1 ]; then
-  echo "KEEP => ${INCS[0]}"
-  for hit in "${INCS[@]:1}"; do
-    FILE="${hit%%:*}"
-    [ -f "$FILE" ] || continue
-    cp -a "$FILE" "$FILE.bak_$TS"
-    sed -i -E 's@^([[:space:]]*)include([[:space:]]+.*wolverine_routes\.conf.*);@\1# DISABLED_DUP_INCLUDE include\2;@' "$FILE"
-    echo "disabled include in $FILE"
-  done
-else
-  echo "No duplicate include found (0/1 include)."
+echo "== 2) Rename snippet .conf -> .inc (so it won't be included by snippets/*.conf) =="
+if [ -f "$SNIP_CONF" ]; then
+  mv -v "$SNIP_CONF" "$SNIP_INC"
 fi
-echo
 
-echo "== 3) Disable any OTHER traderone locations outside the snippet =="
-mapfile -t LOCS < <(
-  grep -RIn --binary-files=without-match \
-    -E '^\s*location\b.*(/wolverine/traderone/api)' \
-    /etc/nginx/sites-enabled /etc/nginx/conf.d /etc/nginx/nginx.conf 2>/dev/null \
-  | grep -vE '\.bak|\.broken|sites-disabled' || true
-)
+echo "== 3) Update vhost include to point to .inc (and remove any .conf include) =="
+# comment any include wolverine_routes.conf
+sed -i -E 's@^([[:space:]]*)include([[:space:]]+.*wolverine_routes\.conf.*);@\1# DISABLED_OLD include\2;@' "$VHOST"
 
-for hit in "${LOCS[@]}"; do
-  FILE="${hit%%:*}"
-  [ "$FILE" = "$SNIP" ] && continue
-  [ -f "$FILE" ] || continue
-  cp -a "$FILE" "$FILE.bak_$TS"
-  # comment out whole location blocks that mention /wolverine/traderone/api
-  python3 - <<PY
-import re
-p="${FILE}"
-lines=open(p,"r",errors="ignore").read().splitlines(True)
-out=[]
-in_loc=False
-d=0
-for l in lines:
-    if not in_loc and re.search(r'^\s*location\b.*?/wolverine/traderone/api', l):
-        out.append("# DISABLED_DUP_TRADERONE " + l)
-        in_loc=True
-        d = l.count("{") - l.count("}")
-        continue
-    if in_loc:
-        out.append("# DISABLED_DUP_TRADERONE " + l)
-        d += l.count("{") - l.count("}")
-        if d <= 0 and "}" in l:
-            in_loc=False
-        continue
-    out.append(l)
-open(p,"w").writelines(out)
-PY
-  echo "disabled traderone location(s) in $FILE"
-done
+# ensure include .inc exists inside vhost (append if missing)
+if ! grep -q "wolverine_routes\.inc" "$VHOST"; then
+  echo "" >> "$VHOST"
+  echo "  include ${SNIP_INC};" >> "$VHOST"
+fi
+
+echo "== 4) Show any wildcard includes that might have caused the double-load =="
+grep -RIn --binary-files=without-match \
+  -E 'include\s+/etc/nginx/snippets/\*|include\s+/etc/nginx/snippets/\*\.conf' \
+  /etc/nginx/nginx.conf /etc/nginx/conf.d /etc/nginx/sites-enabled 2>/dev/null || true
 
 echo
-echo "== 4) nginx -t && reload =="
+echo "== 5) nginx -t && reload =="
 nginx -t
 systemctl reload nginx || service nginx reload
+
+echo "== 6) verify locations loaded (optional) =="
+nginx -T 2>/dev/null | grep -n "location .*wolverine/traderone/api" || true
 
 echo "DONE ✅"
 BASH
 
-chmod +x /root/fix_traderone_dup_include_and_locations.sh
-/root/fix_traderone_dup_include_and_locations.sh
+chmod +x /root/fix_snippet_loaded_twice.sh
+/root/fix_snippet_loaded_twice.sh
