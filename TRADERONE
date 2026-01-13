@@ -1,76 +1,61 @@
-cat >/root/fix_duplicate_location_wolverine.sh <<'BASH'
+cat >/root/fix_dup_wolverine_by_disabling_snippet_ui_location.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 TS="$(date +%Y%m%d_%H%M%S)"
 
 SNIP="/etc/nginx/snippets/wolverine_routes.conf"
+VHOST="/etc/nginx/sites-enabled/fireinners.online-ssl"
 
-echo "== 1) Find all includes of wolverine_routes.conf (enabled configs only) =="
-mapfile -t INCS < <(
-  grep -RIn --binary-files=without-match \
-    -E "include\s+.*wolverine_routes\.conf" \
-    /etc/nginx/nginx.conf /etc/nginx/conf.d /etc/nginx/sites-enabled 2>/dev/null \
-  | grep -vE '\.bak|\.broken|sites-disabled' || true
-)
-printf "%s\n" "${INCS[@]}"
-echo
+test -f "$SNIP" || { echo "Missing $SNIP"; exit 1; }
+test -f "$VHOST" || { echo "Missing $VHOST"; exit 1; }
 
-echo "== 2) Keep FIRST include, comment out any duplicate includes =="
-if [ "${#INCS[@]}" -gt 1 ]; then
-  KEEP="${INCS[0]}"
-  echo "KEEP => $KEEP"
-  for i in "${INCS[@]:1}"; do
-    FILE="${i%%:*}"
-    [ -f "$FILE" ] || continue
-    cp -a "$FILE" "$FILE.bak_$TS"
-    sed -i -E 's@^([[:space:]]*)include([[:space:]]+.*wolverine_routes\.conf.*);@\1# DISABLED_DUPLICATE include\2;@' "$FILE"
-  done
-else
-  echo "No duplicate include found (or only one)."
-fi
-echo
+cp -a "$SNIP"  "$SNIP.bak_$TS"
+cp -a "$VHOST" "$VHOST.bak_$TS"
 
-echo "== 3) Find ALL location blocks for /wolverine/ in enabled configs =="
-mapfile -t LOCS < <(
-  grep -RIn --binary-files=without-match \
-    -E '^\s*location\s+\^~\s+/wolverine/' \
-    /etc/nginx/sites-enabled /etc/nginx/conf.d /etc/nginx/nginx.conf 2>/dev/null \
-  | grep -vE '\.bak|\.broken|sites-disabled' || true
-)
-printf "%s\n" "${LOCS[@]}"
-echo
+echo "== 1) Disable ONLY the UI location in the snippet to avoid duplicate /wolverine/ =="
 
-echo "== 4) Ensure snippet contains only ONE location ^~ /wolverine/ (rename extra ones) =="
-if [ -f "$SNIP" ]; then
-  cp -a "$SNIP" "$SNIP.bak_$TS"
-  awk '
-    BEGIN{c=0}
-    {
-      if ($0 ~ /^[[:space:]]*location[[:space:]]+\^~[[:space:]]+\/wolverine\//) {
-        c++
-        if (c>=2) sub(/\/wolverine\//,"/wolverine_DISABLED/")
-      }
-      print
-    }' "$SNIP.bak_$TS" > "$SNIP"
+python3 - <<'PY'
+import re
+SNIP="/etc/nginx/snippets/wolverine_routes.conf"
+lines=open(SNIP,"r",errors="ignore").read().splitlines(True)
+
+out=[]
+in_block=False
+depth=0
+for l in lines:
+    if not in_block and re.search(r'^\s*location\b.*\s/wolverine/\s*\{', l):
+        out.append("# DISABLED_DUPLICATE " + l)
+        in_block=True
+        depth = l.count("{") - l.count("}")
+        continue
+    if in_block:
+        out.append("# DISABLED_DUPLICATE " + l)
+        depth += l.count("{") - l.count("}")
+        if depth <= 0 and "}" in l:
+            in_block=False
+        continue
+    out.append(l)
+
+open(SNIP,"w").writelines(out)
+PY
+
+echo "== 2) Ensure vhost has the UI /wolverine/ location (if not, add) =="
+if ! grep -qE '^\s*location\s+\^~\s+/wolverine/' "$VHOST"; then
+  cat >> "$VHOST" <<'NGX'
+
+location ^~ /wolverine/ {
+  alias /var/www/wolverine/;
+  try_files $uri $uri/ /wolverine/index.html;
+}
+NGX
 fi
 
-echo "== 5) If another file (not the snippet) also defines /wolverine/, disable it =="
-for h in "${LOCS[@]}"; do
-  FILE="${h%%:*}"
-  [ "$FILE" = "$SNIP" ] && continue
-  [ -f "$FILE" ] || continue
-  cp -a "$FILE" "$FILE.bak_$TS"
-  # rename that location so it can’t collide
-  sed -i -E 's@^([[:space:]]*location[[:space:]]+\^~[[:space:]]+)/wolverine/@\1/wolverine_DISABLED/@' "$FILE"
-done
-
-echo
-echo "== 6) nginx -t && reload =="
+echo "== 3) nginx -t && reload =="
 nginx -t
 systemctl reload nginx || service nginx reload
 
 echo "DONE ✅"
 BASH
 
-chmod +x /root/fix_duplicate_location_wolverine.sh
-/root/fix_duplicate_location_wolverine.sh
+chmod +x /root/fix_dup_wolverine_by_disabling_snippet_ui_location.sh
+/root/fix_dup_wolverine_by_disabling_snippet_ui_location.sh
