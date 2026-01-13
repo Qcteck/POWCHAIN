@@ -1,26 +1,44 @@
-cat >/root/fix_wolverine_rpc_browserproof.sh <<'BASH'
+cat >/root/fix_rpc_absolute_and_browserproof.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
-INC="/etc/nginx/includes/wolverine_routes.inc"
 TS="$(date +%Y%m%d_%H%M%S)"
 
-test -f "$INC" || { echo "❌ Missing $INC"; exit 1; }
-cp -a "$INC" "${INC}.bak_${TS}"
+HTML="/var/www/wolverine/index.html"
+INC="/etc/nginx/includes/wolverine_routes.inc"
 
+cp -a "$HTML" "${HTML}.bak_${TS}"
+cp -a "$INC"  "${INC}.bak_${TS}"
+
+echo "== 1) Patch UI: force RPC absolute (https://.../wolverine/rpc) =="
+python3 - <<'PY'
+import re
+from pathlib import Path
+p=Path("/var/www/wolverine/index.html")
+s=p.read_text(errors="ignore")
+
+# Remplace "const RPC = "/wolverine/rpc";" par une URL absolue basée sur l'origin
+s = re.sub(r'const\s+RPC\s*=\s*["\']/wolverine/rpc["\']\s*;',
+           'const RPC = window.location.origin + "/wolverine/rpc";',
+           s)
+
+p.write_text(s)
+print("OK: index.html RPC now absolute via window.location.origin")
+PY
+
+echo "== 2) Patch nginx: /wolverine/rpc accept OPTIONS + POST + CORS + redirect slash =="
 python3 - <<'PY'
 import re, pathlib
 p = pathlib.Path("/etc/nginx/includes/wolverine_routes.inc")
 s = p.read_text(errors="ignore")
 
-# remove old rpc blocks (marker or raw)
+# Remove previous rpc blocks (marker or raw)
 s = re.sub(r"\n?#\s*WOLVERINE_RPC_PROXY_BEGIN.*?#\s*WOLVERINE_RPC_PROXY_END\s*\n?", "\n", s, flags=re.S)
 s = re.sub(r"\n\s*location\s*=\s*/wolverine/rpc\s*\{.*?\n\s*\}\s*\n", "\n", s, flags=re.S)
+s = re.sub(r"\n\s*location\s*\^~\s*/wolverine/rpc/\s*\{.*?\n\s*\}\s*\n", "\n", s, flags=re.S)
 
 block = r'''
 # WOLVERINE_RPC_PROXY_BEGIN
-# Solana JSON-RPC proxy (same-origin) - browser-proof
 location = /wolverine/rpc {
-  # Handle preflight (some browsers/libraries do OPTIONS)
   if ($request_method = OPTIONS) {
     add_header Access-Control-Allow-Origin "*" always;
     add_header Access-Control-Allow-Methods "POST, OPTIONS" always;
@@ -44,7 +62,6 @@ location = /wolverine/rpc {
   proxy_pass https://api.mainnet-beta.solana.com/;
 }
 
-# normalize trailing slash
 location ^~ /wolverine/rpc/ {
   return 301 /wolverine/rpc;
 }
@@ -52,7 +69,7 @@ location ^~ /wolverine/rpc/ {
 '''
 s = s.rstrip() + "\n\n" + block + "\n"
 p.write_text(s)
-print("OK: installed browser-proof /wolverine/rpc")
+print("OK: nginx rpc block installed (OPTIONS+POST+CORS+slash)")
 PY
 
 nginx -t
@@ -63,10 +80,9 @@ echo "== ORIGIN test (POST) =="
 curl -sk --resolve fireinners.online:443:127.0.0.1 -i \
   -X POST https://fireinners.online/wolverine/rpc \
   -H 'Content-Type: application/json' \
-  --data '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' | sed -n '1,25p'
-echo
+  --data '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' | sed -n '1,20p'
 echo "DONE ✅"
 BASH
 
-chmod +x /root/fix_wolverine_rpc_browserproof.sh
-/root/fix_wolverine_rpc_browserproof.sh
+chmod +x /root/fix_rpc_absolute_and_browserproof.sh
+/root/fix_rpc_absolute_and_browserproof.sh
