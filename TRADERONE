@@ -1,4 +1,4 @@
-cat >/root/trace_rpc_403_origin_or_cf.sh <<'BASH'
+cat >/root/fix_rpc_strip_origin.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 INC="/etc/nginx/includes/wolverine_routes.inc"
@@ -12,24 +12,19 @@ import re, pathlib
 p = pathlib.Path("/etc/nginx/includes/wolverine_routes.inc")
 s = p.read_text(errors="ignore")
 
-# remove existing rpc blocks we injected before (marker-based)
+# remove any existing rpc blocks (marker-based)
 s = re.sub(r"\n?#\s*WOLVERINE_RPC_PROXY_BEGIN.*?#\s*WOLVERINE_RPC_PROXY_END\s*\n?", "\n", s, flags=re.S)
-# remove any raw rpc location blocks (best effort)
+# remove raw duplicates best-effort
 s = re.sub(r"\n\s*location\s*=\s*/wolverine/rpc\s*\{.*?\n\s*\}\s*\n", "\n", s, flags=re.S)
 s = re.sub(r"\n\s*location\s*\^~\s*/wolverine/rpc/\s*\{.*?\n\s*\}\s*\n", "\n", s, flags=re.S)
 
 block = r'''
 # WOLVERINE_RPC_PROXY_BEGIN
-# Solana JSON-RPC proxy (same-origin) + TRACE
+# Solana JSON-RPC proxy (same-origin) - strip browser Origin
 location = /wolverine/rpc {
-  # TRACE headers (si tu les vois dans le navigateur => ça arrive bien à nginx)
-  add_header X-Wolverine-RPC "nginx-origin" always;
-  add_header Cache-Control "no-store" always;
-
-  # log dédié
+  add_header X-Wolverine-Rpc "nginx-origin" always;
   access_log /var/log/nginx/wolverine_rpc_access.log combined;
 
-  # preflight
   if ($request_method = OPTIONS) {
     add_header Access-Control-Allow-Origin "*" always;
     add_header Access-Control-Allow-Methods "POST, OPTIONS" always;
@@ -46,6 +41,14 @@ location = /wolverine/rpc {
   proxy_ssl_server_name on;
 
   proxy_set_header Host api.mainnet-beta.solana.com;
+
+  # IMPORTANT: strip browser headers that can trigger 403 upstream
+  proxy_set_header Origin "";
+  proxy_set_header Referer "";
+
+  # give upstream a normal UA
+  proxy_set_header User-Agent "Mozilla/5.0";
+
   proxy_set_header X-Real-IP $remote_addr;
   proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
   proxy_set_header X-Forwarded-Proto $scheme;
@@ -53,33 +56,25 @@ location = /wolverine/rpc {
   proxy_pass https://api.mainnet-beta.solana.com/;
 }
 
-# normalize trailing slash
-location ^~ /wolverine/rpc/ {
-  return 301 /wolverine/rpc;
-}
+location ^~ /wolverine/rpc/ { return 301 /wolverine/rpc; }
 # WOLVERINE_RPC_PROXY_END
 '''
 s = s.rstrip() + "\n\n" + block + "\n"
 p.write_text(s)
-print("OK: rpc trace block installed")
+print("OK: installed rpc block (strip Origin/Referer)")
 PY
 
 touch /var/log/nginx/wolverine_rpc_access.log || true
-
 nginx -t
 systemctl reload nginx || service nginx reload
 
-echo "== ORIGIN test (bypass CF) =="
-curl -sk --resolve fireinners.online:443:127.0.0.1 -i \
-  -X POST https://fireinners.online/wolverine/rpc \
+echo "== Test (simulate browser Origin) =="
+curl -sk -i -X POST https://fireinners.online/wolverine/rpc \
   -H 'Content-Type: application/json' \
-  --data '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' | sed -n '1,25p'
-
-echo
-echo "== Tail rpc access log =="
-tail -n 20 /var/log/nginx/wolverine_rpc_access.log || true
+  -H 'Origin: https://fireinners.online' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' | sed -n '1,30p'
 echo "DONE ✅"
 BASH
 
-chmod +x /root/trace_rpc_403_origin_or_cf.sh
-/root/trace_rpc_403_origin_or_cf.sh
+chmod +x /root/fix_rpc_strip_origin.sh
+/root/fix_rpc_strip_origin.sh
