@@ -1,33 +1,95 @@
-cat >/root/purge_enabled_backups_again.sh <<'BASH'
+cat >/root/fix_dup_traderone_by_nginxT.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
-EN="/etc/nginx/sites-enabled"
-DST="/etc/nginx/sites-disabled/cleanup_$(date +%Y%m%d_%H%M%S)"
-mkdir -p "$DST"
+TS="$(date +%Y%m%d_%H%M%S)"
 
-echo "== Move all backups/variants out of sites-enabled =="
-shopt -s nullglob
-for f in "$EN"/fireinners.online-ssl.* "$EN"/*.bak* "$EN"/*.broken*; do
-  [ -e "$f" ] || continue
-  # keep only the exact active file
-  [ "$f" = "$EN/fireinners.online-ssl" ] && continue
-  echo "MOVE: $f -> $DST/"
-  mv -v "$f" "$DST/"
-done
+VHOST="/etc/nginx/sites-enabled/fireinners.online-ssl"
+INC="/etc/nginx/includes/wolverine_routes.inc"
+
+echo "== 0) Backup main vhost =="
+cp -a "$VHOST" "$VHOST.bak_$TS"
+
+echo "== 1) Dump full loaded config (nginx -T) =="
+nginx -T > /tmp/nginxT.txt 2>&1 || true
 
 echo
-echo "== Enabled now (must show only fireinners.online-ssl) =="
-ls -lah "$EN"
+echo "== 2) Where traderone location appears in LOADED config =="
+grep -n "wolverine/traderone/api" /tmp/nginxT.txt || true
 
 echo
-echo "== nginx -t =="
+echo "== 3) Where the include file is included in LOADED config =="
+grep -n "include .*wolverine_routes\.inc" /tmp/nginxT.txt || true
+
+echo
+echo "== 4) Disable duplicate includes of /etc/nginx/includes/wolverine_routes.inc in the vhost (keep first) =="
+if [ -f "$VHOST" ]; then
+  cp -a "$VHOST" "$VHOST.bak_incfix_$TS"
+  awk -v inc="$INC" '
+    BEGIN{c=0}
+    {
+      if ($0 ~ "include[[:space:]]+" inc ";") {
+        c++
+        if (c>=2) { print "# DISABLED_DUP_INCLUDE " $0; next }
+      }
+      print
+    }' "$VHOST.bak_incfix_$TS" > "$VHOST"
+fi
+
+echo
+echo "== 5) Disable any traderone location blocks defined directly in the vhost (keep only the include file) =="
+python3 - <<'PY'
+import re
+VHOST="/etc/nginx/sites-enabled/fireinners.online-ssl"
+lines=open(VHOST,"r",errors="ignore").read().splitlines(True)
+out=[]
+in_loc=False
+d=0
+for l in lines:
+    if not in_loc and re.search(r'^\s*location\b.*?/wolverine/traderone/api', l):
+        out.append("# DISABLED_DUP_TRADERONE " + l)
+        in_loc=True
+        d = l.count("{") - l.count("}")
+        continue
+    if in_loc:
+        out.append("# DISABLED_DUP_TRADERONE " + l)
+        d += l.count("{") - l.count("}")
+        if d <= 0 and "}" in l:
+            in_loc=False
+        continue
+    out.append(l)
+open(VHOST,"w").writelines(out)
+PY
+
+echo
+echo "== 6) Ensure include file itself has only one traderone block (rewrite clean) =="
+if [ -f "$INC" ]; then cp -a "$INC" "$INC.bak_$TS"; fi
+mkdir -p /etc/nginx/includes
+cat > "$INC" <<'NGX'
+# Wolverine routes (clean) - included inside server{}
+
+location = /wolverine/traderone/api {
+  return 301 /wolverine/traderone/api/;
+}
+
+location ^~ /wolverine/traderone/api/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+
+  rewrite ^/wolverine/traderone/api/(.*)$ /api/$1 break;
+  proxy_pass http://127.0.0.1:8585;
+}
+NGX
+
+echo
+echo "== 7) Test + reload =="
 nginx -t
-
-echo
-echo "== reload =="
 systemctl reload nginx || service nginx reload
+
 echo "DONE ✅"
 BASH
 
-chmod +x /root/purge_enabled_backups_again.sh
-/root/purge_enabled_backups_again.sh
+chmod +x /root/fix_dup_traderone_by_nginxT.sh
+/root/fix_dup_traderone_by_nginxT.sh
