@@ -1,60 +1,55 @@
-cat >/root/traderone_lockdown_fix_check.sh <<'BASH'
+cat >/root/fix_nginx_location_not_allowed.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
+CFG="/etc/nginx/sites-enabled/fireinners.online-ssl"
 
-echo "=== 1) ORIGIN check (bypass Cloudflare) ==="
-curl -skI --resolve fireinners.online:443:127.0.0.1 https://fireinners.online/wolverine/traderone/api/ | head -n 20
-echo
-
-echo "=== 2) PUBLIC check (through Cloudflare) ==="
-curl -skI https://fireinners.online/wolverine/traderone/api/ | head -n 20
-echo
-
-echo "=== 3) Locate nginx file with wolverine/traderone/api ==="
-CFG="$(grep -RIl "wolverine/traderone/api" /etc/nginx 2>/dev/null | head -n 1 || true)"
+echo "== 0) Sanity =="
+test -f "$CFG" || { echo "❌ Missing $CFG"; exit 1; }
 echo "CFG=$CFG"
-test -n "$CFG" || { echo "❌ Not found"; exit 1; }
 echo
 
-echo "=== 4) Ensure include snippet is present ==="
-grep -n "include /etc/nginx/snippets/traderone_api_lockdown.conf;" "$CFG" || echo "NOT PRESENT ❌"
+echo "== 1) Show the error context (lines 60-90) =="
+nl -ba "$CFG" | sed -n '60,90p' || true
 echo
 
-echo "=== 5) Add 'no-store' for that path (to stop CF caching 200) ==="
-# Insert a small exact-match block only if not already present
-if ! grep -q "location = /wolverine/traderone/api/" "$CFG"; then
-  cp -a "$CFG" "${CFG}.bak_lockfix_$(date -u +%Y%m%d_%H%M%S)"
-  awk '
-    {print}
-    /wolverine\/traderone\/api/ && /location/ && !done {
-      # after the first matching location line, add exact-match blocker
-      print ""
-      print "  # Hard block + no-cache (exact match)"
-      print "  location = /wolverine/traderone/api/ {"
-      print "    add_header Cache-Control \"no-store\" always;"
-      print "    return 403;"
-      print "  }"
-      done=1
-    }
-  ' "$CFG" > /tmp/nginx_site.tmp
-  mv /tmp/nginx_site.tmp "$CFG"
-  echo "Inserted exact-match 403 + no-store ✅"
+echo "== 2) Restore latest backup (.bak_lockfix_*) if exists =="
+LATEST_BAK="$(ls -1t ${CFG}.bak_lockfix_* 2>/dev/null | head -n 1 || true)"
+if [ -n "${LATEST_BAK:-}" ]; then
+  cp -a "$LATEST_BAK" "$CFG"
+  echo "Restored: $LATEST_BAK -> $CFG"
 else
-  echo "Exact-match block already present ✅"
+  echo "No .bak_lockfix_* found. Listing any backups:"
+  ls -1t ${CFG}.bak_* 2>/dev/null | head -n 10 || true
+  echo "If you have a different backup name, tell me and I’ll adapt."
 fi
 echo
 
-echo "=== 6) Test + reload nginx ==="
+echo "== 3) Ensure snippet include is present INSIDE server{} (top) =="
+SNIP="include /etc/nginx/snippets/traderone_api_lockdown.conf;"
+python3 - <<'PY'
+from pathlib import Path
+import re
+
+cfg = Path("/etc/nginx/sites-enabled/fireinners.online-ssl")
+s = cfg.read_text(errors="ignore")
+
+if SNIP in s:
+    print("OK: include already present")
+else:
+    # insert right after the first 'server {' opening
+    s2, n = re.subn(r'(server\s*\{\s*)', r'\1\n  ' + SNIP + '\n', s, count=1, flags=re.M)
+    if n != 1:
+        raise SystemExit("❌ Could not find a server { block to inject include into")
+    cfg.write_text(s2)
+    print("OK: include injected into first server{} block")
+PY
+echo
+
+echo "== 4) Test + reload nginx =="
 nginx -t
 systemctl reload nginx || service nginx reload
-echo
-
-echo "=== 7) ORIGIN re-check (should be 403 now) ==="
-curl -skI --resolve fireinners.online:443:127.0.0.1 https://fireinners.online/wolverine/traderone/api/ | head -n 20
-echo
-
 echo "DONE ✅"
 BASH
 
-chmod +x /root/traderone_lockdown_fix_check.sh
-/root/traderone_lockdown_fix_check.sh
+chmod +x /root/fix_nginx_location_not_allowed.sh
+/root/fix_nginx_location_not_allowed.sh
