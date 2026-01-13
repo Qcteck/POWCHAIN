@@ -1,4 +1,4 @@
-cat >/root/inject_wolverine_send_sol_script_safe.sh <<'BASH'
+cat >/root/inject_wolverine_send_sol_script_safe_v2.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -8,33 +8,45 @@ TS="$(date +%Y%m%d_%H%M%S)"
 test -f "$FILE" || { echo "❌ Missing $FILE"; exit 1; }
 cp -a "$FILE" "${FILE}.bak_${TS}"
 
-# Trouver la pubkey Solana sur le VPS (best effort)
+# 1) trouver id.json
 KEYFILE=""
 for f in /root/.config/solana/id.json /home/*/.config/solana/id.json; do
   [ -f "$f" ] && KEYFILE="$f" && break
 done
-if [ -n "$KEYFILE" ]; then
+
+# 2) extraire pubkey
+if [ -n "$KEYFILE" ] && command -v solana-keygen >/dev/null 2>&1; then
   PUBKEY="$(solana-keygen pubkey "$KEYFILE")"
 else
+  echo "⚠️ solana-keygen ou id.json introuvable, fallback placeholder"
   PUBKEY="REMPLACE_PAR_PUBLIC_KEY_WOLVERINE"
 fi
+export PUBKEY
 
-python3 - <<PY
+python3 - <<'PY'
+import os
 from pathlib import Path
 
-p=Path("$FILE")
+FILE="/var/www/wolverine/index.html"
+pubkey=os.environ.get("PUBKEY","REMPLACE_PAR_PUBLIC_KEY_WOLVERINE")
+
+p=Path(FILE)
 s=p.read_text(errors="ignore")
 
-if "WOLVERINE_SEND_SOL_SCRIPT" in s:
-    print("ℹ️ Script déjà présent")
-else:
-    script = f'''
+# bouton
+if 'id="sendSolBtn"' not in s:
+    s=s.replace("<body", '<body', 1)  # no-op safety
+    import re
+    s=re.sub(r"(<body[^>]*>)", r"\1\n  <button id=\"sendSolBtn\" style=\"position:fixed;bottom:18px;right:18px;z-index:9999;\">Envoyer SOL au wallet WOLVERINE</button>\n", s, count=1)
+
+# script
+if "WOLVERINE_SEND_SOL_SCRIPT" not in s:
+    script=f"""
 <script type="module">
 /* WOLVERINE_SEND_SOL_SCRIPT */
 import {{ Connection, PublicKey, SystemProgram, Transaction, LAMPORTS_PER_SOL }} from "https://cdn.skypack.dev/@solana/web3.js";
-
 const RPC = "https://api.mainnet-beta.solana.com";
-const WOLVERINE_WALLET = new PublicKey("{PUBKEY}");
+const WOLVERINE_WALLET = new PublicKey("{pubkey}");
 
 async function sendSol(amountSol) {{
   const provider = window.solana;
@@ -69,26 +81,26 @@ document.getElementById("sendSolBtn")?.addEventListener("click", async () => {{
     const sig = await sendSol(amount);
     alert("Envoyé ✅ Tx: " + sig);
   }} catch (e) {{
-    alert("Erreur: " + (e?.message || e));
+    alert("Erreur: " + (getattr(e,"message",None) or str(e)));
   }}
 }});
 </script>
-'''
+"""
     if "</body>" in s:
-        s = s.replace("</body>", script + "\n</body>", 1)
+        s=s.replace("</body>", script + "\n</body>", 1)
     else:
-        s = s + "\n" + script
-    p.write_text(s)
-    print("✅ Script injecté")
+        s += "\n" + script
+
+p.write_text(s)
+print("OK: injected (pubkey=" + pubkey + ")")
 PY
 
 systemctl reload nginx || service nginx reload
 
 echo "== ORIGIN check (bypass CF) =="
-curl -sk --resolve fireinners.online:443:127.0.0.1 https://fireinners.online/wolverine/ | grep -nE 'sendSolBtn|WOLVERINE_SEND_SOL_SCRIPT' && echo "OK ✅" || echo "STILL NOT FOUND ❌"
-
-echo "Wallet utilisé: $PUBKEY"
+curl -sk --resolve fireinners.online:443:127.0.0.1 https://fireinners.online/wolverine/ \
+ | grep -nE 'sendSolBtn|WOLVERINE_SEND_SOL_SCRIPT' && echo "OK ✅" || echo "STILL NOT FOUND ❌"
 BASH
 
-chmod +x /root/inject_wolverine_send_sol_script_safe.sh
-/root/inject_wolverine_send_sol_script_safe.sh
+chmod +x /root/inject_wolverine_send_sol_script_safe_v2.sh
+/root/inject_wolverine_send_sol_script_safe_v2.sh
