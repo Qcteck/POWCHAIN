@@ -1,21 +1,105 @@
-cat >/root/find_phantom_connect_in_ui.sh <<'BASH'
+cat >/root/plug_phantom_balances_ui.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
-
 UI="/opt/WOLVERINE1_export/ui"
+IDX="$UI/index.html"
+TS="$(date +%Y%m%d_%H%M%S)"
 
-echo "== UI dir =="
-ls -lah "$UI" | head -n 30 || true
-echo
+test -f "$IDX" || { echo "Missing $IDX"; exit 1; }
 
-echo "== Search Phantom / window.solana / connect =="
-grep -RIn --exclude-dir=.git --exclude-dir=node_modules \
-  -E 'window\.solana|phantom|solana\.connect\(|connect\(\)|isPhantom|publicKey' \
-  "$UI" | head -n 80 || true
+echo "== 1) Backup index.html =="
+cp -a "$IDX" "$IDX.bak_${TS}"
 
-echo
-echo "DONE ✅ (paste the best matching line(s) here)"
+echo "== 2) Write phantom_balances.js =="
+cat > "$UI/phantom_balances.js" <<'JS'
+(() => {
+  const RPC = "https://fireinners.online/wolverine/rpc";
+  const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+
+  async function rpc(method, params) {
+    const r = await fetch(RPC, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+    });
+    const j = await r.json();
+    if (j.error) throw new Error(j.error.message || JSON.stringify(j.error));
+    return j.result;
+  }
+
+  async function getBalances(pubkey) {
+    const bal = await rpc("getBalance", [pubkey]);
+    const sol = bal.value / 1e9;
+
+    const ta = await rpc("getTokenAccountsByOwner", [
+      pubkey,
+      { mint: USDC_MINT },
+      { encoding: "jsonParsed" },
+    ]);
+
+    const usdc = (ta.value || []).reduce((sum, it) => {
+      const uiAmt = it?.account?.data?.parsed?.info?.tokenAmount?.uiAmount || 0;
+      return sum + uiAmt;
+    }, 0);
+
+    return { sol, usdc };
+  }
+
+  function setText(id, txt) {
+    const el = document.getElementById(id);
+    if (el) el.textContent = txt;
+  }
+
+  async function onConnected(pubkey) {
+    try {
+      setText("wolv_wallet", pubkey);
+      setText("wolv_sol", "…");
+      setText("wolv_usdc", "…");
+      const { sol, usdc } = await getBalances(pubkey);
+      setText("wolv_sol", sol.toFixed(6));
+      setText("wolv_usdc", usdc.toFixed(2));
+    } catch (e) {
+      console.error("balance fetch failed", e);
+      setText("wolv_sol", "ERR");
+      setText("wolv_usdc", "ERR");
+    }
+  }
+
+  // Hook Phantom connect without touching your existing phantom_patch.js
+  function installHook() {
+    if (!window.solana || !window.solana.isPhantom) return;
+    const orig = window.solana.connect.bind(window.solana);
+    window.solana.connect = async (...args) => {
+      const res = await orig(...args);
+      const pk = window.solana.publicKey?.toBase58?.() || window.solana.publicKey?.toString?.();
+      if (pk) onConnected(pk);
+      return res;
+    };
+
+    // if already connected
+    const pk0 = window.solana.publicKey?.toBase58?.() || window.solana.publicKey?.toString?.();
+    if (pk0) onConnected(pk0);
+  }
+
+  // Wait a bit for phantom_patch.js to run / inject buttons
+  window.addEventListener("load", () => setTimeout(installHook, 300));
+})();
+JS
+
+echo "== 3) Ensure 3 placeholders exist in index.html (wallet/sol/usdc) =="
+# If your UI already has places to show them, you can delete this block later.
+# We inject a tiny panel only if not present.
+if ! grep -q 'id="wolv_sol"' "$IDX"; then
+  sed -i 's@</body>@<div style="position:fixed;bottom:12px;right:12px;background:#111;color:#fff;padding:10px 12px;border-radius:10px;font-family:Arial;z-index:99999;opacity:.9">\n  <div><b>Wallet</b>: <span id="wolv_wallet">-</span></div>\n  <div><b>SOL</b>: <span id="wolv_sol">-</span></div>\n  <div><b>USDC</b>: <span id="wolv_usdc">-</span></div>\n</div>\n</body>@' "$IDX"
+fi
+
+echo "== 4) Inject script tag in index.html (before </body>) =="
+if ! grep -q 'phantom_balances.js' "$IDX"; then
+  sed -i 's@</body>@<script src="/phantom_balances.js"></script>\n</body>@' "$IDX"
+fi
+
+echo "DONE ✅  Now deploy/copy $UI to /var/www/wolverine (or your live dir) then refresh UI."
 BASH
 
-chmod +x /root/find_phantom_connect_in_ui.sh
-/root/find_phantom_connect_in_ui.sh
+chmod +x /root/plug_phantom_balances_ui.sh
+/root/plug_phantom_balances_ui.sh
