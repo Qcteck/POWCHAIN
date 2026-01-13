@@ -1,36 +1,75 @@
-cat >/root/show_active_wolverine_rpc_block.sh <<'BASH'
+cat >/root/fix_duplicate_wolverine_rpc_location.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "== 1) Export nginx full config (nginx -T) =="
-nginx -T 2>/tmp/nginxT.txt >/dev/null || true
+echo "== 1) Find ACTIVE duplicates for /wolverine/rpc (excluding .bak) =="
+mapfile -t HITS < <(
+  grep -RIn --binary-files=without-match \
+    -E 'location\s*=*\s*/wolverine/rpc\b' /etc/nginx \
+  | grep -vE '\.bak_|\.bak$' \
+  | head -n 50
+)
+
+printf "%s\n" "${HITS[@]:-}" || true
+echo
+
+FILES=()
+for h in "${HITS[@]:-}"; do
+  f="${h%%:*}"
+  [[ " ${FILES[*]} " =~ " ${f} " ]] || FILES+=("$f")
+done
+
+if [ "${#FILES[@]}" -le 1 ]; then
+  echo "No duplicate found (<=1 file)."
+  exit 0
+fi
+
+echo "== Files containing /wolverine/rpc location =="
+printf " - %s\n" "${FILES[@]}"
+echo
+
+echo "== 2) Choose the file to KEEP (prefer sites-enabled/fireinners.online*) =="
+KEEP=""
+for f in "${FILES[@]}"; do
+  if [[ "$f" =~ /etc/nginx/sites-enabled/fireinners\.online ]]; then
+    KEEP="$f"
+    break
+  fi
+done
+if [ -z "$KEEP" ]; then
+  KEEP="${FILES[0]}"
+fi
+echo "KEEP: $KEEP"
+echo
+
+echo "== 3) Patch other files to disable duplicate location =="
+TS="$(date +%Y%m%d_%H%M%S)"
+for f in "${FILES[@]}"; do
+  [ "$f" = "$KEEP" ] && continue
+  echo "--- disabling duplicates in: $f ---"
+  cp -a "$f" "$f.bak_$TS"
+
+  # Rename the location path so it no longer collides
+  sed -i -E \
+    's@(location[[:space:]]*=*[[:space:]]*)/wolverine/rpc\b@\1/wolverine/rpc_DISABLED@g' \
+    "$f"
+done
 
 echo
-echo "== 2) Where is /wolverine/rpc defined (ACTIVE config, not backups) =="
-grep -nE 'location\s*=*\s*/wolverine/rpc|/wolverine/rpc' /tmp/nginxT.txt | head -n 80
+echo "== 4) nginx config test =="
+nginx -t
 
 echo
-echo "== 3) Print the location block context (the real one nginx is using) =="
-python3 - <<'PY'
-import re
-p=open("/tmp/nginxT.txt","r",errors="ignore").read().splitlines()
-hits=[i for i,l in enumerate(p) if re.search(r'location\s*=*\s*/wolverine/rpc', l)]
-if not hits:
-  hits=[i for i,l in enumerate(p) if "/wolverine/rpc" in l]
-for h in hits[:3]:
-  s=max(0,h-25); e=min(len(p),h+120)
-  print("\n---- CONTEXT %d-%d ----" % (s+1,e))
-  for i in range(s,e):
-    print(f"{i+1}: {p[i]}")
-PY
+echo "== 5) reload nginx =="
+systemctl reload nginx || service nginx reload
 
 echo
-echo "== 4) Find common blockers related to 403/deny/auth/limit/error_page =="
-grep -nE 'deny\s+all;|allow\s+127\.0\.0\.1;|return\s+403;|auth_basic|satisfy|limit_req|error_page\s+403' /tmp/nginxT.txt | head -n 200
+echo "== 6) Re-check duplicates (should be 1) =="
+grep -RIn -E 'location\s*=*\s*/wolverine/rpc\b' /etc/nginx | grep -vE '\.bak_|\.bak$' | head -n 30 || true
 
 echo
-echo "DONE ✅  (Send me the CONTEXT block that contains the location /wolverine/rpc)"
+echo "DONE ✅"
 BASH
 
-chmod +x /root/show_active_wolverine_rpc_block.sh
-/root/show_active_wolverine_rpc_block.sh
+chmod +x /root/fix_duplicate_wolverine_rpc_location.sh
+/root/fix_duplicate_wolverine_rpc_location.sh
