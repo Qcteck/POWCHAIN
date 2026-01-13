@@ -1,151 +1,62 @@
-cat >/root/traderone_full_audit_hardening.sh <<'BASH'
+cat >/root/enable_traderone_lockdown_nginx.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 TS="$(date -u +%Y%m%d_%H%M%S)"
 
-APP="/opt/traderone-opt"
-OUT="/root/traderone_audit_${TS}.log"
-
-exec > >(tee -a "$OUT") 2>&1
-
-echo "=== TIME/HOST ==="
-date -u
-hostname
-echo "Log: $OUT"
-echo
-
-echo "=== 1) Quick node/pm2 inventory ==="
-command -v pm2 >/dev/null 2>&1 && pm2 list || echo "pm2 not installed"
-ps auxww | grep -E "[n]ode|[p]m2" | head -n 80
-echo
-
-echo "=== 2) Listening ports (exposure check) ==="
-ss -lntp | sed -n '1,200p'
-echo
-
-echo "=== 3) APP sanity ==="
-if [ ! -d "$APP" ]; then
-  echo "❌ Missing $APP"
-  exit 0
-fi
-ls -lah "$APP" | sed -n '1,140p'
-echo
-
-echo "=== 4) Confirm LIVE server.js (not a symlink) ==="
-readlink -f "$APP/server.js" || true
-stat "$APP/server.js" || true
-echo
-
-echo "=== 5) Backups list (server.js*) ==="
-ls -ltah "$APP"/server.js* 2>/dev/null | head -n 50 || true
-echo
-
-echo "=== 6) Extract routes (top 120 lines of route defs) ==="
-# (No secrets printed; just code lines already in file)
-grep -nE "app\.(get|post|put|delete)\(|router\.(get|post|put|delete)\(" "$APP/server.js" | head -n 120 || true
-echo
-
-echo "=== 7) Find LI.FI/Jupiter mentions (top 120) ==="
-grep -nE "lifi|li\.fi|LI\.FI|jupiter|quote|route|routes|bridge|swap" "$APP/server.js" | head -n 120 || true
-echo
-
-echo "=== 8) Find key-material *references* (paths only, not values) ==="
-grep -nE "KEYFILE|BOT_WALLET|DEPOSIT|secretKey|privateKey|mnemonic|seed|fromSecretKey|Keypair\.from|process\.env" "$APP/server.js" | head -n 120 || true
-echo
-
-echo "=== 9) Nginx: locate exposure of /wolverine/traderone/api ==="
-if command -v nginx >/dev/null 2>&1; then
-  nginx -T 2>/dev/null | grep -nE "wolverine/traderone/api|location\s+\^~\s+/wolverine/|proxy_pass|alias\s+|root\s+" | head -n 200 || true
-  echo
-  echo "nginx config test:"
-  nginx -t || true
-else
-  echo "nginx not installed"
-fi
-echo
-
-echo "=== 10) Create an nginx hardening snippet (NOT auto-enabled) ==="
 SNIP="/etc/nginx/snippets/traderone_api_lockdown.conf"
-mkdir -p /etc/nginx/snippets
-cat >"$SNIP" <<'NG'
-# TraderOne API lockdown (include inside the right server{} block)
-# Recommended: API not public.
-# Allow only localhost (add your admin IP if needed).
-location ^~ /wolverine/traderone/api/ {
-  allow 127.0.0.1;
-  deny all;
-}
+test -f "$SNIP" || { echo "❌ Missing $SNIP"; exit 1; }
 
-# If you also expose /api/, lock it too (uncomment if applicable):
-# location ^~ /api/ {
-#   allow 127.0.0.1;
-#   deny all;
-# }
-NG
-chmod 0644 "$SNIP"
-echo "Wrote: $SNIP"
-echo "➡️ To enable: add inside the correct server{}:  include /etc/nginx/snippets/traderone_api_lockdown.conf;"
-echo
-
-echo "=== 11) File permissions hardening (.env + keys) ==="
-# Back up before changing perms
-if [ -f "$APP/.env" ]; then
-  cp -a "$APP/.env" "$APP/.env.bak_${TS}"
-  chown root:root "$APP/.env"
-  chmod 600 "$APP/.env"
-  echo "Hardened: $APP/.env (backup: .env.bak_${TS})"
-else
-  echo "No $APP/.env found"
+echo "== 1) Find nginx site file containing /wolverine/traderone/api =="
+SITE_FILE="$(grep -RIl --line-number "wolverine/traderone/api" /etc/nginx 2>/dev/null | head -n 1 || true)"
+if [ -z "${SITE_FILE:-}" ]; then
+  echo "❌ Could not find nginx config containing 'wolverine/traderone/api'"
+  echo "Try: nginx -T | grep -n wolverine/traderone/api"
+  exit 1
 fi
-
-if [ -d "$APP/keys" ]; then
-  chown -R root:root "$APP/keys"
-  chmod 700 "$APP/keys"
-  chmod 600 "$APP/keys"/* 2>/dev/null || true
-  echo "Hardened: $APP/keys (700 dir, 600 files)"
-else
-  echo "No $APP/keys/ found"
-fi
+echo "Found: $SITE_FILE"
 echo
 
-echo "=== 12) OPTIONAL: generate an API key (append to .env) ==="
-if [ -f "$APP/.env" ]; then
-  if ! grep -qE '^API_KEY=' "$APP/.env"; then
-    (umask 077; printf "API_KEY=%s\n" "$(openssl rand -hex 24)" >> "$APP/.env")
-    echo "Added API_KEY to .env"
-  else
-    echo "API_KEY already present in .env"
-  fi
-else
-  echo "Skip (no .env)"
-fi
+echo "== 2) Backup =="
+cp -a "$SITE_FILE" "${SITE_FILE}.bak_${TS}"
+echo "Backup: ${SITE_FILE}.bak_${TS}"
 echo
 
-echo "=== 13) What to do next (manual, safe) ==="
-cat <<'NEXT'
-1) Enable nginx lockdown (recommended):
-   - open the correct site config in /etc/nginx/sites-enabled/
-   - inside the correct server{...} block, add:
-       include /etc/nginx/snippets/traderone_api_lockdown.conf;
-   - then run:
-       nginx -t && systemctl reload nginx
+echo "== 3) Add include inside the first matching server{} if missing =="
+python3 - <<'PY'
+from pathlib import Path
+import re, sys
 
-2) Add server-side auth middleware (defense-in-depth):
-   - In /opt/traderone-opt/server.js, add a middleware that checks:
-       header: X-API-KEY === process.env.API_KEY
-     and apply it to:
-       /wolverine/traderone/api
-       /api
-     (I can give you the exact few lines to paste once you show the routes list.)
+site = Path(sys.argv[1])
+snip = sys.argv[2]
+s = site.read_text(errors="ignore")
 
-3) If your Node process runs as www-data and now can’t read keys/.env:
-   - DO NOT loosen perms publicly.
-   - Create a dedicated group + least-privilege access.
-NEXT
+include_line = f"include {snip};"
+if include_line in s:
+    print("OK: include already present")
+    sys.exit(0)
+
+# naive but effective: find server block that mentions wolverine/traderone/api
+# and inject include near top of that server{}
+m = re.search(r"(server\s*\{.*?wolverine/traderone/api.*?\})", s, flags=re.S)
+if not m:
+    print("❌ No server{} block containing wolverine/traderone/api found in this file")
+    sys.exit(2)
+
+block = m.group(1)
+# insert include right after opening brace
+block2 = re.sub(r"server\s*\{\s*", lambda m: m.group(0) + "\n  " + include_line + "\n", block, count=1)
+
+s2 = s[:m.start(1)] + block2 + s[m.end(1):]
+site.write_text(s2)
+print("OK: include injected")
+PY "$SITE_FILE" "$SNIP"
 echo
 
+echo "== 4) Test + reload nginx =="
+nginx -t
+systemctl reload nginx || service nginx reload
 echo "DONE ✅"
 BASH
 
-chmod +x /root/traderone_full_audit_hardening.sh
-/root/traderone_full_audit_hardening.sh
+chmod +x /root/enable_traderone_lockdown_nginx.sh
+/root/enable_traderone_lockdown_nginx.sh
