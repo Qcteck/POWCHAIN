@@ -1,28 +1,35 @@
-cat >/root/fix_location_not_allowed_wolverine.sh <<'BASH'
+cat >/root/fix_unexpected_brace_fireinners_ssl.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-HOST="fireinners.online"
-VHOST="/etc/nginx/sites-enabled/${HOST}-ssl"
+VHOST="/etc/nginx/sites-enabled/fireinners.online-ssl"
 SNIP="/etc/nginx/snippets/wolverine_routes.conf"
-TS="$(date +%Y%m%d_%H%M%S)"
 
-test -f "$VHOST" || { echo "Missing $VHOST"; exit 1; }
+echo "== 1) Show error context =="
+nl -ba "$VHOST" | sed -n '30,55p'
 
-echo "== 1) Backup =="
-cp -a "$VHOST" "$VHOST.bak_$TS"
+echo
+echo "== 2) Find latest backup of vhost =="
+LATEST="$(ls -1t ${VHOST}.bak_* 2>/dev/null | head -n 1 || true)"
+echo "LATEST=$LATEST"
+[ -n "$LATEST" ] || { echo "No backup found (${VHOST}.bak_*)"; exit 1; }
 
-echo "== 2) Write snippet with wolverine routes =="
+echo
+echo "== 3) Restore backup =="
+cp -a "$VHOST" "${VHOST}.broken_$(date +%Y%m%d_%H%M%S)"
+cp -a "$LATEST" "$VHOST"
+
+echo
+echo "== 4) Ensure snippet exists (write if missing) =="
+if [ ! -f "$SNIP" ]; then
 cat > "$SNIP" <<'NGX'
-# ---- Wolverine routes (included inside server {}) ----
+# ---- Wolverine routes (include inside server {}) ----
 
-# UI under /wolverine/
 location ^~ /wolverine/ {
   alias /var/www/wolverine/;
   try_files $uri $uri/ /wolverine/index.html;
 }
 
-# Traderone API under /wolverine/traderone/api/
 location = /wolverine/traderone/api {
   return 301 /wolverine/traderone/api/;
 }
@@ -38,22 +45,26 @@ location ^~ /wolverine/traderone/api/ {
   proxy_pass http://127.0.0.1:8585;
 }
 NGX
+fi
 
-echo "== 3) Patch vhost: ensure include is INSIDE server{} and comment any trailing location blocks outside =="
-python3 - <<PY
+echo
+echo "== 5) Insert include INSIDE first server{} only =="
+python3 - <<'PY'
 import re
-VHOST="${VHOST}"
-SNIP="${SNIP}"
+VHOST="/etc/nginx/sites-enabled/fireinners.online-ssl"
+SNIP="/etc/nginx/snippets/wolverine_routes.conf"
+
 lines=open(VHOST,"r",errors="ignore").read().splitlines(True)
 
-# find first "server {" and its matching closing brace
+# find first server {
 start=None
 for i,l in enumerate(lines):
     if re.search(r'^\s*server\s*\{', l):
         start=i; break
 if start is None:
-    raise SystemExit("No server { found in vhost")
+    raise SystemExit("No server { found")
 
+# find its matching closing brace
 depth=0
 end=None
 for i in range(start, len(lines)):
@@ -65,35 +76,27 @@ for i in range(start, len(lines)):
 if end is None:
     raise SystemExit("Could not find end of server block (brace mismatch)")
 
-server_block = lines[:end+1]
-trailing = lines[end+1:]
+server = lines[:end+1]
+rest   = lines[end+1:]
 
-# ensure include inside server block (before its final "}")
-inc_line = f"  include {SNIP};\n"
-if not any(SNIP in l for l in server_block):
-    # insert right before end brace
-    server_block.insert(len(server_block)-1, inc_line)
+inc = f"  include {SNIP};\n"
+if not any(SNIP in l for l in server):
+    server.insert(len(server)-1, inc)
 
-# comment out any 'location' directives that are trailing (outside server)
-new_trailing=[]
-for l in trailing:
-    if re.search(r'^\s*location\b', l) or '/wolverine/' in l:
-        new_trailing.append("# DISABLED_OUTSIDE_SERVER " + l)
-    else:
-        new_trailing.append(l)
-
-open(VHOST,"w").writelines(server_block + new_trailing)
+open(VHOST,"w").writelines(server + rest)
 PY
 
-echo "== 4) nginx -t && reload =="
+echo
+echo "== 6) nginx -t && reload =="
 nginx -t
 systemctl reload nginx || service nginx reload
 
-echo "== 5) Quick tests =="
+echo
+echo "== 7) Quick tests =="
 curl -sk -o /dev/null -w "UI /wolverine/ : %{http_code}\n" https://fireinners.online/wolverine/
 curl -sk -o /dev/null -w "Traderone health : %{http_code}\n" https://fireinners.online/wolverine/traderone/api/health
 echo "DONE ✅"
 BASH
 
-chmod +x /root/fix_location_not_allowed_wolverine.sh
-/root/fix_location_not_allowed_wolverine.sh
+chmod +x /root/fix_unexpected_brace_fireinners_ssl.sh
+/root/fix_unexpected_brace_fireinners_ssl.sh
