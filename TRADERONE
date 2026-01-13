@@ -1,72 +1,9 @@
-cat >/root/add_send_sol_button_from_vps_key.sh <<'BASH'
-#!/usr/bin/env bash
-set -euo pipefail
+# 1) retrouve quel index.html a été patché (si tu ne sais plus)
+find /var/www/wolverine /var/www /usr/share/nginx/html -maxdepth 4 -type f -name index.html 2>/dev/null | head -n 5
 
-SEARCH_KEYS=(
-  "/root/.config/solana/id.json"
-  "/home/*/.config/solana/id.json"
-  "/opt/*/id.json"
-)
+# 2) check que le bouton + le script sont bien dedans
+grep -RIn 'id="sendSolBtn"|WOLVERINE_SEND_SOL_SCRIPT|WOLVERINE_WALLET' \
+  /var/www/wolverine /var/www /usr/share/nginx/html 2>/dev/null | head -n 40
 
-echo "== 1) Recherche d'une clé Solana =="
-KEYFILE=""
-for p in "${SEARCH_KEYS[@]}"; do
-  for f in $p; do
-    if [ -f "$f" ]; then KEYFILE="$f"; break 2; fi
-  done
-done
-
-if [ -z "$KEYFILE" ]; then
-  echo "❌ Aucune clé Solana trouvée. Où est le fichier ? (ex: /root/.config/solana/id.json)"
-  exit 1
-fi
-
-echo "Clé trouvée : $KEYFILE"
-
-echo "== 2) Extraction de la public key =="
-PUBKEY="$(solana-keygen pubkey "$KEYFILE")"
-echo "Public key = $PUBKEY"
-
-RPC_URL="https://api.mainnet-beta.solana.com"
-
-SEARCH_DIRS=(/var/www/wolverine /var/www /usr/share/nginx/html)
-
-echo "== 3) Recherche de index.html =="
-TARGET=""
-for d in "${SEARCH_DIRS[@]}"; do
-  if [ -f "$d/index.html" ]; then TARGET="$d/index.html"; break; fi
-done
-
-if [ -z "$TARGET" ]; then
-  TARGET="$(find "${SEARCH_DIRS[@]}" -maxdepth 4 -type f -name index.html 2>/dev/null | head -n 1 || true)"
-fi
-
-if [ -z "$TARGET" ]; then
-  echo "❌ index.html introuvable"
-  exit 1
-fi
-
-echo "UI = $TARGET"
-
-TS="$(date +%Y%m%d_%H%M%S)"
-cp -a "$TARGET" "${TARGET}.bak_${TS}"
-
-echo "== 4) Ajout du bouton si absent =="
-if ! grep -q 'id="sendSolBtn"' "$TARGET"; then
-  sed -i -E '0,/<body[^>]*>/s//&\n  <button id="sendSolBtn">Envoyer SOL au wallet WOLVERINE<\/button>\n/' "$TARGET"
-fi
-
-echo "== 5) Ajout du script SOL =="
-if ! grep -q 'WOLVERINE_SEND_SOL_SCRIPT' "$TARGET"; then
-perl -0777 -i -pe 's@</body>@<script type="module">\n/* WOLVERINE_SEND_SOL_SCRIPT */\nimport { Connection, PublicKey, SystemProgram, Transaction, LAMPORTS_PER_SOL } from "https://cdn.skypack.dev/@solana/web3.js";\n\nconst RPC = "'"$RPC_URL"'";\nconst WOLVERINE_WALLET = new PublicKey("'"$PUBKEY"'");\n\nasync function sendSol(amountSol) {\n  const provider = window.solana;\n  if (!provider?.isPhantom) throw new Error(\"Phantom non détecté\");\n  await provider.connect();\n\n  const connection = new Connection(RPC, \"confirmed\");\n  const fromPubkey = provider.publicKey;\n\n  const tx = new Transaction().add(\n    SystemProgram.transfer({\n      fromPubkey,\n      toPubkey: WOLVERINE_WALLET,\n      lamports: Math.round(amountSol * LAMPORTS_PER_SOL),\n    })\n  );\n\n  tx.feePayer = fromPubkey;\n  const { blockhash } = await connection.getLatestBlockhash(\"finalized\");\n  tx.recentBlockhash = blockhash;\n\n  const signed = await provider.signTransaction(tx);\n  const sig = await connection.sendRawTransaction(signed.serialize());\n  await connection.confirmTransaction(sig, \"confirmed\");\n  return sig;\n}\n\ndocument.getElementById(\"sendSolBtn\")?.addEventListener(\"click\", async () => {\n  const amount = Number(prompt(\"Montant en SOL à envoyer :\") || \"0\");\n  if (!amount || amount <= 0) return;\n  try {\n    const sig = await sendSol(amount);\n    alert(\"Envoyé ✅ Tx: \" + sig);\n  } catch (e) {\n    alert(\"Erreur: \" + (e?.message || e));\n  }\n});\n</script>\n</body>@s' "$TARGET"
-fi
-
-echo "== 6) Reload nginx =="
-systemctl reload nginx || service nginx reload
-
-echo "DONE ✅"
-echo "Wallet WOLVERINE utilisé : $PUBKEY"
-BASH
-
-chmod +x /root/add_send_sol_button_from_vps_key.sh
-/root/add_send_sol_button_from_vps_key.sh
+# 3) vérif que le site sert bien le bon fichier
+curl -sk https://fireinners.online/wolverine/ | grep -n 'sendSolBtn\|WOLVERINE_SEND_SOL_SCRIPT' || echo "Pas trouvé dans le HTML servi"
