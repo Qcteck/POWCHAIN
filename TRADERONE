@@ -1,31 +1,15 @@
-cat >/root/fix_blob_encode_lamports_buffer.sh <<'BASH'
+cat >/root/fix_require_not_defined_and_balance.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 TS="$(date +%Y%m%d_%H%M%S)"
 DIR="/var/www/wolverine"
 HTML="$DIR/index.html"
+BAL="$DIR/phantom_balances.js"
+PATCH="$DIR/phantom_patch.js"
 
-test -f "$HTML" || { echo "❌ Missing $HTML"; exit 1; }
 cp -a "$HTML" "${HTML}.bak_${TS}"
 
-echo "== 1) Download a REAL buffer polyfill locally (try multiple CDNs) =="
-OUT="$DIR/buffer.real.min.js"
-urls=(
-  "https://cdn.jsdelivr.net/npm/buffer@6.0.3/umd/buffer.min.js"
-  "https://cdn.jsdelivr.net/npm/buffer@6.0.3/index.min.js"
-  "https://unpkg.com/buffer@6.0.3/index.min.js"
-  "https://cdnjs.cloudflare.com/ajax/libs/buffer/6.0.3/buffer.min.js"
-)
-ok=0
-for u in "${urls[@]}"; do
-  echo "TRY: $u"
-  if curl -fsSL "$u" -o "$OUT"; then ok=1; echo "OK: $u"; break; else echo "FAIL"; fi
-done
-[ "$ok" -eq 1 ] || { echo "❌ Could not download buffer polyfill"; exit 1; }
-chmod 0644 "$OUT"
-ls -lah "$OUT"
-
-echo "== 2) Patch index.html: remove all old Buffer hacks + inject ONE clean polyfill in <head> =="
+echo "== 1) index.html: remove broken buffer.real.min.js + remove Buffer hacks =="
 python3 - <<'PY'
 from pathlib import Path
 import re
@@ -33,61 +17,77 @@ import re
 p=Path("/var/www/wolverine/index.html")
 s=p.read_text(errors="ignore")
 
-# remove any previous injected polyfills and any script tags containing "buffer"
+# remove our injected blocks
 s = re.sub(r"<!--\s*WOLVERINE_BUFFER_POLYFILL\s*-->.*?(?=</head>)", "", s, flags=re.S|re.I)
-s = re.sub(r'<script[^>]+src=["\'][^"\']*buffer[^"\']*["\'][^>]*>\s*</script>\s*', '', s, flags=re.I)
 
-poly = r"""
+# remove any buffer.* includes we added
+s = re.sub(r'<script[^>]+src=["\'][^"\']*(?:buffer\.real\.min\.js|buffer\.umd\.min\.js|buffer\.min\.js)[^"\']*["\'][^>]*>\s*</script>\s*', '', s, flags=re.I)
+
+# remove any "lock Buffer" / "Object.defineProperty(window, 'Buffer'" blocks if present
+s = re.sub(r'Object\.defineProperty\(window,\s*["\']Buffer["\'].*?\);\s*', '', s, flags=re.S)
+
+# add a tiny post-web3 sanity (does NOT override if already good)
+sanity = r"""
 <!-- WOLVERINE_BUFFER_POLYFILL -->
 <script>
-  // minimal globals expected by some bundles
-  window.global = window;
-  window.process = window.process || { env: {} };
-</script>
-<script src="/wolverine/buffer.real.min.js"></script>
-<script>
-  // buffer package exposes window.buffer.Buffer (the real one with Buffer.from, alloc, etc.)
-  if (window.buffer && window.buffer.Buffer) {
-    window.Buffer = window.buffer.Buffer;
-  }
+  // Do NOT override Buffer. Just warn if missing.
+  setTimeout(() => {
+    if (!window.Buffer || typeof window.Buffer.from !== "function") {
+      console.warn("Buffer missing/invalid. Ensure @solana/web3.js iife is loaded before wallet scripts.");
+    }
+  }, 0);
 </script>
 """
-
 if "</head>" in s:
-    s = s.replace("</head>", poly + "\n</head>", 1)
-else:
-    s = poly + "\n" + s
+    s = s.replace("</head>", sanity + "\n</head>", 1)
 
 p.write_text(s)
-print("OK: clean Buffer polyfill injected")
+print("OK: removed broken buffer polyfills; kept only a sanity warning")
 PY
 
-echo "== 3) Patch the Send SOL script: force lamports to BigInt (u64) =="
-python3 - <<'PY'
+echo "== 2) phantom_balances.js: avoid res.json() twice + slow polling =="
+if [ -f "$BAL" ]; then
+  cp -a "$BAL" "${BAL}.bak_${TS}"
+  python3 - <<'PY'
 from pathlib import Path
 import re
-p=Path("/var/www/wolverine/index.html")
+p=Path("/var/www/wolverine/phantom_balances.js")
 s=p.read_text(errors="ignore")
 
-# replace lamports calc if present
-s = re.sub(
-  r"lamports:\s*Math\.round\(\s*amountSol\s*\*\s*solanaWeb3\.LAMPORTS_PER_SOL\s*\)",
-  r"lamports: BigInt(Math.round(amountSol * solanaWeb3.LAMPORTS_PER_SOL))",
-  s
-)
+# Slow down any tight setInterval
+s = re.sub(r"setInterval\(([^,]+),\s*(\d+)\s*\)", lambda m: f"setInterval({m.group(1)}, 5000)", s)
+
+# Fix common bug: calling res.json() more than once.
+# Replace patterns like:
+#   const j = await res.json(); ... await res.json()
+# best-effort: ensure only one parse and reuse variable "j"
+s = re.sub(r"await\s+res\.json\(\)\s*;", "await res.clone().json();", s)
 
 p.write_text(s)
-print("OK: lamports now BigInt")
+print("OK: balances script adjusted (best-effort)")
 PY
+fi
+
+echo "== 3) phantom_patch.js: guard missing DOM elements (.value of undefined) =="
+if [ -f "$PATCH" ]; then
+  cp -a "$PATCH" "${PATCH}.bak_${TS}"
+  python3 - <<'PY'
+from pathlib import Path
+import re
+p=Path("/var/www/wolverine/phantom_patch.js")
+s=p.read_text(errors="ignore")
+
+# Guard ".value" reads on querySelector results (best-effort)
+s = re.sub(r"(document\.querySelector\([^)]+\))\.value", r"(\1 && \1.value)", s)
+
+p.write_text(s)
+print("OK: phantom_patch guarded")
+PY
+fi
 
 systemctl reload nginx || service nginx reload
-
-echo
-echo "== ORIGIN checks =="
-curl -sk --resolve fireinners.online:443:127.0.0.1 https://fireinners.online/wolverine/ | grep -n "WOLVERINE_BUFFER_POLYFILL" && echo "HTML OK ✅" || echo "HTML NOT OK ❌"
-curl -sk --resolve fireinners.online:443:127.0.0.1 -I https://fireinners.online/wolverine/buffer.real.min.js | sed -n '1,12p'
 echo "DONE ✅"
 BASH
 
-chmod +x /root/fix_blob_encode_lamports_buffer.sh
-/root/fix_blob_encode_lamports_buffer.sh
+chmod +x /root/fix_require_not_defined_and_balance.sh
+/root/fix_require_not_defined_and_balance.sh
