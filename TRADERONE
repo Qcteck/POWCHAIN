@@ -1,46 +1,86 @@
-cat >/root/purge_all_sites_enabled_backups.sh <<'BASH'
+cat >/root/wolverine_nocache_safe.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-EN="/etc/nginx/sites-enabled"
-DST="/etc/nginx/sites-disabled/cleanup_$(date +%Y%m%d_%H%M%S)"
-mkdir -p "$DST"
+VHOST="/etc/nginx/sites-enabled/fireinners.online-ssl"
+BKDIR="/etc/nginx/sites-disabled/cleanup_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$BKDIR"
 
-echo "== BEFORE =="
-ls -lah "$EN"
+test -f "$VHOST" || { echo "❌ Missing $VHOST"; exit 1; }
+cp -a "$VHOST" "$BKDIR/fireinners.online-ssl.bak"
 
-echo
-echo "== Move ALL backups/variants out of sites-enabled =="
-shopt -s nullglob
-for f in "$EN"/*.bak* "$EN"/*_bak* "$EN"/*.broken* "$EN"/*.old* "$EN"/*~; do
-  [ -e "$f" ] || continue
-  echo "MOVE: $f -> $DST/"
-  mv -v "$f" "$DST/"
-done
+python3 - <<'PY'
+import re
+p="/etc/nginx/sites-enabled/fireinners.online-ssl"
+s=open(p,"r",errors="ignore").read()
 
-echo
-echo "== Also move any fireinners.* variants except the exact live file =="
-KEEP="$EN/fireinners.online-ssl"
-for f in "$EN"/fireinners.online-ssl*; do
-  [ -e "$f" ] || continue
-  [ "$f" = "$KEEP" ] && continue
-  echo "MOVE: $f -> $DST/"
-  mv -v "$f" "$DST/"
-done
+# remove any previous nocache block
+s = re.sub(r"\n?\s*#\s*WOLVERINE_NOCACHE_BEGIN.*?#\s*WOLVERINE_NOCACHE_END\s*\n?", "\n", s, flags=re.S)
 
-echo
-echo "== AFTER (should show only fireinners.online-ssl + maybe other real vhosts) =="
-ls -lah "$EN"
+lines=s.splitlines(True)
 
-echo
-echo "== nginx -t =="
+# find first server block
+start=None
+for i,l in enumerate(lines):
+    if re.search(r'^\s*server\s*\{', l):
+        start=i; break
+if start is None:
+    raise SystemExit("No server { found in vhost")
+
+depth=0
+end=None
+for i in range(start, len(lines)):
+    depth += lines[i].count("{")
+    depth -= lines[i].count("}")
+    if depth==0 and i>start:
+        end=i
+        break
+if end is None:
+    raise SystemExit("Brace mismatch in server block")
+
+before=lines[:start]
+server=lines[start:end+1]
+after=lines[end+1:]
+
+block = """
+  # WOLVERINE_NOCACHE_BEGIN
+  # Empêche HTML SPA d'être caché (Cloudflare / navigateurs)
+  location = /wolverine/ {
+    add_header Cache-Control "no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0" always;
+    add_header Pragma "no-cache" always;
+    add_header Expires "0" always;
+    return 301 /wolverine/index.html;
+  }
+
+  location = /wolverine/index.html {
+    add_header Cache-Control "no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0" always;
+    add_header Pragma "no-cache" always;
+    add_header Expires "0" always;
+    try_files /wolverine/index.html =404;
+  }
+  # WOLVERINE_NOCACHE_END
+"""
+
+# inject just before closing brace of server
+server.insert(len(server)-1, block + "\n")
+
+open(p,"w").write("".join(before+server+after))
+print("OK: nocache injected inside server{}")
+PY
+
 nginx -t
+systemctl reload nginx || service nginx reload
 
 echo
-echo "== reload =="
-systemctl reload nginx || service nginx reload
-echo "DONE ✅"
+echo "== ORIGIN headers (bypass CF) =="
+curl -skI --resolve fireinners.online:443:127.0.0.1 https://fireinners.online/wolverine/index.html | sed -n '1,25p'
+
+echo
+echo "== PUBLIC cache-bust grep =="
+curl -sk "https://fireinners.online/wolverine/index.html?v=$(date +%s)" \
+ | grep -nE 'sendSolBtn|WOLVERINE_SEND_SOL_SCRIPT' \
+ && echo "PUBLIC OK ✅" || echo "PUBLIC STILL OLD ❌"
 BASH
 
-chmod +x /root/purge_all_sites_enabled_backups.sh
-/root/purge_all_sites_enabled_backups.sh
+chmod +x /root/wolverine_nocache_safe.sh
+/root/wolverine_nocache_safe.sh
