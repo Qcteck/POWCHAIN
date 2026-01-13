@@ -1,123 +1,32 @@
-cat >/root/fix_web3_import_and_rpc_403.sh <<'BASH'
+cat >/root/fix_duplicate_wolverine_rpc_location.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
+INC="/etc/nginx/includes/wolverine_routes.inc"
 TS="$(date +%Y%m%d_%H%M%S)"
 
-HTML="/var/www/wolverine/index.html"
-INC="/etc/nginx/includes/wolverine_routes.inc"
-
-echo "== 1) Patch UI: replace ESM import with IIFE bundle (solanaWeb3) =="
-test -f "$HTML" || { echo "Missing $HTML"; exit 1; }
-cp -a "$HTML" "${HTML}.bak_${TS}"
-
-# get pubkey from VPS if possible
-KEYFILE=""
-for f in /root/.config/solana/id.json /home/*/.config/solana/id.json; do
-  [ -f "$f" ] && KEYFILE="$f" && break
-done
-if [ -n "$KEYFILE" ] && command -v solana-keygen >/dev/null 2>&1; then
-  PUBKEY="$(solana-keygen pubkey "$KEYFILE")"
-else
-  PUBKEY="REMPLACE_PAR_PUBLIC_KEY_WOLVERINE"
-fi
-export PUBKEY
-
-python3 - <<'PY'
-import os, re
-from pathlib import Path
-p=Path("/var/www/wolverine/index.html")
-s=p.read_text(errors="ignore")
-pubkey=os.environ.get("PUBKEY","REMPLACE_PAR_PUBLIC_KEY_WOLVERINE")
-
-# remove previous injected script block if present
-s = re.sub(r"<script type=\"module\">\s*/\* WOLVERINE_SEND_SOL_SCRIPT \*/.*?</script>\s*",
-           "", s, flags=re.S)
-
-# ensure button exists
-if 'id="sendSolBtn"' not in s:
-    s=re.sub(r"(<body[^>]*>)",
-             r"\1\n  <button id=\"sendSolBtn\" style=\"position:fixed;bottom:18px;right:18px;z-index:9999;\">Envoyer SOL au wallet WOLVERINE</button>\n",
-             s, count=1)
-
-# inject IIFE bundle + script (no ESM imports)
-inject = f"""
-<script src="https://cdn.jsdelivr.net/npm/@solana/web3.js@1.98.0/lib/index.iife.min.js"></script>
-<script>
-/* WOLVERINE_SEND_SOL_SCRIPT */
-(function() {{
-  const RPC = "/wolverine/rpc"; // same-origin proxy
-  const WOLVERINE_WALLET = new solanaWeb3.PublicKey("{pubkey}");
-
-  async function sendSol(amountSol) {{
-    const provider = window.solana;
-    if (!provider || !provider.isPhantom) throw new Error("Phantom non détecté");
-    await provider.connect();
-
-    const connection = new solanaWeb3.Connection(RPC, "confirmed");
-    const fromPubkey = provider.publicKey;
-
-    const tx = new solanaWeb3.Transaction().add(
-      solanaWeb3.SystemProgram.transfer({{
-        fromPubkey,
-        toPubkey: WOLVERINE_WALLET,
-        lamports: Math.round(amountSol * solanaWeb3.LAMPORTS_PER_SOL),
-      }})
-    );
-
-    tx.feePayer = fromPubkey;
-    const bh = await connection.getLatestBlockhash("finalized");
-    tx.recentBlockhash = bh.blockhash;
-
-    const signed = await provider.signTransaction(tx);
-    const sig = await connection.sendRawTransaction(signed.serialize());
-    await connection.confirmTransaction(sig, "confirmed");
-    return sig;
-  }}
-
-  const btn = document.getElementById("sendSolBtn");
-  if (btn) {{
-    btn.addEventListener("click", async () => {{
-      const amount = Number(prompt("Montant en SOL à envoyer :") || "0");
-      if (!amount || amount <= 0) return;
-      try {{
-        const sig = await sendSol(amount);
-        alert("Envoyé ✅ Tx: " + sig);
-      }} catch (e) {{
-        alert("Erreur: " + ((e && e.message) ? e.message : String(e)));
-      }}
-    }});
-  }}
-}})();
-</script>
-"""
-
-if "</body>" in s:
-    s = s.replace("</body>", inject + "\n</body>", 1)
-else:
-    s += "\n" + inject
-
-p.write_text(s)
-print("OK: UI patched (IIFE bundle) pubkey=" + pubkey)
-PY
-
-echo
-echo "== 2) Ensure nginx /wolverine/rpc proxy exists (POST) =="
-test -f "$INC" || { echo "Missing $INC"; exit 1; }
+test -f "$INC" || { echo "❌ Missing $INC"; exit 1; }
 cp -a "$INC" "${INC}.bak_${TS}"
 
-# add/replace rpc location (idempotent via markers)
 python3 - <<'PY'
-import re
-p="/etc/nginx/includes/wolverine_routes.inc"
-s=open(p,"r",errors="ignore").read()
+import re, pathlib
 
+p = pathlib.Path("/etc/nginx/includes/wolverine_routes.inc")
+s = p.read_text(errors="ignore")
+
+# 1) remove any marker-based blocks we injected before
 s = re.sub(r"\n?#\s*WOLVERINE_RPC_PROXY_BEGIN.*?#\s*WOLVERINE_RPC_PROXY_END\s*\n?", "\n", s, flags=re.S)
+s = re.sub(r"\n?#\s*WOLVERINE_RPC_PROXY.*?(?=\n#|\Z)", "\n", s, flags=re.S)
 
+# 2) remove ANY existing nginx location blocks for /wolverine/rpc (duplicate killer)
+#    (best-effort regex: location = /wolverine/rpc { ... })
+s = re.sub(r"\n\s*location\s*=\s*/wolverine/rpc\s*\{.*?\n\s*\}\s*\n", "\n", s, flags=re.S)
+
+# 3) append one canonical block
 block = r'''
 # WOLVERINE_RPC_PROXY_BEGIN
 # Solana JSON-RPC proxy (same-origin)
 location = /wolverine/rpc {
-  # allow POST (JSON-RPC)
+  # only allow POST for JSON-RPC
   limit_except POST { deny all; }
 
   proxy_http_version 1.1;
@@ -133,33 +42,24 @@ location = /wolverine/rpc {
 }
 # WOLVERINE_RPC_PROXY_END
 '''
-
-s = s.strip() + "\n" + block + "\n"
-open(p,"w").write(s)
-print("OK: rpc proxy block installed")
+s = s.rstrip() + "\n\n" + block + "\n"
+p.write_text(s)
+print("OK: deduped /wolverine/rpc and installed single canonical block")
 PY
 
-echo
-echo "== 3) nginx -t && reload =="
+echo "== nginx -t =="
 nginx -t
 systemctl reload nginx || service nginx reload
 
 echo
-echo "== 4) Test RPC (ORIGIN bypass CF) =="
+echo "== ORIGIN RPC test (bypass CF) =="
 curl -sk --resolve fireinners.online:443:127.0.0.1 \
   -X POST https://fireinners.online/wolverine/rpc \
   -H 'Content-Type: application/json' \
-  --data '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' | head -c 200
+  --data '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' | head -c 250
 echo
-
-echo "== 5) Test RPC (PUBLIC) =="
-curl -sk -X POST https://fireinners.online/wolverine/rpc \
-  -H 'Content-Type: application/json' \
-  --data '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' | head -c 200
-echo
-
 echo "DONE ✅"
 BASH
 
-chmod +x /root/fix_web3_import_and_rpc_403.sh
-/root/fix_web3_import_and_rpc_403.sh
+chmod +x /root/fix_duplicate_wolverine_rpc_location.sh
+/root/fix_duplicate_wolverine_rpc_location.sh
