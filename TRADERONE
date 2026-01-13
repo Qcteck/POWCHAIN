@@ -1,32 +1,81 @@
-cat >/root/check_usdc_accounts_fixed3.sh <<'BASH'
+cat >/root/branch_ui_under_wolverine.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
+TS="$(date +%Y%m%d_%H%M%S)"
 
-RPC="https://fireinners.online/wolverine/rpc"
-USDC="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+LIVE="/var/www/wolverine"
+IDX="$LIVE/index.html"
 
-read -p "Paste Phantom address (Connected: ...): " WALLET
-WALLET="$(echo "$WALLET" | tr -d '[:space:]')"
+echo "== 0) Sanity =="
+test -d "$LIVE" || { echo "Missing $LIVE"; exit 1; }
+test -f "$IDX" || { echo "Missing $IDX"; exit 1; }
 
-PAY=$(printf '{"jsonrpc":"2.0","id":1,"method":"getTokenAccountsByOwner","params":["%s",{"mint":"%s"},{"encoding":"jsonParsed"}]}' "$WALLET" "$USDC")
-resp="$(curl -sk -H 'content-type: application/json' --data "$PAY" "$RPC")"
+echo "== 1) Backup =="
+tar -C "$LIVE" -czf "/root/wolverine_ui_backup_${TS}.tgz" .
+cp -a "$IDX" "$IDX.bak_$TS"
 
-printf '%s' "$resp" | python3 -c '
-import json,sys
-txt=sys.stdin.read().strip()
-j=json.loads(txt)
-if "error" in j:
-    print("RPC ERROR:", j["error"]); raise SystemExit(1)
-vals=j.get("result",{}).get("value",[]) or []
-print("token accounts:", len(vals))
-total=0.0
-for v in vals:
-    ta=v["account"]["data"]["parsed"]["info"]["tokenAmount"]
-    s=ta.get("uiAmountString") or "0"
-    total += float(s)
-print("USDC total:", total)
-'
+echo "== 2) Ensure <base href='/wolverine/'> in index.html =="
+if grep -qi "<base " "$IDX"; then
+  # replace existing base href
+  sed -i -E 's@<base[^>]*href="[^"]*"[^>]*>@<base href="/wolverine/">@i' "$IDX"
+else
+  # inject base into <head>
+  sed -i -E '0,/<head[^>]*>/s@<head[^>]*>@&\n  <base href="/wolverine/">@i' "$IDX"
+fi
+
+echo "== 3) Rewrite absolute HTML urls: src=/ href=/ action=/  -> /wolverine/... =="
+# NOTE: avoids rewriting already /wolverine/
+sed -i -E \
+  -e 's@(src|href|action)="/(?!wolverine/)@\1="/wolverine/@g' \
+  "$IDX" || true
+
+echo "== 4) Rewrite common JS calls in all ui files (fetch/axios/XHR absolute paths) =="
+# only touches .js .css .html
+find "$LIVE" -type f \( -name "*.js" -o -name "*.html" -o -name "*.css" \) -print0 \
+| xargs -0 sed -i -E \
+  -e 's@fetch\("/(?!wolverine/)@fetch("/wolverine/@g' \
+  -e "s@fetch\\('/(?!wolverine/)@fetch('/wolverine/@g" \
+  -e 's@axios\.(get|post|put|delete)\("/(?!wolverine/)@axios.\1("/wolverine/@g' \
+  -e "s@axios\\.(get|post|put|delete)\\('/(?!wolverine/)@axios.\1('/wolverine/@g" \
+  -e 's@open\("GET","/(?!wolverine/)@open("GET","/wolverine/@g' \
+  -e "s@open\\('GET','/(?!wolverine/)@open('GET','/wolverine/@g" \
+  || true
+
+echo "== 5) Make sure phantom_balances.js is referenced correctly =="
+if ! grep -q 'phantom_balances.js' "$IDX"; then
+  sed -i 's@</body>@<script src="/wolverine/phantom_balances.js"></script>\n</body>@' "$IDX"
+fi
+
+echo "== 6) Show quick diff hints =="
+echo "--- base tag ---"
+grep -n "<base " "$IDX" || true
+echo "--- any remaining src/href/action='/' (should be none) ---"
+grep -nE '(src|href|action)="/(?!wolverine/)' "$IDX" || echo "OK"
+
+echo "== 7) Nginx: ensure /wolverine/ serves LIVE directory =="
+# We don't auto-edit your vhost blindly; we print the snippet you should have.
+cat <<'NGX'
+
+RECOMMENDED nginx block (inside your server { } for fireinners.online):
+---------------------------------------------------------------
+location ^~ /wolverine/ {
+  alias /var/www/wolverine/;
+  try_files $uri $uri/ /wolverine/index.html;
+}
+---------------------------------------------------------------
+If you already have it, ignore.
+
+NGX
+
+echo "== 8) nginx -t and reload (if config is OK) =="
+nginx -t && (systemctl reload nginx || service nginx reload)
+
+echo "== 9) HTTP checks =="
+curl -sk -o /dev/null -w "UI /wolverine/ : %{http_code}\n" https://fireinners.online/wolverine/
+curl -sk -o /dev/null -w "JS balances : %{http_code}\n" https://fireinners.online/wolverine/phantom_balances.js
+
+echo "DONE ✅ Backup: /root/wolverine_ui_backup_${TS}.tgz"
 BASH
 
-chmod +x /root/check_usdc_accounts_fixed3.sh
-/root/check_usdc_accounts_fixed3.sh
+chmod +x /root/branch_ui_under_wolverine.sh
+/root/branch_ui_under_wolverine.sh
