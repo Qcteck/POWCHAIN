@@ -1,56 +1,55 @@
-cat >/root/fix_traderone_me_orders_404.sh <<'BASH'
+cat >/root/trace_traderone_404.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
+
+INC="/etc/nginx/includes/wolverine_routes.inc"
 TS="$(date +%Y%m%d_%H%M%S)"
-VHOST="/etc/nginx/sites-enabled/fireinners.online-ssl"
 
-echo "== 1) Find which file is included by the vhost =="
-INC_LINE="$(grep -nE 'include\s+.*wolverine_routes\.(inc|conf);' "$VHOST" | head -n 1 || true)"
-echo "VHOST include: $INC_LINE"
-if [ -z "$INC_LINE" ]; then
-  echo "❌ No include wolverine_routes.* found in $VHOST"
-  exit 1
-fi
+echo "== 1) Local direct (backend) =="
+for p in /health /me /orders /positions /pnl; do
+  code=$(curl -sS -o /dev/null -w "%{http_code}" "http://127.0.0.1:8585$p" || true)
+  echo "http://127.0.0.1:8585$p => $code"
+done
+echo
 
-INC_FILE="$(echo "$INC_LINE" | sed -E 's/^[0-9]+:.*include[[:space:]]+([^;]+);.*/\1/')"
-echo "INC_FILE=$INC_FILE"
-test -f "$INC_FILE" || { echo "❌ Included file not found: $INC_FILE"; exit 1; }
+echo "== 2) Ensure debug headers + access_log in the traderone location =="
+cp -a "$INC" "$INC.bak_trace_$TS"
 
-echo "== 2) Backup =="
-cp -a "$INC_FILE" "$INC_FILE.bak_$TS"
+# inject debug lines inside the location ^~ /wolverine/traderone/api/ block
+python3 - <<'PY'
+import re
+INC="/etc/nginx/includes/wolverine_routes.inc"
+lines=open(INC,"r",errors="ignore").read().splitlines(True)
+out=[]
+in_loc=False
+for l in lines:
+    out.append(l)
+    if re.search(r'^\s*location\s+\^~\s+/wolverine/traderone/api/\s*\{', l):
+        in_loc=True
+        continue
+    if in_loc and re.search(r'^\s*proxy_set_header\s+X-Forwarded-Proto', l):
+        out.append('  add_header X-Wolverine-Route "traderone" always;\n')
+        out.append('  add_header X-Wolverine-Upstream "$upstream_addr" always;\n')
+        out.append('  access_log /var/log/nginx/traderone_access.log combined;\n')
+        in_loc=False
+open(INC,"w").writelines(out)
+PY
 
-echo "== 3) Rewrite routes to ROOT backend (me/orders/positions/pnl) =="
-cat > "$INC_FILE" <<'NGX'
-# Wolverine routes (clean) - traderone backend expects /health, /me, /orders, ...
-
-location = /wolverine/traderone/api {
-  return 301 /wolverine/traderone/api/;
-}
-
-location ^~ /wolverine/traderone/api/ {
-  proxy_http_version 1.1;
-  proxy_set_header Host $host;
-  proxy_set_header X-Real-IP $remote_addr;
-  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto $scheme;
-
-  rewrite ^/wolverine/traderone/api/(.*)$ /$1 break;
-  proxy_pass http://127.0.0.1:8585;
-}
-NGX
-
-echo "== 4) nginx -t && reload =="
 nginx -t
 systemctl reload nginx || service nginx reload
+echo
 
-echo "== 5) Re-test =="
-for p in /wolverine/traderone/api/health /wolverine/traderone/api/me /wolverine/traderone/api/orders ; do
-  code=$(curl -sk -o /dev/null -w "%{http_code}" "https://fireinners.online$p")
-  echo "$p => $code"
+echo "== 3) Public tests with headers =="
+for p in /wolverine/traderone/api/health /wolverine/traderone/api/me /wolverine/traderone/api/orders; do
+  echo "--- $p ---"
+  curl -sk -D- -o /dev/null "https://fireinners.online$p" | sed -n '1,25p'
 done
+echo
 
+echo "== 4) Tail traderone access log (last 20 lines) =="
+tail -n 20 /var/log/nginx/traderone_access.log || true
 echo "DONE ✅"
 BASH
 
-chmod +x /root/fix_traderone_me_orders_404.sh
-/root/fix_traderone_me_orders_404.sh
+chmod +x /root/trace_traderone_404.sh
+/root/trace_traderone_404.sh
