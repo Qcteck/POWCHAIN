@@ -1,51 +1,36 @@
-cat >/root/unlock_wolverine_rpc_public.sh <<'BASH'
+cat >/root/show_active_wolverine_rpc_block.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "== 1) Find where the 403 JSON is defined (Access forbidden) =="
-HITS="$(grep -RIn --binary-files=without-match -E 'Access forbidden|wolverine/rpc' /etc/nginx 2>/dev/null || true)"
-echo "$HITS" | head -n 200
+echo "== 1) Export nginx full config (nginx -T) =="
+nginx -T 2>/tmp/nginxT.txt >/dev/null || true
 
 echo
-echo "== 2) Locate exact file(s) containing 'Access forbidden' =="
-FILES="$(echo "$HITS" | awk -F: '/Access forbidden/ {print $1}' | sort -u)"
-[ -n "$FILES" ] || { echo "No 'Access forbidden' string found in /etc/nginx. Paste your /wolverine/rpc location block."; exit 1; }
-echo "$FILES"
+echo "== 2) Where is /wolverine/rpc defined (ACTIVE config, not backups) =="
+grep -nE 'location\s*=*\s*/wolverine/rpc|/wolverine/rpc' /tmp/nginxT.txt | head -n 80
 
 echo
-echo "== 3) Backup and patch (remove localhost-only remote_addr check if present) =="
-TS="$(date +%Y%m%d_%H%M%S)"
-for f in $FILES; do
-  echo "--- patching: $f ---"
-  cp -a "$f" "$f.bak_$TS"
-
-  # Comment the common blocker: remote_addr != 127.0.0.1 returning 403 JSON
-  # (handles variants with spaces and braces on same line)
-  sed -i -E \
-    's@^[[:space:]]*(if[[:space:]]*\([[:space:]]*\$remote_addr[[:space:]]*!=[[:space:]]*127\.0\.0\.1[[:space:]]*\)[[:space:]]*\{[[:space:]]*return[[:space:]]*403[[:space:]]*.*Access forbidden.*\}[[:space:]]*)@# DISABLED: \1@g' \
-    "$f" || true
-
-  # Also comment "allow 127.0.0.1; deny all;" if it exists in that file
-  sed -i -E 's@^[[:space:]]*allow[[:space:]]+127\.0\.0\.1;@# DISABLED: allow 127.0.0.1;@g' "$f" || true
-  sed -i -E 's@^[[:space:]]*deny[[:space:]]+all;@# DISABLED: deny all;@g' "$f" || true
-done
+echo "== 3) Print the location block context (the real one nginx is using) =="
+python3 - <<'PY'
+import re
+p=open("/tmp/nginxT.txt","r",errors="ignore").read().splitlines()
+hits=[i for i,l in enumerate(p) if re.search(r'location\s*=*\s*/wolverine/rpc', l)]
+if not hits:
+  hits=[i for i,l in enumerate(p) if "/wolverine/rpc" in l]
+for h in hits[:3]:
+  s=max(0,h-25); e=min(len(p),h+120)
+  print("\n---- CONTEXT %d-%d ----" % (s+1,e))
+  for i in range(s,e):
+    print(f"{i+1}: {p[i]}")
+PY
 
 echo
-echo "== 4) nginx config test =="
-nginx -t
+echo "== 4) Find common blockers related to 403/deny/auth/limit/error_page =="
+grep -nE 'deny\s+all;|allow\s+127\.0\.0\.1;|return\s+403;|auth_basic|satisfy|limit_req|error_page\s+403' /tmp/nginxT.txt | head -n 200
 
 echo
-echo "== 5) reload nginx =="
-systemctl reload nginx || service nginx reload
-
-echo
-echo "== 6) Retest public endpoint (should be 200 now) =="
-curl -sk -D- https://fireinners.online/wolverine/rpc \
-  -H 'content-type: application/json' \
-  --data '{"jsonrpc":"2.0","id":1,"method":"getVersion"}' | head -n 40
-
-echo "DONE ✅"
+echo "DONE ✅  (Send me the CONTEXT block that contains the location /wolverine/rpc)"
 BASH
 
-chmod +x /root/unlock_wolverine_rpc_public.sh
-/root/unlock_wolverine_rpc_public.sh
+chmod +x /root/show_active_wolverine_rpc_block.sh
+/root/show_active_wolverine_rpc_block.sh
