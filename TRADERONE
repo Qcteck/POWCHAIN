@@ -1,11 +1,11 @@
-cat >/root/move_wolverine_location_inside_server.sh <<'BASH'
+cat >/root/fix_wolverine_location_generic_move_or_create.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 VHOST="/etc/nginx/sites-enabled/fireinners.online-ssl"
 TS="$(date +%Y%m%d_%H%M%S)"
 
 test -f "$VHOST" || { echo "Missing $VHOST"; exit 1; }
-cp -a "$VHOST" "$VHOST.bak_move_${TS}"
+cp -a "$VHOST" "$VHOST.bak_generic_${TS}"
 
 python3 - <<'PY'
 import re
@@ -13,7 +13,7 @@ import re
 VHOST="/etc/nginx/sites-enabled/fireinners.online-ssl"
 lines=open(VHOST,"r",errors="ignore").read().splitlines(True)
 
-# 1) Find first server { ... } range
+# find first server block
 start=None
 for i,l in enumerate(lines):
     if re.search(r'^\s*server\s*\{', l):
@@ -32,14 +32,16 @@ for i in range(start, len(lines)):
 if end is None:
     raise SystemExit("Could not find end of first server block (brace mismatch)")
 
-# 2) Extract ANY location ^~ /wolverine/ { ... } block found ANYWHERE
-block=[]
+# regex for any /wolverine/ location block (with or without ^~)
+loc_re = re.compile(r'^\s*location\s+(\^~\s+)?/wolverine/\s*\{')
+
+# extract ALL such blocks (keep the last), remove them from file
+blocks=[]
 out=[]
 i=0
 while i < len(lines):
     l=lines[i]
-    if re.search(r'^\s*location\s+\^~\s+/wolverine/\s*\{', l):
-        # capture full block by brace depth
+    if loc_re.search(l):
         b=[l]
         d = l.count("{") - l.count("}")
         i += 1
@@ -47,16 +49,14 @@ while i < len(lines):
             b.append(lines[i])
             d += lines[i].count("{") - lines[i].count("}")
             i += 1
-        block = b  # keep last found (fine)
+        blocks.append(b)
         continue
     out.append(l)
     i += 1
 
-if not block:
-    raise SystemExit("No 'location ^~ /wolverine/ {' block found to move")
-
-# 3) Recompute server range after removal
 lines=out
+
+# recompute server range after removal
 start=None
 for i,l in enumerate(lines):
     if re.search(r'^\s*server\s*\{', l):
@@ -70,12 +70,24 @@ for i in range(start, len(lines)):
         end=i
         break
 
-# 4) Insert block right before closing brace of server
 server = lines[:end]
-close = lines[end:end+1]
-rest  = lines[end+1:]
+close  = lines[end:end+1]
+rest   = lines[end+1:]
 
-# Avoid duplicates: remove any existing /wolverine_DISABLED/ etc not needed
+if blocks:
+    block = blocks[-1]  # keep last one
+else:
+    # create it if missing
+    block = [
+        "\n",
+        "  location ^~ /wolverine/ {\n",
+        "    alias /var/www/wolverine/;\n",
+        "    try_files $uri $uri/ /wolverine/index.html;\n",
+        "  }\n",
+        "\n"
+    ]
+
+# insert inside server (before closing brace)
 server.append("\n")
 server.extend(block)
 server.append("\n")
@@ -83,11 +95,14 @@ server.append("\n")
 open(VHOST,"w").writelines(server + close + rest)
 PY
 
+echo "== nginx -t =="
 nginx -t
+echo "== reload =="
 systemctl reload nginx || service nginx reload
 
-echo "DONE ✅"
+echo "== quick check =="
+curl -sk -o /dev/null -w "UI /wolverine/ : %{http_code}\n" https://fireinners.online/wolverine/
 BASH
 
-chmod +x /root/move_wolverine_location_inside_server.sh
-/root/move_wolverine_location_inside_server.sh
+chmod +x /root/fix_wolverine_location_generic_move_or_create.sh
+/root/fix_wolverine_location_generic_move_or_create.sh
