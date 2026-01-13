@@ -1,106 +1,38 @@
-cat >/root/inject_wolverine_send_sol_script_safe_v2.sh <<'BASH'
+cat >/root/debug_wolverine_served_vs_file.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
 FILE="/var/www/wolverine/index.html"
-TS="$(date +%Y%m%d_%H%M%S)"
 
-test -f "$FILE" || { echo "❌ Missing $FILE"; exit 1; }
-cp -a "$FILE" "${FILE}.bak_${TS}"
+echo "== FILE hash =="
+sha256sum "$FILE" || exit 1
+echo
 
-# 1) trouver id.json
-KEYFILE=""
-for f in /root/.config/solana/id.json /home/*/.config/solana/id.json; do
-  [ -f "$f" ] && KEYFILE="$f" && break
-done
+echo "== ORIGIN headers (force identity) =="
+curl -skI --resolve fireinners.online:443:127.0.0.1 -H 'Accept-Encoding: identity' https://fireinners.online/wolverine/ | sed -n '1,25p'
+echo
 
-# 2) extraire pubkey
-if [ -n "$KEYFILE" ] && command -v solana-keygen >/dev/null 2>&1; then
-  PUBKEY="$(solana-keygen pubkey "$KEYFILE")"
-else
-  echo "⚠️ solana-keygen ou id.json introuvable, fallback placeholder"
-  PUBKEY="REMPLACE_PAR_PUBLIC_KEY_WOLVERINE"
-fi
-export PUBKEY
+echo "== ORIGIN body (first lines) =="
+curl -sk --resolve fireinners.online:443:127.0.0.1 -H 'Accept-Encoding: identity' https://fireinners.online/wolverine/ | head -n 40
+echo
 
-python3 - <<'PY'
-import os
-from pathlib import Path
+echo "== ORIGIN grep markers =="
+curl -sk --resolve fireinners.online:443:127.0.0.1 -H 'Accept-Encoding: identity' https://fireinners.online/wolverine/ \
+ | grep -nE 'sendSolBtn|WOLVERINE_SEND_SOL_SCRIPT' || echo "NOT FOUND in served HTML"
+echo
 
-FILE="/var/www/wolverine/index.html"
-pubkey=os.environ.get("PUBKEY","REMPLACE_PAR_PUBLIC_KEY_WOLVERINE")
+echo "== ORIGIN hash =="
+curl -sk --resolve fireinners.online:443:127.0.0.1 -H 'Accept-Encoding: identity' https://fireinners.online/wolverine/ | sha256sum
+echo
 
-p=Path(FILE)
-s=p.read_text(errors="ignore")
-
-# bouton
-if 'id="sendSolBtn"' not in s:
-    s=s.replace("<body", '<body', 1)  # no-op safety
-    import re
-    s=re.sub(r"(<body[^>]*>)", r"\1\n  <button id=\"sendSolBtn\" style=\"position:fixed;bottom:18px;right:18px;z-index:9999;\">Envoyer SOL au wallet WOLVERINE</button>\n", s, count=1)
-
-# script
-if "WOLVERINE_SEND_SOL_SCRIPT" not in s:
-    script=f"""
-<script type="module">
-/* WOLVERINE_SEND_SOL_SCRIPT */
-import {{ Connection, PublicKey, SystemProgram, Transaction, LAMPORTS_PER_SOL }} from "https://cdn.skypack.dev/@solana/web3.js";
-const RPC = "https://api.mainnet-beta.solana.com";
-const WOLVERINE_WALLET = new PublicKey("{pubkey}");
-
-async function sendSol(amountSol) {{
-  const provider = window.solana;
-  if (!provider?.isPhantom) throw new Error("Phantom non détecté");
-  await provider.connect();
-
-  const connection = new Connection(RPC, "confirmed");
-  const fromPubkey = provider.publicKey;
-
-  const tx = new Transaction().add(
-    SystemProgram.transfer({{
-      fromPubkey,
-      toPubkey: WOLVERINE_WALLET,
-      lamports: Math.round(amountSol * LAMPORTS_PER_SOL),
-    }})
-  );
-
-  tx.feePayer = fromPubkey;
-  const {{ blockhash }} = await connection.getLatestBlockhash("finalized");
-  tx.recentBlockhash = blockhash;
-
-  const signed = await provider.signTransaction(tx);
-  const sig = await connection.sendRawTransaction(signed.serialize());
-  await connection.confirmTransaction(sig, "confirmed");
-  return sig;
-}}
-
-document.getElementById("sendSolBtn")?.addEventListener("click", async () => {{
-  const amount = Number(prompt("Montant en SOL à envoyer :") || "0");
-  if (!amount || amount <= 0) return;
-  try {{
-    const sig = await sendSol(amount);
-    alert("Envoyé ✅ Tx: " + sig);
-  }} catch (e) {{
-    alert("Erreur: " + (getattr(e,"message",None) or str(e)));
-  }}
-}});
-</script>
-"""
-    if "</body>" in s:
-        s=s.replace("</body>", script + "\n</body>", 1)
-    else:
-        s += "\n" + script
-
-p.write_text(s)
-print("OK: injected (pubkey=" + pubkey + ")")
-PY
-
-systemctl reload nginx || service nginx reload
-
-echo "== ORIGIN check (bypass CF) =="
-curl -sk --resolve fireinners.online:443:127.0.0.1 https://fireinners.online/wolverine/ \
- | grep -nE 'sendSolBtn|WOLVERINE_SEND_SOL_SCRIPT' && echo "OK ✅" || echo "STILL NOT FOUND ❌"
+echo "== If hashes differ, show nginx wolverine block =="
+nginx -T 2>/dev/null | awk '
+  /location[[:space:]]+(\^~[[:space:]]+)?\/wolverine\/|location[[:space:]]+=?[[:space:]]\/wolverine/ {p=1}
+  p{print}
+  p && /\}/{c++}
+  p && c>=2{exit}
+' || true
 BASH
 
-chmod +x /root/inject_wolverine_send_sol_script_safe_v2.sh
-/root/inject_wolverine_send_sol_script_safe_v2.sh
+chmod +x /root/debug_wolverine_served_vs_file.sh
+/root/debug_wolverine_served_vs_file.sh
