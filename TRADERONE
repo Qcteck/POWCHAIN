@@ -1,56 +1,76 @@
-cat >/root/fix_duplicate_include_solana_rpc_proxy.sh <<'BASH'
+cat >/root/fix_duplicate_traderone_api_location.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-SNIP="/etc/nginx/snippets/solana_rpc_proxy.conf"
+PATH_RE='location\s*=*\s*/wolverine/traderone/api/?\b'
 TS="$(date +%Y%m%d_%H%M%S)"
 
-echo "== 1) Find all includes of solana_rpc_proxy.conf (active files) =="
-mapfile -t INCS < <(
-  grep -RIn --binary-files=without-match \
-    -E "include\s+.*solana_rpc_proxy\.conf" \
-    /etc/nginx/sites-enabled /etc/nginx/sites-available /etc/nginx/conf.d /etc/nginx/nginx.conf 2>/dev/null \
+echo "== 1) Find ACTIVE duplicates for /wolverine/traderone/api (exclude .bak) =="
+mapfile -t HITS < <(
+  grep -RIn --binary-files=without-match -E "$PATH_RE" /etc/nginx \
   | grep -vE '\.bak_|\.bak$' || true
 )
+printf "%s\n" "${HITS[@]}"
+echo
 
-if [ "${#INCS[@]}" -eq 0 ]; then
-  echo "No include found for solana_rpc_proxy.conf in common dirs."
-  echo "Try: grep -RIn 'solana_rpc_proxy.conf' /etc/nginx"
+FILES=()
+for h in "${HITS[@]:-}"; do
+  f="${h%%:*}"
+  [[ " ${FILES[*]} " =~ " ${f} " ]] || FILES+=("$f")
+done
+
+if [ "${#FILES[@]}" -eq 0 ]; then
+  echo "No matching location found. Paste the exact nginx error line."
   exit 1
 fi
 
-printf "%s\n" "${INCS[@]}"
+echo "== Files containing /wolverine/traderone/api location =="
+printf " - %s\n" "${FILES[@]}"
 echo
 
-echo "== 2) Keep FIRST include, comment out the rest =="
-KEEP="${INCS[0]}"
-echo "KEEP => $KEEP"
+echo "== 2) Pick file to KEEP (prefer sites-enabled/fireinners.online-ssl) =="
+KEEP=""
+for f in "${FILES[@]}"; do
+  if [[ "$f" =~ /etc/nginx/sites-enabled/fireinners\.online-ssl ]]; then KEEP="$f"; break; fi
+done
+if [ -z "$KEEP" ]; then KEEP="${FILES[0]}"; fi
+echo "KEEP: $KEEP"
 echo
 
-# group by file, comment only the matching include lines
-declare -A touched=()
-for i in "${INCS[@]:1}"; do
-  FILE="${i%%:*}"
-  [ -f "$FILE" ] || continue
-
-  if [ -z "${touched[$FILE]+x}" ]; then
-    cp -a "$FILE" "$FILE.bak_$TS"
-    touched["$FILE"]=1
-  fi
-
-  # Comment any include line that references solana_rpc_proxy.conf
-  sed -i -E 's@^([[:space:]]*)include([[:space:]]+.*solana_rpc_proxy\.conf.*);@\1# DISABLED_DUPLICATE include\2;@' "$FILE"
+echo "== 3) Disable duplicates in OTHER files by renaming location path =="
+for f in "${FILES[@]}"; do
+  [ "$f" = "$KEEP" ] && continue
+  echo "--- patching $f ---"
+  cp -a "$f" "$f.bak_$TS"
+  sed -i -E \
+    's@(location[[:space:]]*=*[[:space:]]*)/wolverine/traderone/api\b@\1/wolverine/traderone/api_DISABLED@g' \
+    "$f"
 done
 
-echo "== 3) nginx config test =="
-nginx -t
+echo
+echo "== 4) If the KEEP file itself has 2 locations, rename the SECOND one =="
+cp -a "$KEEP" "$KEEP.bak2_$TS"
+awk '
+  BEGIN{c=0}
+  {
+    if ($0 ~ /location[[:space:]]*=*[[:space:]]*\/wolverine\/traderone\/api\/?\b/) {
+      c++
+      if (c>=2) sub(/\/wolverine\/traderone\/api/, "/wolverine/traderone/api_DISABLED")
+    }
+    print
+  }' "$KEEP.bak2_$TS" > "$KEEP"
 
-echo "== 4) reload nginx =="
+echo
+echo "== 5) nginx -t and reload =="
+nginx -t
 systemctl reload nginx || service nginx reload
 
 echo
-echo "DONE ✅ duplicate include removed"
+echo "== 6) Verify only one location remains =="
+grep -RIn -E "$PATH_RE" /etc/nginx | grep -vE '\.bak_|\.bak$' || true
+
+echo "DONE ✅"
 BASH
 
-chmod +x /root/fix_duplicate_include_solana_rpc_proxy.sh
-/root/fix_duplicate_include_solana_rpc_proxy.sh
+chmod +x /root/fix_duplicate_traderone_api_location.sh
+/root/fix_duplicate_traderone_api_location.sh
