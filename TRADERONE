@@ -1,2 +1,57 @@
-grep -n "buffer.min.js" /var/www/wolverine/index.html | head
-curl -sk "https://fireinners.online/wolverine/?v=$(date +%s)" | grep -n "WOLVERINE_BUFFER_POLYFILL" || echo "POLYFILL NOT FOUND"
+cat >/root/force_single_buffer_polyfill_head.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+TS="$(date +%Y%m%d_%H%M%S)"
+HTML="/var/www/wolverine/index.html"
+
+test -f "$HTML" || { echo "❌ Missing $HTML"; exit 1; }
+cp -a "$HTML" "${HTML}.bak_${TS}"
+
+python3 - <<'PY'
+from pathlib import Path
+import re
+
+p=Path("/var/www/wolverine/index.html")
+s=p.read_text(errors="ignore")
+
+# Remove any previous polyfill blocks we injected
+s = re.sub(r"<!--\s*WOLVERINE_BUFFER_POLYFILL\s*-->.*?(?=</head>)", "", s, flags=re.S|re.I)
+
+# Remove ANY buffer includes (cdnjs/jsdelivr/unpkg/local buffer.min.js)
+s = re.sub(r'<script[^>]+src=["\'][^"\']*buffer[^"\']*["\'][^>]*>\s*</script>\s*', '', s, flags=re.I)
+
+poly = r"""
+<!-- WOLVERINE_BUFFER_POLYFILL -->
+<script>
+  window.global = window;
+  window.process = window.process || { env: {} };
+</script>
+<script src="/wolverine/buffer.min.js"></script>
+<script>
+  if (window.buffer && window.buffer.Buffer) window.Buffer = window.buffer.Buffer;
+</script>
+"""
+
+if "</head>" in s:
+    s = s.replace("</head>", poly + "\n</head>", 1)
+else:
+    s = poly + "\n" + s
+
+p.write_text(s)
+print("OK: injected single Buffer polyfill in <head>")
+PY
+
+systemctl reload nginx || service nginx reload
+
+echo "== ORIGIN verify HTML contains marker + local script =="
+curl -sk --resolve fireinners.online:443:127.0.0.1 https://fireinners.online/wolverine/ \
+ | grep -nE "WOLVERINE_BUFFER_POLYFILL|/wolverine/buffer.min.js" || true
+
+echo
+echo "== ORIGIN verify file is 200 =="
+curl -sk --resolve fireinners.online:443:127.0.0.1 -I https://fireinners.online/wolverine/buffer.min.js | sed -n '1,12p'
+echo "DONE ✅"
+BASH
+
+chmod +x /root/force_single_buffer_polyfill_head.sh
+/root/force_single_buffer_polyfill_head.sh
