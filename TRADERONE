@@ -1,4 +1,4 @@
-cat >/root/fix_buffer_from_and_rpc_balance_ui.sh <<'BASH'
+cat >/root/fix_buffer_from_final_and_balance_rpc.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 TS="$(date +%Y%m%d_%H%M%S)"
@@ -6,18 +6,16 @@ TS="$(date +%Y%m%d_%H%M%S)"
 DIR="/var/www/wolverine"
 HTML="$DIR/index.html"
 BAL="$DIR/phantom_balances.js"
-PATCH="$DIR/phantom_patch.js"
 
 test -f "$HTML" || { echo "❌ Missing $HTML"; exit 1; }
 cp -a "$HTML" "${HTML}.bak_${TS}"
 
-# 1) Put a known-good UMD Buffer in local file (gives Buffer.from)
-# (unpkg UMD path is the most reliable for browsers)
-curl -fsSL "https://unpkg.com/buffer@6.0.3/umd/buffer.min.js" -o "$DIR/buffer.umd.min.js"
-chmod 0644 "$DIR/buffer.umd.min.js"
-ls -lah "$DIR/buffer.umd.min.js"
+echo "== 1) Install LOCAL buffer.min.js from a working CDN (jsDelivr) =="
+curl -fsSL "https://cdn.jsdelivr.net/npm/buffer@6.0.3/index.min.js" -o "$DIR/buffer.min.js"
+chmod 0644 "$DIR/buffer.min.js"
+ls -lah "$DIR/buffer.min.js"
 
-# 2) Force ONE Buffer polyfill early in <head>, and lock it (prevents overwrite)
+echo "== 2) Inject ONE robust Buffer polyfill early in <head> + better button placement =="
 python3 - <<'PY'
 from pathlib import Path
 import re
@@ -25,79 +23,98 @@ import re
 p=Path("/var/www/wolverine/index.html")
 s=p.read_text(errors="ignore")
 
-# remove any old buffer scripts/polyfills (cdnjs/jsdelivr/local buffer.min.js etc.)
+# remove any previous injected blocks + any <script ...buffer...>
 s = re.sub(r"<!--\s*WOLVERINE_BUFFER_POLYFILL\s*-->.*?(?=</head>)", "", s, flags=re.S|re.I)
 s = re.sub(r'<script[^>]+src=["\'][^"\']*buffer[^"\']*["\'][^>]*>\s*</script>\s*', '', s, flags=re.I)
 
 poly = r"""
 <!-- WOLVERINE_BUFFER_POLYFILL -->
 <style>
-  /* place buttons cleanly */
-  #sendSolBtn{position:fixed;bottom:18px;right:18px;z-index:9999;padding:10px 14px;border-radius:10px}
-  #connectPhantomBtn{position:fixed;bottom:18px;right:160px;z-index:9999;padding:10px 14px;border-radius:10px}
+  /* buttons: clean + visible */
+  #sendSolBtn{position:fixed;bottom:18px;right:18px;z-index:99999;padding:10px 14px;border-radius:10px}
+  #connectPhantomBtn{position:fixed;bottom:18px;right:160px;z-index:99999;padding:10px 14px;border-radius:10px}
 </style>
 
 <script>
   window.global = window;
   window.process = window.process || { env: {} };
 </script>
-<script src="/wolverine/buffer.umd.min.js"></script>
+
+<script src="/wolverine/buffer.min.js"></script>
 <script>
-  // UMD exposes window.buffer.Buffer (with Buffer.from)
-  const RealBuffer = (window.buffer && window.buffer.Buffer) ? window.buffer.Buffer : null;
-  if (!RealBuffer || typeof RealBuffer.from !== "function") {
-    console.error("Buffer polyfill failed: RealBuffer missing .from");
-  } else {
-    Object.defineProperty(window, "Buffer", { value: RealBuffer, writable: false, configurable: false });
-  }
+  // Make Buffer.from always available (handles different export shapes)
+  (function(){
+    function pickRealBuffer(){
+      if (window.Buffer && typeof window.Buffer.from === "function") return window.Buffer;
+      if (window.buffer && window.buffer.Buffer && typeof window.buffer.Buffer.from === "function") return window.buffer.Buffer;
+      if (window.buffer && typeof window.buffer.from === "function") return window.buffer;
+      return null;
+    }
+
+    var B = pickRealBuffer();
+    if (!B) {
+      // last-resort minimal Buffer.from for common cases (string / Uint8Array / Array)
+      var enc = new TextEncoder();
+      B = {
+        from: function(input){
+          if (typeof input === "string") return enc.encode(input);
+          if (input instanceof Uint8Array) return input;
+          if (Array.isArray(input)) return new Uint8Array(input);
+          throw new Error("Unsupported Buffer.from input");
+        }
+      };
+    }
+
+    // lock it so other scripts can't overwrite with a broken Buffer
+    Object.defineProperty(window, "Buffer", { value: B, writable: false, configurable: false });
+  })();
 </script>
 """
 
 if "</head>" in s:
-    s = s.replace("</head>", poly + "\n</head>", 1)
+  s = s.replace("</head>", poly + "\n</head>", 1)
 else:
-    s = poly + "\n" + s
+  s = poly + "\n" + s
 
-# ensure buttons exist (optional but helps)
+# ensure buttons exist (in case)
 if 'id="sendSolBtn"' not in s:
-    s = re.sub(r"(<body[^>]*>)", r'\1\n<button id="sendSolBtn">Envoyer SOL</button>\n', s, count=1)
+  s = re.sub(r"(<body[^>]*>)", r'\1\n<button id="sendSolBtn">Envoyer SOL</button>\n', s, count=1)
 if 'id="connectPhantomBtn"' not in s:
-    s = re.sub(r"(<body[^>]*>)", r'\1\n<button id="connectPhantomBtn">Connect Phantom</button>\n', s, count=1)
+  s = re.sub(r"(<body[^>]*>)", r'\1\n<button id="connectPhantomBtn">Connect Phantom</button>\n', s, count=1)
 
 p.write_text(s)
-print("OK: Buffer UMD + locked Buffer.from + buttons positioned")
+print("OK: robust Buffer polyfill + buttons placed")
 PY
 
-# 3) Force RPC absolute in phantom scripts (fix Balance RPC error from relative URL / bad endpoint)
-for f in "$BAL" "$PATCH"; do
-  if [ -f "$f" ]; then
-    cp -a "$f" "${f}.bak_${TS}"
-    python3 - <<PY
+echo "== 3) Reduce balance spam (avoid RPC error / rate-limit) =="
+if [ -f "$BAL" ]; then
+  cp -a "$BAL" "${BAL}.bak_${TS}"
+  python3 - <<'PY'
 from pathlib import Path
 import re
-p=Path("$f")
+p=Path("/var/www/wolverine/phantom_balances.js")
 s=p.read_text(errors="ignore")
 
-# replace /wolverine/rpc usages with absolute origin-based URL
-s = re.sub(r'(["\'])/wolverine/rpc\1', r'window.location.origin + "/wolverine/rpc"', s)
+# common: setInterval(fn, 1000) / 500 / etc -> set to 5000ms
+s = re.sub(r"setInterval\(([^,]+),\s*(\d+)\s*\)", lambda m: f"setInterval({m.group(1)}, 5000)", s)
 
-# if they define RPC const like const RPC="..."; make it absolute
+# ensure RPC is absolute if referenced as /wolverine/rpc
+s = re.sub(r'(["\'])/wolverine/rpc\1', r'window.location.origin + "/wolverine/rpc"', s)
 s = re.sub(r'const\s+RPC\s*=\s*["\']/wolverine/rpc["\']\s*;', 'const RPC = window.location.origin + "/wolverine/rpc";', s)
 
 p.write_text(s)
-print("OK: patched RPC absolute in", p)
+print("OK: phantom_balances.js slowed + RPC absolute")
 PY
-  fi
-done
+fi
 
 systemctl reload nginx || service nginx reload
 
 echo
 echo "== ORIGIN checks =="
 curl -sk --resolve fireinners.online:443:127.0.0.1 https://fireinners.online/wolverine/ | grep -n "WOLVERINE_BUFFER_POLYFILL" && echo "HTML OK ✅" || echo "HTML NOT OK ❌"
-curl -sk --resolve fireinners.online:443:127.0.0.1 -I https://fireinners.online/wolverine/buffer.umd.min.js | sed -n '1,12p'
+curl -sk --resolve fireinners.online:443:127.0.0.1 -I https://fireinners.online/wolverine/buffer.min.js | sed -n '1,12p'
 echo "DONE ✅"
 BASH
 
-chmod +x /root/fix_buffer_from_and_rpc_balance_ui.sh
-/root/fix_buffer_from_and_rpc_balance_ui.sh
+chmod +x /root/fix_buffer_from_final_and_balance_rpc.sh
+/root/fix_buffer_from_final_and_balance_rpc.sh
