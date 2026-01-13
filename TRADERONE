@@ -1,4 +1,4 @@
-cat >/root/fix_buffer_and_rpc_429_ui.sh <<'BASH'
+cat >/root/fix_buffer_polyfill_proper.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 TS="$(date +%Y%m%d_%H%M%S)"
@@ -11,84 +11,44 @@ python3 - <<'PY'
 from pathlib import Path
 import re
 
-p=Path("/var/www/wolverine/index.html")
-s=p.read_text(errors="ignore")
+p = Path("/var/www/wolverine/index.html")
+s = p.read_text(errors="ignore")
 
-# 1) Buffer polyfill (inject once, early in <head>)
-if "WOLVERINE_BUFFER_POLYFILL" not in s:
-    poly = """
+# 1) Remove old polyfill blocks we added before (buffer@... index.min.js etc.)
+s = re.sub(r"<!--\s*WOLVERINE_BUFFER_POLYFILL\s*-->.*?</script>\s*</script>\s*", "", s, flags=re.S)
+s = re.sub(r"<script[^>]+buffer@6\.0\.3[^>]*></script>\s*<script>.*?window\.Buffer.*?</script>\s*", "", s, flags=re.S)
+
+# 2) Insert a robust polyfill in <head> (must run BEFORE Next.js bundles)
+poly = """
 <!-- WOLVERINE_BUFFER_POLYFILL -->
-<script src="https://cdn.jsdelivr.net/npm/buffer@6.0.3/index.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/buffer/6.0.3/buffer.min.js"></script>
 <script>
-  // Expose Buffer like Node for browser bundles that expect it
-  window.Buffer = window.Buffer || buffer.Buffer;
+  // Make Node-like globals available for browser bundles
+  window.global = window;
+  window.process = window.process || { env: {} };
+
+  // Force Buffer to the real polyfilled Buffer (with .from)
+  if (window.buffer && window.buffer.Buffer) {
+    window.Buffer = window.buffer.Buffer;
+  }
 </script>
 """
-    if "</head>" in s:
-        s = s.replace("</head>", poly + "\n</head>", 1)
-    else:
-        s = poly + "\n" + s
 
-# 2) RPC backoff wrapper for /wolverine/rpc (inject once)
-if "WOLVERINE_RPC_BACKOFF" not in s:
-    backoff = r"""
-<script>
-/* WOLVERINE_RPC_BACKOFF */
-(function () {
-  const origFetch = window.fetch.bind(window);
-  let inFlight = null;
-  let waitMs = 0;
-
-  async function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
-
-  window.fetch = async function(input, init){
-    try{
-      const url = (typeof input === "string") ? input : (input && input.url) || "";
-      const isRpc = url.includes("/wolverine/rpc");
-      if(!isRpc) return origFetch(input, init);
-
-      // prevent request storms: keep only one in flight
-      if(inFlight) return inFlight;
-
-      inFlight = (async () => {
-        if(waitMs > 0) await sleep(waitMs);
-
-        const res = await origFetch(input, init);
-
-        // If upstream rate-limits, apply exponential backoff
-        if(res && res.status === 429){
-          waitMs = Math.min(waitMs ? waitMs * 2 : 800, 15000); // 0.8s -> 15s max
-        } else if(res && res.ok){
-          waitMs = 0;
-        }
-        return res;
-      })();
-
-      const out = await inFlight;
-      inFlight = null;
-      return out;
-    } catch(e){
-      inFlight = null;
-      throw e;
-    }
-  };
-})();
-</script>
-"""
-    if "</body>" in s:
-        s = s.replace("</body>", backoff + "\n</body>", 1)
-    else:
-        s += "\n" + backoff
+if "</head>" in s:
+    # inject as early as possible in head
+    s = s.replace("</head>", poly + "\n</head>", 1)
+else:
+    s = poly + "\n" + s
 
 p.write_text(s)
-print("OK: Buffer polyfill + RPC backoff injected")
+print("OK: proper Buffer polyfill injected")
 PY
 
 systemctl reload nginx || service nginx reload
 
-echo "== PUBLIC check (cache-bust) =="
-curl -sk "https://fireinners.online/wolverine/?v=$(date +%s)" | grep -n "WOLVERINE_BUFFER_POLYFILL" >/dev/null && echo "PUBLIC OK ✅" || echo "PUBLIC STILL OLD ❌"
+echo "== ORIGIN quick check (bypass CF) =="
+curl -sk --resolve fireinners.online:443:127.0.0.1 https://fireinners.online/wolverine/ | grep -n "WOLVERINE_BUFFER_POLYFILL" && echo "OK ✅" || echo "NOT FOUND ❌"
 BASH
 
-chmod +x /root/fix_buffer_and_rpc_429_ui.sh
-/root/fix_buffer_and_rpc_429_ui.sh
+chmod +x /root/fix_buffer_polyfill_proper.sh
+/root/fix_buffer_polyfill_proper.sh
