@@ -1,55 +1,76 @@
-cat >/root/fix_duplicate_traderone_location.sh <<'BASH'
+cat >/root/dedupe_traderone_in_wolverine_routes.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
-VHOST="/etc/nginx/sites-enabled/fireinners.online-ssl"
 SNIP="/etc/nginx/snippets/wolverine_routes.conf"
 TS="$(date +%Y%m%d_%H%M%S)"
 
-echo "== 1) Show where traderone locations are defined =="
-grep -RIn --binary-files=without-match \
-  -E '^\s*location\b.*(/wolverine/traderone/api)' \
-  /etc/nginx/sites-enabled /etc/nginx/snippets /etc/nginx/conf.d /etc/nginx/nginx.conf 2>/dev/null \
-  | grep -vE '\.bak|\.broken|sites-disabled' || true
+test -f "$SNIP" || { echo "Missing $SNIP"; exit 1; }
+cp -a "$SNIP" "$SNIP.bak_$TS"
+
+echo "== BEFORE (matches) =="
+grep -nE '^\s*location\b.*(/wolverine/traderone/api)' "$SNIP" || true
 echo
 
-echo "== 2) Backup vhost =="
-cp -a "$VHOST" "$VHOST.bak_traderonefix_$TS"
-
-echo "== 3) Disable traderone locations in vhost (keep them in snippet) =="
 python3 - <<'PY'
 import re
-VHOST="/etc/nginx/sites-enabled/fireinners.online-ssl"
-lines=open(VHOST,"r",errors="ignore").read().splitlines(True)
+SNIP="/etc/nginx/snippets/wolverine_routes.conf"
+lines=open(SNIP,"r",errors="ignore").read().splitlines(True)
 
-# comment any traderone location blocks in THIS file
+# We allow exactly ONE block for:
+# - location = /wolverine/traderone/api
+# - location ^~ /wolverine/traderone/api/
+# Any extra duplicates get commented out.
+keep_eq = False
+keep_pref = False
+
 out=[]
-in_loc=False
-d=0
-for l in lines:
-    if not in_loc and re.search(r'^\s*location\b.*?/wolverine/traderone/api', l):
-        out.append("# DISABLED_DUP_TRADERONE " + l)
-        in_loc=True
-        d = l.count("{") - l.count("}")
-        continue
-    if in_loc:
-        out.append("# DISABLED_DUP_TRADERONE " + l)
-        d += l.count("{") - l.count("}")
-        if d <= 0 and "}" in l:
-            in_loc=False
-        continue
-    out.append(l)
+i=0
+while i < len(lines):
+    l=lines[i]
 
-open(VHOST,"w").writelines(out)
+    m_eq = re.search(r'^\s*location\s*=\s*/wolverine/traderone/api\s*\{', l)
+    m_pf = re.search(r'^\s*location\s+.*?/wolverine/traderone/api/\s*\{', l)
+
+    if m_eq or m_pf:
+        # capture full block
+        block=[l]
+        d = l.count("{") - l.count("}")
+        i += 1
+        while i < len(lines) and d > 0:
+            block.append(lines[i])
+            d += lines[i].count("{") - lines[i].count("}")
+            i += 1
+
+        if m_eq:
+            if not keep_eq:
+                keep_eq = True
+                out.extend(block)
+            else:
+                out.extend(["# DISABLED_DUP_TRADERONE " + x for x in block])
+        else:
+            if not keep_pref:
+                keep_pref = True
+                out.extend(block)
+            else:
+                out.extend(["# DISABLED_DUP_TRADERONE " + x for x in block])
+        continue
+
+    out.append(l)
+    i += 1
+
+open(SNIP,"w").writelines(out)
 PY
 
-echo "== 4) nginx -t && reload =="
+echo "== AFTER (matches) =="
+grep -nE '^\s*location\b.*(/wolverine/traderone/api)' "$SNIP" || true
+echo
+
+echo "== nginx -t && reload =="
 nginx -t
 systemctl reload nginx || service nginx reload
 
-echo "== 5) tests =="
-curl -sk -o /dev/null -w "Traderone health : %{http_code}\n" https://fireinners.online/wolverine/traderone/api/health
 echo "DONE ✅"
 BASH
 
-chmod +x /root/fix_duplicate_traderone_location.sh
-/root/fix_duplicate_traderone_location.sh
+chmod +x /root/dedupe_traderone_in_wolverine_routes.sh
+/root/dedupe_traderone_in_wolverine_routes.sh
