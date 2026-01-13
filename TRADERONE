@@ -1,75 +1,56 @@
-cat >/root/fix_duplicate_wolverine_rpc_location.sh <<'BASH'
+cat >/root/fix_rpc_403_in_solana_snippet.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "== 1) Find ACTIVE duplicates for /wolverine/rpc (excluding .bak) =="
-mapfile -t HITS < <(
-  grep -RIn --binary-files=without-match \
-    -E 'location\s*=*\s*/wolverine/rpc\b' /etc/nginx \
-  | grep -vE '\.bak_|\.bak$' \
-  | head -n 50
-)
-
-printf "%s\n" "${HITS[@]:-}" || true
-echo
-
-FILES=()
-for h in "${HITS[@]:-}"; do
-  f="${h%%:*}"
-  [[ " ${FILES[*]} " =~ " ${f} " ]] || FILES+=("$f")
-done
-
-if [ "${#FILES[@]}" -le 1 ]; then
-  echo "No duplicate found (<=1 file)."
-  exit 0
-fi
-
-echo "== Files containing /wolverine/rpc location =="
-printf " - %s\n" "${FILES[@]}"
-echo
-
-echo "== 2) Choose the file to KEEP (prefer sites-enabled/fireinners.online*) =="
-KEEP=""
-for f in "${FILES[@]}"; do
-  if [[ "$f" =~ /etc/nginx/sites-enabled/fireinners\.online ]]; then
-    KEEP="$f"
-    break
-  fi
-done
-if [ -z "$KEEP" ]; then
-  KEEP="${FILES[0]}"
-fi
-echo "KEEP: $KEEP"
-echo
-
-echo "== 3) Patch other files to disable duplicate location =="
+F="/etc/nginx/snippets/solana_rpc_proxy.conf"
 TS="$(date +%Y%m%d_%H%M%S)"
-for f in "${FILES[@]}"; do
-  [ "$f" = "$KEEP" ] && continue
-  echo "--- disabling duplicates in: $f ---"
-  cp -a "$f" "$f.bak_$TS"
 
-  # Rename the location path so it no longer collides
-  sed -i -E \
-    's@(location[[:space:]]*=*[[:space:]]*)/wolverine/rpc\b@\1/wolverine/rpc_DISABLED@g' \
-    "$f"
-done
+test -f "$F" || { echo "Missing $F"; exit 1; }
 
+echo "== 1) Show current snippet (with line numbers) =="
+nl -ba "$F" | sed -n '1,200p'
 echo
-echo "== 4) nginx config test =="
+
+echo "== 2) Backup =="
+cp -a "$F" "$F.bak_$TS"
+
+echo "== 3) Disable localhost-only blockers (allow/deny/return 403/if remote_addr) =="
+sed -i -E \
+  -e 's@^[[:space:]]*allow[[:space:]]+127\.0\.0\.1;@# DISABLED: allow 127.0.0.1;@g' \
+  -e 's@^[[:space:]]*deny[[:space:]]+all;@# DISABLED: deny all;@g' \
+  -e 's@^[[:space:]]*return[[:space:]]+403;@# DISABLED: return 403;@g' \
+  -e 's@^[[:space:]]*if[[:space:]]*\([[:space:]]*\$remote_addr.*\)[[:space:]]*\{.*return[[:space:]]*403.*\}@# DISABLED: localhost-only if (remote_addr) block@g' \
+  "$F" || true
+
+echo "== 4) Ensure CORS for browser + OPTIONS preflight =="
+# Add a safe CORS block inside location if not already present
+if ! grep -q "Access-Control-Allow-Origin" "$F"; then
+  awk '
+    BEGIN{inloc=0}
+    /location[[:space:]]*=*[[:space:]]*\/wolverine\/rpc/ {inloc=1}
+    {print}
+    inloc==1 && /\{/ {
+      print "    # CORS (browser/Phantom)";
+      print "    add_header Access-Control-Allow-Origin * always;";
+      print "    add_header Access-Control-Allow-Methods \"POST, OPTIONS\" always;";
+      print "    add_header Access-Control-Allow-Headers \"content-type\" always;";
+      print "    if ($request_method = OPTIONS) { return 204; }";
+      inloc=2
+    }
+  ' "$F" > "$F.tmp" && mv "$F.tmp" "$F"
+fi
+
+echo "== 5) nginx -t and reload =="
 nginx -t
-
-echo
-echo "== 5) reload nginx =="
 systemctl reload nginx || service nginx reload
 
-echo
-echo "== 6) Re-check duplicates (should be 1) =="
-grep -RIn -E 'location\s*=*\s*/wolverine/rpc\b' /etc/nginx | grep -vE '\.bak_|\.bak$' | head -n 30 || true
+echo "== 6) Retest (public) should be 200 =="
+curl -sk -D- https://fireinners.online/wolverine/rpc \
+  -H 'content-type: application/json' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"getVersion"}' | head -n 60
 
-echo
 echo "DONE ✅"
 BASH
 
-chmod +x /root/fix_duplicate_wolverine_rpc_location.sh
-/root/fix_duplicate_wolverine_rpc_location.sh
+chmod +x /root/fix_rpc_403_in_solana_snippet.sh
+/root/fix_rpc_403_in_solana_snippet.sh
