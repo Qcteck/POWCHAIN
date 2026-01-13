@@ -1,4 +1,4 @@
-cat >/root/fix_traderone_api_proxy_conf_outside_location.sh <<'BASH'
+cat >/root/fix_traderone_api_proxy_snippet_inside_parent.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -7,34 +7,48 @@ TS="$(date +%Y%m%d_%H%M%S)"
 
 test -f "$F" || { echo "Missing $F"; exit 1; }
 
-echo "== BEFORE =="
-nl -ba "$F" | head -n 120
-
+echo "== Backup =="
 cp -a "$F" "$F.bak_$TS"
 
-# 1) health: absolute -> relative
-sed -i -E 's@location[[:space:]]*=[[:space:]]*/wolverine/traderone/api_DISABLED/health[[:space:]]*\{@location = /health {@g' "$F"
+echo "== Rewrite snippet to be VALID inside: location ^~ /wolverine/traderone/api/ { include ... } =="
+cat > "$F" <<'NGINX'
+# This snippet is meant to be INCLUDED INSIDE:
+#   location ^~ /wolverine/traderone/api/ { ... }
 
-# 2) main block: absolute -> relative (so it fits inside the parent location)
-sed -i -E 's@location[[:space:]]+\^~[[:space:]]+/wolverine/traderone/api/[[:space:]]*\{@location ^~ / {@g' "$F"
+# Health endpoint MUST be under the same prefix to be a valid nested location:
+location = /wolverine/traderone/api/health {
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
 
-# 3) rewrite: remove the /wolverine/traderone/api/ prefix since we're now relative
-sed -i -E 's@rewrite[[:space:]]+\^/wolverine/traderone/api/\(\.\*\)\$@rewrite ^/\(\.\*\)\$@g' "$F"
+  rewrite ^/wolverine/traderone/api/(.*)$ /api/$1 break;
+  proxy_pass http://127.0.0.1:8585;
+}
 
-echo
-echo "== AFTER =="
-nl -ba "$F" | head -n 120
+# Default behavior for the rest of /wolverine/traderone/api/*
+proxy_http_version 1.1;
+proxy_set_header Host $host;
+proxy_set_header X-Real-IP $remote_addr;
+proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+proxy_set_header X-Forwarded-Proto $scheme;
 
-echo
+proxy_set_header Upgrade $http_upgrade;
+proxy_set_header Connection "upgrade";
+
+rewrite ^/wolverine/traderone/api/(.*)$ /api/$1 break;
+proxy_pass http://127.0.0.1:8585;
+NGINX
+
 echo "== nginx -t =="
 nginx -t
 
-echo
 echo "== reload nginx =="
 systemctl reload nginx || service nginx reload
 
 echo "DONE ✅"
 BASH
 
-chmod +x /root/fix_traderone_api_proxy_conf_outside_location.sh
-/root/fix_traderone_api_proxy_conf_outside_location.sh
+chmod +x /root/fix_traderone_api_proxy_snippet_inside_parent.sh
+/root/fix_traderone_api_proxy_snippet_inside_parent.sh
