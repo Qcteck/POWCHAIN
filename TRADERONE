@@ -1,1 +1,111 @@
-curl -s https://fireinners.online/wolverine/traderone/api/health
+cat >/root/MEGA_TRADERONE_CONCORDANCE.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+log(){ printf "\n[%s] %s\n" "$(date +'%F %T')" "$*"; }
+die(){ echo "ERROR: $*" >&2; exit 1; }
+
+[ "$(id -u)" -eq 0 ] || die "Lance en root."
+
+NGINX_SITE="/etc/nginx/sites-available/fireinners.online-ssl"
+ASK_LIB="/opt/fireinners/sentinel/lib/askorupdate.sh"
+API_BASE="/wolverine/traderone/api"
+API_HOST="127.0.0.1"
+API_PORT="3000"
+
+# fallback safe si askorupdate absent
+askorupdate_file(){ local p="$1"; shift; local c="$1"; shift; mkdir -p "$(dirname "$p")"; [ -f "$p" ] && cp -a "$p" "$p.bak.$(date +%s)"; printf "%s" "$c" >"$p"; }
+askorupdate_yesno(){ local prompt="$1"; shift; local yn; read -r -p "$prompt [y/N] " yn || true; case "${yn,,}" in y|yes) return 0;; *) return 1;; esac; }
+
+if [ -f "$ASK_LIB" ]; then
+  # shellcheck disable=SC1090
+  source "$ASK_LIB" || true
+fi
+
+log "1) Vérif nginx site + unlock temporaire si immuable"
+[ -f "$NGINX_SITE" ] || die "nginx site introuvable: $NGINX_SITE"
+chattr -i /etc/nginx/nginx.conf "$NGINX_SITE" 2>/dev/null || true
+
+log "2) Détection du process qui écoute sur ${API_HOST}:${API_PORT}"
+PID="$(ss -lntp | awk -v hp="${API_HOST}:${API_PORT}" '$4==hp {print $NF}' | head -n1 | sed -n 's/.*pid=\([0-9]\+\).*/\1/p' || true)"
+if [ -z "${PID:-}" ]; then
+  log "Aucun PID trouvé sur ${API_HOST}:${API_PORT}. On continue quand même (nginx logs + tests)."
+else
+  CWD="$(readlink -f "/proc/$PID/cwd" 2>/dev/null || true)"
+  CMD="$(tr '\0' ' ' </proc/$PID/cmdline 2>/dev/null || true)"
+  log "PID=${PID}"
+  log "CWD=${CWD}"
+  log "CMD=${CMD}"
+fi
+
+log "3) Ajouter un access_log dédié pour Wolverine (si absent) sans toucher au front"
+# On ajoute 2 logs: /var/log/nginx/wolverine_access.log et wolverine_api_access.log
+# Insertion simple: on ajoute des 'location' logs, non destructif.
+if ! grep -q "wolverine_access.log" "$NGINX_SITE"; then
+  TS="$(date +%s)"
+  cp -a "$NGINX_SITE" "${NGINX_SITE}.bak.${TS}"
+  # Ajoute 2 blocs location logs (ne change pas les proxy déjà présents)
+  PATCH=$(cat <<'NGX'
+
+  # --- WOLVERINE request logging (auto) ---
+  location ^~ /wolverine/ {
+    access_log /var/log/nginx/wolverine_access.log;
+    try_files $uri $uri/ @wolverine_fallback;
+  }
+  location ^~ /wolverine/traderone/api/ {
+    access_log /var/log/nginx/wolverine_api_access.log;
+    proxy_pass http://127.0.0.1:3000;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+  }
+  location @wolverine_fallback {
+    # fallback statique standard (ne modifie pas l'UI, juste la sert)
+    root /var/www;
+    try_files /wolverine/index.html =404;
+  }
+  # --- /WOLVERINE request logging ---
+NGX
+)
+  # Insère avant la dernière accolade du server{} si possible
+  if tail -n 1 "$NGINX_SITE" | grep -q "}$"; then
+    tmp="$(mktemp)"
+    head -n -1 "$NGINX_SITE" >"$tmp"
+    printf "%s\n" "$PATCH" >>"$tmp"
+    echo "}" >>"$tmp"
+    mv "$tmp" "$NGINX_SITE"
+  else
+    printf "\n%s\n" "$PATCH" >>"$NGINX_SITE"
+  fi
+fi
+
+log "4) nginx -t + reload"
+nginx -t >/dev/null
+systemctl reload nginx
+
+log "5) Tests API: health + endpoints attendus (stubs si 404)"
+base="https://fireinners.online${API_BASE}"
+curl -sS "${base}/health" || true; echo
+# tests "attendus" (si ton backend ne les a pas encore, ça montrera 404 -> on saura quoi ajouter)
+for p in version dashboard trade positions orders history wallet settings; do
+  code="$(curl -sS -o /dev/null -w "%{http_code}" "${base}/${p}" || true)"
+  echo "${p}: HTTP ${code}"
+done
+code2="$(curl -sS -o /dev/null -w "%{http_code}" "${base}/invested?pub=TEST" || true)"
+echo "invested?pub=: HTTP ${code2}"
+
+log "6) Afficher dernières lignes de logs nginx (si fichiers existent)"
+[ -f /var/log/nginx/wolverine_access.log ] && tail -n 20 /var/log/nginx/wolverine_access.log || true
+[ -f /var/log/nginx/wolverine_api_access.log ] && tail -n 20 /var/log/nginx/wolverine_api_access.log || true
+
+log "7) Relock nginx conf si possible"
+chattr +i /etc/nginx/nginx.conf "$NGINX_SITE" 2>/dev/null || true
+
+log "Fini. Prochaine étape: on crée les endpoints manquants EXACTS selon ce que le front appelle (visible via wolverine_api_access.log)."
+echo "Commande utile: tail -f /var/log/nginx/wolverine_api_access.log"
+BASH
+
+chmod +x /root/MEGA_TRADERONE_CONCORDANCE.sh
+bash /root/MEGA_TRADERONE_CONCORDANCE.sh
