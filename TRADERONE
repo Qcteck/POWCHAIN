@@ -1,4 +1,4 @@
-cat >/root/fix_buffer_polyfill_proper.sh <<'BASH'
+cat >/root/fix_buffer_404_force_cdn.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 TS="$(date +%Y%m%d_%H%M%S)"
@@ -11,44 +11,42 @@ python3 - <<'PY'
 from pathlib import Path
 import re
 
-p = Path("/var/www/wolverine/index.html")
-s = p.read_text(errors="ignore")
+p=Path("/var/www/wolverine/index.html")
+s=p.read_text(errors="ignore")
 
-# 1) Remove old polyfill blocks we added before (buffer@... index.min.js etc.)
-s = re.sub(r"<!--\s*WOLVERINE_BUFFER_POLYFILL\s*-->.*?</script>\s*</script>\s*", "", s, flags=re.S)
-s = re.sub(r"<script[^>]+buffer@6\.0\.3[^>]*></script>\s*<script>.*?window\.Buffer.*?</script>\s*", "", s, flags=re.S)
+# 1) kill any local buffer.min.js includes (the 404 you're seeing)
+s = re.sub(r'<script[^>]+src=["\'](?:/)?buffer\.min\.js["\'][^>]*>\s*</script>\s*', '', s, flags=re.I)
 
-# 2) Insert a robust polyfill in <head> (must run BEFORE Next.js bundles)
+# 2) remove older polyfill blocks we may have injected
+s = re.sub(r'<!--\s*WOLVERINE_BUFFER_POLYFILL\s*-->.*?</script>\s*</script>\s*', '', s, flags=re.S|re.I)
+
+# 3) inject working CDN polyfill EARLY (in <head>)
 poly = """
 <!-- WOLVERINE_BUFFER_POLYFILL -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/buffer/6.0.3/buffer.min.js"></script>
 <script>
-  // Make Node-like globals available for browser bundles
   window.global = window;
   window.process = window.process || { env: {} };
-
-  // Force Buffer to the real polyfilled Buffer (with .from)
-  if (window.buffer && window.buffer.Buffer) {
-    window.Buffer = window.buffer.Buffer;
-  }
+  if (window.buffer && window.buffer.Buffer) window.Buffer = window.buffer.Buffer;
 </script>
 """
 
 if "</head>" in s:
-    # inject as early as possible in head
     s = s.replace("</head>", poly + "\n</head>", 1)
 else:
     s = poly + "\n" + s
 
 p.write_text(s)
-print("OK: proper Buffer polyfill injected")
+print("OK: local buffer.min.js removed + CDN polyfill injected")
 PY
 
 systemctl reload nginx || service nginx reload
 
-echo "== ORIGIN quick check (bypass CF) =="
-curl -sk --resolve fireinners.online:443:127.0.0.1 https://fireinners.online/wolverine/ | grep -n "WOLVERINE_BUFFER_POLYFILL" && echo "OK ✅" || echo "NOT FOUND ❌"
+echo "== ORIGIN check (bypass CF): ensure CDN link is present in HTML =="
+curl -sk --resolve fireinners.online:443:127.0.0.1 https://fireinners.online/wolverine/ \
+ | grep -n "cdnjs.cloudflare.com/ajax/libs/buffer/6.0.3/buffer.min.js" \
+ && echo "OK ✅" || echo "NOT FOUND ❌"
 BASH
 
-chmod +x /root/fix_buffer_polyfill_proper.sh
-/root/fix_buffer_polyfill_proper.sh
+chmod +x /root/fix_buffer_404_force_cdn.sh
+/root/fix_buffer_404_force_cdn.sh
