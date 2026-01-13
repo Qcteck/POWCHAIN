@@ -1,93 +1,47 @@
-cat >/root/fix_require_not_defined_and_balance.sh <<'BASH'
+cat >/root/fix_web3_timing_final.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 TS="$(date +%Y%m%d_%H%M%S)"
-DIR="/var/www/wolverine"
-HTML="$DIR/index.html"
-BAL="$DIR/phantom_balances.js"
-PATCH="$DIR/phantom_patch.js"
+HTML="/var/www/wolverine/index.html"
 
 cp -a "$HTML" "${HTML}.bak_${TS}"
 
-echo "== 1) index.html: remove broken buffer.real.min.js + remove Buffer hacks =="
 python3 - <<'PY'
 from pathlib import Path
 import re
 
-p=Path("/var/www/wolverine/index.html")
-s=p.read_text(errors="ignore")
+p = Path("/var/www/wolverine/index.html")
+s = p.read_text(errors="ignore")
 
-# remove our injected blocks
+# Remove any previous sanity warnings
 s = re.sub(r"<!--\s*WOLVERINE_BUFFER_POLYFILL\s*-->.*?(?=</head>)", "", s, flags=re.S|re.I)
 
-# remove any buffer.* includes we added
-s = re.sub(r'<script[^>]+src=["\'][^"\']*(?:buffer\.real\.min\.js|buffer\.umd\.min\.js|buffer\.min\.js)[^"\']*["\'][^>]*>\s*</script>\s*', '', s, flags=re.I)
+# Ensure web3 is loaded FIRST in head
+web3 = '<script src="https://cdn.jsdelivr.net/npm/@solana/web3.js@1.98.0/lib/index.iife.min.js"></script>'
+if "index.iife.min.js" not in s:
+    s = s.replace("</head>", web3 + "\n</head>", 1)
 
-# remove any "lock Buffer" / "Object.defineProperty(window, 'Buffer'" blocks if present
-s = re.sub(r'Object\.defineProperty\(window,\s*["\']Buffer["\'].*?\);\s*', '', s, flags=re.S)
+# Remove phantom scripts anywhere
+s = re.sub(r'\s*<script[^>]+phantom_(?:patch|balances)\.js[^>]*>\s*</script>', "", s, flags=re.I)
 
-# add a tiny post-web3 sanity (does NOT override if already good)
-sanity = r"""
-<!-- WOLVERINE_BUFFER_POLYFILL -->
-<script>
-  // Do NOT override Buffer. Just warn if missing.
-  setTimeout(() => {
-    if (!window.Buffer || typeof window.Buffer.from !== "function") {
-      console.warn("Buffer missing/invalid. Ensure @solana/web3.js iife is loaded before wallet scripts.");
-    }
-  }, 0);
-</script>
+# Re-inject them at bottom with defer
+inject = """
+<script defer src="/wolverine/phantom_patch.js?v=final"></script>
+<script defer src="/wolverine/phantom_balances.js?v=final"></script>
 """
-if "</head>" in s:
-    s = s.replace("</head>", sanity + "\n</head>", 1)
+
+if "</body>" in s:
+    s = s.replace("</body>", inject + "\n</body>", 1)
+else:
+    s += inject
 
 p.write_text(s)
-print("OK: removed broken buffer polyfills; kept only a sanity warning")
+print("OK: web3 first, phantom scripts deferred")
 PY
-
-echo "== 2) phantom_balances.js: avoid res.json() twice + slow polling =="
-if [ -f "$BAL" ]; then
-  cp -a "$BAL" "${BAL}.bak_${TS}"
-  python3 - <<'PY'
-from pathlib import Path
-import re
-p=Path("/var/www/wolverine/phantom_balances.js")
-s=p.read_text(errors="ignore")
-
-# Slow down any tight setInterval
-s = re.sub(r"setInterval\(([^,]+),\s*(\d+)\s*\)", lambda m: f"setInterval({m.group(1)}, 5000)", s)
-
-# Fix common bug: calling res.json() more than once.
-# Replace patterns like:
-#   const j = await res.json(); ... await res.json()
-# best-effort: ensure only one parse and reuse variable "j"
-s = re.sub(r"await\s+res\.json\(\)\s*;", "await res.clone().json();", s)
-
-p.write_text(s)
-print("OK: balances script adjusted (best-effort)")
-PY
-fi
-
-echo "== 3) phantom_patch.js: guard missing DOM elements (.value of undefined) =="
-if [ -f "$PATCH" ]; then
-  cp -a "$PATCH" "${PATCH}.bak_${TS}"
-  python3 - <<'PY'
-from pathlib import Path
-import re
-p=Path("/var/www/wolverine/phantom_patch.js")
-s=p.read_text(errors="ignore")
-
-# Guard ".value" reads on querySelector results (best-effort)
-s = re.sub(r"(document\.querySelector\([^)]+\))\.value", r"(\1 && \1.value)", s)
-
-p.write_text(s)
-print("OK: phantom_patch guarded")
-PY
-fi
 
 systemctl reload nginx || service nginx reload
 echo "DONE ✅"
 BASH
 
-chmod +x /root/fix_require_not_defined_and_balance.sh
-/root/fix_require_not_defined_and_balance.sh
+chmod +x /root/fix_web3_timing_final.sh
+/root/fix_web3_timing_final.sh
