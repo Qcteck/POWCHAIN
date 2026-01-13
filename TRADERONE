@@ -1,55 +1,67 @@
-cat >/root/trace_traderone_404.sh <<'BASH'
+cat >/root/force_traderone_location_debug_and_bypass_cf.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
+VHOST="/etc/nginx/sites-enabled/fireinners.online-ssl"
 INC="/etc/nginx/includes/wolverine_routes.inc"
 TS="$(date +%Y%m%d_%H%M%S)"
 
-echo "== 1) Local direct (backend) =="
-for p in /health /me /orders /positions /pnl; do
-  code=$(curl -sS -o /dev/null -w "%{http_code}" "http://127.0.0.1:8585$p" || true)
-  echo "http://127.0.0.1:8585$p => $code"
-done
-echo
+test -f "$VHOST" || { echo "Missing $VHOST"; exit 1; }
+test -f "$INC" || { echo "Missing $INC"; exit 1; }
 
-echo "== 2) Ensure debug headers + access_log in the traderone location =="
-cp -a "$INC" "$INC.bak_trace_$TS"
+echo "== 1) Backup =="
+cp -a "$INC" "$INC.bak_$TS"
 
-# inject debug lines inside the location ^~ /wolverine/traderone/api/ block
-python3 - <<'PY'
-import re
-INC="/etc/nginx/includes/wolverine_routes.inc"
-lines=open(INC,"r",errors="ignore").read().splitlines(True)
-out=[]
-in_loc=False
-for l in lines:
-    out.append(l)
-    if re.search(r'^\s*location\s+\^~\s+/wolverine/traderone/api/\s*\{', l):
-        in_loc=True
-        continue
-    if in_loc and re.search(r'^\s*proxy_set_header\s+X-Forwarded-Proto', l):
-        out.append('  add_header X-Wolverine-Route "traderone" always;\n')
-        out.append('  add_header X-Wolverine-Upstream "$upstream_addr" always;\n')
-        out.append('  access_log /var/log/nginx/traderone_access.log combined;\n')
-        in_loc=False
-open(INC,"w").writelines(out)
-PY
+echo "== 2) Rewrite INC with ROOT routes + debug headers + access_log =="
+cat > "$INC" <<'NGX'
+# Wolverine routes (traderone) - DEBUG
 
+location = /wolverine/traderone/api {
+  return 301 /wolverine/traderone/api/;
+}
+
+location ^~ /wolverine/traderone/api/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+
+  # DEBUG
+  add_header X-Wolverine-Route "traderone" always;
+  add_header X-Wolverine-Upstream "$upstream_addr" always;
+  access_log /var/log/nginx/traderone_access.log combined;
+
+  # backend expects /health /me /orders ...
+  rewrite ^/wolverine/traderone/api/(.*)$ /$1 break;
+  proxy_pass http://127.0.0.1:8585;
+}
+NGX
+
+echo "== 3) Ensure log path exists =="
+touch /var/log/nginx/traderone_access.log
+chown www-data:adm /var/log/nginx/traderone_access.log 2>/dev/null || true
+
+echo "== 4) nginx -t && reload =="
 nginx -t
 systemctl reload nginx || service nginx reload
+
+echo "== 5) What nginx THINKS is loaded (grep in nginx -T) =="
+nginx -T 2>/dev/null | grep -nE 'location \^~ /wolverine/traderone/api/|wolverine_routes\.inc|wolverine/traderone/api' | head -n 80 || true
 echo
 
-echo "== 3) Public tests with headers =="
+echo "== 6) BYPASS Cloudflare (hit origin locally with Host header) =="
 for p in /wolverine/traderone/api/health /wolverine/traderone/api/me /wolverine/traderone/api/orders; do
-  echo "--- $p ---"
-  curl -sk -D- -o /dev/null "https://fireinners.online$p" | sed -n '1,25p'
+  echo "--- ORIGIN $p ---"
+  curl -sk --resolve fireinners.online:443:127.0.0.1 -D- -o /dev/null "https://fireinners.online$p" | sed -n '1,35p'
 done
-echo
 
-echo "== 4) Tail traderone access log (last 20 lines) =="
-tail -n 20 /var/log/nginx/traderone_access.log || true
+echo
+echo "== 7) Tail traderone access log =="
+tail -n 30 /var/log/nginx/traderone_access.log || true
+
 echo "DONE ✅"
 BASH
 
-chmod +x /root/trace_traderone_404.sh
-/root/trace_traderone_404.sh
+chmod +x /root/force_traderone_location_debug_and_bypass_cf.sh
+/root/force_traderone_location_debug_and_bypass_cf.sh
