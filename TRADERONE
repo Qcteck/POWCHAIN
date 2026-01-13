@@ -1,1 +1,80 @@
-grep -RIn "include .*wolverine_routes\.conf" /etc/nginx/sites-enabled
+cat >/root/fix_traderone_dup_include_and_locations.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+SNIP="/etc/nginx/snippets/wolverine_routes.conf"
+TS="$(date +%Y%m%d_%H%M%S)"
+
+echo "== 1) Find ALL includes of wolverine_routes.conf =="
+mapfile -t INCS < <(
+  grep -RIn --binary-files=without-match \
+    -E 'include\s+.*wolverine_routes\.conf' \
+    /etc/nginx/nginx.conf /etc/nginx/conf.d /etc/nginx/sites-enabled 2>/dev/null \
+  | grep -vE '\.bak|\.broken|sites-disabled' || true
+)
+printf "%s\n" "${INCS[@]}"
+echo
+
+echo "== 2) Disable duplicate includes (keep first) =="
+if [ "${#INCS[@]}" -gt 1 ]; then
+  echo "KEEP => ${INCS[0]}"
+  for hit in "${INCS[@]:1}"; do
+    FILE="${hit%%:*}"
+    [ -f "$FILE" ] || continue
+    cp -a "$FILE" "$FILE.bak_$TS"
+    sed -i -E 's@^([[:space:]]*)include([[:space:]]+.*wolverine_routes\.conf.*);@\1# DISABLED_DUP_INCLUDE include\2;@' "$FILE"
+    echo "disabled include in $FILE"
+  done
+else
+  echo "No duplicate include found (0/1 include)."
+fi
+echo
+
+echo "== 3) Disable any OTHER traderone locations outside the snippet =="
+mapfile -t LOCS < <(
+  grep -RIn --binary-files=without-match \
+    -E '^\s*location\b.*(/wolverine/traderone/api)' \
+    /etc/nginx/sites-enabled /etc/nginx/conf.d /etc/nginx/nginx.conf 2>/dev/null \
+  | grep -vE '\.bak|\.broken|sites-disabled' || true
+)
+
+for hit in "${LOCS[@]}"; do
+  FILE="${hit%%:*}"
+  [ "$FILE" = "$SNIP" ] && continue
+  [ -f "$FILE" ] || continue
+  cp -a "$FILE" "$FILE.bak_$TS"
+  # comment out whole location blocks that mention /wolverine/traderone/api
+  python3 - <<PY
+import re
+p="${FILE}"
+lines=open(p,"r",errors="ignore").read().splitlines(True)
+out=[]
+in_loc=False
+d=0
+for l in lines:
+    if not in_loc and re.search(r'^\s*location\b.*?/wolverine/traderone/api', l):
+        out.append("# DISABLED_DUP_TRADERONE " + l)
+        in_loc=True
+        d = l.count("{") - l.count("}")
+        continue
+    if in_loc:
+        out.append("# DISABLED_DUP_TRADERONE " + l)
+        d += l.count("{") - l.count("}")
+        if d <= 0 and "}" in l:
+            in_loc=False
+        continue
+    out.append(l)
+open(p,"w").writelines(out)
+PY
+  echo "disabled traderone location(s) in $FILE"
+done
+
+echo
+echo "== 4) nginx -t && reload =="
+nginx -t
+systemctl reload nginx || service nginx reload
+
+echo "DONE ✅"
+BASH
+
+chmod +x /root/fix_traderone_dup_include_and_locations.sh
+/root/fix_traderone_dup_include_and_locations.sh
