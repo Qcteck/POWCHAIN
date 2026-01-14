@@ -1,73 +1,88 @@
 #!/usr/bin/env bash
 set -euo pipefail
+
+# MEGA_WOLVERINE_FIX_PROBES_ROOT.sh
+# Corrige le problème de test local (port 80) en testant correctement sur 443 + Host header.
+# Auto-fix: démarre nginx si inactif. Zéro input manuel.
+
+if [[ "${EUID}" -ne 0 ]]; then echo "ERREUR: lance ce script en root."; exit 1; fi
+
 TS="$(date +%Y%m%d_%H%M%S)"
-OUT="/root/WOLVERINE_VPS_MAP_${TS}.txt"
+HOST="fireinners.online"
+OUT="/root/MEGA_WOLVERINE_PROBES_${TS}.txt"
 
 say(){ printf "\n== %s ==\n" "$*"; }
 w(){ printf "%s\n" "$*" | tee -a "$OUT" >/dev/null; }
 
-echo "# VPS MAP ${TS}" > "$OUT"
+latest_map(){
+  ls -1t /root/WOLVERINE_VPS_MAP_*.txt 2>/dev/null | head -n 1 || true
+}
 
-say "A) Identity"
-w "date: $(date -Is)"
-w "hostname: $(hostname)"
-w "os: $(lsb_release -ds 2>/dev/null || cat /etc/os-release | head -n 1)"
-w "kernel: $(uname -r)"
-w "ip (best effort): $(ip -4 addr show | awk '/inet /{print $2,$NF}' | tr '\n' '; ')"
+need(){
+  local cmd="$1"
+  command -v "$cmd" >/dev/null 2>&1 || { apt-get update -y; apt-get install -y curl ca-certificates; }
+}
 
-say "B) Ports/listeners"
-w "ss -lntup:"
-(ss -lntup || true) | tee -a "$OUT" >/dev/null
+need curl
 
-say "C) Nginx"
-w "nginx -v: $(nginx -v 2>&1 || true)"
-w "nginx -t:"
-(nginx -t 2>&1 || true) | tee -a "$OUT" >/dev/null
-w "sites-enabled:"
-(ls -la /etc/nginx/sites-enabled 2>/dev/null || true) | tee -a "$OUT" >/dev/null
-w "fireinners.online-ssl snippet (first 240 lines):"
-sed -n '1,240p' /etc/nginx/sites-available/fireinners.online-ssl 2>/dev/null | tee -a "$OUT" >/dev/null
-w "includes (grep wolverine):"
-grep -Rni --line-number "wolverine" /etc/nginx/includes 2>/dev/null | head -n 200 | tee -a "$OUT" >/dev/null
+echo "# MEGA WOLVERINE PROBES ${TS}" > "$OUT"
+w "host=${HOST}"
+w "date=$(date -Is)"
+w "hostname=$(hostname)"
+w ""
 
-say "D) Wolverine Front"
-for p in /var/www/wolverine/index.html /opt/fireinners/frontend-react/app/dist/wolverine/index.html; do
-  if [[ -f "$p" ]]; then
-    w "FOUND frontend index: $p"
-    w "sha256: $(sha256sum "$p" | awk '{print $1}')"
-    w "size: $(wc -c < "$p") bytes"
-  else
-    w "missing: $p"
-  fi
-done
-
-say "E) systemd services (node related)"
-w "systemd list (node/traderone/wolverine/fireinners/qplus/amcq):"
-(systemctl list-units --type=service --all | egrep -i "node|traderone|wolverine|fireinners|qplus|amcq" || true) | tee -a "$OUT" >/dev/null
-
-say "F) Candidate backend directories"
-w "scan /opt for package.json (top 120):"
-(find /opt -maxdepth 6 -name package.json -print 2>/dev/null | head -n 120 || true) | tee -a "$OUT" >/dev/null
-w "scan /root for package.json (top 120):"
-(find /root -maxdepth 6 -name package.json -print 2>/dev/null | head -n 120 || true) | tee -a "$OUT" >/dev/null
-
-say "G) TraderOne service file if exists"
-if [[ -f /etc/systemd/system/traderone.service ]]; then
-  w "FOUND /etc/systemd/system/traderone.service:"
-  sed -n '1,220p' /etc/systemd/system/traderone.service | tee -a "$OUT" >/dev/null
-else
-  w "missing: /etc/systemd/system/traderone.service"
+MAP="$(latest_map)"
+if [[ -z "$MAP" ]]; then
+  w "Aucun fichier /root/WOLVERINE_VPS_MAP_*.txt trouvé."
+  w "Relance l’inventaire si besoin."
+  echo "Rapport: $OUT"
+  exit 1
 fi
 
-say "H) Quick HTTP local probes"
-set +e
-w "curl -I http://127.0.0.1/wolverine/ :"
-curl -sS -I http://127.0.0.1/wolverine/ | head -n 15 | tee -a "$OUT" >/dev/null
-w "curl -I http://127.0.0.1/wolverine/traderone/api/ :"
-curl -sS -I http://127.0.0.1/wolverine/traderone/api/ | head -n 15 | tee -a "$OUT" >/dev/null
-set -e
+say "1) Map détectée"
+w "MAP_FILE=$MAP"
+w "MAP_SHA256=$(sha256sum "$MAP" | awk '{print $1}')"
+w ""
+
+say "2) État nginx + listeners"
+w "systemctl is-active nginx: $(systemctl is-active nginx 2>/dev/null || true)"
+if ! systemctl is-active --quiet nginx; then
+  w "nginx inactif -> démarrage..."
+  systemctl enable --now nginx || true
+  sleep 1
+fi
+w "systemctl is-active nginx (after): $(systemctl is-active nginx 2>/dev/null || true)"
+w ""
+w "ss -lntup (nginx):"
+(ss -lntup 2>/dev/null | egrep -i "nginx|:80|:443" || true) | tee -a "$OUT" >/dev/null
+w ""
+
+say "3) Nginx -t"
+w "nginx -t:"
+(nginx -t 2>&1 || true) | tee -a "$OUT" >/dev/null
+w ""
+
+say "4) Tests corrigés (LOCAL HTTPS 443 + Host header)"
+w "--- curl LOCAL https://127.0.0.1/wolverine/ (Host: ${HOST}) ---"
+(curl -k -sS -I "https://127.0.0.1/wolverine/" -H "Host: ${HOST}" | head -n 20 || true) | tee -a "$OUT" >/dev/null
+w ""
+w "--- curl LOCAL https://127.0.0.1/wolverine/traderone/api/ (Host: ${HOST}) ---"
+(curl -k -sS -I "https://127.0.0.1/wolverine/traderone/api/" -H "Host: ${HOST}" | head -n 20 || true) | tee -a "$OUT" >/dev/null
+w ""
+
+say "5) Tests externes (HTTPS public)"
+w "--- curl EXT https://${HOST}/wolverine/ ---"
+(curl -sS -I "https://${HOST}/wolverine/" | head -n 20 || true) | tee -a "$OUT" >/dev/null
+w ""
+w "--- curl EXT https://${HOST}/wolverine/traderone/api/ ---"
+(curl -sS -I "https://${HOST}/wolverine/traderone/api/" | head -n 20 || true) | tee -a "$OUT" >/dev/null
+w ""
+
+say "6) Extraits utiles du MAP (C/D/G/H si présents)"
+w "---- MAP EXTRACT (grep: Wolverine/Nginx/traderone/3000/443/80) ----"
+(grep -nEi "wolverine|fireinners\.online-ssl|traderone|:3000|:443|:80|nginx" "$MAP" | head -n 220 || true) | tee -a "$OUT" >/dev/null
+w ""
 
 say "DONE"
-echo
 echo "Rapport généré: $OUT"
-echo "Colle-moi le contenu de ce fichier (ou juste les sections C/D/G/H) et je verrouille la cartographie."
+echo "Copie/colle ici le contenu de $OUT (ou juste les blocs 4/5) et je te dis exactement ce qui bloque."
