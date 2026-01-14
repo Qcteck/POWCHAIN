@@ -1,270 +1,73 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
-# MEGA_WOLVERINE_TRADERONE_ROOT.sh (PATCH)
-# Fix principal: si /opt/wolverine existe mais n'est pas un repo git -> backup auto + clone propre
-
-if [[ "${EUID}" -ne 0 ]]; then echo "ERREUR: lance ce script en root."; exit 1; fi
-
 TS="$(date +%Y%m%d_%H%M%S)"
-HOST="fireinners.online"
-
-REPO_URL="https://github.com/Qcteck/WOLVERINE.git"
-REPO_DIR="/opt/wolverine"
-
-FRONT_DIR="/var/www/wolverine"
-FRONT_INDEX="${FRONT_DIR}/index.html"
-
-NGINX_SITE="/etc/nginx/sites-available/fireinners.online-ssl"
-NGINX_INC_DIR="/etc/nginx/includes"
-NGINX_INC="${NGINX_INC_DIR}/wolverine_routes.inc"
-
-SENTINEL_LIB="/opt/fireinners/sentinel/lib/askorupdate.sh"
-ASKORUPDATE_ASK="0"; export ASKORUPDATE_ASK
-
-SERVICE_NAME="traderone"
-SERVICE_UNIT="/etc/systemd/system/${SERVICE_NAME}.service"
-
-PORT="3000"
-BIND="127.0.0.1"
+OUT="/root/WOLVERINE_VPS_MAP_${TS}.txt"
 
 say(){ printf "\n== %s ==\n" "$*"; }
-ok(){ printf "OK: %s\n" "$*"; }
-warn(){ printf "WARN: %s\n" "$*" >&2; }
-die(){ printf "ERREUR: %s\n" "$*" >&2; exit 1; }
+w(){ printf "%s\n" "$*" | tee -a "$OUT" >/dev/null; }
 
-backup_file(){ local f="$1"; [[ -f "$f" ]] || return 0; cp -a "$f" "${f}.bak_${TS}"; }
+echo "# VPS MAP ${TS}" > "$OUT"
 
-ensure_pkg(){
-  local p="$1"
-  if ! dpkg -s "$p" >/dev/null 2>&1; then
-    apt-get update -y
-    apt-get install -y "$p"
-  fi
-}
+say "A) Identity"
+w "date: $(date -Is)"
+w "hostname: $(hostname)"
+w "os: $(lsb_release -ds 2>/dev/null || cat /etc/os-release | head -n 1)"
+w "kernel: $(uname -r)"
+w "ip (best effort): $(ip -4 addr show | awk '/inet /{print $2,$NF}' | tr '\n' '; ')"
 
-askorupdate_or_write(){
-  local path="$1"; local content="$2"
-  mkdir -p "$(dirname "$path")"
-  if [[ -f "$SENTINEL_LIB" ]]; then
-    # shellcheck disable=SC1090
-    source "$SENTINEL_LIB"
-    local tmp="/tmp/askorupdate_${TS}_$(basename "$path")"
-    printf "%s" "$content" > "$tmp"
-    askorupdate_file "$path" "$tmp"
-    rm -f "$tmp"
+say "B) Ports/listeners"
+w "ss -lntup:"
+(ss -lntup || true) | tee -a "$OUT" >/dev/null
+
+say "C) Nginx"
+w "nginx -v: $(nginx -v 2>&1 || true)"
+w "nginx -t:"
+(nginx -t 2>&1 || true) | tee -a "$OUT" >/dev/null
+w "sites-enabled:"
+(ls -la /etc/nginx/sites-enabled 2>/dev/null || true) | tee -a "$OUT" >/dev/null
+w "fireinners.online-ssl snippet (first 240 lines):"
+sed -n '1,240p' /etc/nginx/sites-available/fireinners.online-ssl 2>/dev/null | tee -a "$OUT" >/dev/null
+w "includes (grep wolverine):"
+grep -Rni --line-number "wolverine" /etc/nginx/includes 2>/dev/null | head -n 200 | tee -a "$OUT" >/dev/null
+
+say "D) Wolverine Front"
+for p in /var/www/wolverine/index.html /opt/fireinners/frontend-react/app/dist/wolverine/index.html; do
+  if [[ -f "$p" ]]; then
+    w "FOUND frontend index: $p"
+    w "sha256: $(sha256sum "$p" | awk '{print $1}')"
+    w "size: $(wc -c < "$p") bytes"
   else
-    backup_file "$path"
-    printf "%s" "$content" > "$path"
+    w "missing: $p"
   fi
-}
+done
 
-choose_backend_dir(){
-  python3 - <<'PY'
-import os, json
-root="/opt/wolverine"
-cands=[]
-for dirpath, dirnames, filenames in os.walk(root):
-    if "node_modules" in dirnames: dirnames.remove("node_modules")
-    if "package.json" in filenames:
-        pj=os.path.join(dirpath,"package.json")
-        try: data=json.load(open(pj,"r",encoding="utf-8"))
-        except Exception: continue
-        scripts=data.get("scripts") or {}
-        deps=data.get("dependencies") or {}
-        name=(data.get("name") or "").lower()
-        score=0; path=dirpath.lower()
-        if "traderone" in path or "traderone" in name: score+=60
-        if "start" in scripts: score+=25
-        if any(k in deps for k in ["express","fastify","koa","hono"]): score+=10
-        if os.path.exists(os.path.join(dirpath,"server.js")): score+=15
-        if os.path.exists(os.path.join(dirpath,"index.js")): score+=8
-        if score>0: cands.append((score,dirpath))
-cands.sort(reverse=True, key=lambda x:x[0])
-print(cands[0][1] if cands else "")
-PY
-}
+say "E) systemd services (node related)"
+w "systemd list (node/traderone/wolverine/fireinners/qplus/amcq):"
+(systemctl list-units --type=service --all | egrep -i "node|traderone|wolverine|fireinners|qplus|amcq" || true) | tee -a "$OUT" >/dev/null
 
-say "0) Préflight (chemins + prérequis)"
-mkdir -p "$NGINX_INC_DIR"
-[[ -f "$NGINX_SITE" ]] || die "Nginx vhost introuvable: $NGINX_SITE"
-[[ -d "$FRONT_DIR" ]] || warn "Frontend dir absent: $FRONT_DIR (on continue quand même)"
-[[ -f "$FRONT_INDEX" ]] || warn "Frontend index absent: $FRONT_INDEX (on continue quand même)"
-ok "Vhost nginx: $NGINX_SITE"
-ok "Frontend dir: $FRONT_DIR"
+say "F) Candidate backend directories"
+w "scan /opt for package.json (top 120):"
+(find /opt -maxdepth 6 -name package.json -print 2>/dev/null | head -n 120 || true) | tee -a "$OUT" >/dev/null
+w "scan /root for package.json (top 120):"
+(find /root -maxdepth 6 -name package.json -print 2>/dev/null | head -n 120 || true) | tee -a "$OUT" >/dev/null
 
-say "1) Outils système minimaux"
-ensure_pkg "curl"
-ensure_pkg "git"
-ensure_pkg "ca-certificates"
-ensure_pkg "nginx"
-ok "Paquets OK"
-
-say "2) Node.js (sans croiser apt/npm)"
-if ! command -v node >/dev/null 2>&1; then
-  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-  apt-get install -y nodejs
-fi
-node -v >/dev/null
-npm -v >/dev/null
-ok "Node: $(node -v) / npm: $(npm -v)"
-
-say "3) Repo WOLVERINE sur le VPS (auto-fix dossier existant)"
-# Cas A: repo git OK
-if [[ -d "${REPO_DIR}/.git" ]]; then
-  ok "Repo déjà présent (git): $REPO_DIR"
+say "G) TraderOne service file if exists"
+if [[ -f /etc/systemd/system/traderone.service ]]; then
+  w "FOUND /etc/systemd/system/traderone.service:"
+  sed -n '1,220p' /etc/systemd/system/traderone.service | tee -a "$OUT" >/dev/null
 else
-  # Cas B: dossier existe mais pas git
-  if [[ -d "$REPO_DIR" ]]; then
-    # si non vide -> backup auto
-    if [[ "$(ls -A "$REPO_DIR" 2>/dev/null | wc -l | tr -d ' ')" != "0" ]]; then
-      local_bak="${REPO_DIR}.legacy_${TS}"
-      mv "$REPO_DIR" "$local_bak"
-      ok "Dossier non-git déplacé en backup: $local_bak"
-    else
-      rmdir "$REPO_DIR" || true
-    fi
-  fi
-  mkdir -p "$(dirname "$REPO_DIR")"
-  git clone "$REPO_URL" "$REPO_DIR"
-  ok "Repo cloné: $REPO_DIR"
+  w "missing: /etc/systemd/system/traderone.service"
 fi
 
-cd "$REPO_DIR"
-# sécurise remote origin
-if git remote get-url origin >/dev/null 2>&1; then
-  git remote set-url origin "$REPO_URL" || true
-else
-  git remote add origin "$REPO_URL"
-fi
-git fetch --all --prune
-
-DEFAULT_BRANCH="$(git symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null | sed 's#^refs/remotes/origin/##' || true)"
-[[ -n "$DEFAULT_BRANCH" ]] || DEFAULT_BRANCH="main"
-
-git reset --hard "origin/${DEFAULT_BRANCH}"
-git clean -fd
-ok "Repo synchronisé sur origin/${DEFAULT_BRANCH}"
-
-say "4) Détection backend TraderOne dans le repo"
-BACKEND_DIR="$(choose_backend_dir || true)"
-[[ -n "$BACKEND_DIR" ]] || die "Backend TraderOne introuvable dans $REPO_DIR (aucun package.json start/server détecté)."
-ok "Backend détecté: $BACKEND_DIR"
-
-say "5) Installation dépendances backend (npm)"
-cd "$BACKEND_DIR"
-if [[ -f package-lock.json ]]; then npm ci --omit=dev; else npm install --omit=dev; fi
-ok "Deps backend installées"
-
-say "6) systemd service: ${SERVICE_NAME} (bind ${BIND}:${PORT})"
-START_CMD=""
-python3 - <<'PY' > /tmp/traderone_startcmd.txt
-import json, os
-data=json.load(open("package.json","r",encoding="utf-8"))
-scripts=data.get("scripts") or {}
-if "start" in scripts:
-    print("npm start"); raise SystemExit
-for f in ["server.js","index.js","app.js","main.js"]:
-    if os.path.exists(f):
-        print(f"node {f}"); raise SystemExit
-print("")
-PY
-START_CMD="$(cat /tmp/traderone_startcmd.txt || true)"
-rm -f /tmp/traderone_startcmd.txt
-[[ -n "$START_CMD" ]] || die "Aucun start/server.js détecté dans $BACKEND_DIR."
-
-SERVICE_CONTENT=$(cat <<EOF
-[Unit]
-Description=TraderOne Backend (WOLVERINE)
-After=network.target
-
-[Service]
-Type=simple
-WorkingDirectory=${BACKEND_DIR}
-Environment=NODE_ENV=production
-Environment=PORT=${PORT}
-Environment=HOST=${BIND}
-ExecStart=/usr/bin/env bash -lc '${START_CMD}'
-Restart=always
-RestartSec=2
-User=root
-
-[Install]
-WantedBy=multi-user.target
-EOF
-)
-askorupdate_or_write "$SERVICE_UNIT" "$SERVICE_CONTENT"
-systemctl daemon-reload
-systemctl enable --now "$SERVICE_NAME"
-sleep 1
-systemctl is-active --quiet "$SERVICE_NAME" || { systemctl status "$SERVICE_NAME" --no-pager -l || true; die "Service ${SERVICE_NAME} non actif."; }
-ok "Service actif: ${SERVICE_NAME}"
-
-say "7) Nginx include + proxy /wolverine/traderone/api/"
-INC_CONTENT=$(cat <<'EOF'
-# /etc/nginx/includes/wolverine_routes.inc
-location ^~ /wolverine/ {
-  root /var/www;
-  try_files $uri $uri/ /wolverine/index.html;
-  add_header Cache-Control "no-store" always;
-}
-location = /wolverine/sw.js { add_header Cache-Control "no-store" always; return 404; }
-location = /wolverine/service-worker.js { add_header Cache-Control "no-store" always; return 404; }
-location = /wolverine/manifest.json { add_header Cache-Control "no-store" always; return 404; }
-
-location ^~ /wolverine/traderone/api/ {
-  proxy_http_version 1.1;
-  proxy_set_header Host $host;
-  proxy_set_header X-Real-IP $remote_addr;
-  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto $scheme;
-  proxy_set_header Connection "";
-  proxy_read_timeout 60s;
-  proxy_send_timeout 60s;
-  proxy_pass http://127.0.0.1:3000/;
-}
-EOF
-)
-askorupdate_or_write "$NGINX_INC" "$INC_CONTENT"
-ok "Include écrit: $NGINX_INC"
-
-say "8) Nginx vhost: s'assurer que l'include est présent"
-if ! grep -q "includes/wolverine_routes\.inc" "$NGINX_SITE"; then
-  backup_file "$NGINX_SITE"
-  python3 - <<PY
-import re, pathlib
-p=pathlib.Path("${NGINX_SITE}")
-s=p.read_text(errors="ignore")
-if "includes/wolverine_routes.inc" in s:
-    print("already"); raise SystemExit
-m=re.search(r"server\s*\{", s)
-if not m: raise SystemExit("server block not found")
-i=m.end()
-s=s[:i]+"\n  include /etc/nginx/includes/wolverine_routes.inc;\n"+s[i:]
-p.write_text(s)
-print("patched")
-PY
-  ok "Include ajouté dans $NGINX_SITE"
-else
-  ok "Include déjà présent"
-fi
-
-say "9) Reload nginx"
-nginx -t
-systemctl reload nginx
-ok "Nginx rechargé"
-
-say "10) Tests locaux"
+say "H) Quick HTTP local probes"
 set +e
-echo "--- frontend ---"
-curl -sS -I "http://127.0.0.1/wolverine/" | head -n 12
-echo "--- api ---"
-curl -sS -I "http://127.0.0.1/wolverine/traderone/api/" | head -n 12
+w "curl -I http://127.0.0.1/wolverine/ :"
+curl -sS -I http://127.0.0.1/wolverine/ | head -n 15 | tee -a "$OUT" >/dev/null
+w "curl -I http://127.0.0.1/wolverine/traderone/api/ :"
+curl -sS -I http://127.0.0.1/wolverine/traderone/api/ | head -n 15 | tee -a "$OUT" >/dev/null
 set -e
 
-say "11) Résumé"
-echo "Frontend:  https://${HOST}/wolverine/"
-echo "API proxy: https://${HOST}/wolverine/traderone/api/"
-echo "Service:   systemctl status ${SERVICE_NAME} --no-pager -l"
-echo "Logs:      journalctl -u ${SERVICE_NAME} -n 200 --no-pager"
-ok "MEGA batch terminé."
+say "DONE"
+echo
+echo "Rapport généré: $OUT"
+echo "Colle-moi le contenu de ce fichier (ou juste les sections C/D/G/H) et je verrouille la cartographie."
