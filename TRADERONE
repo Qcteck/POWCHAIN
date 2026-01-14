@@ -1,32 +1,31 @@
-cat >/root/unlock_and_patch_wolverine_inc.sh <<'BASH'
+cat >/root/enforce_traderone_api_block.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
 INC="/etc/nginx/includes/wolverine_routes.inc"
-SITE="/etc/nginx/sites-enabled/fireinners.online-ssl"
 TS="$(date -u +%Y%m%d_%H%M%S)"
 HOST="fireinners.online"
+SNIP="include /etc/nginx/snippets/traderone_api_lockdown.conf;"
 
-echo "=== 1) Show attrs BEFORE ==="
-lsattr "$INC" || true
+test -f "$INC" || { echo "❌ Missing $INC"; exit 1; }
+
+echo "=== 1) Backup ==="
+cp -a "$INC" "${INC}.bak_${TS}"
+echo "Backup: ${INC}.bak_${TS}"
 echo
 
-echo "=== 2) Remove immutable/append-only (fix EPERM) ==="
-chattr -i "$INC" 2>/dev/null || true
-chattr -a "$INC" 2>/dev/null || true
-chattr -ia "$INC" 2>/dev/null || true
-echo "Attrs AFTER:"
-lsattr "$INC" || true
+echo "=== 2) Ensure snippet exists (deny public) ==="
+mkdir -p /etc/nginx/snippets
+cat >/etc/nginx/snippets/traderone_api_lockdown.conf <<'NG'
+add_header Cache-Control "no-store" always;
+allow 127.0.0.1;
+deny all;
+NG
+chmod 0644 /etc/nginx/snippets/traderone_api_lockdown.conf
+echo "OK snippet written"
 echo
 
-echo "=== 3) Quick write test (must succeed) ==="
-cp -a "$INC" "${INC}.bak_unlock_${TS}"
-echo "# unlock_test_${TS}" >> "$INC"
-tail -n 2 "$INC"
-echo "Write test OK ✅"
-echo
-
-echo "=== 4) Patch include: make /wolverine PUBLIC, keep /wolverine/traderone/api protected ==="
+echo "=== 3) Inject include inside ANY /wolverine/traderone/api location blocks ==="
 python3 - <<'PY'
 from pathlib import Path
 import re
@@ -34,65 +33,76 @@ import re
 inc_path = Path("/etc/nginx/includes/wolverine_routes.inc")
 s = inc_path.read_text(errors="ignore")
 
-# Remove any accidental global include of traderone_api_lockdown
-s = s.replace("include /etc/nginx/snippets/traderone_api_lockdown.conf;", "")
+include_line = "include /etc/nginx/snippets/traderone_api_lockdown.conf;"
 
-def rewrite_location(text, loc_regex, rewrite_fn):
-    m = re.search(loc_regex, text, flags=re.M)
-    if not m:
-        return text, False
-    start = m.start()
-    brace = text.find("{", start)
-    if brace == -1:
-        return text, False
-    i = brace
-    depth = 0
-    end = None
-    while i < len(text):
-        if text[i] == "{": depth += 1
-        elif text[i] == "}":
-            depth -= 1
-            if depth == 0:
-                end = i+1
-                break
-        i += 1
-    if end is None:
-        return text, False
-    block = text[start:end]
-    block2 = rewrite_fn(block)
-    return text[:start] + block2 + text[end:], True
+# Inject include right after "{" for any location block matching /wolverine/traderone/api (with or without slash)
+def inject_into_locations(text):
+    out = []
+    i = 0
+    changed = False
+    # Find "location ... /wolverine/traderone/api ... {"
+    for m in re.finditer(r'(^\s*location\s+[^{};]*?/wolverine/traderone/api/?\s*\{)', text, flags=re.M):
+        start = m.start(1)
+        brace = text.find("{", start)
+        if brace == -1:
+            continue
+        # find end of that location block by brace matching
+        j = brace
+        depth = 0
+        end = None
+        while j < len(text):
+            if text[j] == "{": depth += 1
+            elif text[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    end = j + 1
+                    break
+            j += 1
+        if end is None:
+            continue
 
-def clean_wolverine(block: str) -> str:
-    block = re.sub(r'^\s*(deny\s+all;|internal;)\s*$', '', block, flags=re.M)
-    block = re.sub(r'^\s*allow\s+127\.0\.0\.1;\s*$', '', block, flags=re.M)
-    block = re.sub(r'^\s*deny\s+all;\s*$', '', block, flags=re.M)
-    return block
+        block = text[start:end]
+        if include_line in block:
+            continue
 
-s, _ = rewrite_location(s, r'^\s*location\s+(\^~\s+)?/wolverine/\s*\{', clean_wolverine)
+        # inject include after first "{"
+        block2 = re.sub(r'\{\s*', '{\n    ' + include_line + '\n', block, count=1)
+        text = text[:start] + block2 + text[end:]
+        changed = True
+        return text, changed  # run iteratively (string changed offsets)
 
-def ensure_api_lock(block: str) -> str:
-    inc = "include /etc/nginx/snippets/traderone_api_lockdown.conf;"
-    if inc not in block:
-        block = re.sub(r'\{\s*', '{\n    ' + inc + '\n', block, count=1)
-    return block
+    return text, changed
 
-s, _ = rewrite_location(s, r'^\s*location\s+(\^~\s+)?/wolverine/traderone/api/?\s*\{', ensure_api_lock)
+changed_any = False
+while True:
+    s2, changed = inject_into_locations(s)
+    if not changed:
+        break
+    s = s2
+    changed_any = True
 
-inc_path.write_text(s)
-print("OK patched:", inc_path)
+if not changed_any:
+    print("WARN: no /wolverine/traderone/api location found to patch (it may be in site file, not include).")
+else:
+    inc_path.write_text(s)
+    print("OK: include injected into traderone api location(s)")
 PY
 echo
 
-echo "=== 5) nginx test + reload ==="
+echo "=== 4) nginx test + reload ==="
 nginx -t
 systemctl reload nginx || service nginx reload
 echo
 
-echo "=== 6) ORIGIN checks ==="
-curl -skI --resolve ${HOST}:443:127.0.0.1 https://${HOST}/wolverine/index.html | head -n 12 || true
-curl -skI --resolve ${HOST}:443:127.0.0.1 https://${HOST}/wolverine/traderone/api/ | head -n 12 || true
+echo "=== 5) Checks ==="
+echo "--- ORIGIN (localhost allowed, may be 200/404 depending on app) ---"
+curl -skI --resolve ${HOST}:443:127.0.0.1 https://${HOST}/wolverine/traderone/api | head -n 12 || true
+echo
+echo "--- PUBLIC (should be 403) ---"
+curl -skI https://${HOST}/wolverine/traderone/api | head -n 12 || true
+
 echo "DONE ✅"
 BASH
 
-chmod +x /root/unlock_and_patch_wolverine_inc.sh
-/root/unlock_and_patch_wolverine_inc.sh
+chmod +x /root/enforce_traderone_api_block.sh
+/root/enforce_traderone_api_block.sh
