@@ -1,207 +1,82 @@
-cat >/root/MEGA_WOLVERINE_TRADERONE_PLUG.sh <<'BASH'
+cat >/root/fix_wolverine_403_front.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
-TS="$(date +%Y%m%d_%H%M%S)"
 
-# ===== Emplacements FIXES (pas de question) =====
-FRONT_DIR="/var/www/wolverine"
-FRONT_INDEX="${FRONT_DIR}/index.html"
+CFG="/etc/nginx/sites-enabled/fireinners.online-ssl"
+TS="$(date -u +%Y%m%d_%H%M%S)"
 
-BASE="/opt/traderone-opt"
-BACK="${BASE}/backend"
-SVC="/etc/systemd/system/traderone.service"
+echo "=== Backup ==="
+cp -a "$CFG" "${CFG}.bak_frontfix_${TS}"
+echo "Backup: ${CFG}.bak_frontfix_${TS}"
+echo
 
-INC="/etc/nginx/includes/wolverine_routes.inc"
-VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
-NGINXCONF="/etc/nginx/nginx.conf"
+echo "=== Remove any deny/internal from /wolverine location ==="
+python3 - <<'PY'
+from pathlib import Path
+import re
 
-HOST="127.0.0.1"
-PORT="3000"
-RPC_UPSTREAM="https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac"
+cfg = Path("/etc/nginx/sites-enabled/fireinners.online-ssl")
+s = cfg.read_text(errors="ignore")
 
-bk(){ local f="$1"; [ -f "$f" ] && cp -a "$f" "${f}.bak_${TS}"; true; }
-unlock(){ chattr -i "$1" 2>/dev/null || true; }
-relock(){ chattr +i "$1" 2>/dev/null || true; }
+# Remove deny all / internal inside location /wolverine
+def clean_block(text, pat):
+    m = re.search(pat, text)
+    if not m: return text
+    start = m.start()
+    brace = text.find("{", start)
+    if brace == -1: return text
+    i = brace
+    depth = 0
+    while i < len(text):
+        if text[i] == "{": depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                end = i+1
+                block = text[start:end]
+                block2 = re.sub(r'^\s*(deny\s+all;|internal;).*$', '', block, flags=re.M)
+                return text[:start] + block2 + text[end:]
+        i += 1
+    return text
 
-echo "=== MEGA_WOLVERINE_TRADERONE_PLUG :: ${TS} ==="
+s2 = clean_block(s, r'location\s+(\^~\s+)?/?wolverine/?\s*\{')
+cfg.write_text(s2)
+print("OK: cleaned deny/internal in /wolverine")
+PY
 
-# 0) Prérequis stricts
-[ -f "$FRONT_INDEX" ] || { echo "[FATAL] Frontend manquant: $FRONT_INDEX"; exit 1; }
-[ -f "$VHOST" ] || { echo "[FATAL] VHOST manquant: $VHOST"; exit 1; }
-
-# 1) Node (sans apt/npm croisé)
-if ! command -v node >/dev/null 2>&1; then
-  apt-get update -y
-  apt-get install -y ca-certificates curl gnupg
-  install -d -m 0755 /etc/apt/keyrings
-  curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
-  NODE_MAJOR="20"
-  echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_${NODE_MAJOR}.x nodistro main" >/etc/apt/sources.list.d/nodesource.list
-  apt-get update -y
-  apt-get install -y nodejs
-fi
-
-# 2) TraderOne backend (install fixe)
-mkdir -p "$BACK"
-cd "$BACK"
-
-cat >package.json <<'JSON'
-{
-  "name": "traderone-backend",
-  "version": "1.0.0",
-  "private": true,
-  "main": "server.js",
-  "type": "commonjs",
-  "scripts": { "start": "node server.js" },
-  "dependencies": { "express": "4.19.2", "cors": "2.8.5" }
-}
-JSON
-
-cat >server.js <<'JS'
-"use strict";
-const express=require("express");
-const cors=require("cors");
-const app=express();
-app.set("trust proxy", true);
-app.use(cors({origin:true,credentials:true}));
-app.use(express.json({limit:"2mb"}));
-
-app.get("/ping",(_q,r)=>r.json({ok:true,svc:"traderone",ts:Date.now()}));
-app.get("/health",(_q,r)=>r.json({ok:true,svc:"traderone",ts:Date.now()}));
-
-app.get("/api/status",(_q,r)=>r.json({ok:true,mode:"idle",ts:Date.now()}));
-app.post("/api/start",(q,r)=>r.json({ok:true,started:true,echo:q.body||{},ts:Date.now()}));
-app.post("/api/traderone/mode",(q,r)=>r.json({ok:true,mode:(q.body&&q.body.mode)?String(q.body.mode):"auto",ts:Date.now()}));
-app.post("/api/traderone/withdraw",(q,r)=>r.json({ok:true,queued:true,echo:q.body||{},ts:Date.now()}));
-app.get("/api/invested",(q,r)=>r.json({ok:true,pub:q.query.pub?String(q.query.pub):"",invested_usdc:0,positions:[],ts:Date.now()}));
-
-app.use((req,res)=>res.status(404).json({ok:false,error:"not_found",path:req.originalUrl}));
-
-const HOST=process.env.HOST||"127.0.0.1";
-const PORT=Number(process.env.PORT||3000);
-app.listen(PORT,HOST,()=>console.log(`[traderone] http://${HOST}:${PORT}`));
-JS
-
-npm install --silent
-
-# 3) systemd service (lancement backend)
-bk "$SVC"
-cat >"$SVC" <<EOF
-[Unit]
-Description=TraderOne Backend (WOLVERINE)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-WorkingDirectory=${BACK}
-Environment=HOST=${HOST}
-Environment=PORT=${PORT}
-ExecStart=/usr/bin/node ${BACK}/server.js
-Restart=always
-RestartSec=2
-User=root
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl daemon-reload
-systemctl enable --now traderone.service
-
-# 4) Nginx include UNIQUE (zéro doublon)
-bk "$INC"
-unlock "$INC"
-cat >"$INC" <<EOF
-# Wolverine routes (TRADERONE) - SINGLE SOURCE OF TRUTH
-# Generated: ${TS}
-
-# --- TraderOne API under /wolverine/traderone/api/ ---
-location = /wolverine/traderone/api { return 301 /wolverine/traderone/api/; }
-
-location ^~ /wolverine/traderone/api/ {
-  proxy_http_version 1.1;
-  proxy_set_header Host \$host;
-  proxy_set_header X-Real-IP \$remote_addr;
-  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto \$scheme;
-
-  add_header X-Wolverine-Route "traderone" always;
-  add_header Cache-Control "no-store" always;
-
-  rewrite ^/wolverine/traderone/api/(.*)$ /\$1 break;
-  proxy_pass http://${HOST}:${PORT};
-}
-
-# --- Solana RPC proxy (PUBLIC for Phantom/web3.js) ---
-location = /wolverine/rpc {
-  add_header X-Wolverine-Rpc "nginx-origin" always;
-  add_header Cache-Control "no-store" always;
-
-  if (\$request_method = OPTIONS) {
-    add_header Access-Control-Allow-Origin "*" always;
-    add_header Access-Control-Allow-Methods "POST, OPTIONS" always;
-    add_header Access-Control-Allow-Headers "Content-Type, Authorization" always;
-    return 204;
-  }
-  add_header Access-Control-Allow-Origin "*" always;
-  add_header Access-Control-Allow-Methods "POST, OPTIONS" always;
-  add_header Access-Control-Allow-Headers "Content-Type, Authorization" always;
-
-  proxy_http_version 1.1;
-  proxy_set_header Host lb.drpc.live;
-  proxy_set_header Connection "";
-  proxy_set_header X-Real-IP \$remote_addr;
-  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto \$scheme;
-
-  proxy_pass ${RPC_UPSTREAM};
-}
-location ^~ /wolverine/rpc/ { return 301 /wolverine/rpc; }
-EOF
-relock "$INC"
-
-# 5) VHOST: enlève les règles qui créent le 403 (allow/deny), et force include 1 seule fois
-bk "$VHOST"
-unlock "$VHOST"
-
-# purge allow/deny toxiques (souvent la cause directe des 403 externes)
-sed -i -E '/^\s*allow\s+127\.0\.0\.1;\s*$/d; /^\s*deny\s+all;\s*$/d' "$VHOST"
-
-# retire toutes les occurrences existantes de l'include (on remet 1 seule)
-sed -i -E "\|^\s*include\s+${INC//\//\\/};\s*$|d" "$VHOST"
-
-# ajoute l'include UNE fois, juste après le bloc /wolverine/ si trouvé, sinon à la fin du server
-if grep -qE "location\s+\^~\s+/wolverine/" "$VHOST"; then
-  awk -v inc="  include ${INC};" '
+echo "=== Force public /wolverine location (add if missing) ==="
+if ! grep -qE "location\s+\^~\s+/wolverine/\s*\{" "$CFG"; then
+  awk '
+    BEGIN{done=0}
     {print}
-    (!done && $0 ~ /location[[:space:]]+\^~[[:space:]]+\/wolverine\//){print inc; done=1}
-  ' "$VHOST" >"${VHOST}.tmp_${TS}" && mv "${VHOST}.tmp_${TS}" "$VHOST"
+    done==0 && $0 ~ /^[[:space:]]*server[[:space:]]*\{/ {
+      print ""
+      print "  # Force public front"
+      print "  location ^~ /wolverine/ {"
+      print "    root /var/www;"
+      print "    try_files $uri $uri/ /wolverine/index.html;"
+      print "    allow all;"
+      print "  }"
+      print ""
+      done=1
+    }
+  ' "$CFG" > /tmp/nginx_frontfix.tmp
+  mv /tmp/nginx_frontfix.tmp "$CFG"
+  echo "Added public /wolverine location"
 else
-  echo "  include ${INC};" >>"$VHOST"
+  echo "/wolverine location already exists"
 fi
 
-relock "$VHOST"
+echo
+echo "=== nginx test + reload ==="
+nginx -t
+systemctl reload nginx || service nginx reload
+echo
 
-# 6) Reload nginx (sans section de tests)
-unlock "$NGINXCONF"
-systemctl reload nginx
-relock "$NGINXCONF"
-
-# 7) Résultats (pas de curl, pas de bloc “tests”)
-echo "=== RESULTATS ==="
-echo "Frontend (WOLVERINE): ${FRONT_INDEX}"
-echo "Backend (TraderOne):  ${BACK}/server.js"
-echo "Service:              traderone.service"
-echo -n "Service is-active:    "; systemctl is-active traderone.service || true
-echo "Nginx include:         ${INC}"
-echo "Nginx vhost:           ${VHOST}"
-echo ""
-echo "URL UI:   https://fireinners.online/wolverine/"
-echo "URL API:  https://fireinners.online/wolverine/traderone/api/ping"
-echo "URL RPC:  https://fireinners.online/wolverine/rpc"
-echo "=== FIN ==="
+echo "=== ORIGIN check ==="
+curl -skI --resolve fireinners.online:443:127.0.0.1 https://fireinners.online/wolverine/index.html | head -n 12 || true
+echo "DONE ✅"
 BASH
 
-chmod +x /root/MEGA_WOLVERINE_TRADERONE_PLUG.sh
-bash /root/MEGA_WOLVERINE_TRADERONE_PLUG.sh
+chmod +x /root/fix_wolverine_403_front.sh
+/root/fix_wolverine_403_front.sh
