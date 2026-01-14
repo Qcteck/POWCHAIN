@@ -1,117 +1,119 @@
-cat >/root/FIX_WOLVERINE_403_ONEPASS.sh <<'BASH'
+cat >/root/unlock_patch_wolverine_inc.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
+
+INC="/etc/nginx/includes/wolverine_routes.inc"
+SITE="/etc/nginx/sites-enabled/fireinners.online-ssl"
+TS="$(date -u +%Y%m%d_%H%M%S)"
 HOST="fireinners.online"
 
-SITE="/etc/nginx/sites-enabled/fireinners.online-ssl"
-INC="/etc/nginx/includes/wolverine_routes.inc"
-TS="$(date -u +%Y%m%d_%H%M%S)"
-
-echo "=== 0) ORIGIN check BEFORE ==="
-curl -skI --resolve ${HOST}:443:127.0.0.1 https://${HOST}/wolverine/index.html | head -n 12 || true
+echo "=== 1) Check mounts + file perms ==="
+mount | egrep " /etc | / " || true
+ls -lah "$INC" || true
+stat "$INC" || true
 echo
 
-echo "=== 1) Locate where /wolverine is defined ==="
-echo "--- In site file:"
-grep -nE "wolverine|include\s+/etc/nginx/includes/wolverine_routes\.inc|location\s+\^~\s+/wolverine" "$SITE" || true
+echo "=== 2) Check immutable attribute (lsattr) ==="
+command -v lsattr >/dev/null 2>&1 && lsattr "$INC" || echo "lsattr not available"
 echo
-if [ -f "$INC" ]; then
-  echo "--- In include file ($INC):"
-  grep -nE "location\s+|wolverine|deny\s+all;|internal;|traderone_api_lockdown" "$INC" || true
+
+echo "=== 3) Unlock if immutable / fix perms ==="
+# remove immutable if present
+if command -v lsattr >/dev/null 2>&1 && lsattr "$INC" | grep -q "\-i\-"; then
+  echo "Immutable not set."
 else
-  echo "WARN: $INC not found"
+  echo "Trying: chattr -i $INC (ignore if not supported)"
+  chattr -i "$INC" 2>/dev/null || true
 fi
+
+chown root:root "$INC" 2>/dev/null || true
+chmod 644 "$INC" 2>/dev/null || true
 echo
 
-echo "=== 2) Backups ==="
+echo "=== 4) Backup ==="
+cp -a "$INC" "${INC}.bak_${TS}"
 cp -a "$SITE" "${SITE}.bak_${TS}"
-[ -f "$INC" ] && cp -a "$INC" "${INC}.bak_${TS}" || true
-echo "Backup: ${SITE}.bak_${TS}"
-[ -f "$INC" ] && echo "Backup: ${INC}.bak_${TS}"
+echo "Backups:"
+echo " - ${INC}.bak_${TS}"
+echo " - ${SITE}.bak_${TS}"
 echo
 
-echo "=== 3) FIX include file: make /wolverine public, keep /wolverine/traderone/api protected ==="
+echo "=== 5) Patch include: make /wolverine PUBLIC, keep /wolverine/traderone/api protected ==="
 python3 - <<'PY'
 from pathlib import Path
 import re
 
 inc_path = Path("/etc/nginx/includes/wolverine_routes.inc")
-site_path = Path("/etc/nginx/sites-enabled/fireinners.online-ssl")
+s = inc_path.read_text(errors="ignore")
 
-def patch_text(s: str) -> str:
-    # Remove any server/global include of traderone_api_lockdown (we want it ONLY in the api location)
-    s = s.replace("include /etc/nginx/snippets/traderone_api_lockdown.conf;", "")
+# 1) remove any accidental global include of traderone_api_lockdown
+s = s.replace("include /etc/nginx/snippets/traderone_api_lockdown.conf;", "")
 
-    # Helper: find & rewrite a location block content
-    def rewrite_location(text, loc_regex, rewrite_fn):
-        m = re.search(loc_regex, text, flags=re.M)
-        if not m:
-            return text, False
-        start = m.start()
-        brace = text.find("{", start)
-        if brace == -1:
-            return text, False
-        i = brace
-        depth = 0
-        end = None
-        while i < len(text):
-            if text[i] == "{": depth += 1
-            elif text[i] == "}":
-                depth -= 1
-                if depth == 0:
-                    end = i+1
-                    break
-            i += 1
-        if end is None:
-            return text, False
-        block = text[start:end]
-        block2 = rewrite_fn(block)
-        return text[:start] + block2 + text[end:], True
+def rewrite_location(text, loc_regex, rewrite_fn):
+    m = re.search(loc_regex, text, flags=re.M)
+    if not m:
+        return text, False
+    start = m.start()
+    brace = text.find("{", start)
+    if brace == -1:
+        return text, False
+    i = brace
+    depth = 0
+    end = None
+    while i < len(text):
+        if text[i] == "{": depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                end = i+1
+                break
+        i += 1
+    if end is None:
+        return text, False
+    block = text[start:end]
+    block2 = rewrite_fn(block)
+    return text[:start] + block2 + text[end:], True
 
-    # 1) Ensure /wolverine/ is PUBLIC: remove deny/internal lines inside that block
-    def clean_wolverine(block: str) -> str:
-        block = re.sub(r'^\s*(deny\s+all;|internal;)\s*$', '', block, flags=re.M)
-        # also remove allow 127.0.0.1 / deny all combos if they were mistakenly inserted
-        block = re.sub(r'^\s*allow\s+127\.0\.0\.1;\s*$', '', block, flags=re.M)
-        block = re.sub(r'^\s*deny\s+all;\s*$', '', block, flags=re.M)
-        return block
+# 2) /wolverine/ must be public: remove deny/internal/allow127 combos inside that block
+def clean_wolverine(block: str) -> str:
+    block = re.sub(r'^\s*(deny\s+all;|internal;)\s*$', '', block, flags=re.M)
+    block = re.sub(r'^\s*allow\s+127\.0\.0\.1;\s*$', '', block, flags=re.M)
+    block = re.sub(r'^\s*deny\s+all;\s*$', '', block, flags=re.M)
+    return block
 
-    s, _ = rewrite_location(s, r'^\s*location\s+(\^~\s+)?/wolverine/\s*\{', clean_wolverine)
+s, _ = rewrite_location(s, r'^\s*location\s+(\^~\s+)?/wolverine/\s*\{', clean_wolverine)
 
-    # 2) Ensure /wolverine/traderone/api has the lockdown include inside it
-    def ensure_api_lock(block: str) -> str:
-        inc = "include /etc/nginx/snippets/traderone_api_lockdown.conf;"
-        if inc not in block:
-            block = re.sub(r'\{\s*', '{\n    ' + inc + '\n', block, count=1)
-        return block
+# 3) /wolverine/traderone/api must keep lockdown include inside it
+def ensure_api_lock(block: str) -> str:
+    inc = "include /etc/nginx/snippets/traderone_api_lockdown.conf;"
+    if inc not in block:
+        block = re.sub(r'\{\s*', '{\n    ' + inc + '\n', block, count=1)
+    return block
 
-    s, _ = rewrite_location(s, r'^\s*location\s+(\^~\s+)?/wolverine/traderone/api/?\s*\{', ensure_api_lock)
+s, ok = rewrite_location(s, r'^\s*location\s+(\^~\s+)?/wolverine/traderone/api/?\s*\{', ensure_api_lock)
+if not ok:
+    print("WARN: no /wolverine/traderone/api location found in include (may be elsewhere)")
 
-    return s
-
-# Patch include file if present, else patch site file
-if inc_path.exists():
-    s = inc_path.read_text(errors="ignore")
-    inc_path.write_text(patch_text(s))
-    print("OK: patched include file:", inc_path)
-else:
-    s = site_path.read_text(errors="ignore")
-    site_path.write_text(patch_text(s))
-    print("OK: patched site file (no include found):", site_path)
-
+inc_path.write_text(s)
+print("OK: patched", inc_path)
 PY
 echo
 
-echo "=== 4) nginx test + reload ==="
+echo "=== 6) OPTIONAL: re-lock immutable (only if you want) ==="
+# Uncomment if you really want it immutable after patch
+# chattr +i "$INC" 2>/dev/null || true
+echo
+
+echo "=== 7) nginx test + reload ==="
 nginx -t
 systemctl reload nginx || service nginx reload
 echo
 
-echo "=== 5) ORIGIN check AFTER ==="
+echo "=== 8) ORIGIN check AFTER ==="
 curl -skI --resolve ${HOST}:443:127.0.0.1 https://${HOST}/wolverine/index.html | head -n 12 || true
 curl -skI --resolve ${HOST}:443:127.0.0.1 https://${HOST}/wolverine/traderone/api/ | head -n 12 || true
 echo "DONE ✅"
 BASH
 
-chmod +x /root/FIX_WOLVERINE_403_ONEPASS.sh
-/root/FIX_WOLVERINE_403_ONEPASS.sh
+chmod +x /root/unlock_patch_wolverine_inc.sh
+/root/unlock_patch_wolverine_inc.sh
