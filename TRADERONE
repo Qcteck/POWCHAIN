@@ -1,4 +1,4 @@
-cat >/root/unlock_patch_wolverine_inc.sh <<'BASH'
+cat >/root/unlock_and_patch_wolverine_inc.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -7,38 +7,26 @@ SITE="/etc/nginx/sites-enabled/fireinners.online-ssl"
 TS="$(date -u +%Y%m%d_%H%M%S)"
 HOST="fireinners.online"
 
-echo "=== 1) Check mounts + file perms ==="
-mount | egrep " /etc | / " || true
-ls -lah "$INC" || true
-stat "$INC" || true
+echo "=== 1) Show attrs BEFORE ==="
+lsattr "$INC" || true
 echo
 
-echo "=== 2) Check immutable attribute (lsattr) ==="
-command -v lsattr >/dev/null 2>&1 && lsattr "$INC" || echo "lsattr not available"
+echo "=== 2) Remove immutable/append-only (fix EPERM) ==="
+chattr -i "$INC" 2>/dev/null || true
+chattr -a "$INC" 2>/dev/null || true
+chattr -ia "$INC" 2>/dev/null || true
+echo "Attrs AFTER:"
+lsattr "$INC" || true
 echo
 
-echo "=== 3) Unlock if immutable / fix perms ==="
-# remove immutable if present
-if command -v lsattr >/dev/null 2>&1 && lsattr "$INC" | grep -q "\-i\-"; then
-  echo "Immutable not set."
-else
-  echo "Trying: chattr -i $INC (ignore if not supported)"
-  chattr -i "$INC" 2>/dev/null || true
-fi
-
-chown root:root "$INC" 2>/dev/null || true
-chmod 644 "$INC" 2>/dev/null || true
+echo "=== 3) Quick write test (must succeed) ==="
+cp -a "$INC" "${INC}.bak_unlock_${TS}"
+echo "# unlock_test_${TS}" >> "$INC"
+tail -n 2 "$INC"
+echo "Write test OK ✅"
 echo
 
-echo "=== 4) Backup ==="
-cp -a "$INC" "${INC}.bak_${TS}"
-cp -a "$SITE" "${SITE}.bak_${TS}"
-echo "Backups:"
-echo " - ${INC}.bak_${TS}"
-echo " - ${SITE}.bak_${TS}"
-echo
-
-echo "=== 5) Patch include: make /wolverine PUBLIC, keep /wolverine/traderone/api protected ==="
+echo "=== 4) Patch include: make /wolverine PUBLIC, keep /wolverine/traderone/api protected ==="
 python3 - <<'PY'
 from pathlib import Path
 import re
@@ -46,7 +34,7 @@ import re
 inc_path = Path("/etc/nginx/includes/wolverine_routes.inc")
 s = inc_path.read_text(errors="ignore")
 
-# 1) remove any accidental global include of traderone_api_lockdown
+# Remove any accidental global include of traderone_api_lockdown
 s = s.replace("include /etc/nginx/snippets/traderone_api_lockdown.conf;", "")
 
 def rewrite_location(text, loc_regex, rewrite_fn):
@@ -74,7 +62,6 @@ def rewrite_location(text, loc_regex, rewrite_fn):
     block2 = rewrite_fn(block)
     return text[:start] + block2 + text[end:], True
 
-# 2) /wolverine/ must be public: remove deny/internal/allow127 combos inside that block
 def clean_wolverine(block: str) -> str:
     block = re.sub(r'^\s*(deny\s+all;|internal;)\s*$', '', block, flags=re.M)
     block = re.sub(r'^\s*allow\s+127\.0\.0\.1;\s*$', '', block, flags=re.M)
@@ -83,37 +70,29 @@ def clean_wolverine(block: str) -> str:
 
 s, _ = rewrite_location(s, r'^\s*location\s+(\^~\s+)?/wolverine/\s*\{', clean_wolverine)
 
-# 3) /wolverine/traderone/api must keep lockdown include inside it
 def ensure_api_lock(block: str) -> str:
     inc = "include /etc/nginx/snippets/traderone_api_lockdown.conf;"
     if inc not in block:
         block = re.sub(r'\{\s*', '{\n    ' + inc + '\n', block, count=1)
     return block
 
-s, ok = rewrite_location(s, r'^\s*location\s+(\^~\s+)?/wolverine/traderone/api/?\s*\{', ensure_api_lock)
-if not ok:
-    print("WARN: no /wolverine/traderone/api location found in include (may be elsewhere)")
+s, _ = rewrite_location(s, r'^\s*location\s+(\^~\s+)?/wolverine/traderone/api/?\s*\{', ensure_api_lock)
 
 inc_path.write_text(s)
-print("OK: patched", inc_path)
+print("OK patched:", inc_path)
 PY
 echo
 
-echo "=== 6) OPTIONAL: re-lock immutable (only if you want) ==="
-# Uncomment if you really want it immutable after patch
-# chattr +i "$INC" 2>/dev/null || true
-echo
-
-echo "=== 7) nginx test + reload ==="
+echo "=== 5) nginx test + reload ==="
 nginx -t
 systemctl reload nginx || service nginx reload
 echo
 
-echo "=== 8) ORIGIN check AFTER ==="
+echo "=== 6) ORIGIN checks ==="
 curl -skI --resolve ${HOST}:443:127.0.0.1 https://${HOST}/wolverine/index.html | head -n 12 || true
 curl -skI --resolve ${HOST}:443:127.0.0.1 https://${HOST}/wolverine/traderone/api/ | head -n 12 || true
 echo "DONE ✅"
 BASH
 
-chmod +x /root/unlock_patch_wolverine_inc.sh
-/root/unlock_patch_wolverine_inc.sh
+chmod +x /root/unlock_and_patch_wolverine_inc.sh
+/root/unlock_and_patch_wolverine_inc.sh
