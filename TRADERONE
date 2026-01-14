@@ -1,88 +1,282 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# MEGA_WOLVERINE_FIX_PROBES_ROOT.sh
-# Corrige le problème de test local (port 80) en testant correctement sur 443 + Host header.
-# Auto-fix: démarre nginx si inactif. Zéro input manuel.
+# MEGA_WOLVERINE_AUTOFIX_ROOT.sh
+# Objectif: Diagnostiquer (codes HTTP) + Fix 403 /wolverine + Fix proxy /wolverine/traderone/api/ + tenter de (re)lancer TraderOne si détecté
+# Zéro input manuel. Backups systématiques. Reload nginx uniquement si nginx -t OK.
 
 if [[ "${EUID}" -ne 0 ]]; then echo "ERREUR: lance ce script en root."; exit 1; fi
 
 TS="$(date +%Y%m%d_%H%M%S)"
 HOST="fireinners.online"
-OUT="/root/MEGA_WOLVERINE_PROBES_${TS}.txt"
+
+FRONT_DIR="/var/www/wolverine"
+FRONT_INDEX="${FRONT_DIR}/index.html"
+
+NGINX_SITE="/etc/nginx/sites-available/fireinners.online-ssl"
+NGINX_INC_DIR="/etc/nginx/includes"
+NGINX_INC="${NGINX_INC_DIR}/wolverine_routes.inc"
+
+SENTINEL_LIB="/opt/fireinners/sentinel/lib/askorupdate.sh"
+ASKORUPDATE_ASK="0"; export ASKORUPDATE_ASK
+
+SERVICE_NAME="traderone"
+SERVICE_UNIT="/etc/systemd/system/${SERVICE_NAME}.service"
+PORT="3000"
+BIND="127.0.0.1"
+
+OUT="/root/MEGA_WOLVERINE_AUTOFIX_${TS}.log"
 
 say(){ printf "\n== %s ==\n" "$*"; }
 w(){ printf "%s\n" "$*" | tee -a "$OUT" >/dev/null; }
+ok(){ w "OK: $*"; }
+warn(){ w "WARN: $*"; }
+die(){ w "ERREUR: $*"; exit 1; }
 
-latest_map(){
-  ls -1t /root/WOLVERINE_VPS_MAP_*.txt 2>/dev/null | head -n 1 || true
+ensure_pkg(){
+  local p="$1"
+  if ! dpkg -s "$p" >/dev/null 2>&1; then
+    apt-get update -y
+    apt-get install -y "$p"
+  fi
 }
 
-need(){
-  local cmd="$1"
-  command -v "$cmd" >/dev/null 2>&1 || { apt-get update -y; apt-get install -y curl ca-certificates; }
+backup_file(){
+  local f="$1"
+  [[ -f "$f" ]] || return 0
+  cp -a "$f" "${f}.bak_${TS}"
 }
 
-need curl
+askorupdate_or_write(){
+  local path="$1"; local content="$2"
+  mkdir -p "$(dirname "$path")"
+  if [[ -f "$SENTINEL_LIB" ]]; then
+    # shellcheck disable=SC1090
+    source "$SENTINEL_LIB"
+    local tmp="/tmp/askorupdate_${TS}_$(basename "$path")"
+    printf "%s" "$content" > "$tmp"
+    askorupdate_file "$path" "$tmp"
+    rm -f "$tmp"
+  else
+    backup_file "$path"
+    printf "%s" "$content" > "$path"
+  fi
+}
 
-echo "# MEGA WOLVERINE PROBES ${TS}" > "$OUT"
+http_code_local(){
+  local path="$1"
+  curl -k -sS -o /dev/null -w "%{http_code}" "https://127.0.0.1${path}" -H "Host: ${HOST}" || true
+}
+http_code_ext(){
+  local path="$1"
+  curl -sS -o /dev/null -w "%{http_code}" "https://${HOST}${path}" || true
+}
+
+find_backend_dir(){
+  # Cherche un package.json plausible pour TraderOne (priorité aux chemins contenant traderone)
+  python3 - <<'PY'
+import os, json
+roots=["/opt","/root"]
+cands=[]
+for r in roots:
+    if not os.path.isdir(r): 
+        continue
+    for dirpath, dirnames, filenames in os.walk(r):
+        if "node_modules" in dirnames: dirnames.remove("node_modules")
+        if ".git" in dirnames: dirnames.remove(".git")
+        if "package.json" in filenames:
+            pj=os.path.join(dirpath,"package.json")
+            try:
+                data=json.load(open(pj,"r",encoding="utf-8"))
+            except Exception:
+                continue
+            scripts=data.get("scripts") or {}
+            deps=data.get("dependencies") or {}
+            name=(data.get("name") or "").lower()
+            score=0; p=dirpath.lower()
+            if "traderone" in p or "traderone" in name: score+=70
+            if "start" in scripts: score+=25
+            if any(k in deps for k in ["express","fastify","koa","hono"]): score+=10
+            if os.path.exists(os.path.join(dirpath,"server.js")): score+=15
+            if os.path.exists(os.path.join(dirpath,"index.js")): score+=8
+            if score>0:
+                cands.append((score,dirpath))
+cands.sort(reverse=True, key=lambda x:x[0])
+print(cands[0][1] if cands else "")
+PY
+}
+
+start_cmd_from_pkg(){
+  python3 - <<'PY'
+import json, os
+data=json.load(open("package.json","r",encoding="utf-8"))
+scripts=data.get("scripts") or {}
+if "start" in scripts:
+    print("npm start"); raise SystemExit
+for f in ["server.js","index.js","app.js","main.js"]:
+    if os.path.exists(f):
+        print(f"node {f}"); raise SystemExit
+print("")
+PY
+}
+
+say "0) Pré-requis"
+: > "$OUT"
+w "# MEGA_WOLVERINE_AUTOFIX ${TS}"
 w "host=${HOST}"
-w "date=$(date -Is)"
-w "hostname=$(hostname)"
-w ""
+ensure_pkg curl
+ensure_pkg ca-certificates
+ensure_pkg nginx
+ensure_pkg git || true
+ensure_pkg python3 || true
+ensure_pkg nodejs || true
+ensure_pkg npm || true
+ok "Paquets OK"
 
-MAP="$(latest_map)"
-if [[ -z "$MAP" ]]; then
-  w "Aucun fichier /root/WOLVERINE_VPS_MAP_*.txt trouvé."
-  w "Relance l’inventaire si besoin."
-  echo "Rapport: $OUT"
-  exit 1
-fi
-
-say "1) Map détectée"
-w "MAP_FILE=$MAP"
-w "MAP_SHA256=$(sha256sum "$MAP" | awk '{print $1}')"
-w ""
-
-say "2) État nginx + listeners"
+say "1) État nginx"
+w "nginx -v: $(nginx -v 2>&1 || true)"
 w "systemctl is-active nginx: $(systemctl is-active nginx 2>/dev/null || true)"
 if ! systemctl is-active --quiet nginx; then
-  w "nginx inactif -> démarrage..."
+  warn "nginx inactif -> démarrage"
   systemctl enable --now nginx || true
   sleep 1
 fi
 w "systemctl is-active nginx (after): $(systemctl is-active nginx 2>/dev/null || true)"
-w ""
-w "ss -lntup (nginx):"
+w "listeners (80/443/nginx):"
 (ss -lntup 2>/dev/null | egrep -i "nginx|:80|:443" || true) | tee -a "$OUT" >/dev/null
-w ""
 
-say "3) Nginx -t"
+say "2) Probes (avant fix)"
+LC_WOLV="$(http_code_local "/wolverine/")"
+LC_API="$(http_code_local "/wolverine/traderone/api/")"
+EX_WOLV="$(http_code_ext "/wolverine/")"
+EX_API="$(http_code_ext "/wolverine/traderone/api/")"
+w "LOCAL  /wolverine/                => ${LC_WOLV}"
+w "LOCAL  /wolverine/traderone/api/  => ${LC_API}"
+w "EXT    /wolverine/                => ${EX_WOLV}"
+w "EXT    /wolverine/traderone/api/  => ${EX_API}"
+
+say "3) Fix frontend 403 (nginx include + permissions) si nécessaire"
+mkdir -p "$NGINX_INC_DIR"
+
+# On force une config robuste pour /wolverine en alias (évite les pièges root/try_files)
+INC_CONTENT=$(cat <<EOF
+# /etc/nginx/includes/wolverine_routes.inc
+# Frontend WOLVERINE (alias direct pour éviter /wolverine/wolverine)
+location ^~ /wolverine/ {
+  alias ${FRONT_DIR}/;
+  try_files \$uri \$uri/ /index.html;
+  add_header Cache-Control "no-store" always;
+}
+
+# (optionnel) neutraliser SW/manifest si absent
+location = /wolverine/sw.js { add_header Cache-Control "no-store" always; return 404; }
+location = /wolverine/service-worker.js { add_header Cache-Control "no-store" always; return 404; }
+location = /wolverine/manifest.json { add_header Cache-Control "no-store" always; return 404; }
+
+# Backend TraderOne (API)
+location ^~ /wolverine/traderone/api/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+  proxy_set_header Connection "";
+  proxy_read_timeout 60s;
+  proxy_send_timeout 60s;
+  proxy_pass http://127.0.0.1:${PORT}/;
+}
+EOF
+)
+
+askorupdate_or_write "$NGINX_INC" "$INC_CONTENT"
+ok "Include WOLVERINE écrit/confirmé: $NGINX_INC"
+
+if [[ -f "$NGINX_SITE" ]]; then
+  if ! grep -q "includes/wolverine_routes\.inc" "$NGINX_SITE"; then
+    backup_file "$NGINX_SITE"
+    python3 - <<PY
+import re, pathlib
+p=pathlib.Path("${NGINX_SITE}")
+s=p.read_text(errors="ignore")
+if "includes/wolverine_routes.inc" in s:
+    raise SystemExit
+m=re.search(r"server\s*\\{", s)
+if not m:
+    raise SystemExit("server block not found")
+i=m.end()
+s=s[:i] + "\\n  include /etc/nginx/includes/wolverine_routes.inc;\\n" + s[i:]
+p.write_text(s)
+PY
+    ok "Include ajouté dans vhost: $NGINX_SITE"
+  else
+    ok "Include déjà présent dans vhost"
+  fi
+else
+  die "Vhost introuvable: $NGINX_SITE"
+fi
+
+# Permissions frontend (403 classique si droits trop stricts)
+if [[ -d "$FRONT_DIR" ]]; then
+  chmod 755 "$FRONT_DIR" || true
+  if [[ -f "$FRONT_INDEX" ]]; then chmod 644 "$FRONT_INDEX" || true; fi
+  ok "Permissions frontend ajustées (755 dir, 644 index si présent)"
+else
+  warn "Frontend dir absent: $FRONT_DIR (le site peut pointer ailleurs)"
+fi
+
+say "4) Tenter de (re)lancer TraderOne si détectable (sinon on ne casse rien)"
+BACKEND_DIR="$(find_backend_dir || true)"
+if [[ -n "$BACKEND_DIR" ]]; then
+  ok "Backend détecté: $BACKEND_DIR"
+  cd "$BACKEND_DIR"
+  if [[ -f package-lock.json ]]; then npm ci --omit=dev || true; else npm install --omit=dev || true; fi
+  START_CMD="$(start_cmd_from_pkg || true)"
+  if [[ -n "$START_CMD" ]]; then
+    SERVICE_CONTENT=$(cat <<EOF
+[Unit]
+Description=TraderOne Backend (WOLVERINE)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=${BACKEND_DIR}
+Environment=NODE_ENV=production
+Environment=PORT=${PORT}
+Environment=HOST=${BIND}
+ExecStart=/usr/bin/env bash -lc '${START_CMD}'
+Restart=always
+RestartSec=2
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+)
+    askorupdate_or_write "$SERVICE_UNIT" "$SERVICE_CONTENT"
+    systemctl daemon-reload
+    systemctl enable --now "$SERVICE_NAME" || true
+    sleep 1
+    w "systemctl is-active ${SERVICE_NAME}: $(systemctl is-active ${SERVICE_NAME} 2>/dev/null || true)"
+  else
+    warn "Backend trouvé mais pas de start/server.js détecté: $BACKEND_DIR"
+  fi
+else
+  warn "Aucun backend TraderOne détecté automatiquement (on laisse le proxy prêt)."
+fi
+
+say "5) nginx -t + reload (sécurisé)"
 w "nginx -t:"
-(nginx -t 2>&1 || true) | tee -a "$OUT" >/dev/null
-w ""
+if nginx -t 2>&1 | tee -a "$OUT" >/dev/null; then
+  systemctl reload nginx
+  ok "nginx reload OK"
+else
+  die "nginx -t a échoué. Backups disponibles (*.bak_${TS})."
+fi
 
-say "4) Tests corrigés (LOCAL HTTPS 443 + Host header)"
-w "--- curl LOCAL https://127.0.0.1/wolverine/ (Host: ${HOST}) ---"
-(curl -k -sS -I "https://127.0.0.1/wolverine/" -H "Host: ${HOST}" | head -n 20 || true) | tee -a "$OUT" >/dev/null
-w ""
-w "--- curl LOCAL https://127.0.0.1/wolverine/traderone/api/ (Host: ${HOST}) ---"
-(curl -k -sS -I "https://127.0.0.1/wolverine/traderone/api/" -H "Host: ${HOST}" | head -n 20 || true) | tee -a "$OUT" >/dev/null
-w ""
-
-say "5) Tests externes (HTTPS public)"
-w "--- curl EXT https://${HOST}/wolverine/ ---"
-(curl -sS -I "https://${HOST}/wolverine/" | head -n 20 || true) | tee -a "$OUT" >/dev/null
-w ""
-w "--- curl EXT https://${HOST}/wolverine/traderone/api/ ---"
-(curl -sS -I "https://${HOST}/wolverine/traderone/api/" | head -n 20 || true) | tee -a "$OUT" >/dev/null
-w ""
-
-say "6) Extraits utiles du MAP (C/D/G/H si présents)"
-w "---- MAP EXTRACT (grep: Wolverine/Nginx/traderone/3000/443/80) ----"
-(grep -nEi "wolverine|fireinners\.online-ssl|traderone|:3000|:443|:80|nginx" "$MAP" | head -n 220 || true) | tee -a "$OUT" >/dev/null
-w ""
-
-say "DONE"
-echo "Rapport généré: $OUT"
-echo "Copie/colle ici le contenu de $OUT (ou juste les blocs 4/5) et je te dis exactement ce qui bloque."
+say "6) Probes (après fix)"
+LC_WOLV2="$(http_code_local "/wolverine/")"
+LC_API2="$(http_code_local "/wolverine/traderone/api/")"
+EX_WOLV2="$(http_code_ext "/wolverine/")"
+EX_API2="$(http_code_ext "/wolverine/traderone/api/")"
+w "LOCAL  /wolverine/                => ${LC_WOLV2}"
+w
