@@ -1,50 +1,140 @@
-cat >/root/disable_wolverine_sw.sh <<'BASH'
-#!/usr/bin/env bash
-set -euo pipefail
-CFG="/etc/nginx/sites-enabled/fireinners.online-ssl"
-TS="$(date -u +%Y%m%d_%H%M%S)"
+@echo off
+setlocal EnableExtensions EnableDelayedExpansion
+title ROBO600 - BUILD STL (1:3) - AUTO FIND
 
-test -f "$CFG" || { echo "❌ Missing $CFG"; exit 1; }
+REM ================== SETTINGS ==================
+set "SCALE=0.3333333333"
+set "SCAD_NAME=robo600_parts.scad"
+set "LIST_NAME=PARTS_LIST"
+set "OUTDIR_NAME=out_stl"
+REM =============================================
 
-echo "== Backup =="
-cp -a "$CFG" "${CFG}.bak_disable_sw_${TS}"
-echo "Backup: ${CFG}.bak_disable_sw_${TS}"
-echo
+echo.
+echo ================= ROBO600 STL BUILD =================
+echo Scale: %SCALE% (1:3)
+echo Current dir: "%CD%"
+echo.
 
-echo "== Insert SW kill-switch locations (only if missing) =="
-if grep -q "SW_KILL_SWITCH_WOLVERINE" "$CFG"; then
-  echo "OK: already present"
-else
-  awk '
-    BEGIN{done=0}
-    {print}
-    done==0 && $0 ~ /^[[:space:]]*server[[:space:]]*\{/ {
-      print ""
-      print "  # SW_KILL_SWITCH_WOLVERINE"
-      print "  location = /wolverine/sw.js { add_header Cache-Control \"no-store\" always; return 404; }"
-      print "  location = /wolverine/service-worker.js { add_header Cache-Control \"no-store\" always; return 404; }"
-      print "  location = /wolverine/manifest.json { add_header Cache-Control \"no-store\" always; return 404; }"
-      print ""
-      done=1
-    }
-  ' "$CFG" > /tmp/nginx_swkill.tmp
-  mv /tmp/nginx_swkill.tmp "$CFG"
-  echo "✅ Added SW kill-switch"
-fi
-echo
+REM ---- 0) Find OpenSCAD executable (openscad.com / openscad.exe) ----
+set "OPENSCAD="
+for %%P in (
+  "C:\Program Files\OpenSCAD\openscad.com"
+  "C:\Program Files\OpenSCAD\openscad.exe"
+  "C:\Program Files (x86)\OpenSCAD\openscad.com"
+  "C:\Program Files (x86)\OpenSCAD\openscad.exe"
+  "C:\Program Files\OpenSCAD (Nightly)\openscad.com"
+  "C:\Program Files\OpenSCAD (Nightly)\openscad.exe"
+) do if exist "%%~P" set "OPENSCAD=%%~P"
 
-echo "== nginx test + reload =="
-nginx -t
-systemctl reload nginx || service nginx reload
-echo
+if not defined OPENSCAD (
+  for %%Q in (openscad.com openscad.exe) do (
+    where %%Q >nul 2>&1 && (for /f "delims=" %%W in ('where %%Q') do if not defined OPENSCAD set "OPENSCAD=%%W")
+  )
+)
 
-echo "== ORIGIN checks (must be 404 now) =="
-curl -skI --resolve fireinners.online:443:127.0.0.1 https://fireinners.online/wolverine/sw.js | head -n 8 || true
-curl -skI --resolve fireinners.online:443:127.0.0.1 https://fireinners.online/wolverine/service-worker.js | head -n 8 || true
-curl -skI --resolve fireinners.online:443:127.0.0.1 https://fireinners.online/wolverine/manifest.json | head -n 8 || true
+if not defined OPENSCAD (
+  echo [ERREUR] OpenSCAD introuvable.
+  echo Installe OpenSCAD puis relance. (ou ajoute-le au PATH)
+  pause
+  exit /b 1
+)
 
-echo "DONE ✅"
-BASH
+echo OpenSCAD: "%OPENSCAD%"
+echo.
 
-chmod +x /root/disable_wolverine_sw.sh
-/root/disable_wolverine_sw.sh
+REM ---- 1) Find SCAD file by searching from current directory ----
+set "SCAD_PATH="
+for /f "delims=" %%F in ('dir /s /b "%SCAD_NAME%" 2^>nul') do if not defined SCAD_PATH set "SCAD_PATH=%%F"
+
+if not defined SCAD_PATH (
+  echo [ERREUR] "%SCAD_NAME%" introuvable sous "%CD%".
+  echo Place le .bat dans le dossier du PRINTPACK (ou lance-le depuis ce dossier) et relance.
+  pause
+  exit /b 1
+)
+
+for %%D in ("%SCAD_PATH%") do set "ROOT_DIR=%%~dpD"
+set "ROOT_DIR=%ROOT_DIR:~0,-1%"
+
+echo Found SCAD: "%SCAD_PATH%"
+echo Root dir : "%ROOT_DIR%"
+echo.
+
+REM ---- 2) Find PARTS_LIST (optional) ----
+set "LIST_PATH="
+for /f "delims=" %%L in ('dir /s /b "%LIST_NAME%" 2^>nul') do if not defined LIST_PATH set "LIST_PATH=%%L"
+
+if defined LIST_PATH (
+  echo Found LIST: "%LIST_PATH%"
+) else (
+  echo [WARN] "%LIST_NAME%" introuvable. Je vais utiliser une liste de secours.
+)
+echo.
+
+REM ---- 3) Prepare output folder next to SCAD ----
+set "OUTDIR=%ROOT_DIR%\%OUTDIR_NAME%"
+if not exist "%OUTDIR%" mkdir "%OUTDIR%" >nul 2>&1
+
+if not exist "%OUTDIR%" (
+  echo [ERREUR] Impossible de creer "%OUTDIR%".
+  pause
+  exit /b 1
+)
+
+echo Output: "%OUTDIR%"
+echo.
+
+REM ---- 4) Build a temp list of parts to iterate ----
+set "TMP_LIST=%TEMP%\robo600_parts_%RANDOM%%RANDOM%.txt"
+
+if defined LIST_PATH (
+  REM Clean list: remove empty lines and comments (# or ;)
+  >"%TMP_LIST%" (
+    for /f "usebackq delims=" %%A in ("%LIST_PATH%") do (
+      set "L=%%A"
+      if not "!L!"=="" (
+        if /i not "!L:~0,1!"=="#" if /i not "!L:~0,1!"==";" echo !L!
+      )
+    )
+  )
+) else (
+  >"%TMP_LIST%" (
+    echo BASE_PLATE
+    echo TORSO
+    echo UPPER
+    echo THIGH
+    echo SHIN
+    echo FOOT
+  )
+)
+
+REM ---- 5) Export loop ----
+set /a OK=0,FAIL=0
+
+for /f "usebackq delims=" %%P in ("%TMP_LIST%") do (
+  set "PART=%%P"
+  set "OUT=%OUTDIR%\!PART!_1to3.stl"
+  echo ==== Export !PART! -> "!OUT!" ====
+  "%OPENSCAD%" -o "!OUT!" -D "SCALE=%SCALE%" -D "PART=\"!PART!\"" "%SCAD_PATH%"
+  if errorlevel 1 (
+    echo [FAIL] !PART!
+    set /a FAIL+=1
+  ) else (
+    echo [OK]   !PART!
+    set /a OK+=1
+  )
+  echo.
+)
+
+del "%TMP_LIST%" >nul 2>&1
+
+echo ================= RESULT =================
+echo OK  : %OK%
+echo FAIL: %FAIL%
+echo Folder: "%OUTDIR%"
+echo.
+if %FAIL% GTR 0 (
+  echo Certains exports ont echoue. Souvent: nom de PART invalide (pas dans ton SCAD) ou erreur de rendu.
+)
+pause
+exit /b 0
