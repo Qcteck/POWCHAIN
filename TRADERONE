@@ -1,99 +1,57 @@
+cat >/root/MEGA_WOLVERINE_RUN.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
-
-# MEGA_NODE_REPAIR_AND_WOLVERINE_FIX_ROOT.sh
-# 1) Répare APT (dpkg configure + -f install une fois)
-# 2) Purge npm Ubuntu si présent (cause deps)
-# 3) Garantit Node+npm via NodeSource (nodejs) uniquement
-# 4) Applique un fix nginx robuste pour /wolverine (alias + try_files)
-# 5) Affiche les codes HTTP LOCAL (443 Host header) + EXT (public)
-
-if [[ "${EUID}" -ne 0 ]]; then echo "ERREUR: lance ce script en root."; exit 1; fi
-
 TS="$(date +%Y%m%d_%H%M%S)"
 HOST="fireinners.online"
-
 FRONT_DIR="/var/www/wolverine"
 NGINX_SITE="/etc/nginx/sites-available/fireinners.online-ssl"
 NGINX_INC_DIR="/etc/nginx/includes"
 NGINX_INC="${NGINX_INC_DIR}/wolverine_routes.inc"
-
 PORT="3000"
-OUT="/root/MEGA_NODE_REPAIR_WOLVERINE_${TS}.log"
-
+OUT="/root/MEGA_WOLVERINE_RUN_${TS}.log"
 say(){ printf "\n== %s ==\n" "$*"; }
 w(){ printf "%s\n" "$*" | tee -a "$OUT" >/dev/null; }
 ok(){ w "OK: $*"; }
 warn(){ w "WARN: $*"; }
 die(){ w "ERREUR: $*"; exit 1; }
+ensure_pkg(){ local p="$1"; dpkg -s "$p" >/dev/null 2>&1 || { apt-get update -y; apt-get install -y "$p"; }; }
+http_code_local(){ local path="$1"; curl -k -sS -o /dev/null -w "%{http_code}" "https://127.0.0.1${path}" -H "Host: ${HOST}" || true; }
+http_code_ext(){ local path="$1"; curl -sS -o /dev/null -w "%{http_code}" "https://${HOST}${path}" || true; }
 
-ensure_pkg(){
-  local p="$1"
-  if ! dpkg -s "$p" >/dev/null 2>&1; then
-    apt-get update -y
-    apt-get install -y "$p"
-  fi
-}
-
-http_code_local(){
-  local path="$1"
-  curl -k -sS -o /dev/null -w "%{http_code}" "https://127.0.0.1${path}" -H "Host: ${HOST}" || true
-}
-http_code_ext(){
-  local path="$1"
-  curl -sS -o /dev/null -w "%{http_code}" "https://${HOST}${path}" || true
-}
-
-echo "# MEGA_NODE_REPAIR_WOLVERINE ${TS}" > "$OUT"
+echo "# MEGA_WOLVERINE_RUN ${TS}" >"$OUT"
 w "host=${HOST}"
 w "date=$(date -Is)"
 w "hostname=$(hostname)"
 
-say "1) Réparer état APT/dpkg (1 seule passe, pas de loop)"
+say "1) Réparer état APT/dpkg (1 passe)"
 export DEBIAN_FRONTEND=noninteractive
-
-w "held packages (apt-mark showhold):"
 (apt-mark showhold || true) | tee -a "$OUT" >/dev/null
-
-w "dpkg -C (paquets cassés):"
 (dpkg -C || true) | tee -a "$OUT" >/dev/null
-
-w "dpkg --configure -a:"
 (dpkg --configure -a 2>&1 || true) | tee -a "$OUT" >/dev/null
-
-w "apt-get -f install -y:"
 (apt-get -f install -y 2>&1 || true) | tee -a "$OUT" >/dev/null
 
-say "2) Purge npm Ubuntu (la source du problème) + autoremove"
+say "2) Purge npm Ubuntu (cause deps)"
 if dpkg -s npm >/dev/null 2>&1; then
-  w "npm (Ubuntu) détecté -> purge"
   (apt-get purge -y npm 2>&1 || true) | tee -a "$OUT" >/dev/null
-else
-  w "npm (Ubuntu) pas installé -> OK"
 fi
 (apt-get autoremove -y 2>&1 || true) | tee -a "$OUT" >/dev/null
-ok "Nettoyage APT terminé"
+ok "APT nettoyé"
 
-say "3) Assurer Node+npm via NodeSource (nodejs) uniquement"
+say "3) Node+npm via NodeSource (nodejs) uniquement"
 ensure_pkg curl
 ensure_pkg ca-certificates
-
-if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
-  ok "Node/npm déjà présents: node=$(node -v) npm=$(npm -v)"
-else
-  w "Node ou npm manquant -> installation NodeSource 20.x"
+if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
   curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
   apt-get install -y nodejs
-  ok "Install NodeSource OK: node=$(node -v) npm=$(npm -v)"
 fi
+ok "node=$(node -v 2>/dev/null || true) npm=$(npm -v 2>/dev/null || true)"
 
-say "4) Nginx (installer si besoin) + fix /wolverine (alias robuste)"
+say "4) Nginx + routes /wolverine"
 ensure_pkg nginx
 mkdir -p "$NGINX_INC_DIR"
 [[ -f "$NGINX_SITE" ]] || die "Vhost nginx introuvable: $NGINX_SITE"
 
-# include robuste: alias /var/www/wolverine/ -> /wolverine/
-cat > "$NGINX_INC" <<EOF
+cat >"$NGINX_INC" <<EOF
 # /etc/nginx/includes/wolverine_routes.inc
 location ^~ /wolverine/ {
   alias ${FRONT_DIR}/;
@@ -118,52 +76,40 @@ location ^~ /wolverine/traderone/api/ {
 EOF
 ok "Include écrit: $NGINX_INC"
 
-# inject include dans le vhost si absent
 if ! grep -q "includes/wolverine_routes\.inc" "$NGINX_SITE"; then
   cp -a "$NGINX_SITE" "${NGINX_SITE}.bak_${TS}"
-  awk '
-    BEGIN{done=0}
-    {print}
-    !done && $0 ~ /server[ \t]*\{/ {
-      print "  include /etc/nginx/includes/wolverine_routes.inc;";
-      done=1
-    }
-  ' "${NGINX_SITE}.bak_${TS}" > "$NGINX_SITE"
-  ok "Include ajouté dans vhost: $NGINX_SITE"
+  awk 'BEGIN{done=0}{print}!done&&$0~/server[ \t]*\{/{print "  include /etc/nginx/includes/wolverine_routes.inc;";done=1}' \
+    "${NGINX_SITE}.bak_${TS}" >"$NGINX_SITE"
+  ok "Include ajouté dans vhost"
 else
   ok "Include déjà présent dans vhost"
 fi
 
-# permissions front (403 classique)
 if [[ -d "$FRONT_DIR" ]]; then
   chmod 755 "$FRONT_DIR" || true
-  find "$FRONT_DIR" -maxdepth 1 -type f -name "index.html" -exec chmod 644 {} \; 2>/dev/null || true
-  ok "Permissions front ajustées"
+  [[ -f "${FRONT_DIR}/index.html" ]] && chmod 644 "${FRONT_DIR}/index.html" || true
+  ok "Permissions front OK"
 else
   warn "Frontend dir absent: $FRONT_DIR"
 fi
 
-say "5) nginx -t + reload (sécurisé)"
-w "nginx -t:"
-if nginx -t 2>&1 | tee -a "$OUT" >/dev/null; then
-  systemctl enable --now nginx >/dev/null 2>&1 || true
-  systemctl reload nginx
-  ok "nginx reload OK"
-else
-  die "nginx -t a échoué. Backup: ${NGINX_SITE}.bak_${TS}"
-fi
+say "5) nginx -t + reload"
+(nginx -t 2>&1 || true) | tee -a "$OUT" >/dev/null
+nginx -t >/dev/null 2>&1 || die "nginx -t FAIL. Backup: ${NGINX_SITE}.bak_${TS}"
+systemctl enable --now nginx >/dev/null 2>&1 || true
+systemctl reload nginx
+ok "nginx reload OK"
 
-say "6) Probes (codes HTTP) LOCAL 443 + EXT"
-LC_WOLV="$(http_code_local "/wolverine/")"
-LC_API="$(http_code_local "/wolverine/traderone/api/")"
-EX_WOLV="$(http_code_ext "/wolverine/")"
-EX_API="$(http_code_ext "/wolverine/traderone/api/")"
-
-w "LOCAL  /wolverine/                => ${LC_WOLV}"
-w "LOCAL  /wolverine/traderone/api/  => ${LC_API}"
-w "EXT    /wolverine/                => ${EX_WOLV}"
-w "EXT    /wolverine/traderone/api/  => ${EX_API}"
+say "6) Probes (LOCAL 443 + EXT)"
+w "LOCAL  /wolverine/                => $(http_code_local "/wolverine/")"
+w "LOCAL  /wolverine/traderone/api/  => $(http_code_local "/wolverine/traderone/api/")"
+w "EXT    /wolverine/                => $(http_code_ext "/wolverine/")"
+w "EXT    /wolverine/traderone/api/  => $(http_code_ext "/wolverine/traderone/api/")"
 
 say "DONE"
-echo "Rapport: $OUT"
-echo "Montre-moi uniquement ces 4 lignes (LOCAL/EXT) si tu veux, ça suffit pour conclure."
+w "LOG=$OUT"
+echo "$OUT"
+BASH
+chmod +x /root/MEGA_WOLVERINE_RUN.sh
+nohup /root/MEGA_WOLVERINE_RUN.sh >/root/MEGA_WOLVERINE_RUN.nohup 2>&1 </dev/null & disown
+echo "Lancé. Pour voir le résultat: tail -n 120 /root/MEGA_WOLVERINE_RUN.nohup && ls -1t /root/MEGA_WOLVERINE_RUN_*.log | head -n 1"
