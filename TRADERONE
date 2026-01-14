@@ -1,137 +1,267 @@
-cat >/root/MEGA_FIX_WOLVERINE_403.sh <<'BASH'
+cat >/root/MEGA_TRADERONE_BACKEND_PLUG_WOLVERINE.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 TS="$(date +%Y%m%d_%H%M%S)"
 
-VHOST_AV="/etc/nginx/sites-available/fireinners.online-ssl"
-VHOST_EN="/etc/nginx/sites-enabled/fireinners.online-ssl"
+# ====== Fixed paths (NO QUESTIONS) ======
+FRONT_DIR="/var/www/wolverine"
+FRONT_INDEX="${FRONT_DIR}/index.html"
+
 INC="/etc/nginx/includes/wolverine_routes.inc"
-NGINX_CONF="/etc/nginx/nginx.conf"
+VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
+NGINXCONF="/etc/nginx/nginx.conf"
 
-echo "=== MEGA_FIX_WOLVERINE_403 ($TS) ==="
-echo "But: enlever le blocage Nginx (allow 127.0.0.1 / deny all) qui cause 403 sur /wolverine/"
-echo
+BASE="/opt/traderone-opt"
+BACK="${BASE}/backend"
+SVC="/etc/systemd/system/traderone.service"
 
-need_root(){ [ "$(id -u)" -eq 0 ] || { echo "[ERREUR] Lance en root."; exit 1; }; }
-need_root
+RPC_UPSTREAM_DEFAULT="https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac"
+PORT="3000"
+HOST="127.0.0.1"
 
-exists_or_die(){ [ -f "$1" ] || { echo "[ERREUR] Fichier introuvable: $1"; exit 1; }; }
+ASKLIB="/opt/fireinners/sentinel/lib/askorupdate.sh"
 
-exists_or_die "$VHOST_AV"
-exists_or_die "$INC"
+echo "=== MEGA_TRADERONE_BACKEND_PLUG_WOLVERINE :: ${TS} ==="
 
-# Déverrouille si immutable
-unlock_if_immutable(){
-  local f="$1"
-  if lsattr -a "$f" 2>/dev/null | grep -q '^-..i'; then
-    echo "[INFO] chattr -i $f"
-    chattr -i "$f" || true
-  fi
-}
+# ====== Helpers ======
+need_cmd(){ command -v "$1" >/dev/null 2>&1; }
+bk(){ local f="$1"; [ -f "$f" ] && cp -a "$f" "${f}.bak_${TS}"; true; }
 
-lock_immutable(){
-  local f="$1"
-  echo "[INFO] chattr +i $f"
-  chattr +i "$f" || true
-}
+# ====== 0) Sanity checks ======
+echo "[0] Checks"
+[ -f "$FRONT_INDEX" ] || { echo "[FATAL] Missing frontend: $FRONT_INDEX"; exit 1; }
+[ -f "$VHOST" ] || { echo "[FATAL] Missing vhost: $VHOST"; exit 1; }
+echo " OK frontend + vhost exist"
 
-backup_file(){
-  local f="$1"
-  cp -a "$f" "${f}.bak_${TS}"
-  echo "[OK] Backup: ${f}.bak_${TS}"
-}
-
-echo "== 1) Backup + unlock =="
-unlock_if_immutable "$NGINX_CONF"
-unlock_if_immutable "$VHOST_AV"
-unlock_if_immutable "$INC"
-
-backup_file "$NGINX_CONF"
-backup_file "$VHOST_AV"
-backup_file "$INC"
-echo
-
-echo "== 2) Patch include wolverine_routes.inc (neutralise allow/deny globaux) =="
-# Objectif: commenter toute paire allow 127.0.0.1; / deny all; qui bloque le contenu statique.
-# On garde le fichier valide: on commente les lignes plutôt que les supprimer.
-python3 - <<PY
-from pathlib import Path
-p=Path("$INC")
-s=p.read_text(errors="ignore").splitlines()
-
-out=[]
-changed=False
-for line in s:
-    raw=line.rstrip("\n")
-    strip=raw.strip()
-    if strip == "allow 127.0.0.1;" or strip == "deny all;":
-        # commenter (idempotent)
-        if not strip.startswith("#"):
-            out.append("# FIX403_DISABLED " + strip)
-            changed=True
-        else:
-            out.append(raw)
-    else:
-        out.append(raw)
-
-if changed:
-    p.write_text("\n".join(out).rstrip()+"\n")
-    print("PATCH: lignes allow/deny neutralisées dans", p)
-else:
-    print("OK: aucun allow/deny à neutraliser (ou déjà patché) dans", p)
-PY
-echo
-
-echo "== 3) Sanity: vhost doit inclure l'include wolverine_routes.inc =="
-# Vérifie qu'on a bien l'include (sinon on l'ajoute juste une fois à l'intérieur du server {})
-if ! grep -qE 'include\s+/etc/nginx/includes/wolverine_routes\.inc;' "$VHOST_AV"; then
-  echo "[WARN] include manquant dans $VHOST_AV -> injection (une seule fois) après bloc /wolverine/"
-  # Ajoute juste avant la fin du server block (avant un "}" final)
-  python3 - <<PY
-from pathlib import Path
-p=Path("$VHOST_AV")
-s=p.read_text(errors="ignore").splitlines()
-# insère avant le dernier "}"
-idx=None
-for i in range(len(s)-1, -1, -1):
-    if s[i].strip()=="}":
-        idx=i; break
-if idx is None:
-    raise SystemExit("ERREUR: pas de } final, vhost inattendu")
-ins='  include /etc/nginx/includes/wolverine_routes.inc;'
-if ins not in s:
-    s.insert(idx, ins)
-p.write_text("\n".join(s).rstrip()+"\n")
-print("OK: include ajouté")
-PY
-else
-  echo "[OK] include déjà présent"
+# ====== 1) Node install if missing (NO apt/npm mix) ======
+echo "[1] Node check/install"
+if ! need_cmd node; then
+  echo " Node not found -> install NodeSource LTS"
+  apt-get update -y
+  apt-get install -y ca-certificates curl gnupg
+  install -d -m 0755 /etc/apt/keyrings
+  curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
+  NODE_MAJOR="20"
+  echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_${NODE_MAJOR}.x nodistro main" >/etc/apt/sources.list.d/nodesource.list
+  apt-get update -y
+  apt-get install -y nodejs
 fi
-echo
+node -v
+npm -v
 
-echo "== 4) Test + reload nginx =="
+# ====== 2) Create backend (TraderOne) ======
+echo "[2] Install TraderOne backend into $BACK"
+mkdir -p "$BACK"
+cd "$BACK"
+
+# package.json (minimal, stable)
+if [ ! -f package.json ]; then
+  cat >package.json <<'JSON'
+{
+  "name": "traderone-backend",
+  "version": "1.0.0",
+  "private": true,
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "4.19.2",
+    "cors": "2.8.5"
+  }
+}
+JSON
+fi
+
+# server.js (API stable for Wolverine UI)
+cat >server.js <<'JS'
+"use strict";
+const express = require("express");
+const cors = require("cors");
+
+const app = express();
+app.set("trust proxy", true);
+app.use(cors({ origin: true, credentials: true }));
+app.use(express.json({ limit: "2mb" }));
+
+// --- health ---
+app.get("/ping", (_req,res)=>res.json({ok:true, svc:"traderone", ts:Date.now()}));
+app.get("/health", (_req,res)=>res.json({ok:true, svc:"traderone", ts:Date.now()}));
+
+// --- API surface expected by Wolverine UI (safe stubs + structure) ---
+// NOTE: Frontend Phantom handles user wallet; backend only coordinates and returns status.
+
+app.get("/api/status", (_req,res)=>res.json({ok:true, mode:"idle", ts:Date.now()}));
+
+app.post("/api/start", (req,res)=>{
+  // expected fields usually: {pub, budget, ...}
+  res.json({ok:true, started:true, echo:req.body||{}, ts:Date.now()});
+});
+
+app.post("/api/traderone/mode", (req,res)=>{
+  // expected: {mode:"auto|off|paper|live"...}
+  const mode = (req.body && req.body.mode) ? String(req.body.mode) : "auto";
+  res.json({ok:true, mode, ts:Date.now()});
+});
+
+app.post("/api/traderone/withdraw", (req,res)=>{
+  // expected: {pub, token, amount}
+  res.json({ok:true, queued:true, echo:req.body||{}, ts:Date.now()});
+});
+
+app.get("/api/invested", (req,res)=>{
+  // expected query: ?pub=...
+  const pub = req.query.pub ? String(req.query.pub) : "";
+  res.json({ok:true, pub, invested_usdc:0, positions:[], ts:Date.now()});
+});
+
+// --- hard 404 for everything else ---
+app.use((req,res)=>res.status(404).json({ok:false, error:"not_found", path:req.originalUrl}));
+
+const HOST = process.env.HOST || "127.0.0.1";
+const PORT = Number(process.env.PORT || 3000);
+app.listen(PORT, HOST, ()=>console.log(`[traderone] listening http://${HOST}:${PORT}`));
+JS
+
+# install deps (idempotent)
+npm install --silent
+
+# ====== 3) systemd service ======
+echo "[3] systemd service traderone -> ${HOST}:${PORT}"
+bk "$SVC"
+cat >"$SVC" <<EOF
+[Unit]
+Description=TraderOne Backend (WOLVERINE)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=${BACK}
+Environment=HOST=${HOST}
+Environment=PORT=${PORT}
+ExecStart=/usr/bin/node ${BACK}/server.js
+Restart=always
+RestartSec=2
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now traderone.service
+sleep 1
+systemctl --no-pager status traderone.service | sed -n '1,120p' || true
+
+# ====== 4) Nginx routes (SINGLE SOURCE OF TRUTH, NO DUPES) ======
+echo "[4] Patch nginx include $INC (single-source routes)"
+bk "$INC"
+
+# unlock if immutable
+chattr -i "$INC" 2>/dev/null || true
+
+cat >"$INC" <<EOF
+# Wolverine routes (TRADERONE) - SINGLE SOURCE OF TRUTH
+# Generated: ${TS}
+
+# --- TraderOne backend under /wolverine/traderone/api/ ---
+location = /wolverine/traderone/api { return 301 /wolverine/traderone/api/; }
+
+location ^~ /wolverine/traderone/api/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+
+  add_header X-Wolverine-Route "traderone" always;
+  add_header Cache-Control "no-store" always;
+
+  # strip prefix
+  rewrite ^/wolverine/traderone/api/(.*)$ /\$1 break;
+
+  proxy_pass http://${HOST}:${PORT};
+}
+
+# --- Solana RPC proxy (public, for Phantom / browser) ---
+# Frontend should POST JSON-RPC to /wolverine/rpc
+location = /wolverine/rpc {
+  add_header X-Wolverine-Rpc "nginx-origin" always;
+  add_header Cache-Control "no-store" always;
+
+  # CORS for browser Phantom/web3.js
+  if (\$request_method = OPTIONS) {
+    add_header Access-Control-Allow-Origin "*" always;
+    add_header Access-Control-Allow-Methods "POST, OPTIONS" always;
+    add_header Access-Control-Allow-Headers "Content-Type, Authorization" always;
+    return 204;
+  }
+  add_header Access-Control-Allow-Origin "*" always;
+  add_header Access-Control-Allow-Methods "POST, OPTIONS" always;
+  add_header Access-Control-Allow-Headers "Content-Type, Authorization" always;
+
+  proxy_http_version 1.1;
+  proxy_set_header Host lb.drpc.live;
+  proxy_set_header Connection "";
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+
+  proxy_pass ${RPC_UPSTREAM_DEFAULT};
+}
+
+location ^~ /wolverine/rpc/ { return 301 /wolverine/rpc; }
+EOF
+
+# ====== 5) Ensure vhost includes the include ONCE ======
+echo "[5] Ensure vhost includes $INC exactly once"
+bk "$VHOST"
+chattr -i "$VHOST" 2>/dev/null || true
+
+# If include missing, insert it inside the server block near the /wolverine location.
+if ! grep -qF "include ${INC};" "$VHOST"; then
+  # insert after first occurrence of "location ^~ /wolverine/" or before end of server
+  if grep -q "location \^~ /wolverine/" "$VHOST"; then
+    awk -v inc="  include ${INC};" '
+      {print}
+      (!done && $0 ~ /location \^~ \/wolverine\//){print inc; done=1}
+    ' "$VHOST" >"${VHOST}.tmp_${TS}" && mv "${VHOST}.tmp_${TS}" "$VHOST"
+  else
+    # fallback: append include near bottom
+    echo "  include ${INC};" >>"$VHOST"
+  fi
+fi
+
+# De-duplicate any repeated include lines (keep first)
+awk '!seen[$0]++' "$VHOST" >"${VHOST}.nodup_${TS}" && mv "${VHOST}.nodup_${TS}" "$VHOST"
+
+# ====== 6) Reload nginx safely ======
+echo "[6] nginx -t && reload"
+chattr -i "$NGINXCONF" 2>/dev/null || true
 nginx -t
 systemctl reload nginx
-echo "[OK] nginx reload"
-echo
 
-echo "== 5) Tests HTTP (origin) =="
-echo "--- curl -I https://127.0.0.1/wolverine/index.html (header server) ---"
-curl -k -I https://127.0.0.1/wolverine/index.html | sed -n '1,20p' || true
-echo
-echo "--- curl -I https://127.0.0.1/wolverine/ (doit 301 -> index.html) ---"
-curl -k -I https://127.0.0.1/wolverine/ | sed -n '1,20p' || true
-echo
+# ====== 7) Tests (origin) ======
+echo "[7] Tests (origin)"
+echo " - backend ping:"
+curl -sS "http://${HOST}:${PORT}/ping" | head -c 200; echo
+echo " - nginx internal route:"
+curl -sS -I "http://127.0.0.1/wolverine/traderone/api/ping" | sed -n '1,25p'
+echo " - frontend:"
+curl -sS -I "http://127.0.0.1/wolverine/index.html" | sed -n '1,25p'
 
-echo "== 6) Re-lock immutable (nginx.conf + vhost) =="
-lock_immutable "$NGINX_CONF"
-lock_immutable "$VHOST_AV"
-# include peut rester modifiable; si tu veux le geler aussi, décommente:
-# lock_immutable "$INC"
+# ====== 8) Re-lock immutables ======
+echo "[8] Re-lock nginx files (immutable)"
+chattr +i "$NGINXCONF" 2>/dev/null || true
+chattr +i "$VHOST" 2>/dev/null || true
+chattr +i "$INC" 2>/dev/null || true
 
-echo
-echo "=== DONE. Si tu as encore 403 via Cloudflare: purge cache CF + hard refresh navigateur. ==="
+echo "=== DONE ==="
+echo "Open: https://fireinners.online/wolverine/"
+echo "API:  https://fireinners.online/wolverine/traderone/api/ping"
 BASH
 
-chmod +x /root/MEGA_FIX_WOLVERINE_403.sh
-bash /root/MEGA_FIX_WOLVERINE_403.sh
+chmod +x /root/MEGA_TRADERONE_BACKEND_PLUG_WOLVERINE.sh
+bash /root/MEGA_TRADERONE_BACKEND_PLUG_WOLVERINE.sh
