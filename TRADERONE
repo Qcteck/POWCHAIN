@@ -1,2 +1,71 @@
-dir /b
-dir /b ROBO600_RUN*
+cat >/root/MEGA_FIX_WOLVERINE_403.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+TS="$(date +%Y%m%d_%H%M%S)"
+echo "== MEGA_FIX_WOLVERINE_403 :: $TS =="
+
+SITES="/etc/nginx/sites-available/fireinners.online-ssl"
+NG="/etc/nginx/nginx.conf"
+
+echo
+echo "== 1) Quick nginx context (wolverine lines) =="
+if test -f "$SITES"; then
+  echo "--- $SITES (grep wolverine/root) ---"
+  grep -nEi 'wolverine|location|root|alias|deny|auth_basic|try_files' "$SITES" || true
+else
+  echo "[WARN] Missing $SITES"
+fi
+
+echo
+echo "== 2) Candidate web roots =="
+ROOTA="/var/www/wolverine"
+ROOTB="/opt/fireinners/frontend-react/app/dist/wolverine"
+for R in "$ROOTA" "$ROOTB"; do
+  echo "--- $R ---"
+  if test -d "$R"; then
+    ls -la "$R" | sed -n '1,80p' || true
+    test -f "$R/index.html" && echo "OK: index.html exists" || echo "WARN: index.html missing"
+    namei -l "$R" || true
+  else
+    echo "WARN: dir missing"
+  fi
+done
+
+echo
+echo "== 3) Fix perms/owner so nginx (www-data) can read =="
+fix_root(){
+  local R="$1"
+  test -d "$R" || return 0
+  echo "--- Fixing $R ---"
+  # Ensure directories are traversable and files readable
+  chown -R www-data:www-data "$R" || true
+  find "$R" -type d -exec chmod 755 {} \; || true
+  find "$R" -type f -exec chmod 644 {} \; || true
+  # Remove accidental Windows ACL weirdness if any (best-effort)
+  setfacl -Rb "$R" >/dev/null 2>&1 || true
+}
+fix_root "$ROOTA"
+fix_root "$ROOTB"
+
+echo
+echo "== 4) Nginx test + reload (no config change) =="
+nginx -t
+systemctl reload nginx
+
+echo
+echo "== 5) Local HTTP checks (headers) =="
+for URL in "https://127.0.0.1/wolverine/index.html" "https://127.0.0.1/wolverine/" ; do
+  echo "--- curl -kI $URL ---"
+  curl -kI "$URL" | sed -n '1,20p' || true
+done
+
+echo
+echo "== 6) Recent nginx errors mentioning wolverine/403/permission denied =="
+journalctl -u nginx --since "30 min ago" --no-pager | grep -Ei "wolverine|403|permission|denied|access|forbidden" | tail -n 80 || true
+test -f /var/log/nginx/error.log && tail -n 120 /var/log/nginx/error.log | grep -Ei "wolverine|403|permission|denied|access|forbidden" || true
+
+echo
+echo "DONE. If still 403: it is almost always nginx config (deny/auth/alias/root mismatch)."
+BASH
+chmod +x /root/MEGA_FIX_WOLVERINE_403.sh
+/root/MEGA_FIX_WOLVERINE_403.sh
