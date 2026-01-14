@@ -1,90 +1,204 @@
-cat >/root/fix_403_wolverine.sh <<'BASH'
-#!/usr/bin/env bash
-set -euo pipefail
-CFG="/etc/nginx/sites-enabled/fireinners.online-ssl"
-TS="$(date -u +%Y%m%d_%H%M%S)"
-INC="include /etc/nginx/snippets/traderone_api_lockdown.conf;"
+#!/usr/bin/env python3
+# make_blueprint_video.py
+# Génère une vidéo "blueprint" animée (MP4 si ffmpeg dispo, sinon GIF) à partir d’un blueprint dessiné en matplotlib.
 
-echo "=== 1) ORIGIN vs PUBLIC ==="
-echo "--- ORIGIN (bypass CF) /wolverine/index.html ---"
-curl -skI --resolve fireinners.online:443:127.0.0.1 https://fireinners.online/wolverine/index.html | head -n 20 || true
-echo
-echo "--- PUBLIC (CF) /wolverine/index.html ---"
-curl -skI https://fireinners.online/wolverine/index.html | head -n 20 || true
-echo
-echo "--- ORIGIN (bypass CF) /wolverine/traderone/api/ ---"
-curl -skI --resolve fireinners.online:443:127.0.0.1 https://fireinners.online/wolverine/traderone/api/ | head -n 20 || true
-echo
+import os, math, shutil, subprocess
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle, Circle
 
-echo "=== 2) Show where the lockdown include is referenced ==="
-grep -n "traderone_api_lockdown.conf" "$CFG" || true
-echo
+OUT_DIR = os.path.abspath("./out_blueprint_video")
+os.makedirs(OUT_DIR, exist_ok=True)
 
-echo "=== 3) Show wolverine location blocks (first 220 lines that mention wolverine) ==="
-grep -nE "location|wolverine" "$CFG" | head -n 220 || true
-echo
+# Paramètres vidéo
+FPS = 30
+DURATION_S = 12
+N = FPS * DURATION_S
+W_MM = 180
+L_MM = 220
 
-echo "=== 4) FIX: keep include ONLY inside /wolverine/traderone/api location ==="
-cp -a "$CFG" "${CFG}.bak_fix403_${TS}"
+# Style blueprint
+BG = "#07101a"
+GRID = "#0f2a40"
+INK = "#9fe7ff"
+INK2 = "#5fd2ff"
+WARN = "#ffcc66"
 
-python3 - <<'PY'
-from pathlib import Path
-import re
+def ease(t):  # t in [0,1]
+    return t*t*(3-2*t)
 
-cfg = Path("/etc/nginx/sites-enabled/fireinners.online-ssl")
-s = cfg.read_text(errors="ignore")
-inc = "include /etc/nginx/snippets/traderone_api_lockdown.conf;"
+def draw_grid(ax, x0, x1, y0, y1, step=10):
+    for x in np.arange(x0, x1+1e-9, step):
+        ax.plot([x,x],[y0,y1], color=GRID, linewidth=0.6, alpha=0.55)
+    for y in np.arange(y0, y1+1e-9, step):
+        ax.plot([x0,x1],[y,y], color=GRID, linewidth=0.6, alpha=0.55)
 
-def find_block(text, pat):
-    m = re.search(pat, text)
-    if not m: return None
-    start = m.start()
-    brace = text.find("{", start)
-    if brace == -1: return None
-    i = brace
-    depth = 0
-    end = None
-    while i < len(text):
-        if text[i] == "{": depth += 1
-        elif text[i] == "}":
-            depth -= 1
-            if depth == 0:
-                end = i
-                break
-        i += 1
-    if end is None: return None
-    return start, end+1, brace
+def text(ax, x, y, s, a=1.0, sz=14, w="normal", ha="left", va="center", c=INK):
+    ax.text(x, y, s, color=c, fontsize=sz, alpha=a, weight=w, ha=ha, va=va, family="DejaVu Sans")
 
-api_pat = r'location\s+(\^~\s+)?=?\s*/wolverine/traderone/api/?\s*\{'
-wol_pat = r'location\s+(\^~\s+)?=?\s*/wolverine/?\s*\{'
+def arrow(ax, x1,y1,x2,y2, a=1.0, lw=2.0, c=INK2):
+    ax.annotate("", xy=(x2,y2), xytext=(x1,y1),
+                arrowprops=dict(arrowstyle="-|>", color=c, lw=lw, alpha=a, shrinkA=0, shrinkB=0))
 
-# remove include everywhere first
-s = s.replace(inc, "")
+def dimline(ax, x1,y1,x2,y2, label, a=1.0):
+    ax.annotate("", xy=(x2,y2), xytext=(x1,y1),
+                arrowprops=dict(arrowstyle="<->", color=INK2, lw=2, alpha=a))
+    text(ax, (x1+x2)/2, (y1+y2)/2-10, label, a=a, sz=12, ha="center", c=INK2)
 
-api = find_block(s, api_pat)
-if not api:
-    raise SystemExit("❌ No /wolverine/traderone/api location block found in nginx site file")
-a0,a1,abrace = api
+# Layout scène (mm → canvas)
+XMIN, XMAX = -40, L_MM + 320
+YMIN, YMAX = -50, W_MM + 200
 
-block = s[a0:a1]
-# inject include right after the opening brace
-block2 = re.sub(r'\{\s*', '{\n    ' + inc + '\n', block, count=1)
-s2 = s[:a0] + block2 + s[a1:]
-cfg.write_text(s2)
-print("OK: include kept ONLY inside /wolverine/traderone/api location")
-PY
+# Positions composants (concept)
+motor_positions = [(40,40),(110,40),(180,40),(40,140),(110,140),(180,140)]
+big_motor = (L_MM-35, W_MM/2)
+servo_box = (L_MM/2-20, W_MM-25, 40, 18)
+stepper_box = (L_MM/2-25, -18, 50, 18)
+solarA = (L_MM+30, 20, 100, 60)
+solarB = (L_MM+30, 100, 100, 60)
+bay = (L_MM+160, 20, 160, 140)
 
-echo
-echo "=== 5) nginx test + reload ==="
-nginx -t
-systemctl reload nginx || service nginx reload
+def render_frame(i):
+    t = i/(N-1)
 
-echo
-echo "=== 6) ORIGIN re-check ==="
-curl -skI --resolve fireinners.online:443:127.0.0.1 https://fireinners.online/wolverine/index.html | head -n 12 || true
-curl -skI --resolve fireinners.online:443:127.0.0.1 https://fireinners.online/wolverine/traderone/api/ | head -n 12 || true
-echo "DONE ✅"
-BASH
+    # Timeline segments (apparitions)
+    # 0-15%: titre + grille
+    # 15-35%: châssis + cotes
+    # 35-60%: moteurs M1..M6 + M7
+    # 60-80%: servo + stepper + solaire
+    # 80-100%: baie électronique + résumé
+    a_title = ease(np.clip((t-0.00)/0.10, 0, 1))
+    a_chassis = ease(np.clip((t-0.12)/0.12, 0, 1))
+    a_dims = ease(np.clip((t-0.18)/0.12, 0, 1))
+    a_motors = ease(np.clip((t-0.32)/0.15, 0, 1))
+    a_aux = ease(np.clip((t-0.58)/0.15, 0, 1))
+    a_bay = ease(np.clip((t-0.78)/0.10, 0, 1))
+    a_sum = ease(np.clip((t-0.86)/0.10, 0, 1))
 
-chmod +x /root/fix_403_wolverine.sh
-/root/fix_403_wolverine.sh
+    fig = plt.figure(figsize=(16,9), dpi=120)
+    ax = fig.add_axes([0,0,1,1])
+    ax.set_xlim(XMIN, XMAX)
+    ax.set_ylim(YMIN, YMAX)
+    ax.set_aspect("equal")
+    ax.axis("off")
+    fig.patch.set_facecolor(BG)
+    ax.set_facecolor(BG)
+
+    # Grille
+    draw_grid(ax, XMIN, XMAX, YMIN, YMAX, step=10)
+
+    # Titre
+    text(ax, 0, W_MM+160, "ROBO-600 — VIDEO BLUEPRINT (CONCEPT)", a=a_title, sz=26, w="bold")
+    text(ax, 0, W_MM+130, "Vue de dessus / intégration moteurs DC + servo + stepper + solaire", a=a_title, sz=14)
+
+    # Châssis
+    if a_chassis > 0:
+        ax.add_patch(Rectangle((0,0), L_MM, W_MM, fill=False, linewidth=3, edgecolor=INK, alpha=a_chassis))
+        text(ax, 10, W_MM+20, "Châssis PLA: plaque + renforts", a=a_chassis, sz=12)
+
+    # Cotes
+    if a_dims > 0:
+        dimline(ax, 0, -25, L_MM, -25, f"{L_MM} mm", a=a_dims)
+        dimline(ax, -25, 0, -25, W_MM, f"{W_MM} mm", a=a_dims)
+
+    # Moteurs M1..M6
+    if a_motors > 0:
+        pulse = 0.5 + 0.5*math.sin(2*math.pi*(t*1.2))
+        for idx,(x,y) in enumerate(motor_positions, start=1):
+            ax.add_patch(Circle((x,y), 12, fill=False, linewidth=2.2, edgecolor=INK2, alpha=a_motors))
+            text(ax, x, y, f"M{idx}", a=a_motors, sz=12, ha="center", va="center", c=INK2)
+        # surlignage cyclique
+        k = int((t*3.0) % 6)
+        hx, hy = motor_positions[k]
+        ax.add_patch(Circle((hx,hy), 18, fill=False, linewidth=3.0, edgecolor=WARN, alpha=a_motors*pulse))
+        text(ax, 10, -40, "M1..M6 = 6 petits moteurs DC", a=a_motors, sz=13, c=WARN)
+
+        # Gros moteur M7
+        ax.add_patch(Circle(big_motor, 18, fill=False, linewidth=2.6, edgecolor=INK2, alpha=a_motors))
+        text(ax, big_motor[0], big_motor[1], "M7\n(gros)", a=a_motors, sz=11, ha="center", va="center", c=INK2)
+
+    # Aux: servo + stepper + solaire
+    if a_aux > 0:
+        x,y,w,h = servo_box
+        ax.add_patch(Rectangle((x,y), w,h, fill=False, linewidth=2.2, edgecolor=INK2, alpha=a_aux))
+        text(ax, x+w/2, y+h/2, "Servo\n(mâchoire/nuque)", a=a_aux, sz=10, ha="center", va="center", c=INK2)
+
+        x,y,w,h = stepper_box
+        ax.add_patch(Rectangle((x,y), w,h, fill=False, linewidth=2.2, edgecolor=INK2, alpha=a_aux))
+        text(ax, x+w/2, y+h/2, "Stepper\n(base/plateau)", a=a_aux, sz=10, ha="center", va="center", c=INK2)
+
+        x,y,w,h = solarA
+        ax.add_patch(Rectangle((x,y), w,h, fill=False, linewidth=3.0, edgecolor=INK, alpha=a_aux))
+        text(ax, x+w/2, y+h/2, "Panneau\nsolaire A", a=a_aux, sz=12, ha="center", va="center")
+        x,y,w,h = solarB
+        ax.add_patch(Rectangle((x,y), w,h, fill=False, linewidth=3.0, edgecolor=INK, alpha=a_aux))
+        text(ax, x+w/2, y+h/2, "Panneau\nsolaire B", a=a_aux, sz=12, ha="center", va="center")
+
+        arrow(ax, L_MM+10, 60, L_MM+30, 50, a=a_aux)
+        arrow(ax, L_MM+10, 120, L_MM+30, 130, a=a_aux)
+
+    # Baie électronique
+    if a_bay > 0:
+        x,y,w,h = bay
+        ax.add_patch(Rectangle((x,y), w,h, fill=False, linewidth=3.0, edgecolor=INK, alpha=a_bay))
+        text(ax, x+w/2, y+h-10, "Baie électronique", a=a_bay, sz=16, w="bold", ha="center")
+        text(ax, x+w/2, y+h-45, "ESP32 + PCA9685\nDriver moteurs DC\nBuck 5V / BMS\nCapteurs / LCD", a=a_bay, sz=12, ha="center", va="top")
+
+    # Résumé final
+    if a_sum > 0:
+        text(ax, 0, W_MM+90, "Résumé", a=a_sum, sz=16, w="bold")
+        text(ax, 0, W_MM+65, "- 6 moteurs DC: axes secondaires (bras/doigts/tête)", a=a_sum, sz=13)
+        text(ax, 0, W_MM+45, "- 1 DC plus gros: axe couple (base/levage/mécanisme)", a=a_sum, sz=13)
+        text(ax, 0, W_MM+25, "- Servo: précision (mâchoire/nuque)  |  Stepper: rotation douce", a=a_sum, sz=13)
+        text(ax, 0, W_MM+5, "- 2 panneaux solaires: auxiliaire / recharge lente", a=a_sum, sz=13)
+
+    # Timecode
+    text(ax, XMAX-10, YMIN+12, f"{i/FPS:05.2f}s", a=0.9, sz=11, ha="right", c=INK2)
+
+    frame_path = os.path.join(OUT_DIR, f"frame_{i:04d}.png")
+    fig.savefig(frame_path, dpi=120)
+    plt.close(fig)
+    return frame_path
+
+def run():
+    print("== 1) Génération des frames PNG ==")
+    for i in range(N):
+        if i % 30 == 0:
+            print(f"  frame {i}/{N}")
+        render_frame(i)
+
+    mp4 = os.path.abspath("./blueprint_robo600.mp4")
+    gif = os.path.abspath("./blueprint_robo600.gif")
+
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg:
+        print("== 2) Encodage MP4 via ffmpeg ==")
+        cmd = [
+            ffmpeg, "-y",
+            "-framerate", str(FPS),
+            "-i", os.path.join(OUT_DIR, "frame_%04d.png"),
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            mp4
+        ]
+        subprocess.check_call(cmd)
+        print("OK:", mp4)
+    else:
+        print("== 2) ffmpeg non trouvé -> export GIF (via Pillow) ==")
+        try:
+            from PIL import Image
+            frames=[]
+            for i in range(N):
+                p=os.path.join(OUT_DIR, f"frame_{i:04d}.png")
+                frames.append(Image.open(p).convert("P", palette=Image.ADAPTIVE))
+            frames[0].save(gif, save_all=True, append_images=frames[1:], duration=int(1000/FPS), loop=0, optimize=False)
+            print("OK:", gif)
+        except Exception as e:
+            print("Erreur: ni ffmpeg ni Pillow dispo. Installe ffmpeg ou pillow.")
+            raise
+
+if __name__ == "__main__":
+    run()
