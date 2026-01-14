@@ -1,97 +1,137 @@
-cat >/root/MEGA_WOLVERINE_UNBLOCK_403.sh <<'BASH'
+cat >/root/MEGA_FIX_WOLVERINE_403.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 TS="$(date +%Y%m%d_%H%M%S)"
-VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
+
+VHOST_AV="/etc/nginx/sites-available/fireinners.online-ssl"
+VHOST_EN="/etc/nginx/sites-enabled/fireinners.online-ssl"
 INC="/etc/nginx/includes/wolverine_routes.inc"
+NGINX_CONF="/etc/nginx/nginx.conf"
 
-echo "== MEGA_WOLVERINE_UNBLOCK_403 :: $TS =="
-
-test -f "$VHOST" || { echo "[FATAL] missing $VHOST"; exit 1; }
-test -f "$INC"   || { echo "[FATAL] missing $INC"; exit 1; }
-
-chattr -i "$VHOST" 2>/dev/null || true
-chattr -i "$INC"   2>/dev/null || true
-
-echo "== 1) Backups =="
-cp -a "$VHOST" "${VHOST}.bak_${TS}"
-cp -a "$INC"   "${INC}.bak_${TS}"
-echo "Backup: ${VHOST}.bak_${TS}"
-echo "Backup: ${INC}.bak_${TS}"
-
+echo "=== MEGA_FIX_WOLVERINE_403 ($TS) ==="
+echo "But: enlever le blocage Nginx (allow 127.0.0.1 / deny all) qui cause 403 sur /wolverine/"
 echo
-echo "== 2) Unblock in include (comment allow/deny global) =="
-# Idempotent: if markers already present, do nothing.
-if grep -q "AUTO_UNBLOCK_DENYALL_BEGIN" "$INC"; then
-  echo "OK: markers already present in include"
-else
-  # Comment the first occurrence of allow 127.0.0.1; and the next deny all;
-  perl -0777 -pe '
-    if($_ !~ /AUTO_UNBLOCK_DENYALL_BEGIN/){
-      s/^\s*allow\s+127\.0\.0\.1\s*;\s*$/# --- AUTO_UNBLOCK_DENYALL_BEGIN ---\n# $&/m;
-      s/^\s*deny\s+all\s*;\s*$/# $&\n# NOTE: disabled because it was blocking public /wolverine (403 by rule).\n# --- AUTO_UNBLOCK_DENYALL_END ---/m;
-    }
-  ' -i "$INC"
-  grep -q "AUTO_UNBLOCK_DENYALL_BEGIN" "$INC" || { echo "[FATAL] include patch failed (no marker)"; exit 1; }
-  echo "OK: include patched"
-fi
 
+need_root(){ [ "$(id -u)" -eq 0 ] || { echo "[ERREUR] Lance en root."; exit 1; }; }
+need_root
+
+exists_or_die(){ [ -f "$1" ] || { echo "[ERREUR] Fichier introuvable: $1"; exit 1; }; }
+
+exists_or_die "$VHOST_AV"
+exists_or_die "$INC"
+
+# Déverrouille si immutable
+unlock_if_immutable(){
+  local f="$1"
+  if lsattr -a "$f" 2>/dev/null | grep -q '^-..i'; then
+    echo "[INFO] chattr -i $f"
+    chattr -i "$f" || true
+  fi
+}
+
+lock_immutable(){
+  local f="$1"
+  echo "[INFO] chattr +i $f"
+  chattr +i "$f" || true
+}
+
+backup_file(){
+  local f="$1"
+  cp -a "$f" "${f}.bak_${TS}"
+  echo "[OK] Backup: ${f}.bak_${TS}"
+}
+
+echo "== 1) Backup + unlock =="
+unlock_if_immutable "$NGINX_CONF"
+unlock_if_immutable "$VHOST_AV"
+unlock_if_immutable "$INC"
+
+backup_file "$NGINX_CONF"
+backup_file "$VHOST_AV"
+backup_file "$INC"
 echo
-echo "== 3) Ensure /wolverine/ location explicitly allows all (vhost) =="
-if ! grep -nE "location\s+\^~\s+/wolverine/" "$VHOST" >/dev/null; then
-  echo "[FATAL] cannot find location ^~ /wolverine/ in vhost"
-  exit 1
-fi
 
-# Insert allow all; right after "location ^~ /wolverine/ {" if not present in that block.
-python3 - <<'PY'
+echo "== 2) Patch include wolverine_routes.inc (neutralise allow/deny globaux) =="
+# Objectif: commenter toute paire allow 127.0.0.1; / deny all; qui bloque le contenu statique.
+# On garde le fichier valide: on commente les lignes plutôt que les supprimer.
+python3 - <<PY
 from pathlib import Path
-import re
-p=Path("/etc/nginx/sites-available/fireinners.online-ssl")
-s=p.read_text(errors="ignore")
+p=Path("$INC")
+s=p.read_text(errors="ignore").splitlines()
 
-m=re.search(r"(location\s+\^~\s+/wolverine/\s*\{\s*\n)([\s\S]*?)(\n\s*\})", s)
-if not m:
-    raise SystemExit("FATAL: cannot locate location ^~ /wolverine/ block")
+out=[]
+changed=False
+for line in s:
+    raw=line.rstrip("\n")
+    strip=raw.strip()
+    if strip == "allow 127.0.0.1;" or strip == "deny all;":
+        # commenter (idempotent)
+        if not strip.startswith("#"):
+            out.append("# FIX403_DISABLED " + strip)
+            changed=True
+        else:
+            out.append(raw)
+    else:
+        out.append(raw)
 
-head,body,tail=m.group(1),m.group(2),m.group(3)
-
-if re.search(r"^\s*allow\s+all\s*;\s*$", body, re.M):
-    print("OK: allow all already present in /wolverine/ block")
-    out=s
+if changed:
+    p.write_text("\n".join(out).rstrip()+"\n")
+    print("PATCH: lignes allow/deny neutralisées dans", p)
 else:
-    inject="    allow all;\n    auth_basic off;\n    satisfy any;\n"
-    out=s[:m.start()] + head + inject + body + tail + s[m.end():]
-    print("OK: injected allow all into /wolverine/ block")
-
-p.write_text(out)
+    print("OK: aucun allow/deny à neutraliser (ou déjà patché) dans", p)
 PY
-
 echo
-echo "== 4) nginx -t + reload =="
+
+echo "== 3) Sanity: vhost doit inclure l'include wolverine_routes.inc =="
+# Vérifie qu'on a bien l'include (sinon on l'ajoute juste une fois à l'intérieur du server {})
+if ! grep -qE 'include\s+/etc/nginx/includes/wolverine_routes\.inc;' "$VHOST_AV"; then
+  echo "[WARN] include manquant dans $VHOST_AV -> injection (une seule fois) après bloc /wolverine/"
+  # Ajoute juste avant la fin du server block (avant un "}" final)
+  python3 - <<PY
+from pathlib import Path
+p=Path("$VHOST_AV")
+s=p.read_text(errors="ignore").splitlines()
+# insère avant le dernier "}"
+idx=None
+for i in range(len(s)-1, -1, -1):
+    if s[i].strip()=="}":
+        idx=i; break
+if idx is None:
+    raise SystemExit("ERREUR: pas de } final, vhost inattendu")
+ins='  include /etc/nginx/includes/wolverine_routes.inc;'
+if ins not in s:
+    s.insert(idx, ins)
+p.write_text("\n".join(s).rstrip()+"\n")
+print("OK: include ajouté")
+PY
+else
+  echo "[OK] include déjà présent"
+fi
+echo
+
+echo "== 4) Test + reload nginx =="
 nginx -t
 systemctl reload nginx
+echo "[OK] nginx reload"
+echo
+
+echo "== 5) Tests HTTP (origin) =="
+echo "--- curl -I https://127.0.0.1/wolverine/index.html (header server) ---"
+curl -k -I https://127.0.0.1/wolverine/index.html | sed -n '1,20p' || true
+echo
+echo "--- curl -I https://127.0.0.1/wolverine/ (doit 301 -> index.html) ---"
+curl -k -I https://127.0.0.1/wolverine/ | sed -n '1,20p' || true
+echo
+
+echo "== 6) Re-lock immutable (nginx.conf + vhost) =="
+lock_immutable "$NGINX_CONF"
+lock_immutable "$VHOST_AV"
+# include peut rester modifiable; si tu veux le geler aussi, décommente:
+# lock_immutable "$INC"
 
 echo
-echo "== 5) Tests (local with SNI) =="
-echo "--- /wolverine/ (should be 301/200, NOT 403) ---"
-curl -kI --resolve fireinners.online:443:127.0.0.1 https://fireinners.online/wolverine/ | sed -n '1,25p' || true
-echo "--- /wolverine/index.html (should be 200, NOT 403) ---"
-curl -kI --resolve fireinners.online:443:127.0.0.1 https://fireinners.online/wolverine/index.html | sed -n '1,25p' || true
-
-echo
-echo "== 6) Show remaining allow/deny references (top 80) =="
-nginx -T 2>/dev/null | grep -nEi "AUTO_UNBLOCK_DENYALL|deny all|allow 127\.0\.0\.1|location \^~ /wolverine/" | head -n 80 || true
-
-echo
-echo "== 7) Tail nginx error log (last 40) =="
-tail -n 40 /var/log/nginx/error.log || true
-
-chattr +i "$VHOST" 2>/dev/null || true
-chattr +i "$INC"   2>/dev/null || true
-
-echo
-echo "DONE."
+echo "=== DONE. Si tu as encore 403 via Cloudflare: purge cache CF + hard refresh navigateur. ==="
 BASH
-chmod +x /root/MEGA_WOLVERINE_UNBLOCK_403.sh
-/root/MEGA_WOLVERINE_UNBLOCK_403.sh
+
+chmod +x /root/MEGA_FIX_WOLVERINE_403.sh
+bash /root/MEGA_FIX_WOLVERINE_403.sh
