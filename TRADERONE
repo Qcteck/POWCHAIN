@@ -1,1 +1,179 @@
-tail -n 200 /root/MEGA_WOLVERINE_RUN.nohup; echo; ls -1t /root/MEGA_WOLVERINE_RUN_*.log 2>/dev/null | head -n 1 | xargs -r bash -lc 'echo "LOG=$1"; egrep -n "LOCAL  /wolverine/|LOCAL  /wolverine/traderone/api/|EXT    /wolverine/|EXT    /wolverine/traderone/api/|ERREUR:|nginx reload OK" "$1" || true' bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+# MEGA_NGINX_RECOVER_WOLVERINE_ROOT.sh
+# Objectif: réparer nginx -t FAIL (restore vhost backup) + reinjecter include Wolverine au bon endroit (server 443 fireinners.online)
+# Puis probes LOCAL/EXT.
+
+if [[ "${EUID}" -ne 0 ]]; then echo "ERREUR: lance en root"; exit 1; fi
+
+TS="$(date +%Y%m%d_%H%M%S)"
+HOST="fireinners.online"
+FRONT_DIR="/var/www/wolverine"
+NGINX_SITE="/etc/nginx/sites-available/fireinners.online-ssl"
+NGINX_INC_DIR="/etc/nginx/includes"
+NGINX_INC="${NGINX_INC_DIR}/wolverine_routes.inc"
+PORT="3000"
+OUT="/root/MEGA_NGINX_RECOVER_WOLVERINE_${TS}.log"
+
+say(){ printf "\n== %s ==\n" "$*"; }
+w(){ printf "%s\n" "$*" | tee -a "$OUT" >/dev/null; }
+ok(){ w "OK: $*"; }
+warn(){ w "WARN: $*"; }
+die(){ w "ERREUR: $*"; exit 1; }
+
+ensure_pkg(){ local p="$1"; dpkg -s "$p" >/dev/null 2>&1 || { apt-get update -y; apt-get install -y "$p"; }; }
+
+http_code_local(){ local path="$1"; curl -k -sS -o /dev/null -w "%{http_code}" "https://127.0.0.1${path}" -H "Host: ${HOST}" || true; }
+http_code_ext(){ local path="$1"; curl -sS -o /dev/null -w "%{http_code}" "https://${HOST}${path}" || true; }
+
+latest_backup(){
+  ls -1t "${NGINX_SITE}.bak_"* 2>/dev/null | head -n 1 || true
+}
+
+echo "# MEGA_NGINX_RECOVER_WOLVERINE ${TS}" >"$OUT"
+w "host=${HOST}"
+w "date=$(date -Is)"
+w "hostname=$(hostname)"
+
+say "0) Pré-requis minimaux"
+ensure_pkg nginx
+ensure_pkg curl
+ensure_pkg ca-certificates
+ensure_pkg python3
+mkdir -p "$NGINX_INC_DIR"
+[[ -f "$NGINX_SITE" ]] || die "Vhost introuvable: $NGINX_SITE"
+ok "Pré-requis OK"
+
+say "1) Erreur nginx actuelle (nginx -t)"
+NGT="$(nginx -t 2>&1 || true)"
+w "$NGT"
+if echo "$NGT" | grep -qi "successful"; then
+  ok "nginx -t OK (pas besoin de restore)."
+else
+  warn "nginx -t FAIL détecté -> restauration dernier backup si présent"
+  BK="$(latest_backup)"
+  if [[ -n "$BK" && -f "$BK" ]]; then
+    cp -a "$NGINX_SITE" "${NGINX_SITE}.broken_${TS}"
+    cp -a "$BK" "$NGINX_SITE"
+    ok "Restauré: $BK  (copie broken: ${NGINX_SITE}.broken_${TS})"
+  else
+    warn "Aucun backup trouvé (${NGINX_SITE}.bak_*) -> on continue mais sans restore auto."
+  fi
+fi
+
+say "2) Écrire include Wolverine (routes + proxy)"
+cat >"$NGINX_INC" <<EOF
+# /etc/nginx/includes/wolverine_routes.inc
+location ^~ /wolverine/ {
+  alias ${FRONT_DIR}/;
+  try_files \$uri \$uri/ /index.html;
+  add_header Cache-Control "no-store" always;
+}
+location = /wolverine/sw.js { add_header Cache-Control "no-store" always; return 404; }
+location = /wolverine/service-worker.js { add_header Cache-Control "no-store" always; return 404; }
+location = /wolverine/manifest.json { add_header Cache-Control "no-store" always; return 404; }
+
+location ^~ /wolverine/traderone/api/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+  proxy_set_header Connection "";
+  proxy_read_timeout 60s;
+  proxy_send_timeout 60s;
+  proxy_pass http://127.0.0.1:${PORT}/;
+}
+EOF
+ok "Include écrit: $NGINX_INC"
+
+say "3) Injecter include DANS le bon server SSL (443) de fireinners.online"
+cp -a "$NGINX_SITE" "${NGINX_SITE}.preinject_${TS}"
+
+python3 - <<'PY'
+from pathlib import Path
+import re, sys
+
+p=Path("/etc/nginx/sites-available/fireinners.online-ssl")
+s=p.read_text(errors="ignore")
+
+inc_line="include /etc/nginx/includes/wolverine_routes.inc;"
+if inc_line in s:
+    print("include déjà présent -> OK")
+    sys.exit(0)
+
+# Parse simple des blocs server { ... } (approx, mais suffisant ici)
+# On cherche un server qui contient: listen 443 (ou ssl) ET server_name fireinners.online
+servers=[]
+stack=[]
+start=None
+for i,ch in enumerate(s):
+    if ch=="{":
+        stack.append(i)
+    elif ch=="}" and stack:
+        stack.pop()
+
+# Extraction naïve des blocs "server { ... }" via regex non-greedy (ok si fichier standard)
+pat=re.compile(r"server\s*\{.*?\}", re.S)
+blocks=list(pat.finditer(s))
+
+target_idx=None
+for idx,m in enumerate(blocks):
+    blk=m.group(0)
+    if re.search(r"\blisten\b[^;]*\b443\b", blk) and re.search(r"\bserver_name\b[^;]*\bfireinners\.online\b", blk):
+        target_idx=idx
+        break
+# fallback: premier bloc contenant server_name fireinners.online
+if target_idx is None:
+    for idx,m in enumerate(blocks):
+        blk=m.group(0)
+        if re.search(r"\bserver_name\b[^;]*\bfireinners\.online\b", blk):
+            target_idx=idx
+            break
+if target_idx is None:
+    raise SystemExit("Aucun bloc server correspondant trouvé (server_name fireinners.online).")
+
+m=blocks[target_idx]
+blk=m.group(0)
+
+# Inject juste après "server {"
+blk2=re.sub(r"(server\s*\{)", r"\1\n  "+inc_line, blk, count=1)
+
+s2=s[:m.start()]+blk2+s[m.end():]
+p.write_text(s2)
+print("include injecté dans server cible:", target_idx)
+PY
+ok "Injection include terminée (server 443 fireinners.online ciblé)"
+
+say "4) Permissions frontend (pour éviter 403)"
+if [[ -d "$FRONT_DIR" ]]; then
+  chmod 755 "$FRONT_DIR" || true
+  [[ -f "${FRONT_DIR}/index.html" ]] && chmod 644 "${FRONT_DIR}/index.html" || true
+  ok "Permissions front OK (${FRONT_DIR})"
+else
+  warn "Frontend dir absent: $FRONT_DIR"
+fi
+
+say "5) nginx -t + reload"
+NGT2="$(nginx -t 2>&1 || true)"
+w "$NGT2"
+if echo "$NGT2" | grep -qi "successful"; then
+  systemctl enable --now nginx >/dev/null 2>&1 || true
+  systemctl reload nginx
+  ok "nginx reload OK"
+else
+  warn "nginx -t FAIL encore -> on affiche contexte autour de la ligne d'erreur si possible"
+  # dump rapide: premières occurrences d'erreur
+  echo "$NGT2" | tee -a "$OUT" >/dev/null
+  die "nginx -t FAIL. Restore possible via backup le plus récent: $(ls -1t ${NGINX_SITE}.bak_* 2>/dev/null | head -n 1 || true)"
+fi
+
+say "6) Probes (LOCAL 443 + EXT)"
+w "LOCAL  /wolverine/                => $(http_code_local "/wolverine/")"
+w "LOCAL  /wolverine/traderone/api/  => $(http_code_local "/wolverine/traderone/api/")"
+w "EXT    /wolverine/                => $(http_code_ext "/wolverine/")"
+w "EXT    /wolverine/traderone/api/  => $(http_code_ext "/wolverine/traderone/api/")"
+
+say "DONE"
+echo "LOG=$OUT"
