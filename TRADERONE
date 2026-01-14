@@ -1,19 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# MEGA_WOLVERINE_TRADERONE_ROOT.sh
-# Objectif: servir le frontend WOLVERINE (déjà en place) + démarrer/brancher le backend TraderOne sur 127.0.0.1:3000
-# et proxy via nginx sur /wolverine/traderone/api/ (sans Cloudflare).
-#
-# Exécution: en root, depuis n'importe quel dossier:
-#   bash MEGA_WOLVERINE_TRADERONE_ROOT.sh
-#
-# IMPORTANT: Ce script n’édite rien “à la main”. Il fait backups + tests + résumé.
+# MEGA_WOLVERINE_TRADERONE_ROOT.sh (PATCH)
+# Fix principal: si /opt/wolverine existe mais n'est pas un repo git -> backup auto + clone propre
 
-if [[ "${EUID}" -ne 0 ]]; then
-  echo "ERREUR: lance ce script en root."
-  exit 1
-fi
+if [[ "${EUID}" -ne 0 ]]; then echo "ERREUR: lance ce script en root."; exit 1; fi
 
 TS="$(date +%Y%m%d_%H%M%S)"
 HOST="fireinners.online"
@@ -29,8 +20,7 @@ NGINX_INC_DIR="/etc/nginx/includes"
 NGINX_INC="${NGINX_INC_DIR}/wolverine_routes.inc"
 
 SENTINEL_LIB="/opt/fireinners/sentinel/lib/askorupdate.sh"
-ASKORUPDATE_ASK="0"  # 0 = pas de questions (automatique)
-export ASKORUPDATE_ASK
+ASKORUPDATE_ASK="0"; export ASKORUPDATE_ASK
 
 SERVICE_NAME="traderone"
 SERVICE_UNIT="/etc/systemd/system/${SERVICE_NAME}.service"
@@ -43,11 +33,7 @@ ok(){ printf "OK: %s\n" "$*"; }
 warn(){ printf "WARN: %s\n" "$*" >&2; }
 die(){ printf "ERREUR: %s\n" "$*" >&2; exit 1; }
 
-backup_file(){
-  local f="$1"
-  [[ -f "$f" ]] || return 0
-  cp -a "$f" "${f}.bak_${TS}"
-}
+backup_file(){ local f="$1"; [[ -f "$f" ]] || return 0; cp -a "$f" "${f}.bak_${TS}"; }
 
 ensure_pkg(){
   local p="$1"
@@ -57,71 +43,53 @@ ensure_pkg(){
   fi
 }
 
-choose_backend_dir(){
-  # Heuristique: choisir un dossier qui contient package.json et un script "start" ou un server.js.
-  # Priorité aux chemins contenant "traderone".
-  python3 - <<'PY'
-import os, json, re
-root="/opt/wolverine"
-cands=[]
-for dirpath, dirnames, filenames in os.walk(root):
-    if "node_modules" in dirnames:
-        dirnames.remove("node_modules")
-    if "package.json" in filenames:
-        pj=os.path.join(dirpath,"package.json")
-        try:
-            data=json.load(open(pj,"r",encoding="utf-8"))
-        except Exception:
-            continue
-        scripts=(data.get("scripts") or {})
-        deps=(data.get("dependencies") or {})
-        name=(data.get("name") or "").lower()
-        score=0
-        path=dirpath.lower()
-        if "traderone" in path or "traderone" in name: score+=50
-        if "start" in scripts: score+=25
-        if "express" in deps or "fastify" in deps or "koa" in deps: score+=10
-        if os.path.exists(os.path.join(dirpath,"server.js")): score+=15
-        if os.path.exists(os.path.join(dirpath,"index.js")): score+=5
-        # évite les apps purement front
-        if "next" in deps and ("build" in scripts and "start" in scripts):
-            score+=2
-        cands.append((score,dirpath))
-cands.sort(reverse=True, key=lambda x:x[0])
-print(cands[0][1] if cands and cands[0][0]>0 else "")
-PY
-}
-
-write_file(){
-  local path="$1"
-  local content="$2"
-  mkdir -p "$(dirname "$path")"
-  backup_file "$path"
-  printf "%s" "$content" > "$path"
-}
-
 askorupdate_or_write(){
-  local path="$1"
-  local content="$2"
+  local path="$1"; local content="$2"
   mkdir -p "$(dirname "$path")"
   if [[ -f "$SENTINEL_LIB" ]]; then
     # shellcheck disable=SC1090
     source "$SENTINEL_LIB"
-    # write temp then askorupdate_file compare/backup/sha/chattr handling
     local tmp="/tmp/askorupdate_${TS}_$(basename "$path")"
     printf "%s" "$content" > "$tmp"
     askorupdate_file "$path" "$tmp"
     rm -f "$tmp"
   else
-    write_file "$path" "$content"
+    backup_file "$path"
+    printf "%s" "$content" > "$path"
   fi
+}
+
+choose_backend_dir(){
+  python3 - <<'PY'
+import os, json
+root="/opt/wolverine"
+cands=[]
+for dirpath, dirnames, filenames in os.walk(root):
+    if "node_modules" in dirnames: dirnames.remove("node_modules")
+    if "package.json" in filenames:
+        pj=os.path.join(dirpath,"package.json")
+        try: data=json.load(open(pj,"r",encoding="utf-8"))
+        except Exception: continue
+        scripts=data.get("scripts") or {}
+        deps=data.get("dependencies") or {}
+        name=(data.get("name") or "").lower()
+        score=0; path=dirpath.lower()
+        if "traderone" in path or "traderone" in name: score+=60
+        if "start" in scripts: score+=25
+        if any(k in deps for k in ["express","fastify","koa","hono"]): score+=10
+        if os.path.exists(os.path.join(dirpath,"server.js")): score+=15
+        if os.path.exists(os.path.join(dirpath,"index.js")): score+=8
+        if score>0: cands.append((score,dirpath))
+cands.sort(reverse=True, key=lambda x:x[0])
+print(cands[0][1] if cands else "")
+PY
 }
 
 say "0) Préflight (chemins + prérequis)"
 mkdir -p "$NGINX_INC_DIR"
 [[ -f "$NGINX_SITE" ]] || die "Nginx vhost introuvable: $NGINX_SITE"
-[[ -d "$FRONT_DIR" ]] || die "Frontend WOLVERINE introuvable: $FRONT_DIR"
-[[ -f "$FRONT_INDEX" ]] || warn "index.html non trouvé: $FRONT_INDEX (le frontend peut être ailleurs, mais on continue)."
+[[ -d "$FRONT_DIR" ]] || warn "Frontend dir absent: $FRONT_DIR (on continue quand même)"
+[[ -f "$FRONT_INDEX" ]] || warn "Frontend index absent: $FRONT_INDEX (on continue quand même)"
 ok "Vhost nginx: $NGINX_SITE"
 ok "Frontend dir: $FRONT_DIR"
 
@@ -134,7 +102,6 @@ ok "Paquets OK"
 
 say "2) Node.js (sans croiser apt/npm)"
 if ! command -v node >/dev/null 2>&1; then
-  say "Node absent -> installation via NodeSource (20.x)"
   curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
   apt-get install -y nodejs
 fi
@@ -142,61 +109,69 @@ node -v >/dev/null
 npm -v >/dev/null
 ok "Node: $(node -v) / npm: $(npm -v)"
 
-say "3) Repo WOLVERINE sur le VPS (pull/reset propre)"
-if [[ ! -d "$REPO_DIR/.git" ]]; then
-  mkdir -p "$REPO_DIR"
+say "3) Repo WOLVERINE sur le VPS (auto-fix dossier existant)"
+# Cas A: repo git OK
+if [[ -d "${REPO_DIR}/.git" ]]; then
+  ok "Repo déjà présent (git): $REPO_DIR"
+else
+  # Cas B: dossier existe mais pas git
+  if [[ -d "$REPO_DIR" ]]; then
+    # si non vide -> backup auto
+    if [[ "$(ls -A "$REPO_DIR" 2>/dev/null | wc -l | tr -d ' ')" != "0" ]]; then
+      local_bak="${REPO_DIR}.legacy_${TS}"
+      mv "$REPO_DIR" "$local_bak"
+      ok "Dossier non-git déplacé en backup: $local_bak"
+    else
+      rmdir "$REPO_DIR" || true
+    fi
+  fi
+  mkdir -p "$(dirname "$REPO_DIR")"
   git clone "$REPO_URL" "$REPO_DIR"
   ok "Repo cloné: $REPO_DIR"
-else
-  ok "Repo déjà présent: $REPO_DIR"
 fi
 
 cd "$REPO_DIR"
+# sécurise remote origin
+if git remote get-url origin >/dev/null 2>&1; then
+  git remote set-url origin "$REPO_URL" || true
+else
+  git remote add origin "$REPO_URL"
+fi
 git fetch --all --prune
+
 DEFAULT_BRANCH="$(git symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null | sed 's#^refs/remotes/origin/##' || true)"
 [[ -n "$DEFAULT_BRANCH" ]] || DEFAULT_BRANCH="main"
+
 git reset --hard "origin/${DEFAULT_BRANCH}"
 git clean -fd
 ok "Repo synchronisé sur origin/${DEFAULT_BRANCH}"
 
 say "4) Détection backend TraderOne dans le repo"
 BACKEND_DIR="$(choose_backend_dir || true)"
-if [[ -z "${BACKEND_DIR}" ]]; then
-  die "Impossible de trouver un backend Node (package.json) plausible dans $REPO_DIR. Ajoute le backend TraderOne dans le repo ou indique son chemin exact."
-fi
+[[ -n "$BACKEND_DIR" ]] || die "Backend TraderOne introuvable dans $REPO_DIR (aucun package.json start/server détecté)."
 ok "Backend détecté: $BACKEND_DIR"
 
 say "5) Installation dépendances backend (npm)"
 cd "$BACKEND_DIR"
-if [[ -f package-lock.json ]]; then
-  npm ci --omit=dev
-else
-  npm install --omit=dev
-fi
+if [[ -f package-lock.json ]]; then npm ci --omit=dev; else npm install --omit=dev; fi
 ok "Deps backend installées"
 
-say "6) Création/MAJ systemd service: ${SERVICE_NAME} (bind ${BIND}:${PORT})"
-# On privilégie "npm start" (si existe), sinon node server.js/index.js
+say "6) systemd service: ${SERVICE_NAME} (bind ${BIND}:${PORT})"
 START_CMD=""
 python3 - <<'PY' > /tmp/traderone_startcmd.txt
 import json, os
-p="package.json"
-data=json.load(open(p,"r",encoding="utf-8"))
+data=json.load(open("package.json","r",encoding="utf-8"))
 scripts=data.get("scripts") or {}
 if "start" in scripts:
-    print("npm start")
-    raise SystemExit
-# fallback
+    print("npm start"); raise SystemExit
 for f in ["server.js","index.js","app.js","main.js"]:
     if os.path.exists(f):
-        print(f"node {f}")
-        raise SystemExit
+        print(f"node {f}"); raise SystemExit
 print("")
 PY
-
 START_CMD="$(cat /tmp/traderone_startcmd.txt || true)"
 rm -f /tmp/traderone_startcmd.txt
-[[ -n "$START_CMD" ]] || die "Aucun script start et aucun server.js/index.js/app.js/main.js détecté dans $BACKEND_DIR."
+[[ -n "$START_CMD" ]] || die "Aucun start/server.js détecté dans $BACKEND_DIR."
 
 SERVICE_CONTENT=$(cat <<EOF
 [Unit]
@@ -218,7 +193,6 @@ User=root
 WantedBy=multi-user.target
 EOF
 )
-
 askorupdate_or_write "$SERVICE_UNIT" "$SERVICE_CONTENT"
 systemctl daemon-reload
 systemctl enable --now "$SERVICE_NAME"
@@ -226,22 +200,18 @@ sleep 1
 systemctl is-active --quiet "$SERVICE_NAME" || { systemctl status "$SERVICE_NAME" --no-pager -l || true; die "Service ${SERVICE_NAME} non actif."; }
 ok "Service actif: ${SERVICE_NAME}"
 
-say "7) Nginx: include routes /wolverine + proxy /wolverine/traderone/api/"
+say "7) Nginx include + proxy /wolverine/traderone/api/"
 INC_CONTENT=$(cat <<'EOF'
 # /etc/nginx/includes/wolverine_routes.inc
-# Frontend statique:
 location ^~ /wolverine/ {
   root /var/www;
   try_files $uri $uri/ /wolverine/index.html;
   add_header Cache-Control "no-store" always;
 }
-
-# Evite les SW/manifest fantômes (si tu veux les servir plus tard, on retirera ces 404):
 location = /wolverine/sw.js { add_header Cache-Control "no-store" always; return 404; }
 location = /wolverine/service-worker.js { add_header Cache-Control "no-store" always; return 404; }
 location = /wolverine/manifest.json { add_header Cache-Control "no-store" always; return 404; }
 
-# Backend TraderOne (API):
 location ^~ /wolverine/traderone/api/ {
   proxy_http_version 1.1;
   proxy_set_header Host $host;
@@ -255,45 +225,40 @@ location ^~ /wolverine/traderone/api/ {
 }
 EOF
 )
-
 askorupdate_or_write "$NGINX_INC" "$INC_CONTENT"
 ok "Include écrit: $NGINX_INC"
 
-say "8) Nginx: s’assurer que le vhost inclut wolverine_routes.inc"
+say "8) Nginx vhost: s'assurer que l'include est présent"
 if ! grep -q "includes/wolverine_routes\.inc" "$NGINX_SITE"; then
   backup_file "$NGINX_SITE"
-  # Ajoute l’include dans le server { } du vhost (au plus tôt après l’ouverture du bloc server)
   python3 - <<PY
 import re, pathlib
 p=pathlib.Path("${NGINX_SITE}")
 s=p.read_text(errors="ignore")
 if "includes/wolverine_routes.inc" in s:
-    print("already")
-    raise SystemExit
+    print("already"); raise SystemExit
 m=re.search(r"server\s*\{", s)
-if not m:
-    raise SystemExit("server block not found")
+if not m: raise SystemExit("server block not found")
 i=m.end()
-ins="\n  include /etc/nginx/includes/wolverine_routes.inc;\n"
-s=s[:i]+ins+s[i:]
+s=s[:i]+"\n  include /etc/nginx/includes/wolverine_routes.inc;\n"+s[i:]
 p.write_text(s)
 print("patched")
 PY
   ok "Include ajouté dans $NGINX_SITE"
 else
-  ok "Include déjà présent dans $NGINX_SITE"
+  ok "Include déjà présent"
 fi
 
-say "9) Test + reload nginx"
+say "9) Reload nginx"
 nginx -t
 systemctl reload nginx
 ok "Nginx rechargé"
 
-say "10) Tests locaux (HTTP) + diagnostic simple"
+say "10) Tests locaux"
 set +e
-echo "--- curl local frontend ---"
+echo "--- frontend ---"
 curl -sS -I "http://127.0.0.1/wolverine/" | head -n 12
-echo "--- curl local api (attend au moins un status HTTP) ---"
+echo "--- api ---"
 curl -sS -I "http://127.0.0.1/wolverine/traderone/api/" | head -n 12
 set -e
 
@@ -302,7 +267,4 @@ echo "Frontend:  https://${HOST}/wolverine/"
 echo "API proxy: https://${HOST}/wolverine/traderone/api/"
 echo "Service:   systemctl status ${SERVICE_NAME} --no-pager -l"
 echo "Logs:      journalctl -u ${SERVICE_NAME} -n 200 --no-pager"
-echo "Nginx inc: ${NGINX_INC}"
-echo "Repo:      ${REPO_DIR} (branche origin/${DEFAULT_BRANCH})"
-echo
 ok "MEGA batch terminé."
