@@ -1,93 +1,314 @@
-cat >/root/MEGA_WOLVERINE_DIAG.sh <<'BASH'
+cat >/root/MEGA_NGINX_FIX_WOLVERINE.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 TS="$(date +%Y%m%d_%H%M%S)"
 HOST="fireinners.online"
 FRONT_DIR="/var/www/wolverine"
 NGINX_SITE="/etc/nginx/sites-available/fireinners.online-ssl"
-NGINX_INC="/etc/nginx/includes/wolverine_routes.inc"
-OUT="/root/MEGA_WOLVERINE_DIAG_${TS}.log"
+NGINX_MAIN="/etc/nginx/nginx.conf"
+NGINX_INC_DIR="/etc/nginx/includes"
+NGINX_INC="${NGINX_INC_DIR}/wolverine_routes.inc"
+PORT="3000"
+OUT="/root/MEGA_NGINX_FIX_WOLVERINE_${TS}.log"
+NOH="/root/MEGA_NGINX_FIX_WOLVERINE.nohup"
 
+say(){ printf "\n== %s ==\n" "$*"; }
 w(){ printf "%s\n" "$*" | tee -a "$OUT" >/dev/null; }
-sep(){ w ""; w "==================== $* ===================="; }
+ok(){ w "OK: $*"; }
+warn(){ w "WARN: $*"; }
+die(){ w "ERREUR: $*"; exit 1; }
 
+ensure_pkg(){ local p="$1"; dpkg -s "$p" >/dev/null 2>&1 || { apt-get update -y; apt-get install -y "$p"; }; }
 http_code_local(){ local path="$1"; curl -k -sS -o /dev/null -w "%{http_code}" "https://127.0.0.1${path}" -H "Host: ${HOST}" || true; }
 http_code_ext(){ local path="$1"; curl -sS -o /dev/null -w "%{http_code}" "https://${HOST}${path}" || true; }
 
-w "# MEGA_WOLVERINE_DIAG $TS"
+unlock_if_immutable(){
+  local f="$1" name="$2"
+  local a; a="$(lsattr -d "$f" 2>/dev/null || true)"
+  w "lsattr ${name}: $a"
+  if echo "$a" | awk '{print $1}' | grep -q "i"; then
+    chattr -i "$f" || true
+    ok "chattr -i ${name}"
+    return 0
+  fi
+  return 1
+}
+relock_if_needed(){
+  local f="$1" name="$2" was="$3"
+  if [[ "$was" == "1" ]]; then
+    chattr +i "$f" || true
+    ok "chattr +i ${name}"
+  fi
+}
+
+echo "# MEGA_NGINX_FIX_WOLVERINE ${TS}" >"$OUT"
 w "date=$(date -Is)"
 w "host=$(hostname)"
 w "whoami=$(whoami)"
-w "pwd=$(pwd)"
 w "-------------------------------------------"
 
-sep "A) Fichiers MEGA Wolverine (nohup/log) + tailles"
-(ls -lah /root/MEGA_*WOLVERINE*.nohup /root/MEGA_*WOLVERINE*.log 2>/dev/null || true) | tee -a "$OUT" >/dev/null
-w "Derniers 10 fichiers /root (MEGA*) :"
-(ls -lt /root/MEGA_* 2>/dev/null | head -n 10 || true) | tee -a "$OUT" >/dev/null
+say "0) Pré-requis + chemins"
+ensure_pkg nginx
+ensure_pkg curl
+ensure_pkg ca-certificates
+ensure_pkg python3
+ensure_pkg e2fsprogs
+mkdir -p "$NGINX_INC_DIR"
+[[ -f "$NGINX_SITE" ]] || die "Vhost introuvable: $NGINX_SITE"
+[[ -f "$NGINX_MAIN" ]] || die "Nginx main introuvable: $NGINX_MAIN"
+ok "Pré-requis OK"
+w "NGINX_SITE=$NGINX_SITE"
+w "NGINX_INC=$NGINX_INC"
+w "FRONT_DIR=$FRONT_DIR"
+w "PORT=$PORT"
 
-sep "B) Contenu nohup (AUTOFIX) - tail/head"
-if [[ -f /root/MEGA_NGINX_AUTOFIX_WOLVERINE.nohup ]]; then
-  w "-- head(80) --"; head -n 80 /root/MEGA_NGINX_AUTOFIX_WOLVERINE.nohup | tee -a "$OUT" >/dev/null || true
-  w "-- tail(120) --"; tail -n 120 /root/MEGA_NGINX_AUTOFIX_WOLVERINE.nohup | tee -a "$OUT" >/dev/null || true
-else
-  w "ABSENT: /root/MEGA_NGINX_AUTOFIX_WOLVERINE.nohup"
-fi
+say "1) Unlock immutable si nécessaire (vhost + nginx.conf)"
+SITE_WAS_IMM="0"; MAIN_WAS_IMM="0"
+unlock_if_immutable "$NGINX_SITE" "vhost" && SITE_WAS_IMM="1" || true
+unlock_if_immutable "$NGINX_MAIN" "nginx.conf" && MAIN_WAS_IMM="1" || true
 
-sep "C) Dernier LOG MEGA_NGINX_AUTOFIX_WOLVERINE_*"
-LASTLOG="$(ls -1t /root/MEGA_NGINX_AUTOFIX_WOLVERINE_*.log 2>/dev/null | head -n 1 || true)"
-w "LASTLOG=$LASTLOG"
-if [[ -n "${LASTLOG:-}" && -f "$LASTLOG" ]]; then
-  w "-- tail(200) --"; tail -n 200 "$LASTLOG" | tee -a "$OUT" >/dev/null || true
-  w "-- grep erreurs --"
-  egrep -n "ERREUR:|WARN:|duplicate|not allowed here|emerg|failed|successful|include|location" "$LASTLOG" 2>/dev/null | tail -n 80 | tee -a "$OUT" >/dev/null || true
-else
-  w "Aucun log MEGA_NGINX_AUTOFIX_WOLVERINE_*.log trouvé."
-fi
+say "2) Backups"
+cp -a "$NGINX_SITE" "${NGINX_SITE}.bak_${TS}" || true
+[[ -f "$NGINX_INC" ]] && cp -a "$NGINX_INC" "${NGINX_INC}.bak_${TS}" || true
+ok "Backups créés: ${NGINX_SITE}.bak_${TS} (+ include si présent)"
 
-sep "D) nginx -t (erreur exacte)"
-NGT="$(nginx -t 2>&1 || true)"
-w "$NGT"
+say "3) Écrire l'include Wolverine (canonique)"
+cat >"$NGINX_INC" <<EOF
+# /etc/nginx/includes/wolverine_routes.inc
+location ^~ /wolverine/ {
+  alias ${FRONT_DIR}/;
+  try_files \$uri \$uri/ /index.html;
+  add_header Cache-Control "no-store" always;
+}
+location = /wolverine/sw.js { add_header Cache-Control "no-store" always; return 404; }
+location = /wolverine/service-worker.js { add_header Cache-Control "no-store" always; return 404; }
+location = /wolverine/manifest.json { add_header Cache-Control "no-store" always; return 404; }
 
-sep "E) Extraits vhost + include (wolverine)"
-w "FILE: $NGINX_SITE"
-if [[ -f "$NGINX_SITE" ]]; then
-  egrep -n "server_name|listen|include /etc/nginx/includes/wolverine_routes\.inc|location .*/wolverine" "$NGINX_SITE" 2>/dev/null | tee -a "$OUT" >/dev/null || true
-else
-  w "ABSENT: $NGINX_SITE"
-fi
-w "FILE: $NGINX_INC"
-if [[ -f "$NGINX_INC" ]]; then
-  egrep -n "location|proxy_pass|alias|try_files" "$NGINX_INC" 2>/dev/null | tee -a "$OUT" >/dev/null || true
-else
-  w "ABSENT: $NGINX_INC"
-fi
+location ^~ /wolverine/traderone/api/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+  proxy_set_header Connection "";
+  proxy_read_timeout 60s;
+  proxy_send_timeout 60s;
+  proxy_pass http://127.0.0.1:${PORT}/;
+}
+EOF
+ok "Include écrit: $NGINX_INC"
 
-sep "F) Ports/listeners (80/443/3000)"
-(ss -lntp 2>/dev/null || true) | egrep -n ":80|:443|:3000" | tee -a "$OUT" >/dev/null || true
+say "4) Sanitize vhost (supprimer doublons location wolverine + injecter include au BON server 443)"
+python3 - <<'PY'
+from pathlib import Path
+import re
 
-sep "G) Status nginx"
-(systemctl is-active nginx 2>/dev/null || true) | tee -a "$OUT" >/dev/null
-(systemctl status nginx --no-pager -l 2>/dev/null | tail -n 80 || true) | tee -a "$OUT" >/dev/null
+VHOST=Path("/etc/nginx/sites-available/fireinners.online-ssl")
+INC_LINE="include /etc/nginx/includes/wolverine_routes.inc;"
+s=VHOST.read_text(errors="ignore")
 
-sep "H) Permissions front"
+# (A) enlever toutes occurrences multiples de l'include (on garde 1 pour l'instant)
+lines=[]
+seen=0
+for line in s.splitlines():
+    if INC_LINE in line:
+        seen += 1
+        if seen == 1: lines.append(INC_LINE)
+        else: continue
+    else:
+        lines.append(line)
+s="\n".join(lines)
+
+# (B) supprimer tous les blocs location qui ciblent /wolverine* directement dans le vhost
+def strip_location_blocks(text, prefixes):
+    lines=text.splitlines(True)
+    out=[]
+    i=0
+    while i < len(lines):
+        line=lines[i]
+        m=re.match(r'\s*location\s+(?:=|\^~|~\*|~)?\s*([^ {]+)\s*\{', line)
+        if m:
+            loc=m.group(1).strip()
+            if any(loc.startswith(p) for p in prefixes):
+                depth=0
+                while i < len(lines):
+                    depth += lines[i].count("{")
+                    depth -= lines[i].count("}")
+                    i += 1
+                    if depth <= 0:
+                        break
+                continue
+        out.append(line)
+        i += 1
+    return "".join(out)
+
+s=strip_location_blocks(s, ["/wolverine", "/wolverine/"])
+
+# (C) supprimer include hors server blocks (on va réinjecter proprement)
+server_pat=re.compile(r"server\s*\{.*?\}", re.S)
+servers=list(server_pat.finditer(s))
+if not servers:
+    raise SystemExit("Aucun bloc server{} trouvé dans le vhost")
+
+def is_target_server(block:str)->bool:
+    has443=bool(re.search(r"\blisten\b[^;]*\b443\b", block))
+    hasname=bool(re.search(r"\bserver_name\b[^;]*\bfireinners\.online\b", block))
+    return has443 and hasname
+
+# remove include lines inside all servers
+clean_s=s
+for m in list(server_pat.finditer(clean_s)):
+    blk=m.group(0)
+    blk=re.sub(r"^\s*"+re.escape(INC_LINE)+r"\s*$", "", blk, flags=re.M)
+    clean_s=clean_s[:m.start()]+blk+clean_s[m.end():]
+
+servers=list(server_pat.finditer(clean_s))
+target_idx=None
+for i,m in enumerate(servers):
+    if is_target_server(m.group(0)):
+        target_idx=i
+        break
+if target_idx is None:
+    # fallback: first server with server_name fireinners.online
+    for i,m in enumerate(servers):
+        if re.search(r"\bserver_name\b[^;]*\bfireinners\.online\b", m.group(0)):
+            target_idx=i
+            break
+if target_idx is None:
+    raise SystemExit("Aucun server fireinners.online trouvé")
+
+m=servers[target_idx]
+blk=m.group(0)
+
+# inject include juste après l'ouverture server {
+blk2=re.sub(r"(server\s*\{)", r"\1\n  "+INC_LINE, blk, count=1)
+
+fixed=clean_s[:m.start()]+blk2+clean_s[m.end():]
+VHOST.write_text(fixed)
+print("SANITIZE OK: include injecté dans server idx", target_idx)
+PY
+ok "Vhost sanitizé"
+
+say "5) Permissions front (éviter 403)"
 if [[ -d "$FRONT_DIR" ]]; then
-  ls -ld "$FRONT_DIR" | tee -a "$OUT" >/dev/null
-  [[ -f "$FRONT_DIR/index.html" ]] && ls -l "$FRONT_DIR/index.html" | tee -a "$OUT" >/dev/null || true
+  chmod 755 "$FRONT_DIR" || true
+  [[ -f "${FRONT_DIR}/index.html" ]] && chmod 644 "${FRONT_DIR}/index.html" || true
+  ok "Permissions front OK"
 else
-  w "ABSENT: $FRONT_DIR"
+  warn "Frontend dir absent: $FRONT_DIR (alias nginx pointera quand même)"
 fi
 
-sep "I) Probes HTTP (LOCAL/EXT)"
+nginx_test(){
+  nginx -t 2>&1 || true
+}
+dump_nginx_context(){
+  local ngt="$1"
+  if echo "$ngt" | grep -Eo 'in /[^:]+:[0-9]+' >/dev/null 2>&1; then
+    local ref f ln start end
+    ref="$(echo "$ngt" | grep -Eo 'in /[^:]+:[0-9]+' | head -n 1 | sed 's/^in //')"
+    f="${ref%:*}"; ln="${ref##*:}"
+    w "Contexte erreur: $f:$ln (±30 lignes)"
+    if [[ -f "$f" ]]; then
+      start=$((ln-30)); [[ $start -lt 1 ]] && start=1
+      end=$((ln+30))
+      nl -ba "$f" | sed -n "${start},${end}p" | tee -a "$OUT" >/dev/null
+    fi
+  fi
+}
+
+say "6) nginx -t (tentative) + fallback restore dernier backup si FAIL"
+NGT="$(nginx_test)"
+w "$NGT"
+if ! echo "$NGT" | grep -qi "successful"; then
+  warn "nginx -t FAIL (tentative 1)"
+  dump_nginx_context "$NGT"
+
+  # restore dernier backup du vhost puis réinjecter include (une fois)
+  LASTBK="$(ls -1t ${NGINX_SITE}.bak_* 2>/dev/null | head -n 1 || true)"
+  if [[ -n "${LASTBK:-}" && -f "$LASTBK" ]]; then
+    cp -a "$LASTBK" "$NGINX_SITE"
+    ok "Restore backup vhost: $LASTBK"
+    # re-sanitize after restore
+    python3 - <<'PY'
+from pathlib import Path
+import re
+VHOST=Path("/etc/nginx/sites-available/fireinners.online-ssl")
+INC_LINE="include /etc/nginx/includes/wolverine_routes.inc;"
+s=VHOST.read_text(errors="ignore")
+
+# remove location /wolverine blocks
+def strip_location_blocks(text):
+    lines=text.splitlines(True)
+    out=[]
+    i=0
+    while i < len(lines):
+        line=lines[i]
+        m=re.match(r'\s*location\s+(?:=|\^~|~\*|~)?\s*([^ {]+)\s*\{', line)
+        if m and m.group(1).strip().startswith("/wolverine"):
+            depth=0
+            while i < len(lines):
+                depth += lines[i].count("{")
+                depth -= lines[i].count("}")
+                i += 1
+                if depth <= 0:
+                    break
+            continue
+        out.append(line); i+=1
+    return "".join(out)
+
+s=strip_location_blocks(s)
+
+# remove all include lines then inject into target 443 server
+s=re.sub(r"^\s*"+re.escape(INC_LINE)+r"\s*$", "", s, flags=re.M)
+
+server_pat=re.compile(r"server\s*\{.*?\}", re.S)
+servers=list(server_pat.finditer(s))
+if not servers: raise SystemExit("no server blocks")
+def is_target(block):
+    return bool(re.search(r"\blisten\b[^;]*\b443\b", block)) and bool(re.search(r"\bserver_name\b[^;]*\bfireinners\.online\b", block))
+idx=None
+for i,m in enumerate(servers):
+    if is_target(m.group(0)): idx=i; break
+if idx is None:
+    for i,m in enumerate(servers):
+        if re.search(r"\bserver_name\b[^;]*\bfireinners\.online\b", m.group(0)): idx=i; break
+if idx is None: raise SystemExit("no target server")
+m=servers[idx]; blk=m.group(0)
+blk2=re.sub(r"(server\s*\{)", r"\1\n  "+INC_LINE, blk, count=1)
+s=s[:m.start()]+blk2+s[m.end():]
+VHOST.write_text(s)
+print("Re-sanitize OK after restore")
+PY
+    NGT2="$(nginx_test)"
+    w "$NGT2"
+    if ! echo "$NGT2" | grep -qi "successful"; then
+      die "nginx -t FAIL persistant après restore. Voir $OUT"
+    fi
+  else
+    die "nginx -t FAIL et aucun backup vhost trouvé. Voir $OUT"
+  fi
+fi
+ok "nginx -t OK"
+
+say "7) Reload nginx"
+systemctl enable --now nginx >/dev/null 2>&1 || true
+systemctl reload nginx
+ok "nginx reload OK"
+
+say "8) Re-lock immutable (si c'était lock avant)"
+relock_if_needed "$NGINX_SITE" "vhost" "$SITE_WAS_IMM"
+relock_if_needed "$NGINX_MAIN" "nginx.conf" "$MAIN_WAS_IMM"
+
+say "9) Probes HTTP (LOCAL/EXT)"
 w "LOCAL /wolverine/               => $(http_code_local "/wolverine/")"
 w "LOCAL /wolverine/traderone/api/ => $(http_code_local "/wolverine/traderone/api/")"
 w "EXT   /wolverine/               => $(http_code_ext "/wolverine/")"
 w "EXT   /wolverine/traderone/api/ => $(http_code_ext "/wolverine/traderone/api/")"
 
-sep "DONE"
-w "OUT=$OUT"
+say "DONE"
+w "LOG=$OUT"
 echo "$OUT"
 BASH
-chmod +x /root/MEGA_WOLVERINE_DIAG.sh
-nohup /root/MEGA_WOLVERINE_DIAG.sh >/root/MEGA_WOLVERINE_DIAG.nohup 2>&1 </dev/null & disown
-echo "Lancé. Lis: tail -n 220 /root/MEGA_WOLVERINE_DIAG.nohup"
+chmod +x /root/MEGA_NGINX_FIX_WOLVERINE.sh
+nohup /root/MEGA_NGINX_FIX_WOLVERINE.sh >"$NOH" 2>&1 </dev/null & disown
+echo "Lancé. Lis: tail -n 240 $NOH"
