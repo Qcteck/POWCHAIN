@@ -1,53 +1,46 @@
-$ErrorActionPreference="Stop"
+cat >/root/fix_blueprint_return_404.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+CFG="/etc/nginx/sites-enabled/fireinners.online-ssl"
+TS="$(date -u +%Y%m%d_%H%M%S)"
 
-# 1) Trouver OpenSCAD console (openscad.com)
-$Candidates = @(
-  "C:\Program Files\OpenSCAD\openscad.com",
-  "C:\Program Files\OpenSCAD (Nightly)\openscad.com",
-  "C:\Program Files (x86)\OpenSCAD\openscad.com"
-)
-$OpenSCAD = $Candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-if(-not $OpenSCAD){
-  $OpenSCAD = (Get-Command openscad.com -ErrorAction SilentlyContinue).Source
-}
-if(-not $OpenSCAD){ throw "OpenSCAD introuvable. Installe OpenSCAD ou ajuste le chemin dans le script." }
+test -f "$CFG" || { echo "❌ Missing $CFG"; exit 1; }
 
-# 2) Dossiers (on force un endroit sûr)
-$Here = $PWD.Path
-$Scad = Join-Path $Here "robo600_parts.scad"
-if(!(Test-Path $Scad)){ throw "Fichier SCAD introuvable: $Scad" }
+echo "== Backup =="
+cp -a "$CFG" "${CFG}.bak_blueprint404_${TS}"
+echo "Backup: ${CFG}.bak_blueprint404_${TS}"
+echo
 
-$OutDir = Join-Path $Here "stl"
-New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+echo "== Inject blueprint 404 locations inside first server{} if missing =="
+if grep -qE "location\s+\^~\s+/wolverine/blueprint/" "$CFG"; then
+  echo "OK: blueprint location already exists (not adding)."
+else
+  awk '
+    BEGIN{done=0}
+    {print}
+    done==0 && $0 ~ /^[[:space:]]*server[[:space:]]*\{/ {
+      print ""
+      print "  # Blueprint removed: return 404 instead of 403"
+      print "  location = /wolverine/blueprint/ { return 404; }"
+      print "  location ^~ /wolverine/blueprint/ { return 404; }"
+      print ""
+      done=1
+    }
+  ' "$CFG" > /tmp/nginx_blueprint404.tmp
+  mv /tmp/nginx_blueprint404.tmp "$CFG"
+  echo "✅ Added blueprint 404 locations"
+fi
+echo
 
-$Log = Join-Path $Here "export_stl.log"
-"OpenSCAD=$OpenSCAD`nSCAD=$Scad`nOUT=$OutDir`n" | Set-Content -Encoding UTF8 $Log
+echo "== nginx test + reload =="
+nginx -t
+systemctl reload nginx || service nginx reload
+echo
 
-# 3) Liste des pièces
-$Parts = @(
-"pelvis_half1","pelvis_half2","torso_half1","torso_half2","head_half1","head_half2",
-"back_hatch","neck_ring","face_plate","jaw",
-"shoulder_joint","elbow_joint","hip_joint","knee_joint",
-"upperarm_half1","upperarm_half2","forearm_half1","forearm_half2","hand",
-"thigh_half1","thigh_half2","shin_half1","shin_half2","foot",
-"dc_mount_small","dc_mount_big","driver_tray","pca_esp_tray","lcd_bezel",
-"solar_bracket_left","solar_bracket_right","cable_clip"
-)
+echo "== ORIGIN check (should be 404 now) =="
+curl -skI --resolve fireinners.online:443:127.0.0.1 https://fireinners.online/wolverine/blueprint/blueprint_robo600.mp4 | head -n 12 || true
+echo "DONE ✅"
+BASH
 
-Write-Host "Export -> $OutDir"
-foreach($p in $Parts){
-  $outFile = Join-Path $OutDir ($p + ".stl")
-  Write-Host "  $p"
-  $args = @("-o", $outFile, "-D", ("PART=`"" + $p + "`""), $Scad)
-
-  # Log + exécution
-  "---- $p ----" | Add-Content -Encoding UTF8 $Log
-  & $OpenSCAD @args 2>&1 | Tee-Object -FilePath $Log -Append | Out-Host
-
-  if($LASTEXITCODE -ne 0){ throw "OpenSCAD a échoué sur $p (exit=$LASTEXITCODE). Voir $Log" }
-  if(!(Test-Path $outFile)){ throw "STL non créé: $outFile (voir $Log)" }
-  if((Get-Item $outFile).Length -lt 500){ throw "STL trop petit/suspect: $outFile (voir $Log)" }
-}
-
-Write-Host "OK: $($Parts.Count) STL générés dans $OutDir"
-Write-Host "Log: $Log"
+chmod +x /root/fix_blueprint_return_404.sh
+/root/fix_blueprint_return_404.sh
