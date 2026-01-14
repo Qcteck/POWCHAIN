@@ -1,183 +1,46 @@
-bash -lc 'set -euo pipefail
-WD="/root/robo600_blueprint_video"
-WEB="/var/www/wolverine/blueprint"
-mkdir -p "$WD" "$WEB"
-cd "$WD"
+cat >/root/debug_403_blueprint_mp4.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+URL="/wolverine/blueprint/blueprint_robo600.mp4"
+HOST="fireinners.online"
 
-echo "[1/5] Dépendances (ffmpeg + matplotlib + pillow)"
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -y >/dev/null
-apt-get install -y ffmpeg python3 python3-matplotlib python3-pil >/dev/null
+echo "=== 1) ORIGIN vs PUBLIC headers ==="
+echo "--- ORIGIN (bypass CF) ---"
+curl -skI --resolve ${HOST}:443:127.0.0.1 https://${HOST}${URL} | head -n 30 || true
+echo
+echo "--- PUBLIC (CF) ---"
+curl -skI https://${HOST}${URL} | head -n 30 || true
+echo
 
-echo "[2/5] Écriture du script Python"
-cat > make_blueprint_video.py <<'"'"'PY'"'"'
-#!/usr/bin/env python3
-import os, math, shutil, subprocess
-import numpy as np
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from matplotlib.patches import Rectangle, Circle
+echo "=== 2) Find nginx location handling blueprint/wolverine ==="
+nginx -T 2>/dev/null | grep -nE "location|alias|root|wolverine|blueprint" | head -n 260 || true
+echo
 
-OUT_DIR = os.path.abspath("./out_blueprint_video")
-os.makedirs(OUT_DIR, exist_ok=True)
+echo "=== 3) Search file on disk (fast) ==="
+FOUND="$(find /var/www /opt /root -maxdepth 8 -type f -name 'blueprint_robo600.mp4' 2>/dev/null | head -n 1 || true)"
+echo "FOUND=$FOUND"
+if [ -n "${FOUND:-}" ]; then
+  echo "--- stat ---"
+  stat "$FOUND" || true
+  echo "--- ls -lah ---"
+  ls -lah "$FOUND" || true
+  echo "--- path perms (namei) ---"
+  namei -l "$FOUND" || true
+else
+  echo "❌ File not found in /var/www,/opt,/root (maybe different name or deeper path)"
+fi
+echo
 
-FPS=30
-DURATION_S=12
-N=FPS*DURATION_S
+echo "=== 4) Check nginx user + error logs for this URL ==="
+ps aux | grep -E "[n]ginx: master|nginx: worker" | head -n 10 || true
+echo
+echo "--- error.log (last 120) filtered ---"
+grep -RIn "blueprint_robo600\.mp4|/wolverine/blueprint" /var/log/nginx 2>/dev/null | tail -n 120 || true
+echo
+tail -n 120 /var/log/nginx/error.log 2>/dev/null || true
 
-W_MM=180
-L_MM=220
+echo "DONE ✅"
+BASH
 
-BG="#07101a"
-GRID="#0f2a40"
-INK="#9fe7ff"
-INK2="#5fd2ff"
-WARN="#ffcc66"
-
-XMIN, XMAX = -40, L_MM + 320
-YMIN, YMAX = -50, W_MM + 200
-
-motor_positions=[(40,40),(110,40),(180,40),(40,140),(110,140),(180,140)]
-big_motor=(L_MM-35, W_MM/2)
-servo_box=(L_MM/2-20, W_MM-25, 40, 18)
-stepper_box=(L_MM/2-25, -18, 50, 18)
-solarA=(L_MM+30, 20, 100, 60)
-solarB=(L_MM+30, 100, 100, 60)
-bay=(L_MM+160, 20, 160, 140)
-
-def ease(t):
-    return t*t*(3-2*t)
-
-def draw_grid(ax, x0, x1, y0, y1, step=10):
-    for x in np.arange(x0, x1+1e-9, step):
-        ax.plot([x,x],[y0,y1], color=GRID, linewidth=0.6, alpha=0.55)
-    for y in np.arange(y0, y1+1e-9, step):
-        ax.plot([x0,x1],[y,y], color=GRID, linewidth=0.6, alpha=0.55)
-
-def text(ax, x, y, s, a=1.0, sz=14, w="normal", ha="left", va="center", c=INK):
-    ax.text(x, y, s, color=c, fontsize=sz, alpha=a, weight=w, ha=ha, va=va, family="DejaVu Sans")
-
-def arrow(ax, x1,y1,x2,y2, a=1.0, lw=2.0, c=INK2):
-    ax.annotate("", xy=(x2,y2), xytext=(x1,y1),
-                arrowprops=dict(arrowstyle="-|>", color=c, lw=lw, alpha=a, shrinkA=0, shrinkB=0))
-
-def dimline(ax, x1,y1,x2,y2, label, a=1.0):
-    ax.annotate("", xy=(x2,y2), xytext=(x1,y1),
-                arrowprops=dict(arrowstyle="<->", color=INK2, lw=2, alpha=a))
-    text(ax, (x1+x2)/2, (y1+y2)/2-10, label, a=a, sz=12, ha="center", c=INK2)
-
-def render_frame(i):
-    t=i/(N-1)
-
-    a_title=ease(np.clip((t-0.00)/0.10,0,1))
-    a_chassis=ease(np.clip((t-0.12)/0.12,0,1))
-    a_dims=ease(np.clip((t-0.18)/0.12,0,1))
-    a_motors=ease(np.clip((t-0.32)/0.15,0,1))
-    a_aux=ease(np.clip((t-0.58)/0.15,0,1))
-    a_bay=ease(np.clip((t-0.78)/0.10,0,1))
-    a_sum=ease(np.clip((t-0.86)/0.10,0,1))
-
-    fig=plt.figure(figsize=(16,9), dpi=120)
-    ax=fig.add_axes([0,0,1,1])
-    ax.set_xlim(XMIN,XMAX); ax.set_ylim(YMIN,YMAX)
-    ax.set_aspect("equal"); ax.axis("off")
-    fig.patch.set_facecolor(BG); ax.set_facecolor(BG)
-
-    draw_grid(ax, XMIN, XMAX, YMIN, YMAX, step=10)
-
-    text(ax, 0, W_MM+160, "ROBO-600 — VIDEO BLUEPRINT (CONCEPT)", a=a_title, sz=26, w="bold")
-    text(ax, 0, W_MM+130, "Vue de dessus / moteurs DC + servo + stepper + solaire", a=a_title, sz=14)
-
-    if a_chassis>0:
-        ax.add_patch(Rectangle((0,0), L_MM, W_MM, fill=False, linewidth=3, edgecolor=INK, alpha=a_chassis))
-        text(ax, 10, W_MM+20, "Châssis PLA: plaque + renforts", a=a_chassis, sz=12)
-
-    if a_dims>0:
-        dimline(ax, 0, -25, L_MM, -25, f"{L_MM} mm", a=a_dims)
-        dimline(ax, -25, 0, -25, W_MM, f"{W_MM} mm", a=a_dims)
-
-    if a_motors>0:
-        pulse=0.5+0.5*math.sin(2*math.pi*(t*1.2))
-        for idx,(x,y) in enumerate(motor_positions, start=1):
-            ax.add_patch(Circle((x,y), 12, fill=False, linewidth=2.2, edgecolor=INK2, alpha=a_motors))
-            text(ax, x, y, f"M{idx}", a=a_motors, sz=12, ha="center", va="center", c=INK2)
-        k=int((t*3.0)%6)
-        hx,hy=motor_positions[k]
-        ax.add_patch(Circle((hx,hy), 18, fill=False, linewidth=3.0, edgecolor=WARN, alpha=a_motors*pulse))
-        text(ax, 10, -40, "M1..M6 = 6 petits moteurs DC", a=a_motors, sz=13, c=WARN)
-
-        ax.add_patch(Circle(big_motor, 18, fill=False, linewidth=2.6, edgecolor=INK2, alpha=a_motors))
-        text(ax, big_motor[0], big_motor[1], "M7\n(gros)", a=a_motors, sz=11, ha="center", va="center", c=INK2)
-
-    if a_aux>0:
-        x,y,w,h=servo_box
-        ax.add_patch(Rectangle((x,y), w,h, fill=False, linewidth=2.2, edgecolor=INK2, alpha=a_aux))
-        text(ax, x+w/2, y+h/2, "Servo\n(mâchoire/nuque)", a=a_aux, sz=10, ha="center", va="center", c=INK2)
-
-        x,y,w,h=stepper_box
-        ax.add_patch(Rectangle((x,y), w,h, fill=False, linewidth=2.2, edgecolor=INK2, alpha=a_aux))
-        text(ax, x+w/2, y+h/2, "Stepper\n(base/plateau)", a=a_aux, sz=10, ha="center", va="center", c=INK2)
-
-        x,y,w,h=solarA
-        ax.add_patch(Rectangle((x,y), w,h, fill=False, linewidth=3.0, edgecolor=INK, alpha=a_aux))
-        text(ax, x+w/2, y+h/2, "Panneau\nsolaire A", a=a_aux, sz=12, ha="center", va="center")
-        x,y,w,h=solarB
-        ax.add_patch(Rectangle((x,y), w,h, fill=False, linewidth=3.0, edgecolor=INK, alpha=a_aux))
-        text(ax, x+w/2, y+h/2, "Panneau\nsolaire B", a=a_aux, sz=12, ha="center", va="center")
-
-        arrow(ax, L_MM+10, 60, L_MM+30, 50, a=a_aux)
-        arrow(ax, L_MM+10, 120, L_MM+30, 130, a=a_aux)
-
-    if a_bay>0:
-        x,y,w,h=bay
-        ax.add_patch(Rectangle((x,y), w,h, fill=False, linewidth=3.0, edgecolor=INK, alpha=a_bay))
-        text(ax, x+w/2, y+h-10, "Baie électronique", a=a_bay, sz=16, w="bold", ha="center")
-        text(ax, x+w/2, y+h-45, "ESP32 + PCA9685\nDriver moteurs DC\nBuck 5V / BMS\nCapteurs / LCD", a=a_bay, sz=12, ha="center", va="top")
-
-    if a_sum>0:
-        text(ax, 0, W_MM+90, "Résumé", a=a_sum, sz=16, w="bold")
-        text(ax, 0, W_MM+65, "- 6 moteurs DC: axes secondaires (bras/doigts/tête)", a=a_sum, sz=13)
-        text(ax, 0, W_MM+45, "- 1 DC plus gros: axe couple (base/levage/mécanisme)", a=a_sum, sz=13)
-        text(ax, 0, W_MM+25, "- Servo: précision (mâchoire/nuque)  |  Stepper: rotation douce", a=a_sum, sz=13)
-        text(ax, 0, W_MM+5, "- 2 panneaux solaires: auxiliaire / recharge lente", a=a_sum, sz=13)
-
-    text(ax, XMAX-10, YMIN+12, f"{i/FPS:05.2f}s", a=0.9, sz=11, ha="right", c=INK2)
-
-    fp=os.path.join(OUT_DIR, f"frame_{i:04d}.png")
-    fig.savefig(fp, dpi=120)
-    plt.close(fig)
-    return fp
-
-def run():
-    for i in range(N):
-        if i % 30 == 0:
-            print(f"frame {i}/{N}")
-        render_frame(i)
-
-    mp4=os.path.abspath("./blueprint_robo600.mp4")
-    ffmpeg=shutil.which("ffmpeg")
-    if not ffmpeg:
-        raise SystemExit("ffmpeg introuvable")
-    cmd=[ffmpeg,"-y","-framerate",str(FPS),"-i",os.path.join(OUT_DIR,"frame_%04d.png"),
-         "-c:v","libx264","-pix_fmt","yuv420p","-movflags","+faststart",mp4]
-    subprocess.check_call(cmd)
-    print("OK:", mp4)
-
-if __name__=="__main__":
-    run()
-PY
-chmod +x make_blueprint_video.py
-
-echo "[3/5] Génération vidéo"
-python3 ./make_blueprint_video.py
-
-echo "[4/5] Copie vers le web: $WEB"
-cp -f "$WD/blueprint_robo600.mp4" "$WEB/blueprint_robo600.mp4"
-chmod 644 "$WEB/blueprint_robo600.mp4"
-
-echo "[5/5] Terminé"
-echo "Local: $WD/blueprint_robo600.mp4"
-echo "Web:   /wolverine/blueprint/blueprint_robo600.mp4"
-ls -lh "$WEB/blueprint_robo600.mp4"
-'
+chmod +x /root/debug_403_blueprint_mp4.sh
+/root/debug_403_blueprint_mp4.sh
