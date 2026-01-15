@@ -1,41 +1,82 @@
-cat >/root/FIX_NGINX_WOLVERINE_SERVER_SAFE.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-NGCONF="/etc/nginx/sites-enabled/fireinners.online-ssl"
-BACK="/root/nginx_backup_$(date +%Y%m%d_%H%M%S).conf"
+### =========================
+### MEGA FIX WOLVERINE ROOT
+### =========================
 
-echo "=== FIX WOLVERINE LOCATION INSIDE SERVER ==="
+DOMAIN="fireinners.online"
+ROOT="/var/www/wolverine"
+NGX="/etc/nginx/sites-available/fireinners.online-ssl"
+BACK="/root/backup_wolverine_$(date +%Y%m%d_%H%M%S)"
+VENDOR="$ROOT/vendor"
+JS="$ROOT/wallet-balances.js"
+INDEX="$ROOT/index.html"
 
-# Backup
-cp "$NGCONF" "$BACK"
-echo "Backup: $BACK"
+mkdir -p "$BACK"
+cp -a "$ROOT" "$BACK/" || true
+cp -a "$NGX" "$BACK/" || true
 
-# Remove all existing wolverine locations (anywhere)
-sed -i '/location \/wolverine\//,/}/d' "$NGCONF"
+echo "== STOP NGINX =="
+systemctl stop nginx || true
 
-# Inject location BEFORE last closing server brace
-awk '
-/server[[:space:]]*{/ {in_server=1}
-in_server && /^}/ {
-  print "    location /wolverine/ {"
-  print "        root /var/www;"
-  print "        index index.html;"
-  print "        try_files $uri $uri/ /wolverine/index.html;"
-  print "        add_header Cache-Control \"no-store\";"
-  print "    }"
-  in_server=0
+echo "== CLEAN DUPLICATE /wolverine LOCATIONS =="
+sed -i '/location \/wolverine\//,/}/d' "$NGX"
+
+echo "== ADD SINGLE CLEAN LOCATION =="
+cat >> "$NGX" <<'NGX'
+location /wolverine/ {
+    root /var/www;
+    index index.html;
+    try_files $uri $uri/ /wolverine/index.html;
+    add_header Cache-Control "no-store";
 }
-{print}
-' "$NGCONF" > /tmp/nginx.fixed && mv /tmp/nginx.fixed "$NGCONF"
+NGX
 
-# Test & reload
+echo "== FIX CSP (ALLOW solana + eval SAFE) =="
+sed -i '/Content-Security-Policy/d' "$NGX"
+sed -i '/server_name/a add_header Content-Security-Policy "default-src '\''self'\''; script-src '\''self'\'' '\''unsafe-inline'\'' '\''unsafe-eval'\''; connect-src *; img-src * data:; style-src '\''self'\'' '\''unsafe-inline'\'';" always;' "$NGX"
+
+echo "== ENSURE VENDOR LIBS =="
+mkdir -p "$VENDOR"
+if [ ! -f "$VENDOR/solanaWeb3.min.js" ]; then
+  curl -L https://unpkg.com/@solana/web3.js@latest/lib/index.iife.min.js -o "$VENDOR/solanaWeb3.min.js"
+fi
+
+echo "== FIX INDEX LOAD ORDER =="
+sed -i '/solanaWeb3.min.js/d' "$INDEX"
+sed -i '/wallet-balances.js/d' "$INDEX"
+sed -i "s|</body>|<script src=\"/wolverine/vendor/solanaWeb3.min.js\"></script><script src=\"/wolverine/wallet-balances.js\"></script></body>|" "$INDEX"
+
+echo "== WRITE WALLET BALANCES JS =="
+cat > "$JS" <<'JS'
+(async ()=>{
+if(!window.solana || !window.solana.isPhantom) return;
+const RPC="https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac";
+const USDC_MINT="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1";
+await window.solana.connect();
+const pub=window.solana.publicKey;
+const conn=new solanaWeb3.Connection(RPC,"confirmed");
+const sol=await conn.getBalance(pub);
+document.getElementById("sol").innerText=(sol/1e9).toFixed(4);
+const toks=await conn.getParsedTokenAccountsByOwner(pub,{mint:new solanaWeb3.PublicKey(USDC_MINT)});
+let usdc=0;
+toks.value.forEach(t=>{usdc+=t.account.data.parsed.info.tokenAmount.uiAmount||0});
+document.getElementById("usdc").innerText=usdc.toFixed(2);
+})();
+JS
+
+chmod 644 "$JS"
+
+echo "== ENSURE HTML TARGETS =="
+sed -i 's/SOL:.*/SOL: <span id="sol">0<\/span>/' "$INDEX"
+sed -i 's/USDC:.*/USDC: <span id="usdc">0<\/span>/' "$INDEX"
+
+echo "== TEST NGINX =="
 nginx -t
-systemctl reload nginx
 
-echo "=== OK ==="
+echo "== START NGINX =="
+systemctl start nginx
+
+echo "== DONE =="
 echo "OPEN: https://fireinners.online/wolverine/"
-BASH
-
-chmod +x /root/FIX_NGINX_WOLVERINE_SERVER_SAFE.sh
-/root/FIX_NGINX_WOLVERINE_SERVER_SAFE.sh
