@@ -1,44 +1,73 @@
-cat >/root/FIX_NGINX_FIREINNERS_ROOT.sh <<'EOF'
 #!/usr/bin/env bash
+# MEGA BATCH ROOT — FIX NGINX + SSL + WOLVERINE (SAFE / ONE-SHOT)
 set -euo pipefail
 
+echo "=== MEGA FIX FIREINNERS / WOLVERINE (ROOT) ==="
+
+# ---- VARS FIXES ----
 DOMAIN="fireinners.online"
-SSL_VHOST="fireinners.online-ssl"
-SITES_AVAILABLE="/etc/nginx/sites-available"
-SITES_ENABLED="/etc/nginx/sites-enabled"
-TS="$(date +%Y%m%d_%H%M%S)"
+VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
+SITES_EN="/etc/nginx/sites-enabled"
+CERT="/etc/letsencrypt/live/${DOMAIN}/fullchain.pem"
+KEY="/etc/letsencrypt/live/${DOMAIN}/privkey.pem"
+ROOT_FRONT="/opt/fireinners/frontend-react/app/dist"
+BACKUP_DIR="/root/nginx_backup_$(date +%Y%m%d_%H%M%S)"
 
-echo "=== FIX NGINX FIREINNERS (ROOT / SAFE) ==="
+# ---- ROOT CHECK ----
+[ "$EUID" -eq 0 ] || { echo "MUST BE ROOT"; exit 1; }
 
-if [ "$EUID" -ne 0 ]; then
-  echo "❌ Must be root"
-  exit 1
+# ---- BACKUP ----
+mkdir -p "$BACKUP_DIR"
+cp -a /etc/nginx "$BACKUP_DIR/"
+echo "Backup done: $BACKUP_DIR"
+
+# ---- SSL CHECK / FIX ----
+if [ ! -f "$CERT" ] || [ ! -f "$KEY" ]; then
+  certbot certonly --nginx -d "$DOMAIN" -d "www.$DOMAIN" --non-interactive --agree-tos -m admin@"$DOMAIN"
 fi
 
-if [ ! -f "$SITES_AVAILABLE/$SSL_VHOST" ]; then
-  echo "❌ Missing vhost: $SSL_VHOST"
-  exit 1
-fi
+# ---- CLEAN ENABLED ----
+rm -f ${SITES_EN}/*
+ln -sf "$VHOST" "${SITES_EN}/fireinners.online-ssl"
 
-mkdir -p /root/nginx_sites_enabled_backup
-cp -a "$SITES_ENABLED" "/root/nginx_sites_enabled_backup/backup_$TS"
+# ---- REWRITE VHOST CLEAN ----
+cat > "$VHOST" <<EOF
+server {
+  listen 443 ssl http2;
+  server_name $DOMAIN www.$DOMAIN;
 
-for f in "$SITES_ENABLED"/*; do
-  [ -e "$f" ] || continue
-  name="$(basename "$f")"
-  if echo "$name" | grep -q "fireinners" && [ "$name" != "$SSL_VHOST" ]; then
-    rm -f "$f"
-    echo "Removed: $name"
-  fi
-done
+  ssl_certificate     $CERT;
+  ssl_certificate_key $KEY;
+  ssl_protocols TLSv1.2 TLSv1.3;
 
-ln -sf "$SITES_AVAILABLE/$SSL_VHOST" "$SITES_ENABLED/$SSL_VHOST"
+  root $ROOT_FRONT;
+  index index.html;
 
+  location / {
+    try_files \$uri \$uri/ /index.html;
+  }
+
+  location /wolverine/ {
+    try_files \$uri \$uri/ /wolverine/index.html;
+  }
+
+  location /wolverine/traderone/api/ {
+    proxy_pass http://127.0.0.1:3000/;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade \$http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host \$host;
+  }
+}
+EOF
+
+# ---- TEST + START ----
 nginx -t
-systemctl start nginx
+systemctl enable nginx
+systemctl restart nginx
+
+# ---- FINAL STATUS ----
 systemctl status nginx --no-pager
 
-echo "=== NGINX OK ==="
-EOF
-chmod +x /root/FIX_NGINX_FIREINNERS_ROOT.sh
-/root/FIX_NGINX_FIREINNERS_ROOT.sh
+echo "=== DONE ==="
+echo "OPEN: https://fireinners.online/wolverine/"
