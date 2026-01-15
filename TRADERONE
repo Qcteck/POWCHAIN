@@ -1,76 +1,55 @@
-bash <<'MEGAFIX'
+bash <<'FRONTFIX'
 set -euo pipefail
 
-echo "=== WOLVERINE + TRADERONE :: MEGA FIX AUTO ==="
+echo "=== WOLVERINE FRONT :: 403 FIX ==="
 
-BACK_DIR="/opt/traderone"
-SERVICE="traderone"
-PORT=3000
+FRONT_DIR="/var/www/wolverine"
+NGINX_VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
 
-# --- backend fix ---
-mkdir -p "$BACK_DIR"
-
-cat > "$BACK_DIR/server.cjs" <<'JS'
-const http = require("http");
-
-const server = http.createServer((req, res) => {
-  if (req.url === "/health") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ status: "ok", service: "TraderOne" }));
-    return;
-  }
-
-  if (req.url.startsWith("/api")) {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ ok: true, api: "TraderOne", path: req.url }));
-    return;
-  }
-
-  res.writeHead(404);
-  res.end();
-});
-
-server.listen(3000, "127.0.0.1", () =>
-  console.log("TraderOne running on 127.0.0.1:3000")
-);
-JS
-
-# --- systemd fix ---
-cat > "/etc/systemd/system/${SERVICE}.service" <<EOF
-[Unit]
-Description=TraderOne Backend
-After=network.target
-
-[Service]
-ExecStart=/usr/bin/node $BACK_DIR/server.cjs
-Restart=always
-User=root
-WorkingDirectory=$BACK_DIR
-Environment=NODE_ENV=production
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl daemon-reexec
-systemctl daemon-reload
-systemctl restart "$SERVICE"
-
-sleep 2
-
-# --- hard health check ---
-echo "[CHECK] backend health..."
-curl -sf "http://127.0.0.1:3000/health" || {
-  echo "❌ BACKEND STILL DEAD"
-  journalctl -u "$SERVICE" --no-pager | tail -30
+# --- sanity ---
+test -f "$FRONT_DIR/index.html" || {
+  echo "ERROR: $FRONT_DIR/index.html missing"
   exit 1
 }
 
+# --- permissions ---
+echo "[1/5] Fixing permissions..."
+chown -R www-data:www-data "$FRONT_DIR"
+find "$FRONT_DIR" -type d -exec chmod 755 {} \;
+find "$FRONT_DIR" -type f -exec chmod 644 {} \;
+
+# --- nginx index enforcement ---
+echo "[2/5] Ensuring nginx index..."
+if ! grep -q "location /wolverine" "$NGINX_VHOST"; then
+  echo "ERROR: /wolverine location missing in nginx"
+  exit 1
+fi
+
+# inject index rule if missing
+sed -i '/location \/wolverine/,/}/{/index /!s|{|{\n    index index.html;|}' "$NGINX_VHOST"
+
+# remove deny rules
+sed -i '/location \/wolverine/,/}/s/deny all;//g' "$NGINX_VHOST"
+
+# --- reload nginx ---
+echo "[3/5] Reloading nginx..."
+nginx -t
+systemctl reload nginx
+
+sleep 1
+
+# --- live test ---
+echo "[4/5] Live test..."
+HTTP_CODE=$(curl -o /dev/null -s -w "%{http_code}" https://fireinners.online/wolverine/)
+
+if [ "$HTTP_CODE" != "200" ]; then
+  echo "❌ STILL FAILING (HTTP $HTTP_CODE)"
+  exit 1
+fi
+
 echo
-echo "===================================="
-echo "✅ TRADERONE BACKEND IS LIVE"
-echo "API     : http://127.0.0.1:3000"
-echo "HEALTH  : /health"
-echo "FRONT   : https://fireinners.online/wolverine"
-echo "===================================="
-MEGAFIX
+echo "======================================"
+echo "✅ WOLVERINE FRONT IS LIVE"
+echo "URL : https://fireinners.online/wolverine"
+echo "======================================"
+FRONTFIX
