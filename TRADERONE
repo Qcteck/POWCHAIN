@@ -1,83 +1,53 @@
 #!/usr/bin/env bash
-# MEGA_BATCH_FIX_FIREINNERS_ROOT.sh
 set -euo pipefail
 
-echo "=== MEGA BATCH ROOT – FIREINNERS / WOLVERINE ==="
+echo "=== PURGE PORT 443 / FIX NGINX (ROOT) ==="
 
-DOMAIN="fireinners.online"
-VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
-ENABLED="/etc/nginx/sites-enabled"
-CERT="/etc/letsencrypt/live/${DOMAIN}/fullchain.pem"
-KEY="/etc/letsencrypt/live/${DOMAIN}/privkey.pem"
-ROOT_FRONT="/opt/fireinners/frontend-react/app/dist"
-BACKUP="/root/nginx_backup_$(date +%Y%m%d_%H%M%S)"
-
-# --- ROOT CHECK ---
 [ "$EUID" -eq 0 ] || { echo "MUST BE ROOT"; exit 1; }
 
-# --- BACKUP ---
-mkdir -p "$BACKUP"
-cp -a /etc/nginx "$BACKUP/"
-echo "Backup: $BACKUP"
+echo "--- LISTENERS AVANT ---"
+ss -lptn | grep ':443' || true
 
-# --- STOP EVERYTHING ---
+echo "--- STOP SERVICES SUSPECTS ---"
+systemctl stop apache2 || true
+systemctl disable apache2 || true
+
 systemctl stop nginx || true
 
-# --- HARD CLEAN CONFLICTS ---
-rm -f ${ENABLED}/*
-rm -f /etc/nginx/conf.d/*
-rm -f /etc/nginx/sites-enabled/*
+systemctl stop snapd || true
+systemctl stop docker || true
+systemctl stop docker.socket || true
+systemctl stop containerd || true
 
-# --- SSL CHECK ---
-if [ ! -f "$CERT" ] || [ ! -f "$KEY" ]; then
-  certbot certonly --nginx -d "$DOMAIN" -d "www.$DOMAIN" \
-    --non-interactive --agree-tos -m admin@"$DOMAIN"
-fi
+systemctl stop cloudflared || true
+systemctl stop caddy || true
+systemctl stop haproxy || true
 
-# --- REWRITE SINGLE VHOST (NO DUPLICATE POSSIBLE) ---
-cat > "$VHOST" <<EOF
-server {
-  listen 443 ssl http2;
-  server_name ${DOMAIN} www.${DOMAIN};
+echo "--- KILL HARD (PORT 443) ---"
+for pid in $(lsof -ti :443); do
+  echo "KILL PID $pid"
+  kill -9 $pid || true
+done
 
-  ssl_certificate     ${CERT};
-  ssl_certificate_key ${KEY};
-  ssl_protocols TLSv1.2 TLSv1.3;
+sleep 2
 
-  root ${ROOT_FRONT};
-  index index.html;
+echo "--- LISTENERS APRÈS KILL ---"
+ss -lptn | grep ':443' || echo "PORT 443 LIBRE"
 
-  location / {
-    try_files \$uri \$uri/ /index.html;
-  }
+echo "--- RELOAD SYSTEMD ---"
+systemctl daemon-reexec
+systemctl daemon-reload
 
-  location /wolverine/ {
-    try_files \$uri \$uri/ /wolverine/index.html;
-  }
-
-  location /wolverine/traderone/api/ {
-    proxy_pass http://127.0.0.1:3000/;
-    proxy_http_version 1.1;
-    proxy_set_header Upgrade \$http_upgrade;
-    proxy_set_header Connection "upgrade";
-    proxy_set_header Host \$host;
-  }
-}
-EOF
-
-# --- ENABLE SINGLE VHOST ---
-ln -sf "$VHOST" "${ENABLED}/fireinners.online-ssl"
-
-# --- FINAL TEST ---
-nginx -t
-
-# --- FORCE ENABLE + START ---
+echo "--- START NGINX ---"
 systemctl unmask nginx || true
 systemctl enable nginx
 systemctl start nginx
 
-# --- STATUS ---
+echo "--- STATUS ---"
 systemctl status nginx --no-pager
 
-echo "=== DONE ==="
+echo "--- FINAL CHECK ---"
+ss -lptn | grep ':443'
+
+echo "=== OK ==="
 echo "OPEN : https://fireinners.online/wolverine/"
