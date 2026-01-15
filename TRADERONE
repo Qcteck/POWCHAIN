@@ -1,4 +1,4 @@
-cat > /root/MEGA_WOLVERINE_NGINX_DEDUP_V2.sh <<'BASH'
+cat > /root/MEGA_WOLVERINE_NGINX_DEDUP_V3.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 TS="$(date +%Y%m%d_%H%M%S)"
@@ -10,24 +10,15 @@ INC_DIR="/etc/nginx/includes"
 INC="${INC_DIR}/wolverine_routes.inc"
 FRONT_DIR="/var/www/wolverine"
 
-LOG="/root/MEGA_WOLVERINE_NGINX_DEDUP_V2_${TS}.log"
-REPORT="/root/MEGA_WOLVERINE_NGINX_DEDUP_V2_${TS}.report.txt"
+LOG="/root/MEGA_WOLVERINE_NGINX_DEDUP_V3_${TS}.log"
+REPORT="/root/MEGA_WOLVERINE_NGINX_DEDUP_V3_${TS}.report.txt"
 
 say(){ printf "\n== %s ==\n" "$*"; }
 w(){ printf "%s\n" "$*" | tee -a "$LOG" >/dev/null; }
 die(){ w "ERREUR: $*"; exit 1; }
-
 need(){ command -v "$1" >/dev/null 2>&1 || die "Binaire manquant: $1"; }
 
-need nginx
-need python3
-need systemctl
-need lsattr
-need chattr
-need curl
-need grep
-need sed
-need awk
+need nginx; need python3; need systemctl; need lsattr; need chattr; need curl; need grep; need sed; need awk; need find
 
 test -f "$VHOST" || die "Vhost introuvable: $VHOST"
 mkdir -p "$INC_DIR"
@@ -56,21 +47,20 @@ relock_if_needed(){
 }
 backup(){
   local f="$1"
-  if [[ -f "$f" ]]; then
-    cp -a "$f" "${f}.bak_${TS}"
-    w "Backup: ${f}.bak_${TS}"
-  fi
+  [[ -f "$f" ]] || return 0
+  cp -a "$f" "${f}.bak_${TS}"
+  w "Backup: ${f}.bak_${TS}"
 }
 
-echo "# MEGA_WOLVERINE_NGINX_DEDUP_V2 $TS" > "$LOG"
-echo "# REPORT $TS" > "$REPORT"
+echo "# MEGA_WOLVERINE_NGINX_DEDUP_V3 $TS" > "$LOG"
 w "host=$HOST"
 w "date=$(date -Is)"
 w "hostname=$(hostname)"
 w "whoami=$(whoami)"
 w "pwd=$(pwd)"
+echo "# REPORT $TS" > "$REPORT"
 
-say "0) Nginx -t (etat actuel)"
+say "0) nginx -t (etat actuel)"
 (nginx -t 2>&1 || true) | tee -a "$LOG" >/dev/null
 
 say "1) Unlock immutable si necessaire (nginx.conf + vhost + include)"
@@ -82,27 +72,65 @@ if [[ -f "$INC" ]]; then
   if unlock_if_immutable "$INC" "include"; then WAS_IMM_INC="1"; fi
 fi
 
-say "2) Backups"
+say "2) Backups (vhost/main/include + tous fichiers qui referencent wolverine_routes.inc)"
 backup "$VHOST"
 [[ -f "$NGINX_MAIN" ]] && backup "$NGINX_MAIN"
 [[ -f "$INC" ]] && backup "$INC"
 
-say "3) Re-ecrire include CANONIQUE (ANTI-DOUBLON) : $INC"
+MAP="/root/MEGA_WOLVERINE_NGINX_DEDUP_V3_${TS}.map.txt"
+grep -RIl "wolverine_routes\.inc" /etc/nginx 2>/dev/null | sort -u > "$MAP" || true
+w "Fichiers referencant wolverine_routes.inc: $(wc -l < "$MAP" || echo 0)"
+while read -r f; do
+  [[ -n "$f" ]] || continue
+  backup "$f"
+done < "$MAP"
+
+say "3) Supprimer PARTOUT les lignes include wolverine_routes.inc (on reinjecte 1 seule fois ensuite)"
+python3 - <<PY
+import re
+from pathlib import Path
+
+mapf=Path("$MAP")
+files=[Path(p.strip()) for p in mapf.read_text().splitlines() if p.strip()] if mapf.exists() else []
+pat=re.compile(r'^\s*include\s+[^;]*wolverine_routes\.inc\s*;\s*$', re.I)
+
+removed_total=0
+touched=0
+
+for f in files:
+    try:
+        s=f.read_text(errors="ignore").splitlines(True)
+    except Exception:
+        continue
+    out=[]
+    removed=0
+    for line in s:
+        if pat.match(line):
+            removed += 1
+            continue
+        out.append(line)
+    if removed:
+        f.write_text("".join(out))
+        removed_total += removed
+        touched += 1
+
+print(f"OK: include lines removed_total={removed_total} in touched_files={touched}")
+PY
+w "OK: purge includes done"
+
+say "4) Re-ecrire include CANONIQUE (anti-doublon) : $INC"
 cat > "$INC" <<'NGINX'
 # --- WOLVERINE ROUTES (CANONIQUE, ANTI-DOUBLON) ---
 # Serve under: https://<host>/wolverine/
 # Front: /var/www/wolverine
 # API backend (TraderOne): 127.0.0.1:3000  -> /api/* via /wolverine/traderone/api/*
 
-# PWA / SW off (evite caches agressifs)
 location = /wolverine/sw.js { add_header Cache-Control "no-store" always; return 404; }
 location = /wolverine/service-worker.js { add_header Cache-Control "no-store" always; return 404; }
 location = /wolverine/manifest.json { add_header Cache-Control "no-store" always; return 404; }
 
-# Optionnel: /wolverine (sans slash) -> /wolverine/
 location = /wolverine { return 301 /wolverine/; }
 
-# API: /wolverine/traderone/api/* -> http://127.0.0.1:3000/api/*
 location ^~ /wolverine/traderone/api/ {
   proxy_http_version 1.1;
   proxy_set_header Host $host;
@@ -116,7 +144,6 @@ location ^~ /wolverine/traderone/api/ {
   proxy_pass http://127.0.0.1:3000;
 }
 
-# Front statique + SPA fallback
 location ^~ /wolverine/ {
   root /var/www;
   try_files $uri $uri/ /wolverine/index.html;
@@ -125,82 +152,54 @@ location ^~ /wolverine/ {
 NGINX
 w "OK: include ecrit"
 
-say "4) Nettoyage du VHOST: supprimer TOUT bloc location /wolverine* + dedoublonner include"
+say "5) Injecter UNE SEULE FOIS l'include dans le bon server 443 du VHOST"
 python3 - <<PY
 import re
 from pathlib import Path
 
-vhost = Path("$VHOST")
-s = vhost.read_text(errors="ignore")
+v=Path("$VHOST")
+s=v.read_text(errors="ignore")
 
-# 4A) Supprimer tous les blocs 'location ... /wolverine ... { ... }' (peu importe le modificateur)
-loc_pat = re.compile(r'\n\s*location\s+[^\n{]*?/wolverine[^\n{]*?\{.*?\n\s*\}\s*', re.S)
-s, nloc = loc_pat.subn("\n", s)
+inc_line="include /etc/nginx/includes/wolverine_routes.inc;"
 
-# 4B) Dedoublonner la ligne include
-inc_line = "include /etc/nginx/includes/wolverine_routes.inc;"
-lines = s.splitlines(True)
-out=[]
-seen=0
-for line in lines:
-    if inc_line in line:
-        if seen==0:
-            out.append(line)
-            seen=1
-        else:
-            continue
+# (A) securite: enlever toute ancienne ligne include (on veut 1 seule fois, ici)
+s=re.sub(r'^\s*include\s+[^;]*wolverine_routes\.inc\s*;\s*$', '', s, flags=re.I|re.M)
+
+lines=s.splitlines(True)
+res=[]
+i=0
+inserted=False
+
+while i < len(lines):
+    line=lines[i]
+    if re.match(r'^\s*server\s*\{', line):
+        buf=[line]
+        depth=line.count("{")-line.count("}")
+        i+=1
+        listen443=False
+        server_name_hit=False
+        while i < len(lines) and depth>0:
+            l2=lines[i]
+            if re.search(r'^\s*listen\s+.*443', l2): listen443=True
+            if re.search(r'^\s*server_name\s+.*fireinners\.online', l2): server_name_hit=True
+            depth += l2.count("{")-l2.count("}")
+            buf.append(l2); i+=1
+        # on injecte dans le server 443 (priorite) / sinon 443 tout court
+        if (listen443 and server_name_hit and not inserted) or (listen443 and not inserted and not any("include /etc/nginx/includes/wolverine_routes.inc;" in x for x in buf)):
+            buf.insert(1, "  "+inc_line+"\n")
+            inserted=True
+        res.extend(buf)
     else:
-        out.append(line)
-s = "".join(out)
+        res.append(line); i+=1
 
-# 4C) Si pas d'include, injecter dans le server { } qui contient listen 443
-if seen==0:
-    all_lines = s.splitlines(True)
-    res=[]
-    i=0
-    inserted=False
-    while i < len(all_lines):
-        line = all_lines[i]
-        if re.match(r'^\s*server\s*\{', line):
-            # buffer server block
-            buf=[line]
-            depth = line.count("{") - line.count("}")
-            i += 1
-            listen443=False
-            while i < len(all_lines) and depth > 0:
-                l2 = all_lines[i]
-                if re.search(r'^\s*listen\s+.*443', l2):
-                    listen443=True
-                depth += l2.count("{") - l2.count("}")
-                buf.append(l2)
-                i += 1
-            if listen443 and not inserted:
-                # inserer juste apres "server {"
-                buf.insert(1, "  " + inc_line + "\n")
-                inserted=True
-            res.extend(buf)
-        else:
-            res.append(line)
-            i += 1
-    s = "".join(res)
-    # si jamais aucun server 443, fallback append
-    if not inserted:
-        s += "\n" + inc_line + "\n"
+if not inserted:
+    # fallback: append en fin (evite echec silencieux)
+    res.append("\n"+inc_line+"\n")
 
-vhost.write_text(s)
-print(f"OK: vhost nettoye. locations_removed={nloc}, include_present_after={('include /etc/nginx/includes/wolverine_routes.inc;' in s)}")
+v.write_text("".join(res))
+print("OK: include injected_once=", inserted)
 PY
-w "OK: vhost nettoye"
-
-say "5) Inventaire: wolverine dans config"
-{
-  echo "---- VHOST grep ----"
-  grep -nE "wolverine|wolverine_routes\.inc" "$VHOST" || true
-  echo "---- INCLUDE grep ----"
-  grep -nE "location|wolverine" "$INC" || true
-  echo "---- GLOBAL grep ----"
-  grep -RniE "wolverine_routes\.inc|location\s+.*wolverine" /etc/nginx/sites-enabled /etc/nginx/includes 2>/dev/null || true
-} | tee -a "$LOG" >/dev/null
+w "OK: include injecte"
 
 say "6) Permissions front (eviter 403) si dossier existe"
 if [[ -d "$FRONT_DIR" ]]; then
@@ -210,33 +209,39 @@ else
   w "WARN: $FRONT_DIR absent (skip chmod)"
 fi
 
-say "7) nginx -t (doit PASS) + reload"
+say "7) Inventaire final (occurences include + locations wolverine)"
+{
+  echo "---- OCCURRENCES include (should be 1 in vhost) ----"
+  grep -Rni "wolverine_routes\.inc" /etc/nginx 2>/dev/null || true
+  echo "---- LOCATIONS wolverine (should come only from include once) ----"
+  grep -RniE "location\s+.*wolverine" /etc/nginx 2>/dev/null || true
+} | tee -a "$LOG" >/dev/null
+
+say "8) nginx -t (doit PASS) + reload"
 set +e
 NT="$(nginx -t 2>&1)"
 RC=$?
 set -e
 echo "$NT" | tee -a "$LOG" >/dev/null
-
 if [[ $RC -ne 0 ]]; then
   w "ERREUR: nginx -t FAIL"
-  w "Dernieres erreurs (tail 80):"
-  echo "$NT" | tail -n 80 | tee -a "$LOG" >/dev/null
+  w "Dernieres erreurs (tail 120):"
+  echo "$NT" | tail -n 120 | tee -a "$LOG" >/dev/null
 else
   w "OK: nginx -t PASS"
   systemctl reload nginx
   w "OK: nginx reload"
 fi
 
-say "8) Relock immutable si necessaire"
+say "9) Relock immutable si necessaire"
 relock_if_needed "$INC" "include" "$WAS_IMM_INC"
 relock_if_needed "$VHOST" "vhost" "$WAS_IMM_VHOST"
 [[ -f "$NGINX_MAIN" ]] && relock_if_needed "$NGINX_MAIN" "nginx.conf" "$WAS_IMM_MAIN"
 
-say "9) Tests HTTP (local/externe)"
+say "10) Tests HTTP (local/externe)"
 LC="$(curl -k -sS -o /dev/null -w "%{http_code}" "https://127.0.0.1/wolverine/" -H "Host: ${HOST}" || true)"
 EC="$(curl -sS -o /dev/null -w "%{http_code}" "https://${HOST}/wolverine/" || true)"
 HC="$(curl -sS -o /dev/null -w "%{http_code}" "https://${HOST}/wolverine/traderone/api/health" || true)"
-
 w "LOCAL  /wolverine/ : ${LC}"
 w "EXT    /wolverine/ : ${EC}"
 w "EXT    /wolverine/traderone/api/health : ${HC}"
@@ -259,9 +264,9 @@ echo "Log   : $LOG"
 echo "Report: $REPORT"
 BASH
 
-chmod +x /root/MEGA_WOLVERINE_NGINX_DEDUP_V2.sh
-bash /root/MEGA_WOLVERINE_NGINX_DEDUP_V2.sh
+chmod +x /root/MEGA_WOLVERINE_NGINX_DEDUP_V3.sh
+bash /root/MEGA_WOLVERINE_NGINX_DEDUP_V3.sh
 echo
 echo "----- REPORT (tail) -----"
-tail -n 160 /root/MEGA_WOLVERINE_NGINX_DEDUP_V2_*.report.txt 2>/dev/null || true
+tail -n 200 /root/MEGA_WOLVERINE_NGINX_DEDUP_V3_*.report.txt 2>/dev/null || true
 BASH
