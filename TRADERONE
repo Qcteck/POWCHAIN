@@ -1,1 +1,234 @@
-tail -n 320 /root/MEGA_WOLVERINE_NGINX_DEDUP_GLOBAL_V2_*.nohup
+cat > /root/MEGA_WOLVERINE_NGINX_DEDUP_SAFE.sh <<'__MEGA__'
+#!/usr/bin/env bash
+set -euo pipefail
+
+TS="$(date +%Y%m%d_%H%M%S)"
+HOST="fireinners.online"
+FRONT_DIR="/var/www/wolverine"
+VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
+NGINX_MAIN="/etc/nginx/nginx.conf"
+INC_DIR="/etc/nginx/includes"
+
+# IMPORTANT:
+# - on neutralise le wildcard *.inc en rendant wolverine_routes.inc un STUB (sans locations)
+# - les routes réelles sont dans wolverine_routes.wlvinc (non matché par *.inc)
+INC_STUB="${INC_DIR}/wolverine_routes.inc"
+INC_REAL="${INC_DIR}/wolverine_routes.wlvinc"
+
+LOG="/root/MEGA_WOLVERINE_NGINX_DEDUP_SAFE.log"
+REPORT="/root/MEGA_WOLVERINE_NGINX_DEDUP_SAFE.report.txt"
+NOHUP="/root/MEGA_WOLVERINE_NGINX_DEDUP_SAFE.nohup"
+
+if [[ "${1:-}" != "--run" ]]; then
+  nohup bash "$0" --run >"$NOHUP" 2>&1 & disown || true
+  echo "Lancé en background -> $NOHUP"
+  echo "Suivi: tail -n 260 $NOHUP"
+  exit 0
+fi
+
+w(){ printf "%s\n" "$*" | tee -a "$LOG" >/dev/null; }
+sep(){ w ""; w "== $* =="; }
+ok(){ w "OK: $*"; }
+warn(){ w "WARN: $*"; }
+die(){ w "ERREUR: $*"; exit 1; }
+
+ensure_pkg(){ local p="$1"; dpkg -s "$p" >/dev/null 2>&1 || { apt-get update -y >>"$LOG" 2>&1; apt-get install -y "$p" >>"$LOG" 2>&1; }; }
+is_imm(){ lsattr -d "$1" 2>/dev/null | awk '{print $1}' | grep -q "i"; }
+unlock_imm(){ local f="$1" name="$2"; if [[ -f "$f" ]] && is_imm "$f"; then chattr -i "$f" || true; ok "chattr -i $name"; echo "1"; else echo "0"; fi; }
+relock_imm(){ local f="$1" name="$2" was="$3"; if [[ "$was" == "1" ]] && [[ -f "$f" ]]; then chattr +i "$f" || true; ok "chattr +i $name"; fi; }
+backup_file(){ local f="$1"; [[ -f "$f" ]] || return 0; cp -a "$f" "${f}.bak_${TS}"; ok "backup ${f}.bak_${TS}"; }
+
+http_code_local(){ local path="$1"; curl -k -sS -o /dev/null -w "%{http_code}" "https://127.0.0.1${path}" -H "Host: ${HOST}" || true; }
+http_code_ext(){ local path="$1"; curl -sS -o /dev/null -w "%{http_code}" "https://${HOST}${path}" || true; }
+
+: >"$LOG"
+: >"$REPORT"
+
+sep "0) Pré-requis + chemins"
+ensure_pkg nginx
+ensure_pkg python3
+ensure_pkg ca-certificates
+ensure_pkg curl
+mkdir -p "$INC_DIR"
+[[ -f "$VHOST" ]] || die "Vhost introuvable: $VHOST"
+ok "pré-requis OK"
+w "LOG=$LOG"
+w "REPORT=$REPORT"
+
+sep "1) Scan: wildcard includes/*.inc et occurrences wolverine"
+WILD_HITS="$(grep -RIn --exclude-dir=sites-enabled --exclude-dir=snippets --exclude='*.bak_*' 'include[[:space:]]\+/etc/nginx/includes/\*\.inc' /etc/nginx 2>/dev/null || true)"
+WOLV_LOC_HITS="$(nginx -T 2>/dev/null | egrep -n 'location[[:space:]]+(\^~[[:space:]]+)?/?wolverine|include[[:space:]]+/etc/nginx/includes/wolverine_routes\.(inc|wlvinc)' || true)"
+w "WILD_HITS (include *.inc):"
+printf "%s\n" "$WILD_HITS" | sed '/^\s*$/d' | tee -a "$LOG" >/dev/null || true
+w "WOLV_LOC_HITS (nginx -T filtered, pre-fix):"
+printf "%s\n" "$WOLV_LOC_HITS" | sed '/^\s*$/d' | tee -a "$LOG" >/dev/null || true
+HAS_WILD="0"; if printf "%s\n" "$WILD_HITS" | sed '/^\s*$/d' | grep -q .; then HAS_WILD="1"; fi
+ok "HAS_WILD=$HAS_WILD"
+
+sep "2) Unlock immutable si nécessaire (nginx.conf + vhost + includes)"
+WAS_MAIN="$(unlock_imm "$NGINX_MAIN" "nginx.conf")"
+WAS_VHOST="$(unlock_imm "$VHOST" "vhost")"
+WAS_STUB="$(unlock_imm "$INC_STUB" "wolverine_routes.inc")"
+WAS_REAL="$(unlock_imm "$INC_REAL" "wolverine_routes.wlvinc")"
+
+sep "3) Backups"
+backup_file "$NGINX_MAIN"
+backup_file "$VHOST"
+backup_file "$INC_STUB"
+backup_file "$INC_REAL"
+
+sep "4) Écrire routes RÉELLES (anti-wildcard) -> $INC_REAL"
+cat > "$INC_REAL" <<'EOF'
+# Wolverine routes (REAL) - not matched by include *.inc
+
+location = /wolverine { return 301 /wolverine/; }
+
+location ^~ /wolverine/traderone/api/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  proxy_read_timeout 120s;
+  proxy_send_timeout 120s;
+  proxy_connect_timeout 10s;
+  proxy_pass http://127.0.0.1:3000/;
+}
+
+location ^~ /wolverine/_next/ {
+  alias /var/www/wolverine/_next/;
+  access_log off;
+  expires 30d;
+  add_header Cache-Control "public, max-age=2592000" always;
+  try_files $uri =404;
+}
+
+location ^~ /wolverine/ {
+  alias /var/www/wolverine/;
+  try_files $uri $uri/ /wolverine/index.html;
+}
+EOF
+ok "routes réelles écrites"
+
+sep "5) Écrire STUB -> $INC_STUB (zéro location, safe si wildcard *.inc)"
+cat > "$INC_STUB" <<'EOF'
+# STUB (intentionally empty)
+# This file exists only to avoid wildcard include (*.inc) accidentally including real Wolverine locations twice.
+EOF
+ok "stub écrit"
+
+sep "6) Nettoyage du VHOST: retirer includes explicites + retirer blocs location /wolverine*"
+python3 - <<'PY'
+import re
+from pathlib import Path
+
+VHOST=Path("/etc/nginx/sites-available/fireinners.online-ssl")
+INC_STUB="/etc/nginx/includes/wolverine_routes.inc"
+INC_REAL="/etc/nginx/includes/wolverine_routes.wlvinc"
+
+s=VHOST.read_text(errors="ignore").splitlines()
+
+# remove any explicit include of stub or old inc/wlvinc
+inc_re = re.compile(r'^\s*include\s+/etc/nginx/includes/wolverine_routes\.(inc|wlvinc)\s*;\s*$')
+s=[l for l in s if not inc_re.search(l)]
+
+# remove any existing location blocks for /wolverine (to prevent duplicates)
+loc_start = re.compile(r'^\s*location\s+(\^~\s+)?(=+\s+)?/wolverine\b')
+out=[]
+i=0
+while i<len(s):
+    line=s[i]
+    if loc_start.search(line):
+        # skip block with brace tracking
+        brace=0
+        # handle one-line "location ... { ... }"
+        # count braces from current line onward until balanced and we've seen opening
+        seen_open=False
+        while i<len(s):
+            brace += s[i].count("{")
+            if s[i].count("{")>0: seen_open=True
+            brace -= s[i].count("}")
+            i += 1
+            if seen_open and brace<=0:
+                break
+        continue
+    out.append(line)
+    i+=1
+
+VHOST.write_text("\n".join(out)+("\n" if out else ""))
+print("VHOST cleaned")
+PY
+ok "vhost nettoyé (includes + locations)"
+
+sep "7) Injecter UNE SEULE FOIS include REAL dans le bon server (fireinners.online)"
+python3 - <<'PY'
+import re
+from pathlib import Path
+
+VHOST=Path("/etc/nginx/sites-available/fireinners.online-ssl")
+INC_REAL="/etc/nginx/includes/wolverine_routes.wlvinc"
+
+s=VHOST.read_text(errors="ignore").splitlines()
+
+# ensure not already present
+s=[l for l in s if not re.search(r'^\s*include\s+'+re.escape(INC_REAL)+r'\s*;\s*$', l)]
+
+out=[]
+injected=False
+for l in s:
+    out.append(l)
+    if (not injected) and re.search(r'^\s*server_name\s+.*\bfireinners\.online\b', l):
+        out.append(f'  include {INC_REAL};')
+        injected=True
+
+VHOST.write_text("\n".join(out)+("\n" if out else ""))
+print("injected=",injected)
+PY
+ok "include REAL injecté (1 fois)"
+
+sep "8) Permissions front (éviter 403) si dossier existe"
+if [[ -d "$FRONT_DIR" ]]; then
+  chmod -R a+rX "$FRONT_DIR" || true
+  ok "chmod a+rX sur $FRONT_DIR"
+else
+  warn "FRONT_DIR absent: $FRONT_DIR (ça peut causer 404/403, mais nginx doit d'abord passer)"
+fi
+
+sep "9) Vérif: où /wolverine est défini (nginx -T filtré) -> REPORT"
+{
+  echo "### nginx -T | grep wolverine (POST-fix) ###"
+  nginx -T 2>/dev/null | egrep -n 'include[[:space:]]+/etc/nginx/includes/wolverine_routes\.(inc|wlvinc)|include[[:space:]]+/etc/nginx/includes/\*\.inc|location[[:space:]]+(\^~[[:space:]]+)?(=+[[:space:]]+)?/wolverine\b' | head -n 260 || true
+} | tee -a "$REPORT" >/dev/null
+ok "report écrit: $REPORT"
+
+sep "10) nginx -t puis reload"
+if nginx -t >>"$LOG" 2>&1; then
+  ok "nginx -t PASS"
+  systemctl reload nginx >>"$LOG" 2>&1 || systemctl restart nginx >>"$LOG" 2>&1 || true
+  ok "nginx reloaded"
+else
+  w "---- nginx -t FAIL (last 220 log lines) ----"
+  tail -n 220 "$LOG" | tee -a "$REPORT" >/dev/null || true
+  die "nginx -t FAIL (voir $LOG et $REPORT)"
+fi
+
+sep "11) Tests HTTP"
+w "LOCAL /wolverine/ => $(http_code_local "/wolverine/")"
+w "EXT   /wolverine/ => $(http_code_ext "/wolverine/")"
+w "LOCAL /wolverine/traderone/api/health => $(http_code_local "/wolverine/traderone/api/health")"
+w "EXT   /wolverine/traderone/api/health => $(http_code_ext "/wolverine/traderone/api/health")"
+
+sep "12) Relock immutable si nécessaire"
+relock_imm "$INC_REAL" "wolverine_routes.wlvinc" "$WAS_REAL"
+relock_imm "$INC_STUB" "wolverine_routes.inc" "$WAS_STUB"
+relock_imm "$VHOST" "vhost" "$WAS_VHOST"
+relock_imm "$NGINX_MAIN" "nginx.conf" "$WAS_MAIN"
+
+sep "DONE"
+w "NOHUP=$NOHUP"
+w "LOG=$LOG"
+w "REPORT=$REPORT"
+__MEGA__
+
+chmod +x /root/MEGA_WOLVERINE_NGINX_DEDUP_SAFE.sh
+bash /root/MEGA_WOLVERINE_NGINX_DEDUP_SAFE.sh
