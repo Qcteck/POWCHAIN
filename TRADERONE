@@ -1,60 +1,71 @@
+cat >/root/FIX_WOLVERINE_FULL_ROOT.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "=== MEGA FIX WOLVERINE (ROOT / SAFE) ==="
+echo "=== FIX WOLVERINE FULL ROOT ==="
 
-# VARIABLES
-VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
-INC="/etc/nginx/includes/wolverine.inc"
-ROOT_WOLV="/opt/fireinners/frontend-react/app/dist"
+### VARS
+WEBROOT="/var/www/wolverine"
+INDEX="$WEBROOT/index.html"
+NGINX_SITE="/etc/nginx/sites-available/fireinners.online-ssl"
+USDC_MINT="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1"
+RPC="https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac"
 
-# CHECK ROOT
-if [ "$EUID" -ne 0 ]; then
-  echo "❌ Must be root"
-  exit 1
-fi
+### 1. CHECK FILES
+test -f "$INDEX" || { echo "index.html manquant"; exit 1; }
 
-# BACKUP VHOST
-TS="$(date +%Y%m%d_%H%M%S)"
-cp -a "$VHOST" "$VHOST.bak_$TS"
-echo "✔ Backup vhost: $VHOST.bak_$TS"
+### 2. FIX JS PATH 404 (Next static)
+echo "== Fix JS static paths =="
+sed -i 's|/_next/|/wolverine/_next/|g' "$INDEX"
 
-# CREATE INCLUDE
-cat > "$INC" <<'EOF'
-# === WOLVERINE INCLUDE (DEV SAFE) ===
-add_header Content-Security-Policy "
-default-src * data: blob: 'unsafe-inline' 'unsafe-eval';
-script-src * data: blob: 'unsafe-inline' 'unsafe-eval';
-connect-src * wss: https:;
-img-src * data: blob:;
-style-src * 'unsafe-inline';
-font-src * data:;
-frame-src *;
-" always;
-EOF
+### 3. FORCE SOL + USDC BALANCE LOGIC
+echo "== Inject SOL + USDC balance logic =="
+python3 - <<PY
+from pathlib import Path
+p=Path("$INDEX")
+s=p.read_text()
 
-echo "✔ CSP include créé"
+if "getParsedTokenAccountsByOwner" not in s:
+    inject = f"""
+<script src="/wolverine/vendor/solanaWeb3.min.js"></script>
+<script>
+const RPC="{RPC}";
+const USDC_MINT="{USDC_MINT}";
+async function loadBalances(pubkey){
+ const conn=new solanaWeb3.Connection(RPC,"confirmed");
+ const sol=await conn.getBalance(pubkey);
+ document.querySelector("#sol").innerText=(sol/1e9).toFixed(4);
+ const toks=await conn.getParsedTokenAccountsByOwner(pubkey,{{mint:new solanaWeb3.PublicKey(USDC_MINT)}});
+ let usdc=0;
+ toks.value.forEach(t=>usdc+=t.account.data.parsed.info.tokenAmount.uiAmount||0);
+ document.querySelector("#usdc").innerText=usdc.toFixed(2);
+}
+</script>
+"""
+    s=s.replace("</body>",inject+"\n</body>")
+p.write_text(s)
+PY
 
-# INJECT INCLUDE + FIX ROUTES
-if ! grep -q "wolverine.inc" "$VHOST"; then
-sed -i "/location \\/wolverine\\//a \\
-    include /etc/nginx/includes/wolverine.inc;
-" "$VHOST"
-fi
+### 4. FIX HTML IDS
+sed -i 's|SOL:.*|SOL: <span id="sol">0</span>|' "$INDEX"
+sed -i 's|USDC:.*|USDC: <span id="usdc">0</span>|' "$INDEX"
 
-# FORCE SPA + ASSETS PATH
-sed -i '/location \/wolverine\//,/}/c\
-location /wolverine/ {\
-    root '"$ROOT_WOLV"';\
-    try_files $uri $uri/ /wolverine/index.html;\
-}' "$VHOST"
+### 5. FIX CSP (ALLOW EVAL + PHANTOM)
+echo "== Fix CSP =="
+sed -i '/Content-Security-Policy/d' "$NGINX_SITE"
+sed -i '/server_name/a add_header Content-Security-Policy "default-src * data: blob: '\''unsafe-inline'\'' '\''unsafe-eval'\'';" always;' "$NGINX_SITE"
 
-echo "✔ Routes /wolverine corrigées"
+### 6. CACHE HEADERS CLEAN
+sed -i '/add_header Cache-Control/d' "$NGINX_SITE"
+sed -i '/server_name/a add_header Cache-Control "no-store";' "$NGINX_SITE"
 
-# TEST + RELOAD
+### 7. TEST & RELOAD NGINX
 nginx -t
 systemctl reload nginx
 
-echo "=== ✅ WOLVERINE FIX APPLIQUÉ ==="
-echo "OPEN → https://fireinners.online/wolverine/"
-echo "CTRL + F5 OBLIGATOIRE"
+echo "=== DONE ==="
+echo "OPEN: https://fireinners.online/wolverine/"
+BASH
+
+chmod +x /root/FIX_WOLVERINE_FULL_ROOT.sh
+/root/FIX_WOLVERINE_FULL_ROOT.sh
