@@ -1,71 +1,79 @@
+cat >/root/WOLVERINE_WALLET_FIX.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ==============================
-# MEGA FIX ROOT — WOLVERINE UI + PHANTOM + SOLDES
-# À lancer en ROOT, n'importe où
-# ==============================
+### CONFIG
+ROOT_HTML="/var/www/wolverine/index.html"
+RPC="https://api.mainnet-beta.solana.com"
+USDC_MINT="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1"
+TS=$(date +%Y%m%d_%H%M%S)
 
-DOMAIN="fireinners.online"
-BASE="/var/www/wolverine"
-INDEX="$BASE/index.html"
-VENDOR="$BASE/vendor"
-JS="$BASE/wallet-balances.js"
-NGCONF="/etc/nginx/sites-available/fireinners.online-ssl"
-BACK="/root/nginx_backup_$(date +%Y%m%d_%H%M%S).conf"
+echo "=== WOLVERINE WALLET FIX START ==="
 
-echo "== BACKUP NGINX =="
-cp -a "$NGCONF" "$BACK"
+# 1. Backup
+cp "$ROOT_HTML" "$ROOT_HTML.bak_$TS"
+echo "[OK] Backup created"
 
-echo "== ENSURE DIRS =="
-mkdir -p "$BASE" "$VENDOR"
+# 2. Write clean wallet UI
+cat >"$ROOT_HTML" <<'HTML'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<title>Wolverine Wallet</title>
+<style>
+body{margin:0;font-family:Arial;background:#0b0b0b;color:#0ff}
+#wallet{max-width:420px;margin:80px auto;padding:20px;border:1px solid #0ff;border-radius:8px}
+button{width:100%;padding:12px;background:#0ff;border:0;font-weight:bold;cursor:pointer}
+.line{margin-top:10px}
+</style>
+</head>
+<body>
 
-echo "== ENSURE solanaWeb3 (LOCAL) =="
-if [ ! -f "$VENDOR/solanaWeb3.min.js" ]; then
-  curl -fsSL https://unpkg.com/@solana/web3.js@latest/lib/index.iife.min.js -o "$VENDOR/solanaWeb3.min.js"
-fi
+<div id="wallet">
+  <button id="connect">Connect Phantom</button>
+  <div class="line">Address: <span id="addr">-</span></div>
+  <div class="line">SOL: <span id="sol">-</span></div>
+  <div class="line">USDC: <span id="usdc">-</span></div>
+</div>
 
-echo "== WRITE wallet-balances.js =="
-cat > "$JS" <<'JS'
-(async()=>{
-  if(!window.solana||!window.solana.isPhantom)return;
-  const RPC="https://api.mainnet-beta.solana.com";
-  const USDC_MINT="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1";
-  await window.solana.connect({onlyIfTrusted:true}).catch(()=>{});
-  const pub=window.solana.publicKey;if(!pub)return;
-  const conn=new solanaWeb3.Connection(RPC,"confirmed");
-  const sol=await conn.getBalance(pub);
-  const solEl=document.getElementById("sol");if(solEl)solEl.innerText=(sol/1e9).toFixed(4);
+<script>
+const RPC = "https://api.mainnet-beta.solana.com";
+const USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1";
+
+async function rpc(method,params){
+  const r=await fetch(RPC,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({jsonrpc:"2.0",id:1,method,params})});
+  return (await r.json()).result;
+}
+
+document.getElementById("connect").onclick = async ()=>{
+  if(!window.solana?.isPhantom){alert("Phantom not found");return;}
+  const res = await solana.connect();
+  const pub = res.publicKey.toString();
+  document.getElementById("addr").textContent = pub;
+
+  const lamports = await rpc("getBalance",[pub]);
+  document.getElementById("sol").textContent = (lamports.value/1e9).toFixed(4);
+
+  const tok = await rpc("getParsedTokenAccountsByOwner",[pub,{mint:USDC},{encoding:"jsonParsed"}]);
   let usdc=0;
-  const toks=await conn.getParsedTokenAccountsByOwner(pub,{mint:new solanaWeb3.PublicKey(USDC_MINT)});
-  toks.value.forEach(t=>{usdc+=t.account.data.parsed.info.tokenAmount.uiAmount||0});
-  const usdcEl=document.getElementById("usdc");if(usdcEl)usdcEl.innerText=usdc.toFixed(2);
-})();
-JS
-chmod 644 "$JS"
+  tok.value.forEach(v=>usdc+=Number(v.account.data.parsed.info.tokenAmount.uiAmount||0));
+  document.getElementById("usdc").textContent = usdc.toFixed(2);
+};
+</script>
 
-echo "== ENSURE HTML TARGETS + LOAD ORDER =="
-grep -q 'id="sol"' "$INDEX" || sed -i 's/SOL:.*/SOL: <span id="sol">0<\/span>/' "$INDEX"
-grep -q 'id="usdc"' "$INDEX" || sed -i 's/USDC:.*/USDC: <span id="usdc">0<\/span>/' "$INDEX"
-sed -i '/solanaWeb3.min.js/d' "$INDEX"
-sed -i '/wallet-balances.js/d' "$INDEX"
-sed -i 's#</body>#<script src="/wolverine/vendor/solanaWeb3.min.js"></script><script src="/wolverine/wallet-balances.js"></script></body>#' "$INDEX"
+</body>
+</html>
+HTML
 
-echo "== FIX NGINX (SINGLE /wolverine LOCATION + CSP OK) =="
-sed -i '/location \/wolverine\//,/}/d' "$NGCONF"
-sed -i '/server {/a \
-    location /wolverine/ {\
-        root /var/www;\
-        index index.html;\
-        try_files $uri $uri/ /wolverine/index.html;\
-        add_header Cache-Control "no-store";\
-    }\
-    add_header Content-Security-Policy "default-src '\''self'\'' data: blob:; script-src '\''self'\'' '\''unsafe-eval'\'' '\''unsafe-inline'\''; style-src '\''self'\'' '\''unsafe-inline'\''; img-src * data:; connect-src *;" always;\
-' "$NGCONF"
+echo "[OK] Wallet UI written"
 
-echo "== TEST & RELOAD NGINX =="
-nginx -t
-systemctl reload nginx
+# 3. Permissions
+chown www-data:www-data "$ROOT_HTML"
+chmod 644 "$ROOT_HTML"
 
-echo "== DONE =="
-echo "OPEN: https://fireinners.online/wolverine/"
+echo "=== WOLVERINE WALLET FIX DONE ==="
+echo "Reload browser with CTRL+SHIFT+R"
+BASH
+
+chmod +x /root/WOLVERINE_WALLET_FIX.sh
