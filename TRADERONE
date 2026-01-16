@@ -1,100 +1,155 @@
-cat >/root/WOLVERINE_WALLET_FIX_ALL.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
 ### CONFIG
-ROOT="/var/www/wolverine"
-VENDOR="$ROOT/vendor"
-HTML="$ROOT/index.html"
-TS=$(date +%Y%m%d_%H%M%S)
-
+BASE="/opt/traderone"
+FRONT="/var/www/wolverine"
 RPC="https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac"
-USDC_MINT="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1"
+PORT=3000
+MASTER_KEY="$(hostname)-$(date +%s)"
 
-echo "== BACKUP =="
-cp "$HTML" "$HTML.bak_$TS"
+echo "=== TRADERONE • INSTALLATION COMPLETE ==="
 
-echo "== VENDOR =="
-mkdir -p "$VENDOR"
+### 1) SYSTEM
+echo "[1/6] Dépendances système"
+apt-get update -y
+apt-get install -y nodejs npm qrencode curl
+npm install -g pm2
 
-if [ ! -f "$VENDOR/solana-web3.min.js" ]; then
-  echo "Downloading solana-web3.js (local)"
-  curl -sL https://unpkg.com/@solana/web3.js@1.95.3/lib/index.iife.min.js \
-    -o "$VENDOR/solana-web3.min.js"
-fi
+### 2) BACKEND
+echo "[2/6] Backend sécurisé"
+mkdir -p $BASE/{vaults,trades}
+cd $BASE
 
-echo "== WRITE HTML =="
-cat >"$HTML" <<'HTML'
-<!DOCTYPE html><html><head>
-<meta charset="utf-8">
-<title>WOLVERINE Wallet</title>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<script src="/wolverine/vendor/solana-web3.min.js"></script>
-<style>
-body{background:#050b12;color:#00eaff;font-family:monospace}
-#box{width:420px;margin:120px auto;padding:20px;border:2px solid #00eaff}
-button{width:100%;margin:6px 0;padding:10px;background:#050b12;color:#00eaff;border:1px solid #00eaff;cursor:pointer}
-.addr{word-break:break-all;margin-top:10px}
-</style>
-</head>
-<body>
-<div id="box">
-<button onclick="connect()">Connect Wallet</button>
-<button onclick="refresh()">Refresh</button>
-<div class="addr" id="addr">-</div>
-<div>SOL: <span id="sol">-</span></div>
-<div>USDC: <span id="usdc">-</span></div>
-</div>
-
-<script>
-const RPC = "RPC_ENDPOINT";
-const USDC_MINT = "USDC_MINT_ADDR";
-let PUB=null,CONN=null;
-
-async function connect(){
- if(!window.solana||!window.solana.isPhantom){alert("Phantom not found");return;}
- const r=await window.solana.connect();
- PUB=r.publicKey.toString();
- document.getElementById("addr").textContent=PUB;
- CONN=new solanaWeb3.Connection(RPC,"confirmed");
- await refresh();
-}
-
-async function refresh(){
- if(!PUB||!CONN)return;
-
- const pk=new solanaWeb3.PublicKey(PUB);
-
- // SOL
- const lamports=await CONN.getBalance(pk);
- document.getElementById("sol").textContent=(lamports/1e9).toFixed(6);
-
- // USDC
- let usdc=0;
- const accts=await CONN.getParsedTokenAccountsByOwner(pk,{mint:new solanaWeb3.PublicKey(USDC_MINT)});
- for(const a of accts.value){
-   usdc+=a.account.data.parsed.info.tokenAmount.uiAmount||0;
+cat > package.json <<'JSON'
+{
+ "name":"traderone-backend",
+ "version":"1.0.0",
+ "main":"server.js",
+ "dependencies":{
+  "express":"^4.18.2",
+  "tweetnacl":"^1.0.3",
+  "bs58":"^5.0.0",
+  "crypto-js":"^4.2.0",
+  "@solana/web3.js":"^1.95.3",
+  "qrcode":"^1.5.4"
  }
- document.getElementById("usdc").textContent=usdc.toFixed(2);
 }
-</script>
-</body></html>
-HTML
+JSON
 
-sed -i "s|RPC_ENDPOINT|$RPC|" "$HTML"
-sed -i "s|USDC_MINT_ADDR|$USDC_MINT|" "$HTML"
+npm install --silent
 
-echo "== NGINX CHECK =="
-nginx -t && systemctl reload nginx
+cat > server.js <<'JS'
+const express=require("express");
+const fs=require("fs");
+const nacl=require("tweetnacl");
+const bs58=require("bs58");
+const CryptoJS=require("crypto-js");
+const QR=require("qrcode");
+const {Connection,PublicKey,Keypair,LAMPORTS_PER_SOL}=require("@solana/web3.js");
 
-echo "== DONE =="
-echo "Backup: $HTML.bak_$TS"
-echo "Open: https://fireinners.online/wolverine"
-BASH
+const RPC=process.env.RPC;
+const MASTER=process.env.MASTER_KEY;
+const app=express();
+app.use(express.json());
+const conn=new Connection(RPC,"confirmed");
 
-chmod +x /root/WOLVERINE_WALLET_FIX_ALL.sh
-/root/WOLVERINE_WALLET_FIX_ALL.sh
+function vaultPath(p){return __dirname+"/vaults/"+p+".json"}
+
+function createVault(user){
+ const kp=Keypair.generate();
+ const enc=CryptoJS.AES.encrypt(
+  bs58.encode(kp.secretKey),MASTER
+ ).toString();
+ fs.writeFileSync(vaultPath(user),JSON.stringify({
+  user,
+  pub:kp.publicKey.toBase58(),
+  enc,
+  active:true
+ },null,2));
+ return kp.publicKey.toBase58();
+}
+
+app.post("/api/vault/init",async(req,res)=>{
+ const {userPub}=req.body;
+ if(!userPub)return res.status(400).end();
+ if(!fs.existsSync(vaultPath(userPub))){
+  createVault(userPub);
+ }
+ const v=JSON.parse(fs.readFileSync(vaultPath(userPub)));
+ const qr=await QR.toDataURL(v.pub);
+ res.json({vault:v.pub,qr});
+});
+
+app.get("/api/vault/status",async(req,res)=>{
+ const v=JSON.parse(fs.readFileSync(vaultPath(req.query.user)));
+ const bal=await conn.getBalance(new PublicKey(v.pub));
+ res.json({sol:bal/LAMPORTS_PER_SOL});
+});
+
+app.post("/api/vault/withdraw",async(req,res)=>{
+ const {user,addr}=req.body;
+ const v=JSON.parse(fs.readFileSync(vaultPath(user)));
+ v.active=false;
+ fs.writeFileSync(vaultPath(user),JSON.stringify(v,null,2));
+ res.json({status:"WITHDRAW_REQUESTED",to:addr});
+});
+
+app.post("/api/vault/stop",(req,res)=>{
+ const v=JSON.parse(fs.readFileSync(vaultPath(req.body.user)));
+ v.active=false;
+ fs.writeFileSync(vaultPath(req.body.user),JSON.stringify(v,null,2));
+ res.json({stopped:true});
+});
+
+app.listen(3000,()=>console.log("TraderOne backend live"));
+JS
+
+### 3) ENV + SERVICE
+echo "[3/6] Variables et service"
+cat > .env <<EOF
+RPC=$RPC
+MASTER_KEY=$MASTER_KEY
+EOF
+
+pm2 delete traderone || true
+pm2 start server.js --name traderone
+pm2 save
+
+### 4) FRONTEND PATCH
+echo "[4/6] Patch frontend"
+mkdir -p $FRONT/api
+
+cat > $FRONT/api/vault.js <<'JS'
+async function initVault(pub){
+ const r=await fetch("/api/vault/init",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({userPub:pub})});
+ return r.json();
+}
+async function vaultStatus(pub){
+ const r=await fetch("/api/vault/status?user="+pub);
+ return r.json();
+}
+async function withdraw(pub,addr){
+ return fetch("/api/vault/withdraw",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({user:pub,addr})});
+}
+JS
+
+### 5) LEGAL BANNER
+echo "[5/6] Avertissement légal"
+grep -q "Avertissement légal" $FRONT/index.html || sed -i '/<body>/a \
+<div style="border:2px solid red;padding:10px;color:#fff;background:#300">⚠️ Avertissement légal : Outil expérimental, aucun rendement garanti, risque de perte totale, non enregistré AMF (Québec).</div>' $FRONT/index.html
+
+### 6) FIN
+echo "[6/6] OK"
+echo "Backend: http://127.0.0.1:3000"
+echo "Frontend: https://fireinners.online/wolverine"
+echo "=== TERMINÉ ==="
 
 
+
+
+
+
+bash /root/TRADERONE_ALL_IN_ONE.sh
 
 
