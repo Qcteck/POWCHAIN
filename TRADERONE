@@ -1,106 +1,105 @@
-cat >/root/FIX_WOLVERINE_SOL_USDC.sh <<'BASH'
+cat >/root/FIX_WOLVERINE_WALLET_ALL.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-HTML="/var/www/wolverine/index.html"
+### CONFIG
+ROOT_DIR="/var/www/wolverine"
+HTML="$ROOT_DIR/index.html"
+VENDOR="$ROOT_DIR/vendor"
 RPC="https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac"
 USDC_MINT="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1"
+TS="$(date +%Y%m%d_%H%M%S)"
 
-echo "== Backup =="
-cp "$HTML" "$HTML.bak_$(date +%s)" 2>/dev/null || true
+echo "== WOLVERINE WALLET FIX START =="
 
-echo "== Writing clean Phantom-only HTML =="
+### 1) DOSSIERS
+mkdir -p "$ROOT_DIR" "$VENDOR"
 
-cat >"$HTML"<<HTML
+### 2) BACKUP HTML
+if [ -f "$HTML" ]; then
+  cp "$HTML" "$HTML.bak_$TS"
+  echo "Backup HTML -> $HTML.bak_$TS"
+fi
+
+### 3) LIB SOLANA LOCAL
+if [ ! -s "$VENDOR/solana-web3.min.js" ]; then
+  echo "Downloading solana-web3.js (local)"
+  curl -L https://unpkg.com/@solana/web3.js@1.95.3/lib/index.iife.min.js \
+    -o "$VENDOR/solana-web3.min.js"
+fi
+
+### 4) WRITE HTML PROPRE (PHANTOM + SOL + USDC)
+cat >"$HTML" <<HTML
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <title>WOLVERINE Wallet</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<script src="/wolverine/vendor/solana-web3.min.js"></script>
 <style>
-body{background:#050b10;color:#4ff;font-family:Arial}
-#box{width:420px;margin:120px auto;border:2px solid #4ff;padding:20px}
-button{width:100%;padding:12px;margin:6px 0;background:#081820;color:#4ff;border:1px solid #4ff;font-size:16px;cursor:pointer}
-.addr{word-break:break-all;margin:10px 0}
-.row{margin:6px 0}
+body{margin:0;background:#050b12;color:#00eaff;font-family:monospace}
+#box{width:420px;margin:120px auto;padding:20px;border:2px solid #00eaff}
+button{width:100%;margin:6px 0;padding:10px;background:#050b12;color:#00eaff;border:1px solid #00eaff;cursor:pointer}
+.addr{word-break:break-all;margin-top:10px}
+.row{margin-top:6px}
 </style>
 </head>
 <body>
-
 <div id="box">
-  <button onclick="connect()">Connect Wallet</button>
-  <button onclick="refresh()">Refresh</button>
-  <div class="addr" id="addr">-</div>
-  <div class="row">SOL: <span id="sol">-</span></div>
-  <div class="row">USDC: <span id="usdc">-</span></div>
+<button onclick="connect()">Connect Wallet</button>
+<button onclick="refresh()">Refresh</button>
+<div class="addr" id="addr">—</div>
+<div class="row">SOL: <span id="sol">—</span></div>
+<div class="row">USDC: <span id="usdc">—</span></div>
 </div>
 
 <script>
 const RPC = "$RPC";
 const USDC_MINT = "$USDC_MINT";
-let PUB = null;
-
-async function rpc(method, params){
-  const r = await fetch(RPC,{
-    method:"POST",
-    headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({jsonrpc:"2.0",id:1,method,params})
-  });
-  return (await r.json()).result;
-}
+let pub = null;
+const conn = new solanaWeb3.Connection(RPC,"confirmed");
 
 async function connect(){
-  if(!window.solana || !window.solana.isPhantom){
-    alert("Phantom not found");
-    return;
-  }
+  if(!window.solana || !window.solana.isPhantom){alert("Phantom not found");return;}
   const r = await window.solana.connect();
-  PUB = r.publicKey.toString();
-  document.getElementById("addr").textContent = PUB;
+  pub = r.publicKey;
+  document.getElementById("addr").textContent = pub.toBase58();
   await refresh();
 }
 
 async function refresh(){
-  if(!PUB) return;
+  if(!pub) return;
+  const lamports = await conn.getBalance(pub);
+  document.getElementById("sol").textContent = (lamports/1e9).toFixed(6);
 
-  const lamports = await rpc("getBalance",[PUB]);
-  document.getElementById("sol").textContent = (lamports.value/1e9).toFixed(4);
-
-  const tokens = await rpc("getParsedTokenAccountsByOwner",[
-    PUB,
-    {mint:USDC_MINT},
-    {encoding:"jsonParsed"}
-  ]);
-
-  let usdc = 0;
-  tokens.value.forEach(a=>{
-    usdc += a.account.data.parsed.info.tokenAmount.uiAmount || 0;
-  });
-  document.getElementById("usdc").textContent = usdc.toFixed(2);
+  const accts = await conn.getParsedTokenAccountsByOwner(pub,{mint:new solanaWeb3.PublicKey(USDC_MINT)});
+  let total = 0;
+  accts.value.forEach(a=>{ total += a.account.data.parsed.info.tokenAmount.uiAmount || 0; });
+  document.getElementById("usdc").textContent = total.toFixed(2);
 }
 </script>
-
 </body>
 </html>
 HTML
 
-chown www-data:www-data "$HTML"
+### 5) PERMISSIONS
+chown -R www-data:www-data "$ROOT_DIR" || true
+chmod 755 "$ROOT_DIR"
 chmod 644 "$HTML"
 
-echo "==============================="
-echo "✅ WOLVERINE FIXED"
-echo "• Phantom only"
-echo "• SOL + USDC OK"
-echo "• RPC DRPC OK"
-echo "==============================="
-echo "CTRL+SHIFT+R dans le navigateur"
+### 6) NGINX RELOAD SAFE
+nginx -t && systemctl reload nginx
+
+echo "== DONE =="
+echo "URL: https://fireinners.online/wolverine/"
+echo "CTRL+SHIFT+R in browser"
 BASH
 
-chmod +x /root/FIX_WOLVERINE_SOL_USDC.sh
-/root/FIX_WOLVERINE_SOL_USDC.sh
+chmod +x /root/FIX_WOLVERINE_WALLET_ALL.sh
 
 
 
 
-
+/root/FIX_WOLVERINE_WALLET_ALL.sh
 
