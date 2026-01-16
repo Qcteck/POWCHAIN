@@ -1,56 +1,94 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "=== WOLVERINE FORCE PROXY FIX ==="
+echo "=== WOLVERINE MEGA FIX BACKEND ==="
 
-# 1. Trouver le bon vhost
-VHOST=$(grep -R "wolverine" /etc/nginx/sites-enabled -l | head -n1)
-
-if [ -z "$VHOST" ]; then
-  echo "❌ Aucun vhost wolverine trouvé"
-  exit 1
+# 1. Vérif Node
+if ! command -v node >/dev/null; then
+  curl -fsSL https://deb.nodesource.com/setup_20.x | bash
+  apt-get install -y nodejs
 fi
 
-echo "✅ VHOST trouvé: $VHOST"
+# 2. Dossiers
+mkdir -p /opt/wolverine-api
+cd /opt/wolverine-api
 
-BACKUP="${VHOST}.bak_$(date +%Y%m%d_%H%M%S)"
-cp -a "$VHOST" "$BACKUP"
+# 3. Backend Node.js
+cat > server.js <<'JS'
+import express from "express";
+import cors from "cors";
+import { Connection, PublicKey } from "@solana/web3.js";
 
-# 2. Injecter proxy si absent
-if grep -q "location /wolverine/api/" "$VHOST"; then
-  echo "⚠️ Proxy déjà présent"
-else
-  echo "➕ Injection proxy API"
-  sed -i '/location \/wolverine\/ {/a \
-    location /wolverine/api/ {\
-        proxy_pass http://127.0.0.1:3000/;\
-        proxy_http_version 1.1;\
-        proxy_set_header Upgrade $http_upgrade;\
-        proxy_set_header Connection "upgrade";\
-        proxy_set_header Host $host;\
-        proxy_set_header X-Real-IP $remote_addr;\
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\
-        proxy_set_header X-Forwarded-Proto $scheme;\
-    }\
-' "$VHOST"
+const app = express();
+app.use(cors());
+
+const RPC = "https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac";
+const conn = new Connection(RPC, "confirmed");
+
+app.get("/wolverine/api/balance/:pubkey", async (req, res) => {
+  try {
+    const pub = new PublicKey(req.params.pubkey);
+    const lamports = await conn.getBalance(pub);
+    res.json({ sol: lamports / 1e9 });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.listen(3000, () => console.log("WOLVERINE API ON :3000"));
+JS
+
+# 4. Dépendances
+cat > package.json <<'JSON'
+{
+  "type": "module",
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "@solana/web3.js": "^1.98.0"
+  }
+}
+JSON
+
+npm install
+
+# 5. Service systemd
+cat > /etc/systemd/system/wolverine-api.service <<'SERVICE'
+[Unit]
+Description=Wolverine API
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/node /opt/wolverine-api/server.js
+Restart=always
+User=root
+WorkingDirectory=/opt/wolverine-api
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+
+systemctl daemon-reload
+systemctl enable wolverine-api
+systemctl restart wolverine-api
+
+# 6. NGINX HTTPS proxy
+NGINX="/etc/nginx/sites-available/fireinners.online-ssl"
+
+if ! grep -q wolverine/api "$NGINX"; then
+sed -i '/location \/ws {/i \
+location /wolverine/api/ {\
+ proxy_pass http://127.0.0.1:3000;\
+ proxy_http_version 1.1;\
+ proxy_set_header Host $host;\
+ proxy_set_header X-Real-IP $remote_addr;\
+}' "$NGINX"
 fi
 
-# 3. Test NGINX
-nginx -t
-systemctl reload nginx
+nginx -t && systemctl reload nginx
 
-# 4. Vérifier Node
-echo "=== NODE CHECK ==="
-if ! ss -lntp | grep -q ":3000"; then
-  echo "❌ Node.js n'écoute PAS sur 3000"
-  echo "➡️ Lancer le backend TraderOne"
-else
-  echo "✅ Node.js actif sur 3000"
-fi
+# 7. TEST FINAL
+echo "=== TEST API ==="
+curl -s https://fireinners.online/wolverine/api/balance/11111111111111111111111111111111 || true
 
-# 5. Test API directe
-echo "=== API TEST ==="
-curl -s http://127.0.0.1:3000/health || true
-
-echo "=== DONE ==="
-echo "➡️ Recharge la page: Ctrl+F5"
+echo "=== OK : WOLVERINE BACKEND OPERATIONNEL ==="
