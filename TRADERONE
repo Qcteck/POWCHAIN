@@ -1,114 +1,74 @@
+cat >/root/WOLVERINE_FIX_USDC_TOKEN2022.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-### === WOLVERINE RESET COMPLET + JS PROPRE (SOL + USDC) ===
-### Exécutable depuis root, une seule commande
-
-TS="$(date +%Y%m%d_%H%M%S)"
 HTML="/var/www/wolverine/index.html"
-VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
-RPC="https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac"
-USDC_MINT="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1"
-LOG="/root/WOLVERINE_RESET_${TS}.log"
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP="${HTML}.bak_usdc2022_${TS}"
 
-echo "=== WOLVERINE RESET ${TS} ===" | tee "$LOG"
+echo "=== WOLVERINE FIX USDC TOKEN-2022 ==="
 
-### 1) Sauvegardes blindées
-test -f "$HTML" || { echo "ERREUR: index.html absent"; exit 1; }
-cp -a "$HTML" "${HTML}.bak_${TS}"
-cp -a "$VHOST" "${VHOST}.bak_${TS}"
-echo "[OK] Backups HTML + vhost" | tee -a "$LOG"
+# 1) Vérification fichier servi
+if [ ! -f "$HTML" ]; then
+  echo "ERREUR: index.html absent"
+  exit 1
+fi
 
-### 2) Forcer nginx à servir LE bon root
-sed -i -E 's|root[[:space:]]+[^;]+;|root /var/www/wolverine;|g' "$VHOST"
-grep -n "root /var/www/wolverine;" "$VHOST" >/dev/null || { echo "ERREUR root nginx"; exit 1; }
-echo "[OK] root nginx forcé" | tee -a "$LOG"
+cp -a "$HTML" "$BACKUP"
+echo "Backup: $BACKUP"
 
-### 3) Remplacement TOTAL du HTML par une version saine
-cat > "$HTML" <<'HTML'
-<!DOCTYPE html>
-<html lang="fr">
-<head>
-<meta charset="utf-8"/>
-<title>WOLVERINE — Wallet</title>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
-<script src="/wolverine/vendor/solana-web3.js"></script>
-<style>
-body{background:#0b0f14;color:#9ff;font-family:monospace}
-.box{width:420px;margin:60px auto;border:2px solid #2ff;padding:20px}
-.btn{width:100%;padding:10px;margin:6px 0;background:#000;border:1px solid #2ff;color:#2ff;cursor:pointer}
-</style>
-</head>
-<body>
+# 2) Suppression anciennes injections USDC
+sed -i \
+  -e '/USDC TOKEN 2022 START/,/USDC TOKEN 2022 END/d' \
+  -e '/getParsedTokenAccountsByOwner.*USDC/d' \
+  "$HTML"
 
-<div class="box">
-  <button id="btnConnect" class="btn">Connect Wallet</button>
-  <button id="btnRefresh" class="btn">Refresh</button>
-  <div>Address: <span id="addr">-</span></div>
-  <div>SOL: <span id="sol">-</span></div>
-  <div>USDC: <span id="usdc">-</span></div>
-</div>
+# 3) Injection JS PROPRE (Token-2022 uniquement)
+sed -i "/<\/body>/i \
+<!-- USDC TOKEN 2022 START -->\
+<script type=\"module\">\
+import { Connection, PublicKey } from \"\/wolverine\/vendor\/solana-web3.js\";\
+import { TOKEN_2022_PROGRAM_ID } from \"\/wolverine\/vendor\/spl-token-2022.js\";\
+\
+const RPC = \"https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac\";\
+const USDC_MINT_2022 = \"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1\";\
+\
+async function readUSDC2022(pubkeyStr){\
+  const conn = new Connection(RPC,\"confirmed\");\
+  const owner = new PublicKey(pubkeyStr);\
+  const mint = new PublicKey(USDC_MINT_2022);\
+\
+  const accts = await conn.getParsedTokenAccountsByOwner(owner,{\
+    mint,\
+    programId: TOKEN_2022_PROGRAM_ID\
+  });\
+\
+  let total = 0;\
+  for(const a of accts.value){\
+    total += Number(a.account.data.parsed.info.tokenAmount.uiAmount || 0);\
+  }\
+\
+  const el = document.getElementById(\"usdc\");\
+  if(el) el.textContent = total.toFixed(6);\
+}\
+\
+window.readUSDC2022 = readUSDC2022;\
+</script>\
+<!-- USDC TOKEN 2022 END -->" "$HTML"
 
-<script>
-(() => {
-  const RPC = "__RPC__";
-  const USDC_MINT = "__USDC__";
-  let pubkey = null;
+# 4) Vérification injection
+grep -q "USDC TOKEN 2022 START" "$HTML" || {
+  echo "ERREUR: injection USDC 2022 absente"
+  exit 1
+}
 
-  const conn = new solanaWeb3.Connection(RPC, "confirmed");
-
-  async function connect() {
-    if (!window.solana || !window.solana.isPhantom) {
-      alert("Phantom non détecté");
-      return;
-    }
-    const res = await window.solana.connect();
-    pubkey = res.publicKey.toString();
-    document.getElementById("addr").innerText = pubkey;
-    await refresh();
-  }
-
-  async function refresh() {
-    if (!pubkey) return;
-    const lamports = await conn.getBalance(new solanaWeb3.PublicKey(pubkey));
-    document.getElementById("sol").innerText = (lamports / 1e9).toFixed(6);
-
-    let usdc = 0;
-    const accts = await conn.getParsedTokenAccountsByOwner(
-      new solanaWeb3.PublicKey(pubkey),
-      { mint: new solanaWeb3.PublicKey(USDC_MINT) }
-    );
-    accts.value.forEach(v => {
-      usdc += v.account.data.parsed.info.tokenAmount.uiAmount || 0;
-    });
-    document.getElementById("usdc").innerText = usdc.toFixed(6);
-  }
-
-  document.getElementById("btnConnect").onclick = connect;
-  document.getElementById("btnRefresh").onclick = refresh;
-})();
-</script>
-
-</body>
-</html>
-HTML
-
-sed -i "s|__RPC__|$RPC|g" "$HTML"
-sed -i "s|__USDC__|$USDC_MINT|g" "$HTML"
-echo "[OK] HTML remplacé par version saine" | tee -a "$LOG"
-
-### 4) Permissions
-chown www-data:www-data "$HTML"
-chmod 644 "$HTML"
-
-### 5) Purge cache + reload nginx
+# 5) Cache clean
 rm -rf /var/cache/nginx/* || true
-nginx -t
-systemctl reload nginx
-echo "[OK] nginx reload" | tee -a "$LOG"
 
-### 6) Test HTTP local
-curl -s -I http://127.0.0.1/wolverine/ | head -n 1 | tee -a "$LOG"
+echo "OK — USDC Token-2022 injecté"
+echo "ACTION NAVIGATEUR: CTRL + SHIFT + R"
+echo "=== FIN ==="
+BASH
 
-echo "=== FIN ===" | tee -a "$LOG"
-echo "ACTION: CTRL+SHIFT+R sur https://fireinners.online/wolverine"
+chmod +x /root/WOLVERINE_FIX_USDC_TOKEN2022.sh
+/root/WOLVERINE_FIX_USDC_TOKEN2022.sh
