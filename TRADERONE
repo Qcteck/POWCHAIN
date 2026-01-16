@@ -1,111 +1,193 @@
-bash <<'EOF'
-set -e
-echo "=== WOLVERINE / TRADERONE FULL FIX ==="
-
-### PATHS
-WEB="/var/www/wolverine"
-HTML="$WEB/index.html"
-VENDOR="$WEB/vendor"
-API="/opt/traderone-api"
-PORT=3010
-
-### BACKUP
-cp -f "$HTML" "$HTML.bak.$(date +%s)"
-
-### FRONTEND FIX
-mkdir -p "$VENDOR"
-
-### SOLANA WEB3 LOCAL
-if [ ! -f "$VENDOR/solana-web3.min.js" ]; then
-  curl -sL https://unpkg.com/@solana/web3.js@1.95.4/lib/index.iife.min.js -o "$VENDOR/solana-web3.min.js"
-fi
-
-### REWRITE index.html
-cat > "$HTML" <<'HTML'
-<!DOCTYPE html><html><head><meta charset="utf-8">
-<title>Wolverine – TraderOne</title>
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<title>IA Agentive Autonome – Garde-fous</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
-body{margin:0;background:#0a1a3a;color:#fff;font-family:Arial}
-.panel{background:#143c8a;margin:10px;padding:15px;border-radius:8px}
-button{background:#f1c40f;border:0;padding:10px 15px;margin:5px;font-weight:bold;cursor:pointer}
-input{padding:8px;width:120px}
+body{margin:0;font-family:Arial,Helvetica,sans-serif;background:#0b0f14;color:#e6e6e6}
+#app{max-width:900px;margin:20px auto;padding:20px;border:1px solid #222;border-radius:8px;background:#111723}
+h1,h2{margin:0 0 10px 0}
+h1{font-size:22px}
+h2{font-size:16px;color:#8ab4ff}
+.section{margin-bottom:20px;padding:10px;border:1px solid #1f2a44;border-radius:6px}
+label{display:block;margin-top:8px;font-size:13px;color:#b0b8c5}
+input,select,textarea,button{width:100%;margin-top:4px;padding:8px;border-radius:4px;border:1px solid #333;background:#0b0f14;color:#e6e6e6}
+button{cursor:pointer;background:#1f3b77;border-color:#1f3b77}
+button:hover{background:#2a4f9d}
+.row{display:flex;gap:10px}
+.row>div{flex:1}
+.log{height:200px;overflow:auto;background:#05080d;border:1px solid #222;padding:8px;font-family:monospace;font-size:12px}
+.status{display:flex;gap:10px;font-size:13px}
+.badge{padding:4px 8px;border-radius:4px;background:#222}
+.RUNNING{background:#1b5e20}
+.PAUSED{background:#6a1b9a}
+.BLOCKED{background:#b71c1c}
+.DONE{background:#1565c0}
 </style>
 </head>
 <body>
+<div id="app">
+<h1>IA Agentive Autonome – Version Garde-fous</h1>
 
-<div class="panel">
-<h2>TraderOne Control</h2>
-<button onclick="startBot()">START</button>
-<button onclick="pauseBot()">PAUSE</button>
-<button onclick="stopBot()">STOP</button>
+<div class="section">
+<h2>Objectif</h2>
+<label>Objectif actif</label>
+<input id="goalInput" placeholder="Décrire l’objectif principal">
+<button onclick="setGoal()">Définir l’objectif</button>
 </div>
 
-<div class="panel">
-<button onclick="connectPhantom()">Connect Phantom (REAL)</button>
-<div>Address: <span id="addr">-</span></div>
-<div>SOL: <span id="sol">-</span></div>
+<div class="section">
+<h2>Contrôle Autonomie</h2>
+<div class="row">
+<div>
+<label>Niveau d’autonomie</label>
+<select id="autonomy">
+<option value="LOCKED">LOCKED</option>
+<option value="LIMITED">LIMITED</option>
+<option value="FULL">FULL</option>
+</select>
+</div>
+<div>
+<label>Seuil risque max</label>
+<input id="riskLimit" type="number" value="60">
+</div>
+<div>
+<label>Confiance minimale</label>
+<input id="confidenceMin" type="number" value="50">
+</div>
+</div>
+<button onclick="startAgent()">Démarrer l’agent</button>
+<button onclick="pauseAgent()">Pause</button>
 </div>
 
-<div class="panel">
-<h3>Budget USDC</h3>
-<input id="budget" type="number" value="50">
-<button onclick="deposit()">DEPOSIT</button>
+<div class="section">
+<h2>État</h2>
+<div class="status">
+<div class="badge" id="statusBadge">PAUSED</div>
+<div class="badge">Risque: <span id="risk">0</span></div>
+<div class="badge">Confiance: <span id="confidence">0</span></div>
+<div class="badge">Itération: <span id="iteration">0</span></div>
+</div>
 </div>
 
-<script src="/wolverine/vendor/solana-web3.min.js"></script>
+<div class="section">
+<h2>Journal</h2>
+<div class="log" id="log"></div>
+</div>
+</div>
+
 <script>
-let provider=null, pubkey=null;
+const STATE={
+  goal_active:null,
+  goal_stack:[],
+  context:"",
+  memory_short:[],
+  memory_long:[],
+  confidence_score:0,
+  risk_score:0,
+  autonomy_level:"LOCKED",
+  last_action:null,
+  iteration:0,
+  status:"PAUSED"
+};
 
-async function connectPhantom(){
- if(!window.solana){alert("Phantom not found");return;}
- provider=window.solana;
- const r=await provider.connect();
- pubkey=r.publicKey.toString();
- document.getElementById("addr").textContent=pubkey;
- loadBalance();
+let loop=null;
+
+function log(msg){
+  const el=document.getElementById("log");
+  el.innerHTML+=`[${new Date().toLocaleTimeString()}] ${msg}<br>`;
+  el.scrollTop=el.scrollHeight;
 }
 
-async function loadBalance(){
- const c=new solanaWeb3.Connection(solanaWeb3.clusterApiUrl("mainnet-beta"));
- const lamports=await c.getBalance(new solanaWeb3.PublicKey(pubkey));
- document.getElementById("sol").textContent=(lamports/1e9).toFixed(4);
+function updateUI(){
+  document.getElementById("statusBadge").textContent=STATE.status;
+  document.getElementById("statusBadge").className="badge "+STATE.status;
+  document.getElementById("risk").textContent=STATE.risk_score;
+  document.getElementById("confidence").textContent=STATE.confidence_score;
+  document.getElementById("iteration").textContent=STATE.iteration;
 }
 
-function startBot(){
- fetch("/wolverine/traderone/api/start",{method:"POST",headers:{"Content-Type":"application/json"},
- body:JSON.stringify({pub:pubkey,budget:+document.getElementById("budget").value})});
- alert("TraderOne STARTED");
+function setGoal(){
+  const g=document.getElementById("goalInput").value.trim();
+  if(!g)return;
+  if(STATE.goal_active){
+    STATE.goal_stack.push(g);
+    log("Nouvel objectif empilé");
+  }else{
+    STATE.goal_active=g;
+    log("Objectif actif défini");
+  }
 }
-function pauseBot(){alert("PAUSE")}
-function stopBot(){alert("STOP")}
-function deposit(){alert("Budget ready")}
+
+function PERCEIVE(){
+  return {goal:STATE.goal_active};
+}
+
+function THINK(p){
+  STATE.confidence_score=Math.min(100,STATE.confidence_score+5);
+  return {action:"micro_step"};
+}
+
+function RISK_EVAL(){
+  STATE.risk_score=Math.floor(Math.random()*100);
+  return STATE.risk_score;
+}
+
+function PLAN(){
+  return "ACTION_ATOMIQUE";
+}
+
+function ACT(action){
+  if(STATE.autonomy_level==="FULL"){
+    log("Action exécutée: "+action);
+    return true;
+  }else{
+    log("Action simulée: "+action);
+    return false;
+  }
+}
+
+function EVALUATE(){
+  if(STATE.risk_score>document.getElementById("riskLimit").value){
+    STATE.status="BLOCKED";
+    log("Blocage: risque excessif");
+  }
+  if(STATE.confidence_score<document.getElementById("confidenceMin").value){
+    STATE.status="PAUSED";
+    log("Pause: confiance insuffisante");
+  }
+}
+
+function agentLoop(){
+  if(STATE.status!=="RUNNING")return;
+  STATE.iteration++;
+  const p=PERCEIVE();
+  const d=THINK(p);
+  const r=RISK_EVAL(d);
+  const a=PLAN(d);
+  ACT(a);
+  EVALUATE();
+  updateUI();
+  if(STATE.status==="RUNNING")loop=setTimeout(agentLoop,1000);
+}
+
+function startAgent(){
+  STATE.autonomy_level=document.getElementById("autonomy").value;
+  STATE.status="RUNNING";
+  log("Agent démarré");
+  updateUI();
+  agentLoop();
+}
+
+function pauseAgent(){
+  STATE.status="PAUSED";
+  clearTimeout(loop);
+  log("Agent en pause");
+  updateUI();
+}
+
+updateUI();
 </script>
-</body></html>
-HTML
-
-### BACKEND SIMPLE (SOL BALANCE OK)
-mkdir -p "$API"
-cat > "$API/server.js" <<'JS'
-const express=require("express");
-const {Connection,PublicKey}=require("@solana/web3.js");
-const app=express();app.use(express.json());
-const c=new Connection("https://api.mainnet-beta.solana.com");
-app.post("/start",(req,res)=>res.json({ok:true}));
-app.get("/balances/:pub",async(req,res)=>{
- const lamports=await c.getBalance(new PublicKey(req.params.pub));
- res.json({sol:lamports/1e9});
-});
-app.listen(3010,()=>console.log("TraderOne API 3010"));
-JS
-
-cd "$API"
-npm init -y >/dev/null
-npm install express @solana/web3.js >/dev/null
-
-pkill -f server.js || true
-node server.js >/dev/null 2>&1 &
-
-systemctl reload nginx
-
-echo "=== DONE – REFRESH https://fireinners.online/wolverine ==="
-EOF
+</body>
+</html>
