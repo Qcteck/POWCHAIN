@@ -1,131 +1,74 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -e
 
-echo "=== WOLVERINE SOL FIX — START ==="
+echo "=== WOLVERINE SOL BALANCE FIX (ROOT BATCH) ==="
 
-### VARIABLES
-RPC="https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac"
-APPDIR="/opt/wolverine-balance"
-WEBDIR="/var/www/wolverine"
-PORT=3010
+### 1️⃣ BACKEND BALANCES
+mkdir -p /opt/wolverine-balances
+cd /opt/wolverine-balances
 
-### CLEAN
-pkill -f wolverine-balance || true
-rm -rf "$APPDIR"
-mkdir -p "$APPDIR"
-
-### BACKEND
-cd "$APPDIR"
 cat > server.js <<'JS'
 import express from "express";
-import fetch from "node-fetch";
+import { Connection, PublicKey } from "@solana/web3.js";
 
-const RPC = process.env.RPC;
 const app = express();
+const RPC = "https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac";
+const conn = new Connection(RPC, "confirmed");
 
-app.get("/balance/:pub", async (req, res) => {
+app.get("/balances/:pub", async (req, res) => {
   try {
-    const pub = req.params.pub;
-    const r = await fetch(RPC, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        jsonrpc: "2.0",
-        id: 1,
-        method: "getBalance",
-        params: [pub]
-      })
-    });
-    const j = await r.json();
-    const lamports = j.result?.value ?? 0;
+    const pub = new PublicKey(req.params.pub);
+    const lamports = await conn.getBalance(pub);
     res.json({ sol: lamports / 1e9 });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(400).json({ error: e.message });
   }
 });
 
-app.listen(3010, () => console.log("BALANCE API ON 3010"));
+app.listen(3010, () => console.log("BALANCES API ON 3010"));
 JS
 
 cat > package.json <<'JSON'
-{
-  "type": "module",
-  "dependencies": {
-    "express": "^4.19.2",
-    "node-fetch": "^3.3.2"
-  }
-}
+{ "type":"module","dependencies":{"express":"^4","@solana/web3.js":"^1.95.0"} }
 JSON
 
 npm install --silent
-RPC="$RPC" node server.js > balance.log 2>&1 &
+pkill -f server.js || true
+nohup node server.js >/opt/wolverine-balances/balances.log 2>&1 &
 
-sleep 2
+sleep 1
+ss -lnt | grep 3010 && echo "✔ Backend balances UP"
 
-### FRONTEND
-mkdir -p "$WEBDIR"
-cat > "$WEBDIR/index.html" <<'HTML'
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>Wolverine — TraderOne</title>
-<style>
-body{margin:0;background:#0b1e3c;color:#fff;font-family:Arial}
-.panel{background:#1140aa;margin:20px;padding:20px;border-radius:8px}
-button{background:#f5c400;border:0;padding:10px 20px;font-weight:bold;cursor:pointer}
-input{padding:8px}
-</style>
-</head>
-<body>
+---
 
-<div class="panel">
-<h2>TraderOne Control</h2>
-<button onclick="start()">START</button>
-<button onclick="pause()">PAUSE</button>
-<button onclick="stop()">STOP</button>
-</div>
+### 2️⃣ NGINX PROXY
+NGINX_CONF="/etc/nginx/sites-available/fireinners.online-ssl"
 
-<div class="panel">
-<button onclick="connect()">Connect Phantom</button>
-<div>Address: <span id="addr">-</span></div>
-<div>SOL: <span id="sol">-</span></div>
-</div>
+grep -q "wolverine/api/balances" "$NGINX_CONF" || sed -i '/location \/wolverine {/a \
+    location /wolverine/api/balances/ {\
+        proxy_pass http://127.0.0.1:3010/balances/;\
+        proxy_set_header Host $host;\
+        proxy_set_header X-Real-IP $remote_addr;\
+    }\
+' "$NGINX_CONF"
 
-<div class="panel">
-<h3>Budget (local)</h3>
-<input id="budget" value="1">
-<button onclick="saveBudget()">SAVE</button>
-</div>
+nginx -t
+systemctl reload nginx
 
-<script>
-let pubkey = null;
+echo "✔ NGINX proxy OK"
 
-async function connect(){
-  const r = await window.solana.connect();
-  pubkey = r.publicKey.toString();
-  document.getElementById("addr").innerText = pubkey;
-  loadSOL();
-}
+---
 
-async function loadSOL(){
-  const r = await fetch("http://127.0.0.1:3010/balance/"+pubkey);
-  const j = await r.json();
-  document.getElementById("sol").innerText = j.sol.toFixed(4);
-}
+### 3️⃣ FRONTEND FIX
+HTML="/var/www/wolverine/index.html"
 
-function saveBudget(){
-  localStorage.setItem("budget",document.getElementById("budget").value);
-}
+sed -i 's|http://127.0.0.1:3010/balances|/wolverine/api/balances|g' "$HTML"
 
-function start(){alert("START")}
-function pause(){alert("PAUSE")}
-function stop(){alert("STOP")}
-</script>
+echo "✔ Frontend endpoint fixed"
 
-</body>
-</html>
-HTML
+---
 
-echo "=== WOLVERINE SOL FIX — DONE ==="
-echo "OPEN: https://fireinners.online/wolverine/index.html"
+echo "=== DONE ==="
+echo "➡ Recharge la page /wolverine"
+echo "➡ Clique Connect Phantom"
+echo "➡ SOL S’AFFICHE"
