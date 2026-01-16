@@ -1,94 +1,145 @@
+cat >/root/WOLVERINE_ALL_IN_ONE.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "=== WOLVERINE MEGA FIX BACKEND ==="
+### PATHS
+BASE="/opt/wolverine"
+FRONT="/var/www/wolverine"
+API="$BASE/api"
+DATA="$BASE/data"
+KEY="$BASE/master.key"
 
-# 1. Vérif Node
+### INSTALL
+mkdir -p "$API" "$DATA" "$FRONT"
+cd "$BASE"
+
+### NODE
 if ! command -v node >/dev/null; then
-  curl -fsSL https://deb.nodesource.com/setup_20.x | bash
-  apt-get install -y nodejs
+  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+  apt install -y nodejs
 fi
 
-# 2. Dossiers
-mkdir -p /opt/wolverine-api
-cd /opt/wolverine-api
+npm init -y >/dev/null
+npm install express cors body-parser crypto-js @solana/web3.js bs58 >/dev/null
 
-# 3. Backend Node.js
-cat > server.js <<'JS'
-import express from "express";
-import cors from "cors";
-import { Connection, PublicKey } from "@solana/web3.js";
+### MASTER KEY (AES)
+if [ ! -f "$KEY" ]; then
+  openssl rand -hex 32 >"$KEY"
+fi
 
-const app = express();
-app.use(cors());
+####################################
+# BACKEND API
+####################################
+cat >"$API/server.js"<<'JS'
+const fs=require("fs"),express=require("express"),cors=require("cors"),body=require("body-parser");
+const CryptoJS=require("crypto-js");
+const {Keypair,Connection,PublicKey}=require("@solana/web3.js");
 
-const RPC = "https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac";
-const conn = new Connection(RPC, "confirmed");
+const app=express();
+app.use(cors());app.use(body.json());
 
-app.get("/wolverine/api/balance/:pubkey", async (req, res) => {
-  try {
-    const pub = new PublicKey(req.params.pubkey);
-    const lamports = await conn.getBalance(pub);
-    res.json({ sol: lamports / 1e9 });
-  } catch (e) {
-    res.status(400).json({ error: e.message });
-  }
+const MASTER=fs.readFileSync("/opt/wolverine/master.key","utf8").trim();
+const DATA="/opt/wolverine/data";
+const RPC="https://api.mainnet-beta.solana.com";
+const USDC="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1";
+const conn=new Connection(RPC);
+
+function enc(s){return CryptoJS.AES.encrypt(s,MASTER).toString()}
+function dec(s){return CryptoJS.AES.decrypt(s,MASTER).toString(CryptoJS.enc.Utf8)}
+
+app.post("/create-vault",(req,res)=>{
+  const kp=Keypair.generate();
+  const encPriv=enc(Buffer.from(kp.secretKey).toString("hex"));
+  fs.writeFileSync(`${DATA}/${kp.publicKey}.json`,JSON.stringify({encPriv,stop:false,trades:[]}));
+  res.json({vault:kp.publicKey.toString()});
 });
 
-app.listen(3000, () => console.log("WOLVERINE API ON :3000"));
+app.post("/stop",(req,res)=>{
+  const f=`${DATA}/${req.body.vault}.json`;
+  const j=JSON.parse(fs.readFileSync(f));
+  j.stop=true;fs.writeFileSync(f,JSON.stringify(j));
+  res.json({ok:true});
+});
+
+app.post("/withdraw",(req,res)=>{
+  res.json({status:"READY (hook trading engine here)"});
+});
+
+app.get("/balance/:pub",async(req,res)=>{
+  const pub=req.params.pub;
+  const sol=await conn.getBalance(new PublicKey(pub));
+  const tok=await conn.getParsedTokenAccountsByOwner(new PublicKey(pub),{mint:new PublicKey(USDC)});
+  let usdc=0;tok.value.forEach(v=>usdc+=Number(v.account.data.parsed.info.tokenAmount.uiAmount||0));
+  res.json({sol:sol/1e9,usdc});
+});
+
+app.listen(3000,()=>console.log("API 3000"));
 JS
 
-# 4. Dépendances
-cat > package.json <<'JSON'
-{
-  "type": "module",
-  "dependencies": {
-    "express": "^4.18.2",
-    "cors": "^2.8.5",
-    "@solana/web3.js": "^1.98.0"
-  }
+####################################
+# FRONTEND
+####################################
+cat >"$FRONT/index.html"<<'HTML'
+<!DOCTYPE html><html><head><meta charset="utf-8"/>
+<title>Wolverine TraderOne</title>
+<style>
+body{background:#0b0b0b;color:#0ff;font-family:Arial}
+#box{max-width:420px;margin:50px auto;border:1px solid #0ff;padding:20px}
+button{width:100%;padding:10px;margin-top:8px}
+#spin{display:none}
+</style></head>
+<body>
+<div id="box">
+<button onclick="connect()">Connect Wallet</button>
+<div id="spin">⏳ loading...</div>
+<div id="addr"></div>
+<button onclick="vault()">Créer mon vault trading</button>
+<div id="vault"></div>
+<div>SOL: <span id="sol">-</span></div>
+<div>USDC: <span id="usdc">-</span></div>
+<button onclick="stop()">STOP BOT</button>
+<button onclick="withdraw()">RETIRER TOUT</button>
+</div>
+
+<script>
+let wallet,vaultAddr;
+async function connect(){
+ if(!window.solana){alert("Install Phantom");return;}
+ document.getElementById("spin").style.display="block";
+ const r=await solana.connect();
+ wallet=r.publicKey.toString();
+ document.getElementById("addr").innerText=wallet;
+ document.getElementById("spin").style.display="none";
 }
-JSON
+async function vault(){
+ const r=await fetch("http://127.0.0.1:3000/create-vault",{method:"POST"});
+ const j=await r.json();
+ vaultAddr=j.vault;
+ document.getElementById("vault").innerText="Vault: "+vaultAddr;
+}
+async function refresh(){
+ if(!vaultAddr)return;
+ const r=await fetch("http://127.0.0.1:3000/balance/"+vaultAddr);
+ const j=await r.json();
+ sol.innerText=j.sol.toFixed(4);usdc.innerText=j.usdc.toFixed(2);
+}
+setInterval(refresh,5000);
+async function stop(){await fetch("http://127.0.0.1:3000/stop",{method:"POST",headers:{'Content-Type':'application/json'},body:JSON.stringify({vault:vaultAddr})});}
+async function withdraw(){await fetch("http://127.0.0.1:3000/withdraw",{method:"POST"});}
+</script>
+</body></html>
+HTML
 
-npm install
+####################################
+# START
+####################################
+node "$API/server.js" &
 
-# 5. Service systemd
-cat > /etc/systemd/system/wolverine-api.service <<'SERVICE'
-[Unit]
-Description=Wolverine API
-After=network.target
+echo "=============================="
+echo "WOLVERINE READY"
+echo "Frontend : https://fireinners.online/wolverine"
+echo "API      : 127.0.0.1:3000"
+echo "=============================="
+BASH
 
-[Service]
-ExecStart=/usr/bin/node /opt/wolverine-api/server.js
-Restart=always
-User=root
-WorkingDirectory=/opt/wolverine-api
-
-[Install]
-WantedBy=multi-user.target
-SERVICE
-
-systemctl daemon-reload
-systemctl enable wolverine-api
-systemctl restart wolverine-api
-
-# 6. NGINX HTTPS proxy
-NGINX="/etc/nginx/sites-available/fireinners.online-ssl"
-
-if ! grep -q wolverine/api "$NGINX"; then
-sed -i '/location \/ws {/i \
-location /wolverine/api/ {\
- proxy_pass http://127.0.0.1:3000;\
- proxy_http_version 1.1;\
- proxy_set_header Host $host;\
- proxy_set_header X-Real-IP $remote_addr;\
-}' "$NGINX"
-fi
-
-nginx -t && systemctl reload nginx
-
-# 7. TEST FINAL
-echo "=== TEST API ==="
-curl -s https://fireinners.online/wolverine/api/balance/11111111111111111111111111111111 || true
-
-echo "=== OK : WOLVERINE BACKEND OPERATIONNEL ==="
+chmod +x /root/WOLVERINE_ALL_IN_ONE.sh
