@@ -1,1 +1,77 @@
-/root/WOLVERINE_ADD_USDC_2022_SAFE.sh
+#!/usr/bin/env bash
+set -euo pipefail
+
+TS="$(date +%Y%m%d_%H%M%S)"
+HTML="/var/www/wolverine/index.html"
+NG="/etc/nginx/sites-available/fireinners.online-ssl"
+LOG="/root/WOLVERINE_FIX_USDC_TOKEN2022_${TS}.log"
+
+echo "=== WOLVERINE FIX USDC TOKEN-2022 ===" | tee "$LOG"
+
+### 1) Vérifications
+[ -f "$HTML" ] || { echo "ERREUR: index.html absent"; exit 1; }
+grep -q "/var/www/wolverine" "$NG" || { echo "ERREUR: mauvais root nginx"; exit 1; }
+
+### 2) Backups
+cp -a "$HTML" "$HTML.bak_$TS"
+cp -a "$NG" "$NG.bak_$TS"
+
+### 3) Nettoyage ancienne logique USDC
+sed -i '/refreshUSDC/d' "$HTML"
+sed -i '/USDC_MINT/d' "$HTML"
+sed -i '/TOKEN_2022_PROGRAM_ID/d' "$HTML"
+
+### 4) Injection USDC propre (LEGACY + TOKEN-2022)
+perl -0777 -i -pe 's|</script>|
+// === USDC TOKEN-2022 SAFE ===
+const USDC_MINT = new solanaWeb3.PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1");
+const TOKEN_2022_PROGRAM_ID = new solanaWeb3.PublicKey("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
+
+async function refreshUSDC(){
+  if(!window.connection||!window.pubkey)return;
+  let total=0;
+  try{
+    const a=await connection.getParsedTokenAccountsByOwner(pubkey,{mint:USDC_MINT});
+    if(a.value.length){
+      total+=Number(a.value[0].account.data.parsed.info.tokenAmount.uiAmount||0);
+    }
+  }catch(e){}
+  try{
+    const b=await connection.getParsedTokenAccountsByOwner(
+      pubkey,
+      {mint:USDC_MINT,programId:TOKEN_2022_PROGRAM_ID}
+    );
+    if(b.value.length){
+      total+=Number(b.value[0].account.data.parsed.info.tokenAmount.uiAmount||0);
+    }
+  }catch(e){}
+  document.getElementById("usdc").innerText=total.toFixed(2);
+}
+
+const __oldRefreshSOL=refreshSOL;
+refreshSOL=async()=>{
+  await __oldRefreshSOL();
+  await refreshUSDC();
+};
+// === END USDC ===
+</script>|s' "$HTML"
+
+### 5) Champ USDC si absent
+grep -q 'id="usdc"' "$HTML" || \
+sed -i 's|USDC:.*|USDC: <span id="usdc">0.00</span>|' "$HTML"
+
+### 6) RPC canonique
+sed -i 's|https://[^"]*solana[^"]*|https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac|g' "$HTML"
+
+### 7) Cache + nginx
+rm -rf /var/cache/nginx/* || true
+nginx -t
+systemctl reload nginx
+
+### 8) Test HTTP
+curl -s -I https://fireinners.online/wolverine | grep "200 OK" || {
+  echo "ERREUR HTTP"; exit 1;
+}
+
+echo "=== FIX TERMINÉ ===" | tee -a "$LOG"
+echo "ACTION: CTRL + SHIFT + R (obligatoire)"
