@@ -1,41 +1,35 @@
-cat >/root/FIX_AGENTIA_EADDRINUSE_SAFE.sh <<'BASH'
+cat >/root/DIAG_FIX_AGENTIA_9697.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 TS="$(date +%Y%m%d_%H%M%S)"
 
-# --- IMMUTABLE CHECKS (WOLVERINE / NGINX) ---
 WOLV_HTML="/var/www/wolverine/index.html"
 NGX_SITE="/etc/nginx/sites-available/fireinners.online-ssl"
 sha(){ [ -f "$1" ] && sha256sum "$1" | awk '{print $1}' || echo "MISSING"; }
 BEF_W="$(sha "$WOLV_HTML")"
 BEF_N="$(sha "$NGX_SITE")"
 
-# --- AGENTIA ---
-APP_DIR="/opt/agentia"
-JS="${APP_DIR}/server.js"
 SVC="agentia.service"
 PORT="9697"
 
 [ "$(id -u)" -eq 0 ] || { echo "ERROR: run as root"; exit 1; }
-[ -f "$JS" ] || { echo "ERROR: missing $JS"; exit 1; }
 
 echo "== BEFORE hashes =="
 echo "wolverine index: $BEF_W  $WOLV_HTML"
 echo "nginx vhost    : $BEF_N  $NGX_SITE"
 
-echo "== Stop service =="
-systemctl stop "$SVC" || true
+echo "== WHO LISTENS on :$PORT (before) =="
+ss -ltnp 2>/dev/null | grep ":$PORT" || true
 
-echo "== Kill anything holding :$PORT (if any) =="
-# Prefer ss, fallback lsof
-if command -v ss >/dev/null 2>&1; then
-  PIDS="$(ss -ltnp 2>/dev/null | awk -v p=":$PORT" '$4 ~ p {print $0}' | sed -n 's/.*pid=\([0-9]\+\).*/\1/p' | sort -u | tr '\n' ' ')"
-else
-  PIDS=""
-fi
-if [ -z "${PIDS:-}" ] && command -v lsof >/dev/null 2>&1; then
-  PIDS="$(lsof -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | sort -u | tr '\n' ' ')"
-fi
+echo "== Stop AgentIA =="
+systemctl stop "$SVC" || true
+sleep 1
+
+echo "== WHO LISTENS on :$PORT (after stop) =="
+ss -ltnp 2>/dev/null | grep ":$PORT" || true
+
+echo "== Kill anything holding :$PORT =="
+PIDS="$(ss -ltnp 2>/dev/null | awk -v p=":$PORT" '$4 ~ p {print $0}' | sed -n 's/.*pid=\([0-9]\+\).*/\1/p' | sort -u | tr '\n' ' ')"
 if [ -n "${PIDS:-}" ]; then
   echo "PIDS: $PIDS"
   kill $PIDS 2>/dev/null || true
@@ -43,39 +37,20 @@ if [ -n "${PIDS:-}" ]; then
   kill -9 $PIDS 2>/dev/null || true
 fi
 
-echo "== Kill leftover AgentIA node (if any) =="
+echo "== Kill leftover AgentIA node (path match) =="
 pkill -f "/opt/agentia/server\.js" 2>/dev/null || true
+sleep 1
 
-echo "== Enforce SINGLE listen in server.js =="
-cp -a "$JS" "${JS}.bak_${TS}"
+echo "== WHO LISTENS on :$PORT (after kill) =="
+ss -ltnp 2>/dev/null | grep ":$PORT" || true
 
-python3 - <<'PY'
-from pathlib import Path
-p=Path("/opt/agentia/server.js")
-lines=p.read_text(errors="ignore").splitlines()
-
-# Drop ALL app.listen lines to prevent double-binding
-kept=[]
-for ln in lines:
-    if "app.listen(" in ln:
-        continue
-    kept.append(ln)
-
-# Ensure exactly one listen at end (127.0.0.1 only)
-listen="app.listen(PORT,'127.0.0.1',()=>{log('info','server_start',{port:PORT,base:BASE});});"
-kept.append(listen)
-
-p.write_text("\n".join(kept)+ "\n")
-print("OK: single listen enforced")
-PY
-
-echo "== Start service =="
+echo "== Start AgentIA =="
 systemctl daemon-reload
 systemctl start "$SVC"
 sleep 1
 
-echo "== Status (top) =="
-systemctl --no-pager --full status "$SVC" | sed -n '1,30p' || true
+echo "== Status top =="
+systemctl --no-pager --full status "$SVC" | sed -n '1,28p' || true
 
 echo "== Local health =="
 curl -fsS "http://127.0.0.1:${PORT}/agentia/health" | head -c 500; echo
@@ -91,7 +66,7 @@ echo "nginx vhost    : $AFT_N  $NGX_SITE"
 [ "$BEF_W" = "$AFT_W" ] || { echo "ERROR: Wolverine index changed (should not)."; exit 1; }
 [ "$BEF_N" = "$AFT_N" ] || { echo "ERROR: Nginx vhost changed (should not)."; exit 1; }
 
-echo "OK: AgentIA fixed; Wolverine untouched."
+echo "OK: AgentIA up; Wolverine untouched."
 BASH
 
-bash /root/FIX_AGENTIA_EADDRINUSE_SAFE.sh
+bash /root/DIAG_FIX_AGENTIA_9697.sh
