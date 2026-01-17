@@ -1,68 +1,47 @@
 bash <<'BASH'
 set -euo pipefail
 
-### PARAMÈTRES
-APP_DIR="/opt/traderone"
-APP_FILE="$APP_DIR/server.js"
-PM2_NAME="traderone"
-API_PREFIX="/wolverine/traderone/api"
+APP="/opt/traderone/server.js"
 PORT=3000
-TS="$(date +%Y%m%d_%H%M%S)"
+API="/wolverine/traderone/api"
 
-echo "=== TraderOne API FIX | $TS ==="
+echo "=== FIX PM2 / NODE TRADERONE ==="
 
-# 1) Vérifs
-[ -d "$APP_DIR" ] || { echo "❌ Dossier $APP_DIR introuvable"; exit 1; }
-[ -f "$APP_FILE" ] || { echo "❌ $APP_FILE introuvable"; exit 1; }
+# 1) Lister PM2
+echo "== PM2 list =="
+pm2 list || true
 
-# 2) Backup
-cp -a "$APP_FILE" "$APP_FILE.bak_$TS"
-echo "✔ Backup créé: $APP_FILE.bak_$TS"
+# 2) Trouver process lié à traderone
+PM2_NAME="$(pm2 list | grep -i traderone | awk '{print $2}' | head -n1 || true)"
 
-# 3) Injection routes si absentes
-python3 - <<'PY'
-from pathlib import Path
-p=Path("/opt/traderone/server.js")
-s=p.read_text()
-
-marker="/* === AUTO ROUTES TRADERONE === */"
-if marker in s:
-    print("✔ Routes déjà présentes (skip)")
-else:
-    inject = f"""
-{marker}
-app.get("{"/wolverine/traderone/api/health"}",(req,res)=>res.json({{ok:true,ts:Date.now()}}));
-app.get("{"/wolverine/traderone/api/balances"}",(req,res)=>res.json({{sol:0,usdc:0}}));
-app.post("{"/wolverine/traderone/api/budget"}",(req,res)=>res.json({{ok:true}}));
-/* === END AUTO ROUTES === */
-"""
-    # insérer avant app.listen ou à la fin
-    idx = s.rfind("app.listen")
-    if idx!=-1:
-        s = s[:idx] + inject + "\n" + s[idx:]
-    else:
-        s += "\n" + inject
-    p.write_text(s)
-    print("✔ Routes injectées")
-PY
-
-# 4) Restart PM2
-if pm2 list | grep -q "$PM2_NAME"; then
+if [ -n "$PM2_NAME" ]; then
+  echo "✔ PM2 process trouvé: $PM2_NAME"
   pm2 restart "$PM2_NAME"
 else
-  pm2 start "$APP_FILE" --name "$PM2_NAME"
+  echo "⚠ Aucun process PM2 nommé traderone"
+  echo "→ Lancement explicite via PM2"
+  pm2 start "$APP" --name traderone
 fi
+
 sleep 2
 
-# 5) Vérifs locales
+# 3) Vérifier port
+if ss -lnt | grep -q ":$PORT"; then
+  echo "✔ Node écoute sur $PORT"
+else
+  echo "❌ Node n'écoute PAS sur $PORT"
+  exit 1
+fi
+
+# 4) Tests API
 echo "== TEST LOCAL =="
-curl -s -o /dev/null -w "health: %{http_code}\n" "http://127.0.0.1:$PORT$API_PREFIX/health"
-curl -s -o /dev/null -w "balances: %{http_code}\n" "http://127.0.0.1:$PORT$API_PREFIX/balances"
-curl -s -o /dev/null -w "budget: %{http_code}\n" -X POST "http://127.0.0.1:$PORT$API_PREFIX/budget"
+curl -i "http://127.0.0.1:$PORT$API/health" || true
+curl -i "http://127.0.0.1:$PORT$API/balances" || true
+curl -i -X POST "http://127.0.0.1:$PORT$API/budget" || true
 
-# 6) Vérif HTTPS via Cloudflare
+# 5) Test HTTPS
 echo "== TEST HTTPS =="
-curl -s -o /dev/null -w "https health: %{http_code}\n" "https://fireinners.online$API_PREFIX/health"
+curl -i "https://fireinners.online$API/health" || true
 
-echo "=== FIN OK ==="
+echo "=== FIN ==="
 BASH
