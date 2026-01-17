@@ -1,72 +1,161 @@
-cat >/root/DIAG_FIX_AGENTIA_9697.sh <<'BASH'
+cat >/root/FORCE_AGENTIA_PROXY_443_SAFE.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 TS="$(date +%Y%m%d_%H%M%S)"
 
+# --- DO NOT TOUCH WOLVERINE ---
 WOLV_HTML="/var/www/wolverine/index.html"
-NGX_SITE="/etc/nginx/sites-available/fireinners.online-ssl"
 sha(){ [ -f "$1" ] && sha256sum "$1" | awk '{print $1}' || echo "MISSING"; }
 BEF_W="$(sha "$WOLV_HTML")"
-BEF_N="$(sha "$NGX_SITE")"
 
+# --- NGINX ---
+NGX_SITE="/etc/nginx/sites-available/fireinners.online-ssl"
+
+# --- AGENTIA ---
 SVC="agentia.service"
 PORT="9697"
+UP="http://127.0.0.1:${PORT}"
 
 [ "$(id -u)" -eq 0 ] || { echo "ERROR: run as root"; exit 1; }
+[ -f "$NGX_SITE" ] || { echo "ERROR: missing $NGX_SITE"; exit 1; }
 
-echo "== BEFORE hashes =="
+echo "== BEFORE =="
 echo "wolverine index: $BEF_W  $WOLV_HTML"
-echo "nginx vhost    : $BEF_N  $NGX_SITE"
+echo "nginx vhost    : $(sha "$NGX_SITE")  $NGX_SITE"
 
-echo "== WHO LISTENS on :$PORT (before) =="
-ss -ltnp 2>/dev/null | grep ":$PORT" || true
-
-echo "== Stop AgentIA =="
-systemctl stop "$SVC" || true
+echo "== Ensure AgentIA running =="
+systemctl start "$SVC" >/dev/null 2>&1 || true
 sleep 1
+curl -fsS "$UP/agentia/health" | head -c 300; echo
 
-echo "== WHO LISTENS on :$PORT (after stop) =="
-ss -ltnp 2>/dev/null | grep ":$PORT" || true
+echo "== Patch nginx 443 server block: FORCE proxy /agentia =="
+chattr -i "$NGX_SITE" 2>/dev/null || true
+cp -a "$NGX_SITE" "${NGX_SITE}.bak_${TS}"
 
-echo "== Kill anything holding :$PORT =="
-PIDS="$(ss -ltnp 2>/dev/null | awk -v p=":$PORT" '$4 ~ p {print $0}' | sed -n 's/.*pid=\([0-9]\+\).*/\1/p' | sort -u | tr '\n' ' ')"
-if [ -n "${PIDS:-}" ]; then
-  echo "PIDS: $PIDS"
-  kill $PIDS 2>/dev/null || true
-  sleep 1
-  kill -9 $PIDS 2>/dev/null || true
-fi
+python3 - <<'PY'
+from pathlib import Path
+p=Path("/etc/nginx/sites-available/fireinners.online-ssl")
+s=p.read_text(errors="ignore")
+lines=s.splitlines()
 
-echo "== Kill leftover AgentIA node (path match) =="
-pkill -f "/opt/agentia/server\.js" 2>/dev/null || true
-sleep 1
+# find 443 server block for fireinners.online (brace counting)
+blocks=[]
+i=0
+while i < len(lines):
+    if lines[i].strip().startswith("server") and "{" in lines[i]:
+        a=i
+        depth=0
+        started=False
+        j=i
+        while j < len(lines):
+            ln=lines[j]
+            if "{" in ln:
+                depth += ln.count("{")
+                started=True
+            if "}" in ln and started:
+                depth -= ln.count("}")
+                if depth<=0:
+                    b=j
+                    blocks.append((a,b))
+                    i=b
+                    break
+            j+=1
+    i+=1
 
-echo "== WHO LISTENS on :$PORT (after kill) =="
-ss -ltnp 2>/dev/null | grep ":$PORT" || true
+def txt(a,b): return "\n".join(lines[a:b+1])
 
-echo "== Start AgentIA =="
-systemctl daemon-reload
-systemctl start "$SVC"
-sleep 1
+target=None
+for a,b in blocks:
+    t=txt(a,b)
+    if ("listen 443" in t or "443 ssl" in t) and ("fireinners.online" in t):
+        target=(a,b); break
+if not target:
+    for a,b in blocks:
+        t=txt(a,b)
+        if ("listen 443" in t or "443 ssl" in t):
+            target=(a,b); break
+if not target:
+    raise SystemExit("ERROR: no 443 server block found")
 
-echo "== Status top =="
-systemctl --no-pager --full status "$SVC" | sed -n '1,28p' || true
+a,b=target
 
-echo "== Local health =="
-curl -fsS "http://127.0.0.1:${PORT}/agentia/health" | head -c 500; echo
+# remove any prior agentia include / locations inside the target block
+new=[]
+k=a
+while k<=b:
+    ln=lines[k]
+    drop=False
+    if "include /etc/nginx/includes/agentia_routes.inc" in ln:
+        drop=True
+    if "location = /agentia" in ln:
+        # drop this line and the block if present
+        drop=True
+    if "location ^~ /agentia/" in ln or "location /agentia" in ln:
+        drop=True
+    if drop:
+        # if it's a location line with '{', skip until matching '}'
+        if "location" in ln and "{" in ln:
+            depth=ln.count("{")-ln.count("}")
+            k+=1
+            while k<=b and depth>0:
+                depth += lines[k].count("{")-lines[k].count("}")
+                k+=1
+            continue
+        k+=1
+        continue
+    new.append(ln)
+    k+=1
 
-echo "== Public health =="
-curl -kfsS "https://fireinners.online/agentia/health" | head -c 500; echo
+# rebuild whole file with patched server block content
+out = lines[:a] + new + lines[b+1:]
 
-echo "== AFTER hashes (must match) =="
+# insert our forced locations right after "server {" inside same block
+# re-find the server { line index in rebuilt file near a
+# (search forward from a)
+insert_at=None
+for idx in range(a, min(a+50, len(out))):
+    if out[idx].strip()=="server {" or out[idx].strip().startswith("server {"):
+        insert_at=idx+1
+        break
+if insert_at is None:
+    insert_at=a+1
+
+block = [
+"  # === AGENTIA FORCED ROUTE (auto) ===",
+"  location = /agentia { return 301 /agentia/; }",
+"  location ^~ /agentia/ {",
+"    proxy_http_version 1.1;",
+"    proxy_set_header Host $host;",
+"    proxy_set_header X-Real-IP $remote_addr;",
+"    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;",
+"    proxy_set_header X-Forwarded-Proto $scheme;",
+"    add_header Cache-Control \"no-store\" always;",
+"    proxy_pass http://127.0.0.1:9697;",
+"  }",
+"  # === /AGENTIA FORCED ROUTE ===",
+]
+out = out[:insert_at] + block + out[insert_at:]
+
+p.write_text("\n".join(out) + "\n")
+print("OK: nginx vhost patched with forced /agentia proxy")
+PY
+
+echo "== nginx test + reload =="
+nginx -t
+systemctl reload nginx
+chattr +i "$NGX_SITE" 2>/dev/null || true
+
+echo "== VERIFY: Wolverine untouched =="
 AFT_W="$(sha "$WOLV_HTML")"
-AFT_N="$(sha "$NGX_SITE")"
 echo "wolverine index: $AFT_W  $WOLV_HTML"
-echo "nginx vhost    : $AFT_N  $NGX_SITE"
 [ "$BEF_W" = "$AFT_W" ] || { echo "ERROR: Wolverine index changed (should not)."; exit 1; }
-[ "$BEF_N" = "$AFT_N" ] || { echo "ERROR: Nginx vhost changed (should not)."; exit 1; }
 
-echo "OK: AgentIA up; Wolverine untouched."
+echo "== VERIFY: Public /agentia now shows AgentIA (not FireInners) =="
+OUT="$(curl -kfsS "https://fireinners.online/agentia/" | head -c 3000 || true)"
+echo "$OUT" | head -c 300; echo
+echo "$OUT" | grep -qi "agentia" && echo "OK: AgentIA is served on /agentia" || { echo "ERROR: still not AgentIA on /agentia (nginx -T dump next)."; exit 1; }
+
+echo "OK: https://fireinners.online/agentia/ fixed; Wolverine untouched."
 BASH
 
-bash /root/DIAG_FIX_AGENTIA_9697.sh
+bash /root/FORCE_AGENTIA_PROXY_443_SAFE.sh
