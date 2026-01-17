@@ -1,36 +1,73 @@
-cat > /root/FIX_TRADERONE_API_JSON.sh <<'BASH'
+cat > /root/FIX_TRADERONE_API_FINAL.sh <<'BASH'
 #!/usr/bin/env bash
 set -e
 
-API_PORT=3000
+APP_DIR="/opt/traderone-vault"
+API_FILE="$APP_DIR/api_budget.js"
+SERVER="$APP_DIR/server.js"
 NGINX_SITE="/etc/nginx/sites-available/fireinners.online-ssl"
-BACKEND="/opt/traderone-vault/server.js"
 
-echo "=== [1] Vérification backend ==="
-[ -f "$BACKEND" ] || { echo "❌ server.js introuvable"; exit 1; }
+echo "=== [1] Vérifications ==="
+[ -f "$SERVER" ] || { echo "❌ server.js introuvable"; exit 1; }
 
-echo "=== [2] Patch backend JSON safe ==="
-node <<'JS'
-const fs=require("fs");
-let s=fs.readFileSync("/opt/traderone-vault/server.js","utf8");
-if(!s.includes("res.json({ok:false,error")) {
-  s=s.replace(/app.post\\([^]*?\\{/,m=>m+`
-res.setHeader("Content-Type","application/json");
-`);
-  s=s.replace(/catch\\s*\\(.*?\\)\\s*\\{/,m=>m+`
-res.status(500).json({ok:false,error:String(e)});
-return;
-`);
-  fs.writeFileSync("/opt/traderone-vault/server.js",s);
-  console.log("✓ Backend JSON sécurisé");
-}else{
-  console.log("✓ Backend déjà OK");
-}
+echo "=== [2] Création API budget séparée ==="
+cat > "$API_FILE" <<'JS'
+module.exports = (app, web3, traderKeypair) => {
+  const { SystemProgram, Transaction, sendAndConfirmTransaction, LAMPORTS_PER_SOL, PublicKey } = web3;
+
+  app.post("/wolverine/traderone/api/budget", async (req, res) => {
+    try {
+      const { from, amount } = req.body;
+      if (!from || !amount) {
+        return res.status(400).json({ ok:false, error:"missing from/amount" });
+      }
+
+      const lamports = Math.floor(Number(amount) * LAMPORTS_PER_SOL);
+      if (lamports <= 0) {
+        return res.status(400).json({ ok:false, error:"invalid amount" });
+      }
+
+      const tx = new Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey: new PublicKey(from),
+          toPubkey: traderKeypair.publicKey,
+          lamports
+        })
+      );
+
+      const sig = await sendAndConfirmTransaction(
+        req.app.locals.connection,
+        tx,
+        [],
+        { commitment: "confirmed" }
+      );
+
+      res.json({ ok:true, signature:sig });
+    } catch (e) {
+      res.status(500).json({ ok:false, error:String(e) });
+    }
+  });
+};
 JS
 
-echo "=== [3] Patch NGINX proxy API ==="
-if ! grep -q "traderone/api" "$NGINX_SITE"; then
-sed -i '/location \\/wolverine\\/ {/a\
+echo "✓ API budget créée"
+
+echo "=== [3] Branchement API dans server.js (sans regex) ==="
+if ! grep -q "api_budget" "$SERVER"; then
+cat >> "$SERVER" <<'JS'
+
+// === TraderOne Budget API ===
+const budgetAPI = require("./api_budget");
+budgetAPI(app, require("@solana/web3.js"), traderKeypair);
+JS
+echo "✓ API branchée"
+else
+echo "✓ API déjà branchée"
+fi
+
+echo "=== [4] Patch NGINX proxy API ==="
+if ! grep -q "/wolverine/traderone/api/" "$NGINX_SITE"; then
+sed -i '/location \/wolverine\/ {/a\
     location /wolverine/traderone/api/ {\
         proxy_pass http://127.0.0.1:3000/;\
         proxy_http_version 1.1;\
@@ -40,31 +77,24 @@ sed -i '/location \\/wolverine\\/ {/a\
         proxy_set_header X-Forwarded-Proto $scheme;\
     }\
 ' "$NGINX_SITE"
-echo "✓ NGINX proxy API ajouté"
+echo "✓ NGINX proxy ajouté"
 else
 echo "✓ NGINX proxy déjà présent"
 fi
 
-echo "=== [4] Reload services ==="
+echo "=== [5] Redémarrage ==="
 nginx -t
 systemctl reload nginx
 pm2 restart traderone-vault
 
 sleep 2
 
-echo "=== [5] Test API JSON ==="
-curl -s http://127.0.0.1:3000/wolverine/traderone/api/health | grep ok || {
-  echo "❌ API Node KO"
-  exit 1
-}
+echo "=== [6] Test API ==="
+curl -s http://127.0.0.1:3000/wolverine/traderone/api/health | grep ok
+curl -s https://fireinners.online/wolverine/traderone/api/health | grep ok
 
-curl -s https://fireinners.online/wolverine/traderone/api/health | grep ok || {
-  echo "❌ API publique KO"
-  exit 1
-}
-
-echo "✅ API JSON OPÉRATIONNELLE"
+echo "✅ TRADERONE API BUDGET OPÉRATIONNELLE"
 BASH
 
-chmod +x /root/FIX_TRADERONE_API_JSON.sh
-/root/FIX_TRADERONE_API_JSON.sh
+chmod +x /root/FIX_TRADERONE_API_FINAL.sh
+/root/FIX_TRADERONE_API_FINAL.sh
