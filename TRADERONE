@@ -1,70 +1,50 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "=== TRADERONE :: ENABLE REAL SOL TRANSFER ==="
+echo "=== FIX RPC NAMEERROR + INJECTION SAFE ==="
 
 BASE="/opt/traderone"
 SERVER="$BASE/server.js"
-KEYFILE="$BASE/treasury.json"
-RPC="https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac"
+RPC_URL="https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac"
 
-cd /opt
-
-echo "== 1) Dépendances Solana =="
-cd "$BASE"
-npm install @solana/web3.js bs58 >/dev/null 2>&1 || true
-
-echo "== 2) Création wallet serveur si absent =="
-if [ ! -f "$KEYFILE" ]; then
-  node - <<'JS'
-const {Keypair} = require("@solana/web3.js");
-const fs=require("fs");
-const kp=Keypair.generate();
-fs.writeFileSync("treasury.json",JSON.stringify(Array.from(kp.secretKey)));
-console.log("Wallet créé :",kp.publicKey.toBase58());
-JS
-  chmod 600 "$KEYFILE"
-else
-  echo "Wallet serveur déjà présent"
+if [ ! -f "$SERVER" ]; then
+  echo "❌ server.js introuvable : $SERVER"
+  exit 1
 fi
 
-PUB=$(node - <<'JS'
-const {Keypair}=require("@solana/web3.js");
-const fs=require("fs");
-const kp=Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync("treasury.json"))));
-console.log(kp.publicKey.toBase58());
-JS
-)
-echo "Treasury pubkey: $PUB"
+echo "== Injection routes API (safe) =="
 
-echo "== 3) Injection logique SOL réelle dans API =="
-python3 - <<'PY'
+python3 - <<PY
 from pathlib import Path
-p=Path("/opt/traderone/server.js")
-s=p.read_text()
 
-marker="/* === REAL SOL TRANSFER ENABLED === */"
+p = Path("$SERVER")
+s = p.read_text()
+
+marker = "/* === REAL SOL TRANSFER ENABLED === */"
 if marker in s:
-    print("Logique déjà injectée")
+    print("✔ Déjà injecté — skip")
     exit(0)
 
-inject=f"""
+inject = f"""
 {marker}
 const {{ Connection, Keypair, PublicKey, SystemProgram, Transaction, sendAndConfirmTransaction }} = require("@solana/web3.js");
 const fs = require("fs");
-const RPC = "{RPC}";
+
+const RPC = "{RPC_URL}";
 const connection = new Connection(RPC, "confirmed");
+
 const TREASURY = Keypair.fromSecretKey(
-  Uint8Array.from(JSON.parse(fs.readFileSync(__dirname+"/treasury.json")))
+  Uint8Array.from(JSON.parse(fs.readFileSync(__dirname + "/treasury.json")))
 );
 
-app.post("/wolverine/traderone/api/budget", async (req,res)=>{{
+app.post("/wolverine/traderone/api/budget", async (req, res) => {{
   try {{
     const {{ pubkey, budgetSol }} = req.body;
-    if(!pubkey || !budgetSol) throw "payload invalide";
+    if (!pubkey || !budgetSol) throw "payload invalide";
+
     const to = new PublicKey(pubkey);
     const lamports = Math.floor(Number(budgetSol) * 1e9);
-    if(lamports<=0) throw "montant invalide";
+    if (lamports <= 0) throw "montant invalide";
 
     const tx = new Transaction().add(
       SystemProgram.transfer({{
@@ -75,26 +55,29 @@ app.post("/wolverine/traderone/api/budget", async (req,res)=>{{
     );
 
     const sig = await sendAndConfirmTransaction(connection, tx, [TREASURY]);
-    res.json({{ok:true, tx:sig}});
-  }} catch(e) {{
-    res.status(500).json({{ok:false,error:String(e)}});
+    res.json({{ ok: true, tx: sig }});
+  }} catch (e) {{
+    res.status(500).json({{ ok: false, error: String(e) }});
   }}
-}});
+});
 """
 
-idx=s.find("app.listen")
-s=s[:idx]+inject+"\n"+s[idx:]
+idx = s.find("app.listen")
+if idx != -1:
+    s = s[:idx] + inject + "\\n" + s[idx:]
+else:
+    s += "\\n" + inject
+
 p.write_text(s)
-print("Injection OK")
+print("✔ Injection réussie")
 PY
 
-echo "== 4) Redémarrage PM2 =="
+echo "== Redémarrage PM2 =="
 pm2 restart traderone-vault || pm2 restart traderone || true
 
 sleep 2
 
-echo "== 5) Test API LOCAL (dry) =="
+echo "== Test API local =="
 curl -s http://127.0.0.1:3000/wolverine/traderone/api/health || true
 
-echo "== FIN :: ENVOI SOL RÉEL ACTIVÉ =="
-echo "Wallet serveur: $PUB"
+echo "=== FIX TERMINÉ ==="
