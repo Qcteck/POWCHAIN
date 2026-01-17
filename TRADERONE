@@ -1,84 +1,100 @@
-bash <<'BASH'
+#!/usr/bin/env bash
 set -euo pipefail
 
-APP_DIR="/opt/traderone"
-APP_FILE="$APP_DIR/server.js"
-APP_NAME="traderone-vault"
-API_PORT=3000
-API_HOST="127.0.0.1"
-NGINX_INC="/etc/nginx/includes/wolverine_traderone_api.inc"
-NGINX_SITE="/etc/nginx/sites-available/fireinners.online-ssl"
-TS="$(date +%Y%m%d_%H%M%S)"
+echo "=== TRADERONE :: ENABLE REAL SOL TRANSFER ==="
 
-echo "== 1) Vérifications système =="
-node -v
-pm2 -v
+BASE="/opt/traderone"
+SERVER="$BASE/server.js"
+KEYFILE="$BASE/treasury.json"
+RPC="https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac"
 
-echo "== 2) PM2 TraderOne =="
-pm2 list | grep -q "$APP_NAME" || pm2 start "$APP_FILE" --name "$APP_NAME"
-pm2 restart "$APP_NAME"
-sleep 2
+cd /opt
 
-ss -lnt | grep -q ":$API_PORT" || { echo "❌ Node n'écoute pas $API_PORT"; exit 1; }
-echo "✅ Node écoute $API_PORT"
+echo "== 1) Dépendances Solana =="
+cd "$BASE"
+npm install @solana/web3.js bs58 >/dev/null 2>&1 || true
 
-echo "== 3) Backup server.js =="
-cp -a "$APP_FILE" "$APP_FILE.bak_$TS"
+echo "== 2) Création wallet serveur si absent =="
+if [ ! -f "$KEYFILE" ]; then
+  node - <<'JS'
+const {Keypair} = require("@solana/web3.js");
+const fs=require("fs");
+const kp=Keypair.generate();
+fs.writeFileSync("treasury.json",JSON.stringify(Array.from(kp.secretKey)));
+console.log("Wallet créé :",kp.publicKey.toBase58());
+JS
+  chmod 600 "$KEYFILE"
+else
+  echo "Wallet serveur déjà présent"
+fi
 
-echo "== 4) Injection routes Express si absentes =="
+PUB=$(node - <<'JS'
+const {Keypair}=require("@solana/web3.js");
+const fs=require("fs");
+const kp=Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync("treasury.json"))));
+console.log(kp.publicKey.toBase58());
+JS
+)
+echo "Treasury pubkey: $PUB"
+
+echo "== 3) Injection logique SOL réelle dans API =="
 python3 - <<'PY'
 from pathlib import Path
 p=Path("/opt/traderone/server.js")
 s=p.read_text()
 
-marker="/* === AUTO ROUTES TRADERONE === */"
+marker="/* === REAL SOL TRANSFER ENABLED === */"
 if marker in s:
-    print("Routes déjà présentes (skip)")
-else:
-    inject=f'''
+    print("Logique déjà injectée")
+    exit(0)
+
+inject=f"""
 {marker}
-app.get("/wolverine/traderone/api/health",(req,res)=>res.json({{ok:true,ts:Date.now()}}));
-app.get("/wolverine/traderone/api/balances",(req,res)=>res.json({{sol:0,usdc:0}}));
-app.post("/wolverine/traderone/api/budget",(req,res)=>res.json({{ok:true,received:req.body||null}}));
-/* === END AUTO ROUTES === */
-'''
-    idx=s.find("app.listen")
-    s = s[:idx]+inject+"\n"+s[idx:] if idx!=-1 else s+"\n"+inject
-    p.write_text(s)
-    print("Routes injectées")
+const {{ Connection, Keypair, PublicKey, SystemProgram, Transaction, sendAndConfirmTransaction }} = require("@solana/web3.js");
+const fs = require("fs");
+const RPC = "{RPC}";
+const connection = new Connection(RPC, "confirmed");
+const TREASURY = Keypair.fromSecretKey(
+  Uint8Array.from(JSON.parse(fs.readFileSync(__dirname+"/treasury.json")))
+);
+
+app.post("/wolverine/traderone/api/budget", async (req,res)=>{{
+  try {{
+    const {{ pubkey, budgetSol }} = req.body;
+    if(!pubkey || !budgetSol) throw "payload invalide";
+    const to = new PublicKey(pubkey);
+    const lamports = Math.floor(Number(budgetSol) * 1e9);
+    if(lamports<=0) throw "montant invalide";
+
+    const tx = new Transaction().add(
+      SystemProgram.transfer({{
+        fromPubkey: TREASURY.publicKey,
+        toPubkey: to,
+        lamports
+      }})
+    );
+
+    const sig = await sendAndConfirmTransaction(connection, tx, [TREASURY]);
+    res.json({{ok:true, tx:sig}});
+  }} catch(e) {{
+    res.status(500).json({{ok:false,error:String(e)}});
+  }}
+}});
+"""
+
+idx=s.find("app.listen")
+s=s[:idx]+inject+"\n"+s[idx:]
+p.write_text(s)
+print("Injection OK")
 PY
 
-pm2 restart "$APP_NAME"
+echo "== 4) Redémarrage PM2 =="
+pm2 restart traderone-vault || pm2 restart traderone || true
+
 sleep 2
 
-echo "== 5) NGINX include API =="
-cp -a "$NGINX_SITE" "$NGINX_SITE.bak_$TS"
-
-cat > "$NGINX_INC" <<EOF
-location /wolverine/traderone/api/ {
-    proxy_pass http://$API_HOST:$API_PORT/;
-    proxy_http_version 1.1;
-    proxy_set_header Host \$host;
-    proxy_set_header X-Real-IP \$remote_addr;
-    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto \$scheme;
-}
-EOF
-
-grep -q "wolverine_traderone_api.inc" "$NGINX_SITE" || \
-sed -i '/server {/a \ \ include /etc/nginx/includes/wolverine_traderone_api.inc;' "$NGINX_SITE"
-
-nginx -t
-systemctl reload nginx
-
-echo "== 6) TESTS =="
-echo "-- Local --"
+echo "== 5) Test API LOCAL (dry) =="
 curl -s http://127.0.0.1:3000/wolverine/traderone/api/health || true
-curl -s http://127.0.0.1:3000/wolverine/traderone/api/balances || true
 
-echo "-- Proxy NGINX --"
-curl -s https://fireinners.online/wolverine/traderone/api/health || true
-curl -s https://fireinners.online/wolverine/traderone/api/balances || true
-
-echo "== FIN : ROUTAGE API OPÉRATIONNEL =="
-BASH
+echo "== FIN :: ENVOI SOL RÉEL ACTIVÉ =="
+echo "Wallet serveur: $PUB"
