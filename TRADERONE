@@ -1,65 +1,111 @@
-#!/usr/bin/env bash
-set -euo pipefail
+bash <<'BATCH'
+set -e
 
 echo "=============================="
-echo " TRADERONE PORT AUTO-DETECT "
+echo "TRADERONE BUDGET HARD FIX"
 echo "=============================="
 
-APP="traderone-vault"
-FILE="/opt/traderone-vault/server.js"
+### CONFIG
+APP_NAME="traderone-vault"
+APP_DIR="/opt/traderone-vault"
+SERVER_JS="$APP_DIR/server.js"
+NGINX_SITE="/etc/nginx/sites-available/fireinners.online-ssl"
 
-########################################
-# 1) PM2 infos
-########################################
-echo "[1/5] PM2 infos"
-pm2 describe "$APP" || exit 1
+### 1) DETECT PORT NODE (REAL)
+echo "[1/7] Detect port Node réel"
+PORT=$(ss -lntp | grep node | grep -oE ':[0-9]+' | cut -d: -f2 | grep -v 3000 | head -n1)
 
-########################################
-# 2) Détection PORT dans server.js
-########################################
-echo "[2/5] Scan server.js pour listen()"
-
-PORTS=$(grep -E "listen\(|PORT" "$FILE" || true)
-echo "---- server.js ----"
-echo "$PORTS"
-echo "-------------------"
-
-########################################
-# 3) Ports ouverts par le process
-########################################
-echo "[3/5] Ports réellement écoutés"
-PID=$(pm2 pid "$APP")
-echo "PID=$PID"
-
-ss -lntp | grep "$PID" || echo "⚠️ aucun port trouvé via ss"
-
-########################################
-# 4) Test automatique des ports détectés
-########################################
-echo "[4/5] Test API sur ports actifs"
-
-FOUND=0
-for P in $(ss -lntp | grep "$PID" | awk '{print $4}' | awk -F: '{print $NF}'); do
-  echo "→ Test port $P"
-  curl -s --max-time 2 http://127.0.0.1:$P/wolverine/traderone/api/health || true
-  echo
-  if curl -s http://127.0.0.1:$P/wolverine/traderone/api/health | grep -q '"ok"'; then
-    echo "✅ API OK sur port $P"
-    FOUND=$P
-    break
-  fi
-done
-
-########################################
-# 5) Verdict
-########################################
-echo "=============================="
-if [ "$FOUND" = "0" ]; then
-  echo "❌ AUCUN PORT API TROUVÉ"
-  echo "→ Le serveur n'expose pas Express correctement"
+if [ -z "$PORT" ]; then
+  echo "❌ Aucun port Node détecté"
   exit 1
-else
-  echo "✅ PORT RÉEL = $FOUND"
-  echo "👉 Utilise ce port pour nginx proxy_pass"
 fi
+echo "✅ Port détecté: $PORT"
+
+### 2) PATCH NGINX PROXY
+echo "[2/7] Patch NGINX"
+if ! grep -q "wolverine/traderone/api" "$NGINX_SITE"; then
+cat >> "$NGINX_SITE" <<EOF
+
+# === TRADERONE API PROXY ===
+location /wolverine/traderone/api/ {
+    proxy_pass http://127.0.0.1:$PORT/;
+    proxy_http_version 1.1;
+
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+
+    proxy_set_header Content-Type application/json;
+    proxy_pass_request_body on;
+}
+EOF
+else
+  echo "ℹ️ Proxy déjà présent"
+fi
+
+nginx -t && systemctl reload nginx
+
+### 3) BACKUP SERVER.JS
+echo "[3/7] Backup server.js"
+cp "$SERVER_JS" "$SERVER_JS.bak_$(date +%Y%m%d_%H%M%S)"
+
+### 4) INJECT ROUTES API
+echo "[4/7] Injection routes API"
+if ! grep -q "TRADERONE_API_READY" "$SERVER_JS"; then
+cat >> "$SERVER_JS" <<'EOF'
+
+/* ===== TRADERONE_API_READY ===== */
+app.get("/wolverine/traderone/api/health",(req,res)=>{
+  res.json({ok:true,time:Date.now()});
+});
+
+app.post("/wolverine/traderone/api/budget",async(req,res)=>{
+  try{
+    const { pubkey, budgetSol } = req.body;
+    if(!pubkey || !budgetSol) throw "payload invalide";
+    if(isNaN(budgetSol) || budgetSol<=0) throw "budget invalide";
+
+    res.json({
+      ok:true,
+      received:true,
+      pubkey,
+      budgetSol
+    });
+  }catch(e){
+    res.status(400).json({ok:false,error:String(e)});
+  }
+});
+/* ===== END TRADERONE_API_READY ===== */
+EOF
+else
+  echo "ℹ️ Routes déjà présentes"
+fi
+
+### 5) RESTART PM2
+echo "[5/7] Restart PM2"
+pm2 restart "$APP_NAME" --update-env
+sleep 2
+
+### 6) TEST API LOCALE
+echo "[6/7] Test API locale"
+if curl -s http://127.0.0.1:$PORT/wolverine/traderone/api/health | grep -q '"ok":true'; then
+  echo "✅ API locale OK"
+else
+  echo "❌ API locale KO"
+  exit 1
+fi
+
+### 7) TEST API VIA NGINX
+echo "[7/7] Test API via NGINX"
+if curl -s https://fireinners.online/wolverine/traderone/api/health | grep -q '"ok":true'; then
+  echo "✅ API publique OK"
+else
+  echo "❌ API publique KO"
+  exit 1
+fi
+
 echo "=============================="
+echo "✅ TRADERONE BUDGET OPERATIONNEL"
+echo "=============================="
+BATCH
