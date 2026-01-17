@@ -1,56 +1,480 @@
-bash <<'BASH'
+cat >/root/MEGA_AGENTIA_DEPLOY.sh <<'BASH'
+#!/usr/bin/env bash
 set -euo pipefail
 
-HTML="/var/www/wolverine/index.html"
-NGINX_SITE="/etc/nginx/sites-available/fireinners.online-ssl"
+# === CONFIG ===
+APP="agentia"
+APP_DIR="/opt/${APP}"
+PORT="9697"
+HOST="127.0.0.1"
+SVC="${APP}.service"
+NGX_SITE="/etc/nginx/sites-available/fireinners.online-ssl"
+NGX_INC="/etc/nginx/includes/${APP}_routes.inc"
+DATA_DIR="${APP_DIR}/data"
+PUB_DIR="${APP_DIR}/public"
 TS="$(date +%Y%m%d_%H%M%S)"
 
-echo "== [1] Vérifications =="
-test -f "$HTML" || { echo "❌ index.html introuvable"; exit 1; }
+need_root(){ [ "$(id -u)" -eq 0 ] || { echo "ERROR: run as root"; exit 1; }; }
+cmd(){ echo "+ $*"; "$@"; }
 
-echo "== [2] Backup frontend =="
-cp -a "$HTML" "${HTML}.bak_${TS}"
-echo "✔ Backup: ${HTML}.bak_${TS}"
+# Optional askorupdate helpers (safe file update + chattr handling)
+ASKLIB="/opt/fireinners/sentinel/lib/askorupdate.sh"
+if [ -f "$ASKLIB" ]; then
+  # shellcheck disable=SC1090
+  source "$ASKLIB"
+else
+  askorupdate_file(){
+    local dst="$1"; local tmp="$2"
+    mkdir -p "$(dirname "$dst")"
+    [ -f "$dst" ] && cp -a "$dst" "${dst}.bak_${TS}" || true
+    cp -a "$tmp" "$dst"
+  }
+  askorupdate_yesno(){ return 0; }
+fi
 
-echo "== [3] Patch frontend (API + payload) =="
-python3 - <<'PY'
+install_node_if_missing(){
+  if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
+    echo "OK: node=$(node -v) npm=$(npm -v)"
+    return 0
+  fi
+  echo "== Installing Node.js (NodeSource) =="
+  cmd apt-get update -y
+  cmd apt-get install -y ca-certificates curl gnupg
+  cmd install -d -m 0755 /etc/apt/keyrings
+  cmd bash -lc 'curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg'
+  cmd bash -lc 'echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" > /etc/apt/sources.list.d/nodesource.list'
+  cmd apt-get update -y
+  cmd apt-get install -y nodejs
+  echo "OK: node=$(node -v) npm=$(npm -v)"
+}
+
+write_backend(){
+  mkdir -p "$APP_DIR" "$DATA_DIR" "$PUB_DIR"
+  cat >"${APP_DIR}/server.js" <<'JS'
+'use strict';
+const path=require('path');
+const fs=require('fs');
+const express=require('express');
+const helmet=require('helmet');
+const compression=require('compression');
+const Database=require('better-sqlite3');
+
+const APP='agentia';
+const PORT=parseInt(process.env.PORT||'9697',10);
+const BASE=(process.env.BASE_PATH||'/agentia').replace(/\/+$/,'');
+const DATA_DIR=process.env.DATA_DIR||path.join(__dirname,'data');
+const DB_PATH=process.env.DB_PATH||path.join(DATA_DIR,'agentia.db');
+
+fs.mkdirSync(DATA_DIR,{recursive:true});
+const db=new Database(DB_PATH);
+db.pragma('journal_mode = WAL');
+db.exec(`
+CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL, updated_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS decisions (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS runs (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, kind TEXT NOT NULL, input TEXT NOT NULL, output TEXT NOT NULL, score REAL, notes TEXT);
+CREATE TABLE IF NOT EXISTS logs (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, level TEXT NOT NULL, msg TEXT NOT NULL, meta TEXT);
+`);
+
+const setKV=db.prepare('INSERT INTO kv(k,v,updated_at) VALUES(?,?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v, updated_at=excluded.updated_at');
+const getKV=db.prepare('SELECT v,updated_at FROM kv WHERE k=?');
+const listKV=db.prepare('SELECT k,v,updated_at FROM kv ORDER BY k ASC');
+
+const addDecision=db.prepare('INSERT INTO decisions(ts,title,body) VALUES(?,?,?)');
+const listDecisions=db.prepare('SELECT id,ts,title,body FROM decisions ORDER BY id DESC LIMIT ?');
+const getDecision=db.prepare('SELECT id,ts,title,body FROM decisions WHERE id=?');
+
+const addRun=db.prepare('INSERT INTO runs(ts,kind,input,output,score,notes) VALUES(?,?,?,?,?,?)');
+const listRuns=db.prepare('SELECT id,ts,kind,score,notes,input,output FROM runs ORDER BY id DESC LIMIT ?');
+
+const addLog=db.prepare('INSERT INTO logs(ts,level,msg,meta) VALUES(?,?,?,?)');
+function log(level,msg,meta){
+  try{ addLog.run(Date.now(),String(level||'info'),String(msg||''), meta?JSON.stringify(meta):null); }catch(_){}
+}
+
+const app=express();
+app.set('trust proxy', true);
+app.use(helmet({contentSecurityPolicy:false}));
+app.use(compression());
+app.use(express.json({limit:'1mb'}));
+
+app.get(`${BASE}/health`, (req,res)=>res.json({ok:true,app:APP,base:BASE,ts:Date.now()}));
+app.get(`${BASE}/api/status`, (req,res)=>{
+  const memCount=listKV.all().length;
+  const decisionsCount=db.prepare('SELECT COUNT(1) c FROM decisions').get().c;
+  const runsCount=db.prepare('SELECT COUNT(1) c FROM runs').get().c;
+  res.json({ok:true,app:APP,base:BASE,db:DB_PATH,memCount,decisionsCount,runsCount,ts:Date.now()});
+});
+
+app.get(`${BASE}/api/memory`, (req,res)=>{ res.json({ok:true,items:listKV.all()}); });
+app.get(`${BASE}/api/memory/:key`, (req,res)=>{
+  const r=getKV.get(req.params.key);
+  if(!r) return res.status(404).json({ok:false,error:'not_found'});
+  res.json({ok:true,key:req.params.key,value:r.v,updated_at:r.updated_at});
+});
+app.post(`${BASE}/api/memory/:key`, (req,res)=>{
+  const v=(req.body&&typeof req.body.value==='string')?req.body.value:JSON.stringify(req.body||{});
+  setKV.run(req.params.key, v, Date.now());
+  log('info','memory_set',{key:req.params.key,bytes:Buffer.byteLength(v||'')});
+  res.json({ok:true,key:req.params.key});
+});
+
+app.post(`${BASE}/api/decisions`, (req,res)=>{
+  const title=String((req.body&&req.body.title)||'');
+  const body=String((req.body&&req.body.body)||'');
+  if(!title || !body) return res.status(400).json({ok:false,error:'title_and_body_required'});
+  const info=addDecision.run(Date.now(), title, body);
+  log('info','decision_add',{id:info.lastInsertRowid,title});
+  res.json({ok:true,id:info.lastInsertRowid});
+});
+app.get(`${BASE}/api/decisions`, (req,res)=>{
+  const lim=Math.max(1,Math.min(200,parseInt(String(req.query.limit||'50'),10)||50));
+  res.json({ok:true,items:listDecisions.all(lim)});
+});
+app.get(`${BASE}/api/decisions/:id`, (req,res)=>{
+  const id=parseInt(req.params.id,10);
+  const r=getDecision.get(id);
+  if(!r) return res.status(404).json({ok:false,error:'not_found'});
+  res.json({ok:true,item:r});
+});
+
+app.post(`${BASE}/api/runs`, (req,res)=>{
+  const kind=String((req.body&&req.body.kind)||'');
+  const input=String((req.body&&req.body.input)||'');
+  const output=String((req.body&&req.body.output)||'');
+  const score=(req.body&&req.body.score!=null)?Number(req.body.score):null;
+  const notes=(req.body&&req.body.notes!=null)?String(req.body.notes):null;
+  if(!kind || !input || !output) return res.status(400).json({ok:false,error:'kind_input_output_required'});
+  const info=addRun.run(Date.now(), kind, input, output, Number.isFinite(score)?score:null, notes);
+  log('info','run_add',{id:info.lastInsertRowid,kind,score});
+  res.json({ok:true,id:info.lastInsertRowid});
+});
+app.get(`${BASE}/api/runs`, (req,res)=>{
+  const lim=Math.max(1,Math.min(200,parseInt(String(req.query.limit||'50'),10)||50));
+  res.json({ok:true,items:listRuns.all(lim)});
+});
+
+app.get(`${BASE}/api/logs`, (req,res)=>{
+  const lim=Math.max(1,Math.min(200,parseInt(String(req.query.limit||'50'),10)||50));
+  const rows=db.prepare('SELECT id,ts,level,msg,meta FROM logs ORDER BY id DESC LIMIT ?').all(lim);
+  res.json({ok:true,items:rows});
+});
+
+app.use(`${BASE}/`, express.static(path.join(__dirname,'public'), {index:'index.html', maxAge:0, etag:false, lastModified:false}));
+
+app.use((req,res)=>res.status(404).json({ok:false,error:'not_found'}));
+
+app.listen(PORT, HOST=>{});
+app.listen(PORT, '127.0.0.1', ()=>{ log('info','server_start',{port:PORT,base:BASE}); });
+JS
+
+  cat >"${PUB_DIR}/index.html" <<'HTML'
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AgentIA • Global++</title><style>
+:root{--bg:#070a0f;--fg:#e7f0ff;--mut:#8aa1c4;--a:#1e90ff;--b:#00ffc8;--r:#ff3b6b;}
+*{box-sizing:border-box;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial}
+body{margin:0;background:radial-gradient(1000px 700px at 20% 10%,rgba(30,144,255,.18),transparent 60%),radial-gradient(900px 600px at 90% 20%,rgba(0,255,200,.12),transparent 60%),#070a0f;color:var(--fg)}
+.wrap{max-width:1200px;margin:0 auto;padding:18px}
+.top{display:flex;gap:12px;align-items:center;justify-content:space-between}
+.badge{display:inline-flex;gap:8px;align-items:center;padding:8px 10px;border:1px solid rgba(255,255,255,.1);border-radius:12px;background:rgba(255,255,255,.03)}
+.grid{display:grid;grid-template-columns:380px 1fr;gap:14px;margin-top:14px}
+.card{border:1px solid rgba(255,255,255,.1);border-radius:16px;background:rgba(255,255,255,.03);padding:14px}
+h1{font-size:16px;margin:0;color:#fff;letter-spacing:.3px}
+h2{font-size:13px;margin:0 0 10px 0;color:#fff}
+small{color:var(--mut)}
+.row{display:flex;gap:10px;flex-wrap:wrap}
+.btn{cursor:pointer;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04);color:var(--fg);padding:9px 12px;border-radius:12px}
+.btn:hover{border-color:rgba(30,144,255,.55)}
+.in{width:100%;padding:10px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.12);background:rgba(0,0,0,.25);color:var(--fg)}
+.ta{width:100%;min-height:130px;padding:10px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.12);background:rgba(0,0,0,.25);color:var(--fg);resize:vertical}
+.kpi{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+.k{padding:10px 12px;border-radius:14px;border:1px solid rgba(255,255,255,.1);background:rgba(0,0,0,.22)}
+.k b{display:block;font-size:15px}
+.sep{height:1px;background:rgba(255,255,255,.08);margin:12px 0}
+.list{max-height:420px;overflow:auto;border-radius:12px;border:1px solid rgba(255,255,255,.08)}
+.item{padding:10px 12px;border-bottom:1px solid rgba(255,255,255,.06)}
+.item:last-child{border-bottom:0}
+.tag{display:inline-block;font-size:11px;padding:3px 8px;border-radius:999px;border:1px solid rgba(255,255,255,.14);color:var(--mut);margin-left:8px}
+.warn{color:#ffd0da}
+.ok{color:#bfffe9}
+</style></head><body><div class="wrap">
+<div class="top">
+<div class="badge"><h1>AgentIA • Global++</h1><small id="base"></small></div>
+<div class="row">
+<button class="btn" onclick="refreshAll()">Refresh</button>
+<button class="btn" onclick="addDecision()">Add Decision (ADR)</button>
+<button class="btn" onclick="addRun()">Add Run</button>
+</div>
+</div>
+
+<div class="grid">
+  <div class="card">
+    <h2>Status</h2>
+    <div class="kpi">
+      <div class="k"><small>Memory keys</small><b id="kMem">0</b></div>
+      <div class="k"><small>Decisions</small><b id="kDec">0</b></div>
+      <div class="k"><small>Runs</small><b id="kRun">0</b></div>
+    </div>
+    <div class="sep"></div>
+
+    <h2>Memory (no simulation)</h2>
+    <input class="in" id="mKey" placeholder="key (ex: endpoints.rpc, rules.dod, cfg.agentia)" />
+    <textarea class="ta" id="mVal" placeholder="value (string or JSON)"></textarea>
+    <div class="row">
+      <button class="btn" onclick="memGet()">Get</button>
+      <button class="btn" onclick="memSet()">Set</button>
+    </div>
+    <small>Ce panneau stocke les données et décisions. Les modèles/LLM se branchent plus tard côté backend si tu le veux.</small>
+  </div>
+
+  <div class="card">
+    <h2>Decisions (ADR)</h2>
+    <div class="list" id="decList"></div>
+    <div class="sep"></div>
+    <h2>Runs</h2>
+    <div class="list" id="runList"></div>
+    <div class="sep"></div>
+    <h2>Logs</h2>
+    <div class="list" id="logList"></div>
+  </div>
+</div>
+</div>
+
+<script>
+const BASE='/agentia';
+document.getElementById('base').textContent=BASE;
+
+async function jget(u){const r=await fetch(u,{cache:'no-store'});return r.json();}
+async function jpost(u,b){const r=await fetch(u,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(b)});return r.json();}
+
+async function refreshAll(){
+  const s=await jget(BASE+'/api/status');
+  document.getElementById('kMem').textContent=s.memCount||0;
+  document.getElementById('kDec').textContent=s.decisionsCount||0;
+  document.getElementById('kRun').textContent=s.runsCount||0;
+
+  const d=await jget(BASE+'/api/decisions?limit=50');
+  document.getElementById('decList').innerHTML=(d.items||[]).map(x=>`
+    <div class="item">
+      <b>${escapeHtml(x.title)}<span class="tag">ADR #${x.id}</span></b>
+      <small>${new Date(x.ts).toLocaleString()}</small>
+      <div style="margin-top:6px;color:#cfe2ff;white-space:pre-wrap">${escapeHtml(x.body)}</div>
+    </div>`).join('') || `<div class="item"><small class="warn">Aucune décision.</small></div>`;
+
+  const r=await jget(BASE+'/api/runs?limit=50');
+  document.getElementById('runList').innerHTML=(r.items||[]).map(x=>`
+    <div class="item">
+      <b>${escapeHtml(x.kind)}<span class="tag">RUN #${x.id}</span>${x.score!=null?`<span class="tag">score ${x.score}</span>`:''}</b>
+      <small>${new Date(x.ts).toLocaleString()} ${x.notes?`• ${escapeHtml(x.notes)}`:''}</small>
+      <div style="margin-top:6px;color:#cfe2ff;white-space:pre-wrap"><small>INPUT</small>\n${escapeHtml(x.input)}\n\n<small>OUTPUT</small>\n${escapeHtml(x.output)}</div>
+    </div>`).join('') || `<div class="item"><small class="warn">Aucun run.</small></div>`;
+
+  const l=await jget(BASE+'/api/logs?limit=80');
+  document.getElementById('logList').innerHTML=(l.items||[]).map(x=>`
+    <div class="item">
+      <b>${escapeHtml(x.level)}<span class="tag">LOG #${x.id}</span></b>
+      <small>${new Date(x.ts).toLocaleString()}</small>
+      <div style="margin-top:6px;color:#cfe2ff;white-space:pre-wrap">${escapeHtml(x.msg)}${x.meta?`\n${escapeHtml(x.meta)}`:''}</div>
+    </div>`).join('') || `<div class="item"><small class="warn">Aucun log.</small></div>`;
+}
+
+async function memGet(){
+  const k=document.getElementById('mKey').value.trim();
+  if(!k) return;
+  const r=await jget(BASE+'/api/memory/'+encodeURIComponent(k));
+  if(!r.ok) return alert('not_found');
+  document.getElementById('mVal').value=r.value||'';
+}
+async function memSet(){
+  const k=document.getElementById('mKey').value.trim();
+  if(!k) return;
+  const v=document.getElementById('mVal').value;
+  const r=await jpost(BASE+'/api/memory/'+encodeURIComponent(k),{value:v});
+  if(!r.ok) return alert('error');
+  await refreshAll();
+}
+
+async function addDecision(){
+  const title=prompt('ADR title?'); if(!title) return;
+  const body=prompt('ADR body?'); if(!body) return;
+  const r=await jpost(BASE+'/api/decisions',{title,body});
+  if(!r.ok) return alert('error');
+  await refreshAll();
+}
+async function addRun(){
+  const kind=prompt('Run kind? (planner/divergence/judge/builder/redteam/qa/research)'); if(!kind) return;
+  const input=prompt('Input?'); if(!input) return;
+  const output=prompt('Output?'); if(!output) return;
+  const scoreS=prompt('Score? (optional)'); const score=scoreS?Number(scoreS):null;
+  const notes=prompt('Notes? (optional)')||null;
+  const r=await jpost(BASE+'/api/runs',{kind,input,output,score,notes});
+  if(!r.ok) return alert('error');
+  await refreshAll();
+}
+
+function escapeHtml(s){return String(s??'').replace(/[&<>"']/g,m=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[m]));}
+
+refreshAll();
+</script></body></html>
+HTML
+
+  cat >"${APP_DIR}/package.json" <<'JSON'
+{
+  "name": "agentia",
+  "version": "1.0.0",
+  "private": true,
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.5.0",
+    "compression": "^1.7.4",
+    "express": "^4.19.2",
+    "helmet": "^7.1.0"
+  }
+}
+JSON
+}
+
+npm_install(){
+  cd "$APP_DIR"
+  if [ ! -d node_modules ]; then
+    cmd npm install --omit=dev
+  else
+    echo "OK: node_modules exists"
+  fi
+}
+
+write_systemd(){
+  cat >"/etc/systemd/system/${SVC}" <<EOF
+[Unit]
+Description=AgentIA (Global++) backend for /agentia
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=${APP_DIR}
+Environment=PORT=${PORT}
+Environment=BASE_PATH=/agentia
+Environment=DATA_DIR=${DATA_DIR}
+Environment=DB_PATH=${DATA_DIR}/agentia.db
+ExecStart=/usr/bin/node ${APP_DIR}/server.js
+Restart=always
+RestartSec=2
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  cmd systemctl daemon-reload
+  cmd systemctl enable --now "${SVC}"
+}
+
+write_nginx_routes(){
+  mkdir -p "$(dirname "$NGX_INC")"
+  tmp="$(mktemp)"
+  cat >"$tmp" <<EOF
+# ${APP} routes (auto) ${TS}
+location = /agentia { return 301 /agentia/; }
+location ^~ /agentia/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+  proxy_set_header Upgrade \$http_upgrade;
+  proxy_set_header Connection "upgrade";
+  add_header Cache-Control "no-store" always;
+  proxy_pass http://${HOST}:${PORT}/;
+}
+EOF
+  askorupdate_file "$NGX_INC" "$tmp"
+  rm -f "$tmp"
+}
+
+ensure_nginx_include(){
+  [ -f "$NGX_SITE" ] || { echo "ERROR: missing $NGX_SITE"; exit 1; }
+
+  cmd chattr -i "$NGX_SITE" || true
+  tmp="$(mktemp)"
+  cp -a "$NGX_SITE" "$tmp"
+
+  python3 - <<PY
 from pathlib import Path
-p=Path("/var/www/wolverine/index.html")
+p=Path("$tmp")
 s=p.read_text(errors="ignore")
-orig=s
-
-# Forcer l'URL API correcte
-import re
-s=re.sub(r'const\s+API\s*=\s*["\'][^"\']+["\']','const API="/wolverine/traderone/api/budget"',s)
-
-# Normaliser le payload -> { from, amount }
-# Remplace tout body: JSON.stringify({...}) par la version canonique
-s=re.sub(
-    r'body\s*:\s*JSON\.stringify\(\s*\{[^}]*\}\s*\)',
-    'body: JSON.stringify({ from: window.solana.publicKey.toString(), amount: b })',
-    s,
-    flags=re.S
-)
-
-if s==orig:
-    print("⚠ Aucun changement détecté (déjà conforme ?)")
+inc='include $NGX_INC;'
+if inc in s:
+    print("OK: nginx include already present")
 else:
+    # insert inside server block, near other includes if possible
+    if "include /etc/nginx/includes/" in s and "server {" in s:
+        # place after first include in server
+        lines=s.splitlines()
+        out=[]
+        inserted=False
+        for ln in lines:
+            out.append(ln)
+            if (not inserted) and ("server {" in ln):
+                # wait for next includes, but if none, insert after server line
+                pass
+        # simple strategy: insert after server { line
+        lines=s.splitlines()
+        out=[]
+        inserted=False
+        for i,ln in enumerate(lines):
+            out.append(ln)
+            if (not inserted) and ln.strip()=="server {":
+                out.append("  "+inc)
+                inserted=True
+        if not inserted:
+            out.append(inc)
+        s="\n".join(out)
+    else:
+        # fallback: insert after first 'server {' occurrence
+        lines=s.splitlines()
+        out=[]
+        inserted=False
+        for ln in lines:
+            out.append(ln)
+            if (not inserted) and ("server {" in ln):
+                out.append("  "+inc)
+                inserted=True
+        if not inserted:
+            s += "\n" + inc + "\n"
+        else:
+            s="\n".join(out)
     p.write_text(s)
-    print("✔ Frontend corrigé")
+    print("OK: nginx include inserted")
 PY
 
-echo "== [4] Test nginx =="
-nginx -t
+  cp -a "$tmp" "${NGX_SITE}.bak_${TS}"
+  cp -a "$tmp" "$NGX_SITE"
+  rm -f "$tmp"
 
-echo "== [5] Reload nginx =="
-systemctl reload nginx
+  cmd nginx -t
+  cmd systemctl reload nginx
+  cmd chattr +i "$NGX_SITE" || true
+}
 
-echo "== [6] Test API locale =="
-curl -s http://127.0.0.1:3000/wolverine/traderone/api/health | grep ok && echo "✔ API locale OK" || echo "❌ API locale NOK"
+smoke(){
+  echo "== Smoke =="
+  cmd systemctl --no-pager --full status "${SVC}" | sed -n '1,20p' || true
+  cmd curl -fsS "http://${HOST}:${PORT}/agentia/health" | head -c 300; echo
+  echo "OK: https://fireinners.online/agentia/"
+}
 
-echo "== [7] Test API publique =="
-curl -s https://fireinners.online/wolverine/traderone/api/health | grep ok && echo "✔ API publique OK" || echo "❌ API publique NOK"
-
-echo "== TERMINÉ =="
-echo "➡ UI prête : bouton 'Envoyer à TraderOne' doit maintenant renvoyer du JSON"
+main(){
+  need_root
+  echo "== MEGA DEPLOY: /agentia =="
+  install_node_if_missing
+  write_backend
+  npm_install
+  write_systemd
+  write_nginx_routes
+  ensure_nginx_include
+  smoke
+}
+main
 BASH
+
+bash /root/MEGA_AGENTIA_DEPLOY.sh
