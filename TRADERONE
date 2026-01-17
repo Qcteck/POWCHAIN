@@ -2,84 +2,77 @@
 set -euo pipefail
 
 TS="$(date +%Y%m%d_%H%M%S)"
-REPORT="/root/TRADERONE_B_CHECK_${TS}.log"
-WOLV_HTML="/var/www/wolverine/index.html"
 TRADERONE_DIR="/opt/traderone"
-API_BASE="http://127.0.0.1:3000"
-BUDGET_API="/wolverine/traderone/api/budget"
-DRYRUN_API="/wolverine/traderone/api/dryrun"
-RPC_URL="https://api.mainnet-beta.solana.com"
+SERVER="$TRADERONE_DIR/server.js"
+BACKUP="$SERVER.bak.$TS"
 
-exec > >(tee -a "$REPORT") 2>&1
+echo "=== TRADERONE API PATCH (B+) ==="
 
-echo "=== B / TRADERONE CHECK (SOL-ONLY) ==="
-echo "Timestamp: $TS"
-echo
+[ -f "$SERVER" ] || { echo "ERR: server.js introuvable"; exit 1; }
 
-echo "== 0) Preconditions =="
-[ "$(id -u)" = "0" ] || { echo "ERR: must run as root"; exit 1; }
-command -v curl >/dev/null || { echo "ERR: curl missing"; exit 1; }
-command -v jq >/dev/null || { echo "ERR: jq missing"; exit 1; }
-command -v pm2 >/dev/null || echo "[WARN] pm2 not found (will skip pm2 reload checks)"
+echo "[1] Backup server.js"
+cp "$SERVER" "$BACKUP"
 
-echo "OK"
-echo
+echo "[2] Patch API routes (budget + dryrun)"
 
-echo "== 1) Freeze infra (verify nginx only, no change) =="
-nginx -t
-echo "NGINX OK (no reload performed)"
-echo
+python3 <<'PY'
+from pathlib import Path
 
-echo "== 2) RPC test (Solana) =="
-RPC_RES=$(curl -s -X POST "$RPC_URL" -H "Content-Type: application/json" \
-  --data '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' || true)
-echo "RPC response: $RPC_RES"
-echo "$RPC_RES" | grep -qi "ok" && echo "RPC OK" || echo "[WARN] RPC not OK"
-echo
+p = Path("/opt/traderone/server.js")
+s = p.read_text(errors="ignore")
 
-echo "== 3) TraderOne presence =="
-[ -d "$TRADERONE_DIR" ] && echo "Found $TRADERONE_DIR" || { echo "ERR: $TRADERONE_DIR missing"; exit 1; }
-ls -la "$TRADERONE_DIR" | sed -n '1,5p'
-echo
+if "/api/budget" in s:
+    print("API déjà patchée")
+    exit(0)
 
-echo "== 4) API reachability =="
-curl -s -m 3 "$API_BASE/health" || echo "[INFO] /health not present (continuing)"
-curl -s -m 3 "$API_BASE" || echo "[INFO] base reachable check skipped"
-echo
+PATCH = """
+// === API SOL ONLY ===
+app.post("/wolverine/traderone/api/budget", (req,res)=>{
+  const { pubkey, budgetSOL } = req.body || {};
+  if(!pubkey || !budgetSOL || budgetSOL<=0){
+    return res.status(400).json({error:"invalid budget"});
+  }
+  global.TRADERONE_BUDGET_SOL = Number(budgetSOL);
+  return res.json({ok:true,budgetSOL:global.TRADERONE_BUDGET_SOL});
+});
 
-echo "== 5) UI sanity (SOL-only expectations) =="
-[ -f "$WOLV_HTML" ] || { echo "ERR: $WOLV_HTML missing"; exit 1; }
-grep -Rni "USDC" "$WOLV_HTML" || echo "OK: no USDC mention in UI"
-grep -Rni "Budget" "$WOLV_HTML" || echo "[INFO] Budget keyword not found (UI button may be elsewhere)"
-echo
+app.post("/wolverine/traderone/api/dryrun", (req,res)=>{
+  const { pubkey } = req.body || {};
+  if(!pubkey){
+    return res.status(400).json({error:"missing pubkey"});
+  }
+  return res.json({
+    ok:true,
+    mode:"dry-run",
+    budgetSOL: global.TRADERONE_BUDGET_SOL || 0,
+    note:"no execution performed"
+  });
+});
+"""
 
-echo "== 6) Budget API (SOL) — dry post =="
-# Dummy pubkey for validation path only; backend should not move funds in dry mode
-PUB="11111111111111111111111111111111"
-BUDGET_PAYLOAD=$(jq -n --arg pub "$PUB" --argjson sol 0.01 '{pubkey:$pub,budgetSOL:$sol}')
-echo "POST $BUDGET_API payload: $BUDGET_PAYLOAD"
-curl -s -X POST "$API_BASE$BUDGET_API" \
+# insérer après app.use(express.json())
+idx = s.find("app.use(express.json())")
+if idx == -1:
+    raise SystemExit("Impossible de localiser express.json")
+
+s = s[:idx+len("app.use(express.json())")] + PATCH + s[idx+len("app.use(express.json())"):]
+
+p.write_text(s)
+print("PATCH OK")
+PY
+
+echo "[3] Restart PM2"
+pm2 restart traderone-vault
+
+sleep 2
+
+echo "[4] Test endpoints"
+curl -s -X POST http://127.0.0.1:3000/wolverine/traderone/api/budget \
   -H "Content-Type: application/json" \
-  -d "$BUDGET_PAYLOAD" | tee /tmp/budget_res.json
-echo
-echo "Budget API response:"
-cat /tmp/budget_res.json || true
-echo
+  -d '{"pubkey":"11111111111111111111111111111111","budgetSOL":0.01}' | jq .
 
-echo "== 7) TraderOne dry-run (no execution) =="
-DRY_PAYLOAD=$(jq -n --arg pub "$PUB" '{pubkey:$pub,mode:"dry-run"}')
-echo "POST $DRYRUN_API payload: $DRY_PAYLOAD"
-curl -s -X POST "$API_BASE$DRYRUN_API" \
+curl -s -X POST http://127.0.0.1:3000/wolverine/traderone/api/dryrun \
   -H "Content-Type: application/json" \
-  -d "$DRY_PAYLOAD" | tee /tmp/dryrun_res.json
-echo
-echo "Dry-run response:"
-cat /tmp/dryrun_res.json || true
-echo
+  -d '{"pubkey":"11111111111111111111111111111111"}' | jq .
 
-echo "== 8) PM2 status (if any) =="
-pm2 list || true
-echo
-
-echo "=== DONE / B CHECK COMPLETE ==="
-echo "Report: $REPORT"
+echo "=== DONE / TRADERONE API READY ==="
