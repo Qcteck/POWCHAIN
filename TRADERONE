@@ -1,4 +1,4 @@
-cat >/root/DISCOVER_AND_FIX_AGENTIA_ROUTE_SAFE.sh <<'BASH'
+cat >/root/DISCOVER_AND_FORCE_AGENTIA_ROUTE_SAFE_v2.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 TS="$(date +%Y%m%d_%H%M%S)"
@@ -25,31 +25,26 @@ echo "== Dump active nginx config (nginx -T) =="
 DUMP="/root/NGINX_T_${TS}.txt"
 nginx -T >"$DUMP" 2>&1 || { echo "ERROR: nginx -T failed. See $DUMP"; exit 1; }
 
-echo "== Discover active 443 server block for fireinners.online =="
-python3 - <<'PY'
+echo "== Discover active nginx file that owns the 443 server for fireinners.online =="
+TARGET="/root/AGENTIA_NGX_TARGET_${TS}.txt"
+python3 - "$DUMP" <<'PY' >"$TARGET"
 import re, sys
 dump_path=sys.argv[1]
 txt=open(dump_path,'r',errors='ignore').read().splitlines()
 
-# nginx -T contains lines like:
-# "configuration file /etc/nginx/sites-enabled/xxx.conf:" or "# configuration file /path: ... "
-# On Ubuntu, it's usually: "configuration file /path:" (no '#')
 file_re=re.compile(r'^(#\s*)?configuration file (.+?):\s*$')
-cur_file=None
-
-# We will scan and build chunks per file
+cur=None
 files={}
 for ln in txt:
     m=file_re.match(ln)
     if m:
-        cur_file=m.group(2).strip()
-        files.setdefault(cur_file, [])
+        cur=m.group(2).strip()
+        files.setdefault(cur, [])
         continue
-    if cur_file:
-        files[cur_file].append(ln)
+    if cur:
+        files[cur].append(ln)
 
 def find_server_blocks(lines):
-    # naive brace counting for server blocks
     blocks=[]
     i=0
     while i < len(lines):
@@ -61,125 +56,100 @@ def find_server_blocks(lines):
                 depth += lines[j].count('{')
                 depth -= lines[j].count('}')
                 if j>i and depth<=0:
-                    b=j
-                    blocks.append((a,b))
-                    i=b
+                    blocks.append((a,j))
+                    i=j
                     break
                 j+=1
         i+=1
     return blocks
 
-candidates=[]
+cands=[]
 for f,lines in files.items():
-    blocks=find_server_blocks(lines)
-    for a,b in blocks:
-        block="\n".join(lines[a:b+1])
-        # match 443 + fireinners.online
-        if re.search(r'listen\s+443', block) or re.search(r'443\s+ssl', block):
-            if re.search(r'\bserver_name\b', block) and re.search(r'\bfireinners\.online\b', block):
-                candidates.append((f,a,b,block))
+    for a,b in find_server_blocks(lines):
+        blk="\n".join(lines[a:b+1])
+        is443=bool(re.search(r'listen\s+443', blk) or re.search(r'443\s+ssl', blk))
+        hasName=bool(re.search(r'\bserver_name\b', blk) and re.search(r'\bfireinners\.online\b', blk))
+        if is443 and hasName:
+            cands.append((f,a,b,blk))
 
-if not candidates:
-    # fallback: any 443 block (maybe server_name inherited/wildcard)
+if not cands:
+    # fallback: any 443 block (first)
     for f,lines in files.items():
-        blocks=find_server_blocks(lines)
-        for a,b in blocks:
-            block="\n".join(lines[a:b+1])
-            if re.search(r'listen\s+443', block) or re.search(r'443\s+ssl', block):
-                candidates.append((f,a,b,block))
-                break
-        if candidates:
-            break
+        for a,b in find_server_blocks(lines):
+            blk="\n".join(lines[a:b+1])
+            if re.search(r'listen\s+443', blk) or re.search(r'443\s+ssl', blk):
+                print(f); sys.exit(0)
 
-if not candidates:
-    print("ERROR: no 443 server block found in nginx -T output", file=sys.stderr)
+if not cands:
     sys.exit(2)
 
-# choose the best: explicit fireinners.online match first
-best=candidates[0]
-for c in candidates:
-    if 'fireinners.online' in c[3]:
-        best=c
-        break
+# choose first explicit fireinners.online
+print(cands[0][0])
+PY
 
-print(best[0])
-PY "$DUMP" >"/root/AGENTIA_NGX_TARGET_${TS}.txt" || true
+NGX_FILE="$(cat "$TARGET" 2>/dev/null || true)"
+[ -n "${NGX_FILE:-}" ] || { echo "ERROR: cannot discover nginx file. Check $DUMP"; exit 1; }
+[ -f "$NGX_FILE" ] || { echo "ERROR: discovered nginx file not found: $NGX_FILE"; exit 1; }
 
-TARGET="$(cat "/root/AGENTIA_NGX_TARGET_${TS}.txt" 2>/dev/null || true)"
-[ -n "${TARGET:-}" ] || { echo "ERROR: cannot discover nginx target file. Check $DUMP"; exit 1; }
-[ -f "$TARGET" ] || { echo "ERROR: discovered target is not a real file: $TARGET"; exit 1; }
+echo "OK: active nginx file = $NGX_FILE"
 
-echo "OK: nginx target file = $TARGET"
+echo "== Patch active nginx file: FORCE /agentia proxy to $UP =="
+chattr -i "$NGX_FILE" 2>/dev/null || true
+cp -a "$NGX_FILE" "${NGX_FILE}.bak_${TS}"
 
-echo "== Patch target file: FORCE /agentia proxy to $UP =="
-chattr -i "$TARGET" 2>/dev/null || true
-cp -a "$TARGET" "${TARGET}.bak_${TS}"
-
-python3 - <<'PY'
+python3 - "$NGX_FILE" <<'PY'
 from pathlib import Path
 import re, sys
 
-target=Path(sys.argv[1])
-s=target.read_text(errors="ignore")
+p=Path(sys.argv[1])
+s=p.read_text(errors="ignore")
 lines=s.splitlines()
 
-def find_server_blocks(lines):
-    blocks=[]
+def server_blocks(lines):
+    out=[]
     i=0
     while i < len(lines):
         if re.search(r'^\s*server\s*\{', lines[i]):
-            a=i
-            depth=0
-            j=i
+            a=i; depth=0; j=i
             while j < len(lines):
                 depth += lines[j].count('{')
                 depth -= lines[j].count('}')
                 if j>i and depth<=0:
-                    b=j
-                    blocks.append((a,b))
-                    i=b
+                    out.append((a,j))
+                    i=j
                     break
                 j+=1
         i+=1
-    return blocks
+    return out
 
-blocks=find_server_blocks(lines)
+blocks=server_blocks(lines)
 
-def block_text(a,b): return "\n".join(lines[a:b+1])
+def blk(a,b): return "\n".join(lines[a:b+1])
 
-target_block=None
+target=None
 for a,b in blocks:
-    blk=block_text(a,b)
-    if (re.search(r'listen\s+443', blk) or re.search(r'443\s+ssl', blk)) and re.search(r'\bfireinners\.online\b', blk):
-        target_block=(a,b)
-        break
-if target_block is None:
+    t=blk(a,b)
+    if (re.search(r'listen\s+443', t) or re.search(r'443\s+ssl', t)) and re.search(r'\bfireinners\.online\b', t):
+        target=(a,b); break
+if not target:
     for a,b in blocks:
-        blk=block_text(a,b)
-        if (re.search(r'listen\s+443', blk) or re.search(r'443\s+ssl', blk)):
-            target_block=(a,b)
-            break
-if target_block is None:
-    raise SystemExit("ERROR: no server 443 block in target file")
+        t=blk(a,b)
+        if (re.search(r'listen\s+443', t) or re.search(r'443\s+ssl', t)):
+            target=(a,b); break
+if not target:
+    raise SystemExit("ERROR: no 443 server block in file")
 
-a,b=target_block
+a,b=target
 
-# remove prior agentia routes/includes INSIDE this server block
+# remove any existing /agentia locations and any include with agentia
 new=[]
 k=a
 while k<=b:
     ln=lines[k]
-    drop=False
-
-    if "agentia_routes" in ln and "include" in ln:
-        drop=True
-
-    # remove any existing /agentia locations to avoid collisions
+    if "agentia" in ln and "include" in ln:
+        k+=1; continue
     if re.search(r'^\s*location\s*(=|\^~)?\s*/agentia\b', ln):
-        drop=True
-
-    if drop:
-        if "location" in ln and "{" in ln:
+        if "{" in ln:
             depth=ln.count("{")-ln.count("}")
             k+=1
             while k<=b and depth>0:
@@ -188,25 +158,19 @@ while k<=b:
             continue
         k+=1
         continue
+    new.append(ln); k+=1
 
-    new.append(ln)
-    k+=1
-
-# rebuild file with cleaned server block
 out = lines[:a] + new + lines[b+1:]
 
-# re-find the same server block start in rebuilt file near original index a
-# (best effort: search forward for first "server {" after a-20)
-start=None
-for i in range(max(0,a-20), min(len(out), a+200)):
+# insert immediately after the first "server {"
+insert_at=None
+for i in range(a, min(len(out), a+300)):
     if re.search(r'^\s*server\s*\{', out[i]):
-        start=i
+        insert_at=i+1
         break
-if start is None:
-    raise SystemExit("ERROR: cannot re-find server block start after rebuild")
+if insert_at is None:
+    insert_at=a+1
 
-# insert forced locations right after server {
-insert_at=start+1
 block=[
 "  # === AGENTIA FORCED ROUTE (auto) ===",
 "  location = /agentia { return 301 /agentia/; }",
@@ -223,26 +187,26 @@ block=[
 ]
 out = out[:insert_at] + block + out[insert_at:]
 
-target.write_text("\n".join(out) + "\n")
-print("OK: patched", target)
-PY "$TARGET"
+p.write_text("\n".join(out) + "\n")
+print("OK: forced /agentia route added")
+PY
 
 echo "== nginx test + reload =="
 nginx -t
 systemctl reload nginx
-chattr +i "$TARGET" 2>/dev/null || true
+chattr +i "$NGX_FILE" 2>/dev/null || true
 
 echo "== VERIFY: Wolverine untouched =="
 AFT_W="$(sha "$WOLV_HTML")"
 echo "wolverine index: $AFT_W  $WOLV_HTML"
 [ "$BEF_W" = "$AFT_W" ] || { echo "ERROR: Wolverine index changed (should not)."; exit 1; }
 
-echo "== VERIFY: Public /agentia now = AgentIA (must contain 'AgentIA') =="
+echo "== VERIFY: Public /agentia now contains AgentIA (not FireInners) =="
 OUT="$(curl -kfsS "https://fireinners.online/agentia/" | head -c 4000 || true)"
 echo "$OUT" | head -c 250; echo
-echo "$OUT" | grep -qi "agentia" && echo "OK: AgentIA served on /agentia" || { echo "ERROR: still not AgentIA on /agentia. See $DUMP"; exit 1; }
+echo "$OUT" | grep -qi "agentia" && echo "OK: AgentIA served on /agentia" || { echo "ERROR: still not AgentIA on /agentia. Dump at $DUMP"; exit 1; }
 
-echo "OK: /agentia fixed via active nginx config; Wolverine untouched."
+echo "OK: /agentia fixed via active nginx file; Wolverine untouched."
 BASH
 
-bash /root/DISCOVER_AND_FIX_AGENTIA_ROUTE_SAFE.sh
+bash /root/DISCOVER_AND_FORCE_AGENTIA_ROUTE_SAFE_v2.sh
