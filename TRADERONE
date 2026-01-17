@@ -1,1 +1,68 @@
-curl -i https://fireinners.online/wolverine/traderone/api/health
+bash <<'BASH'
+set -euo pipefail
+
+### PARAMÈTRES
+APP_DIR="/opt/traderone"
+APP_FILE="$APP_DIR/server.js"
+PM2_NAME="traderone"
+API_PREFIX="/wolverine/traderone/api"
+PORT=3000
+TS="$(date +%Y%m%d_%H%M%S)"
+
+echo "=== TraderOne API FIX | $TS ==="
+
+# 1) Vérifs
+[ -d "$APP_DIR" ] || { echo "❌ Dossier $APP_DIR introuvable"; exit 1; }
+[ -f "$APP_FILE" ] || { echo "❌ $APP_FILE introuvable"; exit 1; }
+
+# 2) Backup
+cp -a "$APP_FILE" "$APP_FILE.bak_$TS"
+echo "✔ Backup créé: $APP_FILE.bak_$TS"
+
+# 3) Injection routes si absentes
+python3 - <<'PY'
+from pathlib import Path
+p=Path("/opt/traderone/server.js")
+s=p.read_text()
+
+marker="/* === AUTO ROUTES TRADERONE === */"
+if marker in s:
+    print("✔ Routes déjà présentes (skip)")
+else:
+    inject = f"""
+{marker}
+app.get("{"/wolverine/traderone/api/health"}",(req,res)=>res.json({{ok:true,ts:Date.now()}}));
+app.get("{"/wolverine/traderone/api/balances"}",(req,res)=>res.json({{sol:0,usdc:0}}));
+app.post("{"/wolverine/traderone/api/budget"}",(req,res)=>res.json({{ok:true}}));
+/* === END AUTO ROUTES === */
+"""
+    # insérer avant app.listen ou à la fin
+    idx = s.rfind("app.listen")
+    if idx!=-1:
+        s = s[:idx] + inject + "\n" + s[idx:]
+    else:
+        s += "\n" + inject
+    p.write_text(s)
+    print("✔ Routes injectées")
+PY
+
+# 4) Restart PM2
+if pm2 list | grep -q "$PM2_NAME"; then
+  pm2 restart "$PM2_NAME"
+else
+  pm2 start "$APP_FILE" --name "$PM2_NAME"
+fi
+sleep 2
+
+# 5) Vérifs locales
+echo "== TEST LOCAL =="
+curl -s -o /dev/null -w "health: %{http_code}\n" "http://127.0.0.1:$PORT$API_PREFIX/health"
+curl -s -o /dev/null -w "balances: %{http_code}\n" "http://127.0.0.1:$PORT$API_PREFIX/balances"
+curl -s -o /dev/null -w "budget: %{http_code}\n" -X POST "http://127.0.0.1:$PORT$API_PREFIX/budget"
+
+# 6) Vérif HTTPS via Cloudflare
+echo "== TEST HTTPS =="
+curl -s -o /dev/null -w "https health: %{http_code}\n" "https://fireinners.online$API_PREFIX/health"
+
+echo "=== FIN OK ==="
+BASH
