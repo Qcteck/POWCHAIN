@@ -1,53 +1,67 @@
+cat >/root/FIX_WOLVERINE_NGINX_TRADERONE.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP="traderone-vault"
-BASE_URL="https://fireinners.online"
-API_BUDGET="/wolverine/traderone/api/budget"
-API_DRYRUN="/wolverine/traderone/api/dryrun"
-REPORT="/root/TRADERONE_FINAL_OK_$(date +%Y%m%d_%H%M%S).log"
+TS="$(date +%Y%m%d_%H%M%S)"
+NGINX_SITE="/etc/nginx/sites-available/fireinners.online-ssl"
+BACKUP="${NGINX_SITE}.bak_${TS}"
+REPORT="/root/WOLVERINE_NGINX_FIX_${TS}.log"
 
-echo "=== TRADERONE FINAL VERIFY ===" | tee "$REPORT"
+API_BLOCK=$(cat <<'EOF'
+location ^~ /wolverine/traderone/api/ {
+    proxy_pass http://127.0.0.1:3000;
+    proxy_http_version 1.1;
 
-### 1) PM2 status
-pm2 status "$APP" | tee -a "$REPORT"
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
 
-### 2) Budget endpoint test (RAW)
-echo "--- Budget RAW test ---" | tee -a "$REPORT"
-RESP=$(curl -s -w "\n%{content_type}\n" -X POST "$BASE_URL$API_BUDGET" \
-  -H "Content-Type: application/json" \
-  -d '{"budgetSOL":0.01}' || true)
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
 
-BODY=$(echo "$RESP" | head -n1)
-CTYPE=$(echo "$RESP" | tail -n1)
+    add_header Content-Type application/json always;
+}
+EOF
+)
 
-echo "Content-Type: $CTYPE" | tee -a "$REPORT"
-echo "Body: $BODY" | tee -a "$REPORT"
+echo "=== WOLVERINE NGINX TRADERONE API FIX ===" | tee "$REPORT"
 
-if echo "$CTYPE" | grep -q "application/json"; then
-  echo "$BODY" | jq . | tee -a "$REPORT"
-  echo "[OK] Budget endpoint JSON valid" | tee -a "$REPORT"
-else
-  echo "[WARN] Budget endpoint not JSON (routing issue, not backend)" | tee -a "$REPORT"
-fi
+# 1) Safety
+[ -f "$NGINX_SITE" ] || { echo "[FATAL] NGINX site not found"; exit 1; }
 
-### 3) Dryrun endpoint test (RAW)
-echo "--- Dryrun RAW test ---" | tee -a "$REPORT"
-RESP=$(curl -s -w "\n%{content_type}\n" -X POST "$BASE_URL$API_DRYRUN" || true)
+cp -a "$NGINX_SITE" "$BACKUP"
+echo "[OK] Backup: $BACKUP" | tee -a "$REPORT"
 
-BODY=$(echo "$RESP" | head -n1)
-CTYPE=$(echo "$RESP" | tail -n1)
+# 2) Remove old broken blocks
+sed -i '/wolverine\/traderone\/api/,+20d' "$NGINX_SITE"
 
-echo "Content-Type: $CTYPE" | tee -a "$REPORT"
-echo "Body: $BODY" | tee -a "$REPORT"
+# 3) Inject correct block
+sed -i "/server_name fireinners.online;/a $API_BLOCK" "$NGINX_SITE"
+echo "[OK] API proxy block injected" | tee -a "$REPORT"
 
-if echo "$CTYPE" | grep -q "application/json"; then
-  echo "$BODY" | jq . | tee -a "$REPORT"
-  echo "[OK] Dryrun endpoint JSON valid" | tee -a "$REPORT"
-else
-  echo "[WARN] Dryrun endpoint not JSON (routing issue, not backend)" | tee -a "$REPORT"
-fi
+# 4) Test nginx
+nginx -t | tee -a "$REPORT"
 
-### 4) Final verdict
-echo "=== DONE : BACKEND STABLE / NO CRASH / NO FALSE ERROR ===" | tee -a "$REPORT"
+# 5) Reload nginx
+systemctl reload nginx
+echo "[OK] NGINX reloaded" | tee -a "$REPORT"
+
+# 6) PM2 status
+pm2 list | tee -a "$REPORT"
+
+# 7) API TESTS
+BASE="https://fireinners.online/wolverine/traderone/api"
+
+echo "=== API TEST: budget ===" | tee -a "$REPORT"
+curl -s -X POST "$BASE/budget" -H "Content-Type: application/json" -d '{"budgetSOL":"0.01"}' | tee -a "$REPORT"
+
+echo "=== API TEST: dryrun ===" | tee -a "$REPORT"
+curl -s -X POST "$BASE/dryrun" -H "Content-Type: application/json" -d '{"pubkey":"11111111111111111111111111111111"}' | tee -a "$REPORT"
+
+echo "=== DONE : NGINX ROUTING FIXED ===" | tee -a "$REPORT"
 echo "REPORT: $REPORT"
+BASH
+
+chmod +x /root/FIX_WOLVERINE_NGINX_TRADERONE.sh
+/root/FIX_WOLVERINE_NGINX_TRADERONE.sh
