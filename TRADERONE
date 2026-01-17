@@ -1,15 +1,12 @@
-cat >/root/FORCE_AGENTIA_PROXY_443_SAFE.sh <<'BASH'
+cat >/root/DISCOVER_AND_FIX_AGENTIA_ROUTE_SAFE.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 TS="$(date +%Y%m%d_%H%M%S)"
 
-# --- DO NOT TOUCH WOLVERINE ---
+# --- DO NOT TOUCH WOLVERINE FILES ---
 WOLV_HTML="/var/www/wolverine/index.html"
 sha(){ [ -f "$1" ] && sha256sum "$1" | awk '{print $1}' || echo "MISSING"; }
 BEF_W="$(sha "$WOLV_HTML")"
-
-# --- NGINX ---
-NGX_SITE="/etc/nginx/sites-available/fireinners.online-ssl"
 
 # --- AGENTIA ---
 SVC="agentia.service"
@@ -17,83 +14,171 @@ PORT="9697"
 UP="http://127.0.0.1:${PORT}"
 
 [ "$(id -u)" -eq 0 ] || { echo "ERROR: run as root"; exit 1; }
-[ -f "$NGX_SITE" ] || { echo "ERROR: missing $NGX_SITE"; exit 1; }
-
-echo "== BEFORE =="
-echo "wolverine index: $BEF_W  $WOLV_HTML"
-echo "nginx vhost    : $(sha "$NGX_SITE")  $NGX_SITE"
+command -v nginx >/dev/null 2>&1 || { echo "ERROR: nginx missing"; exit 1; }
 
 echo "== Ensure AgentIA running =="
 systemctl start "$SVC" >/dev/null 2>&1 || true
 sleep 1
-curl -fsS "$UP/agentia/health" | head -c 300; echo
+curl -fsS "$UP/agentia/health" | head -c 200; echo
 
-echo "== Patch nginx 443 server block: FORCE proxy /agentia =="
-chattr -i "$NGX_SITE" 2>/dev/null || true
-cp -a "$NGX_SITE" "${NGX_SITE}.bak_${TS}"
+echo "== Dump active nginx config (nginx -T) =="
+DUMP="/root/NGINX_T_${TS}.txt"
+nginx -T >"$DUMP" 2>&1 || { echo "ERROR: nginx -T failed. See $DUMP"; exit 1; }
 
+echo "== Discover active 443 server block for fireinners.online =="
 python3 - <<'PY'
-from pathlib import Path
-p=Path("/etc/nginx/sites-available/fireinners.online-ssl")
-s=p.read_text(errors="ignore")
-lines=s.splitlines()
+import re, sys
+dump_path=sys.argv[1]
+txt=open(dump_path,'r',errors='ignore').read().splitlines()
 
-# find 443 server block for fireinners.online (brace counting)
-blocks=[]
-i=0
-while i < len(lines):
-    if lines[i].strip().startswith("server") and "{" in lines[i]:
-        a=i
-        depth=0
-        started=False
-        j=i
-        while j < len(lines):
-            ln=lines[j]
-            if "{" in ln:
-                depth += ln.count("{")
-                started=True
-            if "}" in ln and started:
-                depth -= ln.count("}")
-                if depth<=0:
+# nginx -T contains lines like:
+# "configuration file /etc/nginx/sites-enabled/xxx.conf:" or "# configuration file /path: ... "
+# On Ubuntu, it's usually: "configuration file /path:" (no '#')
+file_re=re.compile(r'^(#\s*)?configuration file (.+?):\s*$')
+cur_file=None
+
+# We will scan and build chunks per file
+files={}
+for ln in txt:
+    m=file_re.match(ln)
+    if m:
+        cur_file=m.group(2).strip()
+        files.setdefault(cur_file, [])
+        continue
+    if cur_file:
+        files[cur_file].append(ln)
+
+def find_server_blocks(lines):
+    # naive brace counting for server blocks
+    blocks=[]
+    i=0
+    while i < len(lines):
+        if re.search(r'^\s*server\s*\{', lines[i]):
+            a=i
+            depth=0
+            j=i
+            while j < len(lines):
+                depth += lines[j].count('{')
+                depth -= lines[j].count('}')
+                if j>i and depth<=0:
                     b=j
                     blocks.append((a,b))
                     i=b
                     break
-            j+=1
-    i+=1
+                j+=1
+        i+=1
+    return blocks
 
-def txt(a,b): return "\n".join(lines[a:b+1])
-
-target=None
-for a,b in blocks:
-    t=txt(a,b)
-    if ("listen 443" in t or "443 ssl" in t) and ("fireinners.online" in t):
-        target=(a,b); break
-if not target:
+candidates=[]
+for f,lines in files.items():
+    blocks=find_server_blocks(lines)
     for a,b in blocks:
-        t=txt(a,b)
-        if ("listen 443" in t or "443 ssl" in t):
-            target=(a,b); break
-if not target:
-    raise SystemExit("ERROR: no 443 server block found")
+        block="\n".join(lines[a:b+1])
+        # match 443 + fireinners.online
+        if re.search(r'listen\s+443', block) or re.search(r'443\s+ssl', block):
+            if re.search(r'\bserver_name\b', block) and re.search(r'\bfireinners\.online\b', block):
+                candidates.append((f,a,b,block))
 
-a,b=target
+if not candidates:
+    # fallback: any 443 block (maybe server_name inherited/wildcard)
+    for f,lines in files.items():
+        blocks=find_server_blocks(lines)
+        for a,b in blocks:
+            block="\n".join(lines[a:b+1])
+            if re.search(r'listen\s+443', block) or re.search(r'443\s+ssl', block):
+                candidates.append((f,a,b,block))
+                break
+        if candidates:
+            break
 
-# remove any prior agentia include / locations inside the target block
+if not candidates:
+    print("ERROR: no 443 server block found in nginx -T output", file=sys.stderr)
+    sys.exit(2)
+
+# choose the best: explicit fireinners.online match first
+best=candidates[0]
+for c in candidates:
+    if 'fireinners.online' in c[3]:
+        best=c
+        break
+
+print(best[0])
+PY "$DUMP" >"/root/AGENTIA_NGX_TARGET_${TS}.txt" || true
+
+TARGET="$(cat "/root/AGENTIA_NGX_TARGET_${TS}.txt" 2>/dev/null || true)"
+[ -n "${TARGET:-}" ] || { echo "ERROR: cannot discover nginx target file. Check $DUMP"; exit 1; }
+[ -f "$TARGET" ] || { echo "ERROR: discovered target is not a real file: $TARGET"; exit 1; }
+
+echo "OK: nginx target file = $TARGET"
+
+echo "== Patch target file: FORCE /agentia proxy to $UP =="
+chattr -i "$TARGET" 2>/dev/null || true
+cp -a "$TARGET" "${TARGET}.bak_${TS}"
+
+python3 - <<'PY'
+from pathlib import Path
+import re, sys
+
+target=Path(sys.argv[1])
+s=target.read_text(errors="ignore")
+lines=s.splitlines()
+
+def find_server_blocks(lines):
+    blocks=[]
+    i=0
+    while i < len(lines):
+        if re.search(r'^\s*server\s*\{', lines[i]):
+            a=i
+            depth=0
+            j=i
+            while j < len(lines):
+                depth += lines[j].count('{')
+                depth -= lines[j].count('}')
+                if j>i and depth<=0:
+                    b=j
+                    blocks.append((a,b))
+                    i=b
+                    break
+                j+=1
+        i+=1
+    return blocks
+
+blocks=find_server_blocks(lines)
+
+def block_text(a,b): return "\n".join(lines[a:b+1])
+
+target_block=None
+for a,b in blocks:
+    blk=block_text(a,b)
+    if (re.search(r'listen\s+443', blk) or re.search(r'443\s+ssl', blk)) and re.search(r'\bfireinners\.online\b', blk):
+        target_block=(a,b)
+        break
+if target_block is None:
+    for a,b in blocks:
+        blk=block_text(a,b)
+        if (re.search(r'listen\s+443', blk) or re.search(r'443\s+ssl', blk)):
+            target_block=(a,b)
+            break
+if target_block is None:
+    raise SystemExit("ERROR: no server 443 block in target file")
+
+a,b=target_block
+
+# remove prior agentia routes/includes INSIDE this server block
 new=[]
 k=a
 while k<=b:
     ln=lines[k]
     drop=False
-    if "include /etc/nginx/includes/agentia_routes.inc" in ln:
+
+    if "agentia_routes" in ln and "include" in ln:
         drop=True
-    if "location = /agentia" in ln:
-        # drop this line and the block if present
+
+    # remove any existing /agentia locations to avoid collisions
+    if re.search(r'^\s*location\s*(=|\^~)?\s*/agentia\b', ln):
         drop=True
-    if "location ^~ /agentia/" in ln or "location /agentia" in ln:
-        drop=True
+
     if drop:
-        # if it's a location line with '{', skip until matching '}'
         if "location" in ln and "{" in ln:
             depth=ln.count("{")-ln.count("}")
             k+=1
@@ -103,24 +188,26 @@ while k<=b:
             continue
         k+=1
         continue
+
     new.append(ln)
     k+=1
 
-# rebuild whole file with patched server block content
+# rebuild file with cleaned server block
 out = lines[:a] + new + lines[b+1:]
 
-# insert our forced locations right after "server {" inside same block
-# re-find the server { line index in rebuilt file near a
-# (search forward from a)
-insert_at=None
-for idx in range(a, min(a+50, len(out))):
-    if out[idx].strip()=="server {" or out[idx].strip().startswith("server {"):
-        insert_at=idx+1
+# re-find the same server block start in rebuilt file near original index a
+# (best effort: search forward for first "server {" after a-20)
+start=None
+for i in range(max(0,a-20), min(len(out), a+200)):
+    if re.search(r'^\s*server\s*\{', out[i]):
+        start=i
         break
-if insert_at is None:
-    insert_at=a+1
+if start is None:
+    raise SystemExit("ERROR: cannot re-find server block start after rebuild")
 
-block = [
+# insert forced locations right after server {
+insert_at=start+1
+block=[
 "  # === AGENTIA FORCED ROUTE (auto) ===",
 "  location = /agentia { return 301 /agentia/; }",
 "  location ^~ /agentia/ {",
@@ -136,26 +223,26 @@ block = [
 ]
 out = out[:insert_at] + block + out[insert_at:]
 
-p.write_text("\n".join(out) + "\n")
-print("OK: nginx vhost patched with forced /agentia proxy")
-PY
+target.write_text("\n".join(out) + "\n")
+print("OK: patched", target)
+PY "$TARGET"
 
 echo "== nginx test + reload =="
 nginx -t
 systemctl reload nginx
-chattr +i "$NGX_SITE" 2>/dev/null || true
+chattr +i "$TARGET" 2>/dev/null || true
 
 echo "== VERIFY: Wolverine untouched =="
 AFT_W="$(sha "$WOLV_HTML")"
 echo "wolverine index: $AFT_W  $WOLV_HTML"
 [ "$BEF_W" = "$AFT_W" ] || { echo "ERROR: Wolverine index changed (should not)."; exit 1; }
 
-echo "== VERIFY: Public /agentia now shows AgentIA (not FireInners) =="
-OUT="$(curl -kfsS "https://fireinners.online/agentia/" | head -c 3000 || true)"
-echo "$OUT" | head -c 300; echo
-echo "$OUT" | grep -qi "agentia" && echo "OK: AgentIA is served on /agentia" || { echo "ERROR: still not AgentIA on /agentia (nginx -T dump next)."; exit 1; }
+echo "== VERIFY: Public /agentia now = AgentIA (must contain 'AgentIA') =="
+OUT="$(curl -kfsS "https://fireinners.online/agentia/" | head -c 4000 || true)"
+echo "$OUT" | head -c 250; echo
+echo "$OUT" | grep -qi "agentia" && echo "OK: AgentIA served on /agentia" || { echo "ERROR: still not AgentIA on /agentia. See $DUMP"; exit 1; }
 
-echo "OK: https://fireinners.online/agentia/ fixed; Wolverine untouched."
+echo "OK: /agentia fixed via active nginx config; Wolverine untouched."
 BASH
 
-bash /root/FORCE_AGENTIA_PROXY_443_SAFE.sh
+bash /root/DISCOVER_AND_FIX_AGENTIA_ROUTE_SAFE.sh
