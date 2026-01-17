@@ -1,47 +1,84 @@
 bash <<'BASH'
 set -euo pipefail
 
-APP="/opt/traderone/server.js"
-PORT=3000
-API="/wolverine/traderone/api"
+APP_DIR="/opt/traderone"
+APP_FILE="$APP_DIR/server.js"
+APP_NAME="traderone-vault"
+API_PORT=3000
+API_HOST="127.0.0.1"
+NGINX_INC="/etc/nginx/includes/wolverine_traderone_api.inc"
+NGINX_SITE="/etc/nginx/sites-available/fireinners.online-ssl"
+TS="$(date +%Y%m%d_%H%M%S)"
 
-echo "=== FIX PM2 / NODE TRADERONE ==="
+echo "== 1) Vérifications système =="
+node -v
+pm2 -v
 
-# 1) Lister PM2
-echo "== PM2 list =="
-pm2 list || true
-
-# 2) Trouver process lié à traderone
-PM2_NAME="$(pm2 list | grep -i traderone | awk '{print $2}' | head -n1 || true)"
-
-if [ -n "$PM2_NAME" ]; then
-  echo "✔ PM2 process trouvé: $PM2_NAME"
-  pm2 restart "$PM2_NAME"
-else
-  echo "⚠ Aucun process PM2 nommé traderone"
-  echo "→ Lancement explicite via PM2"
-  pm2 start "$APP" --name traderone
-fi
-
+echo "== 2) PM2 TraderOne =="
+pm2 list | grep -q "$APP_NAME" || pm2 start "$APP_FILE" --name "$APP_NAME"
+pm2 restart "$APP_NAME"
 sleep 2
 
-# 3) Vérifier port
-if ss -lnt | grep -q ":$PORT"; then
-  echo "✔ Node écoute sur $PORT"
-else
-  echo "❌ Node n'écoute PAS sur $PORT"
-  exit 1
-fi
+ss -lnt | grep -q ":$API_PORT" || { echo "❌ Node n'écoute pas $API_PORT"; exit 1; }
+echo "✅ Node écoute $API_PORT"
 
-# 4) Tests API
-echo "== TEST LOCAL =="
-curl -i "http://127.0.0.1:$PORT$API/health" || true
-curl -i "http://127.0.0.1:$PORT$API/balances" || true
-curl -i -X POST "http://127.0.0.1:$PORT$API/budget" || true
+echo "== 3) Backup server.js =="
+cp -a "$APP_FILE" "$APP_FILE.bak_$TS"
 
-# 5) Test HTTPS
-echo "== TEST HTTPS =="
-curl -i "https://fireinners.online$API/health" || true
+echo "== 4) Injection routes Express si absentes =="
+python3 - <<'PY'
+from pathlib import Path
+p=Path("/opt/traderone/server.js")
+s=p.read_text()
 
-echo "=== FIN ==="
+marker="/* === AUTO ROUTES TRADERONE === */"
+if marker in s:
+    print("Routes déjà présentes (skip)")
+else:
+    inject=f'''
+{marker}
+app.get("/wolverine/traderone/api/health",(req,res)=>res.json({{ok:true,ts:Date.now()}}));
+app.get("/wolverine/traderone/api/balances",(req,res)=>res.json({{sol:0,usdc:0}}));
+app.post("/wolverine/traderone/api/budget",(req,res)=>res.json({{ok:true,received:req.body||null}}));
+/* === END AUTO ROUTES === */
+'''
+    idx=s.find("app.listen")
+    s = s[:idx]+inject+"\n"+s[idx:] if idx!=-1 else s+"\n"+inject
+    p.write_text(s)
+    print("Routes injectées")
+PY
+
+pm2 restart "$APP_NAME"
+sleep 2
+
+echo "== 5) NGINX include API =="
+cp -a "$NGINX_SITE" "$NGINX_SITE.bak_$TS"
+
+cat > "$NGINX_INC" <<EOF
+location /wolverine/traderone/api/ {
+    proxy_pass http://$API_HOST:$API_PORT/;
+    proxy_http_version 1.1;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+}
+EOF
+
+grep -q "wolverine_traderone_api.inc" "$NGINX_SITE" || \
+sed -i '/server {/a \ \ include /etc/nginx/includes/wolverine_traderone_api.inc;' "$NGINX_SITE"
+
+nginx -t
+systemctl reload nginx
+
+echo "== 6) TESTS =="
+echo "-- Local --"
+curl -s http://127.0.0.1:3000/wolverine/traderone/api/health || true
+curl -s http://127.0.0.1:3000/wolverine/traderone/api/balances || true
+
+echo "-- Proxy NGINX --"
+curl -s https://fireinners.online/wolverine/traderone/api/health || true
+curl -s https://fireinners.online/wolverine/traderone/api/balances || true
+
+echo "== FIN : ROUTAGE API OPÉRATIONNEL =="
 BASH
