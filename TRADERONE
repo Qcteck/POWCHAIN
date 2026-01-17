@@ -1,1 +1,85 @@
-/root/FIX_NGINX_WOLVERINE_INCLUDE_NUKE.sh
+#!/usr/bin/env bash
+set -euo pipefail
+
+TS="$(date +%Y%m%d_%H%M%S)"
+REPORT="/root/TRADERONE_B_CHECK_${TS}.log"
+WOLV_HTML="/var/www/wolverine/index.html"
+TRADERONE_DIR="/opt/traderone"
+API_BASE="http://127.0.0.1:3000"
+BUDGET_API="/wolverine/traderone/api/budget"
+DRYRUN_API="/wolverine/traderone/api/dryrun"
+RPC_URL="https://api.mainnet-beta.solana.com"
+
+exec > >(tee -a "$REPORT") 2>&1
+
+echo "=== B / TRADERONE CHECK (SOL-ONLY) ==="
+echo "Timestamp: $TS"
+echo
+
+echo "== 0) Preconditions =="
+[ "$(id -u)" = "0" ] || { echo "ERR: must run as root"; exit 1; }
+command -v curl >/dev/null || { echo "ERR: curl missing"; exit 1; }
+command -v jq >/dev/null || { echo "ERR: jq missing"; exit 1; }
+command -v pm2 >/dev/null || echo "[WARN] pm2 not found (will skip pm2 reload checks)"
+
+echo "OK"
+echo
+
+echo "== 1) Freeze infra (verify nginx only, no change) =="
+nginx -t
+echo "NGINX OK (no reload performed)"
+echo
+
+echo "== 2) RPC test (Solana) =="
+RPC_RES=$(curl -s -X POST "$RPC_URL" -H "Content-Type: application/json" \
+  --data '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' || true)
+echo "RPC response: $RPC_RES"
+echo "$RPC_RES" | grep -qi "ok" && echo "RPC OK" || echo "[WARN] RPC not OK"
+echo
+
+echo "== 3) TraderOne presence =="
+[ -d "$TRADERONE_DIR" ] && echo "Found $TRADERONE_DIR" || { echo "ERR: $TRADERONE_DIR missing"; exit 1; }
+ls -la "$TRADERONE_DIR" | sed -n '1,5p'
+echo
+
+echo "== 4) API reachability =="
+curl -s -m 3 "$API_BASE/health" || echo "[INFO] /health not present (continuing)"
+curl -s -m 3 "$API_BASE" || echo "[INFO] base reachable check skipped"
+echo
+
+echo "== 5) UI sanity (SOL-only expectations) =="
+[ -f "$WOLV_HTML" ] || { echo "ERR: $WOLV_HTML missing"; exit 1; }
+grep -Rni "USDC" "$WOLV_HTML" || echo "OK: no USDC mention in UI"
+grep -Rni "Budget" "$WOLV_HTML" || echo "[INFO] Budget keyword not found (UI button may be elsewhere)"
+echo
+
+echo "== 6) Budget API (SOL) — dry post =="
+# Dummy pubkey for validation path only; backend should not move funds in dry mode
+PUB="11111111111111111111111111111111"
+BUDGET_PAYLOAD=$(jq -n --arg pub "$PUB" --argjson sol 0.01 '{pubkey:$pub,budgetSOL:$sol}')
+echo "POST $BUDGET_API payload: $BUDGET_PAYLOAD"
+curl -s -X POST "$API_BASE$BUDGET_API" \
+  -H "Content-Type: application/json" \
+  -d "$BUDGET_PAYLOAD" | tee /tmp/budget_res.json
+echo
+echo "Budget API response:"
+cat /tmp/budget_res.json || true
+echo
+
+echo "== 7) TraderOne dry-run (no execution) =="
+DRY_PAYLOAD=$(jq -n --arg pub "$PUB" '{pubkey:$pub,mode:"dry-run"}')
+echo "POST $DRYRUN_API payload: $DRY_PAYLOAD"
+curl -s -X POST "$API_BASE$DRYRUN_API" \
+  -H "Content-Type: application/json" \
+  -d "$DRY_PAYLOAD" | tee /tmp/dryrun_res.json
+echo
+echo "Dry-run response:"
+cat /tmp/dryrun_res.json || true
+echo
+
+echo "== 8) PM2 status (if any) =="
+pm2 list || true
+echo
+
+echo "=== DONE / B CHECK COMPLETE ==="
+echo "Report: $REPORT"
