@@ -2,101 +2,64 @@
 set -euo pipefail
 
 echo "=============================="
-echo " TRADERONE API HARD FIX (ROOT)"
+echo " TRADERONE PORT AUTO-DETECT "
 echo "=============================="
 
 APP="traderone-vault"
 FILE="/opt/traderone-vault/server.js"
-TS=$(date +%Y%m%d_%H%M%S)
 
 ########################################
-# 1) Vérifications
+# 1) PM2 infos
 ########################################
-echo "[1/6] Vérifications"
-[ -f "$FILE" ] || { echo "❌ server.js introuvable"; exit 1; }
-
-########################################
-# 2) Backup
-########################################
-echo "[2/6] Backup"
-cp "$FILE" "$FILE.bak_$TS"
-echo "✔ Backup créé: $FILE.bak_$TS"
+echo "[1/5] PM2 infos"
+pm2 describe "$APP" || exit 1
 
 ########################################
-# 3) Injection API (SAFE)
+# 2) Détection PORT dans server.js
 ########################################
-echo "[3/6] Injection routes API"
+echo "[2/5] Scan server.js pour listen()"
 
-python3 <<'PY'
-from pathlib import Path
-
-p = Path("/opt/traderone-vault/server.js")
-s = p.read_text()
-
-MARK = "/* === TRADERONE API ROUTES === */"
-if MARK in s:
-    print("Routes déjà présentes → SKIP")
-    exit(0)
-
-inject = """
-/* === TRADERONE API ROUTES === */
-app.get("/wolverine/traderone/api/health",(req,res)=>{
-  res.json({ok:true,ts:Date.now()});
-});
-
-app.post("/wolverine/traderone/api/budget",(req,res)=>{
-  try{
-    const body=req.body||{};
-    if(!body.pubkey||!body.budgetSol) throw "payload invalide";
-    const lamports=Math.floor(Number(body.budgetSol)*1e9);
-    if(lamports<=0) throw "montant invalide";
-    res.json({ok:true,lamports});
-  }catch(e){
-    res.status(400).json({ok:false,error:String(e)});
-  }
-});
-/* === END TRADERONE API ROUTES === */
-"""
-
-# insère juste avant app.listen
-idx = s.rfind("app.listen")
-if idx == -1:
-    raise SystemExit("app.listen introuvable")
-
-s = s[:idx] + inject + "\n" + s[idx:]
-p.write_text(s)
-print("✔ Routes API injectées")
-PY
+PORTS=$(grep -E "listen\(|PORT" "$FILE" || true)
+echo "---- server.js ----"
+echo "$PORTS"
+echo "-------------------"
 
 ########################################
-# 4) Restart PM2
+# 3) Ports ouverts par le process
 ########################################
-echo "[4/6] Redémarrage PM2"
-pm2 restart "$APP"
-sleep 2
+echo "[3/5] Ports réellement écoutés"
+PID=$(pm2 pid "$APP")
+echo "PID=$PID"
+
+ss -lntp | grep "$PID" || echo "⚠️ aucun port trouvé via ss"
 
 ########################################
-# 5) Test API LOCALE (clé)
+# 4) Test automatique des ports détectés
 ########################################
-echo "[5/6] Test API locale"
-RESP=$(curl -s http://127.0.0.1:3000/wolverine/traderone/api/health || true)
-echo "$RESP"
+echo "[4/5] Test API sur ports actifs"
 
-echo "$RESP" | grep -q '"ok":true' \
- && echo "✔ API locale OK" \
- || { echo "❌ API locale toujours KO"; exit 1; }
+FOUND=0
+for P in $(ss -lntp | grep "$PID" | awk '{print $4}' | awk -F: '{print $NF}'); do
+  echo "→ Test port $P"
+  curl -s --max-time 2 http://127.0.0.1:$P/wolverine/traderone/api/health || true
+  echo
+  if curl -s http://127.0.0.1:$P/wolverine/traderone/api/health | grep -q '"ok"'; then
+    echo "✅ API OK sur port $P"
+    FOUND=$P
+    break
+  fi
+done
 
 ########################################
-# 6) Test POST local
+# 5) Verdict
 ########################################
-echo "[6/6] Test POST budget local"
-curl -s -X POST http://127.0.0.1:3000/wolverine/traderone/api/budget \
- -H "Content-Type: application/json" \
- -d '{"pubkey":"11111111111111111111111111111111","budgetSol":0.001}' \
- | tee /dev/stderr | grep -q '"ok":true'
-
 echo "=============================="
-echo " ✅ API TRADERONE ACTIVE"
-echo " - health OK"
-echo " - budget OK"
+if [ "$FOUND" = "0" ]; then
+  echo "❌ AUCUN PORT API TROUVÉ"
+  echo "→ Le serveur n'expose pas Express correctement"
+  exit 1
+else
+  echo "✅ PORT RÉEL = $FOUND"
+  echo "👉 Utilise ce port pour nginx proxy_pass"
+fi
 echo "=============================="
