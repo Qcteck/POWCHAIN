@@ -1,136 +1,107 @@
+cat > /root/TRADERONE_UI_BUDGET_SOL_ALL.sh <<'BASH'
 #!/usr/bin/env bash
-set -euo pipefail
+set -e
 
-############################
-# CONFIG FIXE (NE PAS MODIFIER)
-############################
-TRADERONE_DIR="/opt/traderone"
-WOLVERINE_UI="/var/www/wolverine/index.html"
-REPORT="/root/TRADERONE_UI_VAULT_LIVE_$(date +%Y%m%d_%H%M%S).log"
-BACKUP_DIR="/root/TRADERONE_BACKUP_$(date +%Y%m%d_%H%M%S)"
-RPC_URL="https://lb.drpc.live/solana/AsxThpeKkEjGtZhCNUEQYo1ZluSgmwsR76RdFhW5UfFk"
+### CONFIG
+UI_HTML="/var/www/wolverine/index.html"
+BACKEND="/opt/traderone/server.js"
+API_PATH="/wolverine/traderone/api/budget"
+REPORT="/root/TRADERONE_UI_BUDGET_SOL_$(date +%Y%m%d_%H%M%S).log"
 
-echo "=== TRADERONE UI+VAULT+LIVE (SOL ONLY) ===" | tee -a "$REPORT"
-echo "Backup dir: $BACKUP_DIR" | tee -a "$REPORT"
-mkdir -p "$BACKUP_DIR"
+echo "===== TRADERONE UI → BUDGET SOL (ALL-IN-ONE) =====" | tee "$REPORT"
 
-############################
-# PRECHECKS
-############################
-[ -d "$TRADERONE_DIR" ] || { echo "ERROR: $TRADERONE_DIR not found" | tee -a "$REPORT"; exit 1; }
-[ -f "$WOLVERINE_UI" ] || { echo "ERROR: UI not found $WOLVERINE_UI" | tee -a "$REPORT"; exit 1; }
-
-############################
-# BACKUPS
-############################
-cp -a "$TRADERONE_DIR" "$BACKUP_DIR/traderone"
-cp -a "$WOLVERINE_UI" "$BACKUP_DIR/index.html"
+### 1) SAFETY BACKUP
+cp "$UI_HTML" "$UI_HTML.bak.$(date +%s)"
+cp "$BACKEND" "$BACKEND.bak.$(date +%s)"
 echo "[OK] Backups done" | tee -a "$REPORT"
 
-############################################
-# PHASE 1 — UI SOL-ONLY (NETTOYAGE TOTAL)
-############################################
-echo "=== PHASE 1: UI SOL-ONLY ===" | tee -a "$REPORT"
-
-# 1) Neutraliser toute mention USDC dans l’UI
-sed -i \
-  -e 's/USDC/SOL/g' \
-  -e 's/usdc/sol/g' \
-  "$WOLVERINE_UI"
-
-# 2) Forcer RPC et balance SOL uniquement (sécurisé, sans doublons)
-python3 - <<'PY'
+### 2) UI – ADD BUTTON + JS (SOL ONLY)
+python3 <<'PY'
 from pathlib import Path
-p=Path("/var/www/wolverine/index.html")
-s=p.read_text(errors="ignore")
 
-# éviter redéclarations
-s=s.replace("let connection =","// let connection =")
-s=s.replace("const connection =","// const connection =")
+p = Path("/var/www/wolverine/index.html")
+html = p.read_text(errors="ignore")
 
-inject = """
+if "sendBudget" in html:
+    print("UI already patched")
+    exit()
+
+BLOCK = """
+<div style="margin-top:10px;">
+  <input id="budgetSol" type="number" step="0.001" min="0.001" placeholder="Budget SOL" />
+  <button id="sendBudget">Envoyer à TraderOne</button>
+</div>
+<pre id="budgetStatus"></pre>
+
 <script>
-(function(){
-  const RPC_URL = "%s";
-  if(!window.solana || !window.solana.isPhantom) return;
-  const { Connection, PublicKey } = solanaWeb3;
-  const connection = new Connection(RPC_URL,"confirmed");
-
-  async function refreshSOL(){
-    try{
-      const pub = window.solana.publicKey;
-      if(!pub) return;
-      const lamports = await connection.getBalance(pub);
-      const sol = (lamports/1e9).toFixed(6);
-      const el=document.getElementById("sol-balance");
-      if(el) el.textContent=sol+" SOL";
-    }catch(e){ console.error(e); }
-  }
-
-  window.addEventListener("load",refreshSOL);
-})();
+const TRADERONE_API="/wolverine/traderone/api/budget";
+document.getElementById("sendBudget").onclick=async()=>{
+ try{
+  if(!window.solana||!window.solana.publicKey)throw"Wallet non connecté";
+  const b=parseFloat(document.getElementById("budgetSol").value);
+  if(!b||b<=0)throw"Budget invalide";
+  const r=await fetch(TRADERONE_API,{
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({pubkey:window.solana.publicKey.toString(),budgetSOL:b})
+  });
+  document.getElementById("budgetStatus").textContent="OK "+JSON.stringify(await r.json());
+ }catch(e){
+  document.getElementById("budgetStatus").textContent="ERREUR "+e;
+ }
+};
 </script>
-""" % "%s"
+"""
 
-if "</body>" in s and "refreshSOL" not in s:
-    s=s.replace("</body>",inject+"</body>")
-
-p.write_text(s)
+html = html.replace("</body>", BLOCK + "\n</body>")
+p.write_text(html)
+print("UI patched")
 PY
 
-echo "[OK] UI cleaned SOL-only" | tee -a "$REPORT"
+echo "[OK] UI patched (SOL budget button)" | tee -a "$REPORT"
 
-############################################
-# PHASE 2 — VAULT ISOLATION (BACKEND)
-############################################
-echo "=== PHASE 2: VAULT ===" | tee -a "$REPORT"
+### 3) BACKEND – ADD ENDPOINT
+grep -q "api/budget" "$BACKEND" || python3 <<'PY'
+from pathlib import Path
 
-# 1) Forcer logique asset = SOL uniquement dans le backend
-grep -RIl "asset" "$TRADERONE_DIR" | while read -r f; do
-  sed -i \
-    -e 's/asset\s*===\s*["'\'']USDC["'\'']/false/g' \
-    -e 's/asset\s*===\s*["'\'']SOL["'\'']/true/g' \
-    "$f" || true
-done
+p=Path("/opt/traderone/server.js")
+s=p.read_text(errors="ignore")
 
-# 2) Neutraliser toute variable/state usdc côté backend
-grep -RIl "usdc" "$TRADERONE_DIR" | while read -r f; do
-  sed -i \
-    -e 's/usdc\s*[:=][^,;)]*/usdc:0/g' \
-    -e 's/state\.usdc/state.sol/g' \
-    "$f" || true
-done
+ENDPOINT = """
+app.post("/api/budget",(req,res)=>{
+ const {pubkey,budgetSOL}=req.body||{};
+ if(!pubkey||!budgetSOL||budgetSOL<=0)return res.status(400).json({error:"invalid_budget"});
+ if(!db[pubkey])db[pubkey]={sol:0};
+ db[pubkey].budgetSOL=Number(budgetSOL);
+ console.log("[TRADERONE] Budget SOL:",pubkey,budgetSOL);
+ res.json({ok:true,budgetSOL});
+});
+"""
 
-echo "[OK] Backend forced SOL-only" | tee -a "$REPORT"
+s += "\n" + ENDPOINT
+p.write_text(s)
+print("Backend patched")
+PY
 
-############################################
-# PHASE 3 — LIVE MODE (PAS DE SIMULATION)
-############################################
-echo "=== PHASE 3: LIVE ===" | tee -a "$REPORT"
+echo "[OK] Backend endpoint added" | tee -a "$REPORT"
 
-# 1) Supprimer fichiers de simulation connus
-find "$TRADERONE_DIR" -type f \( -iname "*simulate*" -o -iname "*mock*" \) -exec rm -f {} + || true
+### 4) RPC TEST
+echo "[TEST] RPC" | tee -a "$REPORT"
+node - <<'JS'
+const {Connection}=require("@solana/web3.js");
+const c=new Connection("https://lb.drpc.live/solana","confirmed");
+c.getEpochInfo().then(r=>console.log("RPC OK epoch",r.epoch)).catch(e=>console.error("RPC FAIL",e));
+JS
 
-# 2) Variables d’environnement LIVE
-export TRADERONE_MODE="LIVE"
-export TRADERONE_ASSET="SOL"
-export TRADERONE_RPC="$RPC_URL"
+### 5) RELOAD SERVICES
+nginx -s reload
+pm2 restart traderone-vault
 
-# 3) Redémarrage propre via PM2
-if command -v pm2 >/dev/null 2>&1; then
-  pm2 reload all || pm2 restart all
-  pm2 save
-  echo "[OK] PM2 restarted" | tee -a "$REPORT"
-else
-  echo "[WARN] PM2 not found" | tee -a "$REPORT"
-fi
+echo "[OK] NGINX + PM2 reloaded" | tee -a "$REPORT"
 
-############################################
-# VERIFICATION FINALE
-############################################
-echo "=== VERIFICATION ===" | tee -a "$REPORT"
-grep -R "USDC" "$TRADERONE_DIR" "$WOLVERINE_UI" || echo "[OK] No USDC remaining" | tee -a "$REPORT"
-echo "MODE=LIVE ASSET=SOL" | tee -a "$REPORT"
-
-echo "=== DONE: TRADERONE UI+VAULT+LIVE SOL-ONLY ===" | tee -a "$REPORT"
+### DONE
+echo "===== DONE : UI → TRADERONE BUDGET SOL =====" | tee -a "$REPORT"
 echo "Report: $REPORT"
+BASH
+
+chmod +x /root/TRADERONE_UI_BUDGET_SOL_ALL.sh
