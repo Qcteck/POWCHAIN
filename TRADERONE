@@ -1,40 +1,73 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-DIR="/opt/traderone-vault"
-WALLET="$DIR/wallet.json"
+SERVER="/opt/traderone-vault/server.js"
+WALLET="/opt/traderone-vault/wallet.json"
+APP="traderone-vault"
+TS="$(date +%Y%m%d_%H%M%S)"
 
-echo "=== Création wallet TraderOne ==="
+echo "=== TRANSFERT SOL TRADERONE (ROOT) ==="
 
-mkdir -p "$DIR"
+# 1) Vérifs
+[ -f "$SERVER" ] || { echo "server.js introuvable"; exit 1; }
+[ -f "$WALLET" ] || { echo "wallet.json manquant"; exit 1; }
 
-if [ -f "$WALLET" ]; then
-  echo "wallet.json existe déjà — ABORT"
-  exit 1
-fi
+# 2) Backup
+cp "$SERVER" "$SERVER.bak_transfer_$TS"
 
-node <<'JS'
+# 3) Injection API transfert SOL
+python3 <<'PY'
+from pathlib import Path
+p=Path("/opt/traderone-vault/server.js")
+s=p.read_text()
+
+if "TRADERONE_SOL_TRANSFER_READY" in s:
+    print("API transfert déjà injectée")
+    exit(0)
+
+inject = r'''
+/* === TRADERONE_SOL_TRANSFER_READY === */
 const fs = require("fs");
-const { Keypair } = require("@solana/web3.js");
 const bs58 = require("bs58");
+const { Keypair, PublicKey, SystemProgram, Transaction, sendAndConfirmTransaction, LAMPORTS_PER_SOL } = require("@solana/web3.js");
 
-const kp = Keypair.generate();
+const traderWalletRaw = JSON.parse(fs.readFileSync("/opt/traderone-vault/wallet.json","utf8"));
+const traderSecret = traderWalletRaw.secretKey ? bs58.decode(traderWalletRaw.secretKey) : traderWalletRaw;
+const traderKeypair = Keypair.fromSecretKey(traderSecret);
 
-fs.writeFileSync(
-  "/opt/traderone-vault/wallet.json",
-  JSON.stringify({
-    pubkey: kp.publicKey.toBase58(),
-    secretKey: bs58.encode(kp.secretKey)
-  }, null, 2)
-);
+app.post("/wolverine/traderone/api/budget", async (req,res)=>{
+  try{
+    const { from, amount } = req.body;
+    if(!from || !amount) return res.status(400).json({ok:false,error:"missing from/amount"});
+    const lamports = Math.floor(Number(amount) * LAMPORTS_PER_SOL);
+    if(lamports<=0) throw "amount invalid";
 
-console.log("=== WALLET TRADERONE CRÉÉ ===");
-console.log("PUBKEY:", kp.publicKey.toBase58());
-JS
+    const tx = new Transaction().add(
+      SystemProgram.transfer({
+        fromPubkey: new PublicKey(from),
+        toPubkey: traderKeypair.publicKey,
+        lamports
+      })
+    );
 
-chmod 600 "$WALLET"
+    const sig = await sendAndConfirmTransaction(connection, tx, []);
+    res.json({ok:true,signature:sig,to:traderKeypair.publicKey.toBase58(),amount});
+  }catch(e){
+    res.status(500).json({ok:false,error:String(e)});
+  }
+});
+'''
+p.write_text(s + "\n" + inject)
+print("Injection API transfert OK")
+PY
 
-echo "=== Permissions OK ==="
-ls -l "$WALLET"
+# 4) Restart PM2
+pm2 delete "$APP" 2>/dev/null || true
+pm2 start "$SERVER" --name "$APP"
+pm2 save
+sleep 2
 
-echo "✅ WALLET TRADERONE PRÊT"
+# 5) Test local
+curl -s http://127.0.0.1:3000/wolverine/traderone/api/health | grep ok && echo "API OK"
+
+echo "✅ TRANSFERT SOL TRADERONE OPÉRATIONNEL"
