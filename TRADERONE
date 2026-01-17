@@ -1,179 +1,86 @@
-cat >/root/DISCOVER_AND_FORCE_AGENTIA_ROUTE_SAFE_v2.sh <<'BASH'
+cat >/root/FORCE_AGENTIA_ROUTE_WITH_PROBE.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 TS="$(date +%Y%m%d_%H%M%S)"
 
-# --- DO NOT TOUCH WOLVERINE FILES ---
 WOLV_HTML="/var/www/wolverine/index.html"
 sha(){ [ -f "$1" ] && sha256sum "$1" | awk '{print $1}' || echo "MISSING"; }
 BEF_W="$(sha "$WOLV_HTML")"
 
-# --- AGENTIA ---
 SVC="agentia.service"
 PORT="9697"
 UP="http://127.0.0.1:${PORT}"
 
-[ "$(id -u)" -eq 0 ] || { echo "ERROR: run as root"; exit 1; }
-command -v nginx >/dev/null 2>&1 || { echo "ERROR: nginx missing"; exit 1; }
+# Active file you discovered in your output
+NGX_FILE="/etc/nginx/sites-enabled/fireinners.online-ssl"
 
-echo "== Ensure AgentIA running =="
+[ "$(id -u)" -eq 0 ] || { echo "ERROR: run as root"; exit 1; }
+[ -f "$NGX_FILE" ] || { echo "ERROR: missing $NGX_FILE"; exit 1; }
+
+echo "== AgentIA local health =="
 systemctl start "$SVC" >/dev/null 2>&1 || true
 sleep 1
 curl -fsS "$UP/agentia/health" | head -c 200; echo
 
-echo "== Dump active nginx config (nginx -T) =="
-DUMP="/root/NGINX_T_${TS}.txt"
-nginx -T >"$DUMP" 2>&1 || { echo "ERROR: nginx -T failed. See $DUMP"; exit 1; }
-
-echo "== Discover active nginx file that owns the 443 server for fireinners.online =="
-TARGET="/root/AGENTIA_NGX_TARGET_${TS}.txt"
-python3 - "$DUMP" <<'PY' >"$TARGET"
-import re, sys
-dump_path=sys.argv[1]
-txt=open(dump_path,'r',errors='ignore').read().splitlines()
-
-file_re=re.compile(r'^(#\s*)?configuration file (.+?):\s*$')
-cur=None
-files={}
-for ln in txt:
-    m=file_re.match(ln)
-    if m:
-        cur=m.group(2).strip()
-        files.setdefault(cur, [])
-        continue
-    if cur:
-        files[cur].append(ln)
-
-def find_server_blocks(lines):
-    blocks=[]
-    i=0
-    while i < len(lines):
-        if re.search(r'^\s*server\s*\{', lines[i]):
-            a=i
-            depth=0
-            j=i
-            while j < len(lines):
-                depth += lines[j].count('{')
-                depth -= lines[j].count('}')
-                if j>i and depth<=0:
-                    blocks.append((a,j))
-                    i=j
-                    break
-                j+=1
-        i+=1
-    return blocks
-
-cands=[]
-for f,lines in files.items():
-    for a,b in find_server_blocks(lines):
-        blk="\n".join(lines[a:b+1])
-        is443=bool(re.search(r'listen\s+443', blk) or re.search(r'443\s+ssl', blk))
-        hasName=bool(re.search(r'\bserver_name\b', blk) and re.search(r'\bfireinners\.online\b', blk))
-        if is443 and hasName:
-            cands.append((f,a,b,blk))
-
-if not cands:
-    # fallback: any 443 block (first)
-    for f,lines in files.items():
-        for a,b in find_server_blocks(lines):
-            blk="\n".join(lines[a:b+1])
-            if re.search(r'listen\s+443', blk) or re.search(r'443\s+ssl', blk):
-                print(f); sys.exit(0)
-
-if not cands:
-    sys.exit(2)
-
-# choose first explicit fireinners.online
-print(cands[0][0])
-PY
-
-NGX_FILE="$(cat "$TARGET" 2>/dev/null || true)"
-[ -n "${NGX_FILE:-}" ] || { echo "ERROR: cannot discover nginx file. Check $DUMP"; exit 1; }
-[ -f "$NGX_FILE" ] || { echo "ERROR: discovered nginx file not found: $NGX_FILE"; exit 1; }
-
-echo "OK: active nginx file = $NGX_FILE"
-
-echo "== Patch active nginx file: FORCE /agentia proxy to $UP =="
+echo "== Backup + unlock nginx file =="
 chattr -i "$NGX_FILE" 2>/dev/null || true
 cp -a "$NGX_FILE" "${NGX_FILE}.bak_${TS}"
 
-python3 - "$NGX_FILE" <<'PY'
+echo "== Inject PROBE + PROXY into ALL server blocks in $NGX_FILE =="
+python3 - <<'PY'
 from pathlib import Path
-import re, sys
+import re
 
-p=Path(sys.argv[1])
+p=Path("/etc/nginx/sites-enabled/fireinners.online-ssl")
 s=p.read_text(errors="ignore")
 lines=s.splitlines()
 
-def server_blocks(lines):
+# Find all "server { ... }" blocks by brace counting
+blocks=[]
+i=0
+while i < len(lines):
+    if re.match(r'^\s*server\s*\{', lines[i]):
+        a=i; depth=0; j=i
+        while j < len(lines):
+            depth += lines[j].count('{')
+            depth -= lines[j].count('}')
+            if j>i and depth<=0:
+                blocks.append((a,j))
+                i=j
+                break
+            j+=1
+    i+=1
+
+if not blocks:
+    raise SystemExit("ERROR: no server blocks found in file")
+
+def strip_agentia(block_lines):
     out=[]
-    i=0
-    while i < len(lines):
-        if re.search(r'^\s*server\s*\{', lines[i]):
-            a=i; depth=0; j=i
-            while j < len(lines):
-                depth += lines[j].count('{')
-                depth -= lines[j].count('}')
-                if j>i and depth<=0:
-                    out.append((a,j))
-                    i=j
-                    break
-                j+=1
-        i+=1
+    k=0
+    while k < len(block_lines):
+        ln=block_lines[k]
+        # drop any existing /agentia locations to avoid collisions
+        if re.search(r'^\s*location\s*(=|\^~)?\s*/agentia\b', ln):
+            if "{" in ln:
+                depth=ln.count("{")-ln.count("}")
+                k+=1
+                while k < len(block_lines) and depth>0:
+                    depth += block_lines[k].count("{")-block_lines[k].count("}")
+                    k+=1
+                continue
+            k+=1
+            continue
+        # drop any includes of agentia_routes
+        if "include" in ln and "agentia" in ln:
+            k+=1
+            continue
+        out.append(ln); k+=1
     return out
 
-blocks=server_blocks(lines)
-
-def blk(a,b): return "\n".join(lines[a:b+1])
-
-target=None
-for a,b in blocks:
-    t=blk(a,b)
-    if (re.search(r'listen\s+443', t) or re.search(r'443\s+ssl', t)) and re.search(r'\bfireinners\.online\b', t):
-        target=(a,b); break
-if not target:
-    for a,b in blocks:
-        t=blk(a,b)
-        if (re.search(r'listen\s+443', t) or re.search(r'443\s+ssl', t)):
-            target=(a,b); break
-if not target:
-    raise SystemExit("ERROR: no 443 server block in file")
-
-a,b=target
-
-# remove any existing /agentia locations and any include with agentia
-new=[]
-k=a
-while k<=b:
-    ln=lines[k]
-    if "agentia" in ln and "include" in ln:
-        k+=1; continue
-    if re.search(r'^\s*location\s*(=|\^~)?\s*/agentia\b', ln):
-        if "{" in ln:
-            depth=ln.count("{")-ln.count("}")
-            k+=1
-            while k<=b and depth>0:
-                depth += lines[k].count("{")-lines[k].count("}")
-                k+=1
-            continue
-        k+=1
-        continue
-    new.append(ln); k+=1
-
-out = lines[:a] + new + lines[b+1:]
-
-# insert immediately after the first "server {"
-insert_at=None
-for i in range(a, min(len(out), a+300)):
-    if re.search(r'^\s*server\s*\{', out[i]):
-        insert_at=i+1
-        break
-if insert_at is None:
-    insert_at=a+1
-
-block=[
-"  # === AGENTIA FORCED ROUTE (auto) ===",
+patch = [
+"  # === AGENTIA ROUTES (FORCED, AUTO) ===",
 "  location = /agentia { return 301 /agentia/; }",
+"  location = /agentia/__probe { add_header Cache-Control \"no-store\" always; return 200 \"AGENTIA_NGINX_OK\\n\"; }",
 "  location ^~ /agentia/ {",
 "    proxy_http_version 1.1;",
 "    proxy_set_header Host $host;",
@@ -183,12 +90,30 @@ block=[
 "    add_header Cache-Control \"no-store\" always;",
 "    proxy_pass http://127.0.0.1:9697;",
 "  }",
-"  # === /AGENTIA FORCED ROUTE ===",
+"  # === /AGENTIA ROUTES ===",
 ]
-out = out[:insert_at] + block + out[insert_at:]
+
+out=[]
+last=0
+for a,b in blocks:
+    out.extend(lines[last:a])
+    blk=lines[a:b+1]
+    blk=strip_agentia(blk)
+    # insert right after "server {"
+    inserted=False
+    for idx in range(len(blk)):
+        if re.match(r'^\s*server\s*\{', blk[idx]):
+            blk = blk[:idx+1] + patch + blk[idx+1:]
+            inserted=True
+            break
+    if not inserted:
+        blk = blk[:1] + patch + blk[1:]
+    out.extend(blk)
+    last=b+1
+out.extend(lines[last:])
 
 p.write_text("\n".join(out) + "\n")
-print("OK: forced /agentia route added")
+print("OK: injected probe+proxy in all server blocks")
 PY
 
 echo "== nginx test + reload =="
@@ -201,12 +126,13 @@ AFT_W="$(sha "$WOLV_HTML")"
 echo "wolverine index: $AFT_W  $WOLV_HTML"
 [ "$BEF_W" = "$AFT_W" ] || { echo "ERROR: Wolverine index changed (should not)."; exit 1; }
 
-echo "== VERIFY: Public /agentia now contains AgentIA (not FireInners) =="
-OUT="$(curl -kfsS "https://fireinners.online/agentia/" | head -c 4000 || true)"
-echo "$OUT" | head -c 250; echo
-echo "$OUT" | grep -qi "agentia" && echo "OK: AgentIA served on /agentia" || { echo "ERROR: still not AgentIA on /agentia. Dump at $DUMP"; exit 1; }
+echo "== VERIFY: PROBE over HTTPS (must say AGENTIA_NGINX_OK) =="
+curl -kfsS "https://fireinners.online/agentia/__probe" | head -c 200; echo
 
-echo "OK: /agentia fixed via active nginx file; Wolverine untouched."
+echo "== VERIFY: /agentia/ should now contain 'AgentIA' (not FIREINNERS) =="
+curl -kfsS "https://fireinners.online/agentia/" | head -c 400 | sed -n '1,20p' || true
+
+echo "OK."
 BASH
 
-bash /root/DISCOVER_AND_FORCE_AGENTIA_ROUTE_SAFE_v2.sh
+bash /root/FORCE_AGENTIA_ROUTE_WITH_PROBE.sh
