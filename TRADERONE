@@ -1,1 +1,129 @@
-curl -fsSL https://pastebin.com/raw/TRADERONE_MEGA_FIX_ALL | bash
+cat >/root/TRADERONE_MEGA_FIX_ALL.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "=== TRADERONE MEGA FIX ALL (ROOT) ==="
+TS=$(date +%Y%m%d_%H%M%S)
+
+### PATHS FIXES
+FRONT="/var/www/wolverine/index.html"
+BACK="/opt/traderone-vault/server.js"
+NGINX_SITE="/etc/nginx/sites-available/fireinners.online-ssl"
+
+### 1) BACKUP
+echo "== Backup =="
+cp -a "$FRONT" "$FRONT.bak_$TS" || true
+cp -a "$BACK"  "$BACK.bak_$TS"  || true
+
+### 2) BACKEND — API JSON STRICT
+echo "== Fix backend API (JSON strict) =="
+node <<'NODE'
+const fs=require("fs");
+const p="/opt/traderone-vault/server.js";
+let s=fs.readFileSync(p,"utf8");
+
+if(!s.includes("/traderone/api/budget")){
+s+=`
+
+// === TRADERONE BUDGET API (JSON STRICT) ===
+app.post("/traderone/api/budget", async (req,res)=>{
+  try{
+    const {from,amount}=req.body||{};
+    if(!from||!amount) return res.status(400).json({ok:false,error:"missing from/amount"});
+    const lamports=Math.floor(Number(amount)*LAMPORTS_PER_SOL);
+    if(lamports<=0) return res.status(400).json({ok:false,error:"invalid amount"});
+    const tx=new Transaction().add(
+      SystemProgram.transfer({
+        fromPubkey:new PublicKey(from),
+        toPubkey:traderKeypair.publicKey,
+        lamports
+      })
+    );
+    const sig=await sendAndConfirmTransaction(req.app.locals.connection,tx,[traderKeypair]);
+    res.json({ok:true,signature:sig});
+  }catch(e){
+    res.status(500).json({ok:false,error:String(e)});
+  }
+});
+`;
+fs.writeFileSync(p,s);
+}
+console.log("Backend OK");
+NODE
+
+### 3) NGINX — PROXY + CORS + OPTIONS
+echo "== Fix nginx proxy =="
+if ! grep -q "traderone/api" "$NGINX_SITE"; then
+sed -i "/location \\/wolverine\\//a\\
+location /wolverine/traderone/api/ {\\
+  proxy_pass http://127.0.0.1:3000/traderone/api/;\\
+  proxy_http_version 1.1;\\
+  proxy_set_header Host \$host;\\
+  proxy_set_header X-Real-IP \$remote_addr;\\
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;\\
+  proxy_set_header X-Forwarded-Proto \$scheme;\\
+  add_header Content-Type application/json always;\\
+  add_header Access-Control-Allow-Origin * always;\\
+  add_header Access-Control-Allow-Methods 'GET,POST,OPTIONS' always;\\
+  add_header Access-Control-Allow-Headers 'Content-Type' always;\\
+  if (\$request_method = OPTIONS) { return 204; }\\
+}" "$NGINX_SITE"
+fi
+
+nginx -t
+systemctl reload nginx
+
+### 4) FRONTEND — FETCH ROBUSTE (ANTI HTML)
+echo "== Fix frontend fetch =="
+node <<'NODE'
+const fs=require("fs");
+const p="/var/www/wolverine/index.html";
+let s=fs.readFileSync(p,"utf8");
+
+if(!s.includes("safeFetchTraderOne")){
+s=s.replace("</body>",`
+<script>
+async function safeFetchTraderOne(amount){
+ try{
+  const r=await fetch("/wolverine/traderone/api/budget",{
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({
+      from:window.solana.publicKey.toString(),
+      amount:Number(amount)
+    })
+  });
+  const ct=r.headers.get("content-type")||"";
+  if(!ct.includes("application/json")){
+    const t=await r.text();
+    throw new Error("Non JSON: "+t.slice(0,60));
+  }
+  return await r.json();
+ }catch(e){
+  return {ok:false,error:e.message};
+ }
+}
+</script>
+</body>`);
+fs.writeFileSync(p,s);
+}
+console.log("Frontend OK");
+NODE
+
+### 5) RESTART PM2
+echo "== Restart TraderOne =="
+pm2 restart traderone-vault || true
+pm2 save || true
+
+### 6) TEST FINAL
+echo "== TEST API =="
+curl -s -X POST http://127.0.0.1:3000/traderone/api/budget \
+ -H "Content-Type: application/json" \
+ -d '{"from":"11111111111111111111111111111111","amount":0.000001}' || true
+
+echo "=== TERMINÉ ==="
+echo "Si Phantom est connecté → le bouton fonctionne maintenant."
+BASH
+
+chmod +x /root/TRADERONE_MEGA_FIX_ALL.sh
+bash /root/TRADERONE_MEGA_FIX_ALL.sh
