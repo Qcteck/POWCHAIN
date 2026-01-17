@@ -3,54 +3,66 @@ set -euo pipefail
 
 APP_NAME="traderone-vault"
 SERVER="/opt/traderone-vault/server.js"
-NGINX_SITE="/etc/nginx/sites-available/fireinners.online-ssl"
+WALLET="/opt/traderone-vault/wallet.json"
 TS="$(date +%Y%m%d_%H%M%S)"
 
 echo "=== [1] Vérifications ==="
 [ -f "$SERVER" ] || { echo "server.js introuvable"; exit 1; }
+[ -f "$WALLET" ] || { echo "wallet.json TraderOne manquant"; exit 1; }
 
 echo "=== [2] Backup ==="
-cp "$SERVER" "$SERVER.bak_$TS"
+cp "$SERVER" "$SERVER.bak_transfer_$TS"
 
-echo "=== [3] Nettoyage doubles imports Solana ==="
+echo "=== [3] Injection TRANSFERT SOL RÉEL ==="
 python3 <<'PY'
 from pathlib import Path
 p=Path("/opt/traderone-vault/server.js")
 s=p.read_text()
-out=[]
-seen=False
-for l in s.splitlines():
-    if "require('@solana/web3.js')" in l:
-        if seen: continue
-        seen=True
-    out.append(l)
-p.write_text("\n".join(out))
-PY
 
-echo "=== [4] Injection API TraderOne ==="
-python3 <<'PY'
-from pathlib import Path
-p=Path("/opt/traderone-vault/server.js")
-s=p.read_text()
-if "TRADERONE_API_READY" in s:
-    print("API déjà injectée")
+if "TRADERONE_SOL_TRANSFER_READY" in s:
+    print("Transfert déjà injecté")
     exit(0)
 
 inject = r'''
-/* ==== TRADERONE_API_READY ==== */
-const { Connection, PublicKey, SystemProgram, Transaction, sendAndConfirmTransaction } = require("@solana/web3.js");
-const RPC = process.env.SOLANA_RPC || "https://api.mainnet-beta.solana.com";
-const connection = new Connection(RPC,"confirmed");
+/* ==== TRADERONE_SOL_TRANSFER_READY ==== */
+const fs = require("fs");
+const bs58 = require("bs58");
+const { Keypair, LAMPORTS_PER_SOL } = require("@solana/web3.js");
 
-app.get("/wolverine/traderone/api/health",(req,res)=>{
-  res.json({ok:true,ts:Date.now()});
-});
+const traderWalletRaw = JSON.parse(fs.readFileSync("/opt/traderone-vault/wallet.json","utf8"));
+const traderSecret = Array.isArray(traderWalletRaw)
+  ? Uint8Array.from(traderWalletRaw)
+  : bs58.decode(traderWalletRaw.secretKey || traderWalletRaw);
+const traderKeypair = Keypair.fromSecretKey(traderSecret);
 
-app.post("/wolverine/traderone/api/budget",async(req,res)=>{
+app.post("/wolverine/traderone/api/budget", async (req,res)=>{
   try{
     const { from, amount } = req.body;
-    if(!from || !amount) return res.status(400).json({ok:false,error:"missing params"});
-    res.json({ok:true,from,amount});
+    if(!from || !amount) {
+      return res.status(400).json({ok:false,error:"missing from/amount"});
+    }
+
+    const fromPubkey = new PublicKey(from);
+    const lamports = Math.floor(Number(amount) * LAMPORTS_PER_SOL);
+    if(lamports <= 0) throw "amount invalid";
+
+    const tx = new Transaction().add(
+      SystemProgram.transfer({
+        fromPubkey,
+        toPubkey: traderKeypair.publicKey,
+        lamports
+      })
+    );
+
+    tx.feePayer = traderKeypair.publicKey;
+    const sig = await sendAndConfirmTransaction(connection, tx, [traderKeypair]);
+
+    res.json({
+      ok:true,
+      signature:sig,
+      received:amount,
+      to:traderKeypair.publicKey.toBase58()
+    });
   }catch(e){
     res.status(500).json({ok:false,error:String(e)});
   }
@@ -59,39 +71,18 @@ app.post("/wolverine/traderone/api/budget",async(req,res)=>{
 p.write_text(s+"\n"+inject)
 PY
 
-echo "=== [5] Fix app.listen ==="
-grep -q "app.listen" "$SERVER" || echo 'app.listen(3000,()=>console.log("TraderOne API 3000"));' >> "$SERVER"
-
-echo "=== [6] Restart PM2 ==="
+echo "=== [4] Restart PM2 ==="
 pm2 delete "$APP_NAME" 2>/dev/null || true
 pm2 start "$SERVER" --name "$APP_NAME"
 pm2 save
 sleep 2
 
-echo "=== [7] Détection port ==="
 PORT=$(ss -lntp | grep node | awk '{print $4}' | sed 's/.*://' | head -n1)
-echo "PORT=$PORT"
 
-echo "=== [8] Patch NGINX ==="
-grep -q "/wolverine/traderone/api/" "$NGINX_SITE" || cat >> "$NGINX_SITE" <<EOF
-location /wolverine/traderone/api/ {
-  proxy_pass http://127.0.0.1:$PORT;
-  proxy_http_version 1.1;
-  proxy_set_header Host \$host;
-  proxy_set_header X-Real-IP \$remote_addr;
-  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto \$scheme;
-  proxy_set_header Content-Type application/json;
-  proxy_pass_request_body on;
-}
-EOF
-
-nginx -t && systemctl reload nginx
-
-echo "=== [9] TEST LOCAL ==="
+echo "=== [5] TEST LOCAL API ==="
 curl -s http://127.0.0.1:$PORT/wolverine/traderone/api/health | grep '"ok":true'
 
-echo "=== [10] TEST PUBLIC ==="
+echo "=== [6] TEST PUBLIC API ==="
 curl -s https://fireinners.online/wolverine/traderone/api/health | grep '"ok":true'
 
-echo "✅ TOUT EST OPÉRATIONNEL"
+echo "✅ TRANSFERT SOL TRADERONE OPÉRATIONNEL"
