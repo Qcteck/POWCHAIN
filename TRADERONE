@@ -1,24 +1,136 @@
-cat >/root/TRADERONE_PURGE_USDC_UI.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="/opt/traderone"
-TS="$(date +%Y%m%d_%H%M%S)"
-BACKUP="/root/TRADERONE_UI_BACKUP_$TS"
+############################
+# CONFIG FIXE (NE PAS MODIFIER)
+############################
+TRADERONE_DIR="/opt/traderone"
+WOLVERINE_UI="/var/www/wolverine/index.html"
+REPORT="/root/TRADERONE_UI_VAULT_LIVE_$(date +%Y%m%d_%H%M%S).log"
+BACKUP_DIR="/root/TRADERONE_BACKUP_$(date +%Y%m%d_%H%M%S)"
+RPC_URL="https://lb.drpc.live/solana/AsxThpeKkEjGtZhCNUEQYo1ZluSgmwsR76RdFhW5UfFk"
 
-echo "=== PURGE USDC UI / LOGS ==="
-cp -a "$ROOT" "$BACKUP"
+echo "=== TRADERONE UI+VAULT+LIVE (SOL ONLY) ===" | tee -a "$REPORT"
+echo "Backup dir: $BACKUP_DIR" | tee -a "$REPORT"
+mkdir -p "$BACKUP_DIR"
 
-grep -RIl "USDC" "$ROOT" | while read -r f; do
+############################
+# PRECHECKS
+############################
+[ -d "$TRADERONE_DIR" ] || { echo "ERROR: $TRADERONE_DIR not found" | tee -a "$REPORT"; exit 1; }
+[ -f "$WOLVERINE_UI" ] || { echo "ERROR: UI not found $WOLVERINE_UI" | tee -a "$REPORT"; exit 1; }
+
+############################
+# BACKUPS
+############################
+cp -a "$TRADERONE_DIR" "$BACKUP_DIR/traderone"
+cp -a "$WOLVERINE_UI" "$BACKUP_DIR/index.html"
+echo "[OK] Backups done" | tee -a "$REPORT"
+
+############################################
+# PHASE 1 — UI SOL-ONLY (NETTOYAGE TOTAL)
+############################################
+echo "=== PHASE 1: UI SOL-ONLY ===" | tee -a "$REPORT"
+
+# 1) Neutraliser toute mention USDC dans l’UI
+sed -i \
+  -e 's/USDC/SOL/g' \
+  -e 's/usdc/sol/g' \
+  "$WOLVERINE_UI"
+
+# 2) Forcer RPC et balance SOL uniquement (sécurisé, sans doublons)
+python3 - <<'PY'
+from pathlib import Path
+p=Path("/var/www/wolverine/index.html")
+s=p.read_text(errors="ignore")
+
+# éviter redéclarations
+s=s.replace("let connection =","// let connection =")
+s=s.replace("const connection =","// const connection =")
+
+inject = """
+<script>
+(function(){
+  const RPC_URL = "%s";
+  if(!window.solana || !window.solana.isPhantom) return;
+  const { Connection, PublicKey } = solanaWeb3;
+  const connection = new Connection(RPC_URL,"confirmed");
+
+  async function refreshSOL(){
+    try{
+      const pub = window.solana.publicKey;
+      if(!pub) return;
+      const lamports = await connection.getBalance(pub);
+      const sol = (lamports/1e9).toFixed(6);
+      const el=document.getElementById("sol-balance");
+      if(el) el.textContent=sol+" SOL";
+    }catch(e){ console.error(e); }
+  }
+
+  window.addEventListener("load",refreshSOL);
+})();
+</script>
+""" % "%s"
+
+if "</body>" in s and "refreshSOL" not in s:
+    s=s.replace("</body>",inject+"</body>")
+
+p.write_text(s)
+PY
+
+echo "[OK] UI cleaned SOL-only" | tee -a "$REPORT"
+
+############################################
+# PHASE 2 — VAULT ISOLATION (BACKEND)
+############################################
+echo "=== PHASE 2: VAULT ===" | tee -a "$REPORT"
+
+# 1) Forcer logique asset = SOL uniquement dans le backend
+grep -RIl "asset" "$TRADERONE_DIR" | while read -r f; do
   sed -i \
-    -e 's/USDC/SOL/g' \
-    -e 's/usdc/sol/g' \
-    "$f"
+    -e 's/asset\s*===\s*["'\'']USDC["'\'']/false/g' \
+    -e 's/asset\s*===\s*["'\'']SOL["'\'']/true/g' \
+    "$f" || true
 done
 
-echo "[OK] UI/log references cleaned"
-echo "Backup: $BACKUP"
-BASH
+# 2) Neutraliser toute variable/state usdc côté backend
+grep -RIl "usdc" "$TRADERONE_DIR" | while read -r f; do
+  sed -i \
+    -e 's/usdc\s*[:=][^,;)]*/usdc:0/g' \
+    -e 's/state\.usdc/state.sol/g' \
+    "$f" || true
+done
 
-chmod +x /root/TRADERONE_PURGE_USDC_UI.sh
-/root/TRADERONE_PURGE_USDC_UI.sh
+echo "[OK] Backend forced SOL-only" | tee -a "$REPORT"
+
+############################################
+# PHASE 3 — LIVE MODE (PAS DE SIMULATION)
+############################################
+echo "=== PHASE 3: LIVE ===" | tee -a "$REPORT"
+
+# 1) Supprimer fichiers de simulation connus
+find "$TRADERONE_DIR" -type f \( -iname "*simulate*" -o -iname "*mock*" \) -exec rm -f {} + || true
+
+# 2) Variables d’environnement LIVE
+export TRADERONE_MODE="LIVE"
+export TRADERONE_ASSET="SOL"
+export TRADERONE_RPC="$RPC_URL"
+
+# 3) Redémarrage propre via PM2
+if command -v pm2 >/dev/null 2>&1; then
+  pm2 reload all || pm2 restart all
+  pm2 save
+  echo "[OK] PM2 restarted" | tee -a "$REPORT"
+else
+  echo "[WARN] PM2 not found" | tee -a "$REPORT"
+fi
+
+############################################
+# VERIFICATION FINALE
+############################################
+echo "=== VERIFICATION ===" | tee -a "$REPORT"
+grep -R "USDC" "$TRADERONE_DIR" "$WOLVERINE_UI" || echo "[OK] No USDC remaining" | tee -a "$REPORT"
+echo "MODE=LIVE ASSET=SOL" | tee -a "$REPORT"
+
+echo "=== DONE: TRADERONE UI+VAULT+LIVE SOL-ONLY ===" | tee -a "$REPORT"
+echo "Report: $REPORT"
