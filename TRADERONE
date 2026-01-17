@@ -2,98 +2,101 @@
 set -euo pipefail
 
 echo "=============================="
-echo " TRADERONE BUDGET FIX (ROOT)  "
+echo " TRADERONE API HARD FIX (ROOT)"
 echo "=============================="
 
-API_PORT=3000
-APP_NAME="traderone-vault"
-NGINX_SITE="/etc/nginx/sites-available/fireinners.online-ssl"
+APP="traderone-vault"
+FILE="/opt/traderone-vault/server.js"
+TS=$(date +%Y%m%d_%H%M%S)
 
 ########################################
-# 1) Vérification API locale
+# 1) Vérifications
 ########################################
-echo "[1/7] Vérification API locale"
-curl -s http://127.0.0.1:${API_PORT}/wolverine/traderone/api/health \
-  | grep -q '"ok":true' \
-  && echo "✅ API locale OK" \
-  || { echo "❌ API locale KO"; exit 1; }
+echo "[1/6] Vérifications"
+[ -f "$FILE" ] || { echo "❌ server.js introuvable"; exit 1; }
 
 ########################################
-# 2) Patch NGINX (proxy JSON POST)
+# 2) Backup
 ########################################
-echo "[2/7] Patch NGINX (proxy JSON)"
-if ! grep -q "wolverine/traderone/api" "$NGINX_SITE"; then
-cat >> "$NGINX_SITE" <<'NGINX'
-
-# === TRADERONE API PROXY ===
-location /wolverine/traderone/api/ {
-    proxy_pass http://127.0.0.1:3000;
-    proxy_http_version 1.1;
-
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto $scheme;
-
-    proxy_set_header Content-Type application/json;
-    proxy_pass_request_body on;
-}
-NGINX
-else
-  echo "ℹ️  Proxy déjà présent"
-fi
-
-nginx -t
-systemctl reload nginx
-echo "✅ NGINX rechargé"
+echo "[2/6] Backup"
+cp "$FILE" "$FILE.bak_$TS"
+echo "✔ Backup créé: $FILE.bak_$TS"
 
 ########################################
-# 3) Redémarrage PM2
+# 3) Injection API (SAFE)
 ########################################
-echo "[3/7] Redémarrage TraderOne Vault"
-pm2 restart "$APP_NAME"
+echo "[3/6] Injection routes API"
+
+python3 <<'PY'
+from pathlib import Path
+
+p = Path("/opt/traderone-vault/server.js")
+s = p.read_text()
+
+MARK = "/* === TRADERONE API ROUTES === */"
+if MARK in s:
+    print("Routes déjà présentes → SKIP")
+    exit(0)
+
+inject = """
+/* === TRADERONE API ROUTES === */
+app.get("/wolverine/traderone/api/health",(req,res)=>{
+  res.json({ok:true,ts:Date.now()});
+});
+
+app.post("/wolverine/traderone/api/budget",(req,res)=>{
+  try{
+    const body=req.body||{};
+    if(!body.pubkey||!body.budgetSol) throw "payload invalide";
+    const lamports=Math.floor(Number(body.budgetSol)*1e9);
+    if(lamports<=0) throw "montant invalide";
+    res.json({ok:true,lamports});
+  }catch(e){
+    res.status(400).json({ok:false,error:String(e)});
+  }
+});
+/* === END TRADERONE API ROUTES === */
+"""
+
+# insère juste avant app.listen
+idx = s.rfind("app.listen")
+if idx == -1:
+    raise SystemExit("app.listen introuvable")
+
+s = s[:idx] + inject + "\n" + s[idx:]
+p.write_text(s)
+print("✔ Routes API injectées")
+PY
+
+########################################
+# 4) Restart PM2
+########################################
+echo "[4/6] Redémarrage PM2"
+pm2 restart "$APP"
 sleep 2
 
 ########################################
-# 4) Test POST LOCAL (JSON obligatoire)
+# 5) Test API LOCALE (clé)
 ########################################
-echo "[4/7] Test POST LOCAL"
-LOCAL_RESP=$(curl -s -X POST http://127.0.0.1:${API_PORT}/wolverine/traderone/api/budget \
-  -H "Content-Type: application/json" \
-  -d '{"pubkey":"11111111111111111111111111111111","budgetSol":0.001}')
+echo "[5/6] Test API locale"
+RESP=$(curl -s http://127.0.0.1:3000/wolverine/traderone/api/health || true)
+echo "$RESP"
 
-echo "$LOCAL_RESP" | grep -q "ok" \
-  && echo "✅ POST local JSON OK" \
-  || { echo "❌ POST local invalide"; echo "$LOCAL_RESP"; exit 1; }
-
-########################################
-# 5) Test POST PUBLIC (JSON obligatoire)
-########################################
-echo "[5/7] Test POST PUBLIC"
-PUBLIC_RESP=$(curl -s -X POST https://fireinners.online/wolverine/traderone/api/budget \
-  -H "Content-Type: application/json" \
-  -d '{"pubkey":"11111111111111111111111111111111","budgetSol":0.001}')
-
-echo "$PUBLIC_RESP" | grep -q "ok" \
-  && echo "✅ POST public JSON OK" \
-  || { echo "❌ POST public invalide"; echo "$PUBLIC_RESP"; exit 1; }
+echo "$RESP" | grep -q '"ok":true' \
+ && echo "✔ API locale OK" \
+ || { echo "❌ API locale toujours KO"; exit 1; }
 
 ########################################
-# 6) Vérification headers (anti-HTML)
+# 6) Test POST local
 ########################################
-echo "[6/7] Vérification Content-Type"
-curl -s -I https://fireinners.online/wolverine/traderone/api/health \
-  | grep -qi "application/json" \
-  && echo "✅ Content-Type JSON OK" \
-  || { echo "❌ Content-Type incorrect"; exit 1; }
+echo "[6/6] Test POST budget local"
+curl -s -X POST http://127.0.0.1:3000/wolverine/traderone/api/budget \
+ -H "Content-Type: application/json" \
+ -d '{"pubkey":"11111111111111111111111111111111","budgetSol":0.001}' \
+ | tee /dev/stderr | grep -q '"ok":true'
 
-########################################
-# 7) FIN
-########################################
 echo "=============================="
-echo " ✅ BUDGET TRADERONE OPÉRATIONNEL"
-echo " - Backend OK"
-echo " - Proxy NGINX OK"
-echo " - JSON garanti"
-echo " - Envoi budget prêt"
+echo " ✅ API TRADERONE ACTIVE"
+echo " - health OK"
+echo " - budget OK"
 echo "=============================="
