@@ -1,1 +1,126 @@
-curl -fsSL https://pastebin.com/raw/REPLACE_ME || true
+cat >/root/FIX_WOLVERINE_PHANTOM_VAULT_FINAL.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+HTML="/var/www/wolverine/index.html"
+TS="$(date +%Y%m%d_%H%M%S)"
+
+echo "=== WOLVERINE PHANTOM + VAULT FINAL FIX ==="
+
+[ -f "$HTML" ] || { echo "❌ index.html introuvable"; exit 1; }
+
+cp -a "$HTML" "${HTML}.bak_${TS}"
+
+echo "== 1) Suppression de TOUS les anciens blocs Phantom/Vault =="
+python3 - <<'PY'
+from pathlib import Path
+import re
+
+p=Path("/var/www/wolverine/index.html")
+s=p.read_text(errors="ignore")
+
+s=re.sub(r'<section[^>]*(phantom|vault)[^>]*>.*?</section>','',s,flags=re.S|re.I)
+s=re.sub(r'<script[^>]*>.*?(Phantom|vault|solana).*?</script>','',s,flags=re.S|re.I)
+
+p.write_text(s)
+print("OK purge")
+PY
+
+echo "== 2) Injection Phantom + Vault UNIQUE =="
+python3 - <<'PY'
+from pathlib import Path
+
+p=Path("/var/www/wolverine/index.html")
+s=p.read_text()
+
+BLOCK="""
+<section id="phantomVault" style="border:2px solid #00e0ff;padding:16px;margin:20px">
+<h3>Phantom</h3>
+<button id="connectPhantom">Connect Phantom</button>
+<div>Adresse: <span id="userAddr">—</span></div>
+<div>SOL: <span id="userSol">—</span></div>
+
+<hr>
+
+<h3>Vault</h3>
+<button id="createVault">Créer mon Vault</button>
+<div>Vault: <span id="vaultAddr">—</span></div>
+<div>Vault SOL: <span id="vaultSol">—</span></div>
+
+<input id="depositAmount" placeholder="Montant SOL">
+<button id="depositSol">Déposer SOL</button>
+</section>
+
+<script type="module">
+import {
+  Connection,
+  PublicKey,
+  SystemProgram,
+  Transaction,
+  Keypair,
+  LAMPORTS_PER_SOL
+} from "https://unpkg.com/@solana/web3.js@latest/lib/index.iife.js";
+
+const RPC="https://api.mainnet-beta.solana.com";
+const conn=new Connection(RPC);
+
+let userPub=null;
+let vaultKeypair=null;
+
+async function refreshSol(pub,el){
+  const b=await conn.getBalance(pub);
+  document.getElementById(el).textContent=(b/LAMPORTS_PER_SOL).toFixed(6);
+}
+
+document.getElementById("connectPhantom").onclick=async()=>{
+  if(!window.solana) return alert("Phantom absent");
+  const r=await solana.connect();
+  userPub=new PublicKey(r.publicKey.toString());
+  document.getElementById("userAddr").textContent=userPub.toBase58();
+  await refreshSol(userPub,"userSol");
+};
+
+document.getElementById("createVault").onclick=async()=>{
+  vaultKeypair=Keypair.generate();
+  document.getElementById("vaultAddr").textContent=vaultKeypair.publicKey.toBase58();
+  document.getElementById("vaultSol").textContent="0.000000";
+};
+
+document.getElementById("depositSol").onclick=async()=>{
+  if(!userPub||!vaultKeypair) return alert("Wallet ou Vault manquant");
+  const amt=parseFloat(document.getElementById("depositAmount").value);
+  if(!amt||amt<=0) return alert("Montant invalide");
+
+  const tx=new Transaction().add(
+    SystemProgram.transfer({
+      fromPubkey:userPub,
+      toPubkey:vaultKeypair.publicKey,
+      lamports:amt*LAMPORTS_PER_SOL
+    })
+  );
+
+  tx.feePayer=userPub;
+  tx.recentBlockhash=(await conn.getLatestBlockhash()).blockhash;
+
+  const signed=await solana.signTransaction(tx);
+  await conn.sendRawTransaction(signed.serialize());
+  await conn.confirmTransaction(signed.signature);
+
+  await refreshSol(userPub,"userSol");
+  await refreshSol(vaultKeypair.publicKey,"vaultSol");
+};
+</script>
+"""
+
+p.write_text(s.replace("</body>",BLOCK+"\n</body>"))
+print("OK inject")
+PY
+
+echo "== 3) Reload nginx =="
+nginx -t && systemctl reload nginx
+
+echo "=== TERMINÉ — CTRL+SHIFT+R ==="
+BASH
+
+chmod +x /root/FIX_WOLVERINE_PHANTOM_VAULT_FINAL.sh
+/root/FIX_WOLVERINE_PHANTOM_VAULT_FINAL.sh
