@@ -1,74 +1,69 @@
-cat >/root/WOLVERINE_VAULT_FRONTEND_ATTACH.sh <<'BASH'
+cat >/root/WOLVERINE_VAULT_ONLY_FIX.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "=== WOLVERINE — VAULT FRONTEND ATTACH (SAFE) ==="
+echo "=== WOLVERINE — VAULT ONLY FIX (ISOLATED) ==="
 
-FRONTEND="/var/www/wolverine/index.html"
+### PATHS CONFIRMÉS
+FRONT="/var/www/wolverine/index.html"
+NGINX_SITE="/etc/nginx/sites-available/fireinners.online-ssl"
+NGINX_INC="/etc/nginx/includes/wolverine_vault_api.inc"
+API_PORT=3000
 TS="$(date +%Y%m%d_%H%M%S)"
 
-test -f "$FRONTEND" || { echo "❌ index.html introuvable"; exit 1; }
+### 1) BACKUP FRONTEND
+cp -a "$FRONT" "$FRONT.bak_vault_$TS"
 
-echo "== 1) Backup frontend =="
-cp "$FRONTEND" "$FRONTEND.bak_$TS"
-
-echo "== 2) Vérifier injection déjà faite =="
-if grep -q "VAULT_ONLY_BLOCK" "$FRONTEND"; then
-  echo "⚠️ Bloc VAULT déjà présent — stop"
-  exit 0
+### 2) INJECT VAULT UI (ISOLÉ)
+if ! grep -q "VAULT_WIDGET_START" "$FRONT"; then
+sed -i '/<\/body>/i\
+<!-- VAULT_WIDGET_START -->\
+<div id="vaultBox" style="border:2px solid #00ffcc;padding:12px;margin-top:15px">\
+  <h3>Vault</h3>\
+  <button id="createVaultBtn">Créer mon Vault</button><br><br>\
+  <div>Vault: <span id="vaultAddr">-</span></div>\
+  <div>Vault SOL: <span id="vaultSol">-</span></div>\
+</div>\
+<script>\
+async function vaultPost(path,data){\
+  const r=await fetch(path,{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify(data)});\
+  const t=await r.text();\
+  try{return JSON.parse(t)}catch(e){throw new Error(t)}\
+}\
+document.getElementById(\"createVaultBtn\").onclick=async()=>{\
+  if(!window.walletAddress)return alert(\"Wallet non connecté\");\
+  try{\
+    const r=await vaultPost(\"/wolverine/vault/api/create\",{owner:walletAddress});\
+    document.getElementById(\"vaultAddr\").textContent=r.vault;\
+    document.getElementById(\"vaultSol\").textContent=r.sol;\
+  }catch(e){alert(\"Vault requis\");console.error(e)}\
+};\
+</script>\
+<!-- VAULT_WIDGET_END -->\
+</body>' "$FRONT"
 fi
 
-echo "== 3) Injection bloc VAULT isolé =="
-sed -i "s|</body>|
-
-<!-- VAULT_ONLY_BLOCK -->
-<div id=\"vaultBox\" style=\"margin:30px auto;max-width:420px;border:2px solid #00ff88;padding:15px;text-align:center\">
-  <h3>Vault Trading</h3>
-  <button id=\"vaultCreate\" style=\"width:100%;padding:10px\">Créer mon vault</button>
-  <pre id=\"vaultOut\" style=\"margin-top:10px;text-align:left\"></pre>
-</div>
-
-<script>
-window.VAULT_ONLY={
-  id:null,
-  async create(){
-    const r=await fetch('/wolverine/vault/vault/create',{method:'POST'});
-    const j=await r.json();
-    if(!j.ok) return this.log(j);
-    this.id=j.vault.id;
-    localStorage.setItem('VAULT_ID',this.id);
-    this.log(j);
-  },
-  async status(){
-    if(!this.id) return;
-    const r=await fetch('/wolverine/vault/vault/status/'+this.id);
-    const j=await r.json();
-    this.log(j);
-  },
-  log(o){
-    document.getElementById('vaultOut').textContent=JSON.stringify(o,null,2);
-  }
-};
-
-document.getElementById('vaultCreate').onclick=()=>{
-  VAULT_ONLY.create();
-};
-
-const saved=localStorage.getItem('VAULT_ID');
-if(saved){
-  VAULT_ONLY.id=saved;
-  VAULT_ONLY.status();
+### 3) NGINX VAULT API (SÉPARÉ)
+cat > "$NGINX_INC" <<EOF
+location /wolverine/vault/api/ {
+  proxy_pass http://127.0.0.1:${API_PORT}/vault/api/;
+  proxy_http_version 1.1;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
 }
-</script>
-<!-- END_VAULT_ONLY_BLOCK -->
+EOF
 
-</body>|" "$FRONTEND"
+grep -q wolverine_vault_api.inc "$NGINX_SITE" || \
+sed -i "/server {/a\\    include ${NGINX_INC};" "$NGINX_SITE"
 
-echo "== 4) Reload nginx =="
-nginx -t && systemctl reload nginx
+### 4) RELOAD NGINX
+nginx -t
+systemctl reload nginx
 
-echo "=== OK — VAULT BRANCHÉ SANS CASSER LE FRONTEND ==="
+echo "=== OK — VAULT ISOLÉ, FRONTEND PRÉSERVÉ ==="
+echo "Recharge la page (CTRL+SHIFT+R)"
 BASH
 
-chmod +x /root/WOLVERINE_VAULT_FRONTEND_ATTACH.sh
-/root/WOLVERINE_VAULT_FRONTEND_ATTACH.sh
+chmod +x /root/WOLVERINE_VAULT_ONLY_FIX.sh
+/root/WOLVERINE_VAULT_ONLY_FIX.sh
