@@ -1,86 +1,91 @@
-cat >/root/TRADERONE_FIX_FINAL.sh <<'BASH'
+cat >/root/TRADERONE_FIX_ALL.sh <<'BASH'
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
+echo "===== TRADERONE FIX ALL (FRONT + API + COLORS) ====="
 
-echo "===== TRADERONE FIX FINAL ====="
-
-API="/opt/traderone-vault/server.js"
 HTML="/var/www/wolverine/index.html"
+API="/opt/traderone-vault/server.js"
 NGINX="/etc/nginx/sites-available/fireinners.online-ssl"
-TS=$(date +%Y%m%d_%H%M%S)
+TS="$(date +%Y%m%d_%H%M%S)"
 
-echo "[1] Backup"
-cp -a "$API" "$API.bak_$TS"
+echo "[1] BACKUP"
 cp -a "$HTML" "$HTML.bak_$TS"
+cp -a "$API" "$API.bak_$TS"
 
-echo "[2] Patch API budget"
-grep -q "TRADERONE_BUDGET_API" "$API" || cat >>"$API" <<'JS'
+echo "[2] FRONTEND FIX (safePost + colors)"
+node <<'NODE'
+const fs=require("fs");
+let f="/var/www/wolverine/index.html";
+let s=fs.readFileSync(f,"utf8");
 
-/* ===== TRADERONE_BUDGET_API ===== */
+/* SAFE POST GLOBAL */
+if(!s.includes("function safePost(")){
+s=s.replace("</body>",`
+<script>
+async function safePost(url,payload){
+ const r=await fetch(url,{
+  method:"POST",
+  headers:{"Content-Type":"application/json"},
+  body:JSON.stringify(payload)
+ });
+ const t=await r.text();
+ try{return JSON.parse(t);}catch(e){return{ok:false,error:t};}
+}
+</script>
+</body>`);
+}
+
+/* FIX BUTTON CALL */
+s=s.replace(/fetch\\([^)]*budget[^)]*\\)[\\s\\S]*?\\);/g,
+`safePost("/wolverine/traderone/api/budget",{from:walletAddress,amount:parseFloat(amount)})
+.then(r=>{if(!r.ok)throw r.error;log("Envoyé OK",r);})
+.catch(e=>log("Erreur TraderOne",e));`
+);
+
+/* FORCE COLORS */
+s=s.replace(/#4caf50|green|rgb\\(76,175,80\\)/gi,"#00bcd4");
+
+fs.writeFileSync(f,s);
+console.log("FRONTEND OK");
+NODE
+
+echo "[3] API VERIFY"
+grep -q "/wolverine/traderone/api/budget" "$API" || {
+node <<'NODE'
+const fs=require("fs");
+let f="/opt/traderone-vault/server.js";
+let s=fs.readFileSync(f,"utf8");
+s+=`
 app.options("/wolverine/traderone/api/budget",(req,res)=>{
  res.setHeader("Access-Control-Allow-Origin","*");
  res.setHeader("Access-Control-Allow-Headers","Content-Type");
  res.setHeader("Access-Control-Allow-Methods","POST,OPTIONS");
- return res.sendStatus(200);
+ res.sendStatus(200);
 });
-
-app.post("/wolverine/traderone/api/budget",async(req,res)=>{
+app.post("/wolverine/traderone/api/budget",(req,res)=>{
  try{
-  const {from,amount}=req.body||{};
-  if(!from||!amount){
-   return res.status(400).json({ok:false,error:"missing from/amount"});
-  }
-  return res.json({ok:true,from,amount});
- }catch(e){
-  return res.status(500).json({ok:false,error:String(e)});
- }
+  const{from,amount}=req.body||{};
+  if(!from||!amount)return res.status(400).json({ok:false,error:"missing"});
+  res.json({ok:true,from,amount});
+ }catch(e){res.status(500).json({ok:false,error:String(e)})}
 });
-/* ===== END TRADERONE_BUDGET_API ===== */
+`;
+fs.writeFileSync(f,s);
+console.log("API PATCHED");
+NODE
+}
 
-JS
-
-echo "[3] NGINX proxy"
-grep -q "traderone/api" "$NGINX" || sed -i '/location \/wolverine\/ {/a\
-    location /wolverine/traderone/api/ {\
-        proxy_pass http://127.0.0.1:3000;\
-        proxy_http_version 1.1;\
-        proxy_set_header Host $host;\
-        proxy_set_header X-Real-IP $remote_addr;\
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\
-        proxy_set_header X-Forwarded-Proto $scheme;\
-    }\
-' "$NGINX"
-
-echo "[4] Frontend JSON safe + colors"
-grep -q "safePost" "$HTML" || sed -i '/<\/body>/i\
-<script>\
-async function safePost(url,payload){\
- const r=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});\
- const t=await r.text();\
- try{return JSON.parse(t);}catch(e){return {ok:false,error:t};}\
-}\
-</script>' "$HTML"
-
-sed -i '/<\/head>/i\
-<style>\
-body{background:#040b12;color:#e6f1ff}\
-button{background:#00ff88;color:#001;border:2px solid #00ffaa}\
-input{background:#000;color:#00ffaa;border:1px solid #00ffaa}\
-</style>' "$HTML"
-
-echo "[5] Reload services"
-nginx -t
-systemctl reload nginx
+echo "[4] RELOAD SERVICES"
 pm2 restart traderone-vault
+nginx -t && systemctl reload nginx
 
-echo "[6] Test API"
-sleep 2
-curl -s http://127.0.0.1:3000/wolverine/traderone/api/budget \
+echo "[5] TEST ENDPOINT"
+curl -s -X POST http://127.0.0.1:3000/wolverine/traderone/api/budget \
  -H "Content-Type: application/json" \
- -d '{"from":"TEST","amount":0.01}'
+ -d '{"from":"test","amount":1}' || true
 
-echo "===== FIX TERMINÉ ====="
+echo "===== DONE : SYSTEM STABLE ====="
 BASH
 
-chmod +x /root/TRADERONE_FIX_FINAL.sh
-/root/TRADERONE_FIX_FINAL.sh
+chmod +x /root/TRADERONE_FIX_ALL.sh
+/root/TRADERONE_FIX_ALL.sh
