@@ -3,33 +3,25 @@ bash -s <<'BASH'
 set -euo pipefail
 
 ############################################
-# MEGA_WOLVERINE_COMBINED (root, one-shot)
-# Combine: "75% batch" + "25% finalizer" => 100% auto-fix loop
-#
-# CIBLE:
-#  - https://fireinners.online/wolverine/
-#  - https://fireinners.online/wolverine/traderone/api/health
-#
-# Mémoire/chemins:
-#  - Front live: /var/www/wolverine
-#  - Repo: /opt/wolverine
-#  - Nginx vhost: /etc/nginx/sites-available/fireinners.online-ssl
-#  - Include routes: /etc/nginx/includes/wolverine_routes.inc
-#  - Savepoint: /root/WOLVERINE_SAVEPOINT.sh
+# MEGA_WOLVERINE_COMBINED_PLUS (root, one-shot)
+# Ajouts demandés pour couvrir les 4 risques:
+# 1) Front non statique / export Next échoue -> fallback auto: front minimal fonctionnel + Phantom SOL/USDC + endpoints UI
+# 2) Mauvais vhost réellement servi -> détection via nginx -T, patch du bon fichier (server_name fireinners.online + listen 443)
+# 3) chattr +i / includes indirects / conflits /wolverine -> déverrouillage ciblé + neutralisation auto des conflits /wolverine (backup)
+# 4) Backend TraderOne réel absent -> wrapper stable + auto-detect backend réel (ports probables) + proxy interne si trouvé
 ############################################
 
 TS="$(date +%Y%m%d_%H%M%S)"
 export DEBIAN_FRONTEND=noninteractive
+umask 022
 
 log(){ printf "\n[%s] %s\n" "$(date '+%F %T')" "$*"; }
 die(){ echo "ERROR: $*" >&2; exit 1; }
 
 [ "$(id -u)" -eq 0 ] || die "Run as root."
-umask 022
 
 ROOT_WOLV="/var/www/wolverine"
 REPO="/opt/wolverine"
-VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
 INC="/etc/nginx/includes/wolverine_routes.inc"
 ASK="/opt/fireinners/sentinel/lib/askorupdate.sh"
 
@@ -37,38 +29,40 @@ RB_DIR="/root/MEGA_WOLVERINE_ROLLBACK_${TS}"
 mkdir -p "$RB_DIR"
 
 rollback(){
-  log "ROLLBACK triggered (best-effort)"
-  if [ -f "$RB_DIR/fireinners.online-ssl.conf" ]; then
-    chattr -i "$VHOST" 2>/dev/null || true
-    cp -a "$RB_DIR/fireinners.online-ssl.conf" "$VHOST" || true
-    chattr +i "$VHOST" 2>/dev/null || true
-  fi
+  log "ROLLBACK (best-effort)"
+  if [ -f "$RB_DIR/nginx_T_before.txt" ]; then true; fi
   if [ -f "$RB_DIR/wolverine_routes.inc" ]; then
     mkdir -p "$(dirname "$INC")"
-    cp -a "$RB_DIR/wolverine_routes.inc" "$INC" || true
+    cp -a "$RB_DIR/wolverine_routes.inc" "$INC" 2>/dev/null || true
   fi
   if [ -d "$RB_DIR/wolverine_www" ]; then
     rm -rf "$ROOT_WOLV" 2>/dev/null || true
-    cp -a "$RB_DIR/wolverine_www" "$ROOT_WOLV" || true
+    cp -a "$RB_DIR/wolverine_www" "$ROOT_WOLV" 2>/dev/null || true
   fi
-  nginx -t && systemctl reload nginx || true
-  log "ROLLBACK done."
+  if [ -f "$RB_DIR/vhost_patched_path.txt" ]; then
+    VHOST="$(cat "$RB_DIR/vhost_patched_path.txt" 2>/dev/null || true)"
+    if [ -n "${VHOST:-}" ] && [ -f "$RB_DIR/vhost_backup.conf" ]; then
+      chattr -i "$VHOST" 2>/dev/null || true
+      cp -a "$RB_DIR/vhost_backup.conf" "$VHOST" 2>/dev/null || true
+      chattr +i "$VHOST" 2>/dev/null || true
+    fi
+  fi
+  if command -v nginx >/dev/null 2>&1; then
+    nginx -t && systemctl reload nginx || true
+  fi
+  log "ROLLBACK done"
 }
 trap 'rollback; die "Failed at line $LINENO"' ERR
 
 log "0) Preflight"
-command -v nginx >/dev/null 2>&1 || die "nginx not found"
-command -v git  >/dev/null 2>&1 || die "git not found"
+command -v nginx >/dev/null 2>&1 || die "nginx missing"
+command -v git  >/dev/null 2>&1 || die "git missing"
 mkdir -p /etc/nginx/includes
+mkdir -p "$ROOT_WOLV"
 
-# Snapshot for rollback
-[ -f "$VHOST" ] && cp -a "$VHOST" "$RB_DIR/fireinners.online-ssl.conf" || true
-[ -f "$INC" ] && cp -a "$INC" "$RB_DIR/wolverine_routes.inc" || true
-[ -d "$ROOT_WOLV" ] && cp -a "$ROOT_WOLV" "$RB_DIR/wolverine_www" || true
-
-# Optional savepoint
+# optional savepoint
 if [ -x /root/WOLVERINE_SAVEPOINT.sh ]; then
-  /root/WOLVERINE_SAVEPOINT.sh "AUTO_BEFORE_MEGA_${TS}" || true
+  /root/WOLVERINE_SAVEPOINT.sh "AUTO_BEFORE_MEGA_PLUS_${TS}" || true
 fi
 
 # askorupdate
@@ -77,9 +71,12 @@ if [ -f "$ASK" ]; then
   source "$ASK"
   log "askorupdate loaded: $ASK"
 else
-  log "askorupdate not found; using fallback writers."
   askorupdate_file(){ local SRC="$1" DST="$2"; mkdir -p "$(dirname "$DST")"; cp -a "$DST" "${DST}.bak_${TS}" 2>/dev/null || true; cp -a "$SRC" "$DST"; }
 fi
+
+# rollback snapshots
+[ -f "$INC" ] && cp -a "$INC" "$RB_DIR/wolverine_routes.inc" || true
+[ -d "$ROOT_WOLV" ] && cp -a "$ROOT_WOLV" "$RB_DIR/wolverine_www" || true
 
 log "1) Ensure Node.js via NodeSource (no apt/npm mixing)"
 if ! command -v node >/dev/null 2>&1; then
@@ -94,131 +91,244 @@ fi
 node -v >/dev/null
 npm -v >/dev/null
 
-log "2) Sync repo /opt/wolverine (best-effort)"
-if [ -d "$REPO/.git" ]; then
-  ( cd "$REPO" && git fetch --all -p && git reset --hard origin/main ) || true
-  ( cd "$REPO" && git log -1 --oneline ) || true
-else
-  log "Repo not found at $REPO (skip sync)"
-fi
+log "2) Detect REAL active vhost for fireinners.online via nginx -T"
+NGT="/tmp/nginx_T_${TS}.txt"
+nginx -T > "$NGT" 2>&1 || die "nginx -T failed"
+cp -a "$NGT" "$RB_DIR/nginx_T_before.txt"
 
-log "3) FRONTEND: deploy export if found; else attempt Next build/export; else keep current"
-mkdir -p "$ROOT_WOLV"
-[ -f "$ROOT_WOLV/index.html" ] && cp -a "$ROOT_WOLV/index.html" "$ROOT_WOLV/index.html.bak_${TS}" || true
+VHOST_DETECTED="$(python3 - <<'PY'
+import re,sys
+txt=open(sys.argv[1],'r',errors='ignore').read().splitlines()
+cur=None
+blocks=[]
+i=0
+# Track current config file from nginx -T markers
+for line in txt:
+    m=re.match(r'# configuration file (.+?):', line.strip())
+    if m: cur=m.group(1); continue
+# Parse server blocks roughly from full text by scanning per-file is hard in nginx -T.
+# Instead: extract candidate config files by grepping for "server_name" & "fireinners.online" & "listen 443".
+files=set()
+cur=None
+for line in txt:
+    m=re.match(r'# configuration file (.+?):', line.strip())
+    if m: cur=m.group(1); continue
+    if cur and ('server_name' in line and 'fireinners.online' in line):
+        files.add(cur)
+    if cur and ('server_name' in line and 'fireinners.online' in line):
+        pass
+# choose best file: one that also contains "listen 443" near the mention
+best=None
+best_score=-1
+for f in files:
+    # score: count of listen 443 + server_name
+    score=0
+    cur=None
+    for line in txt:
+        m=re.match(r'# configuration file (.+?):', line.strip())
+        if m: cur=m.group(1); continue
+        if cur!=f: continue
+        if 'server_name' in line and 'fireinners.online' in line: score+=10
+        if re.search(r'listen\s+443', line): score+=3
+        if 'ssl' in line: score+=1
+    if score>best_score:
+        best_score=score
+        best=f
+print(best or '')
+PY
+"$NGT")"
 
-detect_export(){
-  local found=""
-  for CAND in \
-    "$REPO/out" "$REPO/dist" "$REPO/frontend/out" "$REPO/frontend/dist" \
-    "$REPO/web/out" "$REPO/web/dist" "$REPO/public" "$REPO/site" \
-    "$REPO/apps/web/out" "$REPO/apps/web/dist" "$REPO/apps/wolverine/out" "$REPO/apps/wolverine/dist" \
-    "$REPO/var_www_wolverine"
-  do
-    if [ -d "$CAND" ] && [ -f "$CAND/index.html" ]; then found="$CAND"; break; fi
-  done
-  echo "$found"
-}
+[ -n "${VHOST_DETECTED:-}" ] || die "Could not detect vhost for fireinners.online from nginx -T"
+echo "$VHOST_DETECTED" > "$RB_DIR/vhost_patched_path.txt"
+log "Detected vhost: $VHOST_DETECTED"
+cp -a "$VHOST_DETECTED" "$RB_DIR/vhost_backup.conf" || true
 
-SRC="$(detect_export || true)"
+log "3) Unlock immutables (targeted) + ensure include path exists"
+chattr -i /etc/nginx/nginx.conf 2>/dev/null || true
+chattr -i "$VHOST_DETECTED" 2>/dev/null || true
+chattr -i "$INC" 2>/dev/null || true
+mkdir -p "$(dirname "$INC")"
 
-# If no export found, try to build if it looks like Next
-if [ -z "${SRC:-}" ] && [ -f "$REPO/package.json" ]; then
-  if grep -qi '"next"' "$REPO/package.json" 2>/dev/null || grep -qi "next" "$REPO/package.json" 2>/dev/null; then
-    log "Next detected: trying npm install + build + export (best-effort)"
-    ( cd "$REPO" && npm ci --silent ) || ( cd "$REPO" && npm i --silent )
-    ( cd "$REPO" && npm run build --silent ) || true
-    ( cd "$REPO" && npm run export --silent ) || true
-    SRC="$(detect_export || true)"
-  fi
-fi
+log "4) Neutralize ALL conflicting /wolverine locations in nginx tree (backup each file)"
+# Only disable blocks that define location for /wolverine or /wolverine/traderone/api outside our include.
+# This prevents "same-length location" priority issues.
+python3 - <<'PY'
+import os,re,sys,shutil,hashlib
+ROOT="/etc/nginx"
+INC="/etc/nginx/includes/wolverine_routes.inc"
+RB=os.environ.get("RB_DIR")
+TS=os.environ.get("TS")
+def sha(p):
+    h=hashlib.sha256()
+    with open(p,'rb') as f:
+        for b in iter(lambda:f.read(1024*1024), b''):
+            h.update(b)
+    return h.hexdigest()[:16]
+def disable_wolverine_locations(path):
+    s=open(path,'r',errors='ignore').read().splitlines()
+    out=[]
+    changed=False
+    i=0
+    while i<len(s):
+        line=s[i]
+        if path==INC:
+            out.append(line); i+=1; continue
+        # match location lines that target /wolverine
+        if re.search(r'^\s*location\s+.*?/wolverine', line):
+            changed=True
+            out.append("# DISABLED_BY_MEGA_WOLVERINE_COMBINED_PLUS "+line)
+            # comment block until matching brace close at same nesting (simple)
+            # find first '{' on this line or subsequent
+            brace=0
+            # count braces from this line
+            brace += line.count('{') - line.count('}')
+            i+=1
+            while i<len(s):
+                l=s[i]
+                out.append("# DISABLED_BY_MEGA_WOLVERINE_COMBINED_PLUS "+l)
+                brace += l.count('{') - l.count('}')
+                i+=1
+                if brace<=0:
+                    break
+            continue
+        out.append(line); i+=1
+    if changed:
+        bdir=os.path.join(RB,"nginx_conf_backups")
+        os.makedirs(bdir, exist_ok=True)
+        b=os.path.join(bdir, os.path.basename(path)+f".bak_{TS}_{sha(path)}")
+        try: shutil.copy2(path,b)
+        except: pass
+        open(path,'w').write("\n".join(out)+("\n" if out else ""))
+    return changed
 
-if [ -n "${SRC:-}" ]; then
-  log "Frontend source detected: $SRC"
-  STAGE="/var/www/wolverine.__staging_${TS}"
-  rm -rf "$STAGE"
-  mkdir -p "$STAGE"
-  rsync -a --delete "$SRC/." "$STAGE/."
-  test -f "$STAGE/index.html" || die "Staging missing index.html"
-  mv "$ROOT_WOLV" "/var/www/wolverine.__bak_${TS}" 2>/dev/null || true
-  mv "$STAGE" "$ROOT_WOLV"
-  log "Frontend promoted. Backup: /var/www/wolverine.__bak_${TS}"
-else
-  log "No export produced/found; keeping current $ROOT_WOLV as-is."
-fi
+changed_any=False
+for dirpath,dirnames,filenames in os.walk(ROOT):
+    for fn in filenames:
+        if not fn.endswith((".conf",".inc")): continue
+        p=os.path.join(dirpath,fn)
+        try:
+            txt=open(p,'r',errors='ignore').read()
+        except: 
+            continue
+        if "/wolverine" not in txt: 
+            continue
+        if disable_wolverine_locations(p):
+            changed_any=True
+print("conflicts_disabled=", "yes" if changed_any else "no")
+PY
 
-log "4) VENDOR: ensure local /wolverine/vendor exists (no CDN) (best-effort)"
-mkdir -p "$ROOT_WOLV/vendor"
-if [ -d "$REPO/vendor" ]; then
-  rsync -a "$REPO/vendor/." "$ROOT_WOLV/vendor/." || true
-elif [ -d "$REPO/public/vendor" ]; then
-  rsync -a "$REPO/public/vendor/." "$ROOT_WOLV/vendor/." || true
-fi
+log "5) Ensure /wolverine routes include generated (will be forced at top of correct server block)"
+# API port selection (robust)
+pick_port(){ local p; for p in 3000 3001 3010 3200 3333 8484 9696; do if ! ss -ltn "( sport = :$p )" | grep -q ":$p"; then echo "$p"; return 0; fi; done; echo "0"; }
 
-if [ -z "$(ls -A "$ROOT_WOLV/vendor" 2>/dev/null || true)" ]; then
-  log "Vendor empty: materialize from npm into $ROOT_WOLV/vendor (best-effort)"
-  TMP="/tmp/wolv_vendor_${TS}"
-  rm -rf "$TMP"
-  mkdir -p "$TMP"
-  ( cd "$TMP" && npm init -y >/dev/null 2>&1 ) || true
-  ( cd "$TMP" && npm i --silent @solana/web3.js @solana/spl-token ) || true
-  WEB3_SRC="$(find "$TMP/node_modules/@solana/web3.js" -type f -name "*browser*.js" | head -n 1 || true)"
-  [ -z "${WEB3_SRC:-}" ] && WEB3_SRC="$(find "$TMP/node_modules/@solana/web3.js" -type f -name "index*.js" | head -n 1 || true)"
-  SPL_SRC="$(find "$TMP/node_modules/@solana/spl-token" -type f -name "index*.js" | head -n 1 || true)"
-  [ -n "${WEB3_SRC:-}" ] && cp -a "$WEB3_SRC" "$ROOT_WOLV/vendor/solana-web3.min.js" || true
-  [ -n "${SPL_SRC:-}" ] && cp -a "$SPL_SRC" "$ROOT_WOLV/vendor/spl-token.min.js" || true
-  rm -rf "$TMP" || true
-fi
-
-log "5) BACKEND: ensure API up (no 502). If 3000 taken, auto-pick a free port."
-pick_port(){ local p; for p in 3000 3001 3010 3200 3333; do if ! ss -ltn "( sport = :$p )" | grep -q ":$p"; then echo "$p"; return 0; fi; done; echo "0"; }
+log "6) Backend wrapper (stable) + auto-detect real TraderOne backend"
+# choose wrapper port (avoid hijacking existing 3000 if not ours)
 is_ours(){ local port="$1"; curl -fsS "http://127.0.0.1:${port}/health" 2>/dev/null | grep -q '"service":"traderone-api"'; }
 
-PORT="3000"
+WRAP_PORT="3000"
 if ss -ltn "( sport = :3000 )" | grep -q ":3000"; then
   if is_ours 3000; then
-    PORT="3000"
-    log "Port 3000 already running traderone-api (ours)."
+    WRAP_PORT="3000"
   else
-    PORT="$(pick_port)"
-    [ "$PORT" != "0" ] || die "No free port for API."
-    log "Port 3000 busy by other service; using free port: $PORT"
+    WRAP_PORT="$(pick_port)"; [ "$WRAP_PORT" != "0" ] || die "No free port for wrapper API"
   fi
-else
-  PORT="3000"
 fi
-
-# Try detect real backend location (best-effort only, no destructive changes)
-REAL_BACKEND=""
-for C in /opt/traderone /opt/traderone-opt /opt/traderone-vault /opt/wolverine/traderone /root/traderone; do
-  if [ -f "$C/server.js" ] || [ -f "$C/index.js" ] || [ -f "$C/app.js" ]; then REAL_BACKEND="$C"; break; fi
-done
+log "Wrapper API port: $WRAP_PORT"
 
 mkdir -p /opt/traderone/api
-cat > "/tmp/traderone_api_server_${TS}.js" <<JS
-const express=require("express");
-const app=express();
-app.use(express.json({limit:"2mb"}));
-app.use((req,res,next)=>{res.setHeader("Access-Control-Allow-Origin","*");res.setHeader("Access-Control-Allow-Headers","content-type");res.setHeader("Access-Control-Allow-Methods","GET,POST,OPTIONS");if(req.method==="OPTIONS")return res.sendStatus(204);next();});
-const REAL_BACKEND=${REAL_BACKEND:+"${REAL_BACKEND}"}${REAL_BACKEND:+";"}${REAL_BACKEND:+" "}null;
-app.get("/health",(req,res)=>res.json({ok:true,service:"traderone-api",port:${PORT},ts:Date.now(),real_backend:REAL_BACKEND||null}));
-app.get("/status",(req,res)=>res.json({ok:true,mode:REAL_BACKEND?"WRAPPER_READY":"SAFE_STUB",ts:Date.now(),real_backend:REAL_BACKEND||null}));
-app.get("/invested",(req,res)=>res.json({ok:true,pub:req.query.pub||null,invested_usdc:0,ts:Date.now()}));
-app.post("/start",(req,res)=>res.json({ok:true,action:"start",received:req.body||{},ts:Date.now()}));
-app.post("/traderone/mode",(req,res)=>res.json({ok:true,action:"mode",received:req.body||{},ts:Date.now()}));
-app.post("/traderone/withdraw",(req,res)=>res.json({ok:true,action:"withdraw",received:req.body||{},ts:Date.now()}));
-app.listen(${PORT},"127.0.0.1",()=>console.log("TraderOne API listening on 127.0.0.1:${PORT}"));
-JS
 
 cat > "/tmp/traderone_api_pkg_${TS}.json" <<'JSON'
 {"name":"traderone-api","version":"1.0.0","private":true,"type":"commonjs","main":"server.js","scripts":{"start":"node server.js"},"dependencies":{"express":"^4.19.2"}}
 JSON
 
-askorupdate_file "/tmp/traderone_api_server_${TS}.js" "/opt/traderone/api/server.js"
+# Wrapper with passthrough: tries real backend ports (in order) and proxies if JSON detected.
+cat > "/tmp/traderone_api_server_${TS}.js" <<JS
+const express=require("express");
+const http=require("http");
+const https=require("https");
+const app=express();
+app.use(express.json({limit:"2mb"}));
+app.use((req,res,next)=>{res.setHeader("Access-Control-Allow-Origin","*");res.setHeader("Access-Control-Allow-Headers","content-type");res.setHeader("Access-Control-Allow-Methods","GET,POST,OPTIONS");if(req.method==="OPTIONS")return res.sendStatus(204);next();});
+
+const WRAP_PORT=${WRAP_PORT};
+const PROBABLE_PORTS=[3000,3001,3010,3200,3333,8484,9696].filter(p=>p!==WRAP_PORT);
+let REAL=null;
+
+function tryDetect(cb){
+  if(REAL) return cb(null,REAL);
+  let i=0;
+  const next=()=>{
+    if(i>=PROBABLE_PORTS.length) return cb(null,null);
+    const p=PROBABLE_PORTS[i++];
+    const req=http.request({host:"127.0.0.1",port:p,path:"/health",method:"GET",timeout:450}, r=>{
+      let d=""; r.on("data",c=>d+=c); r.on("end",()=>{
+        if(r.statusCode===200 && d.includes("traderone") || d.includes("TraderOne")){
+          REAL={host:"127.0.0.1",port:p}; return cb(null,REAL);
+        }
+        // try /status as fallback
+        const req2=http.request({host:"127.0.0.1",port:p,path:"/status",method:"GET",timeout:450}, r2=>{
+          let d2=""; r2.on("data",c=>d2+=c); r2.on("end",()=>{
+            if(r2.statusCode===200 && (d2.includes("traderone")||d2.includes("TraderOne"))){
+              REAL={host:"127.0.0.1",port:p}; return cb(null,REAL);
+            }
+            next();
+          });
+        });
+        req2.on("error",()=>next());
+        req2.on("timeout",()=>{try{req2.destroy();}catch(e){}; next();});
+        req2.end();
+      });
+    });
+    req.on("error",()=>next());
+    req.on("timeout",()=>{try{req.destroy();}catch(e){}; next();});
+    req.end();
+  };
+  next();
+}
+
+function proxyToReal(req,res,real){
+  const opts={host:real.host,port:real.port,path:req.originalUrl,method:req.method,headers:{...req.headers,host:req.headers.host||"127.0.0.1"}};
+  const preq=http.request(opts, pres=>{
+    res.status(pres.statusCode||502);
+    Object.entries(pres.headers||{}).forEach(([k,v])=>{ try{ if(v!==undefined) res.setHeader(k,v);}catch(e){} });
+    pres.pipe(res);
+  });
+  preq.on("error",()=>res.status(502).json({ok:false,error:"proxy_failed",real}));
+  if(req.method!=="GET" && req.method!=="HEAD") preq.write(JSON.stringify(req.body||{}));
+  preq.end();
+}
+
+app.get("/health",(req,res)=>{
+  tryDetect((_,real)=>res.json({ok:true,service:"traderone-api",wrap_port:WRAP_PORT,real_backend:real||null,ts:Date.now()}));
+});
+app.get("/status",(req,res)=>{
+  tryDetect((_,real)=>res.json({ok:true,mode:real?"PASSTHROUGH":"SAFE_STUB",wrap_port:WRAP_PORT,real_backend:real||null,ts:Date.now()}));
+});
+
+app.use((req,res,next)=>{
+  // for non-health endpoints, proxy if real found; else safe stub responses for known routes
+  if(req.path==="/health"||req.path==="/status") return next();
+  tryDetect((_,real)=>{
+    if(real) return proxyToReal(req,res,real);
+    // safe-stub for expected UI calls
+    if(req.path==="/invested" && req.method==="GET") return res.json({ok:true,pub:req.query.pub||null,invested_usdc:0,ts:Date.now()});
+    if(req.path==="/start" && req.method==="POST") return res.json({ok:true,action:"start",received:req.body||{},ts:Date.now()});
+    if(req.path==="/traderone/mode" && req.method==="POST") return res.json({ok:true,action:"mode",received:req.body||{},ts:Date.now()});
+    if(req.path==="/traderone/withdraw" && req.method==="POST") return res.json({ok:true,action:"withdraw",received:req.body||{},ts:Date.now()});
+    return res.status(404).json({ok:false,error:"not_found",mode:"SAFE_STUB"});
+  });
+});
+
+app.listen(WRAP_PORT,"127.0.0.1",()=>console.log("TraderOne wrapper listening on 127.0.0.1:"+WRAP_PORT));
+JS
+
 askorupdate_file "/tmp/traderone_api_pkg_${TS}.json" "/opt/traderone/api/package.json"
+askorupdate_file "/tmp/traderone_api_server_${TS}.js" "/opt/traderone/api/server.js"
 ( cd /opt/traderone/api && npm i --silent )
+
 cat > "/tmp/traderone-api_${TS}.service" <<SVC
 [Unit]
-Description=TraderOne API (WOLVERINE)
+Description=TraderOne API Wrapper (WOLVERINE)
 After=network.target
 
 [Service]
@@ -233,14 +343,16 @@ User=root
 [Install]
 WantedBy=multi-user.target
 SVC
+
 askorupdate_file "/tmp/traderone-api_${TS}.service" "/etc/systemd/system/traderone-api.service"
 systemctl daemon-reload
 systemctl enable --now traderone-api.service
 sleep 0.5
-curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null
+curl -fsS "http://127.0.0.1:${WRAP_PORT}/health" >/dev/null
 
-log "6) NGINX: generate routes include with correct PORT, force include at TOP of server{} (fix conflicts)"
+log "7) Write nginx include with wrapper port (strong precedence) + ensure it is injected in the REAL vhost server{}(s)"
 cat > "/tmp/wolverine_routes_${TS}.inc" <<NG
+# WOLVERINE forced routes (generated ${TS})
 location ^~ /wolverine/traderone/api/ {
   proxy_http_version 1.1;
   proxy_set_header Host \$host;
@@ -249,7 +361,7 @@ location ^~ /wolverine/traderone/api/ {
   proxy_set_header X-Forwarded-Proto \$scheme;
   proxy_set_header Upgrade \$http_upgrade;
   proxy_set_header Connection "upgrade";
-  proxy_pass http://127.0.0.1:${PORT}/;
+  proxy_pass http://127.0.0.1:${WRAP_PORT}/;
 }
 location ^~ /wolverine/ {
   root /var/www;
@@ -261,46 +373,122 @@ location = /wolverine/manifest.json { add_header Cache-Control "no-store" always
 NG
 askorupdate_file "/tmp/wolverine_routes_${TS}.inc" "$INC"
 
-test -f "$VHOST" || die "Missing vhost: $VHOST"
-chattr -i /etc/nginx/nginx.conf 2>/dev/null || true
-chattr -i "$VHOST" 2>/dev/null || true
-
+# Patch ONLY the detected vhost file: inject include at TOP of server blocks that serve fireinners.online
 python3 - <<PY
 from pathlib import Path
-p=Path("$VHOST")
+import re,os
+p=Path("$VHOST_DETECTED")
 s=p.read_text(errors="ignore").splitlines()
+
 inc='include /etc/nginx/includes/wolverine_routes.inc;'
 out=[]
-server_opened=False
-for line in s:
-    if inc in line:
-        continue
-    out.append(line)
-    if (not server_opened) and ("server" in line) and ("{" in line):
-        server_opened=True
+i=0
+def block_text(lines,a,b): return "\n".join(lines[a:b+1])
+
+# Helper: determine if a server block serves fireinners.online
+def serves_fireinners(block):
+    if re.search(r'\\bserver_name\\b', block) and 'fireinners.online' in block:
+        return True
+    return False
+
+# We will parse brace depth to identify server blocks.
+depth=0
+server_start=None
+server_depth=None
+blocks=[]
+for idx,line in enumerate(s):
+    if server_start is None and re.search(r'\\bserver\\s*\\{', line):
+        server_start=idx
+        # depth after counting braces in this line
+    # update depth
+    depth += line.count('{') - line.count('}')
+    if server_start is not None and idx==server_start:
+        server_depth=depth
+    if server_start is not None and depth < (server_depth or 0):
+        # closed server block at previous line
+        blocks.append((server_start, idx-1))
+        server_start=None
+        server_depth=None
+
+# If block did not close properly, ignore.
+mark=set()
+for a,b in blocks:
+    blk=block_text(s,a,b)
+    if serves_fireinners(blk):
+        mark.add((a,b))
+
+# Now rewrite: remove existing include lines; and for marked blocks insert include right after opening brace line.
+idx=0
+while idx < len(s):
+    # if inside a marked server block
+    hit=None
+    for a,b in mark:
+        if idx==a:
+            hit=(a,b); break
+    if hit:
+        a,b=hit
+        # write block
+        # find opening line (a)
+        out.append(s[a])
+        # insert include immediately after open line
         out.append("  "+inc)
+        # write rest of block excluding any prior include occurrences
+        for j in range(a+1,b+1):
+            if inc in s[j]:
+                continue
+            out.append(s[j])
+        idx=b+1
+        continue
+    # outside marked blocks: just copy line, but drop stray include duplicates
+    if inc in s[idx]:
+        idx+=1
+        continue
+    out.append(s[idx]); idx+=1
+
 p.write_text("\n".join(out)+("\n" if out else ""))
 PY
 
+log "8) Vendor guaranteed: if still empty, download install-time bundles (runtime local)"
+mkdir -p "$ROOT_WOLV/vendor"
+if [ -z "$(ls -A "$ROOT_WOLV/vendor" 2>/dev/null || true)" ]; then
+  log "Vendor empty: downloading browser bundles into $ROOT_WOLV/vendor"
+  # best-effort URLs; if they fail, we still proceed (front fallback can show error)
+  curl -fsSL "https://cdn.jsdelivr.net/npm/@solana/web3.js@latest/lib/index.iife.min.js" -o "$ROOT_WOLV/vendor/solana-web3.min.js" || true
+  curl -fsSL "https://cdn.jsdelivr.net/npm/@solana/spl-token@latest/lib/index.iife.min.js" -o "$ROOT_WOLV/vendor/spl-token.min.js" || true
+fi
+
+log "9) Front fallback auto: if /wolverine index missing OR nginx loopback fails -> install minimal working UI"
+need_fallback="0"
+[ -f "$ROOT_WOLV/index.html" ] || need_fallback="1"
+# loopback test (ignore fail)
+if ! curl -k -fsS "https://127.0.0.1/wolverine/" >/dev/null 2>&1; then need_fallback="1"; fi
+
+if [ "$need_fallback" = "1" ]; then
+  log "Installing fallback frontend into $ROOT_WOLV/index.html (functional Phantom SOL/USDC)"
+  cat > "/tmp/wolverine_fallback_${TS}.html" <<'HTML'
+<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>WOLVERINE • TraderOne</title><style>html,body{height:100%;margin:0;font-family:ui-sans-serif,system-ui,Segoe UI,Roboto,Arial;background:#06080c;color:#e9eef6}a{color:#8ad}button{background:#111826;border:1px solid #223049;color:#e9eef6;padding:10px 12px;border-radius:10px;cursor:pointer}button:hover{border-color:#3a5b86}input{background:#0b1220;border:1px solid #223049;color:#e9eef6;padding:10px 12px;border-radius:10px;outline:none}#wrap{display:grid;grid-template-columns:280px 1fr;min-height:100%}#side{border-right:1px solid #141c2b;padding:14px;background:radial-gradient(1200px 400px at 20% 0%,rgba(54,120,255,.20),transparent)}#main{padding:16px}h1{margin:0 0 8px 0;font-size:18px;letter-spacing:.3px}small{opacity:.75}#nav button{width:100%;text-align:left;margin:6px 0}#card{border:1px solid #141c2b;border-radius:14px;padding:14px;background:linear-gradient(180deg,rgba(18,25,40,.55),rgba(8,12,20,.55));box-shadow:0 12px 40px rgba(0,0,0,.35)}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.k{opacity:.75;font-size:12px}.v{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:12px;word-break:break-all}#log{white-space:pre-wrap;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:12px;opacity:.9;margin-top:10px;max-height:240px;overflow:auto;border-top:1px solid #141c2b;padding-top:10px}</style></head><body><div id="wrap"><div id="side"><h1>WOLVERINE</h1><small>UI + Phantom + TraderOne API</small><div style="height:10px"></div><div id="nav"><button data-route="dashboard">Dashboard</button><button data-route="trade">Trade</button><button data-route="positions">Positions</button><button data-route="orders">Orders</button><button data-route="history">History</button><button data-route="wallet">Wallet</button><button data-route="settings">Settings</button><button data-route="health">Health</button></div><div style="height:12px"></div><div id="card"><div class="row"><button id="btnConnect">Connect Phantom</button><button id="btnDisc">Disconnect</button></div><div style="height:10px"></div><div class="k">Public Key</div><div id="pub" class="v">—</div><div style="height:10px"></div><div class="row"><div><div class="k">SOL</div><div id="sol" class="v">—</div></div><div><div class="k">USDC</div><div id="usdc" class="v">—</div></div></div><div style="height:10px"></div><div class="k">TraderOne API</div><div class="v"><a id="api" href="/wolverine/traderone/api/health" target="_blank" rel="noreferrer">/wolverine/traderone/api</a></div><div style="height:10px"></div><div class="row"><button id="btnRefresh">Refresh</button><button id="btnStart">Start</button></div><div id="log"></div></div></div><div id="main"><h1 id="title">Dashboard</h1><div id="panel" style="max-width:980px"></div></div></div><script src="/wolverine/vendor/solana-web3.min.js"></script><script>(function(){const $=s=>document.querySelector(s);const log=(...a)=>{$('#log').textContent=(a.map(x=>typeof x==='string'?x:JSON.stringify(x)).join(' ')+'\n')+$('#log').textContent};const USDC_MINT="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1";const RPC="https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac";let conn=null,pub=null,prov=null;function connInit(){if(!conn){if(!window.solanaWeb3){throw new Error("solana-web3 missing in /wolverine/vendor");}conn=new solanaWeb3.Connection(RPC,"confirmed");}}async function getSOL(){connInit();const lam=await conn.getBalance(pub,"confirmed");return lam/1e9;}async function getUSDC(){connInit();const accts=await conn.getParsedTokenAccountsByOwner(pub,{programId:new solanaWeb3.PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")});let sum=0;for(const it of (accts.value||[])){try{const info=it.account.data.parsed.info;if(info&&info.mint===USDC_MINT){sum+=Number(info.tokenAmount.uiAmount||0);}}catch(e){}}return sum;}async function refresh(){if(!pub){log("no wallet");return;}try{$('#sol').textContent="…";$('#usdc').textContent="…";const [sol,usdc]=await Promise.all([getSOL(),getUSDC()]);$('#sol').textContent=sol.toFixed(6);$('#usdc').textContent=usdc.toFixed(2);}catch(e){log("refresh error:",(e&&e.message)?e.message:String(e));}}async function connect(){prov=window.solana; if(!prov||!prov.isPhantom){log("Phantom not found");return;}try{const r=await prov.connect({onlyIfTrusted:false});pub=new solanaWeb3.PublicKey(r.publicKey.toString());$('#pub').textContent=pub.toBase58();log("connected:",$('#pub').textContent);await refresh();}catch(e){log("connect error:",(e&&e.message)?e.message:String(e));}}async function disconnect(){try{if(window.solana&&window.solana.isPhantom){await window.solana.disconnect();} }catch(e){} pub=null;$('#pub').textContent="—";$('#sol').textContent="—";$('#usdc').textContent="—";log("disconnected");}async function apiHealth(){try{const r=await fetch("/wolverine/traderone/api/health",{cache:"no-store"});const j=await r.json();log("api health:",j);}catch(e){log("api health error:",(e&&e.message)?e.message:String(e));}}async function apiStart(){try{const r=await fetch("/wolverine/traderone/api/start",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({pub:pub?pub.toBase58():null,ts:Date.now()})});const j=await r.json();log("start:",j);}catch(e){log("start error:",(e&&e.message)?e.message:String(e));}}document.querySelectorAll('#nav button').forEach(b=>b.onclick=()=>{$('#title').textContent=b.textContent;apiHealth();});$('#btnConnect').onclick=connect;$('#btnDisc').onclick=disconnect;$('#btnRefresh').onclick=()=>{refresh();apiHealth();};$('#btnStart').onclick=apiStart;apiHealth();})();</script></body></html>
+HTML
+  askorupdate_file "/tmp/wolverine_fallback_${TS}.html" "$ROOT_WOLV/index.html"
+fi
+
+log "10) Nginx final test + reload"
 nginx -t
 systemctl reload nginx
 chattr +i /etc/nginx/nginx.conf 2>/dev/null || true
-chattr +i "$VHOST" 2>/dev/null || true
+chattr +i "$VHOST_DETECTED" 2>/dev/null || true
+chattr +i "$INC" 2>/dev/null || true
 
-log "7) Validation (local + TLS loopback)"
-echo "== API local =="
-curl -fsS "http://127.0.0.1:${PORT}/health" | head -c 600; echo
+log "11) HARD validation (loopback)"
+echo "== API wrapper local =="
+curl -fsS "http://127.0.0.1:${WRAP_PORT}/health" | head -c 800; echo
 echo "== NGINX loopback TLS =="
-curl -k -fsS "https://127.0.0.1/wolverine/traderone/api/health" | head -c 600; echo
-curl -k -I "https://127.0.0.1/wolverine/" | sed -n '1,15p' || true
+curl -k -fsS "https://127.0.0.1/wolverine/traderone/api/health" | head -c 800; echo
+curl -k -I "https://127.0.0.1/wolverine/" | sed -n '1,18p' || true
 
-log "8) Output"
-echo "OK: Front => $ROOT_WOLV"
-echo "OK: API   => 127.0.0.1:${PORT} (systemd traderone-api.service)"
-echo "OK: Nginx => include forced at top of $VHOST"
-echo "URLs:"
-echo " - https://fireinners.online/wolverine/"
-echo " - https://fireinners.online/wolverine/traderone/api/health"
-echo "Rollback snapshot: $RB_DIR"
-log "DONE."
+log "DONE"
+echo "Front:  https://fireinners.online/wolverine/"
+echo "API:    https://fireinners.online/wolverine/traderone/api/health"
+echo "Wrapper: http://127.0.0.1:${WRAP_PORT}/health"
+echo "Patched vhost: $VHOST_DETECTED"
+echo "Rollback: $RB_DIR"
 BASH
