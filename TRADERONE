@@ -1,108 +1,94 @@
-cat >/root/FIX_WOLVERINE_VAULT_PHANTOM.sh <<'BASH'
+cat >/root/WOLVERINE_FIX_PHANTOM_VAULT.sh <<'BASH'
 #!/usr/bin/env bash
-set -euo pipefail
+set -e
 
 HTML="/var/www/wolverine/index.html"
-TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP="/root/index.html.backup.$(date +%Y%m%d_%H%M%S)"
 
-echo "=== FIX WOLVERINE VAULT + PHANTOM (NO DUPLICATES) ==="
+echo "== BACKUP =="
+cp "$HTML" "$BACKUP"
 
-test -f "$HTML" || { echo "❌ index.html introuvable"; exit 1; }
+echo "== WRITE CLEAN FRONTEND =="
 
-cp -a "$HTML" "$HTML.bak_$TS"
+cat >"$HTML" <<'HTML'
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<title>WOLVERINE</title>
+<script src="/wolverine/vendor/solana-web3.min.js"></script>
+<style>
+body{font-family:Arial;background:#f4f4f4}
+section{border:2px solid #4aa;padding:12px;margin:20px}
+button,input{padding:6px;margin:4px}
+</style>
+</head>
+<body>
 
-python3 - <<'PY'
-from pathlib import Path
-import re
-
-p=Path("/var/www/wolverine/index.html")
-s=p.read_text(errors="ignore")
-
-# 1) SUPPRIMER TOUS LES BLOCS PHANTOM / VAULT EXISTANTS
-s=re.sub(r'<section[^>]+id="phantom"[^>]*>.*?</section>','',s,flags=re.S|re.I)
-s=re.sub(r'<section[^>]+id="vault"[^>]*>.*?</section>','',s,flags=re.S|re.I)
-
-# 2) SUPPRIMER TOUS IMPORTS SOLANA CASSÉS
-s=re.sub(r'<script[^>]+unpkg[^>]+solana[^>]+></script>','',s,flags=re.I)
-s=re.sub(r'import\s*{[^}]*Connection[^}]*}[^;]*;','',s)
-
-# 3) AJOUTER BLOC UNIQUE PHANTOM + VAULT
-BLOCK="""
-<section id="phantom" style="border:1px solid #444;padding:12px;margin-top:20px">
+<section id="phantom">
 <h3>Phantom</h3>
-<button id="connectPhantom">Connect Phantom</button>
-<div>Adresse: <span id="userAddr">—</span></div>
-<div>SOL: <span id="userSol">—</span></div>
+<button id="connect">Connect Phantom</button><br>
+Adresse: <span id="addr">—</span><br>
+SOL: <span id="sol">—</span>
 </section>
 
-<section id="vault" style="border:2px solid #00e0ff;padding:16px;margin-top:20px">
+<section id="vault">
 <h3>Vault</h3>
-<button id="vaultCreate">Créer mon Vault</button>
-<div>Vault: <span id="vaultAddr">—</span></div>
-<div>Vault SOL: <span id="vaultSol">—</span></div>
-<input id="vaultAmount" placeholder="Montant SOL">
-<button id="vaultDeposit">Déposer SOL</button>
+<button id="createVault">Créer mon Vault</button><br>
+Vault: <span id="vaultAddr">—</span><br>
+Vault SOL: <span id="vaultSol">—</span><br>
+<input id="amount" placeholder="Montant SOL">
+<button id="deposit">Déposer SOL</button>
 </section>
 
-<script type="module">
-import * as solanaWeb3 from "https://cdn.jsdelivr.net/npm/@solana/web3.js@1.95.4/lib/index.iife.min.js";
-
+<script>
 const RPC="https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac";
-const conn=new solanaWeb3.Connection(RPC,"confirmed");
+const connection=new solanaWeb3.Connection(RPC);
+let wallet=null,vault=null;
 
-let pubkey=null,vault=null;
-
-async function refreshBalances(){
- if(!pubkey)return;
- const lam=await conn.getBalance(pubkey);
- document.getElementById("userSol").textContent=(lam/1e9).toFixed(6);
- if(vault){
-  const vlam=await conn.getBalance(vault.publicKey);
-  document.getElementById("vaultSol").textContent=(vlam/1e9).toFixed(6);
- }
+async function refreshSOL(pub,el){
+ const b=await connection.getBalance(pub);
+ el.textContent=(b/1e9).toFixed(6);
 }
 
-document.getElementById("connectPhantom").onclick=async()=>{
- if(!window.solana?.isPhantom)return alert("Phantom absent");
- const r=await window.solana.connect();
- pubkey=r.publicKey;
- document.getElementById("userAddr").textContent=pubkey.toBase58();
- refreshBalances();
+document.getElementById("connect").onclick=async()=>{
+ if(!window.solana?.isPhantom)return alert("Phantom manquant");
+ const r=await solana.connect();
+ wallet=r.publicKey;
+ addr.textContent=wallet.toBase58();
+ refreshSOL(wallet,sol);
 };
 
-document.getElementById("vaultCreate").onclick=()=>{
+document.getElementById("createVault").onclick=()=>{
  vault=solanaWeb3.Keypair.generate();
- document.getElementById("vaultAddr").textContent=vault.publicKey.toBase58();
+ vaultAddr.textContent=vault.publicKey.toBase58();
+ vaultSol.textContent="0.000000";
 };
 
-document.getElementById("vaultDeposit").onclick=async()=>{
- if(!vault||!pubkey)return alert("Phantom ou Vault manquant");
- const amt=parseFloat(document.getElementById("vaultAmount").value);
- if(!amt||amt<=0)return alert("Montant invalide");
+document.getElementById("deposit").onclick=async()=>{
+ if(!wallet||!vault)return alert("Wallet/Vault manquant");
+ const amt=parseFloat(amount.value);
+ if(!amt||amt<=0)return;
  const tx=new solanaWeb3.Transaction().add(
   solanaWeb3.SystemProgram.transfer({
-   fromPubkey:pubkey,
+   fromPubkey:wallet,
    toPubkey:vault.publicKey,
-   lamports:Math.floor(amt*1e9)
+   lamports:amt*1e9
   })
  );
- tx.feePayer=pubkey;
- tx.recentBlockhash=(await conn.getLatestBlockhash()).blockhash;
- const signed=await window.solana.signTransaction(tx);
- await conn.sendRawTransaction(signed.serialize());
- setTimeout(refreshBalances,2000);
+ tx.feePayer=wallet;
+ tx.recentBlockhash=(await connection.getLatestBlockhash()).blockhash;
+ const signed=await solana.signTransaction(tx);
+ await connection.sendRawTransaction(signed.serialize());
+ refreshSOL(vault.publicKey,vaultSol);
+ refreshSOL(wallet,sol);
 };
 </script>
-"""
 
-s=re.sub(r'</body>',BLOCK+"\n</body>",s,flags=re.I)
+</body></html>
+HTML
 
-p.write_text(s)
-print("OK HTML PATCHED")
-PY
-
-echo "=== DONE ==="
+echo "== DONE =="
+echo "Backup: $BACKUP"
+echo "Recharge la page avec CTRL+SHIFT+R"
 BASH
 
-chmod +x /root/FIX_WOLVERINE_VAULT_PHANTOM.sh
-/root/FIX_WOLVERINE_VAULT_PHANTOM.sh
+chmod +x /root/WOLVERINE_FIX_PHANTOM_VAULT.sh
+/root/WOLVERINE_FIX_PHANTOM_VAULT.sh
