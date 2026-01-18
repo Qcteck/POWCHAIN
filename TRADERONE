@@ -1,346 +1,454 @@
-bash -s <<'BASH'
+bash -lc 'cat >/root/WOLVERINE_FIX_100.sh <<'"'"'BASH'"'"'
 #!/usr/bin/env bash
 set -euo pipefail
 
 TS="$(date +%Y%m%d_%H%M%S)"
-export DEBIAN_FRONTEND=noninteractive
-umask 022
+HOST="$(hostname -f 2>/dev/null || hostname)"
+LOG="/root/WOLVERINE_FIX_100_${TS}.log"
+exec > >(tee -a "$LOG") 2>&1
 
-log(){ printf "\n[%s] %s\n" "$(date '+%F %T')" "$*"; }
-die(){ echo "ERROR: $*" >&2; exit 1; }
+need(){ command -v "$1" >/dev/null 2>&1 || { echo "Missing dependency: $1"; exit 1; }; }
 
-[ "$(id -u)" -eq 0 ] || die "Run as root."
+echo "=== WOLVERINE_FIX_100 :: $TS :: $HOST ==="
+echo "Log: $LOG"
+echo
 
-ROOT_WOLV="/var/www/wolverine"
-REPO="/opt/wolverine"
+if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+  echo "ERROR: run as root."; exit 1
+fi
+
+need bash
+need sed
+need awk
+need grep
+need cp
+need mkdir
+need chmod
+need chattr || true
+need nginx || true
+need systemctl || true
+need curl || true
+need python3 || true
+
+# --- Paths (mémoire projet) ---
+ROOT="/var/www/wolverine"
+NGINX_MAIN="/etc/nginx/nginx.conf"
+VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
 INC="/etc/nginx/includes/wolverine_routes.inc"
-ASK="/opt/fireinners/sentinel/lib/askorupdate.sh"
 
-RB_DIR="/root/MEGA_WOLVERINE_ROLLBACK_${TS}"
-mkdir -p "$RB_DIR"
+API_DIR="/opt/traderone-vault"
+API_PORT="3000"
+PM2_NAME="traderone-vault"
 
-rollback(){
-  log "ROLLBACK (best-effort)"
-  if [ -f "$RB_DIR/wolverine_routes.inc" ]; then
-    mkdir -p "$(dirname "$INC")"
-    cp -a "$RB_DIR/wolverine_routes.inc" "$INC" 2>/dev/null || true
-  fi
-  if [ -d "$RB_DIR/wolverine_www" ]; then
-    rm -rf "$ROOT_WOLV" 2>/dev/null || true
-    cp -a "$RB_DIR/wolverine_www" "$ROOT_WOLV" 2>/dev/null || true
-  fi
-  if [ -f "$RB_DIR/vhost_patched_path.txt" ]; then
-    VHOST="$(cat "$RB_DIR/vhost_patched_path.txt" 2>/dev/null || true)"
-    if [ -n "${VHOST:-}" ] && [ -f "$RB_DIR/vhost_backup.conf" ]; then
-      chattr -i "$VHOST" 2>/dev/null || true
-      cp -a "$RB_DIR/vhost_backup.conf" "$VHOST" 2>/dev/null || true
-      chattr +i "$VHOST" 2>/dev/null || true
-    fi
-  fi
-  nginx -t && systemctl reload nginx || true
-  log "ROLLBACK done"
-}
-trap 'rollback; die "Failed at line $LINENO"' ERR
+echo "Paths:"
+echo "  ROOT      = $ROOT"
+echo "  VHOST     = $VHOST"
+echo "  INC       = $INC"
+echo "  API_DIR   = $API_DIR"
+echo "  API_PORT  = $API_PORT"
+echo
 
-log "0) Preflight"
-command -v nginx >/dev/null 2>&1 || die "nginx missing"
-command -v git  >/dev/null 2>&1 || die "git missing"
-mkdir -p /etc/nginx/includes
-mkdir -p "$ROOT_WOLV"
-
+# --- 0) Savepoint (si présent) ---
 if [ -x /root/WOLVERINE_SAVEPOINT.sh ]; then
-  /root/WOLVERINE_SAVEPOINT.sh "AUTO_BEFORE_MEGA_PLUS_${TS}" || true
-fi
-
-if [ -f "$ASK" ]; then
-  # shellcheck disable=SC1090
-  source "$ASK"
-  log "askorupdate loaded: $ASK"
+  echo "== 0) Running savepoint script =="
+  /root/WOLVERINE_SAVEPOINT.sh || echo "WARN: savepoint script returned non-zero (continuing)"
+  echo
 else
-  askorupdate_file(){ local SRC="$1" DST="$2"; mkdir -p "$(dirname "$DST")"; cp -a "$DST" "${DST}.bak_${TS}" 2>/dev/null || true; cp -a "$SRC" "$DST"; }
+  echo "== 0) Savepoint script not found at /root/WOLVERINE_SAVEPOINT.sh (continuing) =="
+  echo
 fi
 
-[ -f "$INC" ] && cp -a "$INC" "$RB_DIR/wolverine_routes.inc" || true
-[ -d "$ROOT_WOLV" ] && cp -a "$ROOT_WOLV" "$RB_DIR/wolverine_www" || true
-
-log "1) Ensure Node.js via NodeSource"
-if ! command -v node >/dev/null 2>&1; then
-  apt-get update -y
-  apt-get install -y ca-certificates curl gnupg
-  install -d -m 0755 /etc/apt/keyrings
-  curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
-  echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" > /etc/apt/sources.list.d/nodesource.list
-  apt-get update -y
-  apt-get install -y nodejs
-fi
-node -v >/dev/null
-npm -v >/dev/null
-
-log "2) Detect real vhost for fireinners.online via nginx -T"
-NGT="/tmp/nginx_T_${TS}.txt"
-nginx -T > "$NGT" 2>&1 || die "nginx -T failed"
-cp -a "$NGT" "$RB_DIR/nginx_T_before.txt"
-
-VHOST_DETECTED="$(python3 - <<'PY'
-import re,sys
-txt=open(sys.argv[1],'r',errors='ignore').read().splitlines()
-files=set(); cur=None
-for line in txt:
-    m=re.match(r'# configuration file (.+?):', line.strip())
-    if m: cur=m.group(1); continue
-    if cur and 'server_name' in line and 'fireinners.online' in line:
-        files.add(cur)
-best=""; best_score=-1
-for f in files:
-    score=0; cur=None
-    for line in txt:
-        m=re.match(r'# configuration file (.+?):', line.strip())
-        if m: cur=m.group(1); continue
-        if cur!=f: continue
-        if 'server_name' in line and 'fireinners.online' in line: score+=10
-        if re.search(r'listen\s+443', line): score+=3
-        if 'ssl' in line: score+=1
-    if score>best_score: best_score=score; best=f
-print(best)
-PY
-"$NGT")"
-
-[ -n "${VHOST_DETECTED:-}" ] || die "Could not detect vhost serving fireinners.online"
-echo "$VHOST_DETECTED" > "$RB_DIR/vhost_patched_path.txt"
-cp -a "$VHOST_DETECTED" "$RB_DIR/vhost_backup.conf" || true
-log "Detected vhost: $VHOST_DETECTED"
-
-log "3) Unlock immutables (targeted)"
-chattr -i /etc/nginx/nginx.conf 2>/dev/null || true
-chattr -i "$VHOST_DETECTED" 2>/dev/null || true
-chattr -i "$INC" 2>/dev/null || true
-mkdir -p "$(dirname "$INC")"
-
-log "4) Disable conflicting /wolverine locations in /etc/nginx (backup each file)"
-export RB_DIR TS
-python3 - <<'PY'
-import os,re,shutil,hashlib
-ROOT="/etc/nginx"
-INC="/etc/nginx/includes/wolverine_routes.inc"
-RB=os.environ["RB_DIR"]; TS=os.environ["TS"]
-def sha(p):
-    h=hashlib.sha256()
-    with open(p,'rb') as f:
-        for b in iter(lambda:f.read(1024*1024), b''):
-            h.update(b)
-    return h.hexdigest()[:16]
-def disable(path):
-    s=open(path,'r',errors='ignore').read().splitlines()
-    out=[]; changed=False; i=0
-    while i<len(s):
-        line=s[i]
-        if path==INC: out.append(line); i+=1; continue
-        if re.search(r'^\s*location\s+.*?/wolverine', line):
-            changed=True
-            out.append("# DISABLED_BY_MEGA_WOLVERINE "+line)
-            brace=line.count('{')-line.count('}')
-            i+=1
-            while i<len(s):
-                l=s[i]
-                out.append("# DISABLED_BY_MEGA_WOLVERINE "+l)
-                brace += l.count('{')-l.count('}')
-                i+=1
-                if brace<=0: break
-            continue
-        out.append(line); i+=1
-    if changed:
-        bdir=os.path.join(RB,"nginx_conf_backups"); os.makedirs(bdir,exist_ok=True)
-        try: shutil.copy2(path, os.path.join(bdir, os.path.basename(path)+f".bak_{TS}_{sha(path)}"))
-        except: pass
-        open(path,'w').write("\n".join(out)+("\n" if out else ""))
-    return changed
-changed_any=False
-for dp,_,fns in os.walk(ROOT):
-    for fn in fns:
-        if not fn.endswith((".conf",".inc")): continue
-        p=os.path.join(dp,fn)
-        try: txt=open(p,'r',errors='ignore').read()
-        except: continue
-        if "/wolverine" not in txt: continue
-        if disable(p): changed_any=True
-print("conflicts_disabled=", "yes" if changed_any else "no")
-PY
-
-log "5) Sync repo (best-effort)"
-if [ -d "$REPO/.git" ]; then
-  ( cd "$REPO" && git fetch --all -p && git reset --hard origin/main ) || true
-  ( cd "$REPO" && git log -1 --oneline ) || true
-fi
-
-log "6) Front deploy (export if found; else keep) + ensure vendor local"
-mkdir -p "$ROOT_WOLV"
-[ -f "$ROOT_WOLV/index.html" ] && cp -a "$ROOT_WOLV/index.html" "$ROOT_WOLV/index.html.bak_${TS}" || true
-
-detect_export(){
-  local found=""
-  for CAND in \
-    "$REPO/out" "$REPO/dist" "$REPO/frontend/out" "$REPO/frontend/dist" \
-    "$REPO/web/out" "$REPO/web/dist" "$REPO/public" "$REPO/site" \
-    "$REPO/apps/web/out" "$REPO/apps/web/dist" "$REPO/apps/wolverine/out" "$REPO/apps/wolverine/dist" \
-    "$REPO/var_www_wolverine"
-  do
-    [ -d "$CAND" ] && [ -f "$CAND/index.html" ] && { found="$CAND"; break; }
-  done
-  echo "$found"
+# --- helpers ---
+backup_file(){
+  local f="$1"
+  if [ -f "$f" ]; then
+    cp -a "$f" "${f}.bak_${TS}"
+    echo "Backup: $f -> ${f}.bak_${TS}"
+  fi
+}
+unfreeze(){
+  local f="$1"
+  [ -e "$f" ] || return 0
+  chattr -i "$f" 2>/dev/null || true
+}
+refreeze(){
+  local f="$1"
+  [ -e "$f" ] || return 0
+  chattr +i "$f" 2>/dev/null || true
+}
+ensure_dir(){
+  mkdir -p "$1"
+  chmod 755 "$1" || true
 }
 
-SRC="$(detect_export || true)"
-if [ -z "${SRC:-}" ] && [ -f "$REPO/package.json" ] && grep -qi "next" "$REPO/package.json" 2>/dev/null; then
-  log "Next detected: try build/export"
-  ( cd "$REPO" && npm ci --silent ) || ( cd "$REPO" && npm i --silent )
-  ( cd "$REPO" && npm run build --silent ) || true
-  ( cd "$REPO" && npm run export --silent ) || true
-  SRC="$(detect_export || true)"
+# --- 1) Ensure ROOT has index.html (try to recover from known dist locations) ---
+echo "== 1) Ensuring Wolverine frontend exists =="
+ensure_dir "$ROOT"
+
+if [ ! -f "$ROOT/index.html" ]; then
+  echo "WARN: $ROOT/index.html missing. Attempting recovery from known locations..."
+  CANDIDATES=(
+    "/opt/fireinners/frontend-react/app/dist/wolverine"
+    "/opt/wolverine/out"
+    "/opt/wolverine/dist"
+    "/opt/wolverine/build"
+    "/opt/wolverine/.next"
+    "/var/www/wolverine"
+  )
+  FOUND=""
+  for d in "${CANDIDATES[@]}"; do
+    if [ -f "$d/index.html" ]; then
+      FOUND="$d"
+      break
+    fi
+  done
+  if [ -n "$FOUND" ]; then
+    echo "Found candidate: $FOUND"
+    rsync -a --delete "$FOUND/" "$ROOT/" || { cp -a "$FOUND/." "$ROOT/"; }
+    echo "Recovered frontend into $ROOT"
+  else
+    echo "ERROR: Could not find any index.html candidate. Put your built Wolverine files into $ROOT and re-run."
+    exit 1
+  fi
+else
+  echo "OK: $ROOT/index.html exists"
 fi
+echo
 
-if [ -n "${SRC:-}" ]; then
-  STAGE="/var/www/wolverine.__staging_${TS}"
-  rm -rf "$STAGE"; mkdir -p "$STAGE"
-  rsync -a --delete "$SRC/." "$STAGE/."
-  test -f "$STAGE/index.html" || die "Staging missing index.html"
-  mv "$ROOT_WOLV" "/var/www/wolverine.__bak_${TS}" 2>/dev/null || true
-  mv "$STAGE" "$ROOT_WOLV"
-fi
+# --- 2) Create a SERVE BADGE to prove correct site is served ---
+echo "== 2) Creating Wolverine serve badge =="
+BADGE="$ROOT/__wolverine_ok.txt"
+echo "WOLVERINE_OK $TS $HOST" > "$BADGE"
+chmod 644 "$BADGE" || true
+echo "Badge created: $BADGE"
+echo
 
-mkdir -p "$ROOT_WOLV/vendor"
-if [ -d "$REPO/vendor" ]; then rsync -a "$REPO/vendor/." "$ROOT_WOLV/vendor/." || true; fi
-if [ -d "$REPO/public/vendor" ]; then rsync -a "$REPO/public/vendor/." "$ROOT_WOLV/vendor/." || true; fi
+# --- 3) Write/update nginx include for /wolverine routes + proxy backend ---
+echo "== 3) Updating nginx routes include =="
+ensure_dir "$(dirname "$INC")"
+backup_file "$INC" || true
 
-if [ -z "$(ls -A "$ROOT_WOLV/vendor" 2>/dev/null || true)" ]; then
-  TMP="/tmp/wolv_vendor_${TS}"
-  rm -rf "$TMP"; mkdir -p "$TMP"
-  ( cd "$TMP" && npm init -y >/dev/null 2>&1 ) || true
-  ( cd "$TMP" && npm i --silent @solana/web3.js @solana/spl-token ) || true
-  WEB3_SRC="$(find "$TMP/node_modules/@solana/web3.js" -type f -name "*browser*.js" | head -n 1 || true)"
-  [ -z "${WEB3_SRC:-}" ] && WEB3_SRC="$(find "$TMP/node_modules/@solana/web3.js" -type f -name "index*.js" | head -n 1 || true)"
-  SPL_SRC="$(find "$TMP/node_modules/@solana/spl-token" -type f -name "index*.js" | head -n 1 || true)"
-  [ -n "${WEB3_SRC:-}" ] && cp -a "$WEB3_SRC" "$ROOT_WOLV/vendor/solana-web3.min.js" || true
-  [ -n "${SPL_SRC:-}" ] && cp -a "$SPL_SRC" "$ROOT_WOLV/vendor/spl-token.min.js" || true
-  rm -rf "$TMP" || true
-fi
+INC_TMP="/tmp/wolverine_routes_${TS}.inc"
+cat >"$INC_TMP" <<EOF
+# AUTOGENERATED by /root/WOLVERINE_FIX_100.sh @ $TS
+# Wolverine static + TraderOne API proxy
 
-log "7) Backend wrapper (port-safe) + passthrough detect real TraderOne"
-pick_port(){ local p; for p in 3000 3001 3010 3200 3333 8484 9696; do if ! ss -ltn "( sport = :$p )" | grep -q ":$p"; then echo "$p"; return 0; fi; done; echo "0"; }
-is_ours(){ local port="$1"; curl -fsS "http://127.0.0.1:${port}/health" 2>/dev/null | grep -q '"service":"traderone-api"'; }
+location = /wolverine { return 301 /wolverine/; }
 
-WRAP_PORT="3000"
-if ss -ltn "( sport = :3000 )" | grep -q ":3000"; then
-  if is_ours 3000; then WRAP_PORT="3000"; else WRAP_PORT="$(pick_port)"; fi
-fi
-[ "$WRAP_PORT" != "0" ] || die "No free port for wrapper"
+# Badge to confirm correct root is served
+location = /wolverine/__wolverine_ok.txt {
+  alias $ROOT/__wolverine_ok.txt;
+  add_header Cache-Control "no-store" always;
+}
 
-mkdir -p /opt/traderone/api
-cat > "/tmp/traderone_api_pkg_${TS}.json" <<'JSON'
-{"name":"traderone-api","version":"1.0.0","private":true,"type":"commonjs","main":"server.js","scripts":{"start":"node server.js"},"dependencies":{"express":"^4.19.2"}}
-JSON
-cat > "/tmp/traderone_api_server_${TS}.js" <<JS
-const express=require("express");const http=require("http");
-const app=express();app.use(express.json({limit:"2mb"}));
-app.use((req,res,next)=>{res.setHeader("Access-Control-Allow-Origin","*");res.setHeader("Access-Control-Allow-Headers","content-type");res.setHeader("Access-Control-Allow-Methods","GET,POST,OPTIONS");if(req.method==="OPTIONS")return res.sendStatus(204);next();});
-const WRAP_PORT=${WRAP_PORT};const PROBABLE=[3000,3001,3010,3200,3333,8484,9696].filter(p=>p!==WRAP_PORT);let REAL=null;
-function detect(cb){if(REAL)return cb(null,REAL);let i=0;const nxt=()=>{if(i>=PROBABLE.length)return cb(null,null);const p=PROBABLE[i++];const r=http.request({host:"127.0.0.1",port:p,path:"/health",method:"GET",timeout:450},res=>{let d="";res.on("data",c=>d+=c);res.on("end",()=>{if(res.statusCode===200&&(d.toLowerCase().includes("traderone")||d.toLowerCase().includes("trader"))){REAL={host:"127.0.0.1",port:p};return cb(null,REAL);}const r2=http.request({host:"127.0.0.1",port:p,path:"/status",method:"GET",timeout:450},res2=>{let d2="";res2.on("data",c=>d2+=c);res2.on("end",()=>{if(res2.statusCode===200&&(d2.toLowerCase().includes("traderone")||d2.toLowerCase().includes("trader"))){REAL={host:"127.0.0.1",port:p};return cb(null,REAL);}nxt();});});r2.on("error",()=>nxt());r2.on("timeout",()=>{try{r2.destroy();}catch(e){};nxt();});r2.end();});});r.on("error",()=>nxt());r.on("timeout",()=>{try{r.destroy();}catch(e){};nxt();});r.end();};nxt();}
-function proxy(req,res,real){const o={host:real.host,port:real.port,path:req.originalUrl,method:req.method,headers:{...req.headers,host:req.headers.host||"127.0.0.1"}};const pr=http.request(o,rr=>{res.status(rr.statusCode||502);Object.entries(rr.headers||{}).forEach(([k,v])=>{try{if(v!==undefined)res.setHeader(k,v);}catch(e){}});rr.pipe(res);});pr.on("error",()=>res.status(502).json({ok:false,error:"proxy_failed",real}));if(req.method!=="GET"&&req.method!=="HEAD")pr.write(JSON.stringify(req.body||{}));pr.end();}
-app.get("/health",(req,res)=>detect((_,real)=>res.json({ok:true,service:"traderone-api",wrap_port:WRAP_PORT,real_backend:real||null,ts:Date.now()})));
-app.get("/status",(req,res)=>detect((_,real)=>res.json({ok:true,mode:real?"PASSTHROUGH":"SAFE_STUB",wrap_port:WRAP_PORT,real_backend:real||null,ts:Date.now()})));
-app.use((req,res,next)=>{if(req.path==="/health"||req.path==="/status")return next();detect((_,real)=>{if(real)return proxy(req,res,real);if(req.path==="/invested"&&req.method==="GET")return res.json({ok:true,pub:req.query.pub||null,invested_usdc:0,ts:Date.now()});if(req.path==="/start"&&req.method==="POST")return res.json({ok:true,action:"start",received:req.body||{},ts:Date.now()});if(req.path==="/traderone/mode"&&req.method==="POST")return res.json({ok:true,action:"mode",received:req.body||{},ts:Date.now()});if(req.path==="/traderone/withdraw"&&req.method==="POST")return res.json({ok:true,action:"withdraw",received:req.body||{},ts:Date.now()});return res.status(404).json({ok:false,error:"not_found",mode:"SAFE_STUB"});});});
-app.listen(WRAP_PORT,"127.0.0.1",()=>console.log("TraderOne wrapper on 127.0.0.1:"+WRAP_PORT));
-JS
-askorupdate_file "/tmp/traderone_api_pkg_${TS}.json" "/opt/traderone/api/package.json"
-askorupdate_file "/tmp/traderone_api_server_${TS}.js" "/opt/traderone/api/server.js"
-( cd /opt/traderone/api && npm i --silent )
+# Block SW/manifest caching issues (optional hard-404)
+location = /wolverine/sw.js { add_header Cache-Control "no-store" always; return 404; }
+location = /wolverine/service-worker.js { add_header Cache-Control "no-store" always; return 404; }
+location = /wolverine/manifest.json { add_header Cache-Control "no-store" always; return 404; }
 
-cat > "/tmp/traderone-api_${TS}.service" <<SVC
-[Unit]
-Description=TraderOne API Wrapper (WOLVERINE)
-After=network.target
-[Service]
-Type=simple
-WorkingDirectory=/opt/traderone/api
-Environment=NODE_ENV=production
-ExecStart=/usr/bin/node /opt/traderone/api/server.js
-Restart=always
-RestartSec=2
-User=root
-[Install]
-WantedBy=multi-user.target
-SVC
-askorupdate_file "/tmp/traderone-api_${TS}.service" "/etc/systemd/system/traderone-api.service"
-systemctl daemon-reload
-systemctl enable --now traderone-api.service
-sleep 0.5
-curl -fsS "http://127.0.0.1:${WRAP_PORT}/health" >/dev/null
+# Next static assets
+location ^~ /wolverine/_next/ {
+  alias $ROOT/_next/;
+  try_files \$uri \$uri/ =404;
+  add_header Cache-Control "public, max-age=31536000, immutable" always;
+}
 
-log "8) Write nginx include + inject at top of detected vhost server blocks"
-cat > "/tmp/wolverine_routes_${TS}.inc" <<NG
+# Vendor assets (solana-web3 local, etc.)
+location ^~ /wolverine/vendor/ {
+  alias $ROOT/vendor/;
+  try_files \$uri =404;
+  add_header Cache-Control "public, max-age=31536000, immutable" always;
+}
+
+# Main app (static export routing)
+location ^~ /wolverine/ {
+  alias $ROOT/;
+  try_files \$uri \$uri/ /wolverine/index.html;
+  add_header Cache-Control "no-store" always;
+}
+
+# TraderOne API (strip prefix /wolverine/traderone/api/)
 location ^~ /wolverine/traderone/api/ {
+  rewrite ^/wolverine/traderone/api/?(.*)\$ /\$1 break;
+  proxy_pass http://127.0.0.1:$API_PORT/;
   proxy_http_version 1.1;
   proxy_set_header Host \$host;
   proxy_set_header X-Real-IP \$remote_addr;
   proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
   proxy_set_header X-Forwarded-Proto \$scheme;
-  proxy_set_header Upgrade \$http_upgrade;
-  proxy_set_header Connection "upgrade";
-  proxy_pass http://127.0.0.1:${WRAP_PORT}/;
+  proxy_read_timeout 60s;
 }
-location ^~ /wolverine/ {
-  root /var/www;
-  try_files \$uri \$uri/ /wolverine/index.html;
-}
-location = /wolverine/sw.js { add_header Cache-Control "no-store" always; return 404; }
-location = /wolverine/service-worker.js { add_header Cache-Control "no-store" always; return 404; }
-location = /wolverine/manifest.json { add_header Cache-Control "no-store" always; return 404; }
-NG
-askorupdate_file "/tmp/wolverine_routes_${TS}.inc" "$INC"
+EOF
 
-python3 - <<PY
-from pathlib import Path
-import re
-p=Path("$VHOST_DETECTED")
-s=p.read_text(errors="ignore").splitlines()
-inc='include /etc/nginx/includes/wolverine_routes.inc;'
-# remove all existing inc lines; add after first server { line
-out=[]; added=False
-for line in s:
-    if inc in line: continue
-    out.append(line)
-    if (not added) and re.search(r'\\bserver\\s*\\{', line):
-        out.append("  "+inc); added=True
-p.write_text("\\n".join(out)+("\\n" if out else ""))
-PY
+# Safe replace
+cp -a "$INC_TMP" "$INC"
+chmod 644 "$INC" || true
+echo "Wrote: $INC"
+echo
 
-log "9) Fallback frontend if needed (ensures /wolverine renders + Phantom SOL/USDC works)"
-need_fallback="0"
-[ -f "$ROOT_WOLV/index.html" ] || need_fallback="1"
-if ! curl -k -fsS "https://127.0.0.1/wolverine/" >/dev/null 2>&1; then need_fallback="1"; fi
-if [ "$need_fallback" = "1" ]; then
-  cat > "/tmp/wolverine_fallback_${TS}.html" <<'HTML'
-<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>WOLVERINE • TraderOne</title><style>html,body{height:100%;margin:0;font-family:ui-sans-serif,system-ui,Segoe UI,Roboto,Arial;background:#06080c;color:#e9eef6}a{color:#8ad}button{background:#111826;border:1px solid #223049;color:#e9eef6;padding:10px 12px;border-radius:10px;cursor:pointer}button:hover{border-color:#3a5b86}#wrap{display:grid;grid-template-columns:280px 1fr;min-height:100%}#side{border-right:1px solid #141c2b;padding:14px;background:radial-gradient(1200px 400px at 20% 0%,rgba(54,120,255,.20),transparent)}#main{padding:16px}h1{margin:0 0 8px 0;font-size:18px;letter-spacing:.3px}small{opacity:.75}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.k{opacity:.75;font-size:12px}.v{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:12px;word-break:break-all}#card{border:1px solid #141c2b;border-radius:14px;padding:14px;background:linear-gradient(180deg,rgba(18,25,40,.55),rgba(8,12,20,.55));box-shadow:0 12px 40px rgba(0,0,0,.35)}#log{white-space:pre-wrap;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:12px;opacity:.9;margin-top:10px;max-height:240px;overflow:auto;border-top:1px solid #141c2b;padding-top:10px}</style></head><body><div id="wrap"><div id="side"><h1>WOLVERINE</h1><small>Fallback UI (Phantom + SOL/USDC + API)</small><div style="height:12px"></div><div id="card"><div class="row"><button id="btnConnect">Connect Phantom</button><button id="btnDisc">Disconnect</button></div><div style="height:10px"></div><div class="k">Public Key</div><div id="pub" class="v">—</div><div style="height:10px"></div><div class="row"><div><div class="k">SOL</div><div id="sol" class="v">—</div></div><div><div class="k">USDC</div><div id="usdc" class="v">—</div></div></div><div style="height:10px"></div><div class="k">TraderOne API</div><div class="v"><a href="/wolverine/traderone/api/health" target="_blank" rel="noreferrer">/wolverine/traderone/api</a></div><div style="height:10px"></div><div class="row"><button id="btnRefresh">Refresh</button><button id="btnStart">Start</button></div><div id="log"></div></div></div><div id="main"><h1>Dashboard</h1><div style="max-width:980px;opacity:.85">UI fallback installée automatiquement parce que l’export statique n’était pas disponible. Ton UI officielle pourra être redéployée dès qu’un export statique valide existe dans /opt/wolverine.</div></div></div><script src="/wolverine/vendor/solana-web3.min.js"></script><script>(function(){const $=s=>document.querySelector(s);const log=(...a)=>{$('#log').textContent=(a.map(x=>typeof x==='string'?x:JSON.stringify(x)).join(' ')+'\n')+$('#log').textContent};const USDC_MINT="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1";const RPC="https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac";let conn=null,pub=null,prov=null;function connInit(){if(!conn){if(!window.solanaWeb3)throw new Error("solana-web3 missing");conn=new solanaWeb3.Connection(RPC,"confirmed");}}async function getSOL(){connInit();const lam=await conn.getBalance(pub,"confirmed");return lam/1e9;}async function getUSDC(){connInit();const accts=await conn.getParsedTokenAccountsByOwner(pub,{programId:new solanaWeb3.PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")});let sum=0;for(const it of (accts.value||[])){try{const info=it.account.data.parsed.info;if(info&&info.mint===USDC_MINT)sum+=Number(info.tokenAmount.uiAmount||0);}catch(e){}}return sum;}async function refresh(){if(!pub){log("no wallet");return;}try{$('#sol').textContent="…";$('#usdc').textContent="…";const [sol,usdc]=await Promise.all([getSOL(),getUSDC()]);$('#sol').textContent=sol.toFixed(6);$('#usdc').textContent=usdc.toFixed(2);}catch(e){log("refresh error:",(e&&e.message)?e.message:String(e));}}async function connect(){prov=window.solana;if(!prov||!prov.isPhantom){log("Phantom not found");return;}try{const r=await prov.connect({onlyIfTrusted:false});pub=new solanaWeb3.PublicKey(r.publicKey.toString());$('#pub').textContent=pub.toBase58();log("connected:",$('#pub').textContent);await refresh();}catch(e){log("connect error:",(e&&e.message)?e.message:String(e));}}async function disconnect(){try{if(window.solana&&window.solana.isPhantom)await window.solana.disconnect();}catch(e){}pub=null;$('#pub').textContent="—";$('#sol').textContent="—";$('#usdc').textContent="—";log("disconnected");}async function apiHealth(){try{const r=await fetch("/wolverine/traderone/api/health",{cache:"no-store"});log("api health:",await r.json());}catch(e){log("api health error:",(e&&e.message)?e.message:String(e));}}async function apiStart(){try{const r=await fetch("/wolverine/traderone/api/start",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({pub:pub?pub.toBase58():null,ts:Date.now()})});log("start:",await r.json());}catch(e){log("start error:",(e&&e.message)?e.message:String(e));}}$('#btnConnect').onclick=connect;$('#btnDisc').onclick=disconnect;$('#btnRefresh').onclick=()=>{refresh();apiHealth();};$('#btnStart').onclick=apiStart;apiHealth();})();</script></body></html>
-HTML
-  askorupdate_file "/tmp/wolverine_fallback_${TS}.html" "$ROOT_WOLV/index.html"
+# --- 4) Ensure vhost includes the include file ---
+echo "== 4) Ensuring vhost includes $INC =="
+if [ ! -f "$VHOST" ]; then
+  echo "ERROR: Vhost not found: $VHOST"
+  echo "Known vhost path (per project memory) must exist. Fix vhost path then re-run."
+  exit 1
 fi
 
-log "10) Nginx test + reload + relock"
-nginx -t
-systemctl reload nginx
-chattr +i /etc/nginx/nginx.conf 2>/dev/null || true
-chattr +i "$VHOST_DETECTED" 2>/dev/null || true
-chattr +i "$INC" 2>/dev/null || true
+unfreeze "$NGINX_MAIN"
+unfreeze "$VHOST"
+unfreeze "$INC"
 
-log "11) Final validation (loopback)"
-echo "== API wrapper local =="
-curl -fsS "http://127.0.0.1:${WRAP_PORT}/health" | head -c 800; echo
-echo "== NGINX loopback TLS =="
-curl -k -fsS "https://127.0.0.1/wolverine/traderone/api/health" | head -c 800; echo
-curl -k -I "https://127.0.0.1/wolverine/" | sed -n '1,18p' || true
+backup_file "$VHOST"
 
-log "DONE"
-echo "Front: https://fireinners.online/wolverine/"
-echo "API:   https://fireinners.online/wolverine/traderone/api/health"
-echo "Patched vhost: $VHOST_DETECTED"
-echo "Rollback: $RB_DIR"
+if ! grep -qF "include $INC;" "$VHOST"; then
+  echo "Include missing, inserting near end of vhost..."
+  # Insert before the last "}" in file (best-effort)
+  python3 - <<PY
+from pathlib import Path
+p=Path("$VHOST")
+s=p.read_text(errors="ignore").splitlines()
+out=[]
+inserted=False
+for i,line in enumerate(s):
+    out.append(line)
+# naive: add include before last closing brace
+for j in range(len(out)-1, -1, -1):
+    if out[j].strip()=="}":
+        out.insert(j, f"    include $INC;")
+        inserted=True
+        break
+if not inserted:
+    out.append(f"include $INC;")
+p.write_text("\n".join(out)+("\n" if out and not out[-1].endswith("\n") else ""))
+print("Inserted include:", inserted)
+PY
+else
+  echo "OK: vhost already includes $INC"
+fi
+echo
+
+# --- 5) Nginx test + reload ---
+echo "== 5) Testing and reloading nginx =="
+if nginx -t; then
+  systemctl reload nginx || systemctl restart nginx
+  echo "OK: nginx reloaded"
+else
+  echo "ERROR: nginx -t failed. Restoring vhost backup..."
+  if [ -f "${VHOST}.bak_${TS}" ]; then
+    cp -a "${VHOST}.bak_${TS}" "$VHOST"
+  fi
+  nginx -t || true
+  exit 1
+fi
+echo
+
+# --- 6) Ensure Node + PM2 ---
+echo "== 6) Ensuring node + pm2 =="
+if ! command -v node >/dev/null 2>&1; then
+  echo "Node.js missing -> installing via NodeSource (no apt/npm mixing rule respected)"
+  need apt-get
+  need curl
+  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+  apt-get update -y
+  apt-get install -y nodejs
+fi
+node -v
+npm -v
+
+if ! command -v pm2 >/dev/null 2>&1; then
+  echo "Installing pm2 globally..."
+  npm i -g pm2
+fi
+pm2 -v
+echo
+
+# --- 7) Deploy minimal backend that actually creates vaults (real Solana Keypair) ---
+echo "== 7) Deploying TraderOne Vault backend (minimal, real keypair generation) =="
+ensure_dir "$API_DIR"
+ensure_dir "$API_DIR/vaults"
+backup_file "$API_DIR/server.js" || true
+backup_file "$API_DIR/package.json" || true
+
+cat >"$API_DIR/package.json" <<'EOF'
+{
+  "name": "traderone-vault",
+  "version": "1.0.0",
+  "private": true,
+  "main": "server.js",
+  "type": "commonjs",
+  "dependencies": {
+    "@solana/web3.js": "^1.98.0",
+    "bs58": "^5.0.0",
+    "cors": "^2.8.5",
+    "express": "^4.19.2"
+  }
+}
+EOF
+
+cat >"$API_DIR/server.js" <<'EOF'
+const fs=require("fs");
+const path=require("path");
+const crypto=require("crypto");
+const express=require("express");
+const cors=require("cors");
+const bs58=require("bs58");
+const {Keypair}=require("@solana/web3.js");
+
+const PORT=parseInt(process.env.PORT||"3000",10);
+const HOST=process.env.HOST||"127.0.0.1";
+const DATA_DIR=process.env.DATA_DIR||__dirname;
+const VAULTS_DIR=path.join(DATA_DIR,"vaults");
+const MASTER_FILE=path.join(DATA_DIR,".masterkey");
+
+if(!fs.existsSync(VAULTS_DIR)) fs.mkdirSync(VAULTS_DIR,{recursive:true,mode:0o755});
+
+function loadOrCreateMasterKey(){
+  if(process.env.VAULT_MASTER_KEY && process.env.VAULT_MASTER_KEY.length>=32) return Buffer.from(process.env.VAULT_MASTER_KEY,"utf8");
+  if(fs.existsSync(MASTER_FILE)){
+    const k=fs.readFileSync(MASTER_FILE,"utf8").trim();
+    return Buffer.from(k,"utf8");
+  }
+  const k=crypto.randomBytes(32).toString("hex"); // 64 chars
+  fs.writeFileSync(MASTER_FILE,k,{mode:0o600});
+  return Buffer.from(k,"utf8");
+}
+const MASTER=loadOrCreateMasterKey();
+
+function enc(jsonObj){
+  const iv=crypto.randomBytes(12);
+  const key=crypto.createHash("sha256").update(MASTER).digest();
+  const cipher=crypto.createCipheriv("aes-256-gcm",key,iv);
+  const pt=Buffer.from(JSON.stringify(jsonObj),"utf8");
+  const ct=Buffer.concat([cipher.update(pt),cipher.final()]);
+  const tag=cipher.getAuthTag();
+  return {iv:iv.toString("base64"), ct:ct.toString("base64"), tag:tag.toString("base64")};
+}
+
+const app=express();
+app.use(cors({origin:true,credentials:false}));
+app.use(express.json({limit:"1mb"}));
+
+app.get("/health",(req,res)=>{
+  res.json({ok:true,service:"traderone-vault",host:HOST,port:PORT,ts:Date.now()});
+});
+
+function newId(){
+  return crypto.randomBytes(16).toString("hex");
+}
+
+function createVault(clientPub){
+  const kp=Keypair.generate();
+  const id=newId();
+  const rec={
+    id,
+    createdAt:new Date().toISOString(),
+    clientPub: clientPub||null,
+    vaultPub: kp.publicKey.toBase58(),
+    secretKey_b58: bs58.encode(Buffer.from(kp.secretKey))
+  };
+  const sealed=enc(rec);
+  const store={
+    id:rec.id,
+    createdAt:rec.createdAt,
+    clientPub:rec.clientPub,
+    vaultPub:rec.vaultPub,
+    sealed
+  };
+  fs.writeFileSync(path.join(VAULTS_DIR,`${id}.json`),JSON.stringify(store,null,2),{mode:0o600});
+  return {id,vaultPub:rec.vaultPub};
+}
+
+// Accept both /vault/create and /api/vault/create to be tolerant
+app.post(["/vault/create","/api/vault/create"],(req,res)=>{
+  try{
+    const clientPub=(req.body && typeof req.body.pub==="string")?req.body.pub:null;
+    const v=createVault(clientPub);
+    res.json({ok:true,...v});
+  }catch(e){
+    res.status(500).json({ok:false,error:(e&&e.message)?e.message:String(e)});
+  }
+});
+
+// Simple lookup
+app.get(["/vault/:id","/api/vault/:id"],(req,res)=>{
+  try{
+    const id=req.params.id;
+    const f=path.join(VAULTS_DIR,`${id}.json`);
+    if(!fs.existsSync(f)) return res.status(404).json({ok:false,error:"not_found"});
+    const j=JSON.parse(fs.readFileSync(f,"utf8"));
+    res.json({ok:true,id:j.id,vaultPub:j.vaultPub,createdAt:j.createdAt,clientPub:j.clientPub});
+  }catch(e){
+    res.status(500).json({ok:false,error:(e&&e.message)?e.message:String(e)});
+  }
+});
+
+app.listen(PORT,HOST,()=>{ console.log(`[traderone-vault] listening http://${HOST}:${PORT}`); });
+EOF
+
+chmod 755 "$API_DIR" || true
+chmod 600 "$API_DIR/server.js" "$API_DIR/package.json" || true
+echo "Backend files written."
+echo
+
+echo "Installing backend deps (npm install) ..."
+( cd "$API_DIR" && npm install --omit=dev )
+echo "Deps OK."
+echo
+
+# --- 8) Start/Restart PM2 process ---
+echo "== 8) Starting PM2 process =="
+pm2 delete "$PM2_NAME" >/dev/null 2>&1 || true
+( cd "$API_DIR" && pm2 start "$API_DIR/server.js" --name "$PM2_NAME" --update-env --time -- \
+  -- )
+pm2 save || true
+pm2 status
+echo
+
+# --- 9) Tests: badge + API health + vault create ---
+echo "== 9) Local tests (127.0.0.1) =="
+echo "-- 9.1) Badge check:"
+curl -sS -D- "http://127.0.0.1/wolverine/__wolverine_ok.txt" | head -n 20 || true
+echo
+
+echo "-- 9.2) API health check through nginx proxy:"
+curl -sS -D- "http://127.0.0.1/wolverine/traderone/api/health" | head -n 30 || true
+echo
+
+echo "-- 9.3) Vault create (through nginx proxy):"
+curl -sS -X POST "http://127.0.0.1/wolverine/traderone/api/vault/create" \
+  -H "Content-Type: application/json" \
+  -d "{\"pub\":\"\"}" | head -c 500; echo
+echo
+
+# --- 10) External HTTPS test (best-effort) ---
+echo "== 10) External domain tests (best-effort) =="
+echo "-- 10.1) https://fireinners.online/wolverine/__wolverine_ok.txt"
+curl -k -sS -D- "https://fireinners.online/wolverine/__wolverine_ok.txt" | head -n 20 || true
+echo
+echo "-- 10.2) https://fireinners.online/wolverine/traderone/api/health"
+curl -k -sS -D- "https://fireinners.online/wolverine/traderone/api/health" | head -n 30 || true
+echo
+
+# --- 11) Re-freeze immutables (best effort) ---
+echo "== 11) Re-freezing nginx files (best-effort) =="
+refreeze "$NGINX_MAIN"
+refreeze "$VHOST"
+refreeze "$INC"
+echo "Done."
+echo
+
+echo "=== RESULT SUMMARY ==="
+echo "1) Badge should return: WOLVERINE_OK $TS $HOST"
+echo "2) API health should return JSON ok:true"
+echo "3) Vault create should return {ok:true,id,vaultPub}"
+echo
+echo "If badge works but UI still wrong: the served frontend is not the one you think (or cached). The badge proves what file root is used."
+echo "If API health fails: nginx proxy path or PM2 backend is not running."
+echo
+echo "Logs:"
+echo "  Script log: $LOG"
+echo "  PM2 logs: pm2 logs $PM2_NAME --lines 200"
+echo
 BASH
+chmod +x /root/WOLVERINE_FIX_100.sh
+/root/WOLVERINE_FIX_100.sh'
