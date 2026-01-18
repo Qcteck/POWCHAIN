@@ -1,48 +1,108 @@
-cat >/root/TRADERONE_VAULT_ENDPOINT_FIX.sh <<'BASH'
+cat >/root/FIX_WOLVERINE_VAULT_PHANTOM.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP="/opt/traderone/server.js"
-PORT=3000
+HTML="/var/www/wolverine/index.html"
+TS="$(date +%Y%m%d_%H%M%S)"
 
-echo "=== TRADERONE VAULT FIX ==="
+echo "=== FIX WOLVERINE VAULT + PHANTOM (NO DUPLICATES) ==="
 
-[ -f "$APP" ] || { echo "server.js introuvable"; exit 1; }
+test -f "$HTML" || { echo "❌ index.html introuvable"; exit 1; }
 
-cp -a "$APP" "${APP}.bak_$(date +%s)"
+cp -a "$HTML" "$HTML.bak_$TS"
 
-node - <<'NODE'
-const fs=require("fs");
-let s=fs.readFileSync("/opt/traderone/server.js","utf8");
+python3 - <<'PY'
+from pathlib import Path
+import re
 
-if(s.includes("/api/vault")) {
- console.log("Endpoint vault déjà présent");
- process.exit(0);
+p=Path("/var/www/wolverine/index.html")
+s=p.read_text(errors="ignore")
+
+# 1) SUPPRIMER TOUS LES BLOCS PHANTOM / VAULT EXISTANTS
+s=re.sub(r'<section[^>]+id="phantom"[^>]*>.*?</section>','',s,flags=re.S|re.I)
+s=re.sub(r'<section[^>]+id="vault"[^>]*>.*?</section>','',s,flags=re.S|re.I)
+
+# 2) SUPPRIMER TOUS IMPORTS SOLANA CASSÉS
+s=re.sub(r'<script[^>]+unpkg[^>]+solana[^>]+></script>','',s,flags=re.I)
+s=re.sub(r'import\s*{[^}]*Connection[^}]*}[^;]*;','',s)
+
+# 3) AJOUTER BLOC UNIQUE PHANTOM + VAULT
+BLOCK="""
+<section id="phantom" style="border:1px solid #444;padding:12px;margin-top:20px">
+<h3>Phantom</h3>
+<button id="connectPhantom">Connect Phantom</button>
+<div>Adresse: <span id="userAddr">—</span></div>
+<div>SOL: <span id="userSol">—</span></div>
+</section>
+
+<section id="vault" style="border:2px solid #00e0ff;padding:16px;margin-top:20px">
+<h3>Vault</h3>
+<button id="vaultCreate">Créer mon Vault</button>
+<div>Vault: <span id="vaultAddr">—</span></div>
+<div>Vault SOL: <span id="vaultSol">—</span></div>
+<input id="vaultAmount" placeholder="Montant SOL">
+<button id="vaultDeposit">Déposer SOL</button>
+</section>
+
+<script type="module">
+import * as solanaWeb3 from "https://cdn.jsdelivr.net/npm/@solana/web3.js@1.95.4/lib/index.iife.min.js";
+
+const RPC="https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac";
+const conn=new solanaWeb3.Connection(RPC,"confirmed");
+
+let pubkey=null,vault=null;
+
+async function refreshBalances(){
+ if(!pubkey)return;
+ const lam=await conn.getBalance(pubkey);
+ document.getElementById("userSol").textContent=(lam/1e9).toFixed(6);
+ if(vault){
+  const vlam=await conn.getBalance(vault.publicKey);
+  document.getElementById("vaultSol").textContent=(vlam/1e9).toFixed(6);
+ }
 }
 
-const inject=`
-app.get("/wolverine/traderone/api/vault",(req,res)=>{
- if(!process.env.TRADERONE_WALLET)
-  return res.status(500).json({error:"TRADERONE_WALLET manquant"});
- res.json({address:process.env.TRADERONE_WALLET});
-});
-`;
+document.getElementById("connectPhantom").onclick=async()=>{
+ if(!window.solana?.isPhantom)return alert("Phantom absent");
+ const r=await window.solana.connect();
+ pubkey=r.publicKey;
+ document.getElementById("userAddr").textContent=pubkey.toBase58();
+ refreshBalances();
+};
 
-s=s.replace(/app\.listen\\(/,inject+"\n\napp.listen(");
-fs.writeFileSync("/opt/traderone/server.js",s);
-console.log("Endpoint vault injecté");
-NODE
+document.getElementById("vaultCreate").onclick=()=>{
+ vault=solanaWeb3.Keypair.generate();
+ document.getElementById("vaultAddr").textContent=vault.publicKey.toBase58();
+};
 
-if ! grep -q TRADERONE_WALLET /opt/traderone/.env; then
- echo 'TRADERONE_WALLET=REMPLACE_PAR_ADRESSE_SOLANA_DU_BOT' >> /opt/traderone/.env
- echo "⚠️ Ajoute l’adresse SOL du bot dans .env"
-fi
+document.getElementById("vaultDeposit").onclick=async()=>{
+ if(!vault||!pubkey)return alert("Phantom ou Vault manquant");
+ const amt=parseFloat(document.getElementById("vaultAmount").value);
+ if(!amt||amt<=0)return alert("Montant invalide");
+ const tx=new solanaWeb3.Transaction().add(
+  solanaWeb3.SystemProgram.transfer({
+   fromPubkey:pubkey,
+   toPubkey:vault.publicKey,
+   lamports:Math.floor(amt*1e9)
+  })
+ );
+ tx.feePayer=pubkey;
+ tx.recentBlockhash=(await conn.getLatestBlockhash()).blockhash;
+ const signed=await window.solana.signTransaction(tx);
+ await conn.sendRawTransaction(signed.serialize());
+ setTimeout(refreshBalances,2000);
+};
+</script>
+"""
 
-pm2 restart traderone || pm2 start /opt/traderone/server.js --name traderone
+s=re.sub(r'</body>',BLOCK+"\n</body>",s,flags=re.I)
 
-echo "=== OK ==="
-echo "Test: curl http://127.0.0.1:3000/wolverine/traderone/api/vault"
+p.write_text(s)
+print("OK HTML PATCHED")
+PY
+
+echo "=== DONE ==="
 BASH
 
-chmod +x /root/TRADERONE_VAULT_ENDPOINT_FIX.sh
-/root/TRADERONE_VAULT_ENDPOINT_FIX.sh
+chmod +x /root/FIX_WOLVERINE_VAULT_PHANTOM.sh
+/root/FIX_WOLVERINE_VAULT_PHANTOM.sh
