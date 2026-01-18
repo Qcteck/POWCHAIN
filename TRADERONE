@@ -1,91 +1,67 @@
-bash -lc 'cat >/root/FIND_TRADERONE_CORE.sh <<'"'"'BASH'"'"'
+bash -lc 'cat >/root/FIND_TRADERONE_CORE_RUN.sh <<'"'"'BASH'"'"'
 #!/usr/bin/env bash
 set -euo pipefail
 TS="$(date +%Y%m%d_%H%M%S)"
 LOG="/root/FIND_TRADERONE_CORE_${TS}.log"
 exec > >(tee -a "$LOG") 2>&1
-
 [ "${EUID:-$(id -u)}" -eq 0 ] || { echo "ERROR: run as root"; exit 1; }
-
-need(){ command -v "$1" >/dev/null 2>&1 || { echo "Missing: $1"; return 1; }; }
 
 echo "=== FIND_TRADERONE_CORE :: $TS ==="
 echo "LOG=$LOG"
 echo
 
-echo "== 0) Quick context =="
-hostname -f 2>/dev/null || hostname || true
+echo "== 1) Process actually listening on :3000 (THE CORE) =="
+ss -ltnp | grep -E ":3000\b" || true
+PIDS="$(ss -ltnp 2>/dev/null | awk "/:3000[[:space:]]/ {match(\$0,/pid=([0-9]+)/,m); if(m[1]!=\"\") print m[1]}" | sort -u)"
 echo
-echo "-- node/npm/pm2 --"
-need node && node -v || true
-need npm && npm -v || true
-need pm2 && pm2 -v || true
-echo
-
-echo "== 1) Ports + PIDs (focus :3000) =="
-ss -ltnp | grep -E ":(80|443|3000|4001|8484|9696|12701|12702)\b" || true
-echo
-
-extract_pids_from_port(){
-  local port="$1"
-  ss -ltnp 2>/dev/null | awk -v p=":$port" '
-    $0~p {
-      match($0,/pid=([0-9]+)/,m);
-      if(m[1]!=""){print m[1]}
-    }' | sort -u
-}
-
-inspect_pid(){
-  local pid="$1"
-  [ -d "/proc/$pid" ] || return 0
-  echo "---- PID $pid ----"
-  echo "cmdline:"
-  tr "\0" " " <"/proc/$pid/cmdline" 2>/dev/null || true
-  echo
-  echo "cwd:"
-  readlink -f "/proc/$pid/cwd" 2>/dev/null || true
-  echo "exe:"
-  readlink -f "/proc/$pid/exe" 2>/dev/null || true
-  echo "env (filtered):"
-  tr "\0" "\n" <"/proc/$pid/environ" 2>/dev/null | grep -Ei "^(PORT=|NODE_ENV=|RPC|PROXY|JWT|SECRET|KEY|DB|REDIS|HOST=|BASE_URL=)" || true
-  echo
-}
-
-PIDS_3000="$(extract_pids_from_port 3000 || true)"
-if [ -n "${PIDS_3000:-}" ]; then
-  echo "== 1.1) Candidate core processes on :3000 =="
-  for pid in $PIDS_3000; do inspect_pid "$pid"; done
-else
-  echo "No PID listening on :3000 found (ss did not report it)."
-fi
-echo
-
-echo "== 2) PM2 (find TraderOne-like processes) =="
-if need pm2; then
-  pm2 ls || true
-  echo
-  echo "-- pm2 describe (filters: traderone/vault/wolverine) --"
-  for name in $(pm2 jlist 2>/dev/null | tr -d "\n" | sed "s/},{/}\n{/g" | grep -Eo "\"name\":\"[^\"]+\"" | cut -d: -f2 | tr -d "\""); do
-    if echo "$name" | grep -Eiq "traderone|vault|wolverine"; then
-      echo "### pm2 describe $name"
-      pm2 describe "$name" || true
-      echo
-    fi
+if [ -n "${PIDS:-}" ]; then
+  for pid in $PIDS; do
+    echo "---- CORE PID $pid ----"
+    echo "cmdline:"; tr "\0" " " </proc/$pid/cmdline 2>/dev/null || true; echo
+    echo "cwd:"; readlink -f /proc/$pid/cwd 2>/dev/null || true
+    echo "exe:"; readlink -f /proc/$pid/exe 2>/dev/null || true
+    echo "env(filtered):"
+    tr "\0" "\n" </proc/$pid/environ 2>/dev/null | grep -Ei "^(PORT=|NODE_ENV=|RPC|PROXY|JWT|SECRET|KEY|DB|REDIS|HOST=|BASE_URL=)" || true
+    echo
   done
 else
-  echo "pm2 not installed or not in PATH."
+  echo "No PID found on :3000 (core not bound on 3000 right now)."
 fi
 echo
 
-echo "== 3) systemd (TraderOne-like services) =="
-if need systemctl; then
+echo "== 2) PM2 candidate apps (traderone/vault/wolverine) =="
+if command -v pm2 >/dev/null 2>&1; then
+  pm2 ls || true
+  echo
+  pm2 jlist 2>/dev/null | python3 - <<'"'"'PY'"'"'
+import json,sys
+try: a=json.load(sys.stdin)
+except: 
+  print("pm2 jlist unreadable"); sys.exit(0)
+for p in a:
+  n=p.get("name","")
+  if any(k in n.lower() for k in ["traderone","vault","wolverine"]):
+    print("###",n)
+    env=(p.get("pm2_env") or {})
+    print("cwd:", env.get("pm_cwd"))
+    print("script:", env.get("pm_exec_path"))
+    print("args:", env.get("args"))
+    print("PORT:", (env.get("env") or {}).get("PORT"))
+    print()
+PY
+else
+  echo "pm2 not installed."
+fi
+echo
+
+echo "== 3) systemd units matching traderone/vault/wolverine =="
+if command -v systemctl >/dev/null 2>&1; then
   systemctl list-unit-files --type=service | grep -Ei "traderone|vault|wolverine" || true
   echo
-  for svc in $(systemctl list-units --type=service --all | awk "{print \$1}" | grep -Ei "traderone|vault|wolverine" || true); do
-    echo "### systemctl status $svc"
+  systemctl list-units --type=service --all | awk "{print \$1}" | grep -Ei "traderone|vault|wolverine" | while read -r svc; do
+    echo "### $svc"
     systemctl status "$svc" --no-pager || true
     echo
-    echo "### unit file (cat) $svc"
     systemctl cat "$svc" --no-pager || true
     echo
   done
@@ -94,72 +70,37 @@ else
 fi
 echo
 
-echo "== 4) Known project paths (stat) =="
-for p in /opt/wolverine /opt/traderone /opt/traderone-opt /opt/traderone-vault /opt/traderone-vault/* /var/www/wolverine /var/www/wolverine/index.html /etc/nginx/includes/wolverine_routes.inc /etc/nginx/sites-available/fireinners.online-ssl; do
-  [ -e "$p" ] && { echo "-- $p"; ls -la "$p" 2>/dev/null || true; echo; }
+echo "== 4) Known fixed paths (your project memory) =="
+for p in /opt/wolverine /var/www/wolverine /opt/traderone /opt/traderone-opt /opt/traderone-vault; do
+  if [ -e "$p" ]; then echo "--- $p"; ls -la "$p" | head -n 80 || true; echo; fi
 done
+
+echo "== 5) Find entrypoints under /opt (server/app/index + package.json) =="
+find /opt -maxdepth 6 -type f \( -name "server.js" -o -name "app.js" -o -name "index.js" -o -name "main.js" -o -name "package.json" -o -name "ecosystem.config.js" -o -name ".env" \) -not -path "*/node_modules/*" 2>/dev/null | sed "s#^#/opt-hit: #"
 echo
 
-echo "== 5) Find backend entrypoints (server.js/app.js/index.js + package.json) under /opt =="
-find /opt -maxdepth 5 -type f \( -name "server.js" -o -name "app.js" -o -name "index.js" -o -name "main.js" -o -name "package.json" -o -name "ecosystem.config.js" -o -name ".env" \) \
-  -not -path "*/node_modules/*" 2>/dev/null | sed "s#^#/opt-hit: #"
-echo
-
-echo "== 6) Identify package.json that are TraderOne-ish =="
-while IFS= read -r f; do
-  if grep -Eiq "\"name\"\\s*:\\s*\".*(traderone|vault|wolverine).*\"" "$f" 2>/dev/null || \
-     grep -Eiq "(traderone|TraderOne)" "$f" 2>/dev/null; then
-    echo "### MATCH package.json: $f"
-    sed -n "1,120p" "$f" 2>/dev/null || true
-    echo
-  fi
-done < <(find /opt -maxdepth 6 -type f -name package.json -not -path "*/node_modules/*" 2>/dev/null)
-echo
-
-echo "== 7) Grep for TraderOne references (exclude node_modules) =="
-if need rg; then
-  rg -n --hidden --no-ignore -S "TraderOne|traderone|/wolverine/traderone/api|proxy_pass http://127\.0\.0\.1:3000" /opt /var/www /etc/nginx \
-    -g "!**/node_modules/**" -g "!**/.git/**" 2>/dev/null | head -n 300 || true
-else
-  grep -RIn --exclude-dir=node_modules --exclude-dir=.git -E "TraderOne|traderone|/wolverine/traderone/api|proxy_pass http://127\.0\.0\.1:3000" \
-    /opt /var/www /etc/nginx 2>/dev/null | head -n 300 || true
-fi
-echo
-
-echo "== 8) Git remotes (where repos actually live) =="
-if need git; then
-  for gd in $(find /opt /root -maxdepth 5 -type d -name .git 2>/dev/null | sort -u); do
+echo "== 6) Git remotes (WOLVERINE/TraderOne repos on VPS) =="
+if command -v git >/dev/null 2>&1; then
+  find /opt /root -maxdepth 5 -type d -name .git 2>/dev/null | sort -u | while read -r gd; do
     repo="$(dirname "$gd")"
     echo "### REPO: $repo"
     git -C "$repo" remote -v 2>/dev/null || true
     echo
   done
 else
-  echo "git not available."
+  echo "git not installed."
 fi
 echo
 
-echo "== 9) Nginx effective routes proof (wolverine/traderone) =="
-if need nginx; then
-  nginx -T 2>/dev/null | grep -nE "server_name.*fireinners\.online|include /etc/nginx/includes/wolverine_routes\.inc|location \^~ /wolverine/traderone/api/|proxy_pass http://127\.0\.0\.1:3000" | head -n 220 || true
+echo "== 7) Nginx proof (where /wolverine/traderone/api goes) =="
+if command -v nginx >/dev/null 2>&1; then
+  nginx -T 2>/dev/null | grep -nE "server_name.*fireinners\.online|include /etc/nginx/includes/wolverine_routes\.inc|location \^~ /wolverine/traderone/api/|proxy_pass http://127\.0\.0\.1:3000" | head -n 260 || true
 else
-  echo "nginx not available."
+  echo "nginx not installed."
 fi
 echo
 
-echo "== 10) CORE CANDIDATE SUMMARY =="
-if [ -n "${PIDS_3000:-}" ]; then
-  for pid in $PIDS_3000; do
-    cwd="$(readlink -f "/proc/$pid/cwd" 2>/dev/null || true)"
-    cmd="$(tr "\0" " " <"/proc/$pid/cmdline" 2>/dev/null || true)"
-    echo "CORE(pid=$pid) cwd=$cwd"
-    echo "CORE(pid=$pid) cmd=$cmd"
-  done
-else
-  echo "No core PID on :3000 found. Check PM2/systemd sections above."
-fi
-echo
 echo "DONE. LOG=$LOG"
 BASH
-chmod +x /root/FIND_TRADERONE_CORE.sh
-/root/FIND_TRADERONE_CORE.sh'
+chmod +x /root/FIND_TRADERONE_CORE_RUN.sh
+/root/FIND_TRADERONE_CORE_RUN.sh'
