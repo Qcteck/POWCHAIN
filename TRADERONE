@@ -1,137 +1,112 @@
-cat >/root/MEGA_WOLVERINE_RESTORE_AND_TEST.sh <<'BASH'
+cat >/root/MEGA_WOLVERINE_RESTORE_FIX.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 TS="$(date +%Y%m%d_%H%M%S)"
-ROOT="/var/www/wolverine"
-INC="/etc/nginx/includes/wolverine_routes.inc"
-VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
-NGERR="/var/log/nginx/error.log"
-LOG="/root/MEGA_WOLVERINE_RESTORE_AND_TEST_${TS}.log"
-
+LOG="/root/MEGA_WOLVERINE_RESTORE_FIX_${TS}.log"
 exec > >(tee -a "$LOG") 2>&1
 
 need(){ command -v "$1" >/dev/null 2>&1 || { echo "ERROR: missing $1"; exit 1; }; }
-need bash; need find; need grep; need awk; need sed; need cp; need mkdir; need chmod; need date; need curl
-command -v nginx >/dev/null 2>&1 || { echo "ERROR: nginx missing"; exit 1; }
+need bash; need nginx; need systemctl; need curl; need grep; need awk; need sed; need find; need tar; need ss; need head; need tail
 
-echo "== MEGA_WOLVERINE_RESTORE_AND_TEST =="
+WEBROOT="/var/www/wolverine"
+INC="/etc/nginx/includes/wolverine_routes.inc"
+VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
+HOST="fireinners.online"
+API_PORT="3000"
+
+echo "== MEGA_WOLVERINE_RESTORE_FIX =="
 echo "TS=$TS"
-echo "ROOT=$ROOT"
+echo "LOG=$LOG"
+echo "WEBROOT=$WEBROOT"
 echo "INC=$INC"
 echo "VHOST=$VHOST"
-echo "LOG=$LOG"
 echo
 
+backup_file(){ local f="$1"; [ -e "$f" ] || return 0; cp -a "$f" "${f}.bak_${TS}"; echo "Backup: $f -> ${f}.bak_${TS}"; }
 unfreeze(){ [ -e "$1" ] && chattr -i "$1" 2>/dev/null || true; }
 refreeze(){ [ -e "$1" ] && chattr +i "$1" 2>/dev/null || true; }
-backup_path(){
-  local p="$1"
-  if [ -e "$p" ]; then
-    cp -a "$p" "${p}.bak_${TS}"
-    echo "Backup: $p -> ${p}.bak_${TS}"
-  fi
-}
 
-echo "== 1) Preflight: listeners =="
-ss -lntp | awk 'NR==1 || /:80 |:443 |:3000 /{print}' || true
+echo "== 1) Preflight: listeners (80/443/3000) =="
+ss -lntp | awk 'NR==1||/:(80|443|3000)\b/' || true
 echo
 
-echo "== 2) Backup current webroot + nginx include/vhost =="
+echo "== 2) Backup current webroot + nginx files =="
 mkdir -p /root/wolverine_backups
-if [ -d "$ROOT" ]; then
-  tar -C "$(dirname "$ROOT")" -czf "/root/wolverine_backups/wolverine_webroot_${TS}.tgz" "$(basename "$ROOT")" || true
+if [ -d "$WEBROOT" ]; then
+  tar -czf "/root/wolverine_backups/wolverine_webroot_${TS}.tgz" -C "$(dirname "$WEBROOT")" "$(basename "$WEBROOT")" || true
   echo "Backup webroot -> /root/wolverine_backups/wolverine_webroot_${TS}.tgz"
 fi
-backup_path "$INC"
-backup_path "$VHOST"
+backup_file "$INC"
+backup_file "$VHOST"
 echo
 
 echo "== 3) Ensure webroot exists =="
-mkdir -p "$ROOT"
-chmod 755 "$ROOT"
+mkdir -p "$WEBROOT"
+chmod 755 "$WEBROOT"
 echo
 
 echo "== 4) Restore index.html/_next/vendor if missing (auto-discover) =="
-if [ ! -f "$ROOT/index.html" ]; then
-  echo "index.html is MISSING in $ROOT -> searching candidates in /opt and common paths..."
+missing=0
+[ -f "$WEBROOT/index.html" ] || missing=1
+[ -d "$WEBROOT/_next" ] || missing=1
+[ -d "$WEBROOT/vendor" ] || missing=1
+
+if [ "$missing" -eq 1 ]; then
+  echo "index.html or _next or vendor is missing in $WEBROOT -> searching candidates"
   CAND=""
-  # Find an index.html that looks like the wolverine Next export (must contain /wolverine/_next/)
-  while IFS= read -r f; do
-    if grep -q "/wolverine/_next/" "$f" 2>/dev/null; then
-      CAND="$f"
-      break
-    fi
-  done < <(find /opt /root -maxdepth 6 -type f -name index.html 2>/dev/null | head -n 2000)
-
+  for d in \
+    /opt/WOLVERINE1_export/ui \
+    /opt/wolverine/ui \
+    /opt/wolverine/out \
+    /opt/wolverine/dist \
+    /opt/fireinners/WOLVERINE/ui \
+    /opt/fireinners/WOLVERINE_REPO/ui \
+    /var/www/wolverine_backup/ui \
+    ; do
+    if [ -f "$d/index.html" ]; then CAND="$d"; break; fi
+  done
   if [ -z "$CAND" ]; then
-    # fallback: search dist/wolverine or out/wolverine directories
-    while IFS= read -r d; do
-      if [ -f "$d/index.html" ] && grep -q "/wolverine/_next/" "$d/index.html" 2>/dev/null; then
-        CAND="$d/index.html"
-        break
-      fi
-    done < <(find /opt /root -maxdepth 8 -type d \( -name wolverine -o -name dist -o -name out \) 2>/dev/null | head -n 2000)
+    CAND="$(find /opt /root -maxdepth 6 -type f -name index.html 2>/dev/null | grep -E '/(wolverine|WOLVERINE)' | head -n 1 | xargs -r dirname || true)"
   fi
-
-  if [ -z "$CAND" ]; then
-    echo "ERROR: No valid WOLVERINE index.html candidate found in /opt or /root."
-    echo "       You must re-export/build WOLVERINE, then re-run this batch."
-    exit 2
+  if [ -n "$CAND" ] && [ -f "$CAND/index.html" ]; then
+    echo "Found candidate source dir: $CAND"
+    echo "Restoring: $CAND/* -> $WEBROOT/"
+    rsync -a --delete "$CAND/" "$WEBROOT/" || { cp -a "$CAND/." "$WEBROOT/" 2>/dev/null || true; }
+  else
+    echo "WARN: no candidate UI found. Keeping existing $WEBROOT as-is."
   fi
-
-  SRCDIR="$(dirname "$CAND")"
-  echo "Found candidate: $CAND"
-  echo "Source dir: $SRCDIR"
-  echo "Restoring: $SRCDIR/* -> $ROOT/"
-  # Copy everything from candidate dir (expects _next/, vendor/, assets, etc.)
-  cp -a "$SRCDIR/." "$ROOT/"
 else
-  echo "index.html exists, skip restore."
+  echo "OK: webroot already has index.html + _next + vendor"
 fi
 echo
 
 echo "== 5) Create badge file /wolverine/_wolverine_ok.txt =="
-echo "OK $TS" >"$ROOT/_wolverine_ok.txt"
-chmod 644 "$ROOT/_wolverine_ok.txt"
+echo "OK $TS" >"$WEBROOT/_wolverine_ok.txt"
+chmod 644 "$WEBROOT/_wolverine_ok.txt"
 echo
 
-echo "== 6) Write nginx include (NO loops, proper alias + proxy) =="
+echo "== 6) Write nginx include (NO loops, correct alias + proxy) =="
 unfreeze "$INC"
-mkdir -p "$(dirname "$INC")"
 cat >"$INC" <<'NGINX'
-# WOLVERINE routes (include) — served under https://fireinners.online/wolverine/
-# Webroot: /var/www/wolverine
+# AUTO-GENERATED: wolverine routes include
+# Serve badge
+location = /wolverine/_wolverine_ok.txt { alias /var/www/wolverine/_wolverine_ok.txt; add_header Cache-Control "no-store" always; }
 
-location = /wolverine { return 301 /wolverine/; }
-
-# Proof/badge
-location = /wolverine/_wolverine_ok.txt {
-  alias /var/www/wolverine/_wolverine_ok.txt;
-  add_header Cache-Control "no-store" always;
-}
-
-# Disable SW/manifest to avoid cache ghosts
+# Kill SW/manifest if needed
 location = /wolverine/sw.js { add_header Cache-Control "no-store" always; return 404; }
 location = /wolverine/service-worker.js { add_header Cache-Control "no-store" always; return 404; }
 location = /wolverine/manifest.json { add_header Cache-Control "no-store" always; return 404; }
 
-# Next static assets
-location ^~ /wolverine/_next/ {
-  alias /var/www/wolverine/_next/;
-  try_files $uri $uri/ =404;
-  add_header Cache-Control "public, max-age=31536000, immutable" always;
-}
+# Static Next assets
+location ^~ /wolverine/_next/ { alias /var/www/wolverine/_next/; try_files $uri $uri/ =404; add_header Cache-Control "public, max-age=31536000, immutable" always; }
 
-# Local vendor assets (no CDN)
-location ^~ /wolverine/vendor/ {
-  alias /var/www/wolverine/vendor/;
-  try_files $uri $uri/ =404;
-  add_header Cache-Control "public, max-age=31536000, immutable" always;
-}
+# Local vendor libs
+location ^~ /wolverine/vendor/ { alias /var/www/wolverine/vendor/; try_files $uri $uri/ =404; add_header Cache-Control "public, max-age=31536000, immutable" always; }
 
-# TraderOne API (backend local only)
+# TraderOne API (MUST be before SPA)
 location ^~ /wolverine/traderone/api/ {
-  proxy_pass http://127.0.0.1:3000/;
+  rewrite ^/wolverine/traderone/api/?(.*)$ /$1 break;
+  proxy_pass http://127.0.0.1:3000;
   proxy_http_version 1.1;
   proxy_set_header Host $host;
   proxy_set_header X-Real-IP $remote_addr;
@@ -140,59 +115,89 @@ location ^~ /wolverine/traderone/api/ {
   proxy_read_timeout 60s;
 }
 
-# Frontend app (static export)
-location ^~ /wolverine/ {
-  alias /var/www/wolverine/;
-  try_files $uri $uri/ /index.html;
-  add_header Cache-Control "no-store" always;
+# Optional legacy API path (if old frontend calls /wolverine/api/)
+location ^~ /wolverine/api/ {
+  rewrite ^/wolverine/api/?(.*)$ /$1 break;
+  proxy_pass http://127.0.0.1:3000;
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  proxy_read_timeout 60s;
 }
+
+# SPA
+location ^~ /wolverine/ {
+  root /var/www;
+  try_files $uri $uri/ /wolverine/index.html;
+}
+location = /wolverine { return 301 /wolverine/; }
 NGINX
 chmod 644 "$INC"
 echo "Wrote $INC"
 echo
 
-echo "== 7) Nginx config test + reload =="
+echo "== 7) Ensure vhost includes the routes file =="
+# We DO NOT rewrite your whole vhost. We only ensure the include line exists (idempotent).
 unfreeze "$VHOST"
+if ! grep -qE 'include\s+/etc/nginx/includes/wolverine_routes\.inc;' "$VHOST"; then
+  echo "Adding include to $VHOST (inside server block is assumed)."
+  # add include right after server_name line if possible, else append near top
+  if grep -qE 'server_name\s+.*fireinners\.online' "$VHOST"; then
+    awk '
+      BEGIN{added=0}
+      {print}
+      !added && $0 ~ /server_name[[:space:]].*fireinners\.online/ {
+        print "  include /etc/nginx/includes/wolverine_routes.inc;";
+        added=1
+      }
+    ' "$VHOST" >"${VHOST}.tmp_${TS}" && mv "${VHOST}.tmp_${TS}" "$VHOST"
+  else
+    echo "WARN: server_name fireinners.online not found, appending include at end of file."
+    echo 'include /etc/nginx/includes/wolverine_routes.inc;' >>"$VHOST"
+  fi
+else
+  echo "OK: include already present in $VHOST"
+fi
+echo
+
+echo "== 8) nginx config test + reload =="
 nginx -t
 systemctl reload nginx
-refreeze "$INC"
-refreeze "$VHOST"
-echo "nginx reloaded."
+echo "nginx reloaded"
 echo
 
-echo "== 8) Tests (local backend + local nginx + public) =="
+echo "== 9) Tests (local backend + local nginx + public) =="
 echo "-- A) Backend direct (must be JSON) --"
-curl -sS -i "http://127.0.0.1:3000/health" | head -n 40 || true
+curl -sS -i "http://127.0.0.1:${API_PORT}/health" | head -n 60 || true
 echo
 
-echo "-- B) Nginx local badge (must be 200 OK) --"
-curl -sS -i "http://127.0.0.1/wolverine/_wolverine_ok.txt" -H "Host: fireinners.online" | head -n 40 || true
+echo "-- B) Local nginx badge (must be 200 OK) --"
+curl -sS -i "http://127.0.0.1/wolverine/_wolverine_ok.txt" | head -n 40 || true
 echo
 
-echo "-- C) Nginx local API health (must be JSON, NOT HTML/500) --"
-curl -sS -i "http://127.0.0.1/wolverine/traderone/api/health" -H "Host: fireinners.online" | head -n 60 || true
+echo "-- C) Local nginx API health via /wolverine/traderone/api (must be JSON, not HTML) --"
+curl -sS -i -H "Host: ${HOST}" "http://127.0.0.1/wolverine/traderone/api/health" | head -n 80 || true
 echo
 
 echo "-- D) Public badge (must be 200 OK) --"
-curl -sS -i "https://fireinners.online/wolverine/_wolverine_ok.txt" | head -n 40 || true
+curl -sS -i "https://${HOST}/wolverine/_wolverine_ok.txt" | head -n 40 || true
 echo
 
 echo "-- E) Public API health (must be JSON) --"
-curl -sS -i "https://fireinners.online/wolverine/traderone/api/health" | head -n 60 || true
+curl -sS -i "https://${HOST}/wolverine/traderone/api/health" | head -n 80 || true
 echo
 
-echo "-- F) Public vault create (POST) (must be JSON, NOT 405/HTML) --"
-curl -sS -i -X POST "https://fireinners.online/wolverine/traderone/api/vault/create" \
-  -H "Content-Type: application/json" \
-  -d '{}' | head -n 80 || true
+echo "-- F) Public vault create (must be JSON, POST) --"
+curl -sS -i -X POST "https://${HOST}/wolverine/traderone/api/vault/create" -H "Content-Type: application/json" -d '{}' | head -n 80 || true
 echo
 
-echo "== 9) If errors: tail nginx error log =="
-tail -n 120 "$NGERR" 2>/dev/null || true
+echo "== 10) If any 500/502/522, show nginx error tail =="
+tail -n 120 /var/log/nginx/error.log 2>/dev/null || true
 echo
 
 echo "DONE. LOG=$LOG"
 BASH
-
-chmod +x /root/MEGA_WOLVERINE_RESTORE_AND_TEST.sh
-bash /root/MEGA_WOLVERINE_RESTORE_AND_TEST.sh
+chmod +x /root/MEGA_WOLVERINE_RESTORE_FIX.sh
+/root/MEGA_WOLVERINE_RESTORE_FIX.sh
