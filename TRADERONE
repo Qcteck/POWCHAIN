@@ -6,40 +6,21 @@ HOST="fireinners.online"
 WEBROOT="/var/www/wolverine"
 INC="/etc/nginx/includes/wolverine_routes.inc"
 VHOST_AV="/etc/nginx/sites-available/fireinners.online-ssl"
-VHOST_EN="/etc/nginx/sites-enabled/fireinners.online-ssl"
-BACKEND_DIR="/opt/traderone"
-BACKEND_ENTRY="/opt/traderone/server.cjs"
-BACKEND_UP="http://127.0.0.1:3000"
-BACKUP_DIR="/root/wolverine_backups"
 LOG="/root/WVT_FIX_${TS}.log"
-mkdir -p "$BACKUP_DIR"
 exec > >(tee -a "$LOG") 2>&1
 
+unlock_i(){ local f="$1"; [ -e "$f" ]||return 0; if lsattr -d "$f" 2>/dev/null | grep -q " i"; then chattr -i "$f"||true; fi; }
 say(){ echo; echo "== $* =="; }
-unlock_if_immutable(){ local f="$1"; [ -e "$f" ]||return 0; if lsattr -d "$f" 2>/dev/null | grep -q " i"; then echo "immutable: $f -> chattr -i"; chattr -i "$f"||true; echo "$f" >>"$BACKUP_DIR/relock_${TS}.lst"; fi; }
-relock_all(){ local lst="$BACKUP_DIR/relock_${TS}.lst"; [ -f "$lst" ]||return 0; while IFS= read -r f; do [ -e "$f" ]||continue; echo "relock: $f -> chattr +i"; chattr +i "$f"||true; done <"$lst"; }
-backup_file(){ local f="$1"; [ -e "$f" ]||return 0; cp -a "$f" "$BACKUP_DIR/$(basename "$f").bak_${TS}"||true; }
-backup_webroot(){ [ -d "$WEBROOT" ]||return 0; tar -czf "$BACKUP_DIR/wolverine_webroot_${TS}.tgz" -C "$WEBROOT" . || true; echo "Backup webroot -> $BACKUP_DIR/wolverine_webroot_${TS}.tgz"; }
 
-say "1) Preflight"
-ss -lntp | egrep "(:80 |:443 |:3000 )" || true
-
-say "2) Backup"
-backup_webroot
-backup_file "$INC"
-backup_file "$VHOST_AV"
-
-say "3) Ensure webroot"
+say "1) Ensure webroot + badge"
 mkdir -p "$WEBROOT"
-
-say "4) Badge"
 echo "OK ${TS} host=${HOST} backend=127.0.0.1:3000" >"$WEBROOT/_wolverine_ok.txt"
 chmod 0644 "$WEBROOT/_wolverine_ok.txt" || true
 
-say "5) Nginx include (static + API proxy)"
-unlock_if_immutable "$INC"
-cat >"$INC" <<NGINX
-# AUTO-GENERATED ${TS} - Wolverine static + TraderOne API proxy
+say "2) Write nginx include (STATIC + API PROXY)"
+unlock_i "$INC"
+cat >"$INC" <<'"'"'NGINX'"'"'
+# AUTO-GENERATED - Wolverine static + TraderOne API proxy
 location = /wolverine/sw.js { add_header Cache-Control "no-store" always; return 404; }
 location = /wolverine/service-worker.js { add_header Cache-Control "no-store" always; return 404; }
 location = /wolverine/manifest.json { add_header Cache-Control "no-store" always; return 404; }
@@ -47,90 +28,46 @@ location = /wolverine { return 301 /wolverine/; }
 
 location ^~ /wolverine/traderone/api/ {
   proxy_http_version 1.1;
-  proxy_set_header Host \$host;
-  proxy_set_header X-Real-IP \$remote_addr;
-  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto \$scheme;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
   proxy_set_header Connection "";
-  rewrite ^/wolverine/traderone/api/(.*)\$ /\$1 break;
-  proxy_pass ${BACKEND_UP};
+  rewrite ^/wolverine/traderone/api/(.*)$ /$1 break;
+  proxy_pass http://127.0.0.1:3000;
 }
 
 location ^~ /wolverine/ {
-  alias ${WEBROOT}/;
-  try_files \$uri \$uri/ /wolverine/index.html;
+  alias /var/www/wolverine/;
+  try_files $uri $uri/ /wolverine/index.html;
 }
 NGINX
 
-say "6) Ensure vhost includes the include-file + enable symlink"
-unlock_if_immutable "$VHOST_AV"
-if [ -f "$VHOST_AV" ]; then
-  if ! grep -q "include /etc/nginx/includes/wolverine_routes.inc" "$VHOST_AV"; then
-    cp -a "$VHOST_AV" "$BACKUP_DIR/$(basename "$VHOST_AV").preinclude_${TS}" || true
-    awk 'BEGIN{done=0}{print} /server_name[[:space:]]+fireinners\.online/ && done==0 {print "  include /etc/nginx/includes/wolverine_routes.inc;"; done=1}' "$VHOST_AV" >"$VHOST_AV.tmp_${TS}"
-    mv -f "$VHOST_AV.tmp_${TS}" "$VHOST_AV"
-  fi
-else
-  echo "WARNING: missing vhost file: $VHOST_AV"
+say "3) Ensure vhost includes wolverine include"
+unlock_i "$VHOST_AV"
+if [ -f "$VHOST_AV" ] && ! grep -q "include /etc/nginx/includes/wolverine_routes.inc" "$VHOST_AV"; then
+  cp -a "$VHOST_AV" "${VHOST_AV}.bak_${TS}" || true
+  awk 'BEGIN{done=0}{print} /server_name[[:space:]]+fireinners\.online/ && done==0 {print "  include /etc/nginx/includes/wolverine_routes.inc;"; done=1}' "$VHOST_AV" >"${VHOST_AV}.tmp_${TS}"
+  mv -f "${VHOST_AV}.tmp_${TS}" "$VHOST_AV"
 fi
 
-if [ -e "$VHOST_EN" ] && [ ! -L "$VHOST_EN" ]; then rm -f "$VHOST_EN" || true; fi
-if [ ! -e "$VHOST_EN" ]; then ln -s "$VHOST_AV" "$VHOST_EN" || true; fi
-ls -l "$VHOST_EN" 2>/dev/null || true
-
-say "7) Ensure TraderOne service (127.0.0.1:3000)"
-if [ -f "$BACKEND_ENTRY" ]; then
-  SVC="/etc/systemd/system/traderone.service"
-  unlock_if_immutable "$SVC"
-  cat >"$SVC" <<SYSTEMD
-[Unit]
-Description=TraderOne Backend
-After=network.target
-
-[Service]
-Type=simple
-WorkingDirectory=${BACKEND_DIR}
-Environment=HOST=127.0.0.1
-Environment=PORT=3000
-ExecStart=$(command -v node) ${BACKEND_ENTRY}
-Restart=always
-RestartSec=2
-User=root
-
-[Install]
-WantedBy=multi-user.target
-SYSTEMD
-  systemctl daemon-reload
-  systemctl enable --now traderone.service || true
-  sleep 1
-  systemctl --no-pager status traderone.service | sed -n "1,14p" || true
-else
-  echo "WARNING: $BACKEND_ENTRY missing; skipping service creation."
-fi
-
-say "8) Nginx reload"
-unlock_if_immutable /etc/nginx/nginx.conf
+say "4) nginx reload"
+unlock_i /etc/nginx/nginx.conf
 nginx -t
 systemctl reload nginx || systemctl restart nginx
 
-say "9) Tests (must all be 200)"
-echo "-- A) Backend direct --"
-curl -sS -i "${BACKEND_UP}/health" | head -n 30 || true
-echo "-- B) Local badge --"
-curl -sS -i "http://127.0.0.1/wolverine/_wolverine_ok.txt" | head -n 30 || true
-echo "-- C) Local API health via /wolverine/traderone/api --"
-curl -sS -i -H "Host: ${HOST}" "http://127.0.0.1/wolverine/traderone/api/health" | head -n 30 || true
-echo "-- D) Public badge --"
-curl -sS -i "https://${HOST}/wolverine/_wolverine_ok.txt" | head -n 30 || true
-echo "-- E) Public API health --"
-curl -sS -i "https://${HOST}/wolverine/traderone/api/health" | head -n 30 || true
+say "5) Tests (must be 200)"
+echo "-- A) backend direct --"; curl -sS -i "http://127.0.0.1:3000/health" | head -n 25 || true
+echo "-- B) local badge --"; curl -sS -i "http://127.0.0.1/wolverine/_wolverine_ok.txt" | head -n 25 || true
+echo "-- C) local api via nginx --"; curl -sS -i -H "Host: ${HOST}" "http://127.0.0.1/wolverine/traderone/api/health" | head -n 25 || true
+echo "-- D) public badge --"; curl -sS -i "https://${HOST}/wolverine/_wolverine_ok.txt" | head -n 25 || true
+echo "-- E) public api --"; curl -sS -i "https://${HOST}/wolverine/traderone/api/health" | head -n 25 || true
 
-say "10) nginx error tail"
+say "6) nginx error tail"
 tail -n 60 /var/log/nginx/error.log 2>/dev/null || true
 
-relock_all
-say "DONE"
-echo "LOG: $LOG"
+echo
+echo "DONE. LOG: $LOG"
 BASH
 chmod +x /root/WVT_FIX.sh
 /root/WVT_FIX.sh'
