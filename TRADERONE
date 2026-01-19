@@ -1,107 +1,272 @@
-cat >/root/MEGA_WOLVERINE_FIX_SOLANAWEB3.sh <<'BASH'
+cat >/root/MEGA_TRADERONE_HEART_AND_RPC_FIX.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
+export LC_ALL=C
+
 TS="$(date +%Y%m%d_%H%M%S)"
-LOG="/root/MEGA_WOLVERINE_FIX_SOLANAWEB3_${TS}.log"
+LOG="/root/MEGA_TRADERONE_HEART_AND_RPC_FIX_${TS}.log"
 exec > >(tee -a "$LOG") 2>&1
 
-say(){ echo; echo "================================================================"; echo "$*"; echo "================================================================"; }
+echo "== MEGA_TRADERONE_HEART_AND_RPC_FIX == TS=$TS =="
 
-HTML="/var/www/wolverine/index.html"
-VENDOR="/var/www/wolverine/vendor"
-WEB3_MIN="${VENDOR}/solana-web3.min.js"
-WEB3_URL="https://unpkg.com/@solana/web3.js@1.95.4/lib/index.iife.min.js"
+if [ "$(id -u)" -ne 0 ]; then
+  echo "ERROR: run as root"; exit 1
+fi
 
-say "0) Savepoint (if present)"
-if [[ -x /root/WOLVERINE_SAVEPOINT.sh ]]; then
+DOMAIN="fireinners.online"
+UI_HTML="/var/www/wolverine/index.html"
+VENDOR_DIR="/var/www/wolverine/vendor"
+VENDOR_WEB3="${VENDOR_DIR}/solana-web3.min.js"
+NGX_INC="/etc/nginx/includes/wolverine_routes.inc"
+
+# Your DRPC endpoints (HTTP used by proxy; WSS kept for future subscriptions)
+DRPC_HTTP="https://lb.drpc.live/solana/AsxThpeKkEjGtZhCNUEQYo1ZluSgmwsR76RdFhW5UfFk"
+DRPC_WSS="wss://lb.drpc.live/solana/AsxThpeKkEjGtZhCNUEQYo1ZluSgmwsR76RdFhW5UfFk"
+
+echo
+echo "== 0) Savepoint (if present) =="
+if [ -x /root/WOLVERINE_SAVEPOINT.sh ]; then
   /root/WOLVERINE_SAVEPOINT.sh || true
 else
-  echo "No /root/WOLVERINE_SAVEPOINT.sh (skip)"
+  echo "No /root/WOLVERINE_SAVEPOINT.sh (skipping)"
 fi
 
-say "1) Preconditions"
-test -f "$HTML" || { echo "MISSING: $HTML"; exit 1; }
-mkdir -p "$VENDOR"
-echo "HTML: $HTML"
-echo "VENDOR: $VENDOR"
+echo
+echo "== 1) Find TraderOne HEART (backend core) =="
+echo "-- systemd status (traderone.service) --"
+systemctl status traderone.service --no-pager || true
+echo
+echo "-- systemd cat (traderone.service) --"
+systemctl cat traderone.service --no-pager || true
 
-say "2) Ensure solana-web3 is present locally (window.solanaWeb3)"
-if [[ -s "$WEB3_MIN" ]]; then
-  echo "OK: already present -> $WEB3_MIN ($(wc -c <"$WEB3_MIN") bytes)"
+HEART_EXEC="$(systemctl show -p ExecStart --value traderone.service 2>/dev/null || true)"
+echo
+echo "HEART ExecStart raw: $HEART_EXEC"
+
+# Try to extract the script path from ExecStart
+HEART_FILE=""
+if echo "$HEART_EXEC" | grep -qE '/(opt|root|srv|var)/[^ ]+\.(c?js|mjs)$'; then
+  HEART_FILE="$(echo "$HEART_EXEC" | grep -oE '/(opt|root|srv|var)/[^ ]+\.(c?js|mjs)' | head -n1 || true)"
+fi
+
+if [ -n "${HEART_FILE:-}" ] && [ -f "$HEART_FILE" ]; then
+  echo "HEART FILE: $HEART_FILE"
+  echo "-- head(80) of HEART FILE --"
+  sed -n '1,80p' "$HEART_FILE" || true
 else
-  echo "Downloading: $WEB3_URL -> $WEB3_MIN"
-  curl -fsSL "$WEB3_URL" -o "$WEB3_MIN"
-  test -s "$WEB3_MIN" || { echo "Download failed: $WEB3_MIN"; exit 1; }
-  echo "OK: downloaded -> $WEB3_MIN ($(wc -c <"$WEB3_MIN") bytes)"
+  echo "HEART FILE: (could not extract from ExecStart) -> scanning /opt for likely entrypoints..."
+  for p in \
+    /opt/traderone/server.cjs /opt/traderone/server.js /opt/traderone/index.js /opt/traderone/app.js \
+    /opt/traderone/dist/server.js /opt/traderone/dist/index.js \
+    /opt/traderone-opt/server.cjs /opt/traderone-opt/server.js
+  do
+    if [ -f "$p" ]; then HEART_FILE="$p"; break; fi
+  done
+  if [ -n "${HEART_FILE:-}" ]; then
+    echo "HEART FILE (found): $HEART_FILE"
+    echo "-- head(80) of HEART FILE --"
+    sed -n '1,80p' "$HEART_FILE" || true
+  else
+    echo "HEART FILE: NOT FOUND by quick paths; showing top candidates (find)..."
+    find /opt -maxdepth 4 -type f \( -name 'server.cjs' -o -name 'server.js' -o -name 'index.js' -o -name 'app.js' \) 2>/dev/null | head -n 40 || true
+  fi
 fi
 
-say "3) Backup current index.html"
-BKDIR="/root/wolverine_backups"
-mkdir -p "$BKDIR"
-cp -a "$HTML" "$BKDIR/index.html.bak_${TS}"
-echo "Backup: $BKDIR/index.html.bak_${TS}"
+echo
+echo "== 2) Ensure TraderOne backend is listening on 127.0.0.1:3000 =="
+echo "-- listeners on :3000 --"
+ss -ltnp | grep -E '(:3000\b)' || true
 
-say "4) Patch index.html to load /wolverine/vendor/solana-web3.min.js BEFORE any app script"
-python3 - <<'PY'
+echo
+echo "== 3) Pick a free local port for Solana RPC proxy (prefer 12703) =="
+pick_port() {
+  local p
+  for p in 12703 12704 12705 12706 12707 12708 12709 12710 12711 12712 12713 12714 12715 12716 12717 12718 12719 12720; do
+    if ! ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "127\.0\.0\.1:${p}\$"; then
+      echo "$p"; return 0
+    fi
+  done
+  return 1
+}
+SOLRPC_PORT="$(pick_port || true)"
+if [ -z "${SOLRPC_PORT:-}" ]; then
+  echo "ERROR: no free port found in 12703..12720"; exit 1
+fi
+echo "Using SOLRPC_PORT=$SOLRPC_PORT"
+
+echo
+echo "== 4) Install/Update Wolverine Solana RPC proxy (Node, no deps) =="
+PROXY_DIR="/opt/fireinners/solrpc-proxy-wolverine"
+PROXY_JS="${PROXY_DIR}/server.js"
+mkdir -p "$PROXY_DIR"
+
+cat >"$PROXY_JS" <<'JS'
+'use strict';
+const http = require('http');
+
+const LISTEN_HOST = process.env.LISTEN_HOST || '127.0.0.1';
+const LISTEN_PORT = parseInt(process.env.LISTEN_PORT || '12703', 10);
+const UPSTREAM = (process.env.DRPC_HTTP || '').trim();
+
+function send(res, code, obj) {
+  const body = Buffer.from(JSON.stringify(obj));
+  res.writeHead(code, {
+    'content-type': 'application/json; charset=utf-8',
+    'content-length': String(body.length),
+    'cache-control': 'no-store'
+  });
+  res.end(body);
+}
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on('data', c => chunks.push(Buffer.from(c)));
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+
+const srv = http.createServer(async (req, res) => {
+  try {
+    if (!UPSTREAM) return send(res, 500, { error: 'DRPC_HTTP missing' });
+
+    if (req.method === 'GET' && (req.url === '/' || req.url === '/health')) {
+      return send(res, 200, { status: 'ok', upstream: 'drpc', url: UPSTREAM });
+    }
+
+    if (req.method !== 'POST') {
+      return send(res, 405, { error: 'POST only', method: req.method });
+    }
+
+    const body = await readBody(req);
+    const upstreamRes = await fetch(UPSTREAM, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body
+    });
+
+    const text = await upstreamRes.text();
+    res.writeHead(upstreamRes.status, {
+      'content-type': upstreamRes.headers.get('content-type') || 'application/json; charset=utf-8',
+      'cache-control': 'no-store'
+    });
+    res.end(text);
+  } catch (e) {
+    send(res, 502, { error: String(e && e.message ? e.message : e) });
+  }
+});
+
+srv.listen(LISTEN_PORT, LISTEN_HOST, () => {
+  console.log(`wolverine-solrpc-proxy listening on http://${LISTEN_HOST}:${LISTEN_PORT} -> ${UPSTREAM}`);
+});
+JS
+
+chmod 755 "$PROXY_JS"
+
+SERVICE="/etc/systemd/system/wolverine-solrpc-proxy.service"
+cat >"$SERVICE" <<EOF
+[Unit]
+Description=Wolverine Solana RPC Proxy (DRPC passthrough)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=LISTEN_HOST=127.0.0.1
+Environment=LISTEN_PORT=${SOLRPC_PORT}
+Environment=DRPC_HTTP=${DRPC_HTTP}
+WorkingDirectory=${PROXY_DIR}
+ExecStart=/usr/bin/node ${PROXY_JS}
+Restart=always
+RestartSec=1
+KillSignal=SIGINT
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now wolverine-solrpc-proxy.service
+
+echo
+echo "-- proxy service status --"
+systemctl status wolverine-solrpc-proxy.service --no-pager || true
+echo
+echo "-- proxy listeners --"
+ss -ltnp | grep -E "(127\.0\.0\.1:${SOLRPC_PORT}\b)" || true
+
+echo
+echo "== 5) Wire nginx route /wolverine/solana-rpc -> 127.0.0.1:${SOLRPC_PORT} (include only) =="
+test -f "$NGX_INC" || { echo "ERROR: missing $NGX_INC"; exit 1; }
+cp -a "$NGX_INC" "${NGX_INC}.bak_${TS}"
+
+python3 - <<PY
 from pathlib import Path
-p=Path("/var/www/wolverine/index.html")
+p=Path("${NGX_INC}")
 s=p.read_text(errors="ignore")
 
-tag='<script src="/wolverine/vendor/solana-web3.min.js"></script>'
+begin="# BEGIN WOLVERINE_SOLANA_RPC_PROXY"
+end="# END WOLVERINE_SOLANA_RPC_PROXY"
+block=f"""{begin}
+location = /wolverine/solana-rpc {{ return 308 /wolverine/solana-rpc/; }}
+location ^~ /wolverine/solana-rpc/ {{
+  proxy_http_version 1.1;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+  proxy_set_header Upgrade \$http_upgrade;
+  proxy_set_header Connection "upgrade";
+  proxy_pass http://127.0.0.1:${SOLRPC_PORT}/;
+}}
+{end}
+"""
 
-# Remove any wrong/duplicate solana web3 tags (best-effort)
-import re
-s=re.sub(r'<script[^>]+solana[^>]*web3[^>]*></script>\s*','',s,flags=re.I)
-
-# Insert into <head> as the FIRST script (or create head if missing)
-if "<head" in s.lower():
-    # inject right after <head...>
-    def repl(m):
-        return m.group(0) + tag
-    s=re.sub(r'(<head[^>]*>)', repl, s, count=1, flags=re.I)
+if begin in s and end in s:
+  pre=s.split(begin)[0]
+  post=s.split(end)[1]
+  s=pre+block+post
 else:
-    # extremely defensive: wrap minimal head
-    s='<!doctype html><html><head>'+tag+'</head><body>'+s+'</body></html>'
-
-# Hard guard: if page uses solanaWeb3 but it isn't loaded, show explicit log
-guard = r"""
-<script>
-(function(){
-  try{
-    if(!window.solanaWeb3){ console.warn("solanaWeb3 missing: /wolverine/vendor/solana-web3.min.js not loaded"); }
-  }catch(e){}
-})();
-</script>
-""".strip()
-
-# Put guard immediately after web3 tag (once)
-if guard not in s:
-    s=s.replace(tag, tag+guard, 1)
+  s=s.rstrip()+"\n\n"+block+"\n"
 
 p.write_text(s)
-print("OK: index.html patched (web3 tag inserted + guard)")
+print("OK: nginx include patched:", p)
 PY
 
-say "5) Quick static checks"
-echo "--- grep solana-web3 in index.html ---"
-grep -n "solana-web3.min.js" "$HTML" || true
-echo "--- verify vendor file header ---"
-head -n 3 "$WEB3_MIN" || true
+echo
+echo "== 6) Ensure solana-web3 is served locally and loaded BEFORE app code =="
+mkdir -p "$VENDOR_DIR"
 
-say "6) Nginx quick test + reload (no config edits)"
-nginx -t
-systemctl reload nginx || systemctl reload nginx.service || true
+if [ ! -s "$VENDOR_WEB3" ]; then
+  echo "-- downloading solana-web3 iife build to $VENDOR_WEB3 --"
+  curl -fsSL "https://unpkg.com/@solana/web3.js@1.95.4/lib/index.iife.min.js" -o "$VENDOR_WEB3"
+fi
+echo "-- vendor file size --"
+ls -lh "$VENDOR_WEB3" || true
 
-say "7) Live HTTP checks (origin paths)"
-echo "--- /wolverine/vendor/solana-web3.min.js (HTTP head) ---"
-curl -sS -I "https://fireinners.online/wolverine/vendor/solana-web3.min.js" | sed -n '1,12p' || true
-echo "--- /wolverine/ (HTTP head) ---"
-curl -sS -I "https://fireinners.online/wolverine/" | sed -n '1,12p' || true
+test -f "$UI_HTML" || { echo "ERROR: missing $UI_HTML"; exit 1; }
+cp -a "$UI_HTML" "${UI_HTML}.bak_${TS}"
 
-say "DONE"
-echo "LOG: $LOG"
-echo "Backup: $BKDIR/index.html.bak_${TS}"
-echo "Open: https://fireinners.online/wolverine/  (Ctrl+F5 hard refresh)"
-BASH
+python3 - <<'PY'
+from pathlib import Path
+import re
 
-bash /root/MEGA_WOLVERINE_FIX_SOLANAWEB3.sh
+html_path=Path("/var/www/wolverine/index.html")
+s=html_path.read_text(errors="ignore")
+
+# Ensure vendor tag exists in <head> and BEFORE other scripts
+vendor_tag='<script src="/wolverine/vendor/solana-web3.min.js"></script>'
+if vendor_tag not in s:
+  # Insert right after <head ...> tag
+  s=re.sub(r'(<head[^>]*>)', r'\1'+vendor_tag, s, count=1, flags=re.IGNORECASE)
+
+# Guard for solanaWeb3 presence (non-fatal)
+guard = "if(!window.solanaWeb3){console.warn('solanaWeb3 missing: /wolverine/vendor/solana-web3.min.js not loaded');}"
+if guard not in s:
+  # put guard immediately after vendor tag
+  s=s.replace(vendor_tag, vendor_tag+f"<script>{guard}</script>")
+
+# Prefer same-origin RPC first + keep WSS for subscriptions if used
+# Patch common patterns if present
+s=s.replace("https://api.mainnet-beta.solana.com","/wolverine/
