@@ -1,77 +1,609 @@
-cat >/root/MEGA_WOLVERINE_SOLANAWEB3_FIX.sh <<'BASH'
+bash -lc 'cat > /root/MEGA_WOLVERINE_VAULT_SOL.sh <<'"'"'BASH'"'"'
 #!/usr/bin/env bash
 set -euo pipefail
 TS="$(date +%Y%m%d_%H%M%S)"
 
+need(){ command -v "$1" >/dev/null 2>&1 || { echo "Missing: $1"; exit 1; }; }
+need awk; need sed; need grep; need ss; need systemctl; need nginx; need curl; need python3; need node
+
 HTML="/var/www/wolverine/index.html"
 VENDOR_DIR="/var/www/wolverine/vendor"
-VENDOR_WEB3="$VENDOR_DIR/solana-web3.min.js"
-WEB3_URL="https://unpkg.com/@solana/web3.js@1.95.4/lib/index.iife.min.js"
+VENDOR_WEB3="${VENDOR_DIR}/solana-web3.min.js"
 
-need(){ command -v "$1" >/dev/null 2>&1 || { echo "Missing bin: $1"; exit 1; }; }
-need bash; need awk; need grep; need sed; need curl; need python3; need nginx; need systemctl
+NGX_VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
+NGX_INC="/etc/nginx/includes/wolverine_routes.inc"
 
-test -f "$HTML" || { echo "Missing $HTML"; exit 1; }
+VAULT_DIR="/opt/fireinners/wolverine-vault-api"
+VAULT_DATA="${VAULT_DIR}/data"
+VAULT_DB="${VAULT_DATA}/vaults.json"
+VAULT_PORT="3010"
+VAULT_SVC="/etc/systemd/system/wolverine-vault-api.service"
 
-echo "== 0) SAVEPOINT (if present) =="
+echo "== 0) Savepoint (if present) =="
 if [ -x /root/WOLVERINE_SAVEPOINT.sh ]; then /root/WOLVERINE_SAVEPOINT.sh || true; fi
 
-echo "== 1) Backup index.html =="
+echo "== 1) Preconditions =="
+test -f "$HTML" || { echo "Missing $HTML"; exit 1; }
 mkdir -p /root/wolverine_backups
 cp -a "$HTML" "/root/wolverine_backups/index.html.bak_${TS}"
 
 echo "== 2) Ensure local vendor solana-web3 (IIFE) =="
 mkdir -p "$VENDOR_DIR"
-if [ ! -s "$VENDOR_WEB3" ]; then
-  curl -fsSL "$WEB3_URL" -o "$VENDOR_WEB3"
+if [ ! -s "$VENDOR_WEB3" ] || ! head -c 2000 "$VENDOR_WEB3" | grep -q "solanaWeb3"; then
+  curl -fsSL "https://unpkg.com/@solana/web3.js@1.95.4/lib/index.iife.min.js" -o "$VENDOR_WEB3"
+  chmod 0644 "$VENDOR_WEB3"
 fi
-chmod 0644 "$VENDOR_WEB3"
 
-echo "== 3) Patch index.html: force solana-web3 FIRST in <head> =="
+echo "== 3) Ensure nginx routes (solana-rpc + vault api) in include (idempotent) =="
+# Safe unlock/lock (your rule)
+for f in "$NGX_VHOST" "$NGX_INC" "/etc/nginx/nginx.conf"; do
+  if [ -e "$f" ]; then chattr -i "$f" 2>/dev/null || true; fi
+done
+mkdir -p "$(dirname "$NGX_INC")"
+touch "$NGX_INC"
+
 python3 - <<'PY'
 from pathlib import Path
-import re, sys
+inc = Path("/etc/nginx/includes/wolverine_routes.inc")
+s = inc.read_text(errors="ignore") if inc.exists() else ""
 
-p = Path("/var/www/wolverine/index.html")
-s = p.read_text(errors="ignore")
+def ensure_block(tag, block):
+  global s
+  if tag in s:
+    return
+  s += "\n\n" + block.strip() + "\n"
 
-tag = '<script src="/wolverine/vendor/solana-web3.min.js"></script>'
+# same-origin solana rpc route (expects a local listener on 127.0.0.1:12703)
+ensure_block("##WOLVERINE_SOLANA_RPC_ROUTE_V1",
+r"""
+##WOLVERINE_SOLANA_RPC_ROUTE_V1
+location ^~ /wolverine/solana-rpc {
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  proxy_set_header Connection "";
+  proxy_buffering off;
+  proxy_read_timeout 60s;
+  proxy_send_timeout 60s;
+  proxy_pass http://127.0.0.1:12703/;
+}
+""")
 
-# remove any existing solana-web3 tag variants to avoid duplicates
-s = re.sub(r'<script[^>]+src=["\'](?:/wolverine/)?vendor/solana-web3(?:\.min)?\.js["\'][^>]*>\s*</script>', '', s, flags=re.I)
+# vault api route (local 127.0.0.1:3010)
+ensure_block("##WOLVERINE_VAULT_API_ROUTE_V1",
+r"""
+##WOLVERINE_VAULT_API_ROUTE_V1
+location ^~ /wolverine/vault/api/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  proxy_set_header Connection "";
+  proxy_buffering off;
+  proxy_read_timeout 60s;
+  proxy_send_timeout 60s;
+  proxy_pass http://127.0.0.1:3010/;
+}
+""")
 
-# find <head...> open
-m = re.search(r'<head[^>]*>', s, flags=re.I)
-if not m:
-    print("ERR: <head> not found")
-    sys.exit(1)
-
-head_open = m.group(0)
-start = m.end()
-
-# Insert tag immediately after <head...>
-s = s[:start] + tag + s[start:]
-
-# Safety: if there's a CSP meta blocking scripts, we won't touch it here (nginx should serve same-origin).
-p.write_text(s)
-print("OK: injected vendor solana-web3 first in <head>")
+inc.write_text(s)
+print("OK: nginx include ensured")
 PY
 
-echo "== 4) nginx test + reload =="
+echo "== 4) Ensure local Solana RPC proxy on 127.0.0.1:12703 (if already present, keep) =="
+# If something already listens, we do NOT kill it; we reuse.
+if ss -ltnp | grep -qE "127\.0\.0\.1:12703"; then
+  echo "OK: port 12703 already listening (reusing existing solana rpc proxy)"
+else
+  # Minimal no-deps node proxy -> DRPC Solana
+  SOLRPC_DIR="/opt/fireinners/solrpc-proxy-wolverine"
+  mkdir -p "$SOLRPC_DIR"
+  cat > "${SOLRPC_DIR}/server.js" <<'JS'
+"use strict";
+const http = require("http");
+const https = require("https");
+const { URL } = require("url");
+
+const LISTEN_HOST = process.env.LISTEN_HOST || "127.0.0.1";
+const LISTEN_PORT = parseInt(process.env.LISTEN_PORT || "12703", 10);
+const UPSTREAM = process.env.UPSTREAM || "https://lb.drpc.live/solana/AsxThpeKkEjGtZhCNUEQYo1ZluSgmwsR76RdFhW5UfFk";
+
+function readBody(req){
+  return new Promise((resolve,reject)=>{
+    let d=""; req.on("data",c=>d+=c); req.on("end",()=>resolve(d)); req.on("error",reject);
+  });
+}
+
+const srv = http.createServer(async (req,res)=>{
+  if (req.method === "GET" && (req.url==="/" || req.url==="/health")) {
+    res.writeHead(200, {"content-type":"application/json","cache-control":"no-store"});
+    return res.end(JSON.stringify({status:"ok",service:"wolverine-solrpc-proxy",upstream:UPSTREAM}));
+  }
+  if (req.method !== "POST") { res.writeHead(405); return res.end("method not allowed"); }
+
+  try{
+    const body = await readBody(req);
+    const u = new URL(UPSTREAM);
+    const isHttps = u.protocol === "https:";
+    const mod = isHttps ? https : http;
+
+    const upReq = mod.request({
+      protocol: u.protocol,
+      hostname: u.hostname,
+      port: u.port || (isHttps?443:80),
+      path: u.pathname + (u.search || ""),
+      method: "POST",
+      headers: {
+        "content-type":"application/json",
+        "accept":"application/json",
+        "user-agent":"wolverine-solrpc-proxy/1.0",
+        "content-length": Buffer.byteLength(body),
+      }
+    }, upRes=>{
+      let out=""; upRes.on("data",c=>out+=c);
+      upRes.on("end",()=>{
+        res.writeHead(upRes.statusCode||502, {
+          "content-type":"application/json",
+          "cache-control":"no-store",
+          "access-control-allow-origin":"*",
+          "access-control-allow-headers":"*"
+        });
+        res.end(out);
+      });
+    });
+    upReq.on("error",(e)=>{
+      res.writeHead(502, {"content-type":"application/json","cache-control":"no-store"});
+      res.end(JSON.stringify({error:String(e)}));
+    });
+    upReq.write(body); upReq.end();
+  }catch(e){
+    res.writeHead(500, {"content-type":"application/json","cache-control":"no-store"});
+    res.end(JSON.stringify({error:String(e)}));
+  }
+});
+
+srv.listen(LISTEN_PORT, LISTEN_HOST, ()=>{
+  console.log(`wolverine-solrpc-proxy listening on http://${LISTEN_HOST}:${LISTEN_PORT} -> ${UPSTREAM}`);
+});
+JS
+
+  cat > /etc/systemd/system/wolverine-solrpc-proxy.service <<'UNIT'
+[Unit]
+Description=Wolverine Solana RPC Proxy (DRPC passthrough)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=LISTEN_HOST=127.0.0.1
+Environment=LISTEN_PORT=12703
+Environment=UPSTREAM=https://lb.drpc.live/solana/AsxThpeKkEjGtZhCNUEQYo1ZluSgmwsR76RdFhW5UfFk
+WorkingDirectory=/opt/fireinners/solrpc-proxy-wolverine
+ExecStart=/usr/bin/node /opt/fireinners/solrpc-proxy-wolverine/server.js
+Restart=always
+RestartSec=2
+User=root
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+  systemctl daemon-reload
+  systemctl enable --now wolverine-solrpc-proxy.service
+  sleep 1
+fi
+
+echo "== 5) Install/Update Vault API (systemd, 127.0.0.1:${VAULT_PORT}) =="
+mkdir -p "$VAULT_DIR" "$VAULT_DATA"
+if [ ! -s "${VAULT_DIR}/package.json" ]; then (cd "$VAULT_DIR" && npm init -y >/dev/null 2>&1) || true; fi
+# minimal deps: tweetnacl + bs58
+(cd "$VAULT_DIR" && npm install --silent tweetnacl bs58 >/dev/null 2>&1) || true
+if [ ! -s "$VAULT_DB" ]; then echo '{}' > "$VAULT_DB"; chmod 600 "$VAULT_DB"; fi
+
+cat > "${VAULT_DIR}/server.js" <<'JS'
+"use strict";
+const http = require("http");
+const fs = require("fs");
+const path = require("path");
+const nacl = require("tweetnacl");
+const bs58 = require("bs58");
+
+const HOST = "127.0.0.1";
+const PORT = parseInt(process.env.PORT || "3010", 10);
+const DB_PATH = process.env.DB_PATH || "/opt/fireinners/wolverine-vault-api/data/vaults.json";
+
+function readJson(req){
+  return new Promise((resolve,reject)=>{
+    let d=""; req.on("data",c=>d+=c); req.on("end",()=>{ try{ resolve(d?JSON.parse(d):{}); }catch(e){ reject(e);} }); req.on("error",reject);
+  });
+}
+function loadDb(){
+  try{ return JSON.parse(fs.readFileSync(DB_PATH,"utf8")||"{}"); }catch(e){ return {}; }
+}
+function saveDb(db){
+  fs.mkdirSync(path.dirname(DB_PATH),{recursive:true});
+  fs.writeFileSync(DB_PATH, JSON.stringify(db,null,2));
+  try{ fs.chmodSync(DB_PATH,0o600);}catch(e){}
+}
+function json(res, code, obj){
+  res.writeHead(code, {
+    "content-type":"application/json",
+    "cache-control":"no-store",
+    "access-control-allow-origin":"*",
+    "access-control-allow-headers":"*",
+    "access-control-allow-methods":"GET,POST,OPTIONS"
+  });
+  res.end(JSON.stringify(obj));
+}
+
+const srv = http.createServer(async (req,res)=>{
+  if (req.method==="OPTIONS") return json(res,200,{ok:true});
+
+  if (req.method==="GET" && (req.url==="/" || req.url==="/health")) {
+    return json(res,200,{status:"ok",service:"wolverine-vault-api"});
+  }
+
+  if (req.method==="POST" && req.url.startsWith("/create")) {
+    try{
+      const body = await readJson(req);
+      const owner = String(body.owner||"").trim();
+      if (!owner) return json(res,400,{error:"missing owner"});
+
+      const db = loadDb();
+      if (db[owner] && db[owner].vaultPub) {
+        return json(res,200,{status:"ok",owner,vaultPub:db[owner].vaultPub,existing:true});
+      }
+
+      const kp = nacl.sign.keyPair();
+      const pub = bs58.encode(Buffer.from(kp.publicKey));
+      const sec = bs58.encode(Buffer.from(kp.secretKey));
+
+      db[owner] = { owner, vaultPub: pub, vaultSec_b58: sec, createdAt: new Date().toISOString() };
+      saveDb(db);
+      return json(res,200,{status:"ok",owner,vaultPub:pub,existing:false});
+    }catch(e){
+      return json(res,500,{error:String(e)});
+    }
+  }
+
+  if (req.method==="GET" && req.url.startsWith("/get")) {
+    const u = new URL("http://x"+req.url);
+    const owner = (u.searchParams.get("owner")||"").trim();
+    const db = loadDb();
+    if (!owner || !db[owner]) return json(res,404,{error:"not found"});
+    return json(res,200,{status:"ok",owner,vaultPub:db[owner].vaultPub});
+  }
+
+  return json(res,404,{error:"not found"});
+});
+
+srv.listen(PORT, HOST, ()=> console.log(`wolverine-vault-api on http://${HOST}:${PORT}`));
+JS
+
+cat > "$VAULT_SVC" <<UNIT
+[Unit]
+Description=Wolverine Vault API (Solana vault address per user)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=PORT=${VAULT_PORT}
+Environment=DB_PATH=${VAULT_DB}
+WorkingDirectory=${VAULT_DIR}
+ExecStart=/usr/bin/node ${VAULT_DIR}/server.js
+Restart=always
+RestartSec=2
+User=root
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now wolverine-vault-api.service
+sleep 1
+
+echo "== 6) Patch Wolverine index.html (fix solanaWeb3 load + force same-origin RPC + Budget SOL + Vault deposit) =="
+python3 - <<'PY'
+from pathlib import Path
+p=Path("/var/www/wolverine/index.html")
+s=p.read_text(errors="ignore")
+
+# Ensure vendor script in <head> BEFORE any other scripts
+vendor_tag = '<script src="/wolverine/vendor/solana-web3.min.js"></script>'
+if vendor_tag not in s:
+  if "<head" in s.lower():
+    # insert right after <head...>
+    import re
+    s = re.sub(r"(?is)(<head[^>]*>)", r"\1\n"+vendor_tag+"\n", s, count=1)
+  else:
+    s = vendor_tag + "\n" + s
+
+# Inject our controller script once
+marker="id=\"wolverine-sol-vault-v1\""
+if marker not in s:
+  inject = r"""
+<script id="wolverine-sol-vault-v1">
+(function(){
+  const USDC_MINT="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1";
+  const RPC_PRIMARY="/wolverine/solana-rpc"; // SAME-ORIGIN ONLY
+  const VAULT_CREATE="/wolverine/vault/api/create";
+
+  function $(q,root){ return (root||document).querySelector(q); }
+  function el(tag,attrs){ const e=document.createElement(tag); if(attrs) for(const k in attrs){ if(k==="text") e.textContent=attrs[k]; else e.setAttribute(k,attrs[k]); } return e; }
+  function logBox(){
+    let box=$("#wolverineLog");
+    if(!box){
+      box=el("pre",{id:"wolverineLog",style:"white-space:pre-wrap;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;border:1px solid #eee;padding:10px;border-radius:8px;max-width:720px"});
+      const host=document.body;
+      host.appendChild(box);
+    }
+    return box;
+  }
+  function log(msg){ const b=logBox(); b.textContent += (msg+"\n"); }
+
+  function ensureWeb3(){
+    if(!window.solanaWeb3) throw new Error("solanaWeb3 not defined");
+    return window.solanaWeb3;
+  }
+
+  function ensureUI(){
+    // Try to reuse existing UI; if missing, create minimal panel.
+    let root=$("#wolverineRoot");
+    if(!root){
+      root=el("div",{id:"wolverineRoot",style:"max-width:980px;margin:12px"});
+      const h=el("div",{style:"margin-bottom:10px"});
+      h.appendChild(el("div",{text:"Wolverine"}));
+      h.appendChild(el("div",{text:"TraderOne"}));
+      root.appendChild(h);
+
+      const row=el("div",{style:"display:flex;gap:12px;flex-wrap:wrap;align-items:flex-start"});
+      const left=el("div",{style:"border:1px solid #eee;border-radius:10px;padding:12px;min-width:360px"});
+      const right=el("div",{style:"border:1px solid #eee;border-radius:10px;padding:12px;min-width:360px"});
+      left.appendChild(el("div",{text:"Wallet",style:"font-weight:600;margin-bottom:6px"}));
+
+      const btnRow=el("div",{style:"display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px"});
+      btnRow.appendChild(el("button",{id:"btnConnect",text:"Connect Phantom"}));
+      btnRow.appendChild(el("button",{id:"btnRefresh",text:"Refresh"}));
+      btnRow.appendChild(el("button",{id:"btnDisconnect",text:"Disconnect"}));
+      left.appendChild(btnRow);
+
+      const tbl=el("div",{style:"font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px"});
+      tbl.innerHTML = `
+<div>Pubkey <span id="pubkeyVal">-</span></div>
+<div>RPC <span id="rpcVal">-</span></div>
+<div>SOL <span id="solVal">-</span></div>
+<div>USDC <span id="usdcVal">-</span></div>
+<div>Last <span id="lastVal">-</span></div>`;
+      left.appendChild(tbl);
+
+      const vaultRow=el("div",{style:"margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap"});
+      vaultRow.appendChild(el("div",{text:"Budget (SOL)",style:"font-size:12px"}));
+      vaultRow.appendChild(el("input",{id:"budgetSol",value:"0.10",style:"width:90px"}));
+      vaultRow.appendChild(el("button",{id:"btnVaultDeposit",text:"Créer Vault + Déposer"}));
+      left.appendChild(vaultRow);
+
+      right.appendChild(el("div",{text:"Log",style:"font-weight:600;margin-bottom:6px"}));
+      const pre=el("pre",{id:"wolverineLog",style:"white-space:pre-wrap;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;border:1px solid #eee;padding:10px;border-radius:8px;max-width:420px"});
+      right.appendChild(pre);
+
+      row.appendChild(left); row.appendChild(right);
+      root.appendChild(row);
+      document.body.innerHTML=""; document.body.appendChild(root);
+    }
+
+    // If existing page already had these ids, we use them; else ensure minimal ones exist.
+    if(!$("#btnConnect")){ const b=[...document.querySelectorAll("button")].find(x=>/connect phantom/i.test(x.textContent||"")); if(b) b.id="btnConnect"; }
+    if(!$("#btnRefresh")){ const b=[...document.querySelectorAll("button")].find(x=>/refresh/i.test(x.textContent||"")); if(b) b.id="btnRefresh"; }
+    if(!$("#btnDisconnect")){ const b=[...document.querySelectorAll("button")].find(x=>/disconnect/i.test(x.textContent||"")); if(b) b.id="btnDisconnect"; }
+
+    if(!$("#budgetSol")){
+      // Try to find an input near "Budget"
+      const inps=[...document.querySelectorAll("input")];
+      const pick=inps.find(i=>/0\.10|0,10/.test(i.value||"")) || inps[0];
+      if(pick) pick.id="budgetSol";
+    }
+    if(!$("#btnVaultDeposit")){
+      const b=[...document.querySelectorAll("button")].find(x=>/créer vault|deposer|déposer|vault/i.test(x.textContent||""));
+      if(b) b.id="btnVaultDeposit";
+    }
+  }
+
+  function setText(id,val){ const e=document.getElementById(id); if(e) e.textContent=String(val); }
+  function now(){ return new Date().toISOString().replace("T"," ").replace("Z",""); }
+
+  async function getConn(){
+    const web3=ensureWeb3();
+    setText("rpcVal", RPC_PRIMARY);
+    return new web3.Connection(RPC_PRIMARY, { commitment:"confirmed" });
+  }
+
+  async function fetchBalances(pubkeyStr){
+    const web3=ensureWeb3();
+    const conn=await getConn();
+    const pub=new web3.PublicKey(pubkeyStr);
+
+    const lam=await conn.getBalance(pub, "confirmed");
+    const sol=(lam/1e9).toFixed(6);
+
+    let usdc="0.00";
+    try{
+      const accts=await conn.getParsedTokenAccountsByOwner(pub, { mint:new web3.PublicKey(USDC_MINT) }, "confirmed");
+      let sum=0;
+      for(const it of (accts.value||[])){
+        const info=it.account.data.parsed.info.tokenAmount;
+        sum += Number(info.uiAmount || 0);
+      }
+      usdc=sum.toFixed(2);
+    }catch(e){
+      log("USDC read error: "+String(e && e.message ? e.message : e));
+    }
+
+    setText("solVal", sol);
+    setText("usdcVal", usdc);
+    setText("lastVal", now());
+  }
+
+  async function connect(){
+    ensureUI();
+    if(!window.solana || !window.solana.isPhantom){
+      alert("Phantom non détecté");
+      return;
+    }
+    try{
+      const r=await window.solana.connect();
+      const pub=(r && r.publicKey ? r.publicKey.toString() : window.solana.publicKey.toString());
+      setText("pubkeyVal", pub);
+      log("Wallet connected: "+pub);
+      await refresh();
+    }catch(e){
+      log("Connect error: "+String(e && e.message ? e.message : e));
+    }
+  }
+
+  async function disconnect(){
+    try{ if(window.solana && window.solana.disconnect) await window.solana.disconnect(); }catch(_){}
+    setText("pubkeyVal","-"); setText("solVal","-"); setText("usdcVal","-");
+    log("Disconnected");
+  }
+
+  async function refresh(){
+    ensureUI();
+    try{
+      const pub = (window.solana && window.solana.publicKey) ? window.solana.publicKey.toString() : (document.getElementById("pubkeyVal")?.textContent||"").trim();
+      if(!pub || pub==="-" ){ log("Not connected"); return; }
+      await fetchBalances(pub);
+    }catch(e){
+      log("Balance error: "+String(e && e.message ? e.message : e));
+      alert(String(e && e.message ? e.message : e));
+    }
+  }
+
+  function parseBudgetSol(){
+    const v=(document.getElementById("budgetSol")?.value||"").replace(",",".").trim();
+    const f=Number(v);
+    if(!isFinite(f) || f<=0) throw new Error("Budget SOL invalide");
+    return f;
+  }
+
+  async function createVault(owner){
+    const r=await fetch(VAULT_CREATE, {
+      method:"POST",
+      headers:{ "content-type":"application/json" },
+      body: JSON.stringify({ owner })
+    });
+    const j=await r.json().catch(()=> ({}));
+    if(!r.ok || !j.vaultPub) throw new Error("Vault API error: "+JSON.stringify(j));
+    return j.vaultPub;
+  }
+
+  async function vaultDeposit(){
+    ensureUI();
+    if(!window.solana || !window.solana.publicKey){ alert("Connecte Phantom d'abord"); return; }
+    const web3=ensureWeb3();
+    const owner = window.solana.publicKey.toString();
+    const budget = parseBudgetSol();
+    const lamports = Math.round(budget * 1e9);
+
+    log("Create vault for owner: "+owner);
+    const vaultPub = await createVault(owner);
+    log("Vault: "+vaultPub);
+
+    const conn=await getConn();
+    const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash("confirmed");
+
+    const tx = new web3.Transaction({ feePayer: window.solana.publicKey, recentBlockhash: blockhash });
+    tx.add(web3.SystemProgram.transfer({
+      fromPubkey: window.solana.publicKey,
+      toPubkey: new web3.PublicKey(vaultPub),
+      lamports
+    }));
+
+    log("Request Phantom signature for "+budget+" SOL");
+    let sig=null;
+
+    // Phantom prefers signAndSendTransaction for legacy tx
+    if(window.solana.signAndSendTransaction){
+      const r = await window.solana.signAndSendTransaction(tx);
+      sig = r && r.signature ? r.signature : r;
+    }else if(window.solana.signTransaction){
+      const signed = await window.solana.signTransaction(tx);
+      sig = await conn.sendRawTransaction(signed.serialize(), { skipPreflight:false, maxRetries:3 });
+    }else{
+      throw new Error("Phantom signing not available");
+    }
+
+    log("Sent: "+sig);
+    await conn.confirmTransaction({ signature:sig, blockhash, lastValidBlockHeight }, "confirmed");
+    log("Confirmed: "+sig);
+    await refresh();
+    alert("Déposé: "+budget+" SOL\nVault: "+vaultPub+"\nTX: "+sig);
+  }
+
+  function boot(){
+    ensureUI();
+    // hard guard: vendor must be loaded
+    if(!window.solanaWeb3){
+      // do NOT silently fallback to public rpc (403). Just show actionable error.
+      alert("solanaWeb3 not defined");
+      log("RPC try: drpc-primary "+RPC_PRIMARY);
+      log("RPC fail: drpc-primary -> solanaWeb3 is not defined");
+      return;
+    }
+    // wire buttons
+    const c=document.getElementById("btnConnect"); if(c) c.onclick=connect;
+    const r=document.getElementById("btnRefresh"); if(r) r.onclick=refresh;
+    const d=document.getElementById("btnDisconnect"); if(d) d.onclick=disconnect;
+    const v=document.getElementById("btnVaultDeposit"); if(v) v.onclick=()=>vaultDeposit().catch(e=>{ log("Vault deposit error: "+String(e&&e.message?e.message:e)); alert(String(e&&e.message?e.message:e)); });
+    // auto-refresh if already connected
+    try{ if(window.solana && window.solana.isPhantom && window.solana.publicKey) { setText("pubkeyVal", window.solana.publicKey.toString()); refresh(); } }catch(_){}
+  }
+
+  if(document.readyState==="loading") document.addEventListener("DOMContentLoaded", boot);
+  else boot();
+})();
+</script>
+"""
+  if "</body>" in s.lower():
+    import re
+    s = re.sub(r"(?is)</body>", inject+"\n</body>", s, count=1)
+  else:
+    s += "\n" + inject + "\n"
+
+p.write_text(s)
+print("OK: index.html patched")
+PY
+
+echo "== 7) nginx test + reload =="
 nginx -t
-systemctl reload nginx || systemctl restart nginx
+systemctl reload nginx
 
-echo "== 5) Live checks =="
-echo "-- vendor web3 (HEAD) --"
-curl -sSI "https://fireinners.online/wolverine/vendor/solana-web3.min.js" | sed -n '1,10p' || true
+# Re-lock
+for f in "$NGX_VHOST" "$NGX_INC" "/etc/nginx/nginx.conf"; do
+  if [ -e "$f" ]; then chattr +i "$f" 2>/dev/null || true; fi
+done
 
-echo "-- solana-rpc (POST getHealth) --"
-curl -sS "https://fireinners.online/wolverine/solana-rpc" \
-  -H "content-type: application/json" \
-  --data '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' || true
+echo "== 8) Quick tests =="
+echo "-- vault api local --"
+curl -fsS "http://127.0.0.1:${VAULT_PORT}/health" | head -c 200; echo
+echo "-- solana rpc local --"
+curl -fsS -H "content-type: application/json" -d '"'"'{"jsonrpc":"2.0","id":1,"method":"getHealth"}'"'"' "http://127.0.0.1:12703/" | head -c 200; echo
+
+echo "-- public same-origin solana-rpc --"
+curl -fsS -H "content-type: application/json" -d '"'"'{"jsonrpc":"2.0","id":1,"method":"getHealth"}'"'"' "https://fireinners.online/wolverine/solana-rpc" | head -c 200; echo
+
+echo "-- vendor web3 reachable --"
+curl -I "https://fireinners.online/wolverine/vendor/solana-web3.min.js" | head -n 5
+
 echo
-
 echo "DONE"
-echo "OPEN: https://fireinners.online/wolverine/ (Ctrl+F5 hard refresh)"
+echo "OPEN: https://fireinners.online/wolverine/  (Ctrl+F5 hard refresh)"
+echo "OPEN: https://fireinners.online/wolverine/health/ (Ctrl+F5 hard refresh)"
+echo "LOG:  /root/MEGA_WOLVERINE_VAULT_SOL_${TS}.log"
 BASH
-bash /root/MEGA_WOLVERINE_SOLANAWEB3_FIX.sh
+chmod +x /root/MEGA_WOLVERINE_VAULT_SOL.sh
+/root/MEGA_WOLVERINE_VAULT_SOL.sh | tee /root/MEGA_WOLVERINE_VAULT_SOL_$(date +%Y%m%d_%H%M%S).log'
