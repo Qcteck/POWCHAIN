@@ -1,4 +1,4 @@
-cat >/root/MEGA_WOLVERINE_VAULT_SOL.sh <<'BASH'
+cat >/root/MEGA_WOLVERINE_VAULT_SOL_FIX.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 TS="$(date +%Y%m%d_%H%M%S)"
@@ -15,12 +15,12 @@ NGINX_INC="/etc/nginx/includes/wolverine_routes.inc"
 
 VAULT_DIR="/opt/fireinners/wolverine-vault-api"
 VAULT_DATA="${VAULT_DIR}/data"
+DB_PATH="${VAULT_DATA}/vaults.json"
 VAULT_SVC="/etc/systemd/system/wolverine-vault-api.service"
 VAULT_PORT="3010"
 
-RPC_PATH="/wolverine/solana-rpc"
-
 test -f "$HTML" || { echo "Missing $HTML"; exit 1; }
+test -f "$NGINX_INC" || { echo "Missing $NGINX_INC"; exit 1; }
 
 log "== 0) Savepoint (if present) =="
 if [ -x /root/WOLVERINE_SAVEPOINT.sh ]; then /root/WOLVERINE_SAVEPOINT.sh || true; fi
@@ -36,13 +36,18 @@ if [ ! -s "$VENDOR_WEB3" ]; then
 fi
 chmod 0644 "$VENDOR_WEB3"
 
-log "== 3) Install/Update Vault API (systemd, 127.0.0.1:${VAULT_PORT}) =="
+log "== 3) Vault API: install/update + fix DB_PATH =="
 mkdir -p "$VAULT_DIR" "$VAULT_DATA"
 if [ ! -f "${VAULT_DIR}/package.json" ]; then
   (cd "$VAULT_DIR" && npm init -y >/dev/null 2>&1 || true)
 fi
-# deps minimal: tweetnacl + bs58 (keypair + base58)
 (cd "$VAULT_DIR" && npm install --silent tweetnacl bs58 >/dev/null 2>&1 || true)
+
+# ensure DB exists
+if [ ! -f "$DB_PATH" ]; then
+  printf '%s\n' '{"byUser":{}}' >"$DB_PATH"
+fi
+chmod 0600 "$DB_PATH" 2>/dev/null || true
 
 cat >"${VAULT_DIR}/server.js" <<'JS'
 "use strict";
@@ -107,10 +112,9 @@ const server = http.createServer(async (req,res)=>{
         return send(res, 200, { ok:true, existed:true, vaultPub: db.byUser[user].vaultPub });
       }
 
-      // Generate Solana-like ed25519 keypair (64 bytes secretKey = priv(32)+pub(32))
       const kp = nacl.sign.keyPair();
       const pub = bs58.encode(Buffer.from(kp.publicKey));
-      const sec = bs58.encode(Buffer.from(kp.secretKey)); // store (encrypted later if you want) — here minimal
+      const sec = bs58.encode(Buffer.from(kp.secretKey));
 
       db.byUser[user] = { vaultPub: pub, vaultSecret: sec, createdAt: Date.now() };
       writeJsonAtomic(DB_PATH, db);
@@ -127,10 +131,6 @@ const server = http.createServer(async (req,res)=>{
 server.listen(PORT, HOST, ()=>console.log(`vault-api listening on http://${HOST}:${PORT}`));
 JS
 chmod 0644 "${VAULT_DIR}/server.js"
-chmod 0700 "$VAULT_DIR" || true
-chmod 0700 "$VAULT_DATA" || true
-touch "$DB_PATH" 2>/dev/null || true
-chmod 0600 "$DB_PATH" 2>/dev/null || true
 
 cat >"$VAULT_SVC" <<EOF
 [Unit]
@@ -156,19 +156,16 @@ systemctl daemon-reload
 systemctl enable --now wolverine-vault-api.service
 systemctl restart wolverine-vault-api.service
 
-log "== 4) Patch nginx: route /wolverine/traderone/api/vault -> 127.0.0.1:${VAULT_PORT} =="
-# unlock if immutable
+log "== 4) Patch nginx include: /wolverine/traderone/api/vault -> 127.0.0.1:${VAULT_PORT} =="
 chattr -i "$NGINX_VHOST" 2>/dev/null || true
 chattr -i "$NGINX_INC" 2>/dev/null || true
-
-test -f "$NGINX_INC" || { echo "Missing $NGINX_INC"; exit 1; }
 cp -a "$NGINX_INC" "/root/wolverine_backups/wolverine_routes.inc.bak_${TS}"
 
 python3 - <<PY
 from pathlib import Path
+import re
 inc = Path("$NGINX_INC")
 s = inc.read_text(errors="ignore")
-
 marker = "# --- WOLVERINE VAULT API (auto) ---"
 block = f"""
 {marker}
@@ -185,26 +182,20 @@ location = /wolverine/traderone/api/vault {{
 }}
 # --- END WOLVERINE VAULT API (auto) ---
 """
-
 if marker not in s:
   s = s.rstrip() + "\n\n" + block + "\n"
 else:
-  # replace existing auto block
-  import re
-  s = re.sub(rf"{marker}.*?# --- END WOLVERINE VAULT API \\(auto\\) ---\\n", block + "\n", s, flags=re.S)
-
+  s = re.sub(rf"{re.escape(marker)}.*?# --- END WOLVERINE VAULT API \\(auto\\) ---\\n", block + "\n", s, flags=re.S)
 inc.write_text(s)
 print("OK: nginx include patched")
 PY
 
 nginx -t
 systemctl reload nginx
-
-# lock back (best effort)
 chattr +i "$NGINX_VHOST" 2>/dev/null || true
 chattr +i "$NGINX_INC" 2>/dev/null || true
 
-log "== 5) Patch index.html: ensure vendor web3 loads + add Budget SOL vault deposit UI =="
+log "== 5) Patch index.html: vendor web3 + Budget SOL vault deposit UI =="
 python3 - <<'PY'
 from pathlib import Path
 import re
@@ -213,20 +204,16 @@ s = p.read_text(errors="ignore")
 
 vendor_tag = '<script src="/wolverine/vendor/solana-web3.min.js"></script>'
 if vendor_tag not in s:
-  # insert early in <head>
   s = re.sub(r"<head([^>]*)>", r"<head\1>"+vendor_tag, s, count=1, flags=re.I)
 
-# Inject UI + logic once (idempotent marker)
 MARK="<!-- WOLVERINE_VAULT_SOL_UI_v1 -->"
 if MARK not in s:
   ui = r'''
 <!-- WOLVERINE_VAULT_SOL_UI_v1 -->
 <script>
 (function(){
-  function q(sel){return document.querySelector(sel);}
   function qa(sel){return Array.prototype.slice.call(document.querySelectorAll(sel));}
   function findWalletCard(){
-    // best-effort: look for a block that contains "Connect Phantom"
     var nodes = qa("div");
     for(var i=0;i<nodes.length;i++){
       var t = (nodes[i].innerText||"");
@@ -276,7 +263,6 @@ if MARK not in s:
     if(!prov) throw new Error("Phantom not found");
     if(!window.solanaWeb3) throw new Error("solanaWeb3 not defined");
 
-    // ensure connected
     var resp = await prov.connect();
     var pub = (resp && resp.publicKey) ? resp.publicKey.toString() : (prov.publicKey ? prov.publicKey.toString() : "");
     if(!pub) throw new Error("wallet not connected");
@@ -298,17 +284,14 @@ if MARK not in s:
     var tx = new window.solanaWeb3.Transaction({ feePayer: fromPk, recentBlockhash: bh.blockhash });
     tx.add(window.solanaWeb3.SystemProgram.transfer({ fromPubkey: fromPk, toPubkey: toPk, lamports: lamports }));
 
-    // Phantom popup signature + send
     var sig;
     if (prov.signAndSendTransaction){
       var out = await prov.signAndSendTransaction(tx);
       sig = out && (out.signature || out);
     } else {
-      // fallback: signTransaction then sendRawTransaction
       var stx = await prov.signTransaction(tx);
       sig = await conn.sendRawTransaction(stx.serialize(), { skipPreflight:false, maxRetries:3 });
     }
-
     await conn.confirmTransaction({ signature: sig, blockhash: bh.blockhash, lastValidBlockHeight: bh.lastValidBlockHeight }, "confirmed");
     return sig;
   }
@@ -336,37 +319,35 @@ if MARK not in s:
     }
   }
 
-  // try multiple times (Next/static loads async)
-  var tries = 0;
-  var iv = setInterval(function(){
+  var tries=0;
+  var iv=setInterval(function(){
     tries++;
     try{ bind(); }catch(_){}
-    if(tries>40){ clearInterval(iv); }
+    if(tries>40) clearInterval(iv);
   }, 250);
 })();
 </script>
 '''
-  # inject before </body>
-  if "</body>" in s.lower():
+  if re.search(r"</body>", s, flags=re.I):
     s = re.sub(r"</body>", ui + "\n</body>", s, count=1, flags=re.I)
   else:
     s += ui
 
 p.write_text(s)
-print("OK: index.html patched (vendor + vault UI)")
+print("OK: index.html patched")
 PY
 
-log "== 6) Reload nginx (safe) =="
+log "== 6) Nginx reload =="
 chattr -i "$NGINX_VHOST" 2>/dev/null || true
 nginx -t
 systemctl reload nginx
 chattr +i "$NGINX_VHOST" 2>/dev/null || true
 
-log "== 7) Quick tests =="
-echo "--- local vault api ---"
+log "== 7) Tests =="
+echo "--- vault api local ---"
 curl -fsS "http://127.0.0.1:${VAULT_PORT}/health" || true
 echo
-echo "--- public vault api via nginx ---"
+echo "--- vault api public ---"
 curl -fsS "https://fireinners.online/wolverine/traderone/api/vault/health" || true
 echo
 echo "--- vendor web3 ---"
@@ -375,4 +356,4 @@ echo
 echo "DONE"
 echo "OPEN: https://fireinners.online/wolverine/  (Ctrl+F5 hard refresh)"
 BASH
-bash /root/MEGA_WOLVERINE_VAULT_SOL.sh
+bash /root/MEGA_WOLVERINE_VAULT_SOL_FIX.sh
