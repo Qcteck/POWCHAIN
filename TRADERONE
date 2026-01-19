@@ -1,68 +1,58 @@
-bash -lc 'cat >/root/MEGA_WOLVERINE_FIX_AQUILA_V3.sh <<'"'"'BASH'"'"'
+bash -lc 'cat >/root/MEGA_WOLVERINE_FIX_AQUILA_V4.sh <<'"'"'BASH'"'"'
 #!/usr/bin/env bash
-if [ -z "${BASH_VERSION:-}" ]; then exec /usr/bin/env bash "$0" "$@"; fi
 set -euo pipefail
 
 TS="$(date +%Y%m%d_%H%M%S)"
 BK="/root/WOLVERINE_FIX_AQUILA_BK_${TS}"
 mkdir -p "$BK"
 
-say(){ echo "[$(date +%H:%M:%S)] $*"; }
+log(){ echo "[$(date +%H:%M:%S)] $*"; }
+need(){ command -v "$1" >/dev/null 2>&1 || { echo "ERROR: missing $1"; exit 1; }; }
 
 # Fixed paths
+DOMAIN="fireinners.online"
 WEBROOT="/var/www/wolverine"
 HTML="$WEBROOT/index.html"
 VENDOR="$WEBROOT/vendor"
 INC="/etc/nginx/includes/wolverine_routes.inc"
 
-# Target domain
-DOMAIN="fireinners.online"
-
-# DRPC Solana endpoint (canonical)
+# Solana DRPC (canonical)
 DRPC_SOLANA="https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac"
 
-need(){ command -v "$1" >/dev/null 2>&1 || { echo "ERROR: missing $1"; exit 1; }; }
-
 pick_free_port(){
-  # args: candidates...
   for p in "$@"; do
     if ! ss -ltn 2>/dev/null | awk "{print \$4}" | grep -qE "(:|\\.)${p}\$"; then
       echo "$p"; return 0
     fi
   done
-  echo "0"; return 1
+  return 1
 }
 
-say "0) Preflight"
+log "0) Preflight"
 id -u | grep -q "^0$" || { echo "ERROR: run as root"; exit 1; }
-need nginx
-need ss
-need curl
-need python3
-need node
-
-mkdir -p "$WEBROOT" "$VENDOR" /etc/nginx/includes
+need nginx; need ss; need curl; need python3; need node; need npm
 test -f "$HTML" || { echo "ERROR: missing $HTML"; exit 1; }
+mkdir -p "$WEBROOT" "$VENDOR" /etc/nginx/includes
 
-say "1) Backup"
+log "1) Backup"
 cp -a "$HTML" "$BK/index.html.bak" || true
 cp -a /etc/nginx/nginx.conf "$BK/nginx.conf.bak" || true
 cp -a /etc/nginx/sites-available "$BK/sites-available.bak" || true
 cp -a /etc/nginx/sites-enabled "$BK/sites-enabled.bak" || true
 cp -a /etc/nginx/includes "$BK/includes.bak" || true
 
-say "2) Unfreeze nginx files (safe)"
+log "2) Unfreeze nginx (safe)"
 chattr -i /etc/nginx/nginx.conf 2>/dev/null || true
 for f in /etc/nginx/sites-available/* /etc/nginx/sites-enabled/* /etc/nginx/includes/*.inc; do chattr -i "$f" 2>/dev/null || true; done
 
-say "3) Pick free local ports"
+log "3) Pick free local ports"
 SOLRPC_PORT="$(pick_free_port 12721 12722 12723 12724 12725 12726)"
 VAULT_PORT="$(pick_free_port 12731 12732 12733 12734 12735 12736)"
-[ "$SOLRPC_PORT" != "0" ] || { echo "ERROR: no free SOLRPC port"; exit 1; }
-[ "$VAULT_PORT" != "0" ] || { echo "ERROR: no free VAULT port"; exit 1; }
-say "   SOLRPC_PORT=$SOLRPC_PORT  VAULT_PORT=$VAULT_PORT"
+[ -n "${SOLRPC_PORT:-}" ] || { echo "ERROR: no free SOLRPC port"; exit 1; }
+[ -n "${VAULT_PORT:-}" ] || { echo "ERROR: no free VAULT port"; exit 1; }
+log "   SOLRPC_PORT=$SOLRPC_PORT  VAULT_PORT=$VAULT_PORT"
 
-say "4) Ensure local vendor solana-web3.js"
+log "4) Ensure local vendor solana-web3.js"
 if [ ! -s "$VENDOR/solana-web3.min.js" ]; then
   if [ -s "/opt/fireinners/frontend-react/app/dist/wolverine/vendor/solana-web3.min.js" ]; then
     cp -a "/opt/fireinners/frontend-react/app/dist/wolverine/vendor/solana-web3.min.js" "$VENDOR/solana-web3.min.js"
@@ -73,25 +63,26 @@ if [ ! -s "$VENDOR/solana-web3.min.js" ]; then
   fi
 fi
 
-say "5) Install Solana RPC proxy (AQUILA) -> 127.0.0.1:${SOLRPC_PORT}"
+log "5) Install Solana RPC proxy (AQUILA) on 127.0.0.1:$SOLRPC_PORT"
 SOLRPC_DIR="/opt/wolverine-solrpc-proxy"
 mkdir -p "$SOLRPC_DIR"
-cat >"$SOLRPC_DIR/server.js" <<JS
+cat >"$SOLRPC_DIR/package.json" <<'"'"'JSON'"'"'
+{"name":"wolverine-solrpc-proxy","version":"1.0.0","type":"module","private":true}
+JSON
+cat >"$SOLRPC_DIR/server.js" <<'"'"'JS'"'"'
 import http from "http";
-const UPSTREAM = process.env.UPSTREAM || "${DRPC_SOLANA}";
+const UPSTREAM = process.env.UPSTREAM;
 const HOST = "127.0.0.1";
-const PORT = parseInt(process.env.PORT || "${SOLRPC_PORT}", 10);
-
+const PORT = parseInt(process.env.PORT || "12721", 10);
 function send(res, code, body, ct="application/json; charset=utf-8"){
-  res.writeHead(code, {
+  res.writeHead(code,{
     "content-type": ct,
-    "access-control-allow-origin": "*",
-    "access-control-allow-methods": "POST, GET, OPTIONS",
-    "access-control-allow-headers": "content-type, authorization"
+    "access-control-allow-origin":"*",
+    "access-control-allow-methods":"POST, GET, OPTIONS",
+    "access-control-allow-headers":"content-type, authorization"
   });
   res.end(body);
 }
-
 http.createServer(async (req,res)=>{
   if(req.method==="OPTIONS") return send(res,204,"","text/plain; charset=utf-8");
   if(req.url==="/health"||req.url==="/"||req.url==="/ping") return send(res,200,JSON.stringify({status:"ok",service:"wolverine-solrpc-proxy",upstream:UPSTREAM}));
@@ -101,7 +92,6 @@ http.createServer(async (req,res)=>{
     try{
       const r=await fetch(UPSTREAM,{method:"POST",headers:{"content-type":"application/json"},body:raw||"{}"});
       const t=await r.text();
-      // force JSON to avoid frontend "Unexpected token <"
       return send(res,r.status,t,"application/json; charset=utf-8");
     }catch(e){
       return send(res,502,JSON.stringify({error:"bad_gateway",message:(e&&e.message)?e.message:String(e)}));
@@ -109,10 +99,7 @@ http.createServer(async (req,res)=>{
   });
 }).listen(PORT,HOST,()=>console.log("solrpc proxy on http://"+HOST+":"+PORT));
 JS
-
-cat >"$SOLRPC_DIR/package.json" <<JSON
-{"name":"wolverine-solrpc-proxy","version":"1.0.0","type":"module","private":true}
-JSON
+sed -i "s/12721/${SOLRPC_PORT}/g" "$SOLRPC_DIR/server.js"
 
 cat >/etc/systemd/system/wolverine-solrpc-proxy.service <<UNIT
 [Unit]
@@ -131,32 +118,21 @@ RestartSec=2
 WantedBy=multi-user.target
 UNIT
 
-say "6) Install Vault API (AQUILA) -> 127.0.0.1:${VAULT_PORT}"
+log "6) Install Vault API (AQUILA) on 127.0.0.1:$VAULT_PORT"
 VAULT_DIR="/opt/wolverine-vault-api"
 mkdir -p "$VAULT_DIR"
-cat >"$VAULT_DIR/package.json" <<JSON
-{
-  "name":"wolverine-vault-api",
-  "version":"1.0.0",
-  "type":"module",
-  "private":true,
-  "dependencies":{
-    "express":"^4.19.2",
-    "@solana/web3.js":"^1.95.4",
-    "bs58":"^6.0.0"
-  }
-}
+cat >"$VAULT_DIR/package.json" <<'"'"'JSON'"'"'
+{"name":"wolverine-vault-api","version":"1.0.0","type":"module","private":true,"dependencies":{"express":"^4.19.2","@solana/web3.js":"^1.95.4","bs58":"^6.0.0"}}
 JSON
-
-cat >"$VAULT_DIR/server.js" <<JS
+cat >"$VAULT_DIR/server.js" <<'"'"'JS'"'"'
 import express from "express";
 import fs from "fs";
 import { Keypair } from "@solana/web3.js";
 import bs58 from "bs58";
 
 const HOST="127.0.0.1";
-const PORT=parseInt(process.env.PORT||"${VAULT_PORT}",10);
-const DB=process.env.DB||"${VAULT_DIR}/vault_db.json";
+const PORT=parseInt(process.env.PORT||"12731",10);
+const DB=process.env.DB||"/opt/wolverine-vault-api/vault_db.json";
 
 const app=express();
 app.use(express.json({limit:"256kb"}));
@@ -190,8 +166,7 @@ app.post("/create",(req,res)=>{
 
 app.listen(PORT,HOST,()=>console.log("vault api on http://"+HOST+":"+PORT));
 JS
-
-need npm
+sed -i "s/12731/${VAULT_PORT}/g" "$VAULT_DIR/server.js"
 ( cd "$VAULT_DIR" && npm install --silent )
 
 cat >/etc/systemd/system/wolverine-vault-api.service <<UNIT
@@ -210,19 +185,18 @@ RestartSec=2
 WantedBy=multi-user.target
 UNIT
 
-say "7) Start services"
+log "7) Start services"
 systemctl daemon-reload
 systemctl enable --now wolverine-solrpc-proxy.service wolverine-vault-api.service
 systemctl restart wolverine-solrpc-proxy.service wolverine-vault-api.service
 
-say "8) Verify local services (must NOT be nginx/301)"
+log "8) Verify LOCAL health"
 curl -fsS --noproxy "*" "http://127.0.0.1:${SOLRPC_PORT}/health" | grep -q "\"status\":\"ok\"" || { echo "ERROR: solrpc local health failed"; exit 1; }
 curl -fsS --noproxy "*" "http://127.0.0.1:${VAULT_PORT}/health" | grep -q "\"status\":\"ok\"" || { echo "ERROR: vault local health failed"; exit 1; }
 
-say "9) Write canonical nginx include: $INC"
+log "9) Write nginx include: $INC"
 cat >"$INC" <<NGX
 # === WOLVERINE ROUTES (CANONICAL) — AQUILA ===
-
 location ^~ /wolverine/solana-rpc {
   proxy_pass http://127.0.0.1:${SOLRPC_PORT};
   proxy_http_version 1.1;
@@ -230,13 +204,11 @@ location ^~ /wolverine/solana-rpc {
   proxy_set_header X-Real-IP \$remote_addr;
   proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
   proxy_set_header X-Forwarded-Proto \$scheme;
-
   add_header Access-Control-Allow-Origin "*" always;
   add_header Access-Control-Allow-Methods "POST, GET, OPTIONS" always;
   add_header Access-Control-Allow-Headers "content-type, authorization" always;
   if (\$request_method = OPTIONS) { return 204; }
 }
-
 location ^~ /wolverine/vault/api {
   proxy_pass http://127.0.0.1:${VAULT_PORT};
   proxy_http_version 1.1;
@@ -244,7 +216,6 @@ location ^~ /wolverine/vault/api {
   proxy_set_header X-Real-IP \$remote_addr;
   proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
   proxy_set_header X-Forwarded-Proto \$scheme;
-
   add_header Access-Control-Allow-Origin "*" always;
   add_header Access-Control-Allow-Methods "POST, GET, OPTIONS" always;
   add_header Access-Control-Allow-Headers "content-type, authorization" always;
@@ -252,85 +223,72 @@ location ^~ /wolverine/vault/api {
 }
 NGX
 
-say "10) Patch ALL nginx server blocks that serve ${DOMAIN} (fix 404 /wolverine no matter which vhost is active)"
-PY=/tmp/patch_wolverine_${TS}.py
-cat >"$PY" <<PY
+log "10) Patch nginx vhosts serving ${DOMAIN} (force /wolverine + include routes)"
+python3 - <<PY
 from pathlib import Path
 import re
 
+DOMAIN="${DOMAIN}"
 WEBROOT="${WEBROOT}"
 INC="${INC}"
-DOMAIN="${DOMAIN}"
 
 BEGIN="# WOLVERINE_BEGIN"
 END="# WOLVERINE_END"
 
 block = f"""{BEGIN}
-# Wolverine UI (static)
 location = /wolverine {{ return 301 /wolverine/; }}
 location ^~ /wolverine/ {{
   alias {WEBROOT}/;
   try_files \\$uri \\$uri/ /wolverine/index.html;
   add_header Cache-Control "no-store" always;
 }}
-# Disable SW/manifest (avoid stale cache)
 location = /wolverine/sw.js {{ add_header Cache-Control "no-store" always; return 404; }}
 location = /wolverine/service-worker.js {{ add_header Cache-Control "no-store" always; return 404; }}
 location = /wolverine/manifest.json {{ add_header Cache-Control "no-store" always; return 404; }}
-
-# API routes
 include {INC};
 {END}
 """
 
 def patch_file(fp: Path):
     s = fp.read_text(errors="ignore")
-    if DOMAIN not in s:
+    if DOMAIN not in s or "server" not in s:
         return False
-    # patch every server { } that contains "server_name ... DOMAIN"
-    out = []
-    i = 0
-    changed = False
 
-    # If already has block markers, replace globally
+    # replace existing marked block
     if BEGIN in s and END in s:
-        pre = s.split(BEGIN)[0]
+        pre = s.split(BEGIN,1)[0]
         post = s.split(END,1)[1]
         fp.write_text(pre + block + post)
         return True
 
-    # otherwise, inject into each matching server block
-    pattern = re.compile(r"server\\s*\\{", re.I)
-    pos = 0
+    out=[]
+    pos=0
+    server_pat=re.compile(r"server\\s*\\{", re.I)
+    changed=False
     while True:
-        m = pattern.search(s, pos)
+        m=server_pat.search(s,pos)
         if not m:
             out.append(s[pos:])
             break
-        start = m.start()
+        start=m.start()
         out.append(s[pos:start])
-        # find matching braces for this server block
-        j = m.end()
-        brace = 1
-        while j < len(s) and brace:
-            if s[j] == "{": brace += 1
-            elif s[j] == "}": brace -= 1
-            j += 1
-        server_block = s[start:j]
-        pos = j
-
-        if ("server_name" in server_block) and (DOMAIN in server_block):
-            # inject before last "}" of this server block
-            server_block = server_block[:-1] + "\\n" + block + "\\n}\\n"
-            changed = True
-
-        out.append(server_block)
-
+        j=m.end()
+        brace=1
+        while j<len(s) and brace:
+            if s[j]=="{": brace+=1
+            elif s[j]=="}": brace-=1
+            j+=1
+        sb=s[start:j]
+        pos=j
+        if ("server_name" in sb) and (DOMAIN in sb):
+            sb = sb[:-1] + "\\n" + block + "\\n}\\n"
+            changed=True
+        out.append(sb)
     if changed:
         fp.write_text("".join(out))
     return changed
 
-targets = []
+targets=[]
 for root in [Path("/etc/nginx/sites-available"), Path("/etc/nginx/sites-enabled")]:
     if root.exists():
         for fp in root.iterdir():
@@ -340,55 +298,44 @@ for root in [Path("/etc/nginx/sites-available"), Path("/etc/nginx/sites-enabled"
                         targets.append(str(fp))
                 except Exception:
                     pass
-
 print("patched:", len(targets))
-for t in targets[:50]:
-    print(" -", t)
+for t in targets[:60]: print(" -", t)
 PY
 
-python3 "$PY"
-
-say "11) Sanitize index.html to avoid calling mainnet-beta directly and remove any bad script src to /wolverine/solana-rpc"
+log "11) Sanitize index.html (remove any <script src=/wolverine/solana-rpc> and force endpoint)"
 python3 - <<PY
 from pathlib import Path
 import re
 p=Path("${HTML}")
 s=p.read_text(errors="ignore")
-
-# remove <script src="/wolverine/solana-rpc..."> if any (this causes HTML returned -> JSON error)
 s=re.sub(r'<script[^>]+src=["\\\']/wolverine/solana-rpc[^"\\\' ]*["\\\'][^>]*>\\s*</script>\\s*','',s,flags=re.I)
-
-# force use of /wolverine/solana-rpc if code contains mainnet-beta
 s=s.replace("https://api.mainnet-beta.solana.com","/wolverine/solana-rpc")
-
 p.write_text(s)
-print("OK: index.html sanitized")
+print("OK")
 PY
 
-say "12) nginx test + reload"
+log "12) nginx test + reload"
 nginx -t
 systemctl reload nginx
 
-say "13) Public checks (must be OK)"
-echo "-- /wolverine should be 200/301 to /wolverine/ (NOT 404) --"
-curl -sSI "https://${DOMAIN}/wolverine" | sed -n "1,5p"
+log "13) Local nginx checks (no Cloudflare, no redirects)"
+echo "-- /wolverine/ should be 200 (or 301 from /wolverine) --"
+curl -sSI --noproxy "*" "http://127.0.0.1/wolverine" -H "Host: ${DOMAIN}" | sed -n "1,5p"
+curl -sSI --noproxy "*" "http://127.0.0.1/wolverine/" -H "Host: ${DOMAIN}" | sed -n "1,5p"
 echo
-echo "-- vendor web3 should be application/javascript --"
-curl -sSI "https://${DOMAIN}/wolverine/vendor/solana-web3.min.js" | sed -n "1,10p"
+echo "-- solana-rpc getHealth should be JSON ok --"
+curl -fsS --noproxy "*" "http://127.0.0.1/wolverine/solana-rpc" -H "Host: ${DOMAIN}" -H "content-type: application/json" --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getHealth\"}" ; echo
 echo
-echo "-- solana-rpc getHealth should return JSON ok --"
-curl -fsS "https://${DOMAIN}/wolverine/solana-rpc" -H "content-type: application/json" --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getHealth\"}" ; echo
-echo
-echo "-- vault health should return JSON ok (NOT 502) --"
-curl -fsS "https://${DOMAIN}/wolverine/vault/api/health" ; echo
+echo "-- vault health should be JSON ok --"
+curl -fsS --noproxy "*" "http://127.0.0.1/wolverine/vault/api/health" -H "Host: ${DOMAIN}" ; echo
 
-say "14) Refreeze nginx files"
+log "14) Refreeze nginx (safe)"
 chattr +i /etc/nginx/nginx.conf 2>/dev/null || true
 for f in /etc/nginx/sites-available/* /etc/nginx/sites-enabled/* /etc/nginx/includes/*.inc; do chattr +i "$f" 2>/dev/null || true; done
 
-say "DONE"
-echo "OPEN: https://${DOMAIN}/wolverine/  (Ctrl+F5)"
-echo "AQUILA visible in UI; RPC forced via /wolverine/solana-rpc; Vault API via /wolverine/vault/api"
+log "DONE"
+echo "OPEN: https://${DOMAIN}/wolverine/ (Ctrl+F5)"
+echo "AQUILA: Connect Phantom -> Refresh -> Budget(SOL) -> Creer Vault + Deposer -> Phantom popup"
 BASH
-chmod +x /root/MEGA_WOLVERINE_FIX_AQUILA_V3.sh
-/root/MEGA_WOLVERINE_FIX_AQUILA_V3.sh'
+chmod +x /root/MEGA_WOLVERINE_FIX_AQUILA_V4.sh
+/root/MEGA_WOLVERINE_FIX_AQUILA_V4.sh'
