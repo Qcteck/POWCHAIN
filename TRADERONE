@@ -1,398 +1,414 @@
-bash -lc 'set -euo pipefail;F=/root/MEGA_AQUILA_VAULT_FIX.sh;cat >"$F"<<'"'"'EOF'"'"'
+cat >/root/MEGA_WOLVERINE_VAULT_SOL.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
+
 TS="$(date +%Y%m%d_%H%M%S)"
-LIVE_DIR="/var/www/wolverine"
-HTML="$LIVE_DIR/index.html"
-VENDOR_DIR="$LIVE_DIR/vendor"
-SOLWEB3="$VENDOR_DIR/solana-web3.min.js"
-TRADERONE_DIR="/opt/traderone"
-SERVER="$TRADERONE_DIR/server.cjs"
-DATA_DIR="$TRADERONE_DIR/data"
-LOG="/root/MEGA_AQUILA_VAULT_FIX_${TS}.log"
-BK="/root/WOLVERINE_AQUILA_FIX_BACKUP_${TS}"
-exec > >(tee -a "$LOG") 2>&1
+HTML="/var/www/wolverine/index.html"
+VENDOR_DIR="/var/www/wolverine/vendor"
+VENDOR_WEB3="${VENDOR_DIR}/solana-web3.min.js"
+NGX_INC="/etc/nginx/includes/wolverine_routes.inc"
+APP_DIR="/opt/fireinners/solrpc-proxy-wolverine"
+SVC="/etc/systemd/system/wolverine-solrpc-proxy.service"
 
-echo "== MEGA_AQUILA_VAULT_FIX $TS =="
+DRPC_HTTP_DEFAULT="https://lb.drpc.live/solana/AsxThpeKkEjGtZhCNUEQYo1ZluSgmwsR76RdFhW5UfFk"
+DRPC_HTTP="${DRPC_HTTP:-$DRPC_HTTP_DEFAULT}"
 
-id -u | grep -q "^0$" || { echo "ERROR: run as root"; exit 1; }
-test -d "$LIVE_DIR" || { echo "ERROR: missing $LIVE_DIR"; exit 1; }
-test -f "$HTML" || { echo "ERROR: missing $HTML"; exit 1; }
-test -f "$SERVER" || { echo "ERROR: missing $SERVER"; exit 1; }
+log(){ echo "[$(date +%H:%M:%S)] $*"; }
 
-mkdir -p "$BK"
-cp -a "$HTML" "$BK/index.html.bak"
-cp -a "$SERVER" "$BK/server.cjs.bak"
-mkdir -p "$DATA_DIR"
+need(){ command -v "$1" >/dev/null 2>&1 || { echo "Missing $1"; exit 1; }; }
 
-echo "== 1) Ensure local solana-web3 vendor (window.solanaWeb3) =="
+need bash
+need sed
+need awk
+need grep
+need ss
+need systemctl
+need nginx
+need curl
+need python3
+need node
+
+test -f "$HTML" || { echo "Missing $HTML"; exit 1; }
+
+# Savepoint (si présent)
+if [ -x /root/WOLVERINE_SAVEPOINT.sh ]; then
+  log "== Savepoint =="
+  /root/WOLVERINE_SAVEPOINT.sh || true
+fi
+
+# Backup HTML
+log "== Backup index.html =="
+mkdir -p /root/wolverine_backups
+cp -a "$HTML" "/root/wolverine_backups/index.html.bak_${TS}"
+
+# Ensure vendor dir + solana-web3 local (IIFE)
+log "== Ensure local vendor solana-web3 =="
 mkdir -p "$VENDOR_DIR"
-if ! test -s "$SOLWEB3"; then
-  curl -fsSL "https://unpkg.com/@solana/web3.js@1.95.4/lib/index.iife.min.js" -o "$SOLWEB3"
-fi
-chmod 0644 "$SOLWEB3"
-
-echo "== 2) Patch index.html: load vendor early + inject Aquila Vault UI =="
-python3 - <<'PY'
-from pathlib import Path
-import re
-
-p=Path("/var/www/wolverine/index.html")
-s=p.read_text(errors="ignore")
-
-vendor_tag='<script src="/wolverine/vendor/solana-web3.min.js"></script>'
-
-# Ensure vendor tag exists
-if vendor_tag not in s:
-  s=re.sub(r"(<head[^>]*>)", r"\1"+vendor_tag, s, count=1, flags=re.I)
-
-# Ensure vendor tag is BEFORE any other script tags (best-effort)
-# If multiple scripts exist and vendor is after them, move it to just after <head>.
-m_head=re.search(r"<head[^>]*>", s, flags=re.I)
-if m_head:
-  head_end=m_head.end()
-  s_wo=s.replace(vendor_tag,"")
-  s=s_wo[:head_end]+vendor_tag+s_wo[head_end:]
-
-MARK_A="/*AQUILA_VAULT_UI_BEGIN*/"
-MARK_B="/*AQUILA_VAULT_UI_END*/"
-
-ui_js=r"""/*AQUILA_VAULT_UI_BEGIN*/
-(function(){
-  function q(sel){return document.querySelector(sel);}
-  function el(tag,attrs,children){
-    var e=document.createElement(tag);
-    if(attrs){for(var k in attrs){
-      if(k==="style"){for(var sk in attrs.style)e.style[sk]=attrs.style[sk];}
-      else if(k==="class") e.className=attrs[k];
-      else e.setAttribute(k,attrs[k]);
-    }}
-    (children||[]).forEach(function(c){ if(typeof c==="string") e.appendChild(document.createTextNode(c)); else if(c) e.appendChild(c);});
-    return e;
-  }
-  function now(){return new Date().toISOString().replace("T"," ").replace("Z","");}
-  function log(msg){
-    var box=q("#log"); if(!box) return;
-    box.value=(box.value?box.value+"\n":"")+"["+now()+"] "+msg;
-    box.scrollTop=box.scrollHeight;
-  }
-  function needWeb3(){
-    if(!window.solanaWeb3) throw new Error("solanaWeb3 not defined (vendor not loaded)");
-    return window.solanaWeb3;
-  }
-
-  var RPC_SAME_ORIGIN="/wolverine/solana-rpc";
-
-  async function connectPhantom(){
-    if(!window.solana) throw new Error("Phantom not found");
-    var r=await window.solana.connect({onlyIfTrusted:false});
-    return r.publicKey.toString();
-  }
-
-  async function apiJson(url){
-    var r=await fetch(url,{cache:"no-store"});
-    if(!r.ok) throw new Error("HTTP "+r.status+" "+url);
-    return await r.json();
-  }
-
-  async function getVault(pub){
-    return await apiJson("/wolverine/traderone/api/vault?pub="+encodeURIComponent(pub));
-  }
-
-  async function getDepositTx(pub,lamports){
-    return await apiJson("/wolverine/traderone/api/vault/tx/deposit?pub="+encodeURIComponent(pub)+"&lamports="+encodeURIComponent(String(lamports)));
-  }
-
-  async function signSendV0(txB64, blockhash, lastValidBlockHeight){
-    var solanaWeb3=needWeb3();
-    var raw=Uint8Array.from(atob(txB64),c=>c.charCodeAt(0));
-    var tx=solanaWeb3.VersionedTransaction.deserialize(raw);
-    if(!window.solana || !window.solana.signTransaction) throw new Error("Wallet cannot signTransaction");
-    tx=await window.solana.signTransaction(tx);
-    var conn=new solanaWeb3.Connection(RPC_SAME_ORIGIN,{commitment:"confirmed"});
-    var sig=await conn.sendRawTransaction(tx.serialize(),{skipPreflight:false,maxRetries:3});
-    await conn.confirmTransaction({signature:sig,blockhash:blockhash,lastValidBlockHeight:lastValidBlockHeight},"confirmed");
-    return sig;
-  }
-
-  function mount(){
-    if(q("#aquilaVaultCard")) return;
-
-    var host=q("#walletBox")||q(".walletBox")||q("#wallet")||document.body;
-    var card=el("div",{id:"aquilaVaultCard",style:{marginTop:"10px",padding:"10px",border:"1px solid #ccc",borderRadius:"8px",maxWidth:"520px"}},[
-      el("div",{style:{fontWeight:"700",marginBottom:"8px"}},["Aquila Vault (one-click)"]),
-      el("div",{style:{display:"grid",gridTemplateColumns:"140px 1fr",gap:"8px",alignItems:"center"}},[
-        el("div",{},["Deposit (SOL)"]),
-        el("input",{id:"aquilaDepositSol",type:"number",min:"0",step:"0.001",value:"0.01",style:{padding:"6px",border:"1px solid #ccc",borderRadius:"6px"}},[])
-      ]),
-      el("div",{style:{display:"flex",gap:"8px",marginTop:"10px",flexWrap:"wrap"}},[
-        el("button",{id:"aquilaVaultBtn",style:{padding:"8px 10px",border:"1px solid #333",borderRadius:"8px",cursor:"pointer"}},["Create/Load Vault"]),
-        el("button",{id:"aquilaDepBtn",style:{padding:"8px 10px",border:"1px solid #333",borderRadius:"8px",cursor:"pointer"}},["Deposit to Vault"])
-      ]),
-      el("div",{style:{marginTop:"10px",fontSize:"12px"}},[
-        el("div",{},["Vault: ",el("span",{id:"aquilaVaultAddr",style:{fontFamily:"monospace"}},["-"])]),
-        el("div",{},["Last TX: ",el("span",{id:"aquilaLastSig",style:{fontFamily:"monospace"}},["-"])])
-      ])
-    ]);
-
-    host.appendChild(card);
-
-    q("#aquilaVaultBtn").addEventListener("click", async function(){
-      try{
-        log("Vault: connect wallet...");
-        var pub=await connectPhantom();
-        log("Wallet: "+pub);
-        log("Vault: API create/load...");
-        var v=await getVault(pub);
-        q("#aquilaVaultAddr").textContent=v.vault||"-";
-        log("Vault: "+(v.vault||"-"));
-      }catch(e){
-        log("Vault error: "+((e&&e.message)?e.message:String(e)));
-      }
-    });
-
-    q("#aquilaDepBtn").addEventListener("click", async function(){
-      try{
-        var solanaWeb3=needWeb3();
-        log("Deposit: connect wallet...");
-        var pub=await connectPhantom();
-        log("Wallet: "+pub);
-        var v=await getVault(pub);
-        if(!v.vault) throw new Error("No vault");
-        q("#aquilaVaultAddr").textContent=v.vault;
-
-        var sol=parseFloat(q("#aquilaDepositSol").value||"0");
-        if(!(sol>0)) throw new Error("Invalid SOL amount");
-        var lamports=Math.floor(sol*solanaWeb3.LAMPORTS_PER_SOL);
-
-        log("Deposit: build unsigned v0 tx via backend...");
-        var t=await getDepositTx(pub,lamports);
-        if(!t.txB64) throw new Error("Missing txB64");
-        log("Deposit: sign+send...");
-        var sig=await signSendV0(t.txB64,t.blockhash,t.lastValidBlockHeight);
-        q("#aquilaLastSig").textContent=sig;
-        log("Deposit OK: "+sig);
-      }catch(e){
-        log("Deposit error: "+((e&&e.message)?e.message:String(e)));
-      }
-    });
-  }
-
-  if(document.readyState==="loading") document.addEventListener("DOMContentLoaded", mount);
-  else mount();
-})();
-/*AQUILA_VAULT_UI_END*/"""
-
-if MARK_A not in s:
-  # insert before </body>
-  if re.search(r"</body>", s, flags=re.I):
-    s=re.sub(r"</body>", "<script>"+ui_js+"</script></body>", s, count=1, flags=re.I)
-  else:
-    s=s+"\n<script>"+ui_js+"</script>\n"
-else:
-  # replace existing block (safe refresh)
-  s=re.sub(re.escape(MARK_A)+r".*?"+re.escape(MARK_B), ui_js, s, flags=re.S)
-
-p.write_text(s)
-print("OK: index.html patched")
-PY
-
-echo "== 3) Patch TraderOne server.cjs: add /api/vault + /api/vault/tx/deposit (Express) =="
-python3 - <<'PY'
-from pathlib import Path
-import re
-
-p=Path("/opt/traderone/server.cjs")
-s=p.read_text(errors="ignore")
-
-MARK_A="/*AQUILA_VAULT_ROUTES_BEGIN*/"
-MARK_B="/*AQUILA_VAULT_ROUTES_END*/"
-
-routes=r"""/*AQUILA_VAULT_ROUTES_BEGIN*/
-(function(){
-  try{
-    const fs=require("fs");
-    const path=require("path");
-    const crypto=require("crypto");
-    const {Connection,Keypair,PublicKey,SystemProgram,TransactionMessage,VersionedTransaction}=require("@solana/web3.js");
-
-    const DATA_DIR=process.env.TRADERONE_DATA_DIR||"/opt/traderone/data";
-    const VAULTS_FILE=path.join(DATA_DIR,"vaults.json");
-    const MASTER_KEY_FILE=process.env.VAULT_MASTER_KEY_FILE||"/opt/traderone/.vault_master_key";
-    const RPC_URL=process.env.SOLANA_RPC||"https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac";
-
-    function mkdirp(d){try{fs.mkdirSync(d,{recursive:true});}catch(_){}}
-    mkdirp(DATA_DIR);
-
-    function loadMaster(){
-      try{
-        if(fs.existsSync(MASTER_KEY_FILE)){
-          const b=Buffer.from(fs.readFileSync(MASTER_KEY_FILE,"utf8").trim(),"base64");
-          if(b.length===32) return b;
-        }
-      }catch(_){}
-      const b=crypto.randomBytes(32);
-      try{fs.writeFileSync(MASTER_KEY_FILE,b.toString("base64"),{mode:0o600});}catch(_){}
-      try{fs.chmodSync(MASTER_KEY_FILE,0o600);}catch(_){}
-      return b;
-    }
-    const MASTER=loadMaster();
-
-    function enc(buf){
-      const iv=crypto.randomBytes(12);
-      const c=crypto.createCipheriv("aes-256-gcm",MASTER,iv);
-      const ct=Buffer.concat([c.update(buf),c.final()]);
-      const tag=c.getAuthTag();
-      return Buffer.concat([iv,tag,ct]).toString("base64");
-    }
-    function dec(b64){
-      const raw=Buffer.from(b64,"base64");
-      const iv=raw.subarray(0,12);
-      const tag=raw.subarray(12,28);
-      const ct=raw.subarray(28);
-      const d=crypto.createDecipheriv("aes-256-gcm",MASTER,iv);
-      d.setAuthTag(tag);
-      return Buffer.concat([d.update(ct),d.final()]);
-    }
-
-    function readVaults(){
-      try{
-        if(!fs.existsSync(VAULTS_FILE)) return {};
-        const j=JSON.parse(fs.readFileSync(VAULTS_FILE,"utf8"));
-        return (j&&typeof j==="object")?j:{};
-      }catch(_){return {};}
-    }
-    function writeVaults(v){
-      try{fs.writeFileSync(VAULTS_FILE,JSON.stringify(v,null,2),{mode:0o600});}catch(_){}
-      try{fs.chmodSync(VAULTS_FILE,0o600);}catch(_){}
-    }
-    function validPub(p){
-      try{new PublicKey(p);return true;}catch(_){return false;}
-    }
-
-    function getOrCreateVault(userPub){
-      const vaults=readVaults();
-      if(vaults[userPub] && vaults[userPub].vault && vaults[userPub].encSk){
-        return {vault:vaults[userPub].vault,existed:true};
-      }
-      const kp=Keypair.generate();
-      vaults[userPub]={
-        vault:kp.publicKey.toString(),
-        encSk:enc(Buffer.from(kp.secretKey)),
-        createdAt:new Date().toISOString()
-      };
-      writeVaults(vaults);
-      return {vault:kp.publicKey.toString(),existed:false};
-    }
-
-    async function buildDepositTx(userPub,lamports){
-      const v=getOrCreateVault(userPub);
-      const user=new PublicKey(userPub);
-      const vault=new PublicKey(v.vault);
-      const conn=new Connection(RPC_URL,"confirmed");
-      const latest=await conn.getLatestBlockhash("confirmed");
-      const ix=SystemProgram.transfer({fromPubkey:user,toPubkey:vault,lamports:Number(lamports)});
-      const msg=new TransactionMessage({payerKey:user,recentBlockhash:latest.blockhash,instructions:[ix]}).compileToV0Message();
-      const tx=new VersionedTransaction(msg);
-      const txB64=Buffer.from(tx.serialize()).toString("base64");
-      return {vault:v.vault,txB64,blockhash:latest.blockhash,lastValidBlockHeight:latest.lastValidBlockHeight};
-    }
-
-    if(typeof app==="undefined" || !app || !app.get){
-      console.log("AQUILA_VAULT: app not found, routes not attached");
-      return;
-    }
-
-    app.get("/api/vault", async (req,res)=>{
-      try{
-        const pub=String(req.query.pub||"").trim();
-        if(!validPub(pub)) return res.status(400).json({error:"bad pub"});
-        const v=getOrCreateVault(pub);
-        res.json({status:"ok",user:pub,vault:v.vault,existed:v.existed});
-      }catch(e){
-        res.status(500).json({error:(e&&e.message)?e.message:String(e)});
-      }
-    });
-
-    app.get("/api/vault/tx/deposit", async (req,res)=>{
-      try{
-        const pub=String(req.query.pub||"").trim();
-        const lamports=Number(req.query.lamports||0);
-        if(!validPub(pub)) return res.status(400).json({error:"bad pub"});
-        if(!(lamports>0)) return res.status(400).json({error:"bad lamports"});
-        const out=await buildDepositTx(pub,lamports);
-        res.json({status:"ok",...out});
-      }catch(e){
-        res.status(500).json({error:(e&&e.message)?e.message:String(e)});
-      }
-    });
-
-    console.log("AQUILA_VAULT: routes enabled");
-  }catch(e){
-    console.error("AQUILA_VAULT init error:", (e&&e.message)?e.message:String(e));
-  }
-})();
-/*AQUILA_VAULT_ROUTES_END*/"""
-
-if MARK_A in s:
-  s=re.sub(re.escape(MARK_A)+r".*?"+re.escape(MARK_B), routes, s, flags=re.S)
-  print("OK: replaced existing vault routes block")
-else:
-  # Insert right after existing health route if present (best anchor)
-  m=re.search(r"app\.get\((['\"]/api/health['\"]).*?\)\s*;", s, flags=re.S)
-  if m:
-    i=m.end()
-    s=s[:i]+"\n"+routes+"\n"+s[i:]
-    print("OK: inserted after /api/health route")
-  else:
-    # Insert after app = express() if present
-    m2=re.search(r"const\s+app\s*=\s*express\(\)\s*;", s)
-    if m2:
-      i=m2.end()
-      s=s[:i]+"\n"+routes+"\n"+s[i:]
-      print("OK: inserted after express()")
-    else:
-      s=s+"\n\n"+routes+"\n"
-      print("OK: appended at end (no anchor found)")
-
-p.write_text(s)
-PY
-
-echo "== 4) Restart TraderOne (systemd or pm2) =="
-restart_ok=0
-if systemctl list-unit-files | grep -q "^traderone\.service"; then
-  systemctl restart traderone.service && restart_ok=1 || true
-elif systemctl list-unit-files | grep -q "^traderone"; then
-  systemctl restart traderone && restart_ok=1 || true
+if [ ! -s "$VENDOR_WEB3" ]; then
+  curl -fsSL "https://unpkg.com/@solana/web3.js@1.95.4/lib/index.iife.min.js" -o "$VENDOR_WEB3"
 fi
 
-if [ "$restart_ok" -eq 0 ] && command -v pm2 >/dev/null 2>&1; then
-  if pm2 jlist | grep -q "\"name\":\"traderone\""; then
-    pm2 restart traderone && restart_ok=1 || true
-  fi
-fi
+# Pick a free local port (prefer 12703)
+pick_port(){
+  for p in 12703 12713 12723 12733; do
+    if ! ss -ltn "( sport = :$p )" | grep -q ":$p"; then
+      echo "$p"; return 0
+    fi
+  done
+  echo "No free port in candidate list" >&2
+  exit 1
+}
+PORT="$(pick_port)"
+log "== RPC proxy port selected: $PORT =="
 
-if [ "$restart_ok" -eq 0 ]; then
-  echo "WARN: could not restart automatically (no traderone systemd/pm2 name detected)"
-else
-  echo "OK: TraderOne restarted"
-fi
+# Install RPC proxy (node, no deps)
+log "== Install RPC proxy server.js =="
+mkdir -p "$APP_DIR"
+cat >"${APP_DIR}/server.js" <<'JS'
+const http = require("http");
+const { URL } = require("url");
 
-echo "== 5) Quick HTTP tests (public) =="
-echo "-- vendor --"
-curl -fsSI "https://fireinners.online/wolverine/vendor/solana-web3.min.js" | head -n 20 || true
+const BIND = process.env.BIND || "127.0.0.1";
+const PORT = Number(process.env.PORT || 12703);
+const UPSTREAM = process.env.UPSTREAM || "";
 
-echo "-- health --"
-curl -fsS "https://fireinners.online/wolverine/traderone/api/health" | head -n 50 || true
+if (!UPSTREAM) {
+  console.error("Missing UPSTREAM env (ex: https://lb.drpc.live/solana/XXXX)");
+  process.exit(1);
+}
 
-echo "-- vault route --"
-DUMMY="11111111111111111111111111111111"
-curl -fsS "https://fireinners.online/wolverine/traderone/api/vault?pub=${DUMMY}" | head -n 80 || true
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => resolve(Buffer.concat(chunks)));
+    req.on("error", reject);
+  });
+}
 
-echo "== DONE =="
-echo "LOG=$LOG"
-echo "BACKUP=$BK"
-echo "OPEN=https://fireinners.online/wolverine/"
+function proxyJsonRpc(bodyBuf, res) {
+  const u = new URL(UPSTREAM);
+  const lib = (u.protocol === "https:") ? require("https") : require("http");
+
+  const upstreamReq = lib.request({
+    protocol: u.protocol,
+    hostname: u.hostname,
+    port: u.port || (u.protocol === "https:" ? 443 : 80),
+    path: u.pathname + u.search,
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "content-length": bodyBuf.length,
+      "user-agent": "wolverine-solrpc-proxy/1.0",
+      "accept": "*/*",
+    },
+  }, (upstreamRes) => {
+    const chunks = [];
+    upstreamRes.on("data", (c) => chunks.push(c));
+    upstreamRes.on("end", () => {
+      const out = Buffer.concat(chunks);
+      res.statusCode = upstreamRes.statusCode || 502;
+      res.setHeader("content-type", upstreamRes.headers["content-type"] || "application/json");
+      res.setHeader("cache-control", "no-store");
+      res.end(out);
+    });
+  });
+
+  upstreamReq.on("error", (e) => {
+    res.statusCode = 502;
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ jsonrpc:"2.0", id:null, error:{ code:-32000, message:String(e && e.message ? e.message : e) } }));
+  });
+
+  upstreamReq.write(bodyBuf);
+  upstreamReq.end();
+}
+
+const server = http.createServer(async (req, res) => {
+  try {
+    const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+    if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/health")) {
+      res.statusCode = 200;
+      res.setHeader("content-type", "application/json");
+      res.setHeader("cache-control", "no-store");
+      return res.end(JSON.stringify({ ok:true, upstream:UPSTREAM }));
+    }
+
+    if (req.method !== "POST") {
+      res.statusCode = 405;
+      res.setHeader("content-type", "application/json");
+      return res.end(JSON.stringify({ ok:false, error:"POST only" }));
+    }
+
+    const body = await readBody(req);
+    return proxyJsonRpc(body, res);
+  } catch (e) {
+    res.statusCode = 500;
+    res.setHeader("content-type", "application/json");
+    return res.end(JSON.stringify({ ok:false, error:String(e && e.message ? e.message : e) }));
+  }
+});
+
+server.listen(PORT, BIND, () => {
+  console.log(`Wolverine Solana RPC proxy listening on http://${BIND}:${PORT} -> ${UPSTREAM}`);
+});
+JS
+
+# Systemd service
+log "== Install systemd service =="
+cat >"$SVC" <<EOF
+[Unit]
+Description=Wolverine Solana RPC Proxy (DRPC passthrough)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=BIND=127.0.0.1
+Environment=PORT=${PORT}
+Environment=UPSTREAM=${DRPC_HTTP}
+ExecStart=/usr/bin/node ${APP_DIR}/server.js
+Restart=always
+RestartSec=1
+User=root
+WorkingDirectory=${APP_DIR}
+
+[Install]
+WantedBy=multi-user.target
 EOF
-chmod +x "$F"
-"$F"'
+
+systemctl daemon-reload
+systemctl enable --now wolverine-solrpc-proxy.service
+systemctl restart wolverine-solrpc-proxy.service
+
+# Nginx include: route /wolverine/solana-rpc -> local proxy
+log "== Patch nginx include route for /wolverine/solana-rpc =="
+test -f "$NGX_INC" || { echo "Missing $NGX_INC"; exit 1; }
+cp -a "$NGX_INC" "${NGX_INC}.bak_${TS}"
+
+python3 - <<PY
+from pathlib import Path
+p=Path("$NGX_INC")
+s=p.read_text(errors="ignore")
+block=f"""
+  # --- Wolverine Solana RPC (same-origin) ---
+  location = /wolverine/solana-rpc {{
+    proxy_pass http://127.0.0.1:{int("$PORT")}/;
+    proxy_http_version 1.1;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    add_header Cache-Control "no-store" always;
+  }}
+"""
+if "location = /wolverine/solana-rpc" in s:
+    import re
+    s=re.sub(r"(?s)\s*# --- Wolverine Solana RPC.*?location\s*=\s*/wolverine/solana-rpc\s*\{.*?\}\s*", "\n"+block+"\n", s)
+else:
+    s += "\n" + block + "\n"
+p.write_text(s)
+print("OK: nginx include patched")
+PY
+
+nginx -t
+systemctl reload nginx
+
+# Detect default vault destination pubkey from /root/traderone_wallet_backup.txt (if any)
+VAULT_DEST=""
+if [ -f /root/traderone_wallet_backup.txt ]; then
+  VAULT_DEST="$(grep -Eo '[1-9A-HJ-NP-Za-km-z]{32,44}' /root/traderone_wallet_backup.txt | head -n1 || true)"
+fi
+log "== VAULT_DEST auto-detected: ${VAULT_DEST:-<none>} =="
+
+# Patch index.html: ensure vendor web3 + inject widget + force RPC to same-origin proxy
+log "== Patch index.html (vendor + widget + same-origin RPC) =="
+python3 - <<PY
+from pathlib import Path
+import re, json
+
+html_path=Path("$HTML")
+s=html_path.read_text(errors="ignore")
+
+# Ensure vendor script tag in <head>
+vendor_tag = '<script src="/wolverine/vendor/solana-web3.min.js"></script>'
+if vendor_tag not in s:
+    if "</head>" in s:
+        s = s.replace("</head>", vendor_tag + "\\n</head>")
+    else:
+        s = vendor_tag + "\\n" + s
+
+# Inject widget script (idempotent)
+if "id=\"wolverine-vault-widget\"" not in s:
+    vault_dest = "$VAULT_DEST"
+    inject = f"""
+<script id="wolverine-vault-widget">
+(()=>{{try{{
+  const RPC = location.origin + "/wolverine/solana-rpc";
+  const wrap = document.createElement("div");
+  wrap.style.cssText="position:fixed;left:14px;bottom:14px;z-index:99999;background:#fff;border:1px solid #aaa;border-radius:10px;padding:10px 12px;min-width:320px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;box-shadow:0 6px 24px rgba(0,0,0,.12)";
+  wrap.innerHTML = `
+    <div style="font-weight:700;margin-bottom:6px">Vault • Budget SOL (one-click)</div>
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+      <input id="wv_budget" type="number" step="0.0001" min="0" placeholder="Budget (SOL)" style="flex:1;padding:8px;border:1px solid #bbb;border-radius:8px">
+      <button id="wv_go" style="padding:8px 10px;border:1px solid #333;border-radius:8px;background:#e9ffe9;cursor:pointer">Déposer</button>
+    </div>
+    <div style="display:flex;gap:8px;margin-bottom:6px">
+      <input id="wv_dest" placeholder="Vault dest (pubkey)" value="${vault_dest}" style="flex:1;padding:8px;border:1px solid #bbb;border-radius:8px">
+    </div>
+    <div id="wv_status" style="white-space:pre-wrap;color:#111"></div>
+  `;
+  document.body.appendChild(wrap);
+
+  const elBudget = wrap.querySelector("#wv_budget");
+  const elGo = wrap.querySelector("#wv_go");
+  const elDest = wrap.querySelector("#wv_dest");
+  const elStatus = wrap.querySelector("#wv_status");
+
+  const say = (t)=>{{ elStatus.textContent = String(t||""); }};
+  const fmt = (n)=>{{ try{{ return Number(n).toFixed(6); }}catch(e){{ return String(n); }} }};
+
+  async function getProvider(){{
+    const p = window.solana;
+    if(!p || !p.isPhantom) throw new Error("Phantom non détecté");
+    return p;
+  }}
+
+  async function ensureWeb3(){{
+    if(!window.solanaWeb3) throw new Error("solanaWeb3 is not defined (vendor non chargé)");
+  }}
+
+  async function connectIfNeeded(p){{
+    if(!p.isConnected) await p.connect({{ onlyIfTrusted:false }});
+    if(!p.publicKey) throw new Error("Wallet non connecté");
+    return p.publicKey.toBase58();
+  }}
+
+  async function postJsonRpc(method, params){{
+    const body = {{ jsonrpc:"2.0", id:1, method, params }};
+    const r = await fetch(RPC, {{
+      method:"POST",
+      headers:{{"content-type":"application/json"}},
+      body: JSON.stringify(body),
+      cache:"no-store",
+    }});
+    if(!r.ok) throw new Error("RPC HTTP "+r.status);
+    const j = await r.json();
+    if(j.error) throw new Error(j.error.message || "RPC error");
+    return j.result;
+  }}
+
+  async function getLatestBlockhash(){{
+    const r = await postJsonRpc("getLatestBlockhash", [{{ commitment:"confirmed" }}]);
+    return r.value;
+  }}
+
+  async function getBalance(pub){{
+    const r = await postJsonRpc("getBalance", [pub, {{ commitment:"confirmed" }}]);
+    return r.value;
+  }}
+
+  async function sendV0Transfer(provider, fromPub, toPub, solAmount){{
+    const lamports = Math.floor(Number(solAmount) * 1_000_000_000);
+    if(!(lamports>0)) throw new Error("Budget invalide");
+    const bh = await getLatestBlockhash();
+
+    const conn = new window.solanaWeb3.Connection(RPC, "confirmed");
+    const payer = new window.solanaWeb3.PublicKey(fromPub);
+    const dest  = new window.solanaWeb3.PublicKey(toPub);
+
+    const ix = window.solanaWeb3.SystemProgram.transfer({{
+      fromPubkey: payer,
+      toPubkey: dest,
+      lamports
+    }});
+
+    const cup = window.solanaWeb3.ComputeBudgetProgram.setComputeUnitPrice({{ microLamports: 100_000 }});
+
+    const msg = new window.solanaWeb3.TransactionMessage({{
+      payerKey: payer,
+      recentBlockhash: bh.blockhash,
+      instructions: [cup, ix],
+    }}).compileToV0Message();
+
+    const tx = new window.solanaWeb3.VersionedTransaction(msg);
+
+    // Prefer Phantom signAndSendTransaction (works with VersionedTransaction)
+    let sig = "";
+    if (provider.signAndSendTransaction) {{
+      const res = await provider.signAndSendTransaction(tx);
+      sig = (res && res.signature) ? res.signature : (typeof res === "string" ? res : "");
+      if(!sig) throw new Error("No signature returned by signAndSendTransaction");
+    }} else if (provider.signTransaction) {{
+      const signed = await provider.signTransaction(tx);
+      sig = await conn.sendRawTransaction(signed.serialize(), {{ skipPreflight:false, maxRetries:3 }});
+    }} else {{
+      throw new Error("Wallet ne supporte pas signAndSendTransaction/signTransaction");
+    }}
+
+    await conn.confirmTransaction({{ signature:sig, blockhash: bh.blockhash, lastValidBlockHeight: bh.lastValidBlockHeight }}, "confirmed");
+    return sig;
+  }}
+
+  elGo.addEventListener("click", async ()=>{{
+    try{{
+      say("Préparation...");
+      await ensureWeb3();
+      const provider = await getProvider();
+      const fromPub = await connectIfNeeded(provider);
+
+      const toPub = (elDest.value||"").trim();
+      if(!toPub) throw new Error("Dest pubkey manquant");
+
+      const solAmount = (elBudget.value||"").trim();
+      if(!solAmount) throw new Error("Budget manquant");
+
+      const ok = confirm("Déposer " + solAmount + " SOL\\nDe: " + fromPub + "\\nVers: " + toPub + "\\n\\nConfirmer ?");
+      if(!ok) return say("Annulé.");
+
+      const before = await getBalance(fromPub);
+      say("Envoi tx (v0)...\\nRPC: " + RPC + "\\nBalance before: " + (before/1e9).toFixed(6) + " SOL");
+
+      const sig = await sendV0Transfer(provider, fromPub, toPub, solAmount);
+
+      const after = await getBalance(fromPub);
+      say("OK\\nSignature: " + sig + "\\nBalance after: " + (after/1e9).toFixed(6) + " SOL");
+    }} catch(e){{
+      say("ERREUR: " + (e && e.message ? e.message : String(e)));
+    }}
+  }});
+
+  say("Prêt. RPC=" + RPC);
+}}catch(e){{ console.error(e); }} }})();
+</script>
+"""
+    if "</body>" in s:
+        s = s.replace("</body>", inject + "\n</body>")
+    else:
+        s = s + "\n" + inject + "\n"
+
+# Best-effort: if UI script hardcodes public RPC, replace with same-origin
+s = re.sub(r"https?://api\.mainnet-beta\.solana\.com", "''+location.origin+'/wolverine/solana-rpc'", s)
+
+html_path.write_text(s)
+print("OK: index.html patched (vendor + widget)")
+PY
+
+# Quick tests
+log "== Tests =="
+echo "-- Local proxy health --"
+curl -fsS "http://127.0.0.1:${PORT}/health" | head -c 200 || true
+echo
+echo "-- Same-origin proxy JSON-RPC getLatestBlockhash --"
+curl -fsS "https://fireinners.online/wolverine/solana-rpc" \
+  -H "content-type: application/json" \
+  --data '{"jsonrpc":"2.0","id":1,"method":"getLatestBlockhash","params":[{"commitment":"confirmed"}]}' \
+  | head -c 200 || true
+echo
+echo "-- Vendor reachable --"
+curl -fsSI "https://fireinners.online/wolverine/vendor/solana-web3.min.js" | head -n 8 || true
+echo
+log "DONE"
+echo "OPEN=https://fireinners.online/wolverine/ (Ctrl+F5 hard refresh)"
+BASH
+
+bash /root/MEGA_WOLVERINE_VAULT_SOL.sh
