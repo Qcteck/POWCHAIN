@@ -1,257 +1,66 @@
--- cat traderone.service --
-# /etc/systemd/system/traderone.service
-[Unit]
-Description=TraderOne Backend
-After=network.target
+bash -lc 'set -euo pipefail
+TS="$(date +%Y%m%d_%H%M%S)"
+LOG="/root/TRADERONE_HEART_FIX_${TS}.log"
+exec > >(tee -a "$LOG") 2>&1
 
+echo "== 0) Identify TraderOne unit and entrypoint =="
+systemctl cat traderone.service || true
+test -f /opt/traderone/server.cjs || { echo "MISSING /opt/traderone/server.cjs"; exit 1; }
+
+echo
+echo "== 1) Show current listener processes (all) + grep traderone =="
+ss -lntp || true
+ps auxww | egrep -i "node|traderone|/opt/traderone|server\.cjs" || true
+
+echo
+echo "== 2) Show file proof (hash + head) =="
+sha256sum /opt/traderone/server.cjs | tee /root/traderone_heart_proof.sha256
+echo "-- head -n 60 /opt/traderone/server.cjs --"
+sed -n "1,60p" /opt/traderone/server.cjs || true
+
+echo
+echo "== 3) Force bind on 127.0.0.1:3000 via systemd drop-in (no code edits) =="
+mkdir -p /etc/systemd/system/traderone.service.d
+cat >/etc/systemd/system/traderone.service.d/port.conf <<EOF
 [Service]
-ExecStart=/usr/bin/node /opt/traderone/server.cjs
-Restart=always
-User=root
-WorkingDirectory=/opt/traderone
-Environment=NODE_ENV=production
+Environment="PORT=3000"
+Environment="HOST=127.0.0.1"
+Environment="BIND=127.0.0.1"
+Environment="LISTEN_HOST=127.0.0.1"
+EOF
 
-[Install]
-WantedBy=multi-user.target
+systemctl daemon-reload
 
-# /etc/systemd/system/traderone.service.d/cache.conf
-[Service]
-Environment="BALANCES_CACHE_TTL_MS=15000"
+echo
+echo "== 4) Restart TraderOne and show status =="
+systemctl restart traderone.service
+sleep 1
+systemctl --no-pager status traderone.service | sed -n "1,220p" || true
 
-# /etc/systemd/system/traderone.service.d/override.conf
-[Service]
-Environment="TRADERONE_BOT_WALLET=e8DbBrTJxRetx3HNFb83CsXMySETydHVLwxMzkjcVqh"
-Environment="TRADERONE_MIN_SOL_FEES=0.01"
+echo
+echo "== 5) Find actual listening port for traderone (by PID) =="
+PID="$(systemctl show -p MainPID --value traderone.service || true)"
+echo "MainPID=$PID"
+if [ -n "$PID" ] && [ "$PID" != "0" ] && [ -d "/proc/$PID" ]; then
+  echo "-- cmdline --"
+  tr "\0" " " < "/proc/$PID/cmdline" || true
+  echo
+  echo "-- listeners for this PID --"
+  ss -lntp | awk -v pid="pid=$PID," '"'"'$0~pid{print}'"'"' || true
+else
+  echo "No running PID for traderone.service"
+fi
 
-== 4) pm2 (if present) ==
-┌────┬───────────┬─────────────┬─────────┬─────────┬──────────┬────────┬──────┬───────────┬──────────┬──────────┬──────────┬──────────┐
-│ id │ name      │ namespace   │ version │ mode    │ pid      │ uptime │ ↺    │ status    │ cpu      │ mem      │ user     │ watching │
-└────┴───────────┴─────────────┴─────────┴─────────┴──────────┴────────┴──────┴───────────┴──────────┴──────────┴──────────┴──────────┘
+echo
+echo "== 6) Local health tests (direct backend) =="
+curl -fsS "http://127.0.0.1:3000/health" || true
+curl -fsS "http://127.0.0.1:3000/" | head -n 20 || true
 
-== 5) Quick disk scan (package.json) ==
+echo
+echo "== 7) Public health through nginx route =="
+curl -i -sS "https://fireinners.online/wolverine/traderone/api/health" | head -n 60 || true
 
--- /opt/traderone --
-total 14300
-drwxr-xr-x  9 root root     4096 Jan 18 02:14 .
-drwxr-xr-x 56 root root     4096 Jan 17 22:12 ..
--rw-r--r--  1 root root      145 Jan  5 16:32 .env
-drwxr-xr-x  2 root root     4096 Jan  7 07:18 api
--rw-r--r--  1 root root      997 Dec 26 10:24 ascii-curves.js
--rw-r--r--  1 root root     1263 Dec 27 00:23 ascii-dashboard.js
--rw-r--r--  1 root root      785 Dec 27 00:19 ascii-view.js
--rw-r--r--  1 root root   246709 Dec 27 02:31 ascii-view.log
-drwxr-xr-x  2 root root     4096 Dec 27 01:38 backups
--rw-r--r--  1 root root      189 Jan 16 17:07 config.json
--rw-r--r--  1 root root      880 Dec 26 09:23 courbe_capital.csv
--rw-r--r--  1 root root     8609 Dec 26 09:23 courbe_memoire.json
--rw-r--r--  1 root root     1549 Dec 27 00:19 dash-view.js
--rw-r--r--  1 root root      979 Dec 27 03:38 dashboard.js
--rw-r--r--  1 root root     1160 Dec 27 03:13 dashboard.js.BACKUP_20251227_031344
-drwxr-xr-x  2 root root     4096 Jan  5 14:20 data
--rw-r--r--  1 root root      667 Jan  7 07:10 engine.cjs
--rw-r--r--  1 root root      667 Jan  5 20:05 engine.js
--rw-r--r--  1 root root      667 Jan  7 09:29 engine.js.bak.1767769841
--rw-r--r--  1 root root     1420 Dec 26 09:27 graph.html
--rwxr-xr-x  1 root root      522 Dec 27 01:38 guard.js
--rw-r--r--  1 root root       13 Dec 27 01:38 guard.log
--rw-r--r--  1 root root      625 Dec 26 10:30 hybrid-engine.js
--rw-r--r--  1 root root      933 Dec 27 03:38 index.html
--rw-r--r--  1 root root      305 Dec 27 01:57 index.html.BACKUP_20251227_015749
--rw-r--r--  1 root root     2200 Dec 27 02:06 index.html.BACKUP_20251227_020659
--rw-r--r--  1 root root     3038 Dec 27 02:12 index.html.BACKUP_20251227_021221
--rw-r--r--  1 root root     3038 Dec 27 02:12 index.html.BACKUP_20251227_021236
--rw-r--r--  1 root root     4228 Dec 27 02:31 index.html.BACKUP_20251227_023109
--rw-r--r--  1 root root     3015 Dec 27 02:33 index.html.BACKUP_20251227_023303
--rw-r--r--  1 root root     3015 Dec 27 02:34 index.html.BACKUP_20251227_023446
--rw-r--r--  1 root root     3015 Dec 27 02:44 index.html.BACKUP_20251227_024430
--rw-r--r--  1 root root     1550 Dec 27 03:00 index.html.BACKUP_20251227_030042
--rw-r--r--  1 root root      901 Dec 27 03:13 index.html.BACKUP_20251227_031344
--rw-r--r--  1 root root      891 Dec 27 03:27 index.html.BACKUP_20251227_032739
--rw-r--r--  1 root root      901 Dec 27 03:38 index.html.BACKUP_20251227_033845
--rw-r--r--  1 root root      251 Dec 26 10:51 kill-switch.js
--rw-r--r--  1 root root      335 Jan  1 18:05 log-ascii-view.log
--rw-r--r--  1 root root   996785 Jan  5 03:00 log-dashboard.log
-FOUND /opt/traderone/package.json
-name= traderone  main= server.js  scripts= 
-
--- /opt/traderone-opt --
-total 43224
-drwxr-xr-x  72 root root     4096 Jan 18 03:00 .
-drwxr-xr-x  56 root root     4096 Jan 17 22:12 ..
--rw-------   1 root root      345 Jan 13 22:24 .env
--rw-r--r--   1 root root      288 Jan  8 01:14 .env.bak_20260112_234612
--rw-------   1 root root      288 Jan 12 23:46 .env.bak_20260113_222459
-drwxr-xr-x   7 root root     4096 Jan  8 21:25 .git
-drwxr-xr-x   3 root root     4096 Jan 14 18:59 backend
-drwxr-xr-x   2 root root     4096 Jan  2 03:00 backup_20260102_030001
-drwxr-xr-x   2 root root     4096 Jan  3 03:00 backup_20260103_030001
-drwxr-xr-x   2 root root     4096 Jan  3 07:02 backup_20260103_070258
-drwxr-xr-x   2 root root     4096 Jan  3 07:03 backup_20260103_070300
-drwxr-xr-x   2 root root     4096 Jan  3 07:03 backup_20260103_070303
-drwxr-xr-x   2 root root     4096 Jan  3 07:03 backup_20260103_070305
-drwxr-xr-x   2 root root     4096 Jan  3 07:03 backup_20260103_070307
-drwxr-xr-x   2 root root     4096 Jan  3 07:03 backup_20260103_070310
-drwxr-xr-x   2 root root     4096 Jan  3 07:03 backup_20260103_070312
-drwxr-xr-x   2 root root     4096 Jan  3 07:03 backup_20260103_070314
-drwxr-xr-x   2 root root     4096 Jan  3 07:03 backup_20260103_070316
-drwxr-xr-x   2 root root     4096 Jan  3 07:03 backup_20260103_070342
-drwxr-xr-x   2 root root     4096 Jan  3 07:03 backup_20260103_070344
-drwxr-xr-x   2 root root     4096 Jan  3 07:03 backup_20260103_070346
-drwxr-xr-x   2 root root     4096 Jan  3 07:03 backup_20260103_070349
-drwxr-xr-x   2 root root     4096 Jan  3 07:03 backup_20260103_070351
-drwxr-xr-x   2 root root     4096 Jan  3 07:03 backup_20260103_070353
-drwxr-xr-x   2 root root     4096 Jan  3 07:03 backup_20260103_070355
-drwxr-xr-x   2 root root     4096 Jan  3 07:03 backup_20260103_070358
-drwxr-xr-x   2 root root     4096 Jan  3 07:04 backup_20260103_070400
-drwxr-xr-x   2 root root     4096 Jan  3 07:04 backup_20260103_070402
-drwxr-xr-x   2 root root     4096 Jan  3 07:04 backup_20260103_070404
-drwxr-xr-x   2 root root     4096 Jan  3 07:04 backup_20260103_070407
-drwxr-xr-x   2 root root     4096 Jan  3 07:04 backup_20260103_070409
-drwxr-xr-x   2 root root     4096 Jan  3 07:04 backup_20260103_070411
-drwxr-xr-x   2 root root     4096 Jan  3 07:04 backup_20260103_070413
-drwxr-xr-x   2 root root     4096 Jan  3 07:04 backup_20260103_070415
-drwxr-xr-x   2 root root     4096 Jan  3 07:04 backup_20260103_070417
-drwxr-xr-x   2 root root     4096 Jan  3 07:04 backup_20260103_070420
-drwxr-xr-x   2 root root     4096 Jan  3 07:04 backup_20260103_070422
-drwxr-xr-x   2 root root     4096 Jan  3 07:04 backup_20260103_070424
-drwxr-xr-x   2 root root     4096 Jan  3 07:04 backup_20260103_070426
-FOUND /opt/traderone-opt/package.json
-name= traderone-backend  main= server.js  scripts= start
-
--- /opt/traderone-vault --
-total 316
-drwxr-xr-x   4 root root  4096 Jan 18 05:00 .
-drwxr-xr-x  56 root root  4096 Jan 17 22:12 ..
--rw-------   1 root root    64 Jan 18 05:00 .masterkey
--rw-r--r--   1 root root  1065 Jan 17 21:47 api_budget.js
-drwxr-xr-x 113 root root 12288 Jan 18 05:00 node_modules
--rw-r--r--   1 root root 55633 Jan 18 05:00 package-lock.json
--rw-------   1 root root   246 Jan 18 05:00 package.json
--rw-r--r--   1 root root   434 Jan 16 17:09 package.json.bak_20260118_050008
--rw-------   1 root root  3218 Jan 18 05:00 server.js
--rw-r--r--   1 root root  1788 Jan 16 17:10 server.js.bak_20260117_035958
--rw-r--r--   1 root root  1788 Jan 16 17:10 server.js.bak_20260117_040125
--rw-r--r--   1 root root  2581 Jan 17 04:01 server.js.bak_20260117_171147
--rw-r--r--   1 root root  2581 Jan 17 04:01 server.js.bak_20260117_171332
--rw-r--r--   1 root root  4909 Jan 17 17:34 server.js.bak_20260117_173437
--rw-r--r--   1 root root  5452 Jan 17 17:49 server.js.bak_20260117_174921
--rw-r--r--   1 root root  6031 Jan 17 17:51 server.js.bak_20260117_175102
--rw-r--r--   1 root root  6197 Jan 17 20:40 server.js.bak_20260117_204038
--rw-r--r--   1 root root  6374 Jan 17 20:47 server.js.bak_20260117_204728
--rw-r--r--   1 root root  7736 Jan 17 21:47 server.js.bak_20260117_235845
--rw-r--r--   1 root root  7736 Jan 17 21:47 server.js.bak_20260118_001413
--rw-r--r--   1 root root  7736 Jan 17 21:47 server.js.bak_20260118_001558
--rw-r--r--   1 root root  7736 Jan 17 21:47 server.js.bak_20260118_002837
--rw-r--r--   1 root root  7736 Jan 17 21:47 server.js.bak_20260118_050008
--rw-r--r--   1 root root  6373 Jan 17 21:13 server.js.bak_transfer_20260117_211333
--rw-r--r--   1 root root  6196 Jan 17 20:40 server.js.fix_20260117_204430
--rw-------   1 root root   237 Jan 17 04:12 treasury.json
-drwxr-xr-x   2 root root  4096 Jan 18 05:00 vaults
--rw-------   1 root root   169 Jan 17 21:08 wallet.json
-FOUND /opt/traderone-vault/package.json
-name= traderone-vault  main= server.js  scripts= 
-
--- /opt/wolverine --
-total 760
-drwxr-xr-x  12 root root  4096 Jan 19 00:59 .
-drwxr-xr-x  56 root root  4096 Jan 17 22:12 ..
-drwxr-xr-x   8 root root  4096 Jan 19 00:58 .git
--rw-r--r--   1 root root   108 Jan 14 22:48 .gitignore
-drwxr-xr-x   2 root root  4096 Jan 19 00:59 .next
-drwxr-xr-x   8 root root  4096 Jan 14 22:48 TRADERONE
-drwxr-xr-x   2 root root  4096 Jan 16 15:24 api
--rw-r--r--   1 root root  2764 Jan 14 22:48 app.js
--rw-r--r--   1 root root  2764 Jan 14 22:48 app.js.bak.1767433684
-drwxr-xr-x   2 root root  4096 Jan 16 15:24 data
--rw-r--r--   1 root root  3163 Jan 14 22:48 index.html
--rw-r--r--   1 root root  2759 Jan 14 22:48 index.html.bak.1767412394
--rw-r--r--   1 root root  9508 Jan 14 22:48 index.html.bak.1767412394.bak.1767433684
--rw-r--r--   1 root root  2759 Jan 14 22:48 index.html.bak.1767413571
--rw-r--r--   1 root root 11810 Jan 14 22:48 index.html.bak.1767413571.bak.1767433684
--rw-r--r--   1 root root  2759 Jan 14 22:48 index.html.bak.1767414964
--rw-r--r--   1 root root  9570 Jan 14 22:48 index.html.bak.1767414964.bak.1767433684
--rw-r--r--   1 root root  2759 Jan 14 22:48 index.html.bak.1767415293
--rw-r--r--   1 root root  9580 Jan 14 22:48 index.html.bak.1767415293.bak.1767433684
--rw-r--r--   1 root root  2759 Jan 14 22:48 index.html.bak.1767416543
--rw-r--r--   1 root root  9580 Jan 14 22:48 index.html.bak.1767416543.bak.1767433684
--rw-r--r--   1 root root  9580 Jan 14 22:48 index.html.bak.1767433684
--rw-r--r--   1 root root  2043 Jan 14 22:48 index.html.bak.20260101-215752
--rw-r--r--   1 root root  1575 Jan 14 22:48 index.html.bak.20260101-215806
--rw-r--r--   1 root root  1575 Jan 14 22:48 index.html.bak.20260101-220835
--rw-r--r--   1 root root  2052 Jan 14 22:48 index.html.bak.20260101-224232
--rw-r--r--   1 root root  2052 Jan 14 22:48 index.html.bak.20260101-230425
--rw-r--r--   1 root root  2052 Jan 14 22:48 index.html.bak.20260101-232538
--rw-r--r--   1 root root  2052 Jan 14 22:48 index.html.bak.20260101-233005
--rw-r--r--   1 root root  2052 Jan 14 22:48 index.html.bak.20260101-235302
--rw-r--r--   1 root root 10536 Jan 14 22:48 index.html.bak.20260102-000658
--rw-r--r--   1 root root 12249 Jan 14 22:48 index.html.bak.20260102-011740
--rw-r--r--   1 root root  6026 Jan 14 22:48 index.html.bak.20260102-012534
--rw-r--r--   1 root root 15052 Jan 14 22:48 index.html.bak.20260102-012534.bak.1767431837
--rw-r--r--   1 root root  6026 Jan 14 22:48 index.html.bak.20260102T221818Z
--rw-r--r--   1 root root 15313 Jan 14 22:48 index.html.bak.20260102T221818Z.bak.1767431837
--rw-r--r--   1 root root    25 Jan 14 22:48 index.html.bak.20260102T222555Z
--rw-r--r--   1 root root 13629 Jan 14 22:48 index.html.bak.20260102T222624Z
--rw-r--r--   1 root root 13629 Jan 14 22:48 index.html.bak.20260103010523
-FOUND /opt/wolverine/package.json
-name= wolverine  main= app.js  scripts= test,start
-
--- /opt/fireinners --
-total 172
-drwxr-xr-x 26 fireinners fireinners 4096 Jan  9 01:47 .
-drwxr-xr-x 56 root       root       4096 Jan 17 22:12 ..
--rw-r--r--  1 root       root       1583 Dec 25 03:16 CHARTE_FIREINNERS.md
--rw-r--r--  1 root       root        103 Dec 25 03:16 CHARTE_FIREINNERS.sha256
-drwxr-xr-x  9 root       root       4096 Jan  9 19:42 WOLVERINE
-drwxr-xr-x  7 root       root       4096 Jan  9 19:42 WOLVERINE_REPO
-drwxr-xr-x  2 root       root       4096 Dec 19 17:33 assets
-drwxr-xr-x  2 root       root       4096 Dec 25 03:24 audit
--rwxr-xr-x  1 fireinners fireinners  106 Dec 13 00:13 backup.sh
-drwxr-xr-x  3 root       root       4096 Jan  8 11:56 backup_restore_20260108_115603
-drwxr-xr-x  2 root       root       4096 Jan  8 11:42 backup_wolverine_20260108_114230
-drwxr-xr-x  2 root       root       4096 Jan  8 12:03 backup_wolverine_legacy_20260108_120330
-drwxr-xr-x  2 fireinners fireinners 4096 Dec 13 00:13 backups
-drwxr-xr-x  2 fireinners fireinners 4096 Dec 12 23:57 bin
-drwxr-xr-x  2 fireinners fireinners 4096 Dec 13 00:13 bridge
-drwxr-xr-x  3 fireinners fireinners 4096 Dec 23 20:47 consensus
-drwxr-xr-x  2 fireinners fireinners 4096 Dec 12 23:57 data
--rw-r--r--  1 root       root          0 Jan  1 16:57 fireinners.log
--rwxr-xr-x  1 root       root       2107 Jan  1 16:57 fireinners_geth_sepolia_fix.sh
--rwxr-xr-x  1 root       root       2557 Jan  1 16:57 fireinners_geth_sepolia_official.sh
--rwxr-xr-x  1 root       root       3064 Jan  1 16:57 fireinners_prepare_consensus_and_secure.sh
-drwxr-xr-x  2 fireinners fireinners 4096 Dec 13 02:27 frontend
-drwxr-xr-x 26 fireinners fireinners 4096 Dec 22 08:09 frontend-react
-drwxr-xr-x  6 fireinners fireinners 4096 Dec 14 04:55 frontend-react.BACKUP_OK_20251215_020038
-drwxr-xr-x  2 fireinners fireinners 4096 Dec 13 01:01 logs
-drwxr-xr-x  3 fireinners fireinners 4096 Jan  8 06:29 node_modules
--rwxr-xr-x  1 fireinners fireinners  859 Dec 15 02:30 package-lock.json
--rwxr-xr-x  1 fireinners fireinners  320 Jan  8 21:41 package.json
-drwxr-xr-x  2 root       root       4096 Dec 25 10:05 private_sentinel1
-drwxr-xr-x  4 root       root       4096 Jan  1 06:16 sentinel
--rw-r--r--  1 root       root        106 Dec 25 03:24 sentinelle.log
-drwxr-xr-x  3 root       root       4096 Jan  9 19:42 solrpc-proxy
-drwxr-xr-x  2 root       root       4096 Dec 25 03:24 versions
-drwxr-xr-x  5 www-data   www-data   4096 Jan  8 12:03 wolverine
-drwxr-xr-x  4 www-data   www-data   4096 Jan  9 19:42 wolverine-api
-drwx------  2 root       root       4096 Jan  9 19:42 wolverine-telegram
--rwxr-xr-x  1 fireinners fireinners  845 Dec 17 01:41 ws.js
-FOUND /opt/fireinners/package.json
-name= fireinners  main= index.js  scripts= test
-
-== 6) Write HEART ==
-
-== DONE ==
-HEART=/root/traderone_heart.txt
-OUT=/root/TO_HEART_20260119_010805
-LOG=/root/TO_HEART_20260119_010805.log
-
-== HEART FILE ==
-TS=20260119_010805
-PID3000=
-EXE=
-CWD=
-CMDLINE=
-ENTRY_GUESS=
-ENTRY_ABS=
-OUT=/root/TO_HEART_20260119_010805
-LOG=/root/TO_HEART_20260119_010805.log
-root@srv1195584:~# 
+echo
+echo "== DONE =="
+echo "LOG=$LOG"
+'
