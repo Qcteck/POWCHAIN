@@ -1,5 +1,5 @@
 bash -lc 'set -euo pipefail; python3 - <<'"'"'PY'"'"'
-s = r"""#!/usr/bin/env bash
+s=r"""#!/usr/bin/env bash
 set -euo pipefail
 TS="$(date +%Y%m%d_%H%M%S)"
 OUT="/root/TO_HEART_${TS}"
@@ -13,22 +13,16 @@ say "0) Context"
 hostnamectl 2>/dev/null | sed -n "1,6p" || true
 date || true
 id || true
-echo "OUT=$OUT"
-echo "LOG=$LOG"
-echo "HEART=$HEART"
 
-say "1) Who listens on 3000 (TraderOne backend)"
-ss -lntp | egrep "(:3000|:443|:80)\\b" || true
+say "1) listeners (80/443/3000)"
+ss -lntp | egrep "(:80|:443|:3000)\\b" || true
 
 PID3000="$(ss -lntp 2>/dev/null | awk "/:3000[[:space:]]/ && /users:/{ if (match(\\$0,/pid=([0-9]+)/,m)) {print m[1]; exit} }" || true)"
 echo "PID3000=${PID3000:-none}"
 
-ENTRY=""
-CWD=""
-EXE=""
-CMDLINE=""
+EXE="";CWD="";CMDLINE="";ENTRY="";ENTRY_ABS=""
 if [ -n "${PID3000:-}" ] && [ -d "/proc/$PID3000" ]; then
-  say "2) /proc inspection (3000)"
+  say "2) /proc (3000)"
   EXE="$(readlink -f "/proc/$PID3000/exe" 2>/dev/null || true)"
   CWD="$(readlink -f "/proc/$PID3000/cwd" 2>/dev/null || true)"
   CMDLINE="$(tr "\\0" " " < "/proc/$PID3000/cmdline" 2>/dev/null || true)"
@@ -36,95 +30,78 @@ if [ -n "${PID3000:-}" ] && [ -d "/proc/$PID3000" ]; then
   echo "CWD=$CWD"
   echo "CMDLINE=$CMDLINE"
 
-  ENTRY="$(python3 - <<PY2 2>/dev/null || true
-import shlex,sys
-cmd = """$CMDLINE""".strip()
-if not cmd:
-  print("")
-  sys.exit(0)
-t = shlex.split(cmd)
+  say "2.1) ENTRY guess (python reads /proc directly)"
+  ENTRY="$(python3 - "$PID3000" <<'PY2' 2>/dev/null || true
+import sys,os
+pid=sys.argv[1]
+p=f"/proc/{pid}/cmdline"
+try:
+  data=open(p,"rb").read().split(b"\0")
+except Exception:
+  print(""); sys.exit(0)
+args=[a.decode("utf-8","ignore") for a in data if a]
 entry=""
-if t and ("node" in t[0] or t[0].endswith("/node")):
-  for a in t[1:]:
-    if a.startswith("-"):
-      continue
-    if a.endswith((".js",".mjs",".cjs")):
-      entry=a
-      break
+if args:
+  a0=args[0]
+  if a0.endswith("node") or a0.endswith("/node") or a0=="node":
+    i=1
+    while i<len(args):
+      a=args[i]
+      if a.startswith("-"):
+        i+=1; continue
+      if a.endswith((".js",".mjs",".cjs")) or "/dist/" in a or a.endswith("/dist/index.js"):
+        entry=a; break
+      i+=1
 print(entry)
 PY2
 )"
   echo "ENTRY_GUESS=${ENTRY:-none}"
+  if [ -n "${ENTRY:-}" ]; then
+    if [[ "$ENTRY" = /* ]]; then
+      ENTRY_ABS="$ENTRY"
+    elif [ -n "${CWD:-}" ] && [ -f "$CWD/$ENTRY" ]; then
+      ENTRY_ABS="$CWD/$ENTRY"
+    else
+      ENTRY_ABS=""
+    fi
+  fi
+  echo "ENTRY_ABS=${ENTRY_ABS:-none}"
 
-  say "2.1) Env hints (filtered)"
-  (strings "/proc/$PID3000/environ" 2>/dev/null | egrep -i "NODE_ENV|PORT|TRADER|WOLVERINE|RPC|SECRET|KEY|TOKEN|BASE|PROXY" || true) | head -n 120
+  say "2.2) Env hints (filtered)"
+  (strings "/proc/$PID3000/environ" 2>/dev/null | egrep -i "NODE_ENV|PORT|TRADER|WOLVERINE|RPC|SECRET|KEY|TOKEN|BASE|PROXY" || true) | head -n 200
 
-  say "2.2) Process tree (best-effort)"
+  say "2.3) ps / pstree"
   ps -fp "$PID3000" || true
   pstree -ap "$PID3000" 2>/dev/null || true
 fi
 
-say "3) systemd units (TraderOne/3000 candidates)"
+say "3) systemd candidates"
 systemctl list-units --type=service --all | egrep -i "trader|wolver|3000" || true
 for u in traderone.service traderone-api.service wolverine-traderone.service; do
   if systemctl status "$u" >/dev/null 2>&1; then
-    echo; echo "-- systemctl status $u --"
-    systemctl --no-pager status "$u" | sed -n "1,160p" || true
-    echo; echo "-- systemctl cat $u --"
+    echo; echo "-- status $u --"
+    systemctl --no-pager status "$u" | sed -n "1,180p" || true
+    echo; echo "-- cat $u --"
     systemctl cat "$u" | sed -n "1,260p" || true
   fi
 done
 
 say "4) pm2 (if present)"
-if command -v pm2 >/dev/null 2>&1; then
-  pm2 list || true
-  pm2 describe traderone 2>/dev/null || true
-else
-  echo "pm2 not installed"
-fi
+if command -v pm2 >/dev/null 2>&1; then pm2 list || true; else echo "pm2 not installed"; fi
 
-say "5) Disk scan (package.json + known dirs)"
+say "5) Quick disk scan (package.json)"
 CANDS=(/opt/traderone /opt/traderone-opt /opt/traderone-vault /opt/wolverine /opt/fireinners /root/traderone /root/wolverine)
 for d in "${CANDS[@]}"; do
   [ -d "$d" ] || continue
-  echo; echo "-- CAND: $d --"
+  echo; echo "-- $d --"
   ls -la "$d" | head -n 40 || true
   if [ -f "$d/package.json" ]; then
-    echo "FOUND package.json: $d/package.json"
+    echo "FOUND $d/package.json"
     node -e "const p=require(\"$d/package.json\");console.log(\"name=\",p.name,\" main=\",p.main,\" scripts=\",Object.keys(p.scripts||{}).join(\",\"))" 2>/dev/null || true
   fi
 done
 
-say "6) Resolve likely entry files"
-FOUND_FILES=()
-if [ -n "${CWD:-}" ] && [ -d "${CWD:-/no}" ]; then
-  for f in server.cjs server.js app.js index.js main.js dist/index.js dist/server.js build/index.js; do
-    [ -f "$CWD/$f" ] && FOUND_FILES+=("$CWD/$f")
-  done
-fi
-if [ -n "${ENTRY:-}" ]; then
-  if [[ "$ENTRY" != /* ]] && [ -n "${CWD:-}" ]; then
-    [ -f "$CWD/$ENTRY" ] && FOUND_FILES+=("$CWD/$ENTRY")
-  else
-    [ -f "$ENTRY" ] && FOUND_FILES+=("$ENTRY")
-  fi
-fi
-if [ "${#FOUND_FILES[@]}" -eq 0 ]; then
-  echo "none"
-else
-  printf "%s\n" "${FOUND_FILES[@]}"
-fi
-
-say "7) Frontend reality check: /opt/wolverine is Next root?"
-if [ -d /opt/wolverine ]; then
-  if [ -d /opt/wolverine/pages ] || [ -d /opt/wolverine/app ]; then
-    echo "OK: /opt/wolverine has pages/ or app/"
-  else
-    echo "NO: /opt/wolverine has NO pages/ and NO app/ (not a Next frontend root)"
-  fi
-fi
-
-say "8) Write HEART report"
+say "6) Write HEART"
 {
   echo "TS=$TS"
   echo "PID3000=${PID3000:-}"
@@ -132,8 +109,7 @@ say "8) Write HEART report"
   echo "CWD=${CWD:-}"
   echo "CMDLINE=${CMDLINE:-}"
   echo "ENTRY_GUESS=${ENTRY:-}"
-  echo -n "FOUND_ENTRY_FILES="
-  if [ "${#FOUND_FILES[@]}" -eq 0 ]; then echo; else printf "%s " "${FOUND_FILES[@]}"; echo; fi
+  echo "ENTRY_ABS=${ENTRY_ABS:-}"
   echo "OUT=$OUT"
   echo "LOG=$LOG"
 } | tee "$OUT/heart.txt" > "$HEART"
@@ -144,10 +120,10 @@ echo "HEART=$HEART"
 echo "OUT=$OUT"
 echo "LOG=$LOG"
 """
-open("/root/TO_FIND_TRADERONE_HEART.sh","w",encoding="utf-8").write(s)
+open("/root/TO_FIND_TRADERONE_HEART_v2.sh","w",encoding="utf-8").write(s)
 PY
-chmod +x /root/TO_FIND_TRADERONE_HEART.sh
-/root/TO_FIND_TRADERONE_HEART.sh
+chmod +x /root/TO_FIND_TRADERONE_HEART_v2.sh
+/root/TO_FIND_TRADERONE_HEART_v2.sh
 echo
-echo "== HEART FILE (first 200 lines) =="
-sed -n "1,200p" /root/traderone_heart.txt || true'
+echo "== HEART FILE =="
+sed -n "1,220p" /root/traderone_heart.txt || true'
