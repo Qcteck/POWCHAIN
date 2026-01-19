@@ -1,76 +1,194 @@
-bash -lc 'cat > /root/MEGA_WOLVERINE_FIX_400_301.sh <<'"'"'BASH'"'"'
+bash -lc 'cat > /root/MEGA_WOLVERINE_FIX_DUPLOC_SOLRPC.sh <<'"'"'BASH'"'"'
 #!/usr/bin/env bash
 set -euo pipefail
 TS="$(date +%Y%m%d_%H%M%S)"
 need(){ command -v "$1" >/dev/null 2>&1 || { echo "Missing: $1"; exit 1; }; }
-need sed; need grep; need ss; need systemctl; need nginx; need curl; need python3
+need python3; need nginx; need systemctl; need ss; need curl; need sed; need grep
 
 NGX_INC="/etc/nginx/includes/wolverine_routes.inc"
 NGX_VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
+NGX_MAIN="/etc/nginx/nginx.conf"
 SOL_SVC="/etc/systemd/system/wolverine-solrpc-proxy.service"
+
+SOL_PORT="12703"
 SOL_UPSTREAM="https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac"
 
 echo "== 0) Savepoint (if present) =="
 if [ -x /root/WOLVERINE_SAVEPOINT.sh ]; then /root/WOLVERINE_SAVEPOINT.sh || true; fi
 
-echo "== 1) Patch Solana RPC proxy upstream -> DRPC SOLANA =="
-test -f "$SOL_SVC" || { echo "Missing $SOL_SVC (solrpc proxy service not installed)"; exit 1; }
-cp -a "$SOL_SVC" "/root/wolverine_backups/wolverine-solrpc-proxy.service.bak_${TS}" 2>/dev/null || true
-sed -i "s|^Environment=UPSTREAM=.*$|Environment=UPSTREAM=${SOL_UPSTREAM}|g" "$SOL_SVC"
+echo "== 1) Unfreeze nginx + include =="
+for f in "$NGX_MAIN" "$NGX_VHOST" "$NGX_INC"; do [ -e "$f" ] && chattr -i "$f" 2>/dev/null || true; done
+
+echo "== 2) Backup include/service =="
+mkdir -p /root/wolverine_backups
+[ -f "$NGX_INC" ] && cp -a "$NGX_INC" "/root/wolverine_backups/wolverine_routes.inc.bak_${TS}" || true
+[ -f "$SOL_SVC" ] && cp -a "$SOL_SVC" "/root/wolverine_backups/wolverine-solrpc-proxy.service.bak_${TS}" || true
+
+echo "== 3) Force solrpc proxy to PORT=${SOL_PORT} and DRPC SOLANA upstream =="
+test -f "$SOL_SVC" || { echo "Missing $SOL_SVC"; exit 1; }
+python3 - <<PY
+from pathlib import Path
+p=Path("$SOL_SVC")
+s=p.read_text(errors="ignore").splitlines()
+out=[]
+have_port=False
+have_up=False
+for line in s:
+  if line.startswith("Environment=PORT="):
+    out.append(f"Environment=PORT=$SOL_PORT"); have_port=True; continue
+  if line.startswith("Environment=UPSTREAM="):
+    out.append(f"Environment=UPSTREAM=$SOL_UPSTREAM"); have_up=True; continue
+  out.append(line)
+if not have_port:
+  # insert under [Service] (after first occurrence)
+  res=[]
+  inserted=False
+  for line in out:
+    res.append(line)
+    if (not inserted) and line.strip()=="[Service]":
+      res.append(f"Environment=PORT=$SOL_PORT")
+      inserted=True
+  out=res
+if not have_up:
+  res=[]
+  inserted=False
+  for line in out:
+    res.append(line)
+    if (not inserted) and line.strip()=="[Service]":
+      res.append(f"Environment=UPSTREAM=$SOL_UPSTREAM")
+      inserted=True
+  out=res
+p.write_text("\n".join(out).rstrip()+"\n")
+print("OK: service patched")
+PY
+
 systemctl daemon-reload
 systemctl restart wolverine-solrpc-proxy.service
 sleep 1
 systemctl --no-pager -l status wolverine-solrpc-proxy.service | head -n 25 || true
+echo "-- listeners --"
+ss -ltnp | grep -E "127\\.0\\.0\\.1:${SOL_PORT}\\b" || true
 
-echo "== 2) Patch nginx include to avoid 301 on /wolverine/vault/api (no trailing slash) =="
-for f in "$NGX_VHOST" "$NGX_INC" "/etc/nginx/nginx.conf"; do [ -e "$f" ] && chattr -i "$f" 2>/dev/null || true; done
+echo "== 4) Fix nginx duplicate location /wolverine/solana-rpc (keep ONE proxy block) =="
 mkdir -p "$(dirname "$NGX_INC")"
 touch "$NGX_INC"
 
 python3 - <<'PY'
+import re
 from pathlib import Path
 inc=Path("/etc/nginx/includes/wolverine_routes.inc")
-s=inc.read_text(errors="ignore") if inc.exists() else ""
-def ensure(tag, block):
-  global s
-  if tag in s: return
-  s += "\n\n"+block.strip()+"\n"
-ensure("##WOLVERINE_VAULT_API_NOSLASH_V1", r"""
-##WOLVERINE_VAULT_API_NOSLASH_V1
-location = /wolverine/vault/api { return 308 /wolverine/vault/api/; }
-""")
-ensure("##WOLVERINE_SOLANA_RPC_NOSLASH_V1", r"""
-##WOLVERINE_SOLANA_RPC_NOSLASH_V1
-location = /wolverine/solana-rpc { return 308 /wolverine/solana-rpc; }
-""")
-inc.write_text(s)
-print("OK: nginx include updated")
+lines=inc.read_text(errors="ignore").splitlines(True)
+
+# Remove any previously injected redirect marker block if present
+def drop_marker_block(marker):
+  global lines
+  out=[]
+  i=0
+  while i<len(lines):
+    if marker in lines[i]:
+      i+=1
+      # drop until blank line boundary or next marker-ish line
+      while i<len(lines) and lines[i].strip()!="":
+        i+=1
+      continue
+    out.append(lines[i]); i+=1
+  lines=out
+
+drop_marker_block("##WOLVERINE_SOLANA_RPC_NOSLASH_V1")
+
+# Collect all location blocks for /wolverine/solana-rpc and remove them, then reinsert one canonical proxy block.
+pat = re.compile(r'^\s*location\s*(=)?\s*/wolverine/solana-rpc\b')
+blocks=[]
+keep_idx=None
+
+i=0
+out=[]
+while i<len(lines):
+  if pat.search(lines[i]):
+    # capture block
+    start=i
+    block=[lines[i]]
+    # one-liner with { ... } on same line
+    if "{" in lines[i] and "}" in lines[i]:
+      end=i
+    else:
+      j=i+1
+      while j<len(lines):
+        block.append(lines[j])
+        if "}" in lines[j]:
+          break
+        j+=1
+      end=j
+    blocks.append("".join(block))
+    i=end+1
+    continue
+  out.append(lines[i]); i+=1
+
+# choose block to keep: prefer one containing proxy_pass
+chosen=None
+for b in blocks:
+  if "proxy_pass" in b:
+    chosen=b; break
+
+# if none had proxy_pass, discard and generate canonical
+if not chosen:
+  chosen=None
+
+canonical = """##WOLVERINE_SOLANA_RPC_PROXY_V1
+location /wolverine/solana-rpc {
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  proxy_pass http://127.0.0.1:12703/;
+}
+"""
+
+# Also remove older canonical block if duplicated
+out2=[]
+skip=False
+for line in out:
+  if "##WOLVERINE_SOLANA_RPC_PROXY_V1" in line:
+    skip=True
+    continue
+  if skip:
+    if line.strip()=="}":
+      skip=False
+    continue
+  out2.append(line)
+
+out = out2
+# append canonical at end (single source of truth)
+if not out or out[-1].endswith("\n")==False:
+  pass
+if out and out[-1].strip()!="":
+  out.append("\n")
+out.append(canonical+"\n")
+
+inc.write_text("".join(out))
+print("OK: include deduped + canonical proxy block written")
 PY
 
+echo "== 5) nginx test + reload =="
 nginx -t
 systemctl reload nginx
 
-for f in "$NGX_VHOST" "$NGX_INC" "/etc/nginx/nginx.conf"; do [ -e "$f" ] && chattr +i "$f" 2>/dev/null || true; done
-
-echo "== 3) Quick tests (show HTTP codes) =="
-echo "-- vault api local (should be 200 JSON) --"
-curl -sS -D - "http://127.0.0.1:3010/health" -o /tmp/vault_health_${TS}.out || true
-head -n 20 /tmp/vault_health_${TS}.out || true
-
-echo
-echo "-- solana rpc local (should be 200 + ok/healthy) --"
-curl -sS -D - -H "content-type: application/json" -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getHealth\"}" "http://127.0.0.1:12703/" -o /tmp/sol_local_${TS}.out || true
-head -n 20 /tmp/sol_local_${TS}.out || true
-
-echo
-echo "-- public same-origin solana-rpc (should be 200) --"
+echo "== 6) Tests =="
+echo "-- same-origin solana-rpc getHealth --"
 curl -sS -D - -H "content-type: application/json" -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getHealth\"}" "https://fireinners.online/wolverine/solana-rpc" -o /tmp/sol_pub_${TS}.out || true
-head -n 20 /tmp/sol_pub_${TS}.out || true
-
+head -n 25 /tmp/sol_pub_${TS}.out || true
 echo
+echo "-- local solrpc getHealth --"
+curl -sS -D - -H "content-type: application/json" -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getHealth\"}" "http://127.0.0.1:12703/" -o /tmp/sol_local_${TS}.out || true
+head -n 25 /tmp/sol_local_${TS}.out || true
+
+echo "== 7) Refreeze nginx files =="
+for f in "$NGX_MAIN" "$NGX_VHOST" "$NGX_INC"; do [ -e "$f" ] && chattr +i "$f" 2>/dev/null || true; done
+
 echo "DONE"
 echo "OPEN: https://fireinners.online/wolverine/ (Ctrl+F5)"
 echo "OPEN: https://fireinners.online/wolverine/health/ (Ctrl+F5)"
 BASH
-chmod +x /root/MEGA_WOLVERINE_FIX_400_301.sh
-/root/MEGA_WOLVERINE_FIX_400_301.sh | tee /root/MEGA_WOLVERINE_FIX_400_301_${TS}.log'
+chmod +x /root/MEGA_WOLVERINE_FIX_DUPLOC_SOLRPC.sh
+/root/MEGA_WOLVERINE_FIX_DUPLOC_SOLRPC.sh | tee /root/MEGA_WOLVERINE_FIX_DUPLOC_SOLRPC_${TS}.log'
