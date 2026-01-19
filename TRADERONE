@@ -1,37 +1,54 @@
 bash -lc 'set -euo pipefail
 HOST="fireinners.online"
 NG="/etc/nginx/nginx.conf"
-EN="/etc/nginx/sites-enabled"
-AV="/etc/nginx/sites-available"
+ETC="/etc/nginx"
+EN="$ETC/sites-enabled"
+AV="$ETC/sites-available"
 CERTROOT="/var/www/certbot"
 TS="$(date +%Y%m%d_%H%M%S)"
-BK="/root/wolverine_backups/NGINX_CLEANUP_${TS}"
-mkdir -p "$BK" "$CERTROOT" "$AV" "$EN"
+BK="/root/wolverine_backups/NGINX_SSL_RESOLVE_FIX_${TS}"
+mkdir -p "$BK" "$CERTROOT" "$EN" "$AV"
 
 say(){ echo "== $* =="; }
 
 say "0) Snapshot"
 nginx -T > "$BK/nginx_T_before.txt" 2>&1 || true
 cp -a "$NG" "$BK/nginx.conf.bak" 2>/dev/null || true
-ls -la "$EN" > "$BK/sites-enabled.ls" 2>/dev/null || true
-ls -la "$AV" > "$BK/sites-available.ls" 2>/dev/null || true
+cp -a "$EN" "$BK/sites-enabled.bak" 2>/dev/null || true
+cp -a "$AV" "$BK/sites-available.bak" 2>/dev/null || true
 
 say "1) Unlock immutables (best-effort)"
 chattr -i "$NG" 2>/dev/null || true
-for f in "$AV/${HOST}-ssl" "$AV/${HOST}"; do chattr -i "$f" 2>/dev/null || true; done
+chattr -i "$AV/${HOST}" "$AV/${HOST}-ssl" 2>/dev/null || true
+# unlock any discovered files later too (best-effort)
 
-say "2) Resolve SSL vhost file (enabled -> realpath)"
+say "2) Resolve SSL vhost candidates (scan ALL /etc/nginx)"
+CAND_ALL="$BK/ssl_candidates_all.txt"
+: > "$CAND_ALL"
+# candidates: contains server_name host AND (listen 443 OR ssl) in same file
+grep -RIl --exclude-dir=modules-enabled --exclude-dir=sites-enabled --exclude-dir=sites-available -E "server_name[[:space:]].*${HOST}" "$ETC" 2>/dev/null | while read -r f; do
+  if grep -qE "listen[[:space:]].*443|ssl_certificate|http2" "$f" 2>/dev/null; then
+    echo "$f" >> "$CAND_ALL"
+  fi
+done
+# include also sites-available/enabled explicitly
+grep -RIl -E "server_name[[:space:]].*${HOST}" "$AV" "$EN" 2>/dev/null | while read -r f; do
+  if grep -qE "listen[[:space:]].*443|ssl_certificate|http2" "$f" 2>/dev/null; then
+    echo "$f" >> "$CAND_ALL"
+  fi
+done
+
+# uniq
+sort -u "$CAND_ALL" -o "$CAND_ALL" || true
+echo "-- SSL candidates --"; nl -ba "$CAND_ALL" || true
+
+# preferred: /etc/nginx/sites-available/HOST-ssl then enabled symlink target, else first candidate
 VSSL=""
-if [ -L "$EN/${HOST}-ssl" ]; then
-  VSSL="$(readlink -f "$EN/${HOST}-ssl" || true)"
-fi
-if [ -z "${VSSL}" ] || [ ! -f "$VSSL" ]; then
-  # fallback: find any enabled file containing server_name fireinners.online + listen 443
-  VSSL="$(grep -RIl --include="*" -E "server_name[[:space:]].*${HOST}" "$EN" 2>/dev/null | while read -r f; do
-    if grep -qE "listen[[:space:]].*443" "$f" 2>/dev/null; then echo "$f"; break; fi
-  done || true)"
-fi
-echo "SSL_VHOST=$VSSL" | tee "$BK/ssl_vhost_path.txt"
+if [ -f "$AV/${HOST}-ssl" ]; then VSSL="$AV/${HOST}-ssl"; fi
+if [ -z "$VSSL" ] && [ -L "$EN/${HOST}-ssl" ]; then VSSL="$(readlink -f "$EN/${HOST}-ssl" || true)"; fi
+if [ -z "$VSSL" ] && [ -s "$CAND_ALL" ]; then VSSL="$(head -n 1 "$CAND_ALL" || true)"; fi
+
+echo "SSL_VHOST=$VSSL" | tee "$BK/ssl_vhost_chosen.txt"
 
 say "3) Ensure HTTP 80 vhost (ACME passthrough + redirect https)"
 VHTTP="$AV/${HOST}"
@@ -50,63 +67,75 @@ server {
   location / { return 301 https://\$host\$request_uri; }
 }
 EOF
-ln -sf "$VHTTP" "$EN/${HOST}"
+ln -sf "$VHTTP" "$EN/${HOST}" || true
 
-say "4) Patch SSL vhost to REMOVE any listen 80 (keep 443 only)"
-if [ -n "${VSSL}" ] && [ -f "$VSSL" ]; then
-  cp -a "$VSSL" "$BK/$(basename "$VSSL").bak" 2>/dev/null || true
-  # remove lines that start with optional spaces + listen 80 or listen [::]:80
-  sed -i -E "/^[[:space:]]*listen[[:space:]]+80\\b/d; /^[[:space:]]*listen[[:space:]]+\\[::\\]:80\\b/d" "$VSSL"
-else
-  echo "WARN: SSL vhost not found/regular file, skipping listen-80 removal."
+say "4) Patch ALL SSL candidates: remove any listen 80 / [::]:80"
+PATCHED="$BK/ssl_patched.txt"
+: > "$PATCHED"
+
+# build list: chosen first, then all candidates
+LIST="$BK/ssl_patch_list.txt"
+: > "$LIST"
+if [ -n "$VSSL" ] && [ -f "$VSSL" ]; then echo "$VSSL" >> "$LIST"; fi
+cat "$CAND_ALL" >> "$LIST" 2>/dev/null || true
+sort -u "$LIST" -o "$LIST" || true
+
+while IFS= read -r f; do
+  [ -n "$f" ] || continue
+  [ -f "$f" ] || continue
+  chattr -i "$f" 2>/dev/null || true
+  cp -a "$f" "$BK/$(echo "$f" | sed "s#/#_#g").bak" 2>/dev/null || true
+  # remove listen 80 lines
+  sed -i -E "/^[[:space:]]*listen[[:space:]]+80\\b/d; /^[[:space:]]*listen[[:space:]]+\\[::\\]:80\\b/d" "$f"
+  echo "$f" >> "$PATCHED"
+done < "$LIST"
+
+echo "-- patched SSL files --"; nl -ba "$PATCHED" || true
+
+say "5) Ensure SSL vhost symlink exists (best-effort)"
+# If sites-available HOST-ssl exists, ensure enabled points to it
+if [ -f "$AV/${HOST}-ssl" ]; then
+  ln -sf "$AV/${HOST}-ssl" "$EN/${HOST}-ssl" || true
 fi
 
-say "5) Disable duplicate enabled vhosts that bind :80 with server_name fireinners.online (keep only ${HOST})"
-# list enabled config files that contain server_name HOST and listen 80
-MAP="$BK/dupe_80_list.txt"
+say "6) Disable duplicate :80 server_name HOST (keep only sites-enabled/HOST)"
+MAP="$BK/dupe_80_enabled.txt"
 : > "$MAP"
 for f in "$EN"/*; do
-  [ -f "$f" ] || continue
+  [ -e "$f" ] || continue
   if grep -qE "server_name[[:space:]].*${HOST}" "$f" 2>/dev/null && grep -qE "listen[[:space:]].*\\b80\\b" "$f" 2>/dev/null; then
     echo "$f" >> "$MAP"
   fi
 done
+sort -u "$MAP" -o "$MAP" || true
+echo "-- enabled :80 candidates --"; nl -ba "$MAP" || true
 
-echo "-- candidates --"; cat "$MAP" || true
-
-# keep /etc/nginx/sites-enabled/fireinners.online (our HTTP vhost); disable others safely
 KEEP="$EN/${HOST}"
 while IFS= read -r f; do
   [ -n "$f" ] || continue
   if [ "$f" = "$KEEP" ]; then continue; fi
   bn="$(basename "$f")"
   cp -a "$f" "$BK/enabled_${bn}.bak" 2>/dev/null || true
-  if [ -L "$f" ]; then
-    mv -f "$f" "$f.disabled_${TS}" || rm -f "$f" || true
-  else
-    # if it is a real file in sites-enabled, rename it out of the way
-    mv -f "$f" "$f.disabled_${TS}" || true
-  fi
+  mv -f "$f" "$f.disabled_${TS}" 2>/dev/null || rm -f "$f" 2>/dev/null || true
 done < "$MAP"
 
-say "6) Nginx test + reload"
+say "7) Nginx test + reload"
 nginx -t 2>&1 | tee "$BK/nginx_t_after.txt"
 systemctl reload nginx || systemctl restart nginx
 
-say "7) Verify conflict gone"
+say "8) Sanity checks"
+echo "-- HTTP -> must redirect --"; curl -sS -I "http://${HOST}/" | head -n 12 || true
+echo "-- HTTPS wolverine --"; curl -sS -I "https://${HOST}/wolverine/" | head -n 12 || true
+echo "-- Conflicts? --"
 if grep -q "conflicting server name" "$BK/nginx_t_after.txt"; then
-  echo "STILL CONFLICTING. Dump remaining :80 server_name matches:"
-  nginx -T 2>/dev/null | grep -nE "server_name[[:space:]].*${HOST}|listen[[:space:]].*\\b80\\b" | head -n 250 || true
+  echo "STILL CONFLICTING. Extracting lines:"
+  nginx -T 2>/dev/null | grep -nE "conflicting server name|server_name[[:space:]].*${HOST}|listen[[:space:]].*\\b80\\b" | head -n 260 || true
 else
   echo "OK: no conflicting server name in nginx -t."
 fi
 
-say "8) Quick checks"
-curl -sS -I "http://${HOST}/" | head -n 12 || true
-curl -sS -I "https://${HOST}/wolverine/" | head -n 12 || true
-
 say "9) Re-lock immutables (best-effort)"
 chattr +i "$NG" 2>/dev/null || true
-if [ -n "${VSSL}" ] && [ -f "$VSSL" ]; then chattr +i "$VSSL" 2>/dev/null || true; fi
+while IFS= read -r f; do [ -f "$f" ] && chattr +i "$f" 2>/dev/null || true; done < "$PATCHED"
 
 echo "DONE. Backup: $BK"'
