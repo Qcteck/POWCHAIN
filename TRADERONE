@@ -1,272 +1,154 @@
-cat >/root/MEGA_TRADERONE_HEART_AND_RPC_FIX.sh <<'BASH'
-#!/usr/bin/env bash
-set -euo pipefail
-export LC_ALL=C
+import { useConnection, useWallet } from '@solana/wallet-adapter-react';
+import {
+  PublicKey,
+  TransactionMessage,
+  VersionedTransaction,
+  SystemProgram,
+  LAMPORTS_PER_SOL,
+  ComputeBudgetProgram,
+  Commitment,
+  RpcResponseAndContext,
+  SignatureResult,
+} from '@solana/web3.js';
+import { useCallback, useMemo, useState } from 'react';
+import { getVaultPDA, createVaultInstruction, depositInstruction } from '@/lib/vaultProgram';
 
-TS="$(date +%Y%m%d_%H%M%S)"
-LOG="/root/MEGA_TRADERONE_HEART_AND_RPC_FIX_${TS}.log"
-exec > >(tee -a "$LOG") 2>&1
+const COMMITMENT: Commitment = 'confirmed';
 
-echo "== MEGA_TRADERONE_HEART_AND_RPC_FIX == TS=$TS =="
+// Ajuste selon ton besoin
+const DEFAULT_SOL_DEPOSIT = 1; // 1 SOL
+const CU_LIMIT = 250_000; // compute units (safe-ish for multi-instructions)
+const CU_PRICE_MICROLAMPORTS = 50_000; // prioritization fee (ajuste)
 
-if [ "$(id -u)" -ne 0 ]; then
-  echo "ERROR: run as root"; exit 1
-fi
-
-DOMAIN="fireinners.online"
-UI_HTML="/var/www/wolverine/index.html"
-VENDOR_DIR="/var/www/wolverine/vendor"
-VENDOR_WEB3="${VENDOR_DIR}/solana-web3.min.js"
-NGX_INC="/etc/nginx/includes/wolverine_routes.inc"
-
-# Your DRPC endpoints (HTTP used by proxy; WSS kept for future subscriptions)
-DRPC_HTTP="https://lb.drpc.live/solana/AsxThpeKkEjGtZhCNUEQYo1ZluSgmwsR76RdFhW5UfFk"
-DRPC_WSS="wss://lb.drpc.live/solana/AsxThpeKkEjGtZhCNUEQYo1ZluSgmwsR76RdFhW5UfFk"
-
-echo
-echo "== 0) Savepoint (if present) =="
-if [ -x /root/WOLVERINE_SAVEPOINT.sh ]; then
-  /root/WOLVERINE_SAVEPOINT.sh || true
-else
-  echo "No /root/WOLVERINE_SAVEPOINT.sh (skipping)"
-fi
-
-echo
-echo "== 1) Find TraderOne HEART (backend core) =="
-echo "-- systemd status (traderone.service) --"
-systemctl status traderone.service --no-pager || true
-echo
-echo "-- systemd cat (traderone.service) --"
-systemctl cat traderone.service --no-pager || true
-
-HEART_EXEC="$(systemctl show -p ExecStart --value traderone.service 2>/dev/null || true)"
-echo
-echo "HEART ExecStart raw: $HEART_EXEC"
-
-# Try to extract the script path from ExecStart
-HEART_FILE=""
-if echo "$HEART_EXEC" | grep -qE '/(opt|root|srv|var)/[^ ]+\.(c?js|mjs)$'; then
-  HEART_FILE="$(echo "$HEART_EXEC" | grep -oE '/(opt|root|srv|var)/[^ ]+\.(c?js|mjs)' | head -n1 || true)"
-fi
-
-if [ -n "${HEART_FILE:-}" ] && [ -f "$HEART_FILE" ]; then
-  echo "HEART FILE: $HEART_FILE"
-  echo "-- head(80) of HEART FILE --"
-  sed -n '1,80p' "$HEART_FILE" || true
-else
-  echo "HEART FILE: (could not extract from ExecStart) -> scanning /opt for likely entrypoints..."
-  for p in \
-    /opt/traderone/server.cjs /opt/traderone/server.js /opt/traderone/index.js /opt/traderone/app.js \
-    /opt/traderone/dist/server.js /opt/traderone/dist/index.js \
-    /opt/traderone-opt/server.cjs /opt/traderone-opt/server.js
-  do
-    if [ -f "$p" ]; then HEART_FILE="$p"; break; fi
-  done
-  if [ -n "${HEART_FILE:-}" ]; then
-    echo "HEART FILE (found): $HEART_FILE"
-    echo "-- head(80) of HEART FILE --"
-    sed -n '1,80p' "$HEART_FILE" || true
-  else
-    echo "HEART FILE: NOT FOUND by quick paths; showing top candidates (find)..."
-    find /opt -maxdepth 4 -type f \( -name 'server.cjs' -o -name 'server.js' -o -name 'index.js' -o -name 'app.js' \) 2>/dev/null | head -n 40 || true
-  fi
-fi
-
-echo
-echo "== 2) Ensure TraderOne backend is listening on 127.0.0.1:3000 =="
-echo "-- listeners on :3000 --"
-ss -ltnp | grep -E '(:3000\b)' || true
-
-echo
-echo "== 3) Pick a free local port for Solana RPC proxy (prefer 12703) =="
-pick_port() {
-  local p
-  for p in 12703 12704 12705 12706 12707 12708 12709 12710 12711 12712 12713 12714 12715 12716 12717 12718 12719 12720; do
-    if ! ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "127\.0\.0\.1:${p}\$"; then
-      echo "$p"; return 0
-    fi
-  done
-  return 1
-}
-SOLRPC_PORT="$(pick_port || true)"
-if [ -z "${SOLRPC_PORT:-}" ]; then
-  echo "ERROR: no free port found in 12703..12720"; exit 1
-fi
-echo "Using SOLRPC_PORT=$SOLRPC_PORT"
-
-echo
-echo "== 4) Install/Update Wolverine Solana RPC proxy (Node, no deps) =="
-PROXY_DIR="/opt/fireinners/solrpc-proxy-wolverine"
-PROXY_JS="${PROXY_DIR}/server.js"
-mkdir -p "$PROXY_DIR"
-
-cat >"$PROXY_JS" <<'JS'
-'use strict';
-const http = require('http');
-
-const LISTEN_HOST = process.env.LISTEN_HOST || '127.0.0.1';
-const LISTEN_PORT = parseInt(process.env.LISTEN_PORT || '12703', 10);
-const UPSTREAM = (process.env.DRPC_HTTP || '').trim();
-
-function send(res, code, obj) {
-  const body = Buffer.from(JSON.stringify(obj));
-  res.writeHead(code, {
-    'content-type': 'application/json; charset=utf-8',
-    'content-length': String(body.length),
-    'cache-control': 'no-store'
-  });
-  res.end(body);
+function isUserReject(e: any) {
+  const m = String(e?.message || e || '');
+  return /User rejected|user rejected|Rejected|denied|Declined/i.test(m);
 }
 
-function readBody(req) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    req.on('data', c => chunks.push(Buffer.from(c)));
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', reject);
-  });
-}
+export default function AquilaActions() {
+  const { connection } = useConnection();
+  const wallet = useWallet();
+  const { publicKey } = wallet;
 
-const srv = http.createServer(async (req, res) => {
-  try {
-    if (!UPSTREAM) return send(res, 500, { error: 'DRPC_HTTP missing' });
+  const [loading, setLoading] = useState(false);
+  const [status, setStatus] = useState<string>('');
 
-    if (req.method === 'GET' && (req.url === '/' || req.url === '/health')) {
-      return send(res, 200, { status: 'ok', upstream: 'drpc', url: UPSTREAM });
+  const canSign = useMemo(() => {
+    // wallet-adapter peut exposer signTransaction OU signAllTransactions.
+    return !!wallet.signTransaction;
+  }, [wallet.signTransaction]);
+
+  const handleOneClickSetupAndDeposit = useCallback(async () => {
+    if (!publicKey) {
+      setStatus('Wallet non connecté');
+      return;
+    }
+    if (!wallet.signTransaction) {
+      setStatus('Wallet ne supporte pas signTransaction');
+      return;
     }
 
-    if (req.method !== 'POST') {
-      return send(res, 405, { error: 'POST only', method: req.method });
+    setLoading(true);
+    setStatus('Préparation du batch…');
+
+    try {
+      // 1) PDA
+      const [vaultPDA] = getVaultPDA(publicKey);
+
+      // 2) Vérifier si le vault existe déjà (évite de crasher sur "already in use")
+      const vaultInfo = await connection.getAccountInfo(vaultPDA, COMMITMENT);
+      const needCreate = !vaultInfo;
+
+      // 3) Instructions
+      const ixs = [];
+
+      // compute budget (optionnel mais utile si bundle lourd)
+      ixs.push(ComputeBudgetProgram.setComputeUnitLimit({ units: CU_LIMIT }));
+      ixs.push(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: CU_PRICE_MICROLAMPORTS }));
+
+      if (needCreate) {
+        ixs.push(
+          createVaultInstruction({
+            payer: publicKey,
+            vault: vaultPDA,
+          })
+        );
+      }
+
+      // Exemple: transfert natif SOL vers vault (si ton design le veut)
+      const lamports = Math.round(DEFAULT_SOL_DEPOSIT * LAMPORTS_PER_SOL);
+      if (lamports > 0) {
+        ixs.push(
+          SystemProgram.transfer({
+            fromPubkey: publicKey,
+            toPubkey: vaultPDA,
+            lamports,
+          })
+        );
+      }
+
+      // Dépôt custom (Anchor/SPL/logic interne)
+      ixs.push(
+        depositInstruction({
+          user: publicKey,
+          vault: vaultPDA,
+          amount: lamports, // adapte selon ton programme (lamports / amount token / etc.)
+        })
+      );
+
+      // 4) Blockhash + V0 message
+      const latest = await connection.getLatestBlockhash(COMMITMENT);
+
+      const msgV0 = new TransactionMessage({
+        payerKey: publicKey,
+        recentBlockhash: latest.blockhash,
+        instructions: ixs,
+      }).compileToV0Message(); // passe tes lookup tables si tu en utilises
+
+      const vtx = new VersionedTransaction(msgV0);
+
+      // 5) Signature unique
+      setStatus('Signature wallet…');
+      const signed = await wallet.signTransaction(vtx);
+
+      // 6) Envoi raw
+      setStatus('Envoi…');
+      const sig = await connection.sendRawTransaction(signed.serialize(), {
+        skipPreflight: false,
+        maxRetries: 3,
+      });
+
+      // 7) Confirmation
+      setStatus('Confirmation…');
+      const conf: RpcResponseAndContext<SignatureResult> = await connection.confirmTransaction(
+        { signature: sig, blockhash: latest.blockhash, lastValidBlockHeight: latest.lastValidBlockHeight },
+        COMMITMENT
+      );
+
+      if (conf.value.err) {
+        throw new Error(`Transaction confirmée avec erreur: ${JSON.stringify(conf.value.err)}`);
+      }
+
+      setStatus(`Succès: ${sig}`);
+    } catch (e: any) {
+      console.error(e);
+      setStatus(isUserReject(e) ? 'Signature annulée' : `Échec: ${String(e?.message || e)}`);
+    } finally {
+      setLoading(false);
     }
+  }, [publicKey, wallet, connection]);
 
-    const body = await readBody(req);
-    const upstreamRes = await fetch(UPSTREAM, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body
-    });
+  return (
+    <div className="space-y-4">
+      <button
+        onClick={handleOneClickSetupAndDeposit}
+        disabled={loading || !publicKey || !canSign}
+        className="px-6 py-3 bg-green-600 text-white rounded-lg hover:bg-green-700 disabled:opacity-50 transition"
+      >
+        {loading ? 'Traitement…' : 'Tout-en-un : Créer Vault + Déposer'}
+      </button>
 
-    const text = await upstreamRes.text();
-    res.writeHead(upstreamRes.status, {
-      'content-type': upstreamRes.headers.get('content-type') || 'application/json; charset=utf-8',
-      'cache-control': 'no-store'
-    });
-    res.end(text);
-  } catch (e) {
-    send(res, 502, { error: String(e && e.message ? e.message : e) });
-  }
-});
-
-srv.listen(LISTEN_PORT, LISTEN_HOST, () => {
-  console.log(`wolverine-solrpc-proxy listening on http://${LISTEN_HOST}:${LISTEN_PORT} -> ${UPSTREAM}`);
-});
-JS
-
-chmod 755 "$PROXY_JS"
-
-SERVICE="/etc/systemd/system/wolverine-solrpc-proxy.service"
-cat >"$SERVICE" <<EOF
-[Unit]
-Description=Wolverine Solana RPC Proxy (DRPC passthrough)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-Environment=LISTEN_HOST=127.0.0.1
-Environment=LISTEN_PORT=${SOLRPC_PORT}
-Environment=DRPC_HTTP=${DRPC_HTTP}
-WorkingDirectory=${PROXY_DIR}
-ExecStart=/usr/bin/node ${PROXY_JS}
-Restart=always
-RestartSec=1
-KillSignal=SIGINT
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl daemon-reload
-systemctl enable --now wolverine-solrpc-proxy.service
-
-echo
-echo "-- proxy service status --"
-systemctl status wolverine-solrpc-proxy.service --no-pager || true
-echo
-echo "-- proxy listeners --"
-ss -ltnp | grep -E "(127\.0\.0\.1:${SOLRPC_PORT}\b)" || true
-
-echo
-echo "== 5) Wire nginx route /wolverine/solana-rpc -> 127.0.0.1:${SOLRPC_PORT} (include only) =="
-test -f "$NGX_INC" || { echo "ERROR: missing $NGX_INC"; exit 1; }
-cp -a "$NGX_INC" "${NGX_INC}.bak_${TS}"
-
-python3 - <<PY
-from pathlib import Path
-p=Path("${NGX_INC}")
-s=p.read_text(errors="ignore")
-
-begin="# BEGIN WOLVERINE_SOLANA_RPC_PROXY"
-end="# END WOLVERINE_SOLANA_RPC_PROXY"
-block=f"""{begin}
-location = /wolverine/solana-rpc {{ return 308 /wolverine/solana-rpc/; }}
-location ^~ /wolverine/solana-rpc/ {{
-  proxy_http_version 1.1;
-  proxy_set_header Host \$host;
-  proxy_set_header X-Real-IP \$remote_addr;
-  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto \$scheme;
-  proxy_set_header Upgrade \$http_upgrade;
-  proxy_set_header Connection "upgrade";
-  proxy_pass http://127.0.0.1:${SOLRPC_PORT}/;
-}}
-{end}
-"""
-
-if begin in s and end in s:
-  pre=s.split(begin)[0]
-  post=s.split(end)[1]
-  s=pre+block+post
-else:
-  s=s.rstrip()+"\n\n"+block+"\n"
-
-p.write_text(s)
-print("OK: nginx include patched:", p)
-PY
-
-echo
-echo "== 6) Ensure solana-web3 is served locally and loaded BEFORE app code =="
-mkdir -p "$VENDOR_DIR"
-
-if [ ! -s "$VENDOR_WEB3" ]; then
-  echo "-- downloading solana-web3 iife build to $VENDOR_WEB3 --"
-  curl -fsSL "https://unpkg.com/@solana/web3.js@1.95.4/lib/index.iife.min.js" -o "$VENDOR_WEB3"
-fi
-echo "-- vendor file size --"
-ls -lh "$VENDOR_WEB3" || true
-
-test -f "$UI_HTML" || { echo "ERROR: missing $UI_HTML"; exit 1; }
-cp -a "$UI_HTML" "${UI_HTML}.bak_${TS}"
-
-python3 - <<'PY'
-from pathlib import Path
-import re
-
-html_path=Path("/var/www/wolverine/index.html")
-s=html_path.read_text(errors="ignore")
-
-# Ensure vendor tag exists in <head> and BEFORE other scripts
-vendor_tag='<script src="/wolverine/vendor/solana-web3.min.js"></script>'
-if vendor_tag not in s:
-  # Insert right after <head ...> tag
-  s=re.sub(r'(<head[^>]*>)', r'\1'+vendor_tag, s, count=1, flags=re.IGNORECASE)
-
-# Guard for solanaWeb3 presence (non-fatal)
-guard = "if(!window.solanaWeb3){console.warn('solanaWeb3 missing: /wolverine/vendor/solana-web3.min.js not loaded');}"
-if guard not in s:
-  # put guard immediately after vendor tag
-  s=s.replace(vendor_tag, vendor_tag+f"<script>{guard}</script>")
-
-# Prefer same-origin RPC first + keep WSS for subscriptions if used
-# Patch common patterns if present
-s=s.replace("https://api.mainnet-beta.solana.com","/wolverine/
+      {status && <p className="text-sm text-gray-300">{status}</p>}
+    </div>
+  );
+}
