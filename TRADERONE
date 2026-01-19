@@ -1,17 +1,85 @@
 bash -lc 'set -euo pipefail
-INC="/etc/nginx/includes/wolverine_routes.inc"
+HOST="fireinners.online"
+NG="/etc/nginx/nginx.conf"
+VSSL="/etc/nginx/sites-available/fireinners.online-ssl"
+VHTTP="/etc/nginx/sites-available/fireinners.online"
+EN="/etc/nginx/sites-enabled"
+CERTROOT="/var/www/certbot"
 TS="$(date +%Y%m%d_%H%M%S)"
-cp -a "$INC" "${INC}.bak_${TS}" || true
-chattr -i "$INC" 2>/dev/null || true
+BK="/root/wolverine_backups/nginx_80_conflict_fix_${TS}"
+mkdir -p "$BK" "$CERTROOT" "$EN"
 
-# ajoute un redirect propre pour /wolverine/traderone/api -> /wolverine/traderone/api/
-if ! grep -q "location = /wolverine/traderone/api" "$INC"; then
-  perl -0777 -i -pe "s/# AUTO-GENERATED - Wolverine static \\+ TraderOne API proxy/# AUTO-GENERATED - Wolverine static + TraderOne API proxy\\nlocation = \\/wolverine\\/traderone\\/api { return 301 \\/wolverine\\/traderone\\/api\\/; }/s" "$INC" || true
+echo "== 0) Backup =="
+cp -a "$NG" "$BK/nginx.conf.bak" 2>/dev/null || true
+cp -a "$VSSL" "$BK/fireinners.online-ssl.bak" 2>/dev/null || true
+cp -a "$VHTTP" "$BK/fireinners.online.bak" 2>/dev/null || true
+ls -la "$EN" > "$BK/sites-enabled.ls" 2>/dev/null || true
+
+echo "== 1) Unlock immutables (best-effort) =="
+chattr -i "$NG" "$VSSL" "$VHTTP" 2>/dev/null || true
+
+echo "== 2) Ensure HTTP redirect vhost (80) with ACME passthrough =="
+cat > "$VHTTP" <<EOF
+server {
+  listen 80;
+  listen [::]:80;
+  server_name ${HOST};
+
+  location ^~ /.well-known/acme-challenge/ {
+    root ${CERTROOT};
+    default_type "text/plain";
+    try_files \$uri =404;
+  }
+
+  location / {
+    return 301 https://\$host\$request_uri;
+  }
+}
+EOF
+
+echo "== 3) Patch SSL vhost to remove any :80 listens (keep 443 only) =="
+if [ -f "$VSSL" ]; then
+python3 - <<PY
+import re, pathlib
+p=pathlib.Path("'"$VSSL"'")
+s=p.read_text(errors="ignore").splitlines(True)
+out=[]
+for line in s:
+    if re.match(r"^\\s*listen\\s+\\[::\\]:80\\b", line): 
+        continue
+    if re.match(r"^\\s*listen\\s+80\\b", line):
+        continue
+    out.append(line)
+p.write_text("".join(out))
+print("OK: removed listen 80 lines from", p)
+PY
+else
+  echo "WARN: missing $VSSL (skipping patch)"
 fi
 
-nginx -t
+echo "== 4) Enable vhosts (symlinks) =="
+ln -sf "$VHTTP" "$EN/fireinners.online"
+if [ -f "$VSSL" ]; then
+  ln -sf "$VSSL" "$EN/fireinners.online-ssl"
+fi
+
+echo "== 5) Test + reload nginx =="
+nginx -t 2>&1 | tee "$BK/nginx_t.txt"
 systemctl reload nginx || systemctl restart nginx
 
-echo \"== TEST public api ==\"
-curl -sS -i https://fireinners.online/wolverine/traderone/api/health | head -n 20 || true
-echo DONE'
+echo "== 6) Verify warning is gone (nginx -t output already captured) =="
+if grep -q "conflicting server name" "$BK/nginx_t.txt"; then
+  echo "STILL CONFLICTING. Dump candidates:"
+  nginx -T 2>/dev/null | grep -nE "server_name\\s+.*${HOST}|listen\\s+80" | head -n 200 || true
+else
+  echo "OK: no conflicting server name in nginx -t."
+fi
+
+echo "== 7) Quick HTTP/HTTPS checks =="
+curl -sS -I "http://${HOST}/" | head -n 10 || true
+curl -sS -I "https://${HOST}/wolverine/" | head -n 10 || true
+
+echo "== 8) Re-lock immutables (per your rule) =="
+chattr +i "$NG" "$VSSL" 2>/dev/null || true
+
+echo "DONE. Backup: $BK"'
