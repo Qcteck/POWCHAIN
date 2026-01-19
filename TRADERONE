@@ -1,107 +1,107 @@
-cat >/root/MEGA_WOLVERINE_RPC_PORT_FIX.sh <<'BASH'
+cat >/root/MEGA_WOLVERINE_FIX_SOLANAWEB3.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 TS="$(date +%Y%m%d_%H%M%S)"
-LOG="/root/MEGA_WOLVERINE_RPC_PORT_FIX_${TS}.log"
+LOG="/root/MEGA_WOLVERINE_FIX_SOLANAWEB3_${TS}.log"
 exec > >(tee -a "$LOG") 2>&1
 
-HOST="fireinners.online"
-INC="/etc/nginx/includes/wolverine_routes.inc"
+say(){ echo; echo "================================================================"; echo "$*"; echo "================================================================"; }
 
-# On garde le même endpoint DRPC fourni (mais on ne retouche PAS aux secrets)
-DRPC_HTTP="https://lb.drpc.live/solana/AsxThpeKkEjGtZhCNUEQYo1ZluSgmwsR76RdFhW5UfFk"
+HTML="/var/www/wolverine/index.html"
+VENDOR="/var/www/wolverine/vendor"
+WEB3_MIN="${VENDOR}/solana-web3.min.js"
+WEB3_URL="https://unpkg.com/@solana/web3.js@1.95.4/lib/index.iife.min.js"
 
-say(){ echo -e "\n== $* =="; }
-
-say "0) Detect who owns 12703"
-ss -lntp | grep ':12703 ' || true
-PID="$(ss -lntp 2>/dev/null | awk '/:12703[[:space:]]/ && /users:/{ if (match($0,/pid=([0-9]+)/,m)) {print m[1]; exit}}')"
-echo "PID12703=${PID:-none}"
-
-if [ -n "${PID:-}" ]; then
-  say "1) If 12703 is our proxy, keep it; else move to 12704"
-  EXE="$(readlink -f "/proc/$PID/exe" 2>/dev/null || true)"
-  CWD="$(readlink -f "/proc/$PID/cwd" 2>/dev/null || true)"
-  CMD="$(tr '\0' ' ' <"/proc/$PID/cmdline" 2>/dev/null || true)"
-  echo "EXE=$EXE"
-  echo "CWD=$CWD"
-  echo "CMD=$CMD"
-
-  if echo "$CMD $CWD" | grep -q 'solrpc-proxy-wolverine'; then
-    say "Port 12703 already used by solrpc-proxy-wolverine. Ensure service is healthy and exit."
-    systemctl --no-pager -l status wolverine-solrpc-proxy.service || true
-    curl -sS -m 10 -H 'content-type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' "http://127.0.0.1:12703" | head -c 200; echo
-    echo "DONE (kept 12703). LOG=$LOG"
-    exit 0
-  fi
+say "0) Savepoint (if present)"
+if [[ -x /root/WOLVERINE_SAVEPOINT.sh ]]; then
+  /root/WOLVERINE_SAVEPOINT.sh || true
+else
+  echo "No /root/WOLVERINE_SAVEPOINT.sh (skip)"
 fi
 
-# Sinon: 12703 est pris par autre chose -> on bascule proprement sur 12704
-NEWPORT="12704"
-RPC_DIR="/opt/fireinners/solrpc-proxy-wolverine"
-RPC_JS="${RPC_DIR}/server.js"
-RPC_SVC="/etc/systemd/system/wolverine-solrpc-proxy.service"
+say "1) Preconditions"
+test -f "$HTML" || { echo "MISSING: $HTML"; exit 1; }
+mkdir -p "$VENDOR"
+echo "HTML: $HTML"
+echo "VENDOR: $VENDOR"
 
-say "2) Switch proxy to port ${NEWPORT} (systemd + nginx include) and restart"
-test -f "$RPC_JS" || { echo "ERROR: missing $RPC_JS"; exit 1; }
+say "2) Ensure solana-web3 is present locally (window.solanaWeb3)"
+if [[ -s "$WEB3_MIN" ]]; then
+  echo "OK: already present -> $WEB3_MIN ($(wc -c <"$WEB3_MIN") bytes)"
+else
+  echo "Downloading: $WEB3_URL -> $WEB3_MIN"
+  curl -fsSL "$WEB3_URL" -o "$WEB3_MIN"
+  test -s "$WEB3_MIN" || { echo "Download failed: $WEB3_MIN"; exit 1; }
+  echo "OK: downloaded -> $WEB3_MIN ($(wc -c <"$WEB3_MIN") bytes)"
+fi
 
-mkdir -p /root/wolverine_backups
-cp -a "$RPC_SVC" "/root/wolverine_backups/wolverine-solrpc-proxy.service.bak_${TS}" 2>/dev/null || true
-cp -a "$INC" "/root/wolverine_backups/wolverine_routes.inc.bak_${TS}"
+say "3) Backup current index.html"
+BKDIR="/root/wolverine_backups"
+mkdir -p "$BKDIR"
+cp -a "$HTML" "$BKDIR/index.html.bak_${TS}"
+echo "Backup: $BKDIR/index.html.bak_${TS}"
 
-cat >"$RPC_SVC" <<EOF
-[Unit]
-Description=Wolverine Solana RPC Proxy (DRPC passthrough)
-After=network.target
-
-[Service]
-Type=simple
-User=root
-WorkingDirectory=${RPC_DIR}
-Environment=LISTEN_HOST=127.0.0.1
-Environment=LISTEN_PORT=${NEWPORT}
-Environment=DRPC_HTTP=${DRPC_HTTP}
-ExecStart=/usr/bin/node ${RPC_JS}
-Restart=always
-RestartSec=1
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-# Replace any existing /wolverine/solana-rpc proxy_pass to 12703 -> NEWPORT; else append
+say "4) Patch index.html to load /wolverine/vendor/solana-web3.min.js BEFORE any app script"
 python3 - <<'PY'
 from pathlib import Path
-import re
-p=Path("/etc/nginx/includes/wolverine_routes.inc")
+p=Path("/var/www/wolverine/index.html")
 s=p.read_text(errors="ignore")
-orig=s
-# if location exists, patch port
-s=re.sub(r'(location\s+/wolverine/solana-rpc\s*\{[^}]*proxy_pass\s+http://127\.0\.0\.1:)(\d+)(;)',
-         lambda m: m.group(1)+"12704"+m.group(3), s, flags=re.S)
-if s==orig and "location /wolverine/solana-rpc" not in s:
-    s += "\n  location /wolverine/solana-rpc { proxy_pass http://127.0.0.1:12704; proxy_http_version 1.1; proxy_set_header Host $host; add_header Cache-Control \"no-store\" always; }\n"
+
+tag='<script src="/wolverine/vendor/solana-web3.min.js"></script>'
+
+# Remove any wrong/duplicate solana web3 tags (best-effort)
+import re
+s=re.sub(r'<script[^>]+solana[^>]*web3[^>]*></script>\s*','',s,flags=re.I)
+
+# Insert into <head> as the FIRST script (or create head if missing)
+if "<head" in s.lower():
+    # inject right after <head...>
+    def repl(m):
+        return m.group(0) + tag
+    s=re.sub(r'(<head[^>]*>)', repl, s, count=1, flags=re.I)
+else:
+    # extremely defensive: wrap minimal head
+    s='<!doctype html><html><head>'+tag+'</head><body>'+s+'</body></html>'
+
+# Hard guard: if page uses solanaWeb3 but it isn't loaded, show explicit log
+guard = r"""
+<script>
+(function(){
+  try{
+    if(!window.solanaWeb3){ console.warn("solanaWeb3 missing: /wolverine/vendor/solana-web3.min.js not loaded"); }
+  }catch(e){}
+})();
+</script>
+""".strip()
+
+# Put guard immediately after web3 tag (once)
+if guard not in s:
+    s=s.replace(tag, tag+guard, 1)
+
 p.write_text(s)
-print("OK: nginx include updated")
+print("OK: index.html patched (web3 tag inserted + guard)")
 PY
 
-systemctl daemon-reload
-systemctl restart wolverine-solrpc-proxy.service
-systemctl --no-pager -l status wolverine-solrpc-proxy.service | sed -n '1,22p'
+say "5) Quick static checks"
+echo "--- grep solana-web3 in index.html ---"
+grep -n "solana-web3.min.js" "$HTML" || true
+echo "--- verify vendor file header ---"
+head -n 3 "$WEB3_MIN" || true
 
-say "3) nginx test + reload"
+say "6) Nginx quick test + reload (no config edits)"
 nginx -t
-systemctl reload nginx
+systemctl reload nginx || systemctl reload nginx.service || true
 
-say "4) Tests"
-echo "-- Local proxy health --"
-curl -sS -m 10 -H 'content-type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' "http://127.0.0.1:${NEWPORT}" | head -c 200; echo
-echo "-- Public proxy health (same-origin) --"
-curl -sS -m 15 -H 'content-type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' "https://${HOST}/wolverine/solana-rpc" | head -c 200; echo
+say "7) Live HTTP checks (origin paths)"
+echo "--- /wolverine/vendor/solana-web3.min.js (HTTP head) ---"
+curl -sS -I "https://fireinners.online/wolverine/vendor/solana-web3.min.js" | sed -n '1,12p' || true
+echo "--- /wolverine/ (HTTP head) ---"
+curl -sS -I "https://fireinners.online/wolverine/" | sed -n '1,12p' || true
 
 say "DONE"
-echo "LOG=$LOG"
-echo "OPEN=https://${HOST}/wolverine/"
+echo "LOG: $LOG"
+echo "Backup: $BKDIR/index.html.bak_${TS}"
+echo "Open: https://fireinners.online/wolverine/  (Ctrl+F5 hard refresh)"
 BASH
 
-bash /root/MEGA_WOLVERINE_RPC_PORT_FIX.sh
+bash /root/MEGA_WOLVERINE_FIX_SOLANAWEB3.sh
