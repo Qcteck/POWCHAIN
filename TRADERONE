@@ -1,129 +1,169 @@
-cat >/root/MEGA_WOLVERINE_AQUILA_SOL.sh <<'BASH'
+bash -lc 'cat > /root/MEGA_WOLVERINE_FIX_AQUILA_RPC.sh <<'"'"'BASH'"'"'
 #!/usr/bin/env bash
 set -euo pipefail
-export DEBIAN_FRONTEND=noninteractive
+
 TS="$(date +%Y%m%d_%H%M%S)"
 
+# === FIX TARGETS (paths mémorisés) ===
 HTML="/var/www/wolverine/index.html"
-VENDOR_DIR="/var/www/wolverine/vendor"
-VENDOR_WEB3="${VENDOR_DIR}/solana-web3.min.js"
+WEBROOT="/var/www/wolverine"
+VENDOR_DIR="$WEBROOT/vendor"
+VENDOR_WEB3="$VENDOR_DIR/solana-web3.min.js"
 
-NGINX_VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
+NGINX_SITE="/etc/nginx/sites-available/fireinners.online-ssl"
 NGINX_INC="/etc/nginx/includes/wolverine_routes.inc"
 
 SOLRPC_DIR="/opt/fireinners/solrpc-proxy-wolverine"
-VAULT_DIR="/opt/fireinners/vault-api-wolverine"
+SOLRPC_JS="$SOLRPC_DIR/server.js"
+SOLRPC_SERVICE="/etc/systemd/system/wolverine-solrpc-proxy.service"
+SOLRPC_HOST="127.0.0.1"
 SOLRPC_PORT="12713"
-VAULT_PORT="13010"
 
-# DRPC Solana (canon)
-DRPC_SOLANA="https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac"
-# Fallback public (souvent 403 côté navigateur, mais ok côté serveur)
-PUB_SOLANA="https://api.mainnet-beta.solana.com"
+# Upstream RPC Solana (DRPC user préféré)
+SOLANA_UPSTREAM_PRIMARY="https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac"
+SOLANA_UPSTREAM_FALLBACK="https://api.mainnet-beta.solana.com"
 
-log(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
-need(){ command -v "$1" >/dev/null 2>&1 || { echo "Missing $1"; exit 1; }; }
+log(){ echo "[$(date +%H:%M:%S)] $*"; }
 
-log "== Preflight =="
-need awk; need grep; need sed; need ss; need systemctl; need nginx; need curl; need python3; need node
-test -f "$HTML" || { echo "Missing $HTML"; exit 1; }
+log "== 0) Preflight =="
+id -u | grep -q '^0$' || { echo "ERROR: run as root"; exit 1; }
+command -v nginx >/dev/null || { echo "ERROR: nginx missing"; exit 1; }
+command -v python3 >/dev/null || { echo "ERROR: python3 missing"; exit 1; }
+command -v node >/dev/null || { echo "ERROR: node missing (do NOT apt install npm/node; use your existing NodeSource/corepack setup)"; exit 1; }
+test -f "$HTML" || { echo "ERROR: missing $HTML"; exit 1; }
 
 log "== Savepoint (if present) =="
 if [ -x /root/WOLVERINE_SAVEPOINT.sh ]; then /root/WOLVERINE_SAVEPOINT.sh || true; fi
 
-log "== Backups =="
+log "== 1) Backups =="
 mkdir -p /root/wolverine_backups
-cp -a "$HTML" "/root/wolverine_backups/index.html.bak_${TS}"
-[ -f "$NGINX_INC" ] && cp -a "$NGINX_INC" "/root/wolverine_backups/wolverine_routes.inc.bak_${TS}" || true
-[ -f "$NGINX_VHOST" ] && cp -a "$NGINX_VHOST" "/root/wolverine_backups/fireinners.online-ssl.bak_${TS}" || true
+cp -a "$HTML" "/root/wolverine_backups/index.html.bak_$TS"
+if [ -f "$NGINX_INC" ]; then cp -a "$NGINX_INC" "/root/wolverine_backups/wolverine_routes.inc.bak_$TS"; fi
+cp -a "$NGINX_SITE" "/root/wolverine_backups/fireinners.online-ssl.bak_$TS" || true
 
-log "== Unfreeze nginx files if immutable (best effort) =="
-chattr -i /etc/nginx/nginx.conf "$NGINX_VHOST" "$NGINX_INC" 2>/dev/null || true
-
-log "== Ensure local vendor solana-web3.js =="
+log "== 2) Ensure local vendor solana-web3 exists =="
 mkdir -p "$VENDOR_DIR"
 if [ ! -s "$VENDOR_WEB3" ]; then
   curl -fsSL "https://unpkg.com/@solana/web3.js@1.95.4/lib/index.iife.min.js" -o "$VENDOR_WEB3"
   chmod 0644 "$VENDOR_WEB3"
 fi
 
-log "== Install/Update Solana RPC proxy (systemd, 127.0.0.1:${SOLRPC_PORT}) =="
+log "== 3) Install/Update Solana RPC proxy (systemd) =="
 mkdir -p "$SOLRPC_DIR"
-cat >"${SOLRPC_DIR}/server.js" <<'JS'
+
+cat > "$SOLRPC_JS" <<'JS'
 "use strict";
 const http = require("http");
+const https = require("https");
 const { URL } = require("url");
 
-const PORT = parseInt(process.env.PORT || "12713", 10);
-const UPSTREAM = process.env.UPSTREAM || "https://api.mainnet-beta.solana.com";
-const TIMEOUT_MS = parseInt(process.env.TIMEOUT_MS || "15000", 10);
+const LISTEN_HOST = process.env.LISTEN_HOST || "127.0.0.1";
+const LISTEN_PORT = parseInt(process.env.LISTEN_PORT || "12713", 10);
+const UPSTREAM_PRIMARY = process.env.UPSTREAM_PRIMARY || "";
+const UPSTREAM_FALLBACK = process.env.UPSTREAM_FALLBACK || "https://api.mainnet-beta.solana.com";
 
-function send(res, code, obj, headers){
+function pickUpstream() {
+  const u = (UPSTREAM_PRIMARY && /^https?:\/\//i.test(UPSTREAM_PRIMARY)) ? UPSTREAM_PRIMARY : UPSTREAM_FALLBACK;
+  return u;
+}
+
+function sendJSON(res, code, obj) {
   const body = Buffer.from(JSON.stringify(obj));
-  res.writeHead(code, Object.assign({
-    "content-type":"application/json; charset=utf-8",
-    "cache-control":"no-store",
-    "access-control-allow-origin":"*",
-    "access-control-allow-methods":"GET,POST,OPTIONS",
-    "access-control-allow-headers":"content-type,authorization",
-  }, headers||{}));
+  res.writeHead(code, {
+    "content-type": "application/json",
+    "content-length": String(body.length),
+    "access-control-allow-origin": "*",
+    "access-control-allow-methods": "POST,GET,OPTIONS",
+    "access-control-allow-headers": "content-type,authorization",
+    "cache-control": "no-store",
+  });
   res.end(body);
 }
 
-function readBody(req){
-  return new Promise((resolve,reject)=>{
-    const chunks=[];
-    req.on("data",c=>chunks.push(c));
-    req.on("end",()=>resolve(Buffer.concat(chunks)));
-    req.on("error",reject);
+function proxyJSON(req, res, rawBody) {
+  const upstream = pickUpstream();
+  let u;
+  try { u = new URL(upstream); }
+  catch (e) { return sendJSON(res, 500, { status:"error", error:"bad upstream url", upstream }); }
+
+  const isHttps = (u.protocol === "https:");
+  const lib = isHttps ? https : http;
+
+  const opts = {
+    method: "POST",
+    hostname: u.hostname,
+    port: u.port || (isHttps ? 443 : 80),
+    path: (u.pathname && u.pathname !== "/") ? u.pathname : "/",
+    headers: {
+      "content-type": "application/json",
+      "content-length": String(rawBody.length),
+      "accept": "application/json",
+      "user-agent": "wolverine-solrpc-proxy",
+    },
+  };
+
+  const upReq = lib.request(opts, (upRes) => {
+    const chunks = [];
+    upRes.on("data", (d) => chunks.push(d));
+    upRes.on("end", () => {
+      const buf = Buffer.concat(chunks);
+      // pass-through status but normalize headers for browser
+      res.writeHead(upRes.statusCode || 502, {
+        "content-type": (upRes.headers["content-type"] || "application/json"),
+        "access-control-allow-origin": "*",
+        "access-control-allow-methods": "POST,GET,OPTIONS",
+        "access-control-allow-headers": "content-type,authorization",
+        "cache-control": "no-store",
+      });
+      res.end(buf);
+    });
   });
+
+  upReq.on("error", (e) => {
+    sendJSON(res, 502, { status:"error", error:String(e && e.message ? e.message : e), upstream });
+  });
+
+  upReq.write(rawBody);
+  upReq.end();
 }
 
-async function forwardJsonRpc(bodyBuf){
-  const ctrl = new AbortController();
-  const t = setTimeout(()=>ctrl.abort(), TIMEOUT_MS);
-  try{
-    const r = await fetch(UPSTREAM, {
-      method:"POST",
-      headers:{ "content-type":"application/json" },
-      body: bodyBuf,
-      signal: ctrl.signal
+const server = http.createServer((req, res) => {
+  // CORS preflight
+  if (req.method === "OPTIONS") {
+    res.writeHead(204, {
+      "access-control-allow-origin": "*",
+      "access-control-allow-methods": "POST,GET,OPTIONS",
+      "access-control-allow-headers": "content-type,authorization",
+      "cache-control": "no-store",
     });
-    const txt = await r.text();
-    return { status:r.status, text:txt, headers:Object.fromEntries(r.headers.entries()) };
-  } finally {
-    clearTimeout(t);
+    return res.end();
   }
-}
 
-const srv = http.createServer(async (req,res)=>{
-  try{
-    if (req.method === "OPTIONS") return send(res, 200, {ok:true});
-    if (req.method === "GET") {
-      if ((req.url||"").includes("health")) return send(res, 200, {status:"ok", service:"wolverine-solrpc-proxy", upstream:UPSTREAM});
-      return send(res, 200, {status:"ok", service:"wolverine-solrpc-proxy", upstream:UPSTREAM});
-    }
-    if (req.method !== "POST") return send(res, 405, {error:"Method Not Allowed"});
-    const body = await readBody(req);
-    const out = await forwardJsonRpc(body);
-    // passe-through: renvoyer tel quel, mais forcer content-type JSON
-    res.writeHead(out.status, {
-      "content-type":"application/json; charset=utf-8",
-      "cache-control":"no-store",
-      "access-control-allow-origin":"*",
-      "access-control-allow-methods":"GET,POST,OPTIONS",
-      "access-control-allow-headers":"content-type,authorization",
-    });
-    res.end(out.text);
-  } catch(e){
-    send(res, 502, {error:"Bad Gateway", message: (e && e.message) ? e.message : String(e)});
+  if (req.method === "GET" && (req.url === "/health" || req.url === "/")) {
+    return sendJSON(res, 200, { status:"ok", service:"wolverine-solrpc-proxy", upstream: pickUpstream() });
   }
+
+  if (req.method !== "POST") {
+    return sendJSON(res, 405, { status:"error", error:"POST only", hint:"Use POST JSON-RPC to this endpoint." });
+  }
+
+  const chunks = [];
+  req.on("data", (d) => chunks.push(d));
+  req.on("end", () => {
+    const rawBody = Buffer.concat(chunks);
+    // If empty, fail fast (avoids nginx HTML -> JSON confusion)
+    if (!rawBody.length) return sendJSON(res, 400, { status:"error", error:"empty body" });
+    proxyJSON(req, res, rawBody);
+  });
 });
 
-srv.listen(PORT, "127.0.0.1", ()=>{ /* ready */ });
+server.listen(LISTEN_PORT, LISTEN_HOST, () => {
+  // eslint-disable-next-line no-console
+  console.log(`wolverine-solrpc-proxy listening on http://${LISTEN_HOST}:${LISTEN_PORT} -> ${pickUpstream()}`);
+});
 JS
 
-cat >"/etc/systemd/system/wolverine-solrpc-proxy.service" <<EOF
+cat > "$SOLRPC_SERVICE" <<EOF
 [Unit]
 Description=Wolverine Solana RPC Proxy (DRPC passthrough)
 After=network-online.target
@@ -131,15 +171,14 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=root
-WorkingDirectory=${SOLRPC_DIR}
-Environment=PORT=${SOLRPC_PORT}
-Environment=UPSTREAM=${DRPC_SOLANA}
-Environment=TIMEOUT_MS=15000
-ExecStart=/usr/bin/node ${SOLRPC_DIR}/server.js
+Environment=LISTEN_HOST=$SOLRPC_HOST
+Environment=LISTEN_PORT=$SOLRPC_PORT
+Environment=UPSTREAM_PRIMARY=$SOLANA_UPSTREAM_PRIMARY
+Environment=UPSTREAM_FALLBACK=$SOLANA_UPSTREAM_FALLBACK
+ExecStart=/usr/bin/node $SOLRPC_JS
 Restart=always
 RestartSec=1
-KillSignal=SIGINT
+WorkingDirectory=$SOLRPC_DIR
 
 [Install]
 WantedBy=multi-user.target
@@ -147,375 +186,143 @@ EOF
 
 systemctl daemon-reload
 systemctl enable --now wolverine-solrpc-proxy.service
-systemctl restart wolverine-solrpc-proxy.service
 
-log "== Install/Update Vault API (systemd, 127.0.0.1:${VAULT_PORT}) =="
-mkdir -p "$VAULT_DIR" "${VAULT_DIR}/data"
-if [ ! -f "${VAULT_DIR}/package.json" ]; then
-  (cd "$VAULT_DIR" && npm init -y >/dev/null 2>&1) || true
-fi
-(cd "$VAULT_DIR" && npm install --silent tweetnacl bs58 >/dev/null 2>&1) || true
+log "== 4) Unfreeze nginx files (if immutable) =="
+chattr -i "$NGINX_SITE" 2>/dev/null || true
+chattr -i "$NGINX_INC" 2>/dev/null || true
+chattr -i /etc/nginx/nginx.conf 2>/dev/null || true
 
-cat >"${VAULT_DIR}/server.js" <<'JS'
-"use strict";
-const http = require("http");
-const fs = require("fs");
-const path = require("path");
-const nacl = require("tweetnacl");
-const bs58 = require("bs58").default || require("bs58");
-
-const PORT = parseInt(process.env.PORT || "13010", 10);
-const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
-const DB_FILE = path.join(DATA_DIR, "vaults.json");
-
-function now(){ return new Date().toISOString(); }
-
-function readBody(req){
-  return new Promise((resolve,reject)=>{
-    const chunks=[];
-    req.on("data",c=>chunks.push(c));
-    req.on("end",()=>resolve(Buffer.concat(chunks)));
-    req.on("error",reject);
-  });
-}
-
-function send(res, code, obj){
-  const body = Buffer.from(JSON.stringify(obj));
-  res.writeHead(code, {
-    "content-type":"application/json; charset=utf-8",
-    "cache-control":"no-store",
-    "access-control-allow-origin":"*",
-    "access-control-allow-methods":"GET,POST,OPTIONS",
-    "access-control-allow-headers":"content-type,authorization",
-  });
-  res.end(body);
-}
-
-function loadDB(){
-  try{
-    const s = fs.readFileSync(DB_FILE, "utf8");
-    const j = JSON.parse(s);
-    if (j && typeof j === "object") return j;
-  }catch(_){}
-  return { createdAt: now(), vaults: [] };
-}
-
-function saveDB(db){
-  fs.mkdirSync(DATA_DIR, { recursive:true });
-  fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2), { mode:0o600 });
-  try{ fs.chmodSync(DB_FILE, 0o600); }catch(_){}
-}
-
-function genVault(){
-  const kp = nacl.sign.keyPair();
-  // Solana: pubkey base58 = 32 bytes
-  const pub = bs58.encode(Buffer.from(kp.publicKey));
-  const secret = bs58.encode(Buffer.from(kp.secretKey));
-  return { pub, secret };
-}
-
-const srv = http.createServer(async (req,res)=>{
-  try{
-    if (req.method === "OPTIONS") return send(res, 200, {ok:true});
-    if (req.method === "GET"){
-      if ((req.url||"").startsWith("/health")) return send(res, 200, {status:"ok", service:"wolverine-vault-api"});
-      return send(res, 200, {status:"ok", service:"wolverine-vault-api"});
-    }
-
-    if (req.method !== "POST") return send(res, 405, {error:"Method Not Allowed"});
-    const url = req.url || "/";
-    const bodyBuf = await readBody(req);
-    let body = {};
-    try{ body = JSON.parse(bodyBuf.toString("utf8") || "{}"); }catch(_){ body = {}; }
-
-    if (url.startsWith("/v1/vault/create")){
-      const userPubkey = String(body.userPubkey || "").trim();
-      if (!userPubkey) return send(res, 400, {error:"Missing userPubkey"});
-
-      const db = loadDB();
-      const v = genVault();
-      const rec = { id: String(Date.now()), createdAt: now(), userPubkey, vaultPubkey: v.pub, vaultSecretKey: v.secret };
-      db.vaults.push(rec);
-      saveDB(db);
-      return send(res, 200, {status:"ok", vaultPubkey: v.pub});
-    }
-
-    return send(res, 404, {error:"Not Found"});
-  } catch(e){
-    return send(res, 500, {error:"Server Error", message:(e && e.message)?e.message:String(e)});
-  }
-});
-
-srv.listen(PORT, "127.0.0.1", ()=>{ /* ready */ });
-JS
-
-cat >"/etc/systemd/system/wolverine-vault-api.service" <<EOF
-[Unit]
-Description=Wolverine Vault API (create vault keypairs)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=root
-WorkingDirectory=${VAULT_DIR}
-Environment=PORT=${VAULT_PORT}
-Environment=DATA_DIR=${VAULT_DIR}/data
-ExecStart=/usr/bin/node ${VAULT_DIR}/server.js
-Restart=always
-RestartSec=1
-KillSignal=SIGINT
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl daemon-reload
-systemctl enable --now wolverine-vault-api.service
-systemctl restart wolverine-vault-api.service
-
-log "== Patch nginx include: canonical /wolverine/solana-rpc + /wolverine/vault/api (dedupe) =="
-mkdir -p "$(dirname "$NGINX_INC")"
-touch "$NGINX_INC"
-
+log "== 5) Ensure nginx includes wolverine_routes.inc in vhost =="
 python3 - <<PY
 from pathlib import Path
-import re
-
-inc = Path("${NGINX_INC}")
-s = inc.read_text(errors="ignore")
-
-def strip_location_blocks(txt, needle):
-  # retire tout bloc "location ... { ... }" contenant needle
-  out = []
-  i = 0
-  while i < len(txt):
-    m = re.search(r'\n\s*location\s+[^\\n{]*\{', txt[i:])
-    if not m:
-      out.append(txt[i:])
-      break
-    start = i + m.start()
-    out.append(txt[i:start])
-    # trouver fin du bloc via comptage accolades
-    j = start
-    brace = 0
-    while j < len(txt):
-      if txt[j] == '{': brace += 1
-      elif txt[j] == '}':
-        brace -= 1
-        if brace == 0:
-          j += 1
-          break
-      j += 1
-    block = txt[start:j]
-    if needle in block:
-      i = j  # skip
-    else:
-      out.append(block)
-      i = j
-  return ''.join(out)
-
-for needle in ["/wolverine/solana-rpc", "/wolverine/vault/api"]:
-  s = strip_location_blocks(s, needle)
-
-# Ajoute blocs canoniques
-append = f"""
-# --- WOLVERINE canonical proxies (AQUILA) ---
-location ^~ /wolverine/solana-rpc {{
-  proxy_pass http://127.0.0.1:{${"SOLRPC_PORT"}};
-  proxy_http_version 1.1;
-  proxy_set_header Host $host;
-  proxy_set_header X-Real-IP $remote_addr;
-  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto $scheme;
-}}
-
-location ^~ /wolverine/vault/api {{
-  proxy_pass http://127.0.0.1:{${"VAULT_PORT"}};
-  proxy_http_version 1.1;
-  proxy_set_header Host $host;
-  proxy_set_header X-Real-IP $remote_addr;
-  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto $scheme;
-}}
-"""
-# Python f-string above is literal-ish; fix ports:
-append = append.replace("{${\"SOLRPC_PORT\"}}", "${SOLRPC_PORT}").replace("{${\"VAULT_PORT\"}}", "${VAULT_PORT}")
-
-if "WOLVERINE canonical proxies (AQUILA)" not in s:
-  s = s.rstrip() + "\n" + append + "\n"
-else:
-  # si marker existe, on append quand même (safe) après suppression des anciens blocs
-  s = s.rstrip() + "\n" + append + "\n"
-
-inc.write_text(s)
-print("OK: nginx include patched")
+p=Path("$NGINX_SITE")
+s=p.read_text(errors="ignore")
+inc='include /etc/nginx/includes/wolverine_routes.inc;'
+if inc not in s:
+  # try to insert near other includes inside the ssl server block
+  if "server {" in s:
+    parts=s.split("server {",1)
+    head,rest=parts[0], "server {"+parts[1]
+    # insert after first occurrence of "root" or after "server {" line
+    lines=rest.splitlines(True)
+    out=[]
+    inserted=False
+    for i,line in enumerate(lines):
+      out.append(line)
+      if (not inserted) and ("root " in line or "index " in line):
+        out.append("    "+inc+"\n")
+        inserted=True
+    if not inserted:
+      # fallback: right after server {
+      out = ["server {\n","    "+inc+"\n"] + lines[1:]
+    s=head+"".join(out)
+  p.write_text(s)
+print("OK: vhost include present")
 PY
 
-log "== Patch index.html: ensure vendor web3 + fix RPC absolute + inject AQUILA UI =="
+log "== 6) Write CANONICAL nginx routes (dedupe + correct solana-rpc + vault api) =="
+mkdir -p "$(dirname "$NGINX_INC")"
+cat > "$NGINX_INC" <<'NGX'
+# === WOLVERINE ROUTES (CANONICAL) ===
+# Static UI is served from /var/www/wolverine by the main vhost root.
+# These are ONLY the proxy routes.
+
+# Solana JSON-RPC proxy (AQUILA uses this for SOL/USDC balances)
+location ^~ /wolverine/solana-rpc {
+    proxy_pass http://127.0.0.1:12713;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+
+    # CORS
+    add_header Access-Control-Allow-Origin "*" always;
+    add_header Access-Control-Allow-Methods "POST, GET, OPTIONS" always;
+    add_header Access-Control-Allow-Headers "content-type, authorization" always;
+
+    if ($request_method = OPTIONS) { return 204; }
+}
+
+# Vault API (server-side) used by "Créer Vault + Déposer"
+location ^~ /wolverine/vault/api {
+    proxy_pass http://127.0.0.1:3010;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+
+    add_header Access-Control-Allow-Origin "*" always;
+    add_header Access-Control-Allow-Methods "POST, GET, OPTIONS" always;
+    add_header Access-Control-Allow-Headers "content-type, authorization" always;
+
+    if ($request_method = OPTIONS) { return 204; }
+}
+NGX
+
+log "== 7) Patch index.html (AQUILA visible + remove bad script + absolute RPC URL) =="
 python3 - <<'PY'
 from pathlib import Path
-import re
+p=Path("/var/www/wolverine/index.html")
+s=p.read_text(errors="ignore")
 
-p = Path("/var/www/wolverine/index.html")
-s = p.read_text(errors="ignore")
+# 7.1 Remove any accidental script tag pointing to /wolverine/solana-rpc (that causes MIME text/html errors)
+s = s.replace('<script src="/wolverine/solana-rpc"></script>', '')
+s = s.replace('<script src="/wolverine/solana-rpc"></script>\n', '')
 
-# 1) s'assurer vendor web3
-if "/wolverine/vendor/solana-web3.min.js" not in s:
-  # inject dans <head>
-  s = re.sub(r'(<head[^>]*>)', r'\1<script src="/wolverine/vendor/solana-web3.min.js"></script>', s, flags=re.I, count=1)
-
-# 2) enlever tout <script src="/wolverine/solana-rpc"...> (MIME error)
-s = re.sub(r'<script[^>]+src=["\']/wolverine/solana-rpc[^"\']*["\'][^>]*>\s*</script>\s*', '', s, flags=re.I)
-
-# 3) rendre l'endpoint ABSOLU (fix "Endpoint URL must start with http")
-s = s.replace('"/wolverine/solana-rpc"', '(location.origin+"/wolverine/solana-rpc")')
-s = s.replace("'/wolverine/solana-rpc'", '(location.origin+"/wolverine/solana-rpc")')
-
-# 4) inject AQUILA panel + logique
-marker = "/*__AQUILA_SOL_VAULT__*/"
-if marker not in s:
-  inject = r'''
-<script>/*__AQUILA_SOL_VAULT__*/(()=>{try{
-  const W=window;
-  const $=(q)=>document.querySelector(q);
-  const el=(tag,cls,html)=>{const e=document.createElement(tag);if(cls)e.className=cls;if(html!=null)e.innerHTML=html;return e;};
-
-  const mustWeb3=()=>{if(!W.solanaWeb3) throw new Error("solanaWeb3 not defined"); return W.solanaWeb3;};
-  const rpcAbs=()=>location.origin+"/wolverine/solana-rpc";
-  const vaultApi=()=>location.origin+"/wolverine/vault/api/v1/vault/create";
-
-  const mount=()=>{
-    // cible: sous la box Wallet si possible
-    const walletBox = document.querySelector('[data-wallet-box]') || document.querySelector('.wallet') || document.querySelector('main') || document.body;
-    const wrap=el('div','aquilaWrap','');
-    wrap.style.cssText="margin-top:10px;padding:10px;border:1px solid #ddd;border-radius:8px;max-width:520px;";
-    wrap.appendChild(el('div','aquilaTitle','<b>Aquila</b> — Vault SOL'));
-    const row=el('div','aquilaRow','');
-    row.style.cssText="display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap;";
-    const lab=el('div','aquilaLab','Budget (SOL)');
-    lab.style.cssText="min-width:90px;";
-    const inp=el('input','aquilaBudget','');
-    inp.type="text"; inp.value="0.10"; inp.inputMode="decimal";
-    inp.style.cssText="width:120px;padding:6px 8px;border:1px solid #ccc;border-radius:6px;";
-    inp.id="aquilaBudgetSol";
-    const btn=el('button','aquilaBtn','Créer Vault + Déposer');
-    btn.style.cssText="padding:8px 10px;border:0;border-radius:6px;background:#16a34a;color:#fff;cursor:pointer;";
-    btn.id="aquilaCreateDeposit";
-    const st=el('div','aquilaStatus','');
-    st.style.cssText="margin-top:8px;font-size:12px;opacity:.85;white-space:pre-wrap;";
-    st.id="aquilaStatus";
-
-    row.appendChild(lab); row.appendChild(inp); row.appendChild(btn);
-    wrap.appendChild(row); wrap.appendChild(st);
-    walletBox.appendChild(wrap);
-
-    const status=(t)=>{st.textContent=t||"";};
-
-    const getPhantom=()=>{
-      const sol = W.solana;
-      if(!sol || !sol.isPhantom) throw new Error("Phantom non détecté");
-      return sol;
-    };
-
-    async function postJson(url,obj){
-      const r=await fetch(url,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(obj)});
-      if(!r.ok){ throw new Error("HTTP "+r.status); }
-      return await r.json();
-    }
-
-    btn.onclick=async ()=>{
-      try{
-        btn.disabled=true;
-        const budgetRaw = (inp.value||"").replace(",",".").trim();
-        const budget = Number(budgetRaw);
-        if(!isFinite(budget) || budget<=0) { status("Budget invalide"); btn.disabled=false; return; }
-
-        if(!confirm("Aquila: Déposer "+budget.toFixed(4)+" SOL dans le vault ?")) { status("Annulé"); btn.disabled=false; return; }
-
-        const phantom=getPhantom();
-        status("Connexion Phantom...");
-        const resp = await phantom.connect({ onlyIfTrusted:false });
-        const userPubkey = (resp && resp.publicKey) ? resp.publicKey.toString() : phantom.publicKey?.toString();
-        if(!userPubkey) throw new Error("Wallet non connecté");
-
-        status("Création du vault (serveur)...");
-        const v = await postJson(vaultApi(), { userPubkey });
-        const vaultPubkey = v && v.vaultPubkey;
-        if(!vaultPubkey) throw new Error("Vault create failed");
-
-        status("Préparation TX (SOL -> Vault)...");
-        const web3 = mustWeb3();
-        const conn = new web3.Connection(rpcAbs(), "confirmed");
-        const from = new web3.PublicKey(userPubkey);
-        const to = new web3.PublicKey(vaultPubkey);
-        const lamports = Math.round(budget * web3.LAMPORTS_PER_SOL);
-
-        const latest = await conn.getLatestBlockhash("confirmed");
-        const tx = new web3.Transaction({ feePayer: from, recentBlockhash: latest.blockhash });
-        tx.add(web3.SystemProgram.transfer({ fromPubkey: from, toPubkey: to, lamports }));
-
-        status("Signature Phantom (popup)...");
-        let sig="";
-        if (phantom.signAndSendTransaction){
-          const r = await phantom.signAndSendTransaction(tx);
-          sig = r?.signature || "";
-        } else if (phantom.signTransaction){
-          const signed = await phantom.signTransaction(tx);
-          sig = await conn.sendRawTransaction(signed.serialize(), { skipPreflight:false, maxRetries:3 });
-        } else {
-          throw new Error("Phantom: no sign method");
-        }
-
-        status("Confirmation...");
-        await conn.confirmTransaction({ signature: sig, ...latest }, "confirmed");
-        status("Succès\nVault: "+vaultPubkey+"\nSignature: "+sig);
-      } catch(e){
-        const msg = (e && e.message) ? e.message : String(e);
-        status("Échec: "+msg);
-        alert(msg);
-      } finally {
-        btn.disabled=false;
-      }
-    };
-  };
-
-  if(document.readyState==="loading") document.addEventListener("DOMContentLoaded", mount);
-  else mount();
-
-}catch(e){console.error(e);}})();</script>
-'''
-  # inject avant </body> si possible
-  if "</body>" in s:
-    s = s.replace("</body>", inject + "\n</body>")
+# 7.2 Ensure vendor web3 is loaded (keep existing if already there)
+if '/wolverine/vendor/solana-web3.min.js' not in s:
+  # Insert before closing </head> if possible
+  ins = '<script src="/wolverine/vendor/solana-web3.min.js"></script>'
+  if '</head>' in s:
+    s = s.replace('</head>', ins + '</head>', 1)
   else:
-    s += inject
+    s = ins + s
 
+# 7.3 Force RPC endpoint to absolute URL (fix: "Endpoint URL must start with http/https")
+# Replace common patterns: "/wolverine/solana-rpc" or '"/wolverine/solana-rpc"' or "'/wolverine/solana-rpc'"
+s = s.replace('"/wolverine/solana-rpc"', '(location.origin + "/wolverine/solana-rpc")')
+s = s.replace("'/wolverine/solana-rpc'", '(location.origin + "/wolverine/solana-rpc")')
+s = s.replace('/wolverine/solana-rpc', '"+location.origin+"/wolverine/solana-rpc"' ) if '"/wolverine/solana-rpc"' in s else s
+
+# 7.4 If code contains a literal assignment, patch it more safely
+import re
+def repl(m):
+  return m.group(1) + 'location.origin + "/wolverine/solana-rpc"' + m.group(3)
+s = re.sub(r'(\bRPC_PRIMARY\s*=\s*)(["\'])/wolverine/solana-rpc(["\'])', repl, s)
+s = re.sub(r'(\brpc\s*:\s*)(["\'])/wolverine/solana-rpc(["\'])', repl, s)
+
+# 7.5 Keep name AQUILA visible (no-op if already there)
+# (We do not rename UI; just avoid removing any "Aquila" strings)
 p.write_text(s)
-print("OK: index.html patched (vendor web3 + Aquila + RPC abs)")
+print("OK: index.html patched")
 PY
 
-log "== Nginx test + reload =="
+log "== 8) Nginx test + reload =="
 nginx -t
 systemctl reload nginx
 
-log "== Quick tests (local services) =="
-echo "-- solrpc local --"
-curl -fsS "http://127.0.0.1:${SOLRPC_PORT}/health" || true
-echo
-echo "-- vault local --"
-curl -fsS "http://127.0.0.1:${VAULT_PORT}/health" || true
-echo
-echo "-- public vendor web3 --"
-curl -fsSI "https://fireinners.online/wolverine/vendor/solana-web3.min.js" | head -n 5 || true
+log "== 9) Re-freeze nginx files =="
+chattr +i "$NGINX_SITE" 2>/dev/null || true
+chattr +i "$NGINX_INC" 2>/dev/null || true
+chattr +i /etc/nginx/nginx.conf 2>/dev/null || true
 
-log "== Freeze nginx back (best effort) =="
-chattr +i /etc/nginx/nginx.conf "$NGINX_VHOST" "$NGINX_INC" 2>/dev/null || true
+log "== 10) Quick tests =="
+log "-- solrpc local health --"
+curl -fsS "http://127.0.0.1:$SOLRPC_PORT/health" || true
+log "-- solrpc local jsonrpc getHealth --"
+curl -fsS -X POST -H "content-type: application/json" --data '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' "http://127.0.0.1:$SOLRPC_PORT" || true
+
+log "-- public vendor web3 (should be 200 application/javascript) --"
+curl -I -sS "https://fireinners.online/wolverine/vendor/solana-web3.min.js" | head -n 5 || true
+log "-- public solana-rpc health (should be JSON) --"
+curl -fsS "https://fireinners.online/wolverine/solana-rpc/health" || true
 
 echo
 echo "DONE"
 echo "OPEN: https://fireinners.online/wolverine/ (Ctrl+F5)"
-echo "AQUILA: Budget (SOL) -> Creer Vault + Deposer -> confirm -> Phantom popup -> vault create -> SOL transfer"
+echo "AQUILA: Connect Phantom -> Refresh -> SOL/USDC should use /wolverine/solana-rpc (absolute URL)."
 BASH
-
-bash /root/MEGA_WOLVERINE_AQUILA_SOL.sh
+chmod +x /root/MEGA_WOLVERINE_FIX_AQUILA_RPC.sh
+/root/MEGA_WOLVERINE_FIX_AQUILA_RPC.sh'
