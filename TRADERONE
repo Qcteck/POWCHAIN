@@ -1,141 +1,177 @@
 bash -lc 'set -euo pipefail
-HOST="fireinners.online"
-NG="/etc/nginx/nginx.conf"
-ETC="/etc/nginx"
-EN="$ETC/sites-enabled"
-AV="$ETC/sites-available"
-CERTROOT="/var/www/certbot"
 TS="$(date +%Y%m%d_%H%M%S)"
-BK="/root/wolverine_backups/NGINX_SSL_RESOLVE_FIX_${TS}"
-mkdir -p "$BK" "$CERTROOT" "$EN" "$AV"
+LOG="/root/TRADERONE_HEART_${TS}.log"
+OUT="/root/TRADERONE_HEART_${TS}"
+mkdir -p "$OUT"
+exec > >(tee -a "$LOG") 2>&1
 
-say(){ echo "== $* =="; }
+say(){ echo; echo "== $* =="; }
 
-say "0) Snapshot"
-nginx -T > "$BK/nginx_T_before.txt" 2>&1 || true
-cp -a "$NG" "$BK/nginx.conf.bak" 2>/dev/null || true
-cp -a "$EN" "$BK/sites-enabled.bak" 2>/dev/null || true
-cp -a "$AV" "$BK/sites-available.bak" 2>/dev/null || true
+WEBROOT="/var/www/wolverine"
+HOST="fireinners.online"
+API_LOCAL="http://127.0.0.1:3000"
+API_PUBLIC="https://${HOST}/wolverine/traderone/api"
+SAVE_HEART="/root/traderone_heart.txt"
 
-say "1) Unlock immutables (best-effort)"
-chattr -i "$NG" 2>/dev/null || true
-chattr -i "$AV/${HOST}" "$AV/${HOST}-ssl" 2>/dev/null || true
-# unlock any discovered files later too (best-effort)
+say "0) Quick context"
+hostnamectl 2>/dev/null | sed -n "1,6p" || true
+date || true
+id || true
 
-say "2) Resolve SSL vhost candidates (scan ALL /etc/nginx)"
-CAND_ALL="$BK/ssl_candidates_all.txt"
-: > "$CAND_ALL"
-# candidates: contains server_name host AND (listen 443 OR ssl) in same file
-grep -RIl --exclude-dir=modules-enabled --exclude-dir=sites-enabled --exclude-dir=sites-available -E "server_name[[:space:]].*${HOST}" "$ETC" 2>/dev/null | while read -r f; do
-  if grep -qE "listen[[:space:]].*443|ssl_certificate|http2" "$f" 2>/dev/null; then
-    echo "$f" >> "$CAND_ALL"
-  fi
-done
-# include also sites-available/enabled explicitly
-grep -RIl -E "server_name[[:space:]].*${HOST}" "$AV" "$EN" 2>/dev/null | while read -r f; do
-  if grep -qE "listen[[:space:]].*443|ssl_certificate|http2" "$f" 2>/dev/null; then
-    echo "$f" >> "$CAND_ALL"
-  fi
-done
+say "1) Who is listening (80/443/3000) + process cwd"
+ss -lntp | egrep "(:80|:443|:3000)\b" || true
 
-# uniq
-sort -u "$CAND_ALL" -o "$CAND_ALL" || true
-echo "-- SSL candidates --"; nl -ba "$CAND_ALL" || true
+PID3000="$(ss -lntp 2>/dev/null | awk "/:3000[[:space:]]/ && /users:/ {gsub(/.*pid=/,\"\",\$0); gsub(/,.*/,\"\",\$0); print \$0; exit}")"
+echo "PID3000=${PID3000:-none}"
 
-# preferred: /etc/nginx/sites-available/HOST-ssl then enabled symlink target, else first candidate
-VSSL=""
-if [ -f "$AV/${HOST}-ssl" ]; then VSSL="$AV/${HOST}-ssl"; fi
-if [ -z "$VSSL" ] && [ -L "$EN/${HOST}-ssl" ]; then VSSL="$(readlink -f "$EN/${HOST}-ssl" || true)"; fi
-if [ -z "$VSSL" ] && [ -s "$CAND_ALL" ]; then VSSL="$(head -n 1 "$CAND_ALL" || true)"; fi
-
-echo "SSL_VHOST=$VSSL" | tee "$BK/ssl_vhost_chosen.txt"
-
-say "3) Ensure HTTP 80 vhost (ACME passthrough + redirect https)"
-VHTTP="$AV/${HOST}"
-cat > "$VHTTP" <<EOF
-server {
-  listen 80;
-  listen [::]:80;
-  server_name ${HOST};
-
-  location ^~ /.well-known/acme-challenge/ {
-    root ${CERTROOT};
-    default_type "text/plain";
-    try_files \$uri =404;
-  }
-
-  location / { return 301 https://\$host\$request_uri; }
-}
-EOF
-ln -sf "$VHTTP" "$EN/${HOST}" || true
-
-say "4) Patch ALL SSL candidates: remove any listen 80 / [::]:80"
-PATCHED="$BK/ssl_patched.txt"
-: > "$PATCHED"
-
-# build list: chosen first, then all candidates
-LIST="$BK/ssl_patch_list.txt"
-: > "$LIST"
-if [ -n "$VSSL" ] && [ -f "$VSSL" ]; then echo "$VSSL" >> "$LIST"; fi
-cat "$CAND_ALL" >> "$LIST" 2>/dev/null || true
-sort -u "$LIST" -o "$LIST" || true
-
-while IFS= read -r f; do
-  [ -n "$f" ] || continue
-  [ -f "$f" ] || continue
-  chattr -i "$f" 2>/dev/null || true
-  cp -a "$f" "$BK/$(echo "$f" | sed "s#/#_#g").bak" 2>/dev/null || true
-  # remove listen 80 lines
-  sed -i -E "/^[[:space:]]*listen[[:space:]]+80\\b/d; /^[[:space:]]*listen[[:space:]]+\\[::\\]:80\\b/d" "$f"
-  echo "$f" >> "$PATCHED"
-done < "$LIST"
-
-echo "-- patched SSL files --"; nl -ba "$PATCHED" || true
-
-say "5) Ensure SSL vhost symlink exists (best-effort)"
-# If sites-available HOST-ssl exists, ensure enabled points to it
-if [ -f "$AV/${HOST}-ssl" ]; then
-  ln -sf "$AV/${HOST}-ssl" "$EN/${HOST}-ssl" || true
+if [ -n "${PID3000:-}" ] && [ -d "/proc/$PID3000" ]; then
+  echo "-- /proc/$PID3000/cmdline --"
+  tr "\0" " " < "/proc/$PID3000/cmdline" || true; echo
+  echo "-- /proc/$PID3000/cwd --"
+  readlink -f "/proc/$PID3000/cwd" || true
+  echo "-- /proc/$PID3000/exe --"
+  readlink -f "/proc/$PID3000/exe" || true
+  echo "-- ps --"
+  ps -fp "$PID3000" || true
+  echo "-- env hints --"
+  (strings "/proc/$PID3000/environ" 2>/dev/null | egrep -i "NODE_ENV|PORT|TRADER|WOLVERINE|RPC|SECRET|KEY|TOKEN" | head -n 80) || true
 fi
 
-say "6) Disable duplicate :80 server_name HOST (keep only sites-enabled/HOST)"
-MAP="$BK/dupe_80_enabled.txt"
-: > "$MAP"
-for f in "$EN"/*; do
-  [ -e "$f" ] || continue
-  if grep -qE "server_name[[:space:]].*${HOST}" "$f" 2>/dev/null && grep -qE "listen[[:space:]].*\\b80\\b" "$f" 2>/dev/null; then
-    echo "$f" >> "$MAP"
-  fi
+say "2) Find TraderOne code on disk (package.json / server.js / index.js / app.js)"
+CANDS=(
+  "/opt/traderone"
+  "/opt/traderone-opt"
+  "/opt/traderone-vault"
+  "/opt/wolverine"
+  "/opt/fireinners"
+  "/root/traderone"
+  "/root/wolverine"
+)
+> "$OUT/candidates.txt"
+for d in "${CANDS[@]}"; do [ -d "$d" ] && echo "$d" >> "$OUT/candidates.txt"; done
+cat "$OUT/candidates.txt" || true
+
+find_hit(){ local base="$1" pat="$2"; find "$base" -maxdepth 6 -type f -name "$pat" 2>/dev/null | head -n 50; }
+
+> "$OUT/backend_files.txt"
+for d in $(cat "$OUT/candidates.txt" 2>/dev/null || true); do
+  echo "## $d" >> "$OUT/backend_files.txt"
+  find_hit "$d" "package.json" >> "$OUT/backend_files.txt" || true
+  find_hit "$d" "server.js" >> "$OUT/backend_files.txt" || true
+  find_hit "$d" "index.js" >> "$OUT/backend_files.txt" || true
+  find_hit "$d" "app.js" >> "$OUT/backend_files.txt" || true
+  find "$d" -maxdepth 6 -type f -iname "*trader*one*" 2>/dev/null | head -n 50 >> "$OUT/backend_files.txt" || true
 done
-sort -u "$MAP" -o "$MAP" || true
-echo "-- enabled :80 candidates --"; nl -ba "$MAP" || true
+sed -n "1,260p" "$OUT/backend_files.txt" || true
 
-KEEP="$EN/${HOST}"
-while IFS= read -r f; do
-  [ -n "$f" ] || continue
-  if [ "$f" = "$KEEP" ]; then continue; fi
-  bn="$(basename "$f")"
-  cp -a "$f" "$BK/enabled_${bn}.bak" 2>/dev/null || true
-  mv -f "$f" "$f.disabled_${TS}" 2>/dev/null || rm -f "$f" 2>/dev/null || true
-done < "$MAP"
+say "3) Determine backend ENTRY (best guess)"
+HEART=""
+if [ -n "${PID3000:-}" ] && [ -d "/proc/$PID3000" ]; then
+  HEART="$(readlink -f "/proc/$PID3000/cwd" 2>/dev/null || true)"
+fi
+if [ -z "$HEART" ]; then
+  HEART="$(awk "NF{print;exit}" "$OUT/backend_files.txt" | sed "s#/package.json##" || true)"
+fi
+echo "HEART_DIR=$HEART" | tee "$SAVE_HEART"
 
-say "7) Nginx test + reload"
-nginx -t 2>&1 | tee "$BK/nginx_t_after.txt"
-systemctl reload nginx || systemctl restart nginx
-
-say "8) Sanity checks"
-echo "-- HTTP -> must redirect --"; curl -sS -I "http://${HOST}/" | head -n 12 || true
-echo "-- HTTPS wolverine --"; curl -sS -I "https://${HOST}/wolverine/" | head -n 12 || true
-echo "-- Conflicts? --"
-if grep -q "conflicting server name" "$BK/nginx_t_after.txt"; then
-  echo "STILL CONFLICTING. Extracting lines:"
-  nginx -T 2>/dev/null | grep -nE "conflicting server name|server_name[[:space:]].*${HOST}|listen[[:space:]].*\\b80\\b" | head -n 260 || true
-else
-  echo "OK: no conflicting server name in nginx -t."
+if [ -n "$HEART" ] && [ -f "$HEART/package.json" ]; then
+  say "3.1) HEART package.json (scripts/main)"
+  node -e "const p=require(\"$HEART/package.json\"); console.log(JSON.stringify({name:p.name,main:p.main,scripts:p.scripts},null,2));" 2>/dev/null || true
 fi
 
-say "9) Re-lock immutables (best-effort)"
-chattr +i "$NG" 2>/dev/null || true
-while IFS= read -r f; do [ -f "$f" ] && chattr +i "$f" 2>/dev/null || true; done < "$PATCHED"
+say "4) Live API checks (local + public)"
+curl -sS -i "$API_LOCAL/health" | head -n 60 || true
+curl -sS -i "$API_PUBLIC/health" | head -n 60 || true
+curl -sS -i "$API_PUBLIC/ping" | head -n 60 || true
 
-echo "DONE. Backup: $BK"'
+say "5) Frontend currently served (/var/www/wolverine/index.html) + detect STUB"
+test -f "$WEBROOT/index.html" && { ls -la "$WEBROOT/index.html"; head -n 40 "$WEBROOT/index.html" | sed "s/\t/  /g"; } || echo "MISSING $WEBROOT/index.html"
+STUB="0"
+if [ -f "$WEBROOT/index.html" ] && grep -qiE "UI stub|Coming soon|Not connected" "$WEBROOT/index.html"; then STUB="1"; fi
+echo "FRONT_STUB=$STUB"
+
+say "6) Try to locate REAL Wolverine static export on VPS"
+# Search for a directory containing /wolverine/_next/static OR out/_next/static OR .next/static (built/exported)
+REAL=""
+for base in /opt/wolverine /opt/fireinners/frontend-react/app/dist/wolverine /opt/fireinners/frontend-react/app/dist /var/www/wolverine /opt/fireinners /root; do
+  [ -d "$base" ] || continue
+  # exported next: out/_next/static
+  hit="$(find "$base" -maxdepth 4 -type d -path "*/_next/static" 2>/dev/null | head -n 1 || true)"
+  if [ -n "$hit" ]; then
+    # root is parent of _next
+    root="$(dirname "$(dirname "$hit")")"
+    # root might be .../out or .../wolverine
+    if [ -f "$root/index.html" ]; then REAL="$root"; break; fi
+  fi
+done
+echo "REAL_FRONT_ROOT=$REAL"
+
+say "7) If stub -> deploy REAL if found (safe backup first)"
+if [ "$STUB" = "1" ] && [ -n "$REAL" ] && [ -d "$REAL" ]; then
+  BK="/root/WOLVERINE_FRONT_BAK_${TS}"
+  mkdir -p "$BK"
+  if [ -d "$WEBROOT" ]; then tar -czf "$BK/webroot_${TS}.tgz" -C "$WEBROOT" . 2>/dev/null || true; fi
+
+  # keep vendor folder if present in target (user wants local solana libs)
+  mkdir -p "$WEBROOT"
+  rsync -a --delete --exclude "vendor/" "$REAL/" "$WEBROOT/"
+  if [ -d "$REAL/vendor" ]; then
+    mkdir -p "$WEBROOT/vendor"
+    rsync -a "$REAL/vendor/" "$WEBROOT/vendor/"
+  fi
+
+  echo "DEPLOYED_REAL_FRONT_FROM=$REAL" | tee "$OUT/deploy_result.txt"
+fi
+
+say "8) If still stub and /opt/wolverine is a repo -> attempt build/export (best-effort)"
+if [ "$STUB" = "1" ] && [ -d "/opt/wolverine/.git" ]; then
+  cd /opt/wolverine
+  echo "-- git status --"; git status --porcelain=v1 || true
+  echo "-- git pull --"; git pull --rebase || true
+
+  if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1 && [ -f package.json ]; then
+    node -v || true; npm -v || true
+    SCRIPTS="$(node -e "const p=require(\"./package.json\"); console.log(Object.keys(p.scripts||{}).join(\" \"));" 2>/dev/null || true)"
+    echo "SCRIPTS=$SCRIPTS"
+
+    # install only if node_modules missing
+    if [ ! -d node_modules ] && [ -f package-lock.json ]; then
+      npm ci || true
+    fi
+
+    # build
+    if echo " $SCRIPTS " | grep -q " build "; then npm run build || true; fi
+
+    # export (preferred) or next export
+    EXPORTED=""
+    if echo " $SCRIPTS " | grep -q " export "; then
+      npm run export && EXPORTED="1" || true
+    fi
+    # common alt: next export via npm run export already; if not, try npx next export
+    if [ -z "$EXPORTED" ] && command -v npx >/dev/null 2>&1; then
+      (npx next export -o out && EXPORTED="1") || true
+    fi
+
+    # deploy if out exists
+    if [ -d out ] && [ -f out/index.html ]; then
+      BK="/root/WOLVERINE_FRONT_BAK_${TS}_FROM_BUILD"
+      mkdir -p "$BK"
+      tar -czf "$BK/webroot_${TS}.tgz" -C "$WEBROOT" . 2>/dev/null || true
+      rsync -a --delete --exclude "vendor/" "out/" "$WEBROOT/"
+      echo "DEPLOYED_FROM=/opt/wolverine/out" | tee -a "$OUT/deploy_result.txt"
+    fi
+  fi
+fi
+
+say "9) Nginx quick test + tail errors"
+nginx -t || true
+systemctl reload nginx || systemctl restart nginx || true
+curl -sS -I "https://${HOST}/wolverine/" | head -n 30 || true
+tail -n 80 /var/log/nginx/error.log 2>/dev/null || true
+
+say "10) Final outputs"
+echo "LOG=$LOG"
+echo "OUTDIR=$OUT"
+echo "HEART_SAVED=$SAVE_HEART"
+ls -ლა "$OUT" 2>/dev/null || true
+echo "DONE"'
