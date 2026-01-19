@@ -1,66 +1,261 @@
 bash -lc 'set -euo pipefail
 TS="$(date +%Y%m%d_%H%M%S)"
-LOG="/root/TRADERONE_HEART_FIX_${TS}.log"
-exec > >(tee -a "$LOG") 2>&1
+HTML="/var/www/wolverine/index.html"
+BK="/root/WOLVERINE_FIX_${TS}"
+mkdir -p "$BK"
 
-echo "== 0) Identify TraderOne unit and entrypoint =="
-systemctl cat traderone.service || true
-test -f /opt/traderone/server.cjs || { echo "MISSING /opt/traderone/server.cjs"; exit 1; }
+RPC_HTTP_PRIMARY="https://lb.drpc.live/solana/AsxThpeKkEjGtZhCNUEQYo1ZluSgmwsR76RdFhW5UfFk"
+RPC_WS_PRIMARY="wss://lb.drpc.live/solana/AsxThpeKkEjGtZhCNUEQYo1ZluSgmwsR76RdFhW5UfFk"
 
-echo
-echo "== 1) Show current listener processes (all) + grep traderone =="
-ss -lntp || true
-ps auxww | egrep -i "node|traderone|/opt/traderone|server\.cjs" || true
+# fallback known-good (older) + public
+RPC_HTTP_FALLBACK1="https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac"
+RPC_WS_FALLBACK1="wss://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac"
+RPC_HTTP_FALLBACK2="https://api.mainnet-beta.solana.com"
+RPC_WS_FALLBACK2="wss://api.mainnet-beta.solana.com"
 
-echo
-echo "== 2) Show file proof (hash + head) =="
-sha256sum /opt/traderone/server.cjs | tee /root/traderone_heart_proof.sha256
-echo "-- head -n 60 /opt/traderone/server.cjs --"
-sed -n "1,60p" /opt/traderone/server.cjs || true
-
-echo
-echo "== 3) Force bind on 127.0.0.1:3000 via systemd drop-in (no code edits) =="
-mkdir -p /etc/systemd/system/traderone.service.d
-cat >/etc/systemd/system/traderone.service.d/port.conf <<EOF
-[Service]
-Environment="PORT=3000"
-Environment="HOST=127.0.0.1"
-Environment="BIND=127.0.0.1"
-Environment="LISTEN_HOST=127.0.0.1"
-EOF
-
-systemctl daemon-reload
-
-echo
-echo "== 4) Restart TraderOne and show status =="
-systemctl restart traderone.service
-sleep 1
-systemctl --no-pager status traderone.service | sed -n "1,220p" || true
-
-echo
-echo "== 5) Find actual listening port for traderone (by PID) =="
-PID="$(systemctl show -p MainPID --value traderone.service || true)"
-echo "MainPID=$PID"
-if [ -n "$PID" ] && [ "$PID" != "0" ] && [ -d "/proc/$PID" ]; then
-  echo "-- cmdline --"
-  tr "\0" " " < "/proc/$PID/cmdline" || true
-  echo
-  echo "-- listeners for this PID --"
-  ss -lntp | awk -v pid="pid=$PID," '"'"'$0~pid{print}'"'"' || true
-else
-  echo "No running PID for traderone.service"
+echo "== 0) Savepoint (if present) =="
+if [ -x /root/WOLVERINE_SAVEPOINT.sh ]; then
+  /root/WOLVERINE_SAVEPOINT.sh || true
 fi
 
-echo
-echo "== 6) Local health tests (direct backend) =="
-curl -fsS "http://127.0.0.1:3000/health" || true
-curl -fsS "http://127.0.0.1:3000/" | head -n 20 || true
+echo "== 1) Backup current UI =="
+if [ -f "$HTML" ]; then
+  cp -a "$HTML" "$BK/index.html.bak"
+else
+  echo "WARN: $HTML not found, will create it."
+fi
+chattr -i "$HTML" 2>/dev/null || true
 
-echo
-echo "== 7) Public health through nginx route =="
-curl -i -sS "https://fireinners.online/wolverine/traderone/api/health" | head -n 60 || true
+echo "== 2) Install patched Wolverine UI (SOL+USDC + RPC failover) =="
+cat > "$HTML" <<EOF
+<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Wolverine • TraderOne</title><meta http-equiv="cache-control" content="no-cache,no-store,must-revalidate"/><meta http-equiv="pragma" content="no-cache"/><meta http-equiv="expires" content="0"/><style>
+html,body{height:100%;margin:0;font:14px/1.3 system-ui,Segoe UI,Roboto,Arial;background:#fff;color:#111}
+a{color:#06c;text-decoration:underline}
+.wrap{max-width:980px;margin:18px}
+h1{margin:0 0 6px;font-size:18px}
+.small{font-size:12px;color:#444}
+.row{display:flex;gap:18px;flex-wrap:wrap;align-items:flex-start}
+.card{border:1px solid #ddd;border-radius:10px;padding:12px;min-width:260px}
+.kv{display:grid;grid-template-columns:120px 1fr;gap:6px 10px;align-items:center}
+.k{color:#333}
+.v{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;word-break:break-all}
+.btn{display:inline-block;border:1px solid #111;background:#f5f5f5;border-radius:8px;padding:7px 10px;cursor:pointer}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.bad{color:#b00}
+.ok{color:#070}
+hr{border:0;border-top:1px solid #eee;margin:12px 0}
+.nav a{margin-right:10px}
+.log{white-space:pre-wrap;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;background:#fafafa;border:1px solid #eee;border-radius:10px;padding:10px;max-height:260px;overflow:auto}
+</style></head><body><div class="wrap">
+<div class="small">W</div>
+<h1>Wolverine<br/>TraderOne</h1>
+<div class="nav"><a href="/wolverine/">Dashboard</a><a href="/wolverine/trade">Trade</a><a href="/wolverine/positions">Positions</a><a href="/wolverine/orders">Orders</a><a href="/wolverine/history">History</a><a href="/wolverine/wallet">Wallet</a><a href="/wolverine/settings">Settings</a><a href="/wolverine/health">Health</a></div>
+<hr/>
+<div class="row">
+  <div class="card">
+    <div><b>Wallet</b></div>
+    <div class="small" id="w_status">Not connected</div>
+    <div style="margin:8px 0;display:flex;gap:8px;flex-wrap:wrap">
+      <button class="btn" id="btn_connect">Connect Phantom</button>
+      <button class="btn" id="btn_refresh" disabled>Refresh</button>
+      <button class="btn" id="btn_disconnect" disabled>Disconnect</button>
+    </div>
+    <div class="kv">
+      <div class="k">Pubkey</div><div class="v" id="w_pub">-</div>
+      <div class="k">RPC</div><div class="v" id="w_rpc">-</div>
+      <div class="k">SOL</div><div class="v" id="w_sol">-</div>
+      <div class="k">USDC</div><div class="v" id="w_usdc">-</div>
+      <div class="k">Last</div><div class="v" id="w_last">-</div>
+    </div>
+  </div>
 
-echo
+  <div class="card" style="flex:1;min-width:320px">
+    <div><b>API</b>: <span class="v">/wolverine/traderone/api</span></div>
+    <div class="small" id="api_status">-</div>
+    <div class="kv" style="margin-top:10px">
+      <div class="k">Health</div><div class="v" id="api_health">-</div>
+      <div class="k">Service</div><div class="v" id="api_service">-</div>
+    </div>
+    <hr/>
+    <div><b>Log</b></div>
+    <div class="log" id="log"></div>
+  </div>
+</div>
+
+<script>window.__WOLVERINE_RPC__={endpoints:[
+  {http:"$RPC_HTTP_PRIMARY",ws:"$RPC_WS_PRIMARY",name:"drpc-primary"},
+  {http:"$RPC_HTTP_FALLBACK1",ws:"$RPC_WS_FALLBACK1",name:"drpc-fallback"},
+  {http:"$RPC_HTTP_FALLBACK2",ws:"$RPC_WS_FALLBACK2",name:"solana-public"}
+]};</script>
+
+<script src="/wolverine/vendor/solana-web3.min.js"></script>
+<script>
+(function(){
+  const \$=(id)=>document.getElementById(id);
+  const logEl=\$("log");
+  const log=(s)=>{logEl.textContent=(logEl.textContent?logEl.textContent+"\\n":"")+s;logEl.scrollTop=logEl.scrollHeight;};
+
+  const USDC_MINT="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1";
+
+  let provider=null;
+  let pubkeyStr="";
+  let conn=null;
+  let rpcUsed=null;
+
+  function now(){return new Date().toISOString().replace("T"," ").replace("Z","");}
+  function setStatus(ok,msg){\$("w_status").textContent=msg;\$("w_status").className="small "+(ok?"ok":"bad");}
+
+  async function probeEndpoint(http){
+    // Browser CORS test via JSON-RPC. If CORS is blocked, this throws.
+    const body={jsonrpc:"2.0",id:1,method:"getHealth"};
+    const r=await fetch(http,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});
+    if(!r.ok) throw new Error("HTTP "+r.status);
+    const j=await r.json();
+    if(j && (j.result==="ok" || j.result)) return true;
+    return true;
+  }
+
+  async function pickConnection(){
+    const eps=(window.__WOLVERINE_RPC__&&window.__WOLVERINE_RPC__.endpoints)||[];
+    let lastErr=null;
+    for(const ep of eps){
+      try{
+        log("RPC try: "+ep.name+" "+ep.http);
+        await probeEndpoint(ep.http);
+        conn=new solanaWeb3.Connection(ep.http,{wsEndpoint:ep.ws,commitment:"confirmed"});
+        rpcUsed=ep;
+        \$("w_rpc").textContent=ep.http;
+        log("RPC ok: "+ep.name);
+        return;
+      }catch(e){
+        lastErr=e;
+        log("RPC fail: "+ep.name+" -> "+((e&&e.message)?e.message:String(e)));
+      }
+    }
+    throw lastErr||new Error("No RPC endpoint available");
+  }
+
+  async function refreshBalances(){
+    if(!provider||!pubkeyStr) return;
+    \$("btn_refresh").disabled=true;
+    try{
+      if(!conn) await pickConnection();
+      const pub=new solanaWeb3.PublicKey(pubkeyStr);
+
+      const lamports=await conn.getBalance(pub,"confirmed");
+      const sol=(lamports/1e9);
+      \$("w_sol").textContent=sol.toFixed(9);
+
+      const resp=await conn.getParsedTokenAccountsByOwner(pub,{programId:new solanaWeb3.PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")});
+      let usdc=0;
+      for(const it of (resp && resp.value)||[]){
+        try{
+          const info=it.account.data.parsed.info;
+          const mint=info.mint;
+          if(mint===USDC_MINT){
+            const ui=info.tokenAmount && info.tokenAmount.uiAmount;
+            if(typeof ui==="number") usdc+=ui;
+          }
+        }catch(_){}
+      }
+      \$("w_usdc").textContent=usdc.toFixed(6);
+      \$("w_last").textContent=now();
+      setStatus(true,"Connected");
+    }catch(e){
+      const msg=((e&&e.message)?e.message:String(e));
+      \$("w_last").textContent=now();
+      setStatus(false,"Balance: RPC error");
+      log("Balance error: "+msg);
+      // force re-pick next refresh
+      conn=null; rpcUsed=null;
+    }finally{
+      \$("btn_refresh").disabled=false;
+    }
+  }
+
+  async function apiHealth(){
+    try{
+      \$("api_status").textContent="Checking...";
+      const r=await fetch("/wolverine/traderone/api/health",{cache:"no-store"});
+      const t=await r.text();
+      \$("api_status").textContent="HTTP "+r.status;
+      try{
+        const j=JSON.parse(t);
+        \$("api_health").textContent=(j.status||"-");
+        \$("api_service").textContent=(j.service||"-");
+      }catch(_){
+        \$("api_health").textContent=t.slice(0,200);
+        \$("api_service").textContent="-";
+      }
+    }catch(e){
+      \$("api_status").textContent="API error";
+      \$("api_health").textContent=((e&&e.message)?e.message:String(e));
+      \$("api_service").textContent="-";
+    }
+  }
+
+  async function connect(){
+    try{
+      if(!window.solana||!window.solana.isPhantom) throw new Error("Phantom not detected");
+      provider=window.solana;
+      const res=await provider.connect({onlyIfTrusted:false});
+      pubkeyStr=(res && res.publicKey && res.publicKey.toString)?res.publicKey.toString():(provider.publicKey?provider.publicKey.toString():"");
+      if(!pubkeyStr) throw new Error("No pubkey");
+      \$("w_pub").textContent=pubkeyStr;
+      \$("btn_disconnect").disabled=false;
+      \$("btn_refresh").disabled=false;
+      setStatus(true,"Connected: "+pubkeyStr.slice(0,4)+"..."+pubkeyStr.slice(-4));
+      log("Wallet connected: "+pubkeyStr);
+      await apiHealth();
+      await refreshBalances();
+    }catch(e){
+      const msg=((e&&e.message)?e.message:String(e));
+      setStatus(false,msg);
+      log("Connect error: "+msg);
+    }
+  }
+
+  async function disconnect(){
+    try{
+      if(provider&&provider.disconnect) await provider.disconnect();
+    }catch(_){}
+    provider=null; pubkeyStr=""; conn=null; rpcUsed=null;
+    \$("w_pub").textContent="-";
+    \$("w_rpc").textContent="-";
+    \$("w_sol").textContent="-";
+    \$("w_usdc").textContent="-";
+    \$("w_last").textContent="-";
+    \$("btn_disconnect").disabled=true;
+    \$("btn_refresh").disabled=true;
+    setStatus(false,"Not connected");
+    log("Wallet disconnected");
+  }
+
+  \$("btn_connect").addEventListener("click",connect);
+  \$("btn_disconnect").addEventListener("click",disconnect);
+  \$("btn_refresh").addEventListener("click",refreshBalances);
+
+  // auto: show API health even before wallet
+  apiHealth();
+})();
+</script>
+</div></body></html>
+EOF
+
+chmod 0644 "$HTML" || true
+chown root:root "$HTML" || true
+
+echo "== 3) Nginx test + reload =="
+nginx -t
+systemctl reload nginx || systemctl restart nginx
+
+echo "== 4) Quick checks =="
+echo "-- UI file --"
+ls -la "$HTML" | sed -n "1,1p" || true
+echo "-- Public API health --"
+curl -fsS -i "https://fireinners.online/wolverine/traderone/api/health" | head -n 25 || true
+
 echo "== DONE =="
-echo "LOG=$LOG"
+echo "Backup: $BK"
+echo "Open: https://fireinners.online/wolverine/"
 '
