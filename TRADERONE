@@ -1,16 +1,32 @@
-cat >/root/MEGA_WOLVERINE_FIX_AQUILA_FINAL.sh <<'BASH'
+cat >/root/MEGA_WOLVERINE_FIX_AQUILA_PATCH_EOF.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+TS="$(date +%Y%m%d_%H%M%S)"
+SRC="/root/MEGA_WOLVERINE_FIX_AQUILA_FINAL.sh"
+OUT="/root/MEGA_WOLVERINE_FIX_AQUILA_FINAL_REBUILT.sh"
+BK="/root/WOLVERINE_EOF_PATCH_${TS}"
+mkdir -p "$BK"
+
+echo "[*] 0) Preflight"
+id -u | grep -q '^0$' || { echo "ERROR: run as root"; exit 1; }
+
+echo "[*] 1) Backup old script"
+[ -f "$SRC" ] || { echo "ERROR: missing $SRC"; exit 1; }
+cp -a "$SRC" "$BK/MEGA_WOLVERINE_FIX_AQUILA_FINAL.sh.bak"
+
+echo "[*] 2) Rebuild script safely (fix unexpected EOF by avoiding nested heredoc collisions)"
+cat >"$OUT" <<'SCRIPT'
 #!/usr/bin/env bash
 set -euo pipefail
 TS="$(date +%Y%m%d_%H%M%S)"
 BK="/root/WOLVERINE_FIX_${TS}"
 mkdir -p "$BK"
-
 say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
+need(){ command -v "$1" >/dev/null 2>&1 || { echo "ERROR: missing $1"; exit 1; }; }
 
 DOMAIN="fireinners.online"
 VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
 INC="/etc/nginx/includes/wolverine_routes.inc"
-WEBROOT="/var/www"
 WOLVROOT="/var/www/wolverine"
 HTML="$WOLVROOT/index.html"
 VENDOR="$WOLVROOT/vendor"
@@ -18,19 +34,11 @@ VENDOR="$WOLVROOT/vendor"
 SOLRPC_PORT="12713"
 VAULT_PORT="3010"
 TRADERONE_PORT="3000"
-
 DRPC_SOLANA="https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac"
-
-need(){ command -v "$1" >/dev/null 2>&1 || { echo "ERROR: missing $1"; exit 1; }; }
 
 say "0) Preflight"
 id -u | grep -q '^0$' || { echo "ERROR: run as root"; exit 1; }
-need nginx
-need ss
-need curl
-need python3
-need node
-need npm
+need nginx; need ss; need curl; need python3; need node; need npm
 
 if [ -x /root/WOLVERINE_SAVEPOINT.sh ]; then
   say "0b) Savepoint snapshot (/root/WOLVERINE_SAVEPOINT.sh)"
@@ -64,9 +72,9 @@ if [ ! -f "$VENDOR/solana-web3.min.js" ]; then
     TMPV="$BK/tmp_vendor"
     mkdir -p "$TMPV"
     (cd "$TMPV" && npm init -y >/dev/null 2>&1 && npm i @solana/web3.js >/dev/null 2>&1)
-    node - <<'JS' >"$VENDOR/solana-web3.min.js"
+    node - "$TMPV" >"$VENDOR/solana-web3.min.js" <<'JS'
 const fs=require('fs'),path=require('path');
-const base=process.argv[1];
+const base=process.argv[2];
 function pick(p){try{return fs.readFileSync(p,'utf8')}catch(e){return null}}
 const cands=[
   path.join(base,'node_modules','@solana','web3.js','lib','index.iife.min.js'),
@@ -78,7 +86,7 @@ let data=null;
 for(const p of cands){ data=pick(p); if(data) break; }
 if(!data){ console.error("Cannot find iife build in @solana/web3.js"); process.exit(1); }
 process.stdout.write(data);
-JS "$TMPV"
+JS
   fi
 fi
 
@@ -86,20 +94,15 @@ say "5) Write canonical nginx include: $INC"
 mkdir -p /etc/nginx/includes
 cat >"$INC" <<'NGX'
 # ==== WOLVERINE ROUTES (CANONICAL) ====
-
-# Static UI (served from /var/www/wolverine/index.html)
 location ^~ /wolverine/ {
   root /var/www;
   try_files $uri $uri/ /wolverine/index.html;
   add_header Cache-Control "no-store" always;
 }
-
-# Prevent service-workers from hijacking cache
 location = /wolverine/sw.js { add_header Cache-Control "no-store" always; return 404; }
 location = /wolverine/service-worker.js { add_header Cache-Control "no-store" always; return 404; }
 location = /wolverine/manifest.json { add_header Cache-Control "no-store" always; return 404; }
 
-# Solana RPC CORS-safe proxy (frontend uses ABSOLUTE: https://<host>/wolverine/solana-rpc)
 location ^~ /wolverine/solana-rpc {
   rewrite ^/wolverine/solana-rpc/?(.*)$ /$1 break;
   proxy_pass http://127.0.0.1:12713;
@@ -114,7 +117,6 @@ location ^~ /wolverine/solana-rpc {
   if ($request_method = OPTIONS) { return 204; }
 }
 
-# Vault API (create vault + mapping) behind nginx
 location ^~ /wolverine/vault/api {
   rewrite ^/wolverine/vault/api/?(.*)$ /$1 break;
   proxy_pass http://127.0.0.1:3010;
@@ -129,7 +131,6 @@ location ^~ /wolverine/vault/api {
   if ($request_method = OPTIONS) { return 204; }
 }
 
-# TraderOne API (stable wrapper to avoid 502)
 location ^~ /wolverine/traderone/api {
   rewrite ^/wolverine/traderone/api/?(.*)$ /$1 break;
   proxy_pass http://127.0.0.1:3000;
@@ -145,44 +146,27 @@ location ^~ /wolverine/traderone/api {
 }
 NGX
 
-say "6) Ensure vhost exists and includes wolverine routes"
+say "6) Ensure vhost includes wolverine routes"
 test -f "$VHOST" || { echo "ERROR: missing $VHOST"; exit 1; }
-
 python3 - <<PY
 from pathlib import Path
 p=Path("$VHOST")
 s=p.read_text(errors="ignore")
 inc="include /etc/nginx/includes/wolverine_routes.inc;"
-if inc in s:
-    print("OK: include already present")
-    raise SystemExit(0)
-
-# inject inside any server { } that mentions server_name fireinners.online
-out=[]
-lines=s.splitlines(True)
-i=0
-while i < len(lines):
-    line=lines[i]
-    out.append(line)
-    if "server_name" in line and "fireinners.online" in line:
-        # find end of this server block; insert near top after server_name line
-        out.append("  " + inc + "\n")
-    i+=1
-
-p.write_text("".join(out))
-print("OK: injected include into vhost")
+if inc not in s:
+    s=s.replace("server_name fireinners.online;","server_name fireinners.online;\n  "+inc)
+p.write_text(s)
+print("OK: vhost include ensured")
 PY
 
 say "7) Disable duplicate enabled vhosts that conflict on server_name fireinners.online"
 mkdir -p "$BK/nginx/sites-enabled"
-CANON_LINK=""
-if [ -L /etc/nginx/sites-enabled/fireinners.online-ssl ]; then CANON_LINK="/etc/nginx/sites-enabled/fireinners.online-ssl"; fi
 for f in /etc/nginx/sites-enabled/*; do
   [ -e "$f" ] || continue
   bn="$(basename "$f")"
   if grep -Rqs "server_name .*fireinners\.online" "$f"; then
     if [ "$bn" != "fireinners.online-ssl" ]; then
-      say " - disabling $f (backup -> $BK/nginx/sites-enabled/)"
+      say " - disabling $f"
       cp -a "$f" "$BK/nginx/sites-enabled/${bn}.bak" || true
       rm -f "$f"
     fi
@@ -190,27 +174,18 @@ for f in /etc/nginx/sites-enabled/*; do
 done
 ln -sf "$VHOST" /etc/nginx/sites-enabled/fireinners.online-ssl
 
-say "8) Patch /var/www/wolverine/index.html to use ABSOLUTE solana-rpc and keep AQUILA label"
+say "8) Patch /var/www/wolverine/index.html: force ABSOLUTE solana-rpc"
 python3 - <<'PY'
 from pathlib import Path
 import re
 p=Path("/var/www/wolverine/index.html")
 s=p.read_text(errors="ignore")
-
-# Force any raw "/wolverine/solana-rpc" string to become location.origin + "/wolverine/solana-rpc"
-def fix_rpc(m):
-    return 'location.origin+"/wolverine/solana-rpc"'
-# replace assignments like RPC="/wolverine/solana-rpc"
-s=re.sub(r'(["\'])/wolverine/solana-rpc\1', fix_rpc, s)
-
-# common pattern: const RPC="/wolverine/solana-rpc"
-s=re.sub(r'(RPC\s*=\s*)location\.origin\+location\.origin\+', r'\1location.origin+', s)
-
+s=re.sub(r'(["\'])/wolverine/solana-rpc\1', 'location.origin+"/wolverine/solana-rpc"', s)
 p.write_text(s)
 print("OK: index.html patched")
 PY
 
-say "9) Ensure Solana-RPC proxy (127.0.0.1:${SOLRPC_PORT}) is running"
+say "9) Solana RPC proxy service (127.0.0.1:12713)"
 SOLRPC_DIR="/opt/wolverine-solrpc-proxy"
 mkdir -p "$SOLRPC_DIR"
 cat >"$SOLRPC_DIR/server.js" <<'JS'
@@ -234,13 +209,11 @@ app.post('/', async (req,res)=>{
 const port=process.env.PORT||12713;
 app.listen(port,'127.0.0.1',()=>console.log('solrpc-proxy listening',port));
 JS
-
 cat >/etc/systemd/system/wolverine-solrpc-proxy.service <<EOF
 [Unit]
 Description=Wolverine Solana RPC Proxy (CORS-safe)
 After=network-online.target
 Wants=network-online.target
-
 [Service]
 Type=simple
 WorkingDirectory=$SOLRPC_DIR
@@ -250,46 +223,33 @@ ExecStart=/usr/bin/node $SOLRPC_DIR/server.js
 Restart=always
 RestartSec=1
 User=root
-
 [Install]
 WantedBy=multi-user.target
 EOF
-
 systemctl daemon-reload
 systemctl enable --now wolverine-solrpc-proxy.service >/dev/null 2>&1 || true
 systemctl restart wolverine-solrpc-proxy.service
 
-say "10) Ensure Vault API (127.0.0.1:${VAULT_PORT}) is running"
+say "10) Vault API (127.0.0.1:3010)"
 VAULT_DIR="/opt/traderone-vault-api"
 mkdir -p "$VAULT_DIR/vaults"
 chmod 700 "$VAULT_DIR" "$VAULT_DIR/vaults" || true
 (cd "$VAULT_DIR" && [ -f package.json ] || npm init -y >/dev/null 2>&1)
 (cd "$VAULT_DIR" && npm i express bs58 @solana/web3.js >/dev/null 2>&1)
-
 cat >"$VAULT_DIR/server.js" <<'JS'
 const fs=require('fs'),path=require('path');
 const express=require('express');
 const bs58=require('bs58');
 const {Keypair}=require('@solana/web3.js');
-
 const app=express();
 app.use(express.json({limit:'1mb'}));
-
-const ROOT=__dirname;
-const VAULTS=path.join(ROOT,'vaults');
-const MAP=path.join(ROOT,'map.json');
-
+const ROOT=__dirname, VAULTS=path.join(ROOT,'vaults'), MAP=path.join(ROOT,'map.json');
 function loadMap(){ try{return JSON.parse(fs.readFileSync(MAP,'utf8'))}catch(e){return {}} }
 function saveMap(m){ fs.writeFileSync(MAP, JSON.stringify(m,null,2), {mode:0o600}); }
-
 app.get('/health',(req,res)=>res.json({ok:true}));
-app.get('/vault',(req,res)=>{
-  const user=(req.query.userPub||'').toString();
-  const m=loadMap();
-  res.json({ok:true,userPub:user||null,vaultPub:(user && m[user])?m[user]:null});
-});
+app.get('/vault',(req,res)=>{ const user=String(req.query.userPub||''); const m=loadMap(); res.json({ok:true,userPub:user||null,vaultPub:(user && m[user])?m[user]:null}); });
 app.post('/create',(req,res)=>{
-  const user=(req.body && req.body.userPub)?String(req.body.userPub):'';
+  const user=String((req.body&&req.body.userPub)||'');
   const m=loadMap();
   if(user && m[user]) return res.json({ok:true,userPub:user,vaultPub:m[user],existing:true});
   const kp=Keypair.generate();
@@ -299,17 +259,14 @@ app.post('/create',(req,res)=>{
   if(user){ m[user]=vaultPub; saveMap(m); }
   res.json({ok:true,userPub:user||null,vaultPub,existing:false});
 });
-
 const port=process.env.PORT||3010;
 app.listen(port,'127.0.0.1',()=>console.log('vault-api listening',port));
 JS
-
 cat >/etc/systemd/system/traderone-vault-api.service <<EOF
 [Unit]
 Description=TraderOne Vault API (AQUILA)
 After=network-online.target
 Wants=network-online.target
-
 [Service]
 Type=simple
 WorkingDirectory=$VAULT_DIR
@@ -318,22 +275,19 @@ ExecStart=/usr/bin/node $VAULT_DIR/server.js
 Restart=always
 RestartSec=1
 User=root
-
 [Install]
 WantedBy=multi-user.target
 EOF
-
 systemctl daemon-reload
 systemctl enable --now traderone-vault-api.service >/dev/null 2>&1 || true
 systemctl restart traderone-vault-api.service
 
-say "11) Ensure TraderOne API wrapper (127.0.0.1:${TRADERONE_PORT}) is running"
+say "11) TraderOne API wrapper (127.0.0.1:3000)"
 TR_DIR="/opt/traderone-api"
 mkdir -p "$TR_DIR"
 chmod 700 "$TR_DIR" || true
 (cd "$TR_DIR" && [ -f package.json ] || npm init -y >/dev/null 2>&1)
 (cd "$TR_DIR" && npm i express >/dev/null 2>&1)
-
 cat >"$TR_DIR/server.js" <<'JS'
 const express=require('express');
 const app=express();
@@ -346,13 +300,11 @@ app.post('/start',(req,res)=>res.json({ok:true,received:req.body||null}));
 const port=process.env.PORT||3000;
 app.listen(port,'127.0.0.1',()=>console.log('traderone-api listening',port));
 JS
-
 cat >/etc/systemd/system/traderone-api.service <<EOF
 [Unit]
 Description=TraderOne API (wrapper stable)
 After=network-online.target
 Wants=network-online.target
-
 [Service]
 Type=simple
 WorkingDirectory=$TR_DIR
@@ -361,11 +313,9 @@ ExecStart=/usr/bin/node $TR_DIR/server.js
 Restart=always
 RestartSec=1
 User=root
-
 [Install]
 WantedBy=multi-user.target
 EOF
-
 systemctl daemon-reload
 systemctl enable --now traderone-api.service >/dev/null 2>&1 || true
 systemctl restart traderone-api.service
@@ -380,18 +330,18 @@ chattr +i "$VHOST" 2>/dev/null || true
 chattr +i "$INC" 2>/dev/null || true
 
 say "14) Tests (public)"
-echo "== UI =="
-curl -sS -o /dev/null -w "HTTP %{http_code}\n" "https://${DOMAIN}/wolverine/" || true
-echo "== vendor web3 =="
-curl -sS -o /dev/null -w "HTTP %{http_code} (%{content_type})\n" "https://${DOMAIN}/wolverine/vendor/solana-web3.min.js" || true
-echo "== solana-rpc health =="
-curl -sS "https://${DOMAIN}/wolverine/solana-rpc/health" || true; echo
-echo "== vault health =="
-curl -sS "https://${DOMAIN}/wolverine/vault/api/health" || true; echo
-echo "== traderone health =="
-curl -sS "https://${DOMAIN}/wolverine/traderone/api/health" || true; echo
-
+echo "== UI =="; curl -sS -o /dev/null -w "HTTP %{http_code}\n" "https://${DOMAIN}/wolverine/" || true
+echo "== vendor web3 =="; curl -sS -o /dev/null -w "HTTP %{http_code} (%{content_type})\n" "https://${DOMAIN}/wolverine/vendor/solana-web3.min.js" || true
+echo "== solana-rpc health =="; curl -sS "https://${DOMAIN}/wolverine/solana-rpc/health" || true; echo
+echo "== vault health =="; curl -sS "https://${DOMAIN}/wolverine/vault/api/health" || true; echo
+echo "== traderone health =="; curl -sS "https://${DOMAIN}/wolverine/traderone/api/health" || true; echo
 say "DONE: open https://${DOMAIN}/wolverine/ (Ctrl+F5)"
+SCRIPT
+
+chmod +x "$OUT"
+
+echo "[*] 3) Run rebuilt script"
+"$OUT"
 BASH
-chmod +x /root/MEGA_WOLVERINE_FIX_AQUILA_FINAL.sh
-/root/MEGA_WOLVERINE_FIX_AQUILA_FINAL.sh
+chmod +x /root/MEGA_WOLVERINE_FIX_AQUILA_PATCH_EOF.sh
+/root/MEGA_WOLVERINE_FIX_AQUILA_PATCH_EOF.sh
