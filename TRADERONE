@@ -1,107 +1,242 @@
-bash -lc 'set -euo pipefail
+bash -lc 'cat > /root/TO_UI_REAL_DEPLOY.sh <<'"'"'BASH'"'"'
+#!/usr/bin/env bash
+set -euo pipefail
 TS="$(date +%Y%m%d_%H%M%S)"
-LOG="/root/TO_HEART_${TS}.log"
-OUT="/root/TO_HEART_${TS}"
-mkdir -p "$OUT"
+LOG="/root/TO_UI_REAL_DEPLOY_${TS}.log"
 exec > >(tee -a "$LOG") 2>&1
 
 say(){ echo; echo "== $* =="; }
 
-WEBROOT="/var/www/wolverine"
 HOST="fireinners.online"
+WEBROOT="/var/www/wolverine"
+REPO="/opt/wolverine"
+NGINX_INC="/etc/nginx/includes/wolverine_routes.inc"
+SITES_EN="/etc/nginx/sites-enabled"
+SITES_AV="/etc/nginx/sites-available"
+SSL_VHOST="${SITES_AV}/fireinners.online-ssl"
+SSL_EN="${SITES_EN}/fireinners.online-ssl"
+
 API_LOCAL="http://127.0.0.1:3000"
 API_PUBLIC="https://${HOST}/wolverine/traderone/api"
-SAVE_HEART="/root/traderone_heart.txt"
+BADGE_PUBLIC="https://${HOST}/wolverine/_wolverine_ok.txt"
+
+OUT_LATEST="$(ls -1dt /root/TO_HEART_* 2>/dev/null | head -n 1 || true)"
 
 say "0) Context"
 hostnamectl 2>/dev/null | sed -n "1,6p" || true
 date || true
+echo "LOG=$LOG"
+echo "OUT_LATEST=${OUT_LATEST:-none}"
+echo "WEBROOT=$WEBROOT"
+echo "REPO=$REPO"
 
-say "1) Ports + PID 3000 + cmdline/cwd/exe"
-ss -lntp | egrep "(:80|:443|:3000)\b" || true
-PID3000="$(ss -lntp 2>/dev/null | awk "/:3000[[:space:]]/ && /users:/ {gsub(/.*pid=/,\"\",\$0); gsub(/,.*/,\"\",\$0); print \$0; exit}")"
-echo "PID3000=${PID3000:-none}"
-if [ -n "${PID3000:-}" ] && [ -d "/proc/$PID3000" ]; then
-  tr "\0" " " < "/proc/$PID3000/cmdline" || true; echo
-  readlink -f "/proc/$PID3000/cwd" || true
-  readlink -f "/proc/$PID3000/exe" || true
-  ps -fp "$PID3000" || true
-fi
+say "1) Quick health (backend local/public)"
+curl -sS -i "$API_LOCAL/health" | head -n 40 || true
+curl -sS -i "$API_PUBLIC/health" | head -n 40 || true
 
-say "2) Locate TraderOne code on disk (fast search)"
-CANDS=(/opt/traderone /opt/traderone-opt /opt/traderone-vault /opt/wolverine /opt/fireinners /root/traderone /root/wolverine)
-> "$OUT/candidates.txt"
-for d in "${CANDS[@]}"; do [ -d "$d" ] && echo "$d" >> "$OUT/candidates.txt"; done
-cat "$OUT/candidates.txt" || true
-
-> "$OUT/hits.txt"
-for d in $(cat "$OUT/candidates.txt" 2>/dev/null || true); do
-  echo "## $d" >> "$OUT/hits.txt"
-  find "$d" -maxdepth 6 -type f \( -name package.json -o -name server.cjs -o -name server.js -o -name index.js -o -name app.js \) 2>/dev/null | head -n 80 >> "$OUT/hits.txt" || true
-  find "$d" -maxdepth 6 -type f -iname "*trader*one*" 2>/dev/null | head -n 80 >> "$OUT/hits.txt" || true
-done
-sed -n "1,260p" "$OUT/hits.txt" || true
-
-say "3) HEART_DIR (prefer the process cwd if PID found)"
-HEART=""
-if [ -n "${PID3000:-}" ] && [ -d "/proc/$PID3000" ]; then HEART="$(readlink -f "/proc/$PID3000/cwd" 2>/dev/null || true)"; fi
-if [ -z "$HEART" ]; then
-  # best guess: first directory containing package.json under /opt/traderone
-  if [ -f /opt/traderone/package.json ]; then HEART="/opt/traderone"; fi
-fi
-echo "HEART_DIR=$HEART" | tee "$SAVE_HEART"
-
-if [ -n "$HEART" ] && [ -f "$HEART/package.json" ]; then
-  say "3.1) package.json (name/main/scripts)"
-  node -e "const p=require(\"$HEART/package.json\"); console.log(JSON.stringify({name:p.name,main:p.main,scripts:p.scripts},null,2));" 2>/dev/null || true
-fi
-
-say "4) API checks (local + public)"
-curl -sS -i "$API_LOCAL/health" | head -n 80 || true
-curl -sS -i "$API_PUBLIC/health" | head -n 80 || true
-
-say "5) Frontend served now"
-if [ -f "$WEBROOT/index.html" ]; then
-  ls -la "$WEBROOT/index.html"
-  head -n 40 "$WEBROOT/index.html" | sed "s/\t/  /g"
-else
-  echo "MISSING $WEBROOT/index.html"
-fi
-
-say "6) Detect STUB"
+say "2) Detect current frontend is stub?"
 STUB="0"
 if [ -f "$WEBROOT/index.html" ] && grep -qiE "UI stub|Coming soon|Not connected|TraderOne" "$WEBROOT/index.html"; then STUB="1"; fi
 echo "FRONT_STUB=$STUB"
+if [ -f "$WEBROOT/index.html" ]; then head -n 40 "$WEBROOT/index.html" || true; fi
 
-say "7) Locate real Next export (search _next/static)"
+say "3) Find a REAL Next static export on disk"
 REAL=""
-for base in /opt/wolverine /opt/fireinners/frontend-react/app/dist/wolverine /opt/fireinners/frontend-react/app/dist /var/www/wolverine /opt/fireinners /root; do
-  [ -d "$base" ] || continue
-  hit="$(find "$base" -maxdepth 5 -type d -path "*/_next/static" 2>/dev/null | head -n 1 || true)"
-  if [ -n "$hit" ]; then
-    rootdir="$(dirname "$(dirname "$hit")")"
-    [ -f "$rootdir/index.html" ] && REAL="$rootdir" && break
-  fi
-done
-echo "REAL_FRONT_ROOT=$REAL"
+# 3a) if last TO_HEART run already found something, reuse it
+if [ -n "${OUT_LATEST:-}" ] && [ -f "$OUT_LATEST/deploy.txt" ]; then
+  REAL="$(awk -F= "/DEPLOYED_REAL_FRONT_FROM=/{print \$2}" "$OUT_LATEST/deploy.txt" | tail -n 1 || true)"
+fi
+# 3b) scan typical locations for _next/static + index.html
+if [ -z "$REAL" ]; then
+  for base in /opt/wolverine /opt/fireinners/frontend-react/app/dist/wolverine /opt/fireinners/frontend-react/app/dist /opt/fireinners /var/www/wolverine /root; do
+    [ -d "$base" ] || continue
+    hit="$(find "$base" -maxdepth 6 -type d -path "*/_next/static" 2>/dev/null | head -n 1 || true)"
+    if [ -n "$hit" ]; then
+      rootdir="$(dirname "$(dirname "$hit")")"
+      [ -f "$rootdir/index.html" ] && REAL="$rootdir" && break
+    fi
+  done
+fi
+echo "REAL_FRONT_ROOT=${REAL:-none}"
 
-say "8) If stub and REAL found -> deploy into /var/www/wolverine"
-if [ "$STUB" = "1" ] && [ -n "$REAL" ] && [ -d "$REAL" ]; then
+say "4) If stub and REAL found -> deploy REAL into /var/www/wolverine"
+if [ "$STUB" = "1" ] && [ -n "${REAL:-}" ] && [ -d "$REAL" ] && [ -f "$REAL/index.html" ]; then
   BK="/root/WOLV_FRONT_BAK_${TS}"
   mkdir -p "$BK"
   tar -czf "$BK/webroot.tgz" -C "$WEBROOT" . 2>/dev/null || true
+  echo "Backup: $BK/webroot.tgz"
+  # keep vendor served locally
   rsync -a --delete --exclude "vendor/" "$REAL/" "$WEBROOT/"
   if [ -d "$REAL/vendor" ]; then mkdir -p "$WEBROOT/vendor"; rsync -a "$REAL/vendor/" "$WEBROOT/vendor/"; fi
-  echo "DEPLOYED_REAL_FRONT_FROM=$REAL" | tee "$OUT/deploy.txt"
+  echo "DEPLOY_OK_FROM_REAL=$REAL"
 fi
 
-say "9) Nginx reload + smoke tests"
-nginx -t || true
-systemctl reload nginx || systemctl restart nginx || true
-curl -sS -I "https://${HOST}/wolverine/" | head -n 30 || true
-tail -n 80 /var/log/nginx/error.log 2>/dev/null || true
+say "5) If still stub OR no REAL -> build/export from /opt/wolverine then deploy"
+# re-check stub after possible deploy
+STUB2="0"
+if [ -f "$WEBROOT/index.html" ] && grep -qiE "UI stub|Coming soon|Not connected|UI stub" "$WEBROOT/index.html"; then STUB2="1"; fi
+if [ "$STUB2" = "1" ] || [ -z "${REAL:-}" ]; then
+  if [ ! -d "$REPO" ]; then
+    echo "ERROR: Missing repo $REPO"
+    exit 1
+  fi
 
-say "DONE"
+  say "5.1) Repo snapshot + pull (safe)"
+  cd "$REPO"
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 && (git status --porcelain || true) || true
+  git rev-parse --abbrev-ref HEAD 2>/dev/null || true
+  git log -1 --oneline 2>/dev/null || true
+  git fetch --all --prune 2>/dev/null || true
+  # do not hard reset blindly; just try pull if clean
+  if [ -z "$(git status --porcelain 2>/dev/null || true)" ]; then
+    git pull --rebase 2>/dev/null || true
+  fi
+
+  say "5.2) Detect package manager"
+  PM="npm"
+  if [ -f pnpm-lock.yaml ]; then PM="pnpm"; fi
+  if [ -f yarn.lock ]; then PM="yarn"; fi
+  if [ -f package-lock.json ]; then PM="npm"; fi
+  echo "PM=$PM"
+
+  say "5.3) Install deps"
+  if [ "$PM" = "pnpm" ]; then
+    corepack enable >/dev/null 2>&1 || true
+    pnpm -v >/dev/null 2>&1 || npm i -g pnpm >/dev/null 2>&1 || true
+    pnpm install --frozen-lockfile || pnpm install
+  elif [ "$PM" = "yarn" ]; then
+    corepack enable >/dev/null 2>&1 || true
+    yarn -v >/dev/null 2>&1 || npm i -g yarn >/dev/null 2>&1 || true
+    yarn install --frozen-lockfile || yarn install
+  else
+    npm ci || npm install
+  fi
+
+  say "5.4) Build/export Next (best-effort, no prompt)"
+  OUTDIR=""
+  # 1) prefer scripts if present
+  HAS_EXPORT="$(node -e "const p=require(\"./package.json\");console.log(p.scripts&&p.scripts.export?\"1\":\"0\")" 2>/dev/null || echo 0)"
+  HAS_BUILD="$(node -e "const p=require(\"./package.json\");console.log(p.scripts&&p.scripts.build?\"1\":\"0\")" 2>/dev/null || echo 0)"
+  if [ "$PM" = "pnpm" ]; then
+    [ "$HAS_BUILD" = "1" ] && pnpm run build || npx next build || true
+    if [ "$HAS_EXPORT" = "1" ]; then pnpm run export || true; fi
+  elif [ "$PM" = "yarn" ]; then
+    [ "$HAS_BUILD" = "1" ] && yarn build || npx next build || true
+    if [ "$HAS_EXPORT" = "1" ]; then yarn export || true; fi
+  else
+    [ "$HAS_BUILD" = "1" ] && npm run build || npx next build || true
+    if [ "$HAS_EXPORT" = "1" ]; then npm run export || true; fi
+  fi
+
+  # 2) common export outputs
+  if [ -d "$REPO/out" ] && [ -f "$REPO/out/index.html" ]; then OUTDIR="$REPO/out"; fi
+  if [ -z "$OUTDIR" ] && [ -d "$REPO/dist" ] && [ -f "$REPO/dist/index.html" ]; then OUTDIR="$REPO/dist"; fi
+  if [ -z "$OUTDIR" ] && [ -d "$REPO/.next" ]; then
+    # if no export directory, try next export explicitly
+    npx next export -o out >/dev/null 2>&1 || true
+    [ -d "$REPO/out" ] && [ -f "$REPO/out/index.html" ] && OUTDIR="$REPO/out"
+  fi
+
+  echo "OUTDIR=${OUTDIR:-none}"
+  if [ -z "$OUTDIR" ]; then
+    echo "ERROR: Build/export did not produce a static directory (out/dist) with index.html"
+    echo "Check $LOG"
+    exit 1
+  fi
+
+  say "5.5) Deploy built export into /var/www/wolverine (keep vendor)"
+  BK="/root/WOLV_FRONT_BAK_${TS}"
+  mkdir -p "$BK"
+  tar -czf "$BK/webroot.tgz" -C "$WEBROOT" . 2>/dev/null || true
+  rsync -a --delete --exclude "vendor/" "$OUTDIR/" "$WEBROOT/"
+  echo "DEPLOY_OK_FROM_BUILD=$OUTDIR"
+fi
+
+say "6) Nginx include: ensure /wolverine/traderone/api redirect + proxy exists"
+# Make include file if missing
+mkdir -p "$(dirname "$NGINX_INC")"
+touch "$NGINX_INC"
+# unlock immutables best-effort
+chattr -i "$NGINX_INC" /etc/nginx/nginx.conf "$SSL_VHOST" 2>/dev/null || true
+
+# Ensure redirect for missing trailing slash on /wolverine/traderone/api -> /wolverine/traderone/api/
+if ! grep -qE "location\s*=\s*/wolverine/traderone/api\s*\{" "$NGINX_INC"; then
+  cat >> "$NGINX_INC" <<'"'"'NG'"'"'
+
+# --- TraderOne API prefix (force trailing slash) ---
+location = /wolverine/traderone/api { return 301 /wolverine/traderone/api/; }
+NG
+fi
+
+# Ensure proxy block
+if ! grep -qE "location\s+\^~\s+/wolverine/traderone/api/" "$NGINX_INC"; then
+  cat >> "$NGINX_INC" <<'"'"'NG'"'"'
+
+# --- TraderOne API proxy ---
+location ^~ /wolverine/traderone/api/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  proxy_set_header Upgrade $http_upgrade;
+  proxy_set_header Connection "upgrade";
+  proxy_pass http://127.0.0.1:3000/;
+}
+NG
+fi
+
+# Ensure static route for /wolverine
+# (assume main vhost already roots /opt/fireinners/frontend-react/app/dist; but we serve /var/www/wolverine via alias)
+if ! grep -qE "location\s+\^~\s+/wolverine/" "$NGINX_INC"; then
+  cat >> "$NGINX_INC" <<'"'"'NG'"'"'
+
+# --- Wolverine static ---
+location ^~ /wolverine/ {
+  alias /var/www/wolverine/;
+  try_files $uri $uri/ /wolverine/index.html;
+}
+NG
+fi
+
+say "7) Fix duplicate :80 server_name fireinners.online (best-effort: disable extra listen 80 in SSL vhost only)"
+# If SSL vhost mistakenly has :80 listens, remove them (keep 443 only)
+if [ -f "$SSL_VHOST" ]; then
+  cp -a "$SSL_VHOST" "${SSL_VHOST}.bak_${TS}" || true
+  python3 - <<PY || true
+from pathlib import Path
+p=Path("$SSL_VHOST")
+s=p.read_text(errors="ignore").splitlines(True)
+out=[]
+for line in s:
+    if "listen" in line and ":80" in line:
+        continue
+    out.append(line)
+p.write_text("".join(out))
+print("OK: removed listen :80 lines from", p)
+PY
+fi
+
+say "8) Reload nginx + smoke tests"
+nginx -t
+systemctl reload nginx || systemctl restart nginx
+
+echo
+echo "-- Public badge --"
+curl -sS -i "$BADGE_PUBLIC" | head -n 30 || true
+echo
+echo "-- Public API health --"
+curl -sS -i "$API_PUBLIC/health" | head -n 40 || true
+echo
+echo "-- Public /wolverine/ HEAD --"
+curl -sS -I "https://${HOST}/wolverine/" | head -n 30 || true
+
+say "9) Check if stub still present after deploy"
+STUB3="0"
+if [ -f "$WEBROOT/index.html" ] && grep -qiE "UI stub|Coming soon|Not connected" "$WEBROOT/index.html"; then STUB3="1"; fi
+echo "FRONT_STUB_AFTER=$STUB3"
 echo "LOG=$LOG"
-echo "OUT=$OUT"
-echo "HEART=$SAVE_HEART"'
+echo "DONE"
+BASH
+chmod +x /root/TO_UI_REAL_DEPLOY.sh
+/root/TO_UI_REAL_DEPLOY.sh'
