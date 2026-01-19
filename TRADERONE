@@ -1,8 +1,8 @@
-bash -lc 'cat >/root/MEGA_WOLVERINE_SSL_FIX_AND_TEST.sh <<'"'"'BASH'"'"'
+bash -lc 'cat >/root/MEGA_WOLVERINE_SSL_CONFD_FIX_AND_TEST.sh <<'"'"'BASH'"'"'
 #!/usr/bin/env bash
 set -euo pipefail
 TS="$(date +%Y%m%d_%H%M%S)"
-LOG="/root/MEGA_WOLVERINE_SSL_FIX_AND_TEST_${TS}.log"
+LOG="/root/MEGA_WOLVERINE_SSL_CONFD_FIX_AND_TEST_${TS}.log"
 exec > >(tee -a "$LOG") 2>&1
 
 HOST="fireinners.online"
@@ -11,8 +11,7 @@ BADGE_REL="/wolverine/_wolverine_ok.txt"
 BADGE_FILE="${WEBROOT}/_wolverine_ok.txt"
 
 INC="/etc/nginx/includes/wolverine_routes.inc"
-VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
-VHOST_EN="/etc/nginx/sites-enabled/fireinners.online-ssl"
+CONF="/etc/nginx/conf.d/000-${HOST}-ssl.conf"
 
 BACKUP_DIR="/root/wolverine_backups"
 mkdir -p "$BACKUP_DIR"
@@ -22,12 +21,11 @@ say(){ echo "== $* =="; }
 
 unlock_if_immutable(){
   local f="$1"
-  if [ -e "$f" ]; then
-    if lsattr -d "$f" 2>/dev/null | grep -q "i-"; then
-      echo "immutable: $f -> chattr -i"
-      chattr -i "$f" || true
-      echo "$f" >> "${BACKUP_DIR}/_relock_${TS}.lst"
-    fi
+  [ -e "$f" ] || return 0
+  if lsattr -d "$f" 2>/dev/null | grep -q "i-"; then
+    echo "immutable: $f -> chattr -i"
+    chattr -i "$f" || true
+    echo "$f" >> "${BACKUP_DIR}/_relock_${TS}.lst"
   fi
 }
 relock_all(){
@@ -39,51 +37,18 @@ relock_all(){
     chattr +i "$f" || true
   done <"$lst"
 }
-
 backup_file(){
   local f="$1"
   [ -e "$f" ] || return 0
-  local base
-  base="$(basename "$f")"
+  local base; base="$(basename "$f")"
   cp -a "$f" "${BACKUP_DIR}/${base}.bak_${TS}" || true
 }
 
-discover_ui_source(){
-  # Cherche un index.html “Wolverine” en priorité dans /opt (exports), puis backups
-  local cand=""
-  for p in \
-    "/opt/WOLVERINE1_export/ui/index.html" \
-    "/opt/wolverine/index.html" \
-    "/opt/fireinners/WOLVERINE/index.html" \
-    "/opt/fireinners/frontend-react/app/dist/wolverine/index.html" \
-    ; do
-    if [ -f "$p" ]; then cand="$p"; break; fi
-  done
-  if [ -z "$cand" ]; then
-    cand="$(grep -RIl --exclude-dir=node_modules --exclude-dir=.git -m1 "Wolverine" /opt 2>/dev/null | grep -E "/index\.html$" | head -n1 || true)"
-  fi
-  echo "$cand"
-}
-
-restore_webroot_if_missing(){
-  say "Webroot check"
-  mkdir -p "$WEBROOT"
-  if [ ! -f "${WEBROOT}/index.html" ]; then
-    echo "index.html is MISSING in ${WEBROOT} -> attempting restore"
-    local src
-    src="$(discover_ui_source)"
-    if [ -n "$src" ] && [ -f "$src" ]; then
-      local srcdir
-      srcdir="$(dirname "$src")"
-      echo "Found UI source dir: $srcdir"
-      echo "Restoring: $srcdir/* -> $WEBROOT/"
-      rsync -a --delete "$srcdir"/ "$WEBROOT"/
-    else
-      echo "No UI source found. (Cannot restore index.html automatically.)"
-    fi
-  else
-    echo "index.html exists: ${WEBROOT}/index.html"
-  fi
+find_cert(){
+  local d=""
+  if [ -d "/etc/letsencrypt/live/${HOST}" ]; then d="/etc/letsencrypt/live/${HOST}"; fi
+  if [ -z "$d" ]; then d="$(ls -d /etc/letsencrypt/live/${HOST}* 2>/dev/null | head -n1 || true)"; fi
+  echo "$d"
 }
 
 ensure_badge(){
@@ -94,18 +59,18 @@ ensure_badge(){
 
 write_inc(){
   say "Write nginx include (Wolverine routes)"
+  mkdir -p /etc/nginx/includes
   unlock_if_immutable "$INC"
   backup_file "$INC"
   cat >"$INC" <<EOF
-# AUTO-GENERATED ${TS} (MEGA_WOLVERINE_SSL_FIX_AND_TEST)
-# Wolverine static
+# AUTO-GENERATED ${TS} (MEGA_WOLVERINE_SSL_CONFD_FIX_AND_TEST)
 location = /wolverine/_wolverine_ok.txt { alias ${WEBROOT}/_wolverine_ok.txt; add_header Cache-Control "no-store" always; }
+
 location ^~ /wolverine/_next/ { alias ${WEBROOT}/_next/; try_files \$uri =404; add_header Cache-Control "no-store" always; }
 location = /wolverine/sw.js { add_header Cache-Control "no-store" always; return 404; }
 location = /wolverine/service-worker.js { add_header Cache-Control "no-store" always; return 404; }
 location = /wolverine/manifest.json { add_header Cache-Control "no-store" always; return 404; }
 
-# TraderOne API proxy (preferred path)
 location ^~ /wolverine/traderone/api/ {
   proxy_http_version 1.1;
   proxy_set_header Host \$host;
@@ -119,7 +84,6 @@ location ^~ /wolverine/traderone/api/ {
   proxy_pass http://127.0.0.1:3000/;
 }
 
-# Compatibility path (/wolverine/api/)
 location ^~ /wolverine/api/ {
   proxy_http_version 1.1;
   proxy_set_header Host \$host;
@@ -133,36 +97,24 @@ location ^~ /wolverine/api/ {
   proxy_pass http://127.0.0.1:3000/;
 }
 
-# Static root
 location ^~ /wolverine/ { alias ${WEBROOT}/; try_files \$uri \$uri/ /wolverine/index.html; add_header Cache-Control "no-store" always; }
 EOF
 }
 
-find_cert(){
-  local d=""
-  if [ -d "/etc/letsencrypt/live/${HOST}" ]; then d="/etc/letsencrypt/live/${HOST}"; fi
-  if [ -z "$d" ]; then
-    d="$(ls -d /etc/letsencrypt/live/${HOST}* 2>/dev/null | head -n1 || true)"
-  fi
-  echo "$d"
-}
-
-ensure_vhost_ssl(){
-  say "Ensure nginx SSL vhost"
-  unlock_if_immutable "$VHOST"
-  unlock_if_immutable "/etc/nginx/nginx.conf"
-  backup_file "$VHOST"
-
-  local certdir
-  certdir="$(find_cert)"
+write_conf(){
+  say "Write conf.d SSL vhost (no symlink)"
+  local certdir; certdir="$(find_cert)"
   if [ -z "$certdir" ] || [ ! -f "${certdir}/fullchain.pem" ] || [ ! -f "${certdir}/privkey.pem" ]; then
-    echo "No LetsEncrypt cert found for ${HOST}. SSL vhost cannot be safely built."
-    echo "You must have /etc/letsencrypt/live/${HOST}/fullchain.pem + privkey.pem."
+    echo "Missing LetsEncrypt cert for ${HOST} under /etc/letsencrypt/live/${HOST}*"
     exit 1
   fi
 
-  # Minimal SSL vhost that includes Wolverine routes (does not touch other locations)
-  cat >"$VHOST" <<EOF
+  unlock_if_immutable /etc/nginx/nginx.conf
+  unlock_if_immutable "$CONF"
+  backup_file "$CONF"
+
+  cat >"$CONF" <<EOF
+# AUTO-GENERATED ${TS} (MEGA_WOLVERINE_SSL_CONFD_FIX_AND_TEST)
 server {
   listen 80;
   server_name ${HOST};
@@ -176,92 +128,82 @@ server {
   ssl_certificate     ${certdir}/fullchain.pem;
   ssl_certificate_key ${certdir}/privkey.pem;
 
-  # baseline headers
   add_header X-Frame-Options SAMEORIGIN always;
   add_header X-Content-Type-Options nosniff always;
 
-  # include Wolverine routes
   include /etc/nginx/includes/wolverine_routes.inc;
 
-  # default fallback (do not break other site roots)
   location / { try_files \$uri \$uri/ =404; }
 }
 EOF
-
-  # Enable vhost
-  if [ ! -L "$VHOST_EN" ]; then
-    ln -sf "$VHOST" "$VHOST_EN"
-  fi
 }
 
 ensure_ufw_443(){
-  say "UFW check (443)"
+  say "UFW allow 443"
   if need ufw; then
     ufw status | grep -q "443/tcp" || ufw allow 443/tcp >/dev/null || true
   fi
 }
 
-nginx_reload(){
-  say "Nginx test + reload"
+reload_nginx(){
+  say "nginx -t + reload"
   nginx -t
   systemctl reload nginx
+}
+
+preflight(){
+  say "Listeners (80/443/3000)"
+  ss -lntp | egrep "(:80|:443|:3000)\b" || true
 }
 
 tests(){
   say "Tests"
   echo "-- A) Backend direct (must be JSON) --"
-  curl -sS -D- http://127.0.0.1:3000/health 2>/dev/null | head -n 40 || true
+  curl -sS -D- http://127.0.0.1:3000/health 2>/dev/null | head -n 50 || true
 
   echo
-  echo "-- B) Local nginx badge (must be 200 OK) --"
-  curl -sS -k -D- "https://127.0.0.1${BADGE_REL}" -H "Host: ${HOST}" 2>/dev/null | head -n 40 || true
+  echo "-- B) Local nginx badge (must be 200) --"
+  curl -sS -k -D- "https://127.0.0.1${BADGE_REL}" -H "Host: ${HOST}" 2>/dev/null | head -n 50 || true
 
   echo
-  echo "-- C) Local nginx API health via /wolverine/traderone/api (must be JSON, not HTML) --"
-  curl -sS -k -D- "https://127.0.0.1/wolverine/traderone/api/health" -H "Host: ${HOST}" 2>/dev/null | head -n 60 || true
+  echo "-- C) Local nginx API health (must be JSON) --"
+  curl -sS -k -D- "https://127.0.0.1/wolverine/traderone/api/health" -H "Host: ${HOST}" 2>/dev/null | head -n 80 || true
 
   echo
-  echo "-- D) Public badge (must be 200 OK) --"
-  curl -sS -D- "https://${HOST}${BADGE_REL}" 2>/dev/null | head -n 40 || true
+  echo "-- D) Public badge (must be 200) --"
+  curl -sS -D- "https://${HOST}${BADGE_REL}" 2>/dev/null | head -n 50 || true
 
   echo
   echo "-- E) Public API health (must be JSON) --"
-  curl -sS -D- "https://${HOST}/wolverine/traderone/api/health" 2>/dev/null | head -n 60 || true
+  curl -sS -D- "https://${HOST}/wolverine/traderone/api/health" 2>/dev/null | head -n 80 || true
 
   echo
-  echo "-- If errors: last nginx errors --"
-  tail -n 80 /var/log/nginx/error.log 2>/dev/null || true
-}
-
-preflight(){
-  say "Preflight listeners"
-  ss -lntp | egrep "(:80|:443|:3000)\b" || true
+  echo "-- nginx error tail --"
+  tail -n 120 /var/log/nginx/error.log 2>/dev/null || true
 }
 
 main(){
   say "START ${TS}"
   preflight
-
-  say "Backup webroot + nginx files"
+  say "Backups"
   tar -czf "${BACKUP_DIR}/wolverine_webroot_${TS}.tgz" -C /var/www wolverine 2>/dev/null || true
   backup_file "$INC"
-  backup_file "$VHOST"
+  backup_file "$CONF"
 
-  restore_webroot_if_missing
   ensure_badge
   write_inc
-  ensure_vhost_ssl
+  write_conf
   ensure_ufw_443
-  nginx_reload
+  reload_nginx
 
   preflight
   tests
 
   relock_all
-  say "DONE. LOG=${LOG}"
+  say "DONE LOG=${LOG}"
 }
 
 main
 BASH
-chmod +x /root/MEGA_WOLVERINE_SSL_FIX_AND_TEST.sh
-/root/MEGA_WOLVERINE_SSL_FIX_AND_TEST.sh'
+chmod +x /root/MEGA_WOLVERINE_SSL_CONFD_FIX_AND_TEST.sh
+/root/MEGA_WOLVERINE_SSL_CONFD_FIX_AND_TEST.sh'
