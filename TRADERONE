@@ -1,130 +1,47 @@
-cat >/root/MEGA_WOLVERINE_FIX_RPC_VAULT.sh<<'BASH'
+cat >/root/MEGA_WOLVERINE_FIX_VAULT_UI_ONEBOX.sh<<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 TS="$(date +%Y%m%d_%H%M%S)"
 HOST="fireinners.online"
-VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
+WEB="/var/www/wolverine"
+UI="$WEB/index.html"
 INC="/etc/nginx/includes/wolverine_routes.inc"
-WEBROOT="/var/www/wolverine"
-ASK="/opt/fireinners/sentinel/lib/askorupdate.sh"
+VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
 
 say(){ echo "[$(date +%H:%M:%S)] $*"; }
-have(){ command -v "$1" >/dev/null 2>&1; }
 bk(){ local f="$1"; [ -f "$f" ] && cp -a "$f" "$f.bak.$TS" || true; }
-unfreeze(){ local f="$1"; [ -e "$f" ] && chattr -i "$f" 2>/dev/null || true; }
-refreeze(){ local f="$1"; [ -e "$f" ] && chattr +i "$f" 2>/dev/null || true; }
+have(){ command -v "$1" >/dev/null 2>&1; }
 
 say "0) Savepoint (if available)"
 if [ -x /root/WOLVERINE_SAVEPOINT.sh ]; then /root/WOLVERINE_SAVEPOINT.sh || true; fi
 
 say "1) Preflight"
 have nginx || { apt-get update -y; apt-get install -y nginx curl; }
-have node || { say "ERROR: node is missing"; exit 1; }
+have node || { say "ERROR: node missing"; exit 1; }
+mkdir -p "$WEB" || true
 mkdir -p /etc/nginx/includes || true
-mkdir -p "$WEBROOT" || true
 
-say "2) Unfreeze nginx (ignore errors)"
-unfreeze /etc/nginx/nginx.conf
-unfreeze "$VHOST"
-for f in /etc/nginx/includes/*.inc; do unfreeze "$f"; done
-
-say "3) Detect VAULT port locally (best-effort)"
+say "2) Detect VAULT backend port (best-effort)"
 VAULT_PORT=""
 for p in 8787 8788 8789 8790 3001 3002 3100 3200; do
-  if curl -fsS "http://127.0.0.1:$p/health" 2>/dev/null | tr -d '\n' | grep -qi 'vault'; then
-    VAULT_PORT="$p"; break
-  fi
+  if curl -fsS "http://127.0.0.1:$p/health" 2>/dev/null | tr -d '\n' | grep -qi 'vault'; then VAULT_PORT="$p"; break; fi
 done
-if [ -z "${VAULT_PORT}" ]; then
-  for p in 8787 8788 8789 8790 3001 3002 3100 3200; do
-    if curl -fsS "http://127.0.0.1:$p/" 2>/dev/null | tr -d '\n' | grep -qi 'vault'; then
-      VAULT_PORT="$p"; break
-    fi
-  done
-fi
 VAULT_PORT="${VAULT_PORT:-8787}"
 say "VAULT_PORT=$VAULT_PORT"
 
-say "4) Restart services (ignore if missing)"
-systemctl reset-failed traderone-api.service 2>/dev/null || true
-systemctl reset-failed vault-api.service 2>/dev/null || true
-systemctl reset-failed traderone-vault-api.service 2>/dev/null || true
-systemctl restart traderone-api.service 2>/dev/null || true
-systemctl restart traderone-vault-api.service 2>/dev/null || true
-systemctl restart vault-api.service 2>/dev/null || true
-
-say "5) Write Wolverine nginx routes include (fix: /wolverine/solana-rpc POST 405, /wolverine/vault/api 301, /wolverine/traderone/api returning HTML)"
+say "3) Rewrite nginx include to force a SINGLE canonical Vault API"
 bk "$INC"
 cat >"$INC"<<EOF
-# AUTOGEN $TS - Wolverine routes
-# Goals:
-# - /wolverine/solana-rpc must accept POST (no 405) and proxy to DRPC
-# - /wolverine/vault/api/* must proxy (no 301 HTML)
-# - /wolverine/traderone/api must proxy to backend (no static index.html)
-# NOTE: keep specific ^~ locations BEFORE the generic /wolverine/ static location.
+# AUTOGEN $TS - Wolverine routes (canon vault api)
+# Canon:
+#   - UI will call: /wolverine/vault/api/health and /wolverine/vault/api/create
+#   - Nginx will proxy those to the vault backend ($VAULT_PORT) as /health and /create
 
-# ---- TraderOne API (backend on 127.0.0.1:3000) ----
-location ^~ /wolverine/traderone/api/ {
-  proxy_pass http://127.0.0.1:3000/;
-  proxy_http_version 1.1;
-  proxy_set_header Host \$host;
-  proxy_set_header X-Real-IP \$remote_addr;
-  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto \$scheme;
-  proxy_read_timeout 60s;
-}
-location = /wolverine/traderone/api {
-  proxy_pass http://127.0.0.1:3000/;
-  proxy_http_version 1.1;
-  proxy_set_header Host \$host;
-  proxy_set_header X-Real-IP \$remote_addr;
-  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto \$scheme;
-  proxy_read_timeout 60s;
-}
+# TraderOne API
+location ^~ /wolverine/traderone/api/ { proxy_pass http://127.0.0.1:3000/; proxy_http_version 1.1; proxy_set_header Host \$host; proxy_set_header X-Real-IP \$remote_addr; proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Proto \$scheme; proxy_read_timeout 60s; }
+location = /wolverine/traderone/api { proxy_pass http://127.0.0.1:3000/; proxy_http_version 1.1; proxy_set_header Host \$host; proxy_set_header X-Real-IP \$remote_addr; proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Proto \$scheme; proxy_read_timeout 60s; }
 
-# ---- Vault API aliases (local vault service port: $VAULT_PORT) ----
-location ^~ /wolverine/traderone/vault/ {
-  proxy_pass http://127.0.0.1:$VAULT_PORT/;
-  proxy_http_version 1.1;
-  proxy_set_header Host \$host;
-  proxy_set_header X-Real-IP \$remote_addr;
-  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto \$scheme;
-  proxy_read_timeout 60s;
-}
-location ^~ /wolverine/vault-api/ {
-  proxy_pass http://127.0.0.1:$VAULT_PORT/;
-  proxy_http_version 1.1;
-  proxy_set_header Host \$host;
-  proxy_set_header X-Real-IP \$remote_addr;
-  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto \$scheme;
-  proxy_read_timeout 60s;
-}
-# Critical: UI hits /wolverine/vault/api/* but nginx was replying 301 (directory redirect). Force proxy here.
-location ^~ /wolverine/vault/api/ {
-  proxy_pass http://127.0.0.1:$VAULT_PORT/;
-  proxy_http_version 1.1;
-  proxy_set_header Host \$host;
-  proxy_set_header X-Real-IP \$remote_addr;
-  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto \$scheme;
-  proxy_read_timeout 60s;
-}
-# Keep /wolverine/vault/* also mapped (health/create)
-location ^~ /wolverine/vault/ {
-  proxy_pass http://127.0.0.1:$VAULT_PORT/;
-  proxy_http_version 1.1;
-  proxy_set_header Host \$host;
-  proxy_set_header X-Real-IP \$remote_addr;
-  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto \$scheme;
-  proxy_read_timeout 60s;
-}
-
-# ---- Solana JSON-RPC proxy (browser -> VPS -> DRPC) ----
-# Fix: POST /wolverine/solana-rpc was 405 => route was not a proxy.
+# Solana RPC (POST)
 location = /wolverine/solana-rpc {
   proxy_pass https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac;
   proxy_ssl_server_name on;
@@ -135,8 +52,6 @@ location = /wolverine/solana-rpc {
   proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
   proxy_set_header X-Forwarded-Proto \$scheme;
   proxy_read_timeout 60s;
-
-  # (Optional) If any browser sends preflight
   if (\$request_method = OPTIONS) {
     add_header Access-Control-Allow-Origin "*" always;
     add_header Access-Control-Allow-Methods "POST, OPTIONS" always;
@@ -145,43 +60,85 @@ location = /wolverine/solana-rpc {
   }
 }
 
-# ---- Static Wolverine UI (must be LAST) ----
-location ^~ /wolverine/vendor/ { alias $WEBROOT/vendor/; access_log off; expires 7d; add_header Cache-Control "public"; }
-location ^~ /wolverine/ {
-  root /var/www;
-  try_files \$uri \$uri/ /wolverine/index.html;
-}
+# ---- CANON VAULT API ----
+# Canon endpoints expected by UI:
+#   GET  /wolverine/vault/api/health  -> backend /health
+#   POST /wolverine/vault/api/create  -> backend /create
+location = /wolverine/vault/api/health { proxy_pass http://127.0.0.1:$VAULT_PORT/health; proxy_http_version 1.1; proxy_set_header Host \$host; proxy_set_header X-Real-IP \$remote_addr; proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Proto \$scheme; proxy_read_timeout 60s; }
+location = /wolverine/vault/api/create { proxy_pass http://127.0.0.1:$VAULT_PORT/create; proxy_http_version 1.1; proxy_set_header Host \$host; proxy_set_header X-Real-IP \$remote_addr; proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Proto \$scheme; proxy_read_timeout 60s; }
+
+# Backward-compatible aliases (all funnel into canon)
+location ^~ /wolverine/traderone/vault/ { proxy_pass http://127.0.0.1:$VAULT_PORT/; proxy_http_version 1.1; proxy_set_header Host \$host; proxy_set_header X-Real-IP \$remote_addr; proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Proto \$scheme; proxy_read_timeout 60s; }
+location ^~ /wolverine/vault-api/ { proxy_pass http://127.0.0.1:$VAULT_PORT/; proxy_http_version 1.1; proxy_set_header Host \$host; proxy_set_header X-Real-IP \$remote_addr; proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Proto \$scheme; proxy_read_timeout 60s; }
+location ^~ /wolverine/vault/ { proxy_pass http://127.0.0.1:$VAULT_PORT/; proxy_http_version 1.1; proxy_set_header Host \$host; proxy_set_header X-Real-IP \$remote_addr; proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Proto \$scheme; proxy_read_timeout 60s; }
+
+# Static UI (last)
+location ^~ /wolverine/vendor/ { alias $WEB/vendor/; access_log off; expires 7d; add_header Cache-Control "public"; }
+location ^~ /wolverine/ { root /var/www; try_files \$uri \$uri/ /wolverine/index.html; }
 EOF
 
-say "6) Ensure vhost includes wolverine routes include"
+say "4) Ensure vhost includes wolverine_routes.inc"
 bk "$VHOST"
 if ! grep -qE "include\s+/etc/nginx/includes/wolverine_routes\.inc;" "$VHOST"; then
-  # insert include inside the server{} block (near top) safely
-  awk '
-    BEGIN{done=0}
-    {print}
-    !done && $0 ~ /server\s*\{/ {
-      print "    include /etc/nginx/includes/wolverine_routes.inc;";
-      done=1
-    }
-  ' "$VHOST" >"$VHOST.tmp.$TS"
+  awk 'BEGIN{done=0}{print}!done&&/server\s*\{/{print "    include /etc/nginx/includes/wolverine_routes.inc;";done=1}' "$VHOST" >"$VHOST.tmp.$TS"
   mv "$VHOST.tmp.$TS" "$VHOST"
 fi
 
-say "7) Nginx test + reload"
+say "5) UI: remove duplicate Vault box (keep first only) + force canon endpoint"
+if [ -f "$UI" ]; then
+  bk "$UI"
+
+  # (A) Force canon endpoints if strings exist
+  sed -i \
+    -e 's#/wolverine/traderone/vault/#/wolverine/vault/api/#g' \
+    -e 's#/wolverine/vault-api/#/wolverine/vault/api/#g' \
+    -e 's#/wolverine/vault/#/wolverine/vault/api/#g' \
+    "$UI" || true
+
+  # (B) Remove SECOND occurrence of the "Créer Vault + Déposer" section (best-effort)
+  # Strategy: keep first button/section, drop subsequent duplicated blocks around it.
+  # If markup differs, this won't break anything; it will just not remove.
+  python3 - <<'PY'
+import re, pathlib
+p=pathlib.Path("/var/www/wolverine/index.html")
+s=p.read_text(errors="ignore")
+needle="Créer Vault + Déposer"
+idx=[m.start() for m in re.finditer(re.escape(needle), s)]
+if len(idx)>=2:
+    # remove a window around the second occurrence
+    j=idx[1]
+    a=max(0, j-1200)
+    b=min(len(s), j+1800)
+    cut=s[a:b]
+    # try to cut from nearest preceding <div to nearest following </div> to reduce damage
+    pre=s.rfind("<div", 0, j)
+    post=s.find("</div>", j)
+    if pre!=-1 and post!=-1 and post-pre<8000:
+        s2=s[:pre]+s[post+6:]
+    else:
+        s2=s[:a]+s[b:]
+    p.write_text(s2)
+    print("Removed duplicate vault section (2nd occurrence).")
+else:
+    print("No duplicate vault section detected (or only one occurrence).")
+PY
+
+else
+  say "WARN: UI not found at $UI (skipping UI cleanup)"
+fi
+
+say "6) Reload nginx"
 nginx -t
 systemctl reload nginx
 
-say "8) Tests (public + local)"
-echo "== API should be JSON (not HTML) =="
-curl -fsS "https://$HOST/wolverine/traderone/api" | head -c 220; echo; echo
-echo "== solana-rpc POST should NOT be 405 =="
-curl -sS -X POST "https://$HOST/wolverine/solana-rpc" -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' | head -c 220; echo; echo
-echo "== vault/api/health should NOT be 301 HTML =="
-curl -i -sS "https://$HOST/wolverine/vault/api/health" | sed -n '1,12p'; echo
-echo "== vault/health (alias) =="
-curl -fsS "https://$HOST/wolverine/vault/health" | head -c 220; echo; echo
+say "7) Tests (must be JSON)"
+echo "== vault health (canon) =="
+curl -i -sS "https://$HOST/wolverine/vault/api/health" | sed -n '1,18p'
+echo
+echo "== vault create (canon, no body) =="
+curl -i -sS -X POST "https://$HOST/wolverine/vault/api/create" -H "Content-Type: application/json" --data '{}' | sed -n '1,24p'
+echo
 
-say "DONE. In browser: Ctrl+F5 on https://$HOST/wolverine then Connect Phantom -> Refresh (SOL/USDC) then click 'Créer Vault + Déposer'."
+say "DONE. Ctrl+F5 https://$HOST/wolverine then click 'Créer Vault + Déposer' once."
 BASH
-bash /root/MEGA_WOLVERINE_FIX_RPC_VAULT.sh
+bash /root/MEGA_WOLVERINE_FIX_VAULT_UI_ONEBOX.sh
