@@ -1,151 +1,187 @@
-python3 - <<'PY'
-s=r'''#!/usr/bin/env bash
+cat >/root/MEGA_WOLVERINE_FIX_RPC_VAULT.sh<<'BASH'
+#!/usr/bin/env bash
 set -euo pipefail
 TS="$(date +%Y%m%d_%H%M%S)"
-DOMAIN="fireinners.online"
-WEBROOT="/var/www/wolverine"
-INDEX="$WEBROOT/index.html"
+HOST="fireinners.online"
 VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
 INC="/etc/nginx/includes/wolverine_routes.inc"
-BK="/root/WOLVERINE_FIX_VAULTPATHS_${TS}"
-VAULT_UPSTREAM="http://127.0.0.1:3010/"
+WEBROOT="/var/www/wolverine"
+ASK="/opt/fireinners/sentinel/lib/askorupdate.sh"
 
-mkdir -p "$BK"
-log(){ echo "[$(date +%H:%M:%S)] $*"; }
+say(){ echo "[$(date +%H:%M:%S)] $*"; }
 have(){ command -v "$1" >/dev/null 2>&1; }
-unfreeze(){ [ -e "$1" ] && chattr -i "$1" 2>/dev/null || true; }
-backup(){ [ -e "$1" ] && cp -a "$1" "$BK/$(basename "$1").bak" 2>/dev/null || true; }
+bk(){ local f="$1"; [ -f "$f" ] && cp -a "$f" "$f.bak.$TS" || true; }
+unfreeze(){ local f="$1"; [ -e "$f" ] && chattr -i "$f" 2>/dev/null || true; }
+refreeze(){ local f="$1"; [ -e "$f" ] && chattr +i "$f" 2>/dev/null || true; }
 
-log "0) Savepoint (si dispo)"
+say "0) Savepoint (if available)"
 if [ -x /root/WOLVERINE_SAVEPOINT.sh ]; then /root/WOLVERINE_SAVEPOINT.sh || true; fi
 
-log "1) Préflight"
+say "1) Preflight"
 have nginx || { apt-get update -y; apt-get install -y nginx curl; }
-have curl || { apt-get update -y; apt-get install -y curl; }
+have node || { say "ERROR: node is missing"; exit 1; }
+mkdir -p /etc/nginx/includes || true
+mkdir -p "$WEBROOT" || true
 
-log "2) Backup + unfreeze"
-backup "$INC"; backup "$VHOST"; backup "$INDEX"
-unfreeze "$INC"; unfreeze "$VHOST"; unfreeze "$INDEX"
-for f in /etc/nginx/includes/wolverine*.inc /etc/nginx/includes/*.inc; do unfreeze "$f"; done
+say "2) Unfreeze nginx (ignore errors)"
+unfreeze /etc/nginx/nginx.conf
+unfreeze "$VHOST"
+for f in /etc/nginx/includes/*.inc; do unfreeze "$f"; done
 
-log "3) Lire INDEX et extraire chemins vault/aquila"
-if [ ! -f "$INDEX" ]; then
-  log "WARN: $INDEX introuvable. Je vais quand même poser les alias standards."
-  FOUND=""
-else
-  FOUND="$(grep -oE '\/wolverine\/[^"'\'' ]{0,200}' "$INDEX" 2>/dev/null | grep -iE '(vault|aquila)' | sort -u || true)"
+say "3) Detect VAULT port locally (best-effort)"
+VAULT_PORT=""
+for p in 8787 8788 8789 8790 3001 3002 3100 3200; do
+  if curl -fsS "http://127.0.0.1:$p/health" 2>/dev/null | tr -d '\n' | grep -qi 'vault'; then
+    VAULT_PORT="$p"; break
+  fi
+done
+if [ -z "${VAULT_PORT}" ]; then
+  for p in 8787 8788 8789 8790 3001 3002 3100 3200; do
+    if curl -fsS "http://127.0.0.1:$p/" 2>/dev/null | tr -d '\n' | grep -qi 'vault'; then
+      VAULT_PORT="$p"; break
+    fi
+  done
 fi
+VAULT_PORT="${VAULT_PORT:-8787}"
+say "VAULT_PORT=$VAULT_PORT"
 
-echo "=== PATHS DÉTECTÉS DANS INDEX (vault|aquila) ==="
-echo "${FOUND:-<aucun détecté>}"
-echo "==============================================="
+say "4) Restart services (ignore if missing)"
+systemctl reset-failed traderone-api.service 2>/dev/null || true
+systemctl reset-failed vault-api.service 2>/dev/null || true
+systemctl reset-failed traderone-vault-api.service 2>/dev/null || true
+systemctl restart traderone-api.service 2>/dev/null || true
+systemctl restart traderone-vault-api.service 2>/dev/null || true
+systemctl restart vault-api.service 2>/dev/null || true
 
-log "4) Construire liste d'alias à supporter (robuste)"
-# Aliases standards + ce qui est trouvé dans l'index
-CANDIDATES=$(
-  {
-    echo "/wolverine/vault/api"
-    echo "/wolverine/vault"
-    echo "/wolverine/vault-api"
-    echo "/wolverine/traderone/api/vault"
-    echo "/wolverine/traderone/vault"
-    echo "/wolverine/aquila/vault"
-    echo "/wolverine/aquila/api/vault"
-    echo "/wolverine/aquila/vault/api"
-    echo "/wolverine/aq/vault"
-    echo "/wolverine/aq/api/vault"
-    [ -n "${FOUND:-}" ] && echo "$FOUND" | sed 's/[?#].*$//'
-  } | sed 's/\/$//' | awk 'NF' | sort -u
-)
+say "5) Write Wolverine nginx routes include (fix: /wolverine/solana-rpc POST 405, /wolverine/vault/api 301, /wolverine/traderone/api returning HTML)"
+bk "$INC"
+cat >"$INC"<<EOF
+# AUTOGEN $TS - Wolverine routes
+# Goals:
+# - /wolverine/solana-rpc must accept POST (no 405) and proxy to DRPC
+# - /wolverine/vault/api/* must proxy (no 301 HTML)
+# - /wolverine/traderone/api must proxy to backend (no static index.html)
+# NOTE: keep specific ^~ locations BEFORE the generic /wolverine/ static location.
 
-echo "=== ALIASES QUI SERONT PROXIES VERS VAULT API (3010) ==="
-echo "$CANDIDATES"
-echo "========================================================"
+# ---- TraderOne API (backend on 127.0.0.1:3000) ----
+location ^~ /wolverine/traderone/api/ {
+  proxy_pass http://127.0.0.1:3000/;
+  proxy_http_version 1.1;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+  proxy_read_timeout 60s;
+}
+location = /wolverine/traderone/api {
+  proxy_pass http://127.0.0.1:3000/;
+  proxy_http_version 1.1;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+  proxy_read_timeout 60s;
+}
 
-log "5) Écrire/mettre à jour l'include NGINX (sans toucher au RPC qui marche)"
-cat > "$INC" <<'NGX'
-# Wolverine routes include (Vault aliases -> stable JSON Vault API on :3010)
-# IMPORTANT: ne touche pas solana-rpc existant ailleurs; ici on ne fait que mapper des chemins Vault/Aquila vers 3010.
+# ---- Vault API aliases (local vault service port: $VAULT_PORT) ----
+location ^~ /wolverine/traderone/vault/ {
+  proxy_pass http://127.0.0.1:$VAULT_PORT/;
+  proxy_http_version 1.1;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+  proxy_read_timeout 60s;
+}
+location ^~ /wolverine/vault-api/ {
+  proxy_pass http://127.0.0.1:$VAULT_PORT/;
+  proxy_http_version 1.1;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+  proxy_read_timeout 60s;
+}
+# Critical: UI hits /wolverine/vault/api/* but nginx was replying 301 (directory redirect). Force proxy here.
+location ^~ /wolverine/vault/api/ {
+  proxy_pass http://127.0.0.1:$VAULT_PORT/;
+  proxy_http_version 1.1;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+  proxy_read_timeout 60s;
+}
+# Keep /wolverine/vault/* also mapped (health/create)
+location ^~ /wolverine/vault/ {
+  proxy_pass http://127.0.0.1:$VAULT_PORT/;
+  proxy_http_version 1.1;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+  proxy_read_timeout 60s;
+}
 
-# UI static (au cas où)
+# ---- Solana JSON-RPC proxy (browser -> VPS -> DRPC) ----
+# Fix: POST /wolverine/solana-rpc was 405 => route was not a proxy.
+location = /wolverine/solana-rpc {
+  proxy_pass https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac;
+  proxy_ssl_server_name on;
+  proxy_set_header Host lb.drpc.live;
+  proxy_http_version 1.1;
+  proxy_set_header Connection "";
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+  proxy_read_timeout 60s;
+
+  # (Optional) If any browser sends preflight
+  if (\$request_method = OPTIONS) {
+    add_header Access-Control-Allow-Origin "*" always;
+    add_header Access-Control-Allow-Methods "POST, OPTIONS" always;
+    add_header Access-Control-Allow-Headers "Content-Type, Authorization" always;
+    return 204;
+  }
+}
+
+# ---- Static Wolverine UI (must be LAST) ----
+location ^~ /wolverine/vendor/ { alias $WEBROOT/vendor/; access_log off; expires 7d; add_header Cache-Control "public"; }
 location ^~ /wolverine/ {
   root /var/www;
-  try_files $uri $uri/ /wolverine/index.html;
+  try_files \$uri \$uri/ /wolverine/index.html;
 }
-NGX
+EOF
 
-# Ajouter dynamiquement les locations alias -> 3010
-while IFS= read -r P; do
-  [ -z "$P" ] && continue
-  {
-    echo ""
-    echo "# Alias: $P"
-    echo "location = ${P} { return 301 ${P}/; }"
-    echo "location ^~ ${P}/ {"
-    echo "  proxy_pass http://127.0.0.1:3010/;"
-    echo "  proxy_http_version 1.1;"
-    echo "  proxy_set_header Host \$host;"
-    echo "  proxy_set_header X-Real-IP \$remote_addr;"
-    echo "  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;"
-    echo "  proxy_set_header X-Forwarded-Proto \$scheme;"
-    echo "  proxy_read_timeout 60s;"
-    echo "}"
-  } >> "$INC"
-done <<< "$CANDIDATES"
-
-log "6) Assurer include dans le vhost"
-if [ -f "$VHOST" ]; then
-  if ! grep -qF "include $INC;" "$VHOST"; then
-    log "Inject include dans $VHOST"
-    tmp="$VHOST.tmp.$TS"
-    awk -v inc="include $INC;" 'BEGIN{done=0}{print} !done && $0 ~ /^[[:space:]]*server[[:space:]]*\{/ {print "  " inc; done=1}' "$VHOST" > "$tmp"
-    mv "$tmp" "$VHOST"
-  else
-    log "OK: include déjà présent"
-  fi
-else
-  log "WARN: VHOST introuvable: $VHOST"
+say "6) Ensure vhost includes wolverine routes include"
+bk "$VHOST"
+if ! grep -qE "include\s+/etc/nginx/includes/wolverine_routes\.inc;" "$VHOST"; then
+  # insert include inside the server{} block (near top) safely
+  awk '
+    BEGIN{done=0}
+    {print}
+    !done && $0 ~ /server\s*\{/ {
+      print "    include /etc/nginx/includes/wolverine_routes.inc;";
+      done=1
+    }
+  ' "$VHOST" >"$VHOST.tmp.$TS"
+  mv "$VHOST.tmp.$TS" "$VHOST"
 fi
 
-log "7) Nginx test + reload"
+say "7) Nginx test + reload"
 nginx -t
 systemctl reload nginx
 
-log "8) Tests PUBLIC (chaque alias) : GET /health et POST /create"
-OKCOUNT=0
-FAILCOUNT=0
-while IFS= read -r P; do
-  [ -z "$P" ] && continue
-  H="https://${DOMAIN}${P}/health"
-  C="https://${DOMAIN}${P}/create"
-  echo ""
-  echo "---- $P ----"
-  echo "GET  $H"
-  if out="$(curl -ksS -m 10 "$H" || true)"; then
-    echo "$out"
-  fi
-  # POST create
-  echo "POST $C"
-  out2="$(curl -ksS -m 10 -X POST "$C" -H "content-type: application/json" -d '{"budgetSol":0.001}' || true)"
-  echo "$out2"
-  # Heuristique JSON ok
-  if echo "$out2" | grep -q '"ok":true'; then
-    echo "RESULT: OK"
-    OKCOUNT=$((OKCOUNT+1))
-  else
-    echo "RESULT: FAIL"
-    FAILCOUNT=$((FAILCOUNT+1))
-  fi
-done <<< "$CANDIDATES"
+say "8) Tests (public + local)"
+echo "== API should be JSON (not HTML) =="
+curl -fsS "https://$HOST/wolverine/traderone/api" | head -c 220; echo; echo
+echo "== solana-rpc POST should NOT be 405 =="
+curl -sS -X POST "https://$HOST/wolverine/solana-rpc" -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' | head -c 220; echo; echo
+echo "== vault/api/health should NOT be 301 HTML =="
+curl -i -sS "https://$HOST/wolverine/vault/api/health" | sed -n '1,12p'; echo
+echo "== vault/health (alias) =="
+curl -fsS "https://$HOST/wolverine/vault/health" | head -c 220; echo; echo
 
-echo ""
-echo "=== RÉSUMÉ ==="
-echo "OK aliases  : $OKCOUNT"
-echo "FAIL aliases: $FAILCOUNT"
-echo "=============="
-log "DONE. Ouvre https://${DOMAIN}/wolverine/ puis Ctrl+F5 et clique 'Créer Vault + Déposer'."
-'''
-open('/root/MEGA_WOLVERINE_FIX_VAULTPATHS.sh','w',encoding='utf-8').write(s)
-PY
-chmod +x /root/MEGA_WOLVERINE_FIX_VAULTPATHS.sh
-bash /root/MEGA_WOLVERINE_FIX_VAULTPATHS.sh
+say "DONE. In browser: Ctrl+F5 on https://$HOST/wolverine then Connect Phantom -> Refresh (SOL/USDC) then click 'Créer Vault + Déposer'."
+BASH
+bash /root/MEGA_WOLVERINE_FIX_RPC_VAULT.sh
