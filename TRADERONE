@@ -1,133 +1,74 @@
-cat >/root/MEGA_WOLVERINE_FIX_RPC502.sh <<'BASH'
+cat >/root/MEGA_WOLVERINE_FIX_VAULT_API.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 trap 'echo "[FATAL] line=$LINENO exit=$? cmd=$BASH_COMMAND" >&2' ERR
+
+say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 
 DOMAIN="fireinners.online"
 INC="/etc/nginx/includes/wolverine_routes.inc"
 VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
 
-SOLRPC_DIR="/opt/wolverine-solrpc-proxy"
 VAULT_DIR="/opt/traderone-vault-api"
-TR_DIR="/opt/traderone-api"
-
-SOLRPC_PORT="12713"
 VAULT_PORT="3010"
-TRADERONE_PORT="3000"
-
-DRPC_SOLANA="https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac"
-
-say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
-need(){ command -v "$1" >/dev/null 2>&1 || { echo "ERROR: missing $1"; exit 1; }; }
+UNIT="/etc/systemd/system/traderone-vault-api.service"
 
 say "0) Preflight"
 id -u | grep -q '^0$' || { echo "ERROR: run as root"; exit 1; }
-need nginx
-need ss
-need curl
-need node
-need npm
+command -v ss >/dev/null || { echo "ERROR: ss missing"; exit 1; }
+command -v curl >/dev/null || { echo "ERROR: curl missing"; exit 1; }
+command -v node >/dev/null || { echo "ERROR: node missing"; exit 1; }
+command -v npm  >/dev/null || { echo "ERROR: npm missing"; exit 1; }
+command -v nginx >/dev/null || { echo "ERROR: nginx missing"; exit 1; }
 NODEBIN="$(command -v node)"
 say "Node = $NODEBIN"
 
-say "1) Unfreeze nginx files (ignore errors)"
-chattr -i /etc/nginx/nginx.conf 2>/dev/null || true
-[ -f "$VHOST" ] && chattr -i "$VHOST" 2>/dev/null || true
-[ -f "$INC" ] && chattr -i "$INC" 2>/dev/null || true
+say "1) Stop vault service (ignore errors)"
+systemctl stop traderone-vault-api.service 2>/dev/null || true
 
-say "2) Ensure solrpc proxy code exists (no fetch; http/https only)"
-mkdir -p "$SOLRPC_DIR"
-cat >"$SOLRPC_DIR/server.js" <<'JS'
-const http=require('http');
-const https=require('https');
-const {URL}=require('url');
+say "2) Free port ${VAULT_PORT}"
+PIDS="$(ss -ltnp 2>/dev/null | awk -v p=":${VAULT_PORT}" '$0 ~ p {print $0}' | sed -n 's/.*pid=\([0-9]\+\).*/\1/p' | sort -u | tr '\n' ' ')"
+if [ -n "${PIDS// }" ]; then
+  say " - killing PIDs on :${VAULT_PORT} => ${PIDS}"
+  kill -9 ${PIDS} || true
+else
+  say " - no listener found on :${VAULT_PORT}"
+fi
 
-const PORT=parseInt(process.env.PORT||'12713',10);
-const TARGET=process.env.TARGET_SOLANA_RPC||"";
-
-function sendJSON(res, code, obj){
-  const body=JSON.stringify(obj);
-  res.writeHead(code, {"content-type":"application/json","cache-control":"no-store"});
-  res.end(body);
-}
-
-function proxy(req,res){
-  if(!TARGET) return sendJSON(res,500,{ok:false,error:"TARGET_SOLANA_RPC missing"});
-  let raw="";
-  req.on('data', c=>{ raw+=c; if(raw.length>2*1024*1024) req.destroy(); });
-  req.on('end', ()=>{
-    let u; try{ u=new URL(TARGET); }catch(e){ return sendJSON(res,500,{ok:false,error:"Bad TARGET_SOLANA_RPC"}); }
-    const lib=(u.protocol==="https:")?https:http;
-    const opts={
-      method:"POST",
-      hostname:u.hostname,
-      port:u.port || (u.protocol==="https:"?443:80),
-      path:u.pathname + (u.search||""),
-      headers:{"content-type":"application/json","accept":"application/json","user-agent":"wolverine-solrpc-proxy"}
-    };
-    const preq=lib.request(opts, pres=>{
-      let out="";
-      pres.on('data', d=> out+=d);
-      pres.on('end', ()=>{
-        res.writeHead(pres.statusCode||502, {"content-type": pres.headers["content-type"]||"application/json","cache-control":"no-store"});
-        res.end(out);
-      });
-    });
-    preq.on('error', e=> sendJSON(res,502,{ok:false,error:String(e && e.message?e.message:e)}));
-    preq.write(raw||"{}");
-    preq.end();
-  });
-}
-
-http.createServer((req,res)=>{
-  if(req.method==="GET" && req.url && req.url.startsWith("/health")) return sendJSON(res,200,{ok:true,target:TARGET||null});
-  if(req.method==="OPTIONS"){ res.writeHead(204,{"cache-control":"no-store"}); return res.end(); }
-  if(req.method!=="POST") return sendJSON(res,405,{ok:false,error:"Method not allowed"});
-  return proxy(req,res);
-}).listen(PORT,"127.0.0.1",()=>console.log("solrpc-proxy listening",PORT));
-JS
-
-say "3) Force systemd units to use /usr/bin/env node (fix common /usr/bin/node mismatch)"
-cat >/etc/systemd/system/wolverine-solrpc-proxy.service <<EOF
-[Unit]
-Description=Wolverine Solana RPC Proxy (CORS-safe)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-WorkingDirectory=$SOLRPC_DIR
-Environment=PORT=$SOLRPC_PORT
-Environment=TARGET_SOLANA_RPC=$DRPC_SOLANA
-ExecStart=/usr/bin/env node $SOLRPC_DIR/server.js
-Restart=always
-RestartSec=1
-User=root
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-# vault api
+say "3) Ensure vault app exists + deps"
 mkdir -p "$VAULT_DIR/vaults"
 chmod 700 "$VAULT_DIR" "$VAULT_DIR/vaults" || true
-(cd "$VAULT_DIR" && [ -f package.json ] || npm init -y >/dev/null 2>&1)
-(cd "$VAULT_DIR" && npm i express bs58 @solana/web3.js >/dev/null 2>&1)
+cd "$VAULT_DIR"
+[ -f package.json ] || npm init -y >/dev/null 2>&1
+npm i express bs58 @solana/web3.js >/dev/null 2>&1
 
+say "4) Write hardened vault server.js"
 cat >"$VAULT_DIR/server.js" <<'JS'
 const fs=require('fs'),path=require('path');
 const express=require('express');
 const bs58=require('bs58');
 const {Keypair}=require('@solana/web3.js');
+
 const app=express();
 app.use(express.json({limit:'1mb'}));
-const ROOT=__dirname, VAULTS=path.join(ROOT,'vaults'), MAP=path.join(ROOT,'map.json');
+
+const ROOT=__dirname;
+const VAULTS=path.join(ROOT,'vaults');
+const MAP=path.join(ROOT,'map.json');
+
 function loadMap(){ try{return JSON.parse(fs.readFileSync(MAP,'utf8'))}catch(e){return {}} }
 function saveMap(m){ fs.writeFileSync(MAP, JSON.stringify(m,null,2), {mode:0o600}); }
-app.get('/health',(req,res)=>res.json({ok:true,service:"vault-api"}));
-app.get('/vault',(req,res)=>{ const user=String(req.query.userPub||''); const m=loadMap(); res.json({ok:true,userPub:user||null,vaultPub:(user&&m[user])?m[user]:null}); });
+
+app.get('/health',(req,res)=>res.json({ok:true,service:"vault-api",ts:new Date().toISOString()}));
+
+app.get('/vault',(req,res)=>{
+  const user=String((req.query.userPub||'')||'').trim();
+  const m=loadMap();
+  res.json({ok:true,userPub:user||null,vaultPub:(user && m[user])?m[user]:null});
+});
+
 app.post('/create',(req,res)=>{
-  const user=req.body && req.body.userPub ? String(req.body.userPub) : '';
+  const user=String((req.body&&req.body.userPub)||'').trim();
   const m=loadMap();
   if(user && m[user]) return res.json({ok:true,userPub:user,vaultPub:m[user],existing:true});
   const kp=Keypair.generate();
@@ -137,95 +78,80 @@ app.post('/create',(req,res)=>{
   if(user){ m[user]=vaultPub; saveMap(m); }
   res.json({ok:true,userPub:user||null,vaultPub,existing:false});
 });
+
 const port=parseInt(process.env.PORT||'3010',10);
-app.listen(port,'127.0.0.1',()=>console.log('vault-api listening',port));
+const server=app.listen(port,'127.0.0.1',()=>console.log('vault-api listening',port));
+server.on('error',(e)=>{ console.error('server error',e); process.exit(2); });
+setInterval(()=>{}, 1<<30);
 JS
 
-cat >/etc/systemd/system/traderone-vault-api.service <<EOF
+say "5) Rewrite systemd unit (disable start-limit)"
+cat >"$UNIT" <<EOF
 [Unit]
 Description=TraderOne Vault API (AQUILA)
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 WorkingDirectory=$VAULT_DIR
 Environment=PORT=$VAULT_PORT
-ExecStart=/usr/bin/env node $VAULT_DIR/server.js
+ExecStart=$NODEBIN $VAULT_DIR/server.js
 Restart=always
-RestartSec=1
+RestartSec=2
 User=root
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-# traderone wrapper
-mkdir -p "$TR_DIR"
-chmod 700 "$TR_DIR" || true
-(cd "$TR_DIR" && [ -f package.json ] || npm init -y >/dev/null 2>&1)
-(cd "$TR_DIR" && npm i express >/dev/null 2>&1)
+say "6) Ensure nginx route exists for /wolverine/vault/api -> 127.0.0.1:${VAULT_PORT}"
+test -f "$INC" || { echo "ERROR: missing $INC"; exit 1; }
+grep -q "/wolverine/vault/api" "$INC" || {
+  cat >>"$INC" <<EOF
 
-cat >"$TR_DIR/server.js" <<'JS'
-const express=require('express');
-const app=express();
-app.use(express.json({limit:'1mb'}));
-app.get('/health',(req,res)=>res.json({ok:true,service:"traderone-api",mode:"wrapper"}));
-app.post('/start',(req,res)=>res.json({ok:true,received:req.body||null}));
-app.post('/mode',(req,res)=>res.json({ok:true,received:req.body||null}));
-app.post('/withdraw',(req,res)=>res.json({ok:true,received:req.body||null}));
-app.get('/',(req,res)=>res.json({ok:true,service:"traderone-api",endpoints:["/health","/start","/mode","/withdraw"]}));
-const port=parseInt(process.env.PORT||'3000',10);
-app.listen(port,'127.0.0.1',()=>console.log('traderone-api listening',port));
-JS
-
-cat >/etc/systemd/system/traderone-api.service <<EOF
-[Unit]
-Description=TraderOne API (wrapper stable)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-WorkingDirectory=$TR_DIR
-Environment=PORT=$TRADERONE_PORT
-ExecStart=/usr/bin/env node $TR_DIR/server.js
-Restart=always
-RestartSec=1
-User=root
-
-[Install]
-WantedBy=multi-user.target
+# Vault API (create vault + mapping) behind nginx
+location ^~ /wolverine/vault/api {
+  rewrite ^/wolverine/vault/api/?(.*)\$ /\$1 break;
+  proxy_pass http://127.0.0.1:${VAULT_PORT};
+  proxy_http_version 1.1;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+  add_header Access-Control-Allow-Origin "*" always;
+  add_header Access-Control-Allow-Methods "POST, GET, OPTIONS" always;
+  add_header Access-Control-Allow-Headers "content-type, authorization" always;
+  if (\$request_method = OPTIONS) { return 204; }
+}
 EOF
+}
 
-say "4) Restart services"
+say "7) Start vault service"
 systemctl daemon-reload
-systemctl enable --now wolverine-solrpc-proxy.service traderone-vault-api.service traderone-api.service >/dev/null 2>&1 || true
-systemctl restart wolverine-solrpc-proxy.service traderone-vault-api.service traderone-api.service
+systemctl enable --now traderone-vault-api.service >/dev/null 2>&1 || true
+systemctl reset-failed traderone-vault-api.service || true
+systemctl restart traderone-vault-api.service
 
-say "5) Local health checks (must be 200)"
-echo "== localhost solrpc /health =="; curl -sS -i "http://127.0.0.1:${SOLRPC_PORT}/health" | head -n 5 || true
-echo "== localhost solrpc getHealth =="; curl -sS -i "http://127.0.0.1:${SOLRPC_PORT}/" -H 'content-type: application/json' --data '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' | head -n 12 || true
-echo "== localhost vault /health =="; curl -sS -i "http://127.0.0.1:${VAULT_PORT}/health" | head -n 5 || true
-echo "== localhost traderone /health =="; curl -sS -i "http://127.0.0.1:${TRADERONE_PORT}/health" | head -n 5 || true
-
-say "6) Nginx test + reload"
+say "8) Nginx test + reload"
 nginx -t
 systemctl reload nginx
 
-say "7) Public checks (must be 200, not 502)"
-echo "== public solrpc /health =="; curl -sS -i "https://${DOMAIN}/wolverine/solana-rpc/health" | head -n 8 || true
-echo "== public vault /health =="; curl -sS -i "https://${DOMAIN}/wolverine/vault/api/health" | head -n 8 || true
-echo "== public traderone /health =="; curl -sS -i "https://${DOMAIN}/wolverine/traderone/api/health" | head -n 8 || true
+say "9) Local tests"
+ss -ltnp | grep -E ":${VAULT_PORT}\b" || true
+curl -sS -i "http://127.0.0.1:${VAULT_PORT}/health" | head -n 12 || true
+curl -sS -i "http://127.0.0.1:${VAULT_PORT}/vault?userPub=test" | head -n 12 || true
 
-say "8) If still 502: show status + last logs"
-systemctl --no-pager status wolverine-solrpc-proxy.service traderone-vault-api.service traderone-api.service || true
-echo "---- journal solrpc (last 80) ----"; journalctl -u wolverine-solrpc-proxy.service -n 80 --no-pager || true
-echo "---- journal vault (last 80) ----"; journalctl -u traderone-vault-api.service -n 80 --no-pager || true
-echo "---- journal traderone (last 80) ----"; journalctl -u traderone-api.service -n 80 --no-pager || true
-echo "---- nginx error (last 120) ----"; tail -n 120 /var/log/nginx/error.log 2>/dev/null || true
+say "10) Public tests"
+curl -sS -i "https://${DOMAIN}/wolverine/vault/api/health" | head -n 12 || true
+curl -sS -i "https://${DOMAIN}/wolverine/vault/api/vault?userPub=test" | head -n 12 || true
 
-say "DONE: Ctrl+F5 puis Connect Phantom -> Refresh (SOL/USDC)"
+say "11) Status + last logs"
+systemctl --no-pager status traderone-vault-api.service || true
+journalctl -u traderone-vault-api.service -n 160 --no-pager || true
+
+say "DONE"
 BASH
-chmod +x /root/MEGA_WOLVERINE_FIX_RPC502.sh
-/root/MEGA_WOLVERINE_FIX_RPC502.sh
+chmod +x /root/MEGA_WOLVERINE_FIX_VAULT_API.sh
+/root/MEGA_WOLVERINE_FIX_VAULT_API.sh
