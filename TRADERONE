@@ -1,12 +1,120 @@
-bash /root/MEGA_WOLVERINE_FIX_VAULT_JSON.sh
+cat >/root/MEGA_WOLVERINE_FIX_VAULT_JSON.sh<<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+TS="$(date +%Y%m%d_%H%M%S)"
+echo "=== MEGA_WOLVERINE_FIX_VAULT_JSON [$TS] ==="
 
+# --- settings (do not change paths) ---
+DOMAIN="fireinners.online"
+NGX_VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
+NGX_INC="/etc/nginx/includes/wolverine_routes.inc"
+WEBROOT="/var/www/wolverine"
 
+VAULT_DIR="/opt/traderone-vault-api"
+VAULT_PORT="3101"
+VAULT_SVC="/etc/systemd/system/traderone-vault-api.service"
+VAULT_DATA="$VAULT_DIR/data"
 
-curl -sk https://fireinners.online/wolverine/vault/api/health; echo
-curl -sk -X POST https://fireinners.online/wolverine/vault/api/create -H "content-type: application/json" -d '{"ownerPubkey":"11111111111111111111111111111111"}'; echo
+say(){ printf "%s\n" "$*"; }
 
+# --- helpers ---
+have(){ command -v "$1" >/dev/null 2>&1; }
+mkbackup(){ local f="$1"; [ -f "$f" ] && cp -a "$f" "$f.bak.$TS" 2>/dev/null || true; }
+unfreeze_one(){ local f="$1"; [ -e "$f" ] && chattr -i "$f" 2>/dev/null || true; }
+freeze_one(){ local f="$1"; [ -e "$f" ] && chattr +i "$f" 2>/dev/null || true; }
 
+# --- 0) savepoint (if available) ---
+if [ -x /root/WOLVERINE_SAVEPOINT.sh ]; then
+  say "[0] Savepoint snapshot"
+  /root/WOLVERINE_SAVEPOINT.sh || true
+fi
 
+# --- 1) preflight tools ---
+say "[1] Preflight"
+have nginx || { apt-get update -y; apt-get install -y nginx curl; }
+have node || { say "ERROR: node is missing"; exit 1; }
 
-systemctl --no-pager -l status traderone-vault-api
-journalctl -u traderone-vault-api -n 120 --no-pager
+# --- 2) ensure webroot exists ---
+say "[2] Ensure webroot exists: $WEBROOT"
+mkdir -p "$WEBROOT" || true
+
+# --- 3) unfreeze nginx files (ignore errors) ---
+say "[3] Unfreeze nginx files (ignore errors)"
+unfreeze_one /etc/nginx/nginx.conf
+unfreeze_one "$NGX_VHOST"
+unfreeze_one "$NGX_INC"
+for f in /etc/nginx/includes/wolverine*.inc /etc/nginx/includes/*.inc; do unfreeze_one "$f"; done
+
+# --- 4) ensure nginx include exists WITHOUT breaking RPC that currently works ---
+say "[4] Ensure nginx include exists: $NGX_INC (do NOT break existing routes)"
+mkdir -p /etc/nginx/includes
+if [ ! -f "$NGX_INC" ]; then
+  cat >"$NGX_INC"<<'INC'
+# wolverine_routes.inc (created)
+# NOTE: keep existing routes above/below as needed
+INC
+fi
+
+# --- 5) ensure our vault routes are present (idempotent append) ---
+say "[5] Ensure vault routes exist in $NGX_INC"
+if ! grep -q "WOLVERINE_VAULT_API_BEGIN" "$NGX_INC"; then
+  cat >>"$NGX_INC"<<EOF
+
+# --- WOLVERINE_VAULT_API_BEGIN ---
+# Accept both calling styles:
+#  A) /wolverine/vault/api/*
+#  B) /wolverine/traderone/api/vault/*
+# Always return JSON (avoid empty body causing "Unexpected end of JSON input")
+location = /wolverine/vault/api {
+  default_type application/json;
+  return 200 '{"ok":false,"error":"use /wolverine/vault/api/"}';
+}
+location ^~ /wolverine/vault/api/ {
+  proxy_pass http://127.0.0.1:${VAULT_PORT}/;
+  proxy_http_version 1.1;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+  add_header Access-Control-Allow-Origin "*" always;
+  add_header Access-Control-Allow-Headers "*" always;
+  add_header Access-Control-Allow-Methods "GET,POST,OPTIONS" always;
+  if (\$request_method = OPTIONS) { return 204; }
+}
+
+location = /wolverine/traderone/api/vault {
+  default_type application/json;
+  return 200 '{"ok":false,"error":"use /wolverine/traderone/api/vault/"}';
+}
+location ^~ /wolverine/traderone/api/vault/ {
+  proxy_pass http://127.0.0.1:${VAULT_PORT}/;
+  proxy_http_version 1.1;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+  add_header Access-Control-Allow-Origin "*" always;
+  add_header Access-Control-Allow-Headers "*" always;
+  add_header Access-Control-Allow-Methods "GET,POST,OPTIONS" always;
+  if (\$request_method = OPTIONS) { return 204; }
+}
+# --- WOLVERINE_VAULT_API_END ---
+EOF
+else
+  say "OK: vault routes already present"
+fi
+
+# --- 6) install/repair vault backend (stable JSON, no deps) ---
+say "[6] Install/repair Vault API backend: $VAULT_DIR"
+mkdir -p "$VAULT_DATA"
+mkbackup "$VAULT_DIR/server.js"
+cat >"$VAULT_DIR/server.js"<<'JS'
+'use strict';
+const http = require('http');
+const url = require('url');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+
+const PORT = parseInt(process.env.PORT
