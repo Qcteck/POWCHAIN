@@ -1,278 +1,151 @@
 python3 - <<'PY'
-s = r'''#!/usr/bin/env bash
+s=r'''#!/usr/bin/env bash
 set -euo pipefail
-
 TS="$(date +%Y%m%d_%H%M%S)"
 DOMAIN="fireinners.online"
 WEBROOT="/var/www/wolverine"
+INDEX="$WEBROOT/index.html"
 VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
 INC="/etc/nginx/includes/wolverine_routes.inc"
+BK="/root/WOLVERINE_FIX_VAULTPATHS_${TS}"
+VAULT_UPSTREAM="http://127.0.0.1:3010/"
 
-VAULT_DIR="/opt/traderone-vault-api"
-VAULT_PORT="3010"
-VAULT_BIND="127.0.0.1"
-VAULT_SVC="/etc/systemd/system/traderone-vault-api.service"
-
-BK="/root/WOLVERINE_FIX_VAULT_${TS}"
 mkdir -p "$BK"
-
 log(){ echo "[$(date +%H:%M:%S)] $*"; }
 have(){ command -v "$1" >/dev/null 2>&1; }
-
-unfreeze_one(){ local f="$1"; [ -e "$f" ] && chattr -i "$f" 2>/dev/null || true; }
-freeze_one(){ local f="$1"; [ -e "$f" ] && chattr +i "$f" 2>/dev/null || true; }
-backup_one(){ local f="$1"; [ -e "$f" ] && cp -a "$f" "$BK/$(basename "$f").bak" 2>/dev/null || true; }
+unfreeze(){ [ -e "$1" ] && chattr -i "$1" 2>/dev/null || true; }
+backup(){ [ -e "$1" ] && cp -a "$1" "$BK/$(basename "$1").bak" 2>/dev/null || true; }
 
 log "0) Savepoint (si dispo)"
-if [ -x /root/WOLVERINE_SAVEPOINT.sh ]; then
-  /root/WOLVERINE_SAVEPOINT.sh || true
-fi
+if [ -x /root/WOLVERINE_SAVEPOINT.sh ]; then /root/WOLVERINE_SAVEPOINT.sh || true; fi
 
 log "1) Préflight"
 have nginx || { apt-get update -y; apt-get install -y nginx curl; }
-have node || { log "ERROR: node manquant"; exit 1; }
-have npm  || { log "ERROR: npm manquant"; exit 1; }
+have curl || { apt-get update -y; apt-get install -y curl; }
 
-log "2) Backup + unfreeze fichiers sensibles"
-backup_one /etc/nginx/nginx.conf
-backup_one "$VHOST"
-backup_one "$INC"
-backup_one "$WEBROOT/index.html"
+log "2) Backup + unfreeze"
+backup "$INC"; backup "$VHOST"; backup "$INDEX"
+unfreeze "$INC"; unfreeze "$VHOST"; unfreeze "$INDEX"
+for f in /etc/nginx/includes/wolverine*.inc /etc/nginx/includes/*.inc; do unfreeze "$f"; done
 
-unfreeze_one /etc/nginx/nginx.conf
-unfreeze_one "$VHOST"
-unfreeze_one "$INC"
-unfreeze_one "$WEBROOT/index.html"
-for f in /etc/nginx/includes/wolverine*.inc /etc/nginx/includes/*.inc; do unfreeze_one "$f"; done
+log "3) Lire INDEX et extraire chemins vault/aquila"
+if [ ! -f "$INDEX" ]; then
+  log "WARN: $INDEX introuvable. Je vais quand même poser les alias standards."
+  FOUND=""
+else
+  FOUND="$(grep -oE '\/wolverine\/[^"'\'' ]{0,200}' "$INDEX" 2>/dev/null | grep -iE '(vault|aquila)' | sort -u || true)"
+fi
 
-log "3) Assurer WEBROOT Wolverine"
-mkdir -p "$WEBROOT"
-[ -f "$WEBROOT/index.html" ] || { echo "<!doctype html><meta charset=utf-8><title>Wolverine</title><h1>Wolverine webroot OK</h1>" > "$WEBROOT/index.html"; }
+echo "=== PATHS DÉTECTÉS DANS INDEX (vault|aquila) ==="
+echo "${FOUND:-<aucun détecté>}"
+echo "==============================================="
 
-log "4) Déployer Vault API (Node) qui répond toujours JSON"
-mkdir -p "$VAULT_DIR" "$VAULT_DIR/data"
-backup_one "$VAULT_DIR/server.js"
-cat > "$VAULT_DIR/server.js" <<'JS'
-'use strict';
-const http = require('http');
-const { URL } = require('url');
-const fs = require('fs');
-const path = require('path');
+log "4) Construire liste d'alias à supporter (robuste)"
+# Aliases standards + ce qui est trouvé dans l'index
+CANDIDATES=$(
+  {
+    echo "/wolverine/vault/api"
+    echo "/wolverine/vault"
+    echo "/wolverine/vault-api"
+    echo "/wolverine/traderone/api/vault"
+    echo "/wolverine/traderone/vault"
+    echo "/wolverine/aquila/vault"
+    echo "/wolverine/aquila/api/vault"
+    echo "/wolverine/aquila/vault/api"
+    echo "/wolverine/aq/vault"
+    echo "/wolverine/aq/api/vault"
+    [ -n "${FOUND:-}" ] && echo "$FOUND" | sed 's/[?#].*$//'
+  } | sed 's/\/$//' | awk 'NF' | sort -u
+)
 
-let Keypair;
-try {
-  ({ Keypair } = require('@solana/web3.js'));
-} catch (e) {
-  // L'API doit rester vivante même si la lib manque
-  Keypair = null;
-}
+echo "=== ALIASES QUI SERONT PROXIES VERS VAULT API (3010) ==="
+echo "$CANDIDATES"
+echo "========================================================"
 
-const HOST = process.env.HOST || '127.0.0.1';
-const PORT = parseInt(process.env.PORT || '3010', 10);
-const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
-const VAULT_LOG = path.join(DATA_DIR, 'vaults.jsonl');
-
-fs.mkdirSync(DATA_DIR, { recursive: true });
-
-function sendJson(res, code, obj) {
-  const body = JSON.stringify(obj);
-  res.writeHead(code, {
-    'content-type': 'application/json; charset=utf-8',
-    'cache-control': 'no-store',
-    'access-control-allow-origin': '*',
-    'access-control-allow-headers': 'content-type',
-    'access-control-allow-methods': 'GET,POST,OPTIONS'
-  });
-  res.end(body);
-}
-
-function sendJsonError(res, code, msg, extra) {
-  sendJson(res, code, { ok:false, error: msg, ...(extra||{}) });
-}
-
-function readBody(req) {
-  return new Promise((resolve) => {
-    let b = '';
-    req.on('data', (c) => { b += c; if (b.length > 1e6) { try{req.destroy();}catch{} } });
-    req.on('end', () => resolve(b));
-    req.on('error', () => resolve(''));
-  });
-}
-
-function normalizePath(p) {
-  // accepte plusieurs chemins possibles
-  // /health, /vault/health, /api/vault/health, etc.
-  const t = (p || '/').toLowerCase();
-  if (t.endsWith('/health')) return 'health';
-  if (t.endsWith('/create')) return 'create';
-  if (t.endsWith('/vault/create')) return 'create';
-  if (t.endsWith('/vault/health')) return 'health';
-  return 'other';
-}
-
-const srv = http.createServer(async (req, res) => {
-  try {
-    const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-    if (req.method === 'OPTIONS') return sendJson(res, 200, { ok:true });
-
-    const kind = normalizePath(u.pathname);
-
-    if (req.method === 'GET' && kind === 'health') {
-      return sendJson(res, 200, { ok:true, service:'vault-api', host:HOST, port:PORT, solana: !!Keypair });
-    }
-
-    if (req.method === 'POST' && kind === 'create') {
-      const raw = await readBody(req);
-      let payload = {};
-      if (raw && raw.trim().length) {
-        try { payload = JSON.parse(raw); } catch { payload = { _raw: raw.slice(0, 300) }; }
-      }
-
-      if (!Keypair) {
-        // Répond quand même en JSON (évite "Unexpected end of JSON input")
-        return sendJsonError(res, 503, 'Missing dependency @solana/web3.js (vault generation unavailable)', { hint: 'Run npm i @solana/web3.js in /opt/traderone-vault-api' });
-      }
-
-      const kp = Keypair.generate();
-      const pub = kp.publicKey.toBase58();
-      const secretB64 = Buffer.from(kp.secretKey).toString('base64');
-      const rec = { ts: Date.now(), pub, secretB64, payload };
-
-      try {
-        fs.appendFileSync(VAULT_LOG, JSON.stringify(rec) + '\n', 'utf8');
-      } catch (e) {
-        // même en cas d'échec write, on renvoie JSON
-        return sendJsonError(res, 500, 'Failed to persist vault record', { pub });
-      }
-
-      return sendJson(res, 200, { ok:true, vault:{ pub }, saved:true });
-    }
-
-    // Default : toujours JSON
-    return sendJsonError(res, 404, 'Not found', { path: u.pathname });
-  } catch (e) {
-    // Important: ne jamais laisser une réponse vide
-    return sendJsonError(res, 500, 'Unhandled error', { msg: String(e && e.message || e) });
-  }
-});
-
-srv.listen(PORT, HOST, () => {
-  console.log(`vault-api listening http://${HOST}:${PORT}`);
-});
-JS
-
-log "5) Assurer dépendance @solana/web3.js (sans casser APT/npm)"
-cd "$VAULT_DIR"
-if [ ! -f package.json ]; then npm init -y >/dev/null 2>&1 || true; fi
-node -e "require('@solana/web3.js');console.log('web3 ok')" >/dev/null 2>&1 || npm install --silent @solana/web3.js
-
-log "6) Service systemd Vault API"
-backup_one "$VAULT_SVC"
-cat > "$VAULT_SVC" <<SVC
-[Unit]
-Description=TraderOne Vault API (JSON-stable)
-After=network.target
-
-[Service]
-Type=simple
-WorkingDirectory=$VAULT_DIR
-Environment=HOST=$VAULT_BIND
-Environment=PORT=$VAULT_PORT
-Environment=DATA_DIR=$VAULT_DIR/data
-ExecStart=/usr/bin/node $VAULT_DIR/server.js
-Restart=always
-RestartSec=1
-User=root
-
-[Install]
-WantedBy=multi-user.target
-SVC
-
-systemctl daemon-reload
-systemctl enable --now traderone-vault-api.service >/dev/null 2>&1 || true
-systemctl restart traderone-vault-api.service
-
-log "7) NGINX routes Wolverine + Vault (sans toucher au RPC existant)"
-backup_one "$INC"
+log "5) Écrire/mettre à jour l'include NGINX (sans toucher au RPC qui marche)"
 cat > "$INC" <<'NGX'
-# Wolverine routes (TraderOne UI + APIs)
-# NOTE: on ajoute plusieurs chemins possibles pour matcher l'UI (évite 404/HTML -> JSON parse error)
+# Wolverine routes include (Vault aliases -> stable JSON Vault API on :3010)
+# IMPORTANT: ne touche pas solana-rpc existant ailleurs; ici on ne fait que mapper des chemins Vault/Aquila vers 3010.
 
-# 1) Static UI
+# UI static (au cas où)
 location ^~ /wolverine/ {
   root /var/www;
   try_files $uri $uri/ /wolverine/index.html;
 }
-
-# 2) TraderOne API (déjà en place normalement)
-location = /wolverine/traderone/api { return 301 /wolverine/traderone/api/; }
-location ^~ /wolverine/traderone/api/ {
-  proxy_pass http://127.0.0.1:3000/;
-  proxy_http_version 1.1;
-  proxy_set_header Host $host;
-  proxy_set_header X-Real-IP $remote_addr;
-  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto $scheme;
-  proxy_read_timeout 60s;
-}
-
-# 3) Vault API (chemin direct)
-location = /wolverine/vault/api { return 301 /wolverine/vault/api/; }
-location ^~ /wolverine/vault/api/ {
-  proxy_pass http://127.0.0.1:3010/;
-  proxy_http_version 1.1;
-  proxy_set_header Host $host;
-  proxy_set_header X-Real-IP $remote_addr;
-  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto $scheme;
-  proxy_read_timeout 60s;
-}
-
-# 4) Vault API (alias sous traderone/api pour compat UI)
-location = /wolverine/traderone/api/vault { return 301 /wolverine/traderone/api/vault/; }
-location ^~ /wolverine/traderone/api/vault/ {
-  proxy_pass http://127.0.0.1:3010/;
-  proxy_http_version 1.1;
-  proxy_set_header Host $host;
-  proxy_set_header X-Real-IP $remote_addr;
-  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto $scheme;
-  proxy_read_timeout 60s;
-}
 NGX
 
-log "8) Assurer include dans le vhost"
+# Ajouter dynamiquement les locations alias -> 3010
+while IFS= read -r P; do
+  [ -z "$P" ] && continue
+  {
+    echo ""
+    echo "# Alias: $P"
+    echo "location = ${P} { return 301 ${P}/; }"
+    echo "location ^~ ${P}/ {"
+    echo "  proxy_pass http://127.0.0.1:3010/;"
+    echo "  proxy_http_version 1.1;"
+    echo "  proxy_set_header Host \$host;"
+    echo "  proxy_set_header X-Real-IP \$remote_addr;"
+    echo "  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;"
+    echo "  proxy_set_header X-Forwarded-Proto \$scheme;"
+    echo "  proxy_read_timeout 60s;"
+    echo "}"
+  } >> "$INC"
+done <<< "$CANDIDATES"
+
+log "6) Assurer include dans le vhost"
 if [ -f "$VHOST" ]; then
   if ! grep -qF "include $INC;" "$VHOST"; then
-    backup_one "$VHOST"
-    # Injecter juste après 'server {' du bon vhost
-    awk -v inc="include $INC;" '
-      BEGIN{done=0}
-      {print}
-      !done && $0 ~ /^[[:space:]]*server[[:space:]]*\{/ {print "  " inc; done=1}
-    ' "$VHOST" > "$VHOST.tmp"
-    mv "$VHOST.tmp" "$VHOST"
+    log "Inject include dans $VHOST"
+    tmp="$VHOST.tmp.$TS"
+    awk -v inc="include $INC;" 'BEGIN{done=0}{print} !done && $0 ~ /^[[:space:]]*server[[:space:]]*\{/ {print "  " inc; done=1}' "$VHOST" > "$tmp"
+    mv "$tmp" "$VHOST"
+  else
+    log "OK: include déjà présent"
   fi
 else
-  log "WARN: VHOST introuvable: $VHOST (routes INC créées quand même)"
+  log "WARN: VHOST introuvable: $VHOST"
 fi
 
-log "9) Test nginx + reload"
+log "7) Nginx test + reload"
 nginx -t
 systemctl reload nginx
 
-log "10) Tests (local + public)"
-echo "== local vault health =="; curl -fsS "http://127.0.0.1:${VAULT_PORT}/health" || true
-echo; echo "== local vault create =="; curl -fsS -X POST "http://127.0.0.1:${VAULT_PORT}/create" -H "content-type: application/json" -d '{"budgetSol":0.001}' || true
-echo; echo "== public vault health (via /wolverine/traderone/api/vault/health) =="; curl -fsS "https://${DOMAIN}/wolverine/traderone/api/vault/health" || true
-echo; echo "== public vault create (via /wolverine/traderone/api/vault/create) =="; curl -fsS -X POST "https://${DOMAIN}/wolverine/traderone/api/vault/create" -H "content-type: application/json" -d '{"budgetSol":0.001}' || true
-echo
+log "8) Tests PUBLIC (chaque alias) : GET /health et POST /create"
+OKCOUNT=0
+FAILCOUNT=0
+while IFS= read -r P; do
+  [ -z "$P" ] && continue
+  H="https://${DOMAIN}${P}/health"
+  C="https://${DOMAIN}${P}/create"
+  echo ""
+  echo "---- $P ----"
+  echo "GET  $H"
+  if out="$(curl -ksS -m 10 "$H" || true)"; then
+    echo "$out"
+  fi
+  # POST create
+  echo "POST $C"
+  out2="$(curl -ksS -m 10 -X POST "$C" -H "content-type: application/json" -d '{"budgetSol":0.001}' || true)"
+  echo "$out2"
+  # Heuristique JSON ok
+  if echo "$out2" | grep -q '"ok":true'; then
+    echo "RESULT: OK"
+    OKCOUNT=$((OKCOUNT+1))
+  else
+    echo "RESULT: FAIL"
+    FAILCOUNT=$((FAILCOUNT+1))
+  fi
+done <<< "$CANDIDATES"
 
-log "DONE."
-log "Action: ouvre https://${DOMAIN}/wolverine/ puis Ctrl+F5, clique 'Créer Vault + Déposer'."
-log "Si ça affiche encore l'alerte JSON: ouvre DevTools Network, regarde la requête /vault/create et colle ici Status + Response."
+echo ""
+echo "=== RÉSUMÉ ==="
+echo "OK aliases  : $OKCOUNT"
+echo "FAIL aliases: $FAILCOUNT"
+echo "=============="
+log "DONE. Ouvre https://${DOMAIN}/wolverine/ puis Ctrl+F5 et clique 'Créer Vault + Déposer'."
 '''
-open('/root/MEGA_WOLVERINE_FIX_VAULT_API.sh','w',encoding='utf-8').write(s)
+open('/root/MEGA_WOLVERINE_FIX_VAULTPATHS.sh','w',encoding='utf-8').write(s)
 PY
-chmod +x /root/MEGA_WOLVERINE_FIX_VAULT_API.sh
-bash /root/MEGA_WOLVERINE_FIX_VAULT_API.sh
+chmod +x /root/MEGA_WOLVERINE_FIX_VAULTPATHS.sh
+bash /root/MEGA_WOLVERINE_FIX_VAULTPATHS.sh
