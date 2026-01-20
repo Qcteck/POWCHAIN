@@ -1,137 +1,231 @@
-bash -lc 'cat >/root/IAAQUILA_MEGA_INSTALL.sh<<'"'"'EOF'"'"'
+cat >/root/MEGA_WOLVERINE_FIX_RPC502.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
-TS="$(date +%Y%m%d_%H%M%S)"
+trap 'echo "[FATAL] line=$LINENO exit=$? cmd=$BASH_COMMAND" >&2' ERR
 
-SITE="fireinners.online"
-MOUNT="/iaaquila"
-SLUG="iaaquila"
-HOST="127.0.0.1"
-PORT="9697"
+DOMAIN="fireinners.online"
+INC="/etc/nginx/includes/wolverine_routes.inc"
+VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
 
-APP="/opt/${SLUG}"
-PUB="${APP}/public${MOUNT}"
-SVC="/etc/systemd/system/${SLUG}.service"
-NGX="/etc/nginx/sites-available/${SITE}-ssl"
-INC="/etc/nginx/includes/${SLUG}_routes.inc"
-BK="/root/${SLUG}_backup_${TS}"
+SOLRPC_DIR="/opt/wolverine-solrpc-proxy"
+VAULT_DIR="/opt/traderone-vault-api"
+TR_DIR="/opt/traderone-api"
 
+SOLRPC_PORT="12713"
+VAULT_PORT="3010"
+TRADERONE_PORT="3000"
+
+DRPC_SOLANA="https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac"
+
+say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 need(){ command -v "$1" >/dev/null 2>&1 || { echo "ERROR: missing $1"; exit 1; }; }
-asroot(){ [ "$(id -u)" = "0" ] || { echo "ERROR: run as root"; exit 1; }; }
 
-asroot
+say "0) Preflight"
+id -u | grep -q '^0$' || { echo "ERROR: run as root"; exit 1; }
 need nginx
+need ss
+need curl
 need node
 need npm
-need curl
+NODEBIN="$(command -v node)"
+say "Node = $NODEBIN"
 
-mkdir -p "$BK"
-[ -d "$APP" ] && cp -a "$APP" "$BK/${SLUG}.app.bak" || true
-[ -f "$NGX" ] && cp -a "$NGX" "$BK/$(basename "$NGX").bak" || true
-[ -f "$INC" ] && cp -a "$INC" "$BK/$(basename "$INC").bak" || true
+say "1) Unfreeze nginx files (ignore errors)"
+chattr -i /etc/nginx/nginx.conf 2>/dev/null || true
+[ -f "$VHOST" ] && chattr -i "$VHOST" 2>/dev/null || true
+[ -f "$INC" ] && chattr -i "$INC" 2>/dev/null || true
 
-mkdir -p "$APP" "$PUB"
+say "2) Ensure solrpc proxy code exists (no fetch; http/https only)"
+mkdir -p "$SOLRPC_DIR"
+cat >"$SOLRPC_DIR/server.js" <<'JS'
+const http=require('http');
+const https=require('https');
+const {URL}=require('url');
 
-cat >"$APP/package.json"<<'"'"'JSON'"'"'
-{"name":"iaaquila","version":"1.0.0","type":"module","private":true,"main":"server.js","scripts":{"start":"node server.js"},"dependencies":{"@mozilla/readability":"^0.5.0","cheerio":"^1.0.0-rc.12","cors":"^2.8.5","express":"^4.19.2","jsdom":"^24.0.0","node-fetch":"^3.3.2"}}
-JSON
+const PORT=parseInt(process.env.PORT||'12713',10);
+const TARGET=process.env.TARGET_SOLANA_RPC||"";
 
-cat >"$APP/server.js"<<'"'"'JS'"'"'
-import express from"express";import cors from"cors";import crypto from"crypto";import fetch from"node-fetch";import {JSDOM} from"jsdom";import {Readability} from"@mozilla/readability";import cheerio from"cheerio";
-const ENV=(k,d)=>process.env[k]??d;
-const HOST=ENV("HOST","127.0.0.1");const PORT=parseInt(ENV("PORT","9697"),10);const BASE=ENV("BASE","/iaaquila");const API=BASE+"/api";
-const OLLAMA_HOST=ENV("OLLAMA_HOST","http://127.0.0.1:11434");const OLLAMA_MODEL=ENV("OLLAMA_MODEL","llama3.2:3b");
-const MAXTXT=parseInt(ENV("MAXTXT","65000"),10);
-const app=express();app.disable("x-powered-by");app.use(cors());app.use(express.json({limit:"12mb"}));
-const mem={state:{mode:"RUN",saie:"S",hex:"A",confidence:98.0,last:"—",errs:[]},pending:[],domains:{},chat:{msgs:[]}};
-const now=()=>Date.now();const sha=x=>crypto.createHash("sha256").update(String(x||"")).digest("hex");const clip=(s,n)=>String(s||"").slice(0,n);
-const clean=t=>String(t||"").replace(/\r/g,"").replace(/[ \t]+\n/g,"\n").replace(/\n{3,}/g,"\n\n").trim();
-function pushErr(m){mem.state.errs.push({t:now(),m:String(m||"ERR")});mem.state.errs=mem.state.errs.slice(-240);mem.state.last=String(m||"—");}
-function domainOf(u){try{return new URL(u).hostname.replace(/^www\./,"");}catch(e){return"unknown";}}
-function parseRSS(xml){const dom=new JSDOM(xml,{contentType:"text/xml"});const doc=dom.window.document;let items=[...doc.querySelectorAll("item")].slice(0,80).map(it=>({title:(it.querySelector("title")?.textContent||"").trim(),link:(it.querySelector("link")?.textContent||"").trim(),pub:(it.querySelector("pubDate")?.textContent||"").trim()}));if(items.length)return items.filter(x=>x.title&&x.link);items=[...doc.querySelectorAll("entry")].slice(0,80).map(en=>({title:(en.querySelector("title")?.textContent||"").trim(),link:(en.querySelector("link")?.getAttribute("href")||en.querySelector("link")?.textContent||"").trim(),pub:(en.querySelector("updated")?.textContent||en.querySelector("published")?.textContent||"").trim()}));return items.filter(x=>x.title&&x.link);}
-function htmlToPlain(html){const looks=/<\/(html|body|p|div|article|main)>/i.test(html)||/<p[\s>]/i.test(html)||/<article[\s>]/i.test(html);if(!looks)return clean(html);return clean(html.replace(/<script[\s\S]*?<\/script>/gi,"").replace(/<style[\s\S]*?<\/style>/gi,"").replace(/<\/p>/gi,"\n\n").replace(/<br\s*\/?>/gi,"\n").replace(/<li[^>]*>/gi,"\n• ").replace(/<\/li>/gi,"").replace(/<h[1-6][^>]*>/gi,"\n\n").replace(/<\/h[1-6]>/gi,"\n").replace(/<[^>]+>/g," ").replace(/\s+/g," "));}
-function readabilityExtract(html,url){try{const dom=new JSDOM(html,{url});const doc=dom.window.document;const art=new Readability(doc).parse();if(art&&art.textContent&&art.textContent.trim().length>220)return clean(art.textContent);}catch(e){}return"";}
-function heuristicExtract(html){try{const $=cheerio.load(html);$("script,style,noscript,svg,canvas,iframe,nav,footer,header,aside,form,button").remove();let best="",bestScore=0;$("article,main,section,div").each((_,el)=>{const txt=clean($(el).text());if(txt.length<650)return;const links=$(el).find("a").length;const score=txt.length-(links*50);if(score>bestScore){bestScore=score;best=txt;}});return best||clean($("body").text());}catch(e){return"";}}
-function qualityScore(txt){txt=clean(txt);const len=txt.length;const words=txt.toLowerCase().split(/\s+/).filter(Boolean);const uniq=new Set(words).size;const uniqRatio=uniq/Math.max(1,words.length);let score=0;score+=Math.min(60,Math.floor(len/120));score+=Math.min(40,Math.floor(uniqRatio*100));return Math.max(0,Math.min(100,score));}
-function paywallSuspect(txt,html){const s=(txt||"").toLowerCase();const h=(html||"").toLowerCase();const k=["subscribe","subscription","sign in","log in","paywall","abonne","abonnement","connectez-vous","connexion","premium","register","trial","metered","members only"];const hit=k.some(x=>s.includes(x)||h.includes(x));return hit||((txt||"").length<650);}
-function summarize(text){text=clean(text||"");const paras=text.split("\n\n").map(x=>x.trim()).filter(Boolean);const pick=[];for(const pa of paras){if(pick.length>=6)break;const s=pa.replace(/\s+/g," ").slice(0,260);if(s.length>90)pick.push("• "+s);}return pick.length?pick.join("\n"):"• (Résumé impossible: contenu trop court / bloqué)";}
-async function fetchWith(url){const r=await fetch(url,{cache:"no-store",redirect:"follow",headers:{"user-agent":"Mozilla/5.0"}});if(!r.ok)throw new Error("HTTP "+r.status);return await r.text();}
-async function fetchMultiplex(url){const tries=[async()=>({src:"direct",body:await fetchWith(url)}),async()=>({src:"allorigins",body:await fetchWith("https://api.allorigins.win/raw?url="+encodeURIComponent(url))}),async()=>({src:"jina_https",body:await fetchWith("https://r.jina.ai/https://"+url.replace(/^https?:\/\//i,""))}),async()=>({src:"jina_http",body:await fetchWith("https://r.jina.ai/http://"+url.replace(/^https?:\/\//i,""))})];let last=null;for(const f of tries){try{const out=await f();if(out.body&&out.body.trim().length>220)return out;}catch(e){last=e;}}throw last||new Error("fetch failed");}
-async function extractBest(url){const d=domainOf(url);const dom=mem.domains[d]||(mem.domains[d]={ok:0,fail:0,avgQ:0,methods:{}});let raw=null;try{raw=await fetchMultiplex(url);}catch(e){pushErr("fetch fail "+d);}const outs=[];if(raw&&raw.body){const html=raw.body;outs.push({m:raw.src+"_readability",txt:readabilityExtract(html,url),html});outs.push({m:raw.src+"_heuristic",txt:heuristicExtract(html),html});outs.push({m:raw.src+"_plain",txt:htmlToPlain(html),html});}for(const o of outs){o.txt=clean(o.txt||"");if(o.txt.length>MAXTXT)o.txt=o.txt.slice(0,MAXTXT);o.q=qualityScore(o.txt);o.paywall=paywallSuspect(o.txt,o.html);o.len=o.txt.length;}outs.sort((a,b)=>(b.q-b.paywall*8)-(a.q-a.paywall*8));const best=outs[0]||{m:"none",txt:"",q:0,paywall:true,len:0};dom.methods[best.m]=(dom.methods[best.m]||0)+1;if(best.txt&&best.q>=20){dom.ok++;dom.avgQ=Math.round(((dom.avgQ*(dom.ok-1))+best.q)/dom.ok);}else dom.fail++;return {domain:d,best,alts:outs.slice(0,6),domainScore:dom};}
-async function ollamaOK(){try{const r=await fetch(OLLAMA_HOST+"/api/tags",{cache:"no-store"});return !!r.ok;}catch(e){return false;}}
-async function llmGenerate(system,user){const ok=await ollamaOK();if(!ok)return {ok:false,txt:"(LLM local indisponible)"};const prompt=`[SYSTEM]\n${system}\n\n[USER]\n${user}\n`;try{const r=await fetch(OLLAMA_HOST+"/api/generate",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({model:OLLAMA_MODEL,prompt,stream:false,options:{temperature:0.4,top_p:0.9}})});const j=await r.json();return {ok:true,txt:clean(j?.response||"")};}catch(e){return {ok:false,txt:"(LLM local erreur)"};}}
-function pushPending(desc,payload){const id="ACT_"+Date.now();mem.pending.push({id,desc,status:"PENDING",payload,createdAt:now()});mem.pending=mem.pending.slice(-800);return id;}
+function sendJSON(res, code, obj){
+  const body=JSON.stringify(obj);
+  res.writeHead(code, {"content-type":"application/json","cache-control":"no-store"});
+  res.end(body);
+}
 
-app.get(API+"/health",(req,res)=>res.json({ok:true,app:"iaaquila",base:BASE,api:API,host:HOST,port:PORT,ollama:{host:OLLAMA_HOST,model:OLLAMA_MODEL},t:now()}));
-app.get(API+"/state",(req,res)=>res.json({state:mem.state,pending:mem.pending.slice(-200),domains:mem.domains,chatCount:mem.chat.msgs.length,t:now()}));
-app.get(API+"/llm/status",async(req,res)=>res.json({ok:await ollamaOK(),host:OLLAMA_HOST,model:OLLAMA_MODEL}));
-app.post(API+"/llm/chat",async(req,res)=>{const {lang,msg}=req.body||{};const L=(lang==="en"?"en":"fr");const sysFR="Tu es IA AQUILA (Jarvis). 1 question à la fois. Aucun acte externe sans PENDING. Réponse courte et décisionnelle.";const sysEN="You are IA AQUILA (Jarvis). One question at a time. No external actions without PENDING. Short, decision-oriented.";const user=clip(msg,7000);mem.chat.msgs.push({t:now(),role:"user",msg:user});mem.chat.msgs=mem.chat.msgs.slice(-40);const out=await llmGenerate(L==="fr"?sysFR:sysEN,user);mem.chat.msgs.push({t:now(),role:"ai",msg:out.txt});mem.chat.msgs=mem.chat.msgs.slice(-40);res.json({ok:out.ok,answer:out.txt});});
-app.post(API+"/rss/pull",async(req,res)=>{const {feeds}=req.body||{};const list=(feeds&&Array.isArray(feeds)&&feeds.length)?feeds:["https://cryptoast.fr/feed/","https://journalducoin.com/feed/","https://cryptonaute.fr/feed/","https://cointelegraph.com/rss","https://www.coindesk.com/arc/outboundfeeds/rss/","https://decrypt.co/feed","https://www.theblock.co/rss.xml","https://www.reddit.com/r/CryptoCurrency/.rss"];let items=[];for(const f of list.slice(0,14)){try{const xml=await fetchWith("https://api.allorigins.win/raw?url="+encodeURIComponent(f));items=items.concat(parseRSS(xml).map(x=>({...x,src:f})));}catch(e){pushErr("rss fail");}}items=items.filter(x=>x.title&&x.link).slice(0,80);res.json({ok:true,items});});
-app.post(API+"/article/read",async(req,res)=>{try{const {url,lang}=req.body||{};if(!url)return res.status(400).json({ok:false,err:"missing url"});const pack=await extractBest(url);const sum=summarize(pack.best.txt||"");const L=(lang==="en"?"en":"fr");const sysFR="Résumé <=6 puces, puis 1 risque, 1 opportunité, 1 question unique. Très court.";const sysEN="<=6 bullets, then 1 risk, 1 opportunity, 1 single question. Very short.";const llm=await llmGenerate(L==="fr"?sysFR:sysEN,`URL: ${url}\n\nTEXTE:\n${clip(pack.best.txt,6500)}`);res.json({ok:true,url,domain:pack.domain,method:pack.best.m,quality:pack.best.q,paywall:!!pack.best.paywall,domainAvgQ:pack.domainScore.avgQ,domainOk:pack.domainScore.ok,domainFail:pack.domainScore.fail,summary:sum,llm:llm.ok?llm.txt:null,excerpt:clip(pack.best.txt,2600),alts:pack.alts.map(a=>({m:a.m,q:a.q,paywall:a.paywall,len:a.len}))});}catch(e){pushErr("article read fail");res.status(500).json({ok:false,err:String(e)});}});
-app.post(API+"/decision/propose",(req,res)=>{const {desc,payload}=req.body||{};res.json({ok:true,id:pushPending(desc||"Action",payload||{})});});
-app.post(API+"/x/propose_post",(req,res)=>{const {text,reason}=req.body||{};res.json({ok:true,id:pushPending("X WRITE (PENDING only)",{kind:"X_WRITE",text:clip(text,4000),reason:clip(reason,800)}),mode:"PENDING_ONLY"});});
-app.post(API+"/onchain/propose_tx",(req,res)=>{const {chain,intent,details}=req.body||{};res.json({ok:true,id:pushPending("ONCHAIN WRITE (PENDING only)",{kind:"ONCHAIN_WRITE",chain:chain||"solana",intent:intent||"tx",details:details||{}}),mode:"PENDING_ONLY"});});
-app.listen(PORT,HOST,()=>console.log(`iaaquila on http://${HOST}:${PORT}${API}`));
+function proxy(req,res){
+  if(!TARGET) return sendJSON(res,500,{ok:false,error:"TARGET_SOLANA_RPC missing"});
+  let raw="";
+  req.on('data', c=>{ raw+=c; if(raw.length>2*1024*1024) req.destroy(); });
+  req.on('end', ()=>{
+    let u; try{ u=new URL(TARGET); }catch(e){ return sendJSON(res,500,{ok:false,error:"Bad TARGET_SOLANA_RPC"}); }
+    const lib=(u.protocol==="https:")?https:http;
+    const opts={
+      method:"POST",
+      hostname:u.hostname,
+      port:u.port || (u.protocol==="https:"?443:80),
+      path:u.pathname + (u.search||""),
+      headers:{"content-type":"application/json","accept":"application/json","user-agent":"wolverine-solrpc-proxy"}
+    };
+    const preq=lib.request(opts, pres=>{
+      let out="";
+      pres.on('data', d=> out+=d);
+      pres.on('end', ()=>{
+        res.writeHead(pres.statusCode||502, {"content-type": pres.headers["content-type"]||"application/json","cache-control":"no-store"});
+        res.end(out);
+      });
+    });
+    preq.on('error', e=> sendJSON(res,502,{ok:false,error:String(e && e.message?e.message:e)}));
+    preq.write(raw||"{}");
+    preq.end();
+  });
+}
+
+http.createServer((req,res)=>{
+  if(req.method==="GET" && req.url && req.url.startsWith("/health")) return sendJSON(res,200,{ok:true,target:TARGET||null});
+  if(req.method==="OPTIONS"){ res.writeHead(204,{"cache-control":"no-store"}); return res.end(); }
+  if(req.method!=="POST") return sendJSON(res,405,{ok:false,error:"Method not allowed"});
+  return proxy(req,res);
+}).listen(PORT,"127.0.0.1",()=>console.log("solrpc-proxy listening",PORT));
 JS
 
-cat >"$PUB/index.html"<<'"'"'HTML'"'"'
-<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>IA AQUILA • /iaaquila</title><style>:root{--bg:#05060b;--p:#ff2cf7;--c:#19f7ff;--g:#39ff14;--y:#ffe600;--r:#ff3b3b;--t:#f4fbff;--glass:linear-gradient(180deg,rgba(0,0,0,.52),rgba(0,0,0,.22));--sh:0 0 0 2px rgba(25,247,255,.10),0 0 0 2px rgba(255,44,247,.08) inset,0 30px 90px rgba(0,0,0,.65)}html,body{height:100%;margin:0;background:radial-gradient(1400px 900px at 68% 24%,rgba(255,44,247,.22) 0%,rgba(25,247,255,.14) 26%,rgba(5,6,11,1) 55%,rgba(0,0,0,1) 100%);font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Helvetica,Arial,sans-serif;color:var(--t)}*{box-sizing:border-box}button{border:2px solid rgba(25,247,255,.34);background:linear-gradient(180deg,rgba(25,247,255,.12),rgba(255,44,247,.10),rgba(0,0,0,.26));color:var(--t);border-radius:14px;padding:12px 12px;font-weight:1100;letter-spacing:.10em;text-transform:uppercase;font-size:12px;cursor:pointer;box-shadow:0 0 24px rgba(25,247,255,.10),0 0 22px rgba(255,44,247,.08)}button:hover{border-color:rgba(255,230,0,.95)}.chip{border:2px solid rgba(25,247,255,.18);background:rgba(0,0,0,.25);border-radius:999px;padding:7px 10px;font-size:12px;letter-spacing:.12em;text-transform:uppercase;font-weight:1100;white-space:nowrap}.good{border-color:rgba(57,255,20,.30)}.warn{border-color:rgba(255,230,0,.22)}.bad{border-color:rgba(255,59,59,.26)}#app{height:100dvh;display:flex;flex-direction:column;padding:calc(12px + env(safe-area-inset-top)) 12px calc(12px + env(safe-area-inset-bottom)) 12px;gap:12px;min-height:0}#top{display:flex;align-items:center;justify-content:space-between;gap:12px;border:2px solid rgba(25,247,255,.22);background:linear-gradient(180deg,rgba(255,44,247,.18),rgba(25,247,255,.12),rgba(0,0,0,.22));backdrop-filter:blur(10px);border-radius:16px;padding:12px 14px;box-shadow:var(--sh)}#brand{display:flex;align-items:center;gap:14px;min-width:0}#logo{width:48px;height:48px;border-radius:50%;background:radial-gradient(circle at 40% 35%,#fff 0 12%,var(--y) 13% 22%,var(--c) 23% 38%,var(--p) 39% 62%,rgba(0,0,0,0) 63%),conic-gradient(from 190deg,rgba(255,44,247,.52),rgba(25,247,255,.10),rgba(57,255,20,.42),rgba(255,230,0,.22),rgba(255,44,247,.52));box-shadow:0 0 34px rgba(255,44,247,.22),0 0 30px rgba(25,247,255,.18),inset 0 0 14px rgba(255,230,0,.16);position:relative;flex:0 0 auto}#logo:before{content:"";position:absolute;inset:-7px;border-radius:50%;border:2px dashed rgba(25,247,255,.45);animation:spin 7.5s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}#title{line-height:1.1;min-width:0}#title b{letter-spacing:.16em;font-weight:1200;font-size:18px;white-space:nowrap}#title small{display:block;color:rgba(244,251,255,.78);letter-spacing:.14em;text-transform:uppercase;font-size:12px;margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}#topRight{display:flex;align-items:center;gap:10px;flex-wrap:wrap;justify-content:flex-end}#main{flex:1;display:grid;grid-template-columns:560px 1fr;gap:12px;min-height:0}#left,#right{border:2px solid rgba(25,247,255,.18);background:var(--glass);backdrop-filter:blur(10px);border-radius:16px;box-shadow:var(--sh);overflow:hidden;min-height:0;position:relative}#left .hd,#right .hd{padding:14px;border-bottom:2px solid rgba(25,247,255,.10);display:flex;align-items:center;justify-content:space-between;gap:12px}.hd b{letter-spacing:.16em;text-transform:uppercase;font-size:13px}.hd span{color:rgba(244,251,255,.78);font-weight:1100}.scan{position:absolute;inset:0;pointer-events:none;background:linear-gradient(180deg,rgba(255,44,247,.12),rgba(0,0,0,0) 35%,rgba(25,247,255,.10) 70%,rgba(0,0,0,0));mix-blend-mode:screen;animation:scan 3.2s linear infinite;opacity:.7}@keyframes scan{0%{transform:translateY(-65%)}100%{transform:translateY(65%)}}#states{padding:14px;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;border-bottom:2px solid rgba(25,247,255,.10);background:linear-gradient(180deg,rgba(0,0,0,.22),rgba(0,0,0,0))}#states .box{border:2px solid rgba(255,230,0,.10);border-radius:14px;background:rgba(0,0,0,.18);padding:10px}#states .box b{display:block;letter-spacing:.14em;text-transform:uppercase;font-size:11px;color:rgba(244,251,255,.78)}#states .box span{display:block;margin-top:6px;font-weight:1100;color:rgba(244,251,255,.94);word-break:break-word}#rssBox{padding:14px;overflow:auto;min-height:0}#rssBox .it{border:2px solid rgba(255,230,0,.12);border-radius:14px;background:rgba(0,0,0,.18);padding:10px;margin-bottom:10px;display:flex;gap:12px;align-items:flex-start;justify-content:space-between}#rssBox .it span{font-weight:1000;font-size:13px;line-height:1.25;color:rgba(244,251,255,.92)}#rssBox .it small{display:block;color:rgba(244,251,255,.68);font-size:12px;margin-top:6px;letter-spacing:.08em}#log{flex:1;padding:14px;overflow:auto;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:13px;line-height:1.4}#right{display:flex;flex-direction:column;min-height:0}.m{margin:10px 0;padding:10px 12px;border-radius:14px;border:2px solid rgba(25,247,255,.10);background:rgba(25,247,255,.04);white-space:pre-wrap;word-break:break-word}.ai{border-left:5px solid rgba(25,247,255,.80)}.user{border-left:5px solid rgba(255,44,247,.70)}.sys{border-left:5px solid rgba(255,230,0,.70)}#row{display:flex;gap:12px;padding:14px;border-top:2px solid rgba(25,247,255,.10)}#row input{flex:1;border:2px solid rgba(255,230,0,.22);background:rgba(0,0,0,.35);color:var(--t);border-radius:14px;padding:14px;font-weight:1000;outline:none;font-size:14px}#quick{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:10px;padding:14px;border-top:2px solid rgba(25,247,255,.10)}@media(max-width:1200px){#main{grid-template-columns:1fr}#quick{grid-template-columns:repeat(3,minmax(0,1fr))}#states{grid-template-columns:1fr}}</style></head><body><div id="app"><div id="top"><div id="brand"><div id="logo"></div><div id="title"><b>IA AQUILA • RSS → Article → LLM local</b><small>X / on-chain write = PENDING only</small></div></div><div id="topRight"><span class="chip good" id="chipSAIE">SAIE:S</span><span class="chip warn" id="chipHEX">HEX:A</span><span class="chip" id="chipNET">NET:—</span><span class="chip" id="chipRAM">RAM:—</span><span class="chip" id="chipLLM">LLM:—</span><button id="btnPull">PULL RSS</button></div></div><div id="main"><div id="left"><div class="scan"></div><div class="hd"><b>États</b><span id="clock">--:--:--</span></div><div id="states"><div class="box"><b>Mode</b><span id="st_mode">—</span></div><div class="box"><b>Confiance</b><span id="st_conf">—</span></div><div class="box"><b>RAM</b><span id="st_ram">—</span></div><div class="box"><b>Domaine</b><span id="st_dom">—</span></div><div class="box"><b>Qualité extraction</b><span id="st_q">—</span></div><div class="box"><b>LLM</b><span id="st_llm">—</span></div></div><div class="hd"><b>RSS</b><span id="rssStat">—</span></div><div id="rssBox"></div></div><div id="right"><div class="scan"></div><div class="hd"><b>Discussion</b><span id="discStat">—</span></div><div id="log"></div><div id="quick"></div><div id="row"><input id="in" placeholder="1 question à la fois…"><button id="send">ENVOYER</button></div></div></div></div><script>(()=>{"use strict";const $=s=>document.querySelector(s),now=()=>new Date().toLocaleTimeString("fr-CA",{hour12:false});const api=p=>fetch("/iaaquila/api/"+p,{cache:"no-store"});const post=(p,b)=>fetch("/iaaquila/api/"+p,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(b||{})});const log=$("#log"),rss=$("#rssBox"),quick=$("#quick");let S={items:[]};const add=(who,txt,cls)=>{const d=document.createElement("div");d.className="m "+cls;d.innerHTML=`<div style="display:flex;justify-content:space-between;gap:12px;color:rgba(244,251,255,.70);font-size:12px;margin-bottom:8px;letter-spacing:.10em;text-transform:uppercase;font-weight:1100"><span>${who}</span><span>${now()}</span></div><div>${String(txt||"")}</div>`;log.appendChild(d);log.scrollTop=log.scrollHeight;};const setBtns=(arr)=>{quick.innerHTML="";(arr||[]).slice(0,18).forEach(o=>{const b=document.createElement("button");b.textContent=o.t;b.className=o.bad?"bad":"";b.onclick=o.f;quick.appendChild(b);});};async function refresh(){try{const st=await api("state").then(r=>r.json());const ls=await api("llm/status").then(r=>r.json()).catch(()=>({ok:false}));const mt=await api("health").then(r=>r.json()).catch(()=>null);$("#clock").textContent=now();$("#chipNET").textContent="NET:"+(navigator.onLine?"ONLINE":"OFFLINE");$("#chipSAIE").textContent="SAIE:"+((st.state&&st.state.saie)||"S");$("#chipHEX").textContent="HEX:"+((st.state&&st.state.hex)||"A");$("#st_mode").textContent=(st.state&&st.state.mode)||"—";$("#st_conf").textContent=((st.state&&st.state.confidence)||0).toFixed(1)+"%";$("#chipLLM").textContent="LLM:"+(ls.ok?"ON":"OFF");$("#chipLLM").className="chip "+(ls.ok?"good":"bad");$("#st_llm").textContent=ls.ok?("ON • "+(ls.model||"")):"OFF";if(mt&&mt.ok){$("#chipRAM").textContent="RAM:OK";$("#st_ram").textContent="OK";}}catch(e){}}function renderRSS(){rss.innerHTML="";(S.items||[]).slice(0,16).forEach((it,i)=>{const d=document.createElement("div");d.className="it";d.innerHTML=`<span>${i+1}) ${it.title}<small>${it.pub||""}</small></span><button data-i="${i}">LIRE</button>`;rss.appendChild(d);});$("#rssStat").textContent=`Titres:${(S.items||[]).length}`;rss.querySelectorAll("button[data-i]").forEach(b=>b.onclick=()=>read(parseInt(b.getAttribute("data-i"),10)));}async function pull(){add("SYS","Pull RSS…","sys");const r=await post("rss/pull",{}).then(x=>x.json());S.items=r.items||[];renderRSS();add("AI","Choisis un numéro.","ai");setBtns([{t:"LIRE #1",f:()=>read(0)},{t:"LIRE #2",f:()=>read(1)},{t:"PULL RSS",f:()=>pull()}]);}async function read(i){const it=(S.items||[])[i];if(!it)return;add("SYS","Lecture article…","sys");const a=await post("article/read",{url:it.link,lang:"fr"}).then(r=>r.json());$("#st_dom").textContent=`${a.domain||"—"} • avgQ ${(a.domainAvgQ||0)}`;$("#st_q").textContent=`${a.quality||0}/100 • ${a.method||"—"} • paywall ${a.paywall?"suspect":"non"}`;add("AI",`Titre:\n${it.title}\n\nQualité: ${a.quality||0}/100 (${a.method})\nPaywall: ${a.paywall?"suspect":"non"}\n\nRésumé:\n${a.summary||"—"}\n\nLLM:\n${a.llm||"(LLM OFF)"}\n\n1 question: PRIX ou NEWS?`,"ai");setBtns([{t:"PRIX",f:()=>chat("Focus PRIX. 1 risque, 1 opportunité, 1 question unique.")},{t:"NEWS",f:()=>chat("Focus NEWS. 1 risque, 1 opportunité, 1 question unique.")},{t:"PULL RSS",f:()=>pull()}]);}async function chat(msg){add("Utilisateur",msg,"user");const r=await post("llm/chat",{lang:"fr",msg}).then(x=>x.json()).catch(()=>({ok:false,answer:"(LLM indisponible)"}));add("AI",r.answer||"(vide)","ai");}$("#send").onclick=()=>{const v=$("#in").value.trim();$("#in").value="";if(!v)return;chat(v);};$("#btnPull").onclick=()=>pull();setInterval(refresh,1500);add("SYS","Boot. Pull RSS auto.","sys");refresh();pull();})();</script></body></html>
-HTML
-
-cd "$APP"
-npm install --omit=dev >/tmp/iaaquila_npm_install.log 2>&1 || { echo "ERROR: npm install failed (see /tmp/iaaquila_npm_install.log)"; exit 1; }
-
-if ! command -v ollama >/dev/null 2>&1; then
-  curl -fsSL https://ollama.com/install.sh | sh || true
-fi
-if command -v ollama >/dev/null 2>&1; then
-  systemctl enable --now ollama >/dev/null 2>&1 || true
-  sleep 1 || true
-  for M in "llama3.2:3b-instruct" "llama3.2:3b" "phi3:mini" "qwen2.5:3b-instruct" "mistral:7b-instruct"; do
-    ollama pull "$M" >/tmp/iaaquila_ollama_pull.log 2>&1 && break || true
-  done
-fi
-
-cat >"$SVC"<<EOF
+say "3) Force systemd units to use /usr/bin/env node (fix common /usr/bin/node mismatch)"
+cat >/etc/systemd/system/wolverine-solrpc-proxy.service <<EOF
 [Unit]
-Description=IA AQUILA (Node) - ${MOUNT}
-After=network.target
+Description=Wolverine Solana RPC Proxy (CORS-safe)
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=${APP}
-Environment=HOST=${HOST}
-Environment=PORT=${PORT}
-Environment=BASE=${MOUNT}
-Environment=OLLAMA_HOST=http://127.0.0.1:11434
-Environment=OLLAMA_MODEL=llama3.2:3b
+WorkingDirectory=$SOLRPC_DIR
+Environment=PORT=$SOLRPC_PORT
+Environment=TARGET_SOLANA_RPC=$DRPC_SOLANA
+ExecStart=/usr/bin/env node $SOLRPC_DIR/server.js
 Restart=always
-RestartSec=2
-ExecStart=/usr/bin/node ${APP}/server.js
+RestartSec=1
+User=root
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-systemctl daemon-reload
-systemctl enable --now "${SLUG}.service"
+# vault api
+mkdir -p "$VAULT_DIR/vaults"
+chmod 700 "$VAULT_DIR" "$VAULT_DIR/vaults" || true
+(cd "$VAULT_DIR" && [ -f package.json ] || npm init -y >/dev/null 2>&1)
+(cd "$VAULT_DIR" && npm i express bs58 @solana/web3.js >/dev/null 2>&1)
 
-mkdir -p "$(dirname "$INC")"
-cat >"$INC"<<EOF
-location ^~ ${MOUNT}/api/ { proxy_pass http://${HOST}:${PORT}${MOUNT}/api/; proxy_http_version 1.1; proxy_set_header Host \$host; proxy_set_header X-Real-IP \$remote_addr; proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for; add_header Cache-Control "no-store" always; }
-location ^~ ${MOUNT}/ { root ${APP}/public; try_files \$uri \$uri/ ${MOUNT}/index.html; add_header Cache-Control "no-store" always; }
+cat >"$VAULT_DIR/server.js" <<'JS'
+const fs=require('fs'),path=require('path');
+const express=require('express');
+const bs58=require('bs58');
+const {Keypair}=require('@solana/web3.js');
+const app=express();
+app.use(express.json({limit:'1mb'}));
+const ROOT=__dirname, VAULTS=path.join(ROOT,'vaults'), MAP=path.join(ROOT,'map.json');
+function loadMap(){ try{return JSON.parse(fs.readFileSync(MAP,'utf8'))}catch(e){return {}} }
+function saveMap(m){ fs.writeFileSync(MAP, JSON.stringify(m,null,2), {mode:0o600}); }
+app.get('/health',(req,res)=>res.json({ok:true,service:"vault-api"}));
+app.get('/vault',(req,res)=>{ const user=String(req.query.userPub||''); const m=loadMap(); res.json({ok:true,userPub:user||null,vaultPub:(user&&m[user])?m[user]:null}); });
+app.post('/create',(req,res)=>{
+  const user=req.body && req.body.userPub ? String(req.body.userPub) : '';
+  const m=loadMap();
+  if(user && m[user]) return res.json({ok:true,userPub:user,vaultPub:m[user],existing:true});
+  const kp=Keypair.generate();
+  const vaultPub=kp.publicKey.toBase58();
+  const secret58=bs58.encode(Buffer.from(kp.secretKey));
+  fs.writeFileSync(path.join(VAULTS, vaultPub+'.json'), JSON.stringify({vaultPub,secret58,createdAt:new Date().toISOString()},null,2), {mode:0o600});
+  if(user){ m[user]=vaultPub; saveMap(m); }
+  res.json({ok:true,userPub:user||null,vaultPub,existing:false});
+});
+const port=parseInt(process.env.PORT||'3010',10);
+app.listen(port,'127.0.0.1',()=>console.log('vault-api listening',port));
+JS
+
+cat >/etc/systemd/system/traderone-vault-api.service <<EOF
+[Unit]
+Description=TraderOne Vault API (AQUILA)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=$VAULT_DIR
+Environment=PORT=$VAULT_PORT
+ExecStart=/usr/bin/env node $VAULT_DIR/server.js
+Restart=always
+RestartSec=1
+User=root
+
+[Install]
+WantedBy=multi-user.target
 EOF
 
-chattr -i /etc/nginx/nginx.conf "$NGX" 2>/dev/null || true
-if ! grep -q "include ${INC};" "$NGX"; then
-  cp -a "$NGX" "${NGX}.bak_${TS}"
-  awk -v ins="  include ${INC};" '"'"'{print} $0 ~ /server\s*\{/ && done!=1 {done=1; print ins}'"'"' "$NGX" >"${NGX}.tmp_${TS}" && mv "${NGX}.tmp_${TS}" "$NGX"
-fi
+# traderone wrapper
+mkdir -p "$TR_DIR"
+chmod 700 "$TR_DIR" || true
+(cd "$TR_DIR" && [ -f package.json ] || npm init -y >/dev/null 2>&1)
+(cd "$TR_DIR" && npm i express >/dev/null 2>&1)
+
+cat >"$TR_DIR/server.js" <<'JS'
+const express=require('express');
+const app=express();
+app.use(express.json({limit:'1mb'}));
+app.get('/health',(req,res)=>res.json({ok:true,service:"traderone-api",mode:"wrapper"}));
+app.post('/start',(req,res)=>res.json({ok:true,received:req.body||null}));
+app.post('/mode',(req,res)=>res.json({ok:true,received:req.body||null}));
+app.post('/withdraw',(req,res)=>res.json({ok:true,received:req.body||null}));
+app.get('/',(req,res)=>res.json({ok:true,service:"traderone-api",endpoints:["/health","/start","/mode","/withdraw"]}));
+const port=parseInt(process.env.PORT||'3000',10);
+app.listen(port,'127.0.0.1',()=>console.log('traderone-api listening',port));
+JS
+
+cat >/etc/systemd/system/traderone-api.service <<EOF
+[Unit]
+Description=TraderOne API (wrapper stable)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=$TR_DIR
+Environment=PORT=$TRADERONE_PORT
+ExecStart=/usr/bin/env node $TR_DIR/server.js
+Restart=always
+RestartSec=1
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+say "4) Restart services"
+systemctl daemon-reload
+systemctl enable --now wolverine-solrpc-proxy.service traderone-vault-api.service traderone-api.service >/dev/null 2>&1 || true
+systemctl restart wolverine-solrpc-proxy.service traderone-vault-api.service traderone-api.service
+
+say "5) Local health checks (must be 200)"
+echo "== localhost solrpc /health =="; curl -sS -i "http://127.0.0.1:${SOLRPC_PORT}/health" | head -n 5 || true
+echo "== localhost solrpc getHealth =="; curl -sS -i "http://127.0.0.1:${SOLRPC_PORT}/" -H 'content-type: application/json' --data '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' | head -n 12 || true
+echo "== localhost vault /health =="; curl -sS -i "http://127.0.0.1:${VAULT_PORT}/health" | head -n 5 || true
+echo "== localhost traderone /health =="; curl -sS -i "http://127.0.0.1:${TRADERONE_PORT}/health" | head -n 5 || true
+
+say "6) Nginx test + reload"
 nginx -t
 systemctl reload nginx
-chattr +i /etc/nginx/nginx.conf "$NGX" 2>/dev/null || true
 
-curl -fsS "http://${HOST}:${PORT}${MOUNT}/api/health" | sed "s/^/API health: /"
-echo "OK: https://${SITE}${MOUNT}/"
-EOF
-bash /root/IAAQUILA_MEGA_INSTALL.sh'
+say "7) Public checks (must be 200, not 502)"
+echo "== public solrpc /health =="; curl -sS -i "https://${DOMAIN}/wolverine/solana-rpc/health" | head -n 8 || true
+echo "== public vault /health =="; curl -sS -i "https://${DOMAIN}/wolverine/vault/api/health" | head -n 8 || true
+echo "== public traderone /health =="; curl -sS -i "https://${DOMAIN}/wolverine/traderone/api/health" | head -n 8 || true
+
+say "8) If still 502: show status + last logs"
+systemctl --no-pager status wolverine-solrpc-proxy.service traderone-vault-api.service traderone-api.service || true
+echo "---- journal solrpc (last 80) ----"; journalctl -u wolverine-solrpc-proxy.service -n 80 --no-pager || true
+echo "---- journal vault (last 80) ----"; journalctl -u traderone-vault-api.service -n 80 --no-pager || true
+echo "---- journal traderone (last 80) ----"; journalctl -u traderone-api.service -n 80 --no-pager || true
+echo "---- nginx error (last 120) ----"; tail -n 120 /var/log/nginx/error.log 2>/dev/null || true
+
+say "DONE: Ctrl+F5 puis Connect Phantom -> Refresh (SOL/USDC)"
+BASH
+chmod +x /root/MEGA_WOLVERINE_FIX_RPC502.sh
+/root/MEGA_WOLVERINE_FIX_RPC502.sh
