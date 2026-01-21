@@ -1,44 +1,57 @@
-cat >/root/MEGA_BUNDLER_PATCH_ACTIVE_VHOSTS.sh <<'BASH'
+cat >/root/MEGA_BUNDLER_FIX_404.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 umask 022
 
 TS="$(date +%Y%m%d_%H%M%S)"
-BK="/root/BUNDLER_ACTIVEPATCH_${TS}"
+BK="/root/BUNDLER_FIX404_${TS}"
 mkdir -p "$BK"
+
 say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 die(){ say "ERROR: $*"; exit 1; }
-[ "$(id -u)" -eq 0 ] || die "run as root"
+need_root(){ [ "$(id -u)" -eq 0 ] || die "run as root"; }
+
+need_root
 
 DOMAIN="fireinners.online"
-NGINX_CONF="/etc/nginx/nginx.conf"
 INC_DIR="/etc/nginx/includes"
 INC_BUNDLER="${INC_DIR}/bundler_routes.inc"
 
 WEBROOT_BUNDLER="/var/www/bundler"
 DATA_DIR="/opt/bundler_data"
+
+API_DIR="/opt/bundler_api"
 API_HOST="127.0.0.1"
 API_PORT="9797"
+API_SVC="/etc/systemd/system/bundler-api.service"
 
-say "backup: /etc/nginx"
-tar -C /etc -czf "$BK/etc_nginx.tgz" nginx >/dev/null 2>&1 || true
+NGINX_CONF="/etc/nginx/nginx.conf"
+
+unlock(){ chattr -i "$1" 2>/dev/null || true; }
+lockit(){ chattr +i "$1" 2>/dev/null || true; }
+
+say "backup: nginx conf tree + include + service (best-effort)"
+tar -C /etc/nginx -czf "$BK/etc_nginx.tgz" . >/dev/null 2>&1 || true
+cp -a "$INC_BUNDLER" "$BK/bundler_routes.inc.bak" 2>/dev/null || true
+cp -a "$API_SVC" "$BK/bundler-api.service.bak" 2>/dev/null || true
 
 say "ensure dirs"
 mkdir -p "$INC_DIR" "$WEBROOT_BUNDLER" "$DATA_DIR"
 chmod 755 "$WEBROOT_BUNDLER" "$DATA_DIR" || true
 
-say "ensure fallback index.html exists"
+# Ensure at least an index exists (prevents empty alias confusion)
 if [ ! -f "$WEBROOT_BUNDLER/index.html" ]; then
   cat >"$WEBROOT_BUNDLER/index.html" <<'HTML'
-<!doctype html><meta charset="utf-8"><title>Bundler</title><style>body{font-family:system-ui;margin:40px;background:#0b0f14;color:#e7eef7}a{color:#7ec8ff}</style><h1>Bundler</h1><p>Fallback index.html present in /var/www/bundler.</p>
+<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Bundler</title><body style="font-family:system-ui;background:#0b0f14;color:#e7eef7;margin:0;padding:24px"><h2>Bundler</h2><p>UI build not published yet (index placeholder).</p></body>
 HTML
   chmod 644 "$WEBROOT_BUNDLER/index.html" || true
 fi
 
-say "write include: $INC_BUNDLER"
+say "nginx: write/force include $INC_BUNDLER"
+unlock "$INC_BUNDLER" || true
 cat >"$INC_BUNDLER" <<EOF
-# Bundler UI + API (active vhost patch $TS)
-
+# Bundler UI + API (forced $TS)
+# Redirects (fix /bundler without trailing slash)
 location = /bundler { return 301 /bundler/; }
 location = /bundler/api { return 301 /bundler/api/; }
 location = /bundler/data { return 301 /bundler/data/; }
@@ -61,177 +74,102 @@ location ^~ /bundler/ {
   try_files \$uri \$uri/ /bundler/index.html;
 }
 EOF
+chmod 644 "$INC_BUNDLER" || true
 
-say "capture nginx -T"
-nginx -T >"$BK/nginx_T.txt" 2>&1 || true
+say "nginx: patch all vhosts containing server_name $DOMAIN to include bundler_routes.inc"
+patch_file(){
+  local f="$1"
+  [ -f "$f" ] || return 0
+  grep -qE "server_name[^;]*\b${DOMAIN//./\\.}\b" "$f" || return 0
 
-say "detect FIRST (active) server blocks for $DOMAIN on :80 and :443"
-python3 - <<'PY' "$DOMAIN" "$BK/nginx_T.txt" >"$BK/active_vhosts.env"
-import re,sys
-domain=sys.argv[1]
-p=sys.argv[2]
-lines=open(p,"r",errors="ignore").read().splitlines()
+  # If already present anywhere, keep
+  if grep -qF "/etc/nginx/includes/bundler_routes.inc" "$f"; then
+    say "nginx: include already present in $f"
+    return 0
+  fi
 
-cur_file=None
-cur_line=0
-servers=[]
-i=0
-while i<len(lines):
-    line=lines[i]
-    m=re.match(r'# configuration file (.*?):(\d+)', line)
-    if m:
-        cur_file=m.group(1)
-        cur_line=int(m.group(2))
-        i+=1
-        continue
+  unlock "$f" || true
+  cp -a "$f" "$BK/$(echo "$f" | sed 's#/#__#g').bak" 2>/dev/null || true
 
-    if cur_file is not None:
-        cur_line += 1
+  # Insert include just after the server_name line inside the matching server block
+  awk -v dom="$DOMAIN" -v inc="  include /etc/nginx/includes/bundler_routes.inc;" '
+    function countc(s,c,   i,n){ n=0; for(i=1;i<=length(s);i++) if(substr(s,i,1)==c) n++; return n }
+    BEGIN{inS=0;depth=0;hasDom=0;hasInc=0;inserted=0}
+    {
+      line=$0
+      # detect server start
+      if(!inS && line ~ /^[[:space:]]*server[[:space:]]*\{/){
+        inS=1; depth=1; hasDom=0; hasInc=0; inserted=0
+        print line
+        next
+      }
+      if(inS){
+        if(index(line,"/etc/nginx/includes/bundler_routes.inc")>0){ hasInc=1 }
+        if(line ~ /server_name/ && index(line,dom)>0){ hasDom=1 }
+        print line
+        if(hasDom && !hasInc && !inserted && line ~ /server_name/){
+          print inc
+          inserted=1
+          hasInc=1
+        }
+        depth += countc(line,"{") - countc(line,"}")
+        if(depth<=0){ inS=0; depth=0; hasDom=0; hasInc=0; inserted=0 }
+        next
+      }
+      print line
+    }
+  ' "$f" >"$BK/tmp.ngx" && cat "$BK/tmp.ngx" >"$f" && rm -f "$BK/tmp.ngx"
 
-    if re.match(r'\s*server\s*\{', line):
-        start_i=i
-        start_file=cur_file
-        brace=0
-        block=[]
-        while i<len(lines):
-            l=lines[i]
-            if '{' in l: brace += l.count('{')
-            if '}' in l: brace -= l.count('}')
-            block.append(l)
-            i+=1
-            if brace<=0: break
-        b="\n".join(block)
-        if re.search(r'^\s*server_name\b.*\b'+re.escape(domain)+r'\b', b, re.M):
-            has80=bool(re.search(r'^\s*listen\b.*\b80\b', b, re.M))
-            has443=bool(re.search(r'^\s*listen\b.*\b443\b', b, re.M))
-            servers.append((start_file or "", has80, has443))
-        continue
-    i+=1
+  say "nginx: patched $f"
+}
 
-ssl_file=""
-http_file=""
-for f,h80,h443 in servers:
-    if h443 and not ssl_file: ssl_file=f
-    if h80 and not http_file: http_file=f
+# Candidate config files (sites-enabled first matters most)
+mapfile -t CANDS < <( (ls -1 /etc/nginx/sites-enabled/* 2>/dev/null || true; ls -1 /etc/nginx/sites-available/* 2>/dev/null || true; ls -1 /etc/nginx/conf.d/*.conf 2>/dev/null || true) | awk '!seen[$0]++' )
+for f in "${CANDS[@]}"; do patch_file "$f"; done
 
-print("SSL_443_FILE="+ssl_file)
-print("HTTP_80_FILE="+http_file)
-print("COUNT_MATCHING="+str(len(servers)))
-PY
+say "nginx: show matching server blocks (nginx -T extract)"
+nginx -T 2>&1 | awk -v dom="$DOMAIN" '
+  /^# configuration file /{file=$4; sub(":$","",file)}
+  /server_name/ && index($0,dom)>0 {print file ":" NR " " $0}
+' | tee "$BK/nginx_servers.txt" >/dev/null || true
 
-cat "$BK/active_vhosts.env" | tee "$BK/active_vhosts.echo" >/dev/null
+say "api: verify service listening (bundler-api)"
+if systemctl list-unit-files | grep -q '^bundler-api\.service'; then
+  systemctl restart bundler-api >/dev/null 2>&1 || true
+  systemctl is-active --quiet bundler-api && say "bundler-api: active" || say "bundler-api: not active"
+else
+  say "bundler-api: unit not found (expected if API not installed)"
+fi
 
-SSL_FILE="$(grep -E '^SSL_443_FILE=' "$BK/active_vhosts.env" | cut -d= -f2- || true)"
-HTTP_FILE="$(grep -E '^HTTP_80_FILE=' "$BK/active_vhosts.env" | cut -d= -f2- || true)"
+say "tests: local api health"
+curl -fsS "http://$API_HOST:$API_PORT/health" | head -c 200; echo || say "WARN: local api not reachable on $API_HOST:$API_PORT"
 
-say "unlock nginx.conf + active vhosts"
-chattr -i "$NGINX_CONF" 2>/dev/null || true
-[ -n "${SSL_FILE:-}" ] && [ -f "$SSL_FILE" ] && chattr -i "$SSL_FILE" 2>/dev/null || true
-[ -n "${HTTP_FILE:-}" ] && [ -f "$HTTP_FILE" ] && chattr -i "$HTTP_FILE" 2>/dev/null || true
-
-say "patch ONLY the first matching server block inside each active file"
-python3 - <<'PY' "$DOMAIN" "$INC_BUNDLER" "$BK" "$SSL_FILE" "$HTTP_FILE"
-import re,sys,os
-domain=sys.argv[1]
-inc=sys.argv[2]
-bk=sys.argv[3]
-targets=[sys.argv[4],sys.argv[5]]
-targets=[t for t in targets if t and os.path.isfile(t)]
-if not targets:
-    print("NO_TARGET_FILES")
-    raise SystemExit(0)
-
-def patch_file(fp, port):
-    raw=open(fp,"r",errors="ignore").read().splitlines(True)
-    txt="".join(raw)
-
-    # find server blocks by brace scan on lines (good enough for standard nginx)
-    idxs=[]
-    i=0
-    while i<len(raw):
-        if re.match(r'^\s*server\s*\{', raw[i]):
-            start=i
-            brace=0
-            j=i
-            while j<len(raw):
-                brace += raw[j].count("{")
-                brace -= raw[j].count("}")
-                j+=1
-                if brace<=0: break
-            end=j
-            idxs.append((start,end))
-            i=end
-        else:
-            i+=1
-
-    def block_has(start,end, rx):
-        return any(re.search(rx, raw[k]) for k in range(start,end))
-
-    # select FIRST block with server_name domain + listen port
-    chosen=None
-    for start,end in idxs:
-        if not block_has(start,end, r'^\s*server_name\b.*\b'+re.escape(domain)+r'\b'): 
-            continue
-        if not block_has(start,end, r'^\s*listen\b.*\b'+str(port)+r'\b'):
-            continue
-        chosen=(start,end); break
-
-    if not chosen:
-        return False
-
-    start,end=chosen
-    # if include already in this block, do nothing
-    if any(("include "+inc+";") in raw[k] or ("include /etc/nginx/includes/bundler_routes.inc;") in raw[k] for k in range(start,end)):
-        return False
-
-    # insert right after "server {"
-    ins_line = "  include /etc/nginx/includes/bundler_routes.inc;\n"
-    raw.insert(start+1, ins_line)
-    out="".join(raw)
-
-    # backup original
-    base=os.path.basename(fp).replace("/","_")
-    open(os.path.join(bk, base+".prepatch"),"w").write(txt)
-    open(fp,"w").write(out)
-    return True
-
-for fp in targets:
-    patched_443=patch_file(fp,443)
-    patched_80=patch_file(fp,80)
-    print(f"PATCHED {fp} 443={patched_443} 80={patched_80}")
-PY
-
-say "nginx -t"
+say "nginx: test + reload"
+unlock "$NGINX_CONF" || true
 nginx -t >/dev/null
-
-say "reload nginx"
 systemctl reload nginx >/dev/null
+lockit "$NGINX_CONF" || true
 
-say "re-lock nginx.conf + active vhosts"
-chattr +i "$NGINX_CONF" 2>/dev/null || true
-[ -n "${SSL_FILE:-}" ] && [ -f "$SSL_FILE" ] && chattr +i "$SSL_FILE" 2>/dev/null || true
-[ -n "${HTTP_FILE:-}" ] && [ -f "$HTTP_FILE" ] && chattr +i "$HTTP_FILE" 2>/dev/null || true
+# Re-lock edited files (best-effort)
+lockit "$INC_BUNDLER" || true
+for f in "${CANDS[@]}"; do [ -f "$f" ] && lockit "$f" || true; done
 
-say "tests (origin bypass CF) + public"
-curl -fsS "http://127.0.0.1:${API_PORT}/health" | head -c 200; echo
+say "tests: ORIGIN bypass cloudflare (connect to nginx locally with SNI=$DOMAIN)"
+curl -skI --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/bundler/" | head -n 12 | tr -d '\r' || true
+curl -skI --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/bundler/api/health" | head -n 12 | tr -d '\r' || true
 
-echo "--- ORIGIN HTTPS /bundler/ (should be 200)"
-curl -k -fsSI --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/bundler/" | head -n 15 | tr -d '\r' || true
-echo "--- ORIGIN HTTPS /bundler/api/health (should be 200)"
-curl -k -fsSI --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/bundler/api/health" | head -n 15 | tr -d '\r' || true
-echo "--- ORIGIN HTTPS /bundler/index.html (should be 200)"
-curl -k -fsSI --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/bundler/index.html" | head -n 15 | tr -d '\r' || true
-
-echo "--- PUBLIC HTTPS /bundler/"
-curl -fsSI "https://${DOMAIN}/bundler/" | head -n 15 | tr -d '\r' || true
-echo "--- PUBLIC HTTPS /bundler/api/health"
-curl -fsSI "https://${DOMAIN}/bundler/api/health" | head -n 15 | tr -d '\r' || true
+# If we can detect public IPv4, test with it too
+PUBIP="$(ip -4 -o addr show scope global | awk '{print $4}' | cut -d/ -f1 | head -n1 || true)"
+if [ -n "${PUBIP:-}" ]; then
+  say "tests: ORIGIN via public IP (still bypasses cloudflare)"
+  curl -skI --resolve "$DOMAIN:443:$PUBIP" "https://$DOMAIN/bundler/" | head -n 12 | tr -d '\r' || true
+  curl -skI --resolve "$DOMAIN:443:$PUBIP" "https://$DOMAIN/bundler/api/health" | head -n 12 | tr -d '\r' || true
+fi
 
 say "DONE"
 say "BACKUP: $BK"
-say "ACTIVE_SSL_FILE: ${SSL_FILE:-}"
-say "ACTIVE_HTTP_FILE: ${HTTP_FILE:-}"
+say "EXPECT: https://$DOMAIN/bundler/ should return 200 on origin tests above"
 BASH
 
-chmod +x /root/MEGA_BUNDLER_PATCH_ACTIVE_VHOSTS.sh
-/root/MEGA_BUNDLER_PATCH_ACTIVE_VHOSTS.sh
+chmod +x /root/MEGA_BUNDLER_FIX_404.sh
+/root/MEGA_BUNDLER_FIX_404.sh
