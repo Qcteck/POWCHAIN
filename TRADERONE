@@ -1,19 +1,15 @@
-bash -lc 'cat >/root/wv_fix.sh<<'"'"'BASH'"'"'
+bash -lc 'bash -s <<'"'"'BASH'"'"'
 set -euo pipefail
 umask 022
 TS="$(date +%Y%m%d_%H%M%S)"
 DOMAIN="fireinners.online"
 WEBROOT="/var/www/wolverine"
 DIST="/opt/fireinners/frontend-react/app/dist/wolverine"
-SITES_AV="/etc/nginx/sites-available"
-SITES_EN="/etc/nginx/sites-enabled"
-VHOST_A="${SITES_AV}/fireinners.online-ssl"
-VHOST_E="${SITES_EN}/fireinners.online-ssl"
-INC_DIR="/etc/nginx/includes"
-SNIP_DIR="/etc/nginx/snippets"
-INC_WV="${INC_DIR}/wolverine_static.inc"
+VHOST_A="/etc/nginx/sites-available/fireinners.online-ssl"
+VHOST_E="/etc/nginx/sites-enabled/fireinners.online-ssl"
+INC="/etc/nginx/includes/wolverine_static.inc"
 BK="/root/WV_FIX_${TS}"
-IMM="${BK}/immut.list"
+IMM="$BK/immut.list"
 say(){ printf "\n[%s] %s\n" "$(date +%H:%M:%S)" "$*"; }
 need_root(){ [ "$(id -u)" -eq 0 ] || { echo "RUN AS ROOT"; exit 1; }; }
 
@@ -31,15 +27,14 @@ backup_all(){
 }
 
 disable_aquila_bad_include(){
-  local f="${INC_DIR}/aquila_stacking_routes.inc"
+  local f="/etc/nginx/includes/aquila_stacking_routes.inc"
   if [ -f "$f" ] && grep -qE "^[[:space:]]*location[[:space:]]" "$f"; then
-    say "Disable aquila_stacking_routes.inc (location{} outside server{})"
+    say "Disable aquila_stacking_routes.inc (bad include)"
     mv -f "$f" "${f}.disabled_${TS}" 2>/dev/null || true
   fi
   while IFS= read -r file; do
     [ -f "$file" ] || continue
-    cp -a "$file" "$BK/$(echo "$file" | tr "/" "_" ).bak.aquila" 2>/dev/null || true
-    sed -i -E "s|^([[:space:]]*include[[:space:]]+.*aquila_stacking_routes\.inc[^;]*;)|# DISABLED_BY_WV_FIX_${TS} :: \\1|g" "$file" || true
+    sed -i -E "s|^([[:space:]]*include[[:space:]]+.*aquila_stacking_routes\.inc[^;]*;)|# WVFIX_${TS} DISABLED :: \\1|g" "$file" || true
   done < <(grep -RIl "aquila_stacking_routes\.inc" /etc/nginx 2>/dev/null || true)
 }
 
@@ -47,7 +42,7 @@ comment_location_block(){
   local file="$1" pat="$2"
   [ -f "$file" ] || return 0
   awk -v pat="$pat" -v ts="$TS" '
-    function cmt(s){ return "# WV_FIX_"ts" "s }
+    function cmt(s){ return "# WVFIX_"ts" "s }
     BEGIN{inblk=0;depth=0}
     {
       if(inblk==0 && $0 ~ pat){ inblk=1 }
@@ -63,18 +58,13 @@ comment_location_block(){
 }
 
 remove_other_wolverine_locations(){
-  say "Neutralize other location /wolverine/ (avoid duplicate location)"
-  local f bn
+  say "Neutralize other location /wolverine/ (avoid duplicates)"
+  local f
   while IFS= read -r f; do
     [ -f "$f" ] || continue
-    [ "$f" = "$INC_WV" ] && continue
-    bn="$(basename "$f")"
-    cp -a "$f" "$BK/$(echo "$f" | tr "/" "_" ).bak.wvloc" 2>/dev/null || true
-    if echo "$bn" | grep -qiE "wolverine.*(routes|location|static).*\.((inc|conf))$"; then
-      mv -f "$f" "${f}.disabled_${TS}" 2>/dev/null || true
-    else
-      comment_location_block "$f" "location[[:space:]]+\\^~[[:space:]]+/wolverine/|location[[:space:]]+/wolverine/"
-    fi
+    [ "$f" = "$INC" ] && continue
+    [ "$f" = "$VHOST_A" ] && continue
+    comment_location_block "$f" "location[[:space:]]+\\^~[[:space:]]+/wolverine/|location[[:space:]]+/wolverine/"
   done < <(grep -RIlE "location[[:space:]]+\^~[[:space:]]+/wolverine/|location[[:space:]]+/wolverine/" /etc/nginx 2>/dev/null || true)
 }
 
@@ -87,16 +77,16 @@ ensure_webroot(){
   fi
   if [ ! -f "$WEBROOT/index.html" ]; then
     cat >"$WEBROOT/index.html"<<EOF
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WOLVERINE</title></head><body style="font-family:system-ui;margin:40px"><h1>WOLVERINE</h1><p>Webroot OK. Place your UI in /var/www/wolverine/</p></body></html>
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WOLVERINE</title></head><body style="font-family:system-ui;margin:40px"><h1>WOLVERINE</h1><p>WEBROOT OK: /var/www/wolverine</p></body></html>
 EOF
   fi
 }
 
 write_include(){
-  say "Write include: $INC_WV"
-  mkdir -p "$INC_DIR"
-  cat >"$INC_WV"<<EOF
-# WV_STATIC_${TS}
+  say "Write include: $INC"
+  mkdir -p /etc/nginx/includes
+  cat >"$INC"<<EOF
+# WVFIX_${TS}
 location ^~ /wolverine/ {
   alias ${WEBROOT}/;
   index index.html;
@@ -111,8 +101,8 @@ ensure_vhost_enabled(){
   ln -sf "$VHOST_A" "$VHOST_E" || true
 }
 
-disable_duplicate_vhosts(){
-  say "Disable duplicate enabled vhosts with server_name ${DOMAIN} (keep fireinners.online-ssl)"
+disable_duplicate_enabled_vhosts(){
+  say "Disable other enabled vhosts with server_name fireinners.online (keep fireinners.online-ssl)"
   local f
   while IFS= read -r f; do
     [ -L "$f" ] || continue
@@ -120,15 +110,14 @@ disable_duplicate_vhosts(){
     if grep -qE "^[[:space:]]*server_name[[:space:]].*fireinners\.online" "$f" 2>/dev/null; then
       mv -f "$f" "${f}.disabled_${TS}" 2>/dev/null || true
     fi
-  done < <(find "$SITES_EN" -maxdepth 1 -type l 2>/dev/null || true)
+  done < <(find /etc/nginx/sites-enabled -maxdepth 1 -type l 2>/dev/null || true)
 }
 
-inject_into_ssl_server(){
+inject_include_into_443_server(){
   say "Inject include into 443 server{} (only once)"
   unfreeze_file "$VHOST_A"
-  cp -a "$VHOST_A" "$BK/fireinners.online-ssl.bak" 2>/dev/null || true
-  grep -qF "include ${INC_WV};" "$VHOST_A" && return 0
-  awk -v inc="include ${INC_WV};" '
+  grep -qF "include ${INC};" "$VHOST_A" && return 0
+  awk -v inc="include ${INC};" '
     BEGIN{in_srv=0;depth=0;is443=0;done=0}
     /^[[:space:]]*server[[:space:]]*\{/{
       in_srv=1; depth=1; is443=0
@@ -150,7 +139,7 @@ inject_into_ssl_server(){
       }
       print
     }' "$VHOST_A" >"$VHOST_A.tmp" && mv -f "$VHOST_A.tmp" "$VHOST_A"
-  grep -qF "include ${INC_WV};" "$VHOST_A" || printf "\n# WV_FIX_FALLBACK_%s\ninclude %s;\n" "$TS" "$INC_WV" >>"$VHOST_A"
+  grep -qF "include ${INC};" "$VHOST_A" || printf "\n# WVFIX_FALLBACK_%s\ninclude %s;\n" "$TS" "$INC" >>"$VHOST_A"
 }
 
 nginx_reload(){
@@ -166,10 +155,20 @@ tests(){
   curl -skI --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/" | sed -n "1,12p" || true
   echo
   echo "== HTTPS /wolverine/ (first bytes) =="
-  curl -sk --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/" | head -c 200 || true
+  curl -sk --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/" | head -c 220 || true
   echo; echo
   echo "== ls webroot =="
-  ls -la "$WEBROOT" | sed -n "1,20p" || true
+  ls -la "$WEBROOT" | sed -n "1,40p" || true
+}
+
+rollback(){
+  say "ROLLBACK nginx (best-effort)"
+  [ -d "$BK/nginx" ] || return 0
+  rm -rf /etc/nginx.broken_"$TS" 2>/dev/null || true
+  mv /etc/nginx /etc/nginx.broken_"$TS" 2>/dev/null || true
+  cp -a "$BK/nginx" /etc/nginx 2>/dev/null || true
+  nginx -t || true
+  systemctl restart nginx || true
 }
 
 main(){
@@ -182,13 +181,13 @@ main(){
   unfreeze_tree "/etc/nginx/includes"
   unfreeze_tree "/etc/nginx/snippets"
   disable_aquila_bad_include
-  disable_duplicate_vhosts
+  disable_duplicate_enabled_vhosts
   remove_other_wolverine_locations
   ensure_webroot
   write_include
   ensure_vhost_enabled
-  inject_into_ssl_server
-  nginx_reload
+  inject_include_into_443_server
+  if ! nginx_reload; then rollback; fi
   tests
   say "Refreeze (best-effort)"
   refreeze_all
@@ -196,7 +195,5 @@ main(){
   echo "Backups: $BK"
   echo "Open: https://${DOMAIN}/wolverine/ ثم Ctrl+F5"
 }
-main "$@"
-BASH
-sed -i "s/\r$//" /root/wv_fix.sh
-bash /root/wv_fix.sh'
+main
+BASH'
