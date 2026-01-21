@@ -1,27 +1,27 @@
-bash -lc 'cat >/root/WV_FIX_404.sh<<'"'"'BASH'"'"'
+bash -lc 'cat >/root/WV_DEDUP_FIREINNERS_SSL.sh<<'"'"'BASH'"'"'
 #!/usr/bin/env bash
 set -euo pipefail
 TS="$(date +%Y%m%d_%H%M%S)"
 DOMAIN="fireinners.online"
-WEBROOT="/var/www/wolverine"
-VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
-VHOST_EN="/etc/nginx/sites-enabled/fireinners.online-ssl"
+CANON="/etc/nginx/sites-available/fireinners.online-ssl"
+CANON_EN="/etc/nginx/sites-enabled/fireinners.online-ssl"
 INC="/etc/nginx/includes/wolverine_routes.inc"
-BK="/root/WV_FIX_404_${TS}"
+BK="/root/WV_DEDUP_${TS}"
+
 say(){ echo "[$(date +%H:%M:%S)] $*"; }
 need_root(){ [ "$(id -u)" -eq 0 ] || { echo "ROOT ONLY"; exit 1; }; }
-unfreeze(){ command -v chattr >/dev/null 2>&1 || return 0; chattr -i "$@" 2>/dev/null || true; }
-refreeze(){ command -v chattr >/dev/null 2>&1 || return 0; chattr +i "$@" 2>/dev/null || true; }
+unfreeze_tree(){ command -v chattr >/dev/null 2>&1 || return 0; chattr -i -R "$1" 2>/dev/null || true; }
+refreeze_tree(){ command -v chattr >/dev/null 2>&1 || return 0; chattr +i -R "$1" 2>/dev/null || true; }
 
 inject_include_into_ssl_server(){
   local f="$1" incLine="include ${INC};"
-  grep -qF "$incLine" "$f" && return 0
   awk -v inc="$incLine" '
-    BEGIN{in_srv=0;depth=0;is443=0;done=0;}
-    /^[[:space:]]*server[[:space:]]*\{/ {in_srv=1;depth=1;is443=0;}
+    BEGIN{in_srv=0;depth=0;is443=0;done=0;seenName=0;}
+    /^[[:space:]]*server[[:space:]]*\{/ {in_srv=1;depth=1;is443=0;seenName=0;}
     {
       if(in_srv){
         if($0 ~ /listen[[:space:]]+443/){is443=1;}
+        if($0 ~ /^[[:space:]]*server_name[[:space:]]/){seenName=1;}
         n=gsub(/\{/,"{"); depth+=n;
         n=gsub(/\}/,"}"); depth-=n;
         if(depth==0){
@@ -37,67 +37,89 @@ inject_include_into_ssl_server(){
   ' "$f" >"${f}.tmp" && mv -f "${f}.tmp" "$f"
 }
 
-disable_other_wolverine_includes(){
-  local d="/etc/nginx/includes"
+disable_duplicate_vhosts(){
+  local d="/etc/nginx/sites-enabled"
   [ -d "$d" ] || return 0
   shopt -s nullglob
-  for f in "$d"/wolverine*; do
-    [ "$f" = "$INC" ] && continue
-    local base; base="$(basename "$f")"
-    case "$base" in
-      DISABLED_*|*.bak|*.bak_*) continue ;;
-    esac
-    mv -f "$f" "$d/DISABLED_${TS}__${base}" 2>/dev/null || true
+  for p in "$d"/*; do
+    local rp; rp="$(readlink -f "$p" 2>/dev/null || true)"
+    [ -n "$rp" ] || continue
+    [ "$rp" = "$CANON" ] && continue
+    if grep -qE "^[[:space:]]*server_name[[:space:]].*\\b${DOMAIN//./\\.}\\b" "$rp" 2>/dev/null; then
+      if grep -qE "listen[[:space:]]+443" "$rp" 2>/dev/null || grep -qE "listen[[:space:]]+80" "$rp" 2>/dev/null; then
+        local base; base="$(basename "$p")"
+        say "DISABLE duplicate enabled vhost: $p -> $d/DISABLED_${TS}__${base}"
+        mv -f "$p" "$d/DISABLED_${TS}__${base}" || true
+      fi
+    fi
   done
 }
 
-write_include(){
-  mkdir -p "$(dirname "$INC")"
-  cat >"$INC"<<EOF
-# CANONICAL Wolverine routes (auto) ${TS}
-location ^~ /wolverine/ {
-  alias ${WEBROOT}/;
-  try_files \$uri \$uri/ /wolverine/index.html;
-  add_header Cache-Control "no-store" always;
-}
-EOF
+dedup_server_name_inside_canon(){
+  local f="$1"
+  awk -v dom="$DOMAIN" -v ts="$TS" '
+    BEGIN{in_srv=0;depth=0;is443=0;hasName=0;kept443=0;}
+    /^[[:space:]]*server[[:space:]]*\{/ {in_srv=1;depth=1;is443=0;hasName=0;}
+    {
+      line=$0
+      if(in_srv){
+        if(line ~ /listen[[:space:]]+443/){is443=1;}
+        if(line ~ /^[[:space:]]*server_name[[:space:]]/ && line ~ dom){
+          hasName=1
+          if(is443){
+            if(kept443==0){
+              kept443=1
+            } else {
+              sub(/server_name[[:space:]]+.*/,"server_name disabled-"ts".invalid; # AUTO disabled dup",line)
+            }
+          } else {
+            # for :80 duplicates, keep first only
+            if(line ~ dom){
+              if(seen80==0){seen80=1}else{sub(/server_name[[:space:]]+.*/,"server_name disabled-"ts".invalid; # AUTO disabled dup",line)}
+            }
+          }
+        }
+        n=gsub(/\{/,"{"); depth+=n;
+        n=gsub(/\}/,"}"); depth-=n;
+        if(depth==0){in_srv=0}
+      }
+      print line
+    }
+  ' "$f" >"${f}.tmp" && mv -f "${f}.tmp" "$f"
 }
 
-write_index_html(){
-  mkdir -p "$WEBROOT"
-  cat >"$WEBROOT/index.html"<<'"'"'HTML'"'"'
-<!doctype html><html lang="fr"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Wolverine / TraderOne</title><style>:root{--bg:#07090d;--bg2:#0b0f18;--panel:#0e1526;--line:#1b2a4a;--txt:#e7eefc;--mut:#9fb3d9;--ok:#39d98a;--bad:#ff4d4d;--warn:#ffcc66;--acc:#3aa0ff;--acc2:#7a5cff;--shadow:0 18px 60px rgba(0,0,0,.55)}*{box-sizing:border-box}html,body{height:100%}body{margin:0;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;letter-spacing:.2px;background:radial-gradient(1200px 700px at 25% 10%,rgba(58,160,255,.14),transparent 55%),radial-gradient(900px 700px at 85% 25%,rgba(122,92,255,.12),transparent 60%),linear-gradient(180deg,var(--bg),#05070b 60%,#03040a);color:var(--txt)}a{color:inherit;text-decoration:none}button,input,select{font:inherit}#app{height:100%;display:grid;grid-template-columns:280px 1fr;grid-template-rows:64px 1fr;grid-template-areas:"side top""side main"}#side{grid-area:side;border-right:1px solid var(--line);background:linear-gradient(180deg,rgba(14,21,38,.92),rgba(7,9,13,.92));backdrop-filter:blur(10px);padding:18px 14px;display:flex;flex-direction:column;gap:14px}#brand{display:flex;align-items:center;gap:12px;padding:10px 10px;border:1px solid var(--line);border-radius:14px;background:rgba(12,18,32,.55);box-shadow:var(--shadow)}#logo{width:36px;height:36px;border-radius:12px;background:linear-gradient(135deg,var(--acc),var(--acc2));display:grid;place-items:center;font-weight:800}#brand h1{margin:0;font-size:15px;line-height:1.1}#brand small{display:block;color:var(--mut);font-size:11px;margin-top:2px}.nav{display:flex;flex-direction:column;gap:8px}.nav a{display:flex;align-items:center;gap:10px;padding:10px 12px;border-radius:12px;border:1px solid transparent;color:var(--mut)}.nav a:hover{background:rgba(58,160,255,.08);border-color:rgba(58,160,255,.18);color:var(--txt)}.nav a.active{background:rgba(58,160,255,.12);border-color:rgba(58,160,255,.28);color:var(--txt)}.pill{font-size:11px;padding:2px 8px;border-radius:999px;border:1px solid var(--line);color:var(--mut);margin-left:auto}.pill.ok{color:var(--ok);border-color:rgba(57,217,138,.35);background:rgba(57,217,138,.08)}.pill.bad{color:var(--bad);border-color:rgba(255,77,77,.35);background:rgba(255,77,77,.08)}.pill.warn{color:var(--warn);border-color:rgba(255,204,102,.35);background:rgba(255,204,102,.08)}#top{grid-area:top;display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--line);background:linear-gradient(180deg,rgba(11,15,24,.82),rgba(7,9,13,.35));backdrop-filter:blur(10px)}#top .left{display:flex;align-items:center;gap:10px}#top .right{display:flex;align-items:center;gap:10px}.chip{display:flex;align-items:center;gap:8px;padding:10px 12px;border-radius:14px;border:1px solid var(--line);background:rgba(12,18,32,.55)}.dot{width:8px;height:8px;border-radius:999px;background:var(--warn);box-shadow:0 0 0 3px rgba(255,204,102,.14)}.dot.ok{background:var(--ok);box-shadow:0 0 0 3px rgba(57,217,138,.14)}.dot.bad{background:var(--bad);box-shadow:0 0 0 3px rgba(255,77,77,.14)}#main{grid-area:main;padding:16px;overflow:auto}#grid{display:grid;grid-template-columns:1.15fr .85fr;gap:14px}@media(max-width:1060px){#app{grid-template-columns:1fr;grid-template-rows:auto auto 1fr;grid-template-areas:"top""side""main"}#side{border-right:none;border-bottom:1px solid var(--line)}#grid{grid-template-columns:1fr}}.card{border:1px solid var(--line);border-radius:16px;background:linear-gradient(180deg,rgba(14,21,38,.65),rgba(7,9,13,.55));box-shadow:var(--shadow);overflow:hidden}.card .hd{padding:12px 14px;border-bottom:1px solid rgba(27,42,74,.6);display:flex;align-items:center;gap:10px}.card .hd b{font-size:13px}.card .hd small{color:var(--mut);font-size:11px}.card .bd{padding:14px}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.grow{flex:1}.btn{cursor:pointer;border:1px solid rgba(58,160,255,.35);background:linear-gradient(180deg,rgba(58,160,255,.18),rgba(58,160,255,.10));color:var(--txt);padding:10px 12px;border-radius:12px;font-weight:650}.btn:hover{filter:brightness(1.08)}.btn.ghost{border-color:var(--line);background:rgba(12,18,32,.45);color:var(--mut)}.btn.danger{border-color:rgba(255,77,77,.35);background:linear-gradient(180deg,rgba(255,77,77,.18),rgba(255,77,77,.10))}.btn.ok{border-color:rgba(57,217,138,.35);background:linear-gradient(180deg,rgba(57,217,138,.18),rgba(57,217,138,.10))}.inp,select{border:1px solid var(--line);background:rgba(7,9,13,.45);color:var(--txt);padding:10px 12px;border-radius:12px;outline:none;min-width:180px}select{min-width:200px}.kv{display:grid;grid-template-columns:150px 1fr;gap:8px 12px;align-items:center}.k{color:var(--mut);font-size:12px}.v{font-size:12px;word-break:break-all}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:12px}.term{background:rgba(0,0,0,.35);border:1px solid rgba(27,42,74,.55);border-radius:14px;padding:12px;max-height:340px;overflow:auto}.tag{display:inline-flex;align-items:center;gap:8px;padding:6px 10px;border-radius:999px;border:1px solid rgba(27,42,74,.7);background:rgba(12,18,32,.45);color:var(--mut);font-size:12px}.tag b{color:var(--txt)}.split{display:grid;grid-template-columns:1fr 1fr;gap:10px}@media(max-width:680px){.split{grid-template-columns:1fr}}.hr{height:1px;background:rgba(27,42,74,.55);margin:12px 0}.warnbox{border:1px solid rgba(255,204,102,.35);background:rgba(255,204,102,.08);color:#ffe6a6;border-radius:14px;padding:10px 12px;font-size:12px}.badbox{border:1px solid rgba(255,77,77,.35);background:rgba(255,77,77,.08);color:#ffd0d0;border-radius:14px;padding:10px 12px;font-size:12px}</style></head><body><div id="app"><aside id="side"><div id="brand"><div id="logo">W</div><div><h1>Wolverine / TraderOne</h1><small id="sub">UI officielle (static)</small></div></div><div class="nav" id="nav"><a href="#/dashboard" data-r="dashboard">Dashboard<span class="pill" id="pillDash">UI</span></a><a href="#/trade" data-r="trade">Trade<span class="pill" id="pillTrade">API</span></a><a href="#/positions" data-r="positions">Positions</a><a href="#/orders" data-r="orders">Orders</a><a href="#/history" data-r="history">History</a><a href="#/wallet" data-r="wallet">Wallet</a><a href="#/settings" data-r="settings">Settings</a><a href="#/health" data-r="health">Health<span class="pill" id="pillHealth">check</span></a></div><div class="card"><div class="hd"><b>WalletBox</b><small>Phantom (Solana)</small></div><div class="bd"><div class="row"><button class="btn" id="btnConnect">Connect Phantom</button><button class="btn ghost" id="btnDisconnect" disabled>Disconnect</button></div><div class="hr"></div><div class="kv"><div class="k">Address</div><div class="v mono" id="wAddr">—</div><div class="k">SOL</div><div class="v mono" id="wSol">—</div><div class="k">USDC</div><div class="v mono" id="wUsdc">—</div></div><div class="hr"></div><div class="row"><button class="btn ghost" id="btnRefresh" disabled>Refresh balances</button><span class="tag"><b>RPC</b><span class="mono" id="rpcShort">drpc</span></span></div><div class="hr"></div><div id="libWarn" class="warnbox" style="display:none">Lib Solana manquante. Assure-toi que <span class="mono">/wolverine/vendor/solana-web3.min.js</span> est servi.</div></div></div></aside><header id="top"><div class="left"><div class="chip"><span class="dot" id="dotApi"></span><div><div class="mono" style="font-weight:700">API</div><div class="mono" id="apiBase" style="color:var(--mut)">/wolverine/traderone/api</div></div></div><div class="chip"><span class="dot" id="dotVault"></span><div><div class="mono" style="font-weight:700">Vault</div><div class="mono" id="vaultBase" style="color:var(--mut)">/wolverine/vault-api/health</div></div></div></div><div class="right"><span class="tag"><b>UI</b><span class="mono" id="uiVer">OFFICIEL</span></span><span class="tag"><b>Path</b><span class="mono">/wolverine/</span></span></div></header><main id="main"><div id="grid"><section class="card"><div class="hd"><b id="viewTitle">Dashboard</b><small id="viewSub">Vue globale</small></div><div class="bd" id="view"></div></section><aside class="card"><div class="hd"><b>Terminal</b><small>logs & réponses backend</small></div><div class="bd"><div class="row"><button class="btn ghost" id="btnClearLog">Clear</button><button class="btn" id="btnPing">Ping Health</button><button class="btn ghost" id="btnCopyLog">Copy</button></div><div class="hr"></div><div class="term mono" id="log"></div></div></aside></div></main></div><script src="/wolverine/vendor/solana-web3.min.js" onerror="window.__SOLANA_LIB_MISSING__=1"></script><script>(function(){const CFG={RPC:"https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac",USDC_MINT:"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1",API_BASE:"/wolverine/traderone/api",VAULT_HEALTH:"/wolverine/vault-api/health",START:"/wolverine/api/start",MODE:"/wolverine/api/traderone/mode",WITHDRAW:"/wolverine/api/traderone/withdraw",INVESTED:(pub)=>"/wolverine/api/invested?pub="+encodeURIComponent(pub)};const $=s=>document.querySelector(s);const logEl=$("#log");const wAddr=$("#wAddr"),wSol=$("#wSol"),wUsdc=$("#wUsdc");const btnConnect=$("#btnConnect"),btnDisconnect=$("#btnDisconnect"),btnRefresh=$("#btnRefresh");const dotApi=$("#dotApi"),dotVault=$("#dotVault");const pillHealth=$("#pillHealth"),pillTrade=$("#pillTrade"),pillDash=$("#pillDash");const libWarn=$("#libWarn");const rpcShort=$("#rpcShort");rpcShort.textContent=CFG.RPC.replace(/^https?:\/\//,"").slice(0,26)+"…";function log(t,type){const ts=new Date().toISOString().split("T")[1].replace("Z","");const c=type==="bad"?"color:var(--bad)":type==="ok"?"color:var(--ok)":type==="warn"?"color:var(--warn)":"color:var(--mut)";logEl.insertAdjacentHTML("beforeend",`<div><span style="color:var(--mut)">[${ts}]</span> <span style="${c}">${esc(t)}</span></div>`);logEl.scrollTop=logEl.scrollHeight}function esc(s){return String(s).replace(/[&<>"']/g,m=>({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[m]))}function setDot(el,st){el.classList.remove("ok","bad");if(st==="ok")el.classList.add("ok");else if(st==="bad")el.classList.add("bad")}function setPill(el,st,txt){el.classList.remove("ok","bad","warn");if(st==="ok")el.classList.add("ok");else if(st==="bad")el.classList.add("bad");else if(st==="warn")el.classList.add("warn");if(txt)el.textContent=txt}async function jget(url){const r=await fetch(url,{credentials:"same-origin"});const tx=await r.text();return{ok:r.ok,status:r.status,txt:tx,headers:[...r.headers.entries()]}}async function jpost(url,obj){const r=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(obj||{}),credentials:"same-origin"});const tx=await r.text();return{ok:r.ok,status:r.status,txt:tx}}function hasSolanaLib(){return !!(window.solanaWeb3&&window.solanaWeb3.Connection)}function phantom(){return window.solana&&window.solana.isPhantom?window.solana:null}let conn=null;let pub=null;function shortPub(p){return p?p.slice(0,4)+"…"+p.slice(-4):"—"}async function connect(){示;const ph=phantom();if(!ph){log("Phantom introuvable (extension)","bad");return}try{const res=await ph.connect({onlyIfTrusted:false});pub=res.publicKey.toString();wAddr.textContent=pub;btnDisconnect.disabled=false;btnRefresh.disabled=false;log("Connected: "+shortPub(pub),"ok");await refreshBalances()}catch(e){log("Connect error: "+(e&&e.message?e.message:e),"bad")}}async function disconnect(){const ph=phantom();try{if(ph&&ph.disconnect)await ph.disconnect();}catch(_){}pub=null;wAddr.textContent="—";wSol.textContent="—";wUsdc.textContent="—";btnDisconnect.disabled=true;btnRefresh.disabled=true;log("Disconnected","warn")}async function refreshBalances(){if(!pub){log("No wallet connected","warn");return}if(!hasSolanaLib()){log("Solana lib missing","bad");libWarn.style.display="block";return}libWarn.style.display="none";conn=new solanaWeb3.Connection(CFG.RPC,"confirmed");try{const lam=await conn.getBalance(new solanaWeb3.PublicKey(pub));const sol=lam/1e9;wSol.textContent=sol.toFixed(6);log("SOL balance: "+wSol.textContent,"ok")}catch(e){log("SOL balance error: "+(e&&e.message?e.message:e),"bad")}try{const owner=new solanaWeb3.PublicKey(pub);const resp=await conn.getParsedTokenAccountsByOwner(owner,{programId:new solanaWeb3.PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")});let sum=0;for(const it of resp.value){const info=it.account.data.parsed.info;const mint=info.mint;const amt=info.tokenAmount; if(mint===CFG.USDC_MINT){sum+=Number(amt.uiAmount||0)}}wUsdc.textContent=sum.toFixed(6);log("USDC balance: "+wUsdc.textContent,"ok")}catch(e){log("USDC balance error: "+(e&&e.message?e.message:e),"bad")}}async function ping(){log("Ping…","");try{const a=await jget(CFG.API_BASE+"/health").catch(()=>null);if(a&&a.ok){setDot(dotApi,"ok");setPill(pillTrade,"ok","API OK");log("API health "+a.status+": "+a.txt.slice(0,220),"ok")}else{setDot(dotApi,"bad");setPill(pillTrade,"bad","API BAD");log("API health FAIL "+(a?a.status:"(no)"),"bad")} }catch(e){setDot(dotApi,"bad");setPill(pillTrade,"bad","API BAD");log("API ping error: "+(e&&e.message?e.message:e),"bad")}try{const v=await jget(CFG.VAULT_HEALTH).catch(()=>null);if(v&&v.ok&&/^\s*\{/.test(v.txt)){setDot(dotVault,"ok");setPill(pillHealth,"ok","VAULT OK");log("Vault "+v.status+": "+v.txt.slice(0,220),"ok")}else{setDot(dotVault,"bad");setPill(pillHealth,"bad","VAULT BAD");log("Vault FAIL "+(v?v.status:"(no)")+" body="+(v?v.txt.slice(0,60):""),"bad")} }catch(e){setDot(dotVault,"bad");setPill(pillHealth,"bad","VAULT BAD");log("Vault ping error: "+(e&&e.message?e.message:e),"bad")} }const routes={dashboard:{t:"Dashboard",s:"Vue globale",h:()=>"<div class=\\"warnbox\\">UI chargée. Si tu vois encore 404: nginx/alias/include.</div>"},trade:{t:"Trade",s:"Commandes backend",h:()=>"<div class=\\"warnbox\\">Trade UI prête (backend requis).</div>"},positions:{t:"Positions",s:"Portefeuille",h:()=>"<div class=\\"warnbox\\">Positions (backend requis).</div>"},orders:{t:"Orders",s:"Ordres",h:()=>"<div class=\\"warnbox\\">Orders (backend requis).</div>"},history:{t:"History",s:"Historique",h:()=>"<div class=\\"warnbox\\">History (backend requis).</div>"},wallet:{t:"Wallet",s:"Phantom & balances",h:()=>"<div class=\\"warnbox\\">Connect wallet dans la colonne gauche.</div>"},settings:{t:"Settings",s:"Config UI",h:()=>"<div class=\\"warnbox\\">Config: RPC/USDC/API.</div>"},health:{t:"Health",s:"Ping endpoints",h:()=>"<div class=\\"warnbox\\">Clique Ping dans Terminal.</div>"}};function setActive(r){document.querySelectorAll("#nav a").forEach(a=>a.classList.toggle("active",a.dataset.r===r))}function render(){const r=(location.hash||"#/dashboard").replace(/^#\//,"").split("?")[0]||"dashboard";const R=routes[r]||routes.dashboard;$("#viewTitle").textContent=R.t;$("#viewSub").textContent=R.s;$("#view").innerHTML=R.h();setActive(r)}btnConnect.onclick=connect;btnDisconnect.onclick=disconnect;btnRefresh.onclick=refreshBalances;$("#btnClearLog").onclick=()=>logEl.innerHTML="";$("#btnCopyLog").onclick=async()=>{const t=logEl.innerText;try{await navigator.clipboard.writeText(t);log("Log copied","ok")}catch(e){log("Copy failed: "+e,"bad")}};$("#btnPing").onclick=ping;window.addEventListener("hashchange",render);if(window.__SOLANA_LIB_MISSING__||!hasSolanaLib()){libWarn.style.display="block";log("WARNING: solana-web3 lib not loaded from /wolverine/vendor/solana-web3.min.js","warn")}setPill(pillDash,"ok","UI OK");render();ping();})();</script></body></html>
-HTML
+strip_duplicate_wolverine_includes(){
+  local f="$1"
+  local pat="include ${INC};"
+  awk -v p="$pat" '
+    { if($0==p){c++; if(c>1) next;} print }
+  ' "$f" >"${f}.tmp" && mv -f "${f}.tmp" "$f"
 }
 
 main(){
   need_root
+  [ -f "$CANON" ] || { echo "MISSING: $CANON"; exit 1; }
   mkdir -p "$BK"
   say "Backup -> $BK"
-  [ -f "$VHOST" ] && cp -a "$VHOST" "$BK/" || true
-  [ -f "$INC" ] && cp -a "$INC" "$BK/" || true
-  [ -d "$WEBROOT" ] && cp -a "$WEBROOT" "$BK/webroot" || true
+  cp -a /etc/nginx "$BK/nginx" 2>/dev/null || true
 
-  say "Unfreeze nginx (best-effort)"
-  unfreeze /etc/nginx/nginx.conf "$VHOST" "$INC Remember" 2>/dev/null || true
-  unfreeze "$VHOST" "$INC" 2>/dev/null || true
+  say "Unfreeze nginx tree (best-effort)"
+  unfreeze_tree /etc/nginx || true
 
-  say "Disable other wolverine includes"
-  disable_other_wolverine_includes
+  say "Ensure canonical vhost enabled symlink"
+  ln -sf "$CANON" "$CANON_EN"
 
-  say "Write canonical include"
-  write_include
+  say "Disable duplicate vhosts in sites-enabled"
+  disable_duplicate_vhosts
 
-  say "Write UI index.html"
-  write_index_html
-  mkdir -p "$WEBROOT/vendor" || true
+  say "Dedup server_name inside canonical vhost"
+  dedup_server_name_inside_canon "$CANON"
 
-  say "Ensure vhost enabled"
-  [ -f "$VHOST" ] || { echo "MISSING VHOST: $VHOST"; exit 1; }
-  ln -sf "$VHOST" "$VHOST_EN"
+  say "Strip duplicate wolverine include lines (if any)"
+  strip_duplicate_wolverine_includes "$CANON"
 
   say "Inject include into SSL server"
-  inject_include_into_ssl_server "$VHOST"
+  inject_include_into_ssl_server "$CANON"
 
   say "nginx -t"
   nginx -t
@@ -105,13 +127,8 @@ main(){
   say "reload nginx"
   systemctl reload nginx || systemctl restart nginx
 
-  say "Tests"
-  echo "== local SNI -> 127.0.0.1 (HEAD) =="
-  curl -skI --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/" | sed -n "1,12p" || true
-  echo "== public (HEAD) =="
-  curl -skI "https://${DOMAIN}/wolverine/" | sed -n "1,12p" || true
-  echo "== webroot (ls) =="
-  ls -la "$WEBROOT" | sed -n "1,30p" || true
+  say "Proof (nginx -T grep)"
+  nginx -T 2>/dev/null | grep -nE "conflicting server name|server_name[[:space:]]+${DOMAIN}|listen[[:space:]]+443|include /etc/nginx/includes/wolverine_routes.inc|location \\^~ /wolverine/" | head -n 260 || true
 
   say "DONE"
   echo "Backups: $BK"
@@ -120,9 +137,5 @@ main(){
 
 main "$@"
 BASH
-chmod +x /root/WV_FIX_404.sh
-bash /root/WV_FIX_404.sh'
-
-
-
-nginx -T | grep -nE "server_name|listen 443|include /etc/nginx/includes/wolverine_routes.inc|location \^~ /wolverine/" | head -n 200
+chmod +x /root/WV_DEDUP_FIREINNERS_SSL.sh
+bash /root/WV_DEDUP_FIREINNERS_SSL.sh'
