@@ -1,169 +1,405 @@
-cat >/root/MEGA_AQUILA_STACKING_ROUTE_FIX_V3_AWK.sh<<'BASH'
+bash -lc 'cat >/root/MEGA_WOLVERINE_VAULT_FIX_FINAL.sh<<'"'"'BASH'"'"'
 #!/usr/bin/env bash
 set -euo pipefail
-umask 027
+
 TS="$(date +%Y%m%d_%H%M%S)"
-say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
-die(){ say "ERR: $*"; exit 1; }
-need(){ command -v "$1" >/dev/null 2>&1 || die "missing: $1"; }
-
-[ "$(id -u)" -eq 0 ] || die "run as root"
-need nginx
-need systemctl
-need awk
-need grep
-need sed
-need cp
-need mkdir
-need chmod
-
-APP="/opt/aquila_stacking"
-KEYS="${APP}/keys"
-PROG="aquila_stacking"
-
-INC="/etc/nginx/includes/aquila_stacking_routes.inc"
-WEBROOT="/var/www/aquila_stacking"
-HTML="${WEBROOT}/index.html"
-
-VHOST_A="/etc/nginx/sites-available/fireinners.online-ssl"
-VHOST_E="/etc/nginx/sites-enabled/fireinners.online-ssl"
-VHOST_C="/etc/nginx/conf.d/000-fireinners.online-ssl.conf"
-
-INCLUDE_LINE="include /etc/nginx/includes/aquila_stacking_routes.inc;"
-MARK_BEG="# AQUILA_STACKING_INCLUDE_V3"
-MARK_END="# END_AQUILA_STACKING_INCLUDE_V3"
-
-BK="/root/AQUILA_STAKING_ROUTE_FIX_V3_BK_${TS}"
+BK="/root/MEGA_WOLVERINE_VAULT_FIX_${TS}"
 mkdir -p "$BK"
-nginx -T >"$BK/nginx.T.txt" 2>&1 || true
 
-backup_one(){ local f="$1"; [ -f "$f" ] && cp -a "$f" "$BK/$(echo "$f" | sed 's#/#_#g').bak" || true; }
+# ---- Fixed paths (per your VPS) ----
+WEBROOT="/var/www/wolverine"
+VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
+VHOST_EN="/etc/nginx/sites-enabled/fireinners.online-ssl"
+NGXCONF="/etc/nginx/nginx.conf"
+INCDIR="/etc/nginx/includes"
+INC_STATIC="${INCDIR}/wolverine_static.inc"
+INC_ROUTES="${INCDIR}/wolverine_routes.inc"
+AQUILA_BAD="${INCDIR}/aquila_stacking_routes.inc"
 
-backup_one "$INC"
-backup_one "$VHOST_A"
-backup_one "$VHOST_E"
-backup_one "$VHOST_C"
-[ -d "$WEBROOT" ] && cp -a "$WEBROOT" "$BK/webroot_aquila_stacking.bak" || true
+VAULT_DIR="/opt/traderone-vault"
+VAULT_PORT="8787"
+VAULT_HOST="127.0.0.1"
+VAULT_SVC="/etc/systemd/system/vault-api.service"
 
-say "1) WEBROOT: $WEBROOT"
-mkdir -p "$WEBROOT"
-chmod 0755 "$WEBROOT"
+# Your canonical DRPC endpoint (saved preference)
+DRPC_URL="https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac"
 
-say "2) Program ID"
-PID="UNKNOWN"
-if command -v solana-keygen >/dev/null 2>&1 && [ -f "$KEYS/${PROG}-keypair.json" ]; then
-  PID="$(solana-keygen pubkey "$KEYS/${PROG}-keypair.json" 2>/dev/null || echo UNKNOWN)"
-fi
+say(){ printf "[%s] %s\n" "$(date +'%H:%M:%S')" "$*"; }
 
-say "3) index.html"
-cat >"$HTML"<<EOF
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AquilaStacking</title><style>body{font-family:system-ui,Segoe UI,Arial;margin:24px;max-width:980px}code{background:#0b1020;color:#d7e3ff;padding:10px;border-radius:10px;display:block;overflow:auto}h1{margin:0 0 12px}small{opacity:.8}</style></head><body><h1>AquilaStacking</h1><p><b>Program ID:</b><code>${PID}</code></p><p><b>Workspace:</b><code>${APP}</code></p><p><b>URL:</b><code>/aquila_stacking/</code></p><p><small>Redirect: /aquilastacking/ → /aquila_stacking/</small></p></body></html>
-EOF
-chown -R www-data:www-data "$WEBROOT" 2>/dev/null || true
-chmod -R 0755 "$WEBROOT"
+have(){ command -v "$1" >/dev/null 2>&1; }
 
-say "4) nginx include routes: $INC"
-chattr -i "$INC" 2>/dev/null || true
-cat >"$INC"<<EOF
-# AQUILA_STACKING_ROUTES_V3
-location = /aquilastacking { return 301 /aquila_stacking/; }
-location ^~ /aquilastacking/ { return 301 /aquila_stacking/; }
-location = /aquila_stacking { return 301 /aquila_stacking/; }
-location ^~ /aquila_stacking/ { alias ${WEBROOT}/; index index.html; try_files \$uri \$uri/ /aquila_stacking/index.html; add_header Cache-Control "no-store" always; }
-# END_AQUILA_STACKING_ROUTES_V3
-EOF
+mkbackup(){ local f="$1"; [ -e "$f" ] && cp -a "$f" "$BK/$(basename "$f").bak" 2>/dev/null || true; }
 
-patch_file(){
+# Track immutable files and restore immutability at end (optional but safe)
+IMLIST="$BK/immutable.list"
+touch "$IMLIST"
+unfreeze_one(){
   local f="$1"
-  [ -f "$f" ] || return 0
-  if ! grep -qE 'server_name[^;]*\bfireinners\.online\b' "$f"; then
-    say "skip (no fireinners.online): $f"
-    return 0
+  [ -e "$f" ] || return 0
+  if lsattr -d "$f" 2>/dev/null | grep -q 'i'; then
+    echo "$f" >>"$IMLIST"
+    chattr -i "$f" 2>/dev/null || true
   fi
-  if grep -qF "$INCLUDE_LINE" "$f"; then
-    say "ok (already has include): $f"
-    return 0
-  fi
-
-  say "patch: $f"
-  chattr -i "$f" 2>/dev/null || true
-
-  local tmp; tmp="$(mktemp)"
-  awk -v inc="$INCLUDE_LINE" -v mb="$MARK_BEG" -v me="$MARK_END" '
-  function emit_inc(){ print "  " mb; print "  " inc; print "  " me; }
-  BEGIN{inserver=0;depth=0;saw=0;inserted=0;}
-  {
-    line=$0
-    if(!inserver){
-      print line
-      if(line ~ /^[[:space:]]*server[[:space:]]*\{/){
-        inserver=1; depth=1; saw=0; inserted=0;
-      }
-      next
-    }
-
-    # in server block
-    if(line ~ /server_name[[:space:]]+[^;]*\bfireinners\.online\b[^;]*;/){ saw=1 }
-
-    # insert before first location once we know it is the right server
-    if(saw && !inserted && line ~ /^[[:space:]]*location[[:space:]]/){
-      emit_inc()
-      inserted=1
-    }
-
-    # track braces to know when server ends
-    # count { and } occurrences
-    oc=gsub(/\{/,"&",line); cc=gsub(/\}/,"&",line)
-    depth += oc
-    depth -= cc
-
-    # if this is the closing line of the server and we never inserted, insert before }
-    if(depth<=0){
-      if(saw && !inserted){
-        # if line is just "}" or has "}" we emit include before printing closing
-        emit_inc()
-        inserted=1
-      }
-      print line
-      inserver=0; depth=0; saw=0; inserted=0
-      next
-    }
-
-    print line
-  }' "$f" >"$tmp"
-
-  cp -a "$f" "$f.bak.$TS" 2>/dev/null || true
-  cat "$tmp" >"$f"
-  rm -f "$tmp"
+}
+refreeze_all(){
+  [ -s "$IMLIST" ] || return 0
+  while IFS= read -r f; do
+    [ -e "$f" ] && chattr +i "$f" 2>/dev/null || true
+  done <"$IMLIST"
 }
 
-say "5) patch all likely active vhosts (conf.d + sites-enabled + sites-available)"
-patch_file "$VHOST_C"
-patch_file "$VHOST_E"
-patch_file "$VHOST_A"
+restore_latest_savepoint_webroot(){
+  # tries to restore /var/www/wolverine from latest /root/WOLVERINE_SAVE_*
+  local latest
+  latest="$(ls -1dt /root/WOLVERINE_SAVE_* 2>/dev/null | head -n1 || true)"
+  [ -n "$latest" ] || return 0
 
-say "6) nginx -t + reload (rollback if fail)"
-if ! nginx -t; then
-  say "nginx invalid -> rollback"
-  for p in "$INC" "$VHOST_C" "$VHOST_E" "$VHOST_A"; do
-    b="$BK/$(echo "$p" | sed 's#/#_#g').bak"
-    [ -f "$b" ] && cp -a "$b" "$p" || true
-  done
-  nginx -t || true
-  die "rolled back (see $BK)"
+  if [ -d "$latest/var/www/wolverine" ]; then
+    say "Restore WEBROOT from $latest/var/www/wolverine"
+    rm -rf "$WEBROOT" 2>/dev/null || true
+    mkdir -p "$(dirname "$WEBROOT")"
+    cp -a "$latest/var/www/wolverine" "$WEBROOT"
+    return 0
+  fi
+  if [ -d "$latest/wolverine" ]; then
+    say "Restore WEBROOT from $latest/wolverine"
+    rm -rf "$WEBROOT" 2>/dev/null || true
+    mkdir -p "$(dirname "$WEBROOT")"
+    cp -a "$latest/wolverine" "$WEBROOT"
+    return 0
+  fi
+  return 0
+}
+
+comment_includes_everywhere(){
+  # Comment any include of a given pattern (prevents "location not allowed here" at wrong context)
+  local pat="$1"
+  local root="/etc/nginx"
+  say "Scanning nginx configs for includes matching: $pat"
+  # backup all touched files via BK; then comment line
+  while IFS= read -r f; do
+    [ -f "$f" ] || continue
+    if grep -nE "^[[:space:]]*include[[:space:]]+.*${pat}.*;" "$f" >/dev/null 2>&1; then
+      mkbackup "$f"
+      unfreeze_one "$f"
+      perl -0777 -pe "s/^([ \\t]*include[ \\t]+[^;]*${pat}[^;]*;)/# AUTOFIX_${TS} disabled: \\1/mg" -i "$f" || true
+      say "Disabled include in: $f"
+    fi
+  done < <(find "$root" -type f \( -name "*.conf" -o -name "*.inc" \) 2>/dev/null)
+}
+
+inject_in_server_block(){
+  # Ensure the vhost contains our includes INSIDE the first server{} block
+  local f="$1"
+  local want_line="$2"
+  grep -F "$want_line" "$f" >/dev/null 2>&1 && return 0
+
+  mkbackup "$f"
+  unfreeze_one "$f"
+
+  # Insert after the first "server {" line for deterministic placement.
+  awk -v ins="$want_line" '
+    BEGIN{done=0}
+    {print}
+    !done && $0 ~ /^[[:space:]]*server[[:space:]]*\{/ {
+      print "    " ins
+      done=1
+    }
+  ' "$f" >"$f.tmp.$$" && mv "$f.tmp.$$" "$f"
+}
+
+# ---- 0) Savepoint snapshot (if available) ----
+say "0) Savepoint + backups"
+if [ -x /root/WOLVERINE_SAVEPOINT.sh ]; then
+  /root/WOLVERINE_SAVEPOINT.sh || true
 fi
+
+# ---- 1) Preflight ----
+say "1) Preflight"
+have nginx || { apt-get update -y; apt-get install -y nginx curl; }
+have curl || { apt-get update -y; apt-get install -y curl; }
+have node || { echo "ERROR: node is missing. Install Node (NodeSource/corepack). Then rerun."; exit 1; }
+have npm  || { echo "ERROR: npm is missing. Fix Node/npm first. Then rerun."; exit 1; }
+
+# ---- 2) Unfreeze key nginx files (only if immutable) ----
+say "2) Unfreeze nginx/vhost/includes (if chattr +i)"
+unfreeze_one "$NGXCONF"
+unfreeze_one "$VHOST"
+unfreeze_one "$VHOST_EN"
+[ -d "$INCDIR" ] && for f in "$INCDIR"/*.inc "$INCDIR"/*.conf 2>/dev/null; do unfreeze_one "$f" || true; done
+
+# ---- 3) Fix the nginx hard-fail: aquila_stacking_routes.inc included in wrong context ----
+# This is what caused: "location directive is not allowed here ..."
+say "3) Disable any wrong-context include of aquila_stacking_routes.inc (prevents nginx test fail)"
+comment_includes_everywhere "aquila_stacking_routes\\.inc"
+
+# ---- 4) Ensure WEBROOT exists (fix /wolverine 404) ----
+say "4) Ensure webroot exists + restore if missing"
+mkdir -p "$WEBROOT"
+if [ ! -f "$WEBROOT/index.html" ]; then
+  restore_latest_savepoint_webroot || true
+fi
+if [ ! -f "$WEBROOT/index.html" ]; then
+  # minimal placeholder so /wolverine is never 404
+  cat >"$WEBROOT/index.html"<<EOF
+<!doctype html><meta charset="utf-8">
+<title>WOLVERINE</title>
+<h1>WOLVERINE</h1>
+<p>index.html missing. Restore from savepoint or deploy UI export.</p>
+EOF
+fi
+mkdir -p "$WEBROOT/vendor" || true
+
+# ---- 5) Create/force canonical nginx includes for Wolverine static + routes ----
+say "5) Write canonical includes: wolverine_static.inc + wolverine_routes.inc"
+mkdir -p "$INCDIR"
+
+cat >"$INC_STATIC"<<EOF
+# AUTOGEN_${TS} - Wolverine static webroot
+location ^~ /wolverine/ {
+  alias ${WEBROOT}/;
+  index index.html;
+  try_files \$uri \$uri/ /wolverine/index.html;
+}
+EOF
+
+cat >"$INC_ROUTES"<<EOF
+# AUTOGEN_${TS} - Wolverine routes (Vault API + Solana RPC proxy)
+
+# ---- Vault API: NO redirects, always JSON ----
+# canonical upstream
+set \$vault_upstream http://${VAULT_HOST}:${VAULT_PORT};
+
+location = /wolverine/vault-api/health      { proxy_pass \$vault_upstream/health; }
+location = /wolverine/vault-api/create      { proxy_pass \$vault_upstream/create; }
+location = /wolverine/vault/health          { proxy_pass \$vault_upstream/health; }
+location = /wolverine/vault/create          { proxy_pass \$vault_upstream/create; }
+location = /wolverine/traderone/vault/health{ proxy_pass \$vault_upstream/health; }
+location = /wolverine/traderone/vault/create{ proxy_pass \$vault_upstream/create; }
+location = /wolverine/vault/api/health      { proxy_pass \$vault_upstream/health; }
+location = /wolverine/vault/api/create      { proxy_pass \$vault_upstream/create; }
+
+# tolerate buggy double-prefix calls observed in tests (avoid 301/HTML)
+location ^~ /wolverine/vault/api/create/    { proxy_pass \$vault_upstream/; }
+
+# common proxy headers
+proxy_http_version 1.1;
+proxy_set_header Host \$host;
+proxy_set_header X-Real-IP \$remote_addr;
+proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+
+# ---- Solana RPC proxy for browser (same-origin; avoid 403/405) ----
+# Accept POST JSON-RPC and forward to DRPC.
+location = /wolverine/solana-rpc {
+  resolver 1.1.1.1 8.8.8.8 valid=300s;
+  proxy_ssl_server_name on;
+  proxy_set_header Content-Type "application/json";
+  proxy_pass ${DRPC_URL};
+}
+EOF
+
+chmod 0644 "$INC_STATIC" "$INC_ROUTES" || true
+
+# ---- 6) Ensure vhost is enabled and includes Wolverine includes ----
+say "6) Ensure vhost active + includes injected inside server{}"
+if [ ! -f "$VHOST" ]; then
+  echo "ERROR: missing vhost file: $VHOST" >&2
+  exit 1
+fi
+ln -sf "$VHOST" "$VHOST_EN" || true
+
+inject_in_server_block "$VHOST" "include ${INC_STATIC};"
+inject_in_server_block "$VHOST" "include ${INC_ROUTES};"
+
+# ---- 7) Install/repair Vault API backend (real Solana Keypair) ----
+say "7) Install/repair Vault API backend on ${VAULT_HOST}:${VAULT_PORT}"
+mkdir -p "$VAULT_DIR/state"
+mkbackup "$VAULT_SVC" || true
+
+cat >"$VAULT_DIR/package.json"<<'EOF'
+{
+  "name": "vault-api",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "dependencies": {
+    "@solana/web3.js": "1.95.4",
+    "bs58": "5.0.0"
+  }
+}
+EOF
+
+cat >"$VAULT_DIR/server.js"<<'EOF'
+const http = require("http");
+const { URL } = require("url");
+const fs = require("fs");
+const path = require("path");
+const bs58 = require("bs58");
+const { Keypair } = require("@solana/web3.js");
+
+const HOST = process.env.HOST || "127.0.0.1";
+const PORT = Number(process.env.PORT || "8787");
+const STATE_DIR = process.env.STATE_DIR || path.join(__dirname, "state");
+const STATE_FILE = process.env.STATE_FILE || path.join(STATE_DIR, "state.json");
+
+fs.mkdirSync(STATE_DIR, { recursive: true });
+
+function loadState() {
+  try {
+    const raw = fs.readFileSync(STATE_FILE, "utf8");
+    const j = JSON.parse(raw);
+    if (j && typeof j === "object") return j;
+  } catch {}
+  return { vaults: {}, createdAt: new Date().toISOString() };
+}
+function saveState(s) {
+  fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2));
+}
+
+function send(res, code, obj) {
+  const body = JSON.stringify(obj);
+  res.writeHead(code, {
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store"
+  });
+  res.end(body);
+}
+
+function readJson(req) {
+  return new Promise((resolve, reject) => {
+    let data = "";
+    req.on("data", (c) => {
+      data += c;
+      if (data.length > 1_000_000) { reject(new Error("payload_too_large")); req.destroy(); }
+    });
+    req.on("end", () => {
+      if (!data) return resolve({});
+      try { resolve(JSON.parse(data)); } catch (e) { reject(new Error("bad_json")); }
+    });
+  });
+}
+
+// minimal rate limit (per IP, 60 req / 10 min)
+const RL = new Map();
+function rateLimit(ip) {
+  const now = Date.now();
+  const win = 10 * 60 * 1000;
+  const lim = 60;
+  const rec = RL.get(ip) || { t: now, n: 0 };
+  if (now - rec.t > win) { rec.t = now; rec.n = 0; }
+  rec.n++;
+  RL.set(ip, rec);
+  return rec.n <= lim;
+}
+
+const server = http.createServer(async (req, res) => {
+  const u = new URL(req.url, "http://x");
+  const ip = (req.headers["x-forwarded-for"] || "").toString().split(",")[0].trim() || req.socket.remoteAddress || "unknown";
+
+  if (!rateLimit(ip)) return send(res, 429, { ok:false, error:"rate_limited" });
+
+  if (req.method === "GET" && u.pathname === "/health") {
+    return send(res, 200, { ok:true, service:"vault-api", host:HOST, port:PORT });
+  }
+
+  if (req.method === "POST" && u.pathname === "/create") {
+    let body;
+    try { body = await readJson(req); } catch (e) { return send(res, 400, { ok:false, error: e.message }); }
+
+    const userPub = (body.userPub || body.pub || body.owner || "").toString().trim();
+    const state = loadState();
+    state.vaults = state.vaults || {};
+
+    // If userPub provided and already has vault, reuse
+    if (userPub && state.vaults[userPub] && state.vaults[userPub].vaultPub) {
+      return send(res, 200, { ok:true, userPub, vaultPub: state.vaults[userPub].vaultPub, existing:true });
+    }
+
+    // Generate real Solana keypair
+    const kp = Keypair.generate();
+    const vaultPub = kp.publicKey.toBase58();
+    const secret58 = bs58.encode(Buffer.from(kp.secretKey)); // 64 bytes
+
+    // Store mapping (keep it minimal)
+    const key = userPub || `anon:${vaultPub}`;
+    state.vaults[key] = { vaultPub, secret58, createdAt: new Date().toISOString() };
+    saveState(state);
+
+    return send(res, 200, { ok:true, userPub: userPub || null, vaultPub, existing:false });
+  }
+
+  return send(res, 404, { ok:false, error:"not_found" });
+});
+
+server.listen(PORT, HOST, () => {
+  console.log(JSON.stringify({ ok:true, service:"vault-api", host:HOST, port:PORT }));
+});
+EOF
+
+# npm install with lockfile
+(
+  cd "$VAULT_DIR"
+  if [ ! -f package-lock.json ]; then
+    npm install --omit=dev --no-fund --no-audit
+  else
+    npm ci --omit=dev --no-fund --no-audit || npm install --omit=dev --no-fund --no-audit
+  fi
+)
+
+cat >"$VAULT_SVC"<<EOF
+[Unit]
+Description=WOLVERINE Vault API
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=${VAULT_DIR}
+Environment=HOST=${VAULT_HOST}
+Environment=PORT=${VAULT_PORT}
+Environment=STATE_DIR=${VAULT_DIR}/state
+Environment=STATE_FILE=${VAULT_DIR}/state/state.json
+ExecStart=/usr/bin/node ${VAULT_DIR}/server.js
+Restart=always
+RestartSec=2
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now vault-api.service
+systemctl restart vault-api.service
+
+# ---- 8) Nginx test + reload ----
+say "8) nginx -t + reload"
+nginx -t
 systemctl reload nginx
 
-say "7) local verify (no DNS dependency)"
-if command -v curl >/dev/null 2>&1; then
-  set +e
-  curl -skI --resolve fireinners.online:443:127.0.0.1 "https://fireinners.online/aquila_stacking/" | head -n 30
-  curl -sk  --resolve fireinners.online:443:127.0.0.1 "https://fireinners.online/aquila_stacking/" | head -n 5
-  set -e
-fi
+# ---- 9) Tests (local + through nginx with Host header) ----
+say "9) Tests"
+echo "== local vault health =="
+curl -sS "http://${VAULT_HOST}:${VAULT_PORT}/health" || true
+echo
+echo "== local vault create (anon) =="
+curl -sS -X POST "http://${VAULT_HOST}:${VAULT_PORT}/create" -H "content-type: application/json" -d '{}' || true
+echo
+echo "== nginx -> vault health (Host fireinners.online) =="
+curl -sS -H "Host: fireinners.online" "http://127.0.0.1/wolverine/vault-api/health" || true
+echo
+echo "== nginx -> solana-rpc (Host fireinners.online) =="
+curl -sS -H "Host: fireinners.online" -X POST "http://127.0.0.1/wolverine/solana-rpc" \
+  -H "content-type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' || true
+echo
 
-say "DONE: https://fireinners.online/aquila_stacking/"
-say "BK: $BK"
+# ---- 10) Refreeze back what was immutable ----
+say "10) Refreeze previous immutable files (if any)"
+refreeze_all
+
+say "DONE"
+echo "Open: https://fireinners.online/wolverine/  (Ctrl+F5) then click: 'Créer Vault + Déposer'"
+echo "Backups: $BK"
 BASH
-chmod +x /root/MEGA_AQUILA_STACKING_ROUTE_FIX_V3_AWK.sh
-bash /root/MEGA_AQUILA_STACKING_ROUTE_FIX_V3_AWK.sh
+chmod +x /root/MEGA_WOLVERINE_VAULT_FIX_FINAL.sh
+bash /root/MEGA_WOLVERINE_VAULT_FIX_FINAL.sh'
