@@ -1,85 +1,194 @@
-bash -lc 'cat >/root/WV_PUSH_HTML_AND_NGX_FIX.sh<<'"'"'BASH'"'"'
+bash -lc 'cat >/root/AQFIX.sh<<'\''BASH'\''
 #!/usr/bin/env bash
 set -euo pipefail
+TS="$(date +%Y%m%d_%H%M%S)"
+BK="/root/AQFIX_BK_${TS}"
+mkdir -p "$BK"
+say(){ printf "[%s] %s\n" "$(date +%H:%M:%S)" "$*"; }
+die(){ say "ERR: $*"; exit 1; }
+[ "$(id -u)" -eq 0 ] || die "run as root"
+umask 022
 
 DOMAIN="fireinners.online"
-WEBROOT="/var/www/wolverine"
-VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
-INC="/etc/nginx/includes/wolverine_routes.inc"
+PATH_A="/aquila_stacking/"
+PATH_B="/iaaquila/"
+WEBROOT="/var/www/aquila_stacking"
+LINKROOT="/var/www/iaaquila"
+INC="/etc/nginx/includes/aquila_stacking_routes.inc"
 
-need_root(){ [ "$(id -u)" = "0" ] || { echo "need root"; exit 1; }; }
+REACT_APP="/opt/aquila_stacking_react"
+REACT_DIST="$REACT_APP/dist"
 
-write_html(){
-mkdir -p "$WEBROOT"
-cat >"$WEBROOT/index.html"<<'"'"'HTML'"'"'
-<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WOLVERINE</title><style>html,body{margin:0;height:100%;background:#0b0f14;color:#e6eef7;font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Noto Sans,sans-serif}a{color:#7dd3fc}main{max-width:1100px;margin:0 auto;padding:28px}h1{margin:0 0 10px;font-size:28px}p{margin:10px 0;opacity:.9}code,pre{background:#0f172a;border:1px solid rgba(148,163,184,.2);padding:2px 6px;border-radius:8px;color:#cbd5e1}section{margin-top:18px;padding:16px;border:1px solid rgba(148,163,184,.18);border-radius:14px;background:rgba(15,23,42,.35)}.row{display:flex;gap:12px;flex-wrap:wrap}.card{flex:1;min-width:260px}.btn{display:inline-block;padding:10px 14px;border-radius:10px;border:1px solid rgba(148,163,184,.25);background:rgba(30,41,59,.5);text-decoration:none;color:#e6eef7}.btn:hover{filter:brightness(1.08)}.muted{opacity:.7}.ok{color:#86efac}.warn{color:#fde68a}</style></head><body><main><h1>WOLVERINE / TraderOne</h1><p class="muted">Page servie par Nginx: <code>/var/www/wolverine/index.html</code></p><section><div class="row"><div class="card"><h3>UI</h3><p>Si tu vois cette page, le <span class="ok">webroot</span> est OK.</p><a class="btn" href="/wolverine/">Reload</a></div><div class="card"><h3>Health</h3><p>Test API (doit répondre JSON si backend présent).</p><a class="btn" href="/wolverine/vault-api/health">/wolverine/vault-api/health</a></div><div class="card"><h3>Debug</h3><p>Test “first bytes” via navigateur.</p><a class="btn" href="/wolverine/?t=1">/wolverine/?t=1</a></div></div></section><section><h3>Notes</h3><p class="muted">Le 404 actuel vient presque toujours d’un <code>location</code> Nginx absent/mauvais include ou d’un autre vhost qui prend la main.</p></section></main></body></html>
-HTML
-}
+ASKLIB="/opt/fireinners/sentinel/lib/askorupdate.sh"
+if [ -f "$ASKLIB" ]; then
+  # shellcheck disable=SC1090
+  . "$ASKLIB" || true
+fi
 
-write_include(){
-mkdir -p "$(dirname "$INC")"
-cat >"$INC"<<'NGX'
-location ^~ /wolverine/ {
-  root /var/www;
-  try_files /wolverine/index.html =404;
-  add_header Cache-Control "no-store" always;
-}
-location = /wolverine { return 301 /wolverine/; }
-location ^~ /wolverine/vault-api/ {
-  proxy_http_version 1.1;
-  proxy_set_header Host $host;
-  proxy_set_header X-Real-IP $remote_addr;
-  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto $scheme;
-  proxy_pass http://127.0.0.1:3000/;
-}
-NGX
+backup_one(){ local p="$1"; [ -e "$p" ] || return 0; mkdir -p "$BK/$(dirname "$p")"; cp -a "$p" "$BK/$p.bak" 2>/dev/null || true; }
+
+write_file(){
+  local path="$1"; shift
+  local tmp; tmp="$(mktemp)"
+  cat >"$tmp"<<EOF
+$*
+EOF
+  if declare -F askorupdate_file >/dev/null 2>&1; then
+    ASKORUPDATE_ASK=0 askorupdate_file "$path" "$tmp" "AQ routes fix" || { rm -f "$tmp"; die "askorupdate_file failed: $path"; }
+  else
+    chattr -i "$path" 2>/dev/null || true
+    [ -f "$path" ] && cp -a "$path" "$BK/$(echo "$path" | sed "s#/#_#g").bak" 2>/dev/null || true
+    install -m 0644 "$tmp" "$path"
+  fi
+  rm -f "$tmp"
 }
 
-inject_once(){
-[ -f "$VHOST" ] || { echo "MISSING VHOST: $VHOST"; exit 1; }
-grep -qF "include $INC;" "$VHOST" && return 0
-tmp="$(mktemp)"
-awk -v inc="include $INC;" '
-BEGIN{ins=0;done=0;is443=0;depth=0}
-$0 ~ /^[[:space:]]*server[[:space:]]*\{/ {ins=1;depth=1;is443=0}
-ins{
-  if($0 ~ /listen[[:space:]]+443/){is443=1}
-  n=gsub(/\{/,"{"); depth+=n
-  n=gsub(/\}/,"}"); depth-=n
-  if(depth==0){
-    if(is443 && !done){print "  " inc; done=1}
-    ins=0
-  }
+ensure_webroot(){
+  say "1) Ensure WEBROOT"
+  mkdir -p "$WEBROOT"
+  chmod 0755 "$WEBROOT" || true
+  chown -R www-data:www-data "$WEBROOT" 2>/dev/null || true
 }
-{print}
-' "$VHOST" >"$tmp"
-mv -f "$tmp" "$VHOST"
+
+deploy_dist_if_any(){
+  say "2) Deploy React dist if present"
+  if [ -d "$REACT_DIST" ] && [ -f "$REACT_DIST/index.html" ]; then
+    say "   dist found -> deploy"
+    rm -rf "$WEBROOT"/*
+    cp -a "$REACT_DIST"/. "$WEBROOT"/
+    chown -R www-data:www-data "$WEBROOT" 2>/dev/null || true
+    chmod -R a+rX "$WEBROOT" 2>/dev/null || true
+  else
+    say "   dist missing -> keep existing"
+  fi
+
+  if [ ! -f "$WEBROOT/index.html" ]; then
+    say "   create fallback index.html"
+    cat >"$WEBROOT/index.html"<<EOF
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Aquila</title><style>body{font-family:system-ui;margin:24px;background:#0b1020;color:#d7e3ff}code{background:#111a33;padding:3px 6px;border-radius:6px}</style></head><body><h1>Aquila Stacking</h1><p>Fallback served (React dist not found).</p><p>WEBROOT <code>/var/www/aquila_stacking</code></p><p>Paths <code>/aquila_stacking/</code> and <code>/iaaquila/</code></p></body></html>
+EOF
+    chown -R www-data:www-data "$WEBROOT" 2>/dev/null || true
+    chmod -R a+rX "$WEBROOT" 2>/dev/null || true
+  fi
+
+  if [ ! -e "$LINKROOT" ]; then
+    ln -s "$WEBROOT" "$LINKROOT" 2>/dev/null || true
+  fi
+}
+
+ensure_inc(){
+  say "3) Write nginx include $INC"
+  mkdir -p "$(dirname "$INC")"
+  write_file "$INC" \
+"# Aquila Stacking routes\n\
+location = ${PATH_A%/} { return 301 $PATH_A; }\n\
+location ^~ $PATH_A {\n\
+  root /var/www;\n\
+  try_files \$uri \$uri/ ${PATH_A}index.html;\n\
+  add_header Cache-Control \"no-store\" always;\n\
+}\n\
+location = ${PATH_B%/} { return 301 $PATH_B; }\n\
+location ^~ $PATH_B {\n\
+  root /var/www;\n\
+  try_files \$uri \$uri/ ${PATH_B}index.html;\n\
+  add_header Cache-Control \"no-store\" always;\n\
+}\n"
+}
+
+patch_vhosts(){
+  say "4) Patch vhosts to include routes"
+  local files
+  files="$(grep -RIl --exclude='*.dpkg-*' --exclude='*.bak' -E "server_name[[:space:]].*\\b${DOMAIN}\\b" /etc/nginx/sites-enabled /etc/nginx/sites-available /etc/nginx/conf.d 2>/dev/null || true)"
+  [ -n "$files" ] || { say "WARN: no vhost found for $DOMAIN"; return 0; }
+  while IFS= read -r f; do
+    [ -f "$f" ] || continue
+    backup_one "$f"
+    if grep -qF "$INC" "$f"; then
+      say "   ok include already: $f"
+      continue
+    fi
+    python3 - "$f" "$DOMAIN" "$INC" <<'PY'
+import re,sys
+p,dom,inc=sys.argv[1],sys.argv[2],sys.argv[3]
+s=open(p,'r',encoding='utf-8',errors='ignore').read()
+def patch(block):
+  if inc in block: return block, False
+  if not re.search(r'\blisten\b[^;]*\b443\b', block): return block, False
+  if not re.search(r'\bserver_name\b[^;]*\b'+re.escape(dom)+r'\b', block): return block, False
+  lines=block.splitlines()
+  ins=None
+  for i,l in enumerate(lines):
+    if re.search(r'\bserver_name\b', l):
+      ins=i+1; break
+  if ins is None: ins=1
+  lines.insert(ins, "    include %s;"%inc)
+  return "\n".join(lines), True
+
+out=[]
+changed=False
+pos=0
+for m in re.finditer(r'server\s*\{', s):
+  start=m.start()
+  out.append(s[pos:start])
+  i=start
+  depth=0
+  while i < len(s):
+    c=s[i]
+    if c=='{': depth+=1
+    elif c=='}':
+      depth-=1
+      if depth==0:
+        end=i+1
+        block=s[start:end]
+        newb,ch=patch(block)
+        out.append(newb)
+        changed=changed or ch
+        pos=end
+        break
+    i+=1
+else:
+  out=[s]
+new="".join(out)+s[pos:]
+if changed:
+  open(p,'w',encoding='utf-8').write(new)
+  print("patched")
+else:
+  print("nochange")
+PY
+    if grep -qF "$INC" "$f"; then
+      say "   patched: $f"
+    else
+      say "   WARN not patched: $f"
+    fi
+  done <<<"$files"
+}
+
+reload_and_test(){
+  say "5) nginx -t + reload"
+  nginx -t
+  systemctl reload nginx
+
+  say "6) Local tests (must NOT be 404)"
+  echo "--- ${PATH_A} ---"
+  curl -skI -H "Host: $DOMAIN" "https://127.0.0.1$PATH_A" | head -n 12 || true
+  echo "--- ${PATH_B} ---"
+  curl -skI -H "Host: $DOMAIN" "https://127.0.0.1$PATH_B" | head -n 12 || true
+  echo "include hit:"
+  nginx -T 2>/dev/null | grep -n "aquila_stacking_routes" -n | head -n 20 || true
 }
 
 main(){
-need_root
-mkdir -p /root/wv_bk_$(date +%Y%m%d_%H%M%S)
-BK="/root/wv_bk_$(date +%Y%m%d_%H%M%S)"
-mkdir -p "$BK"
-cp -a "$VHOST" "$BK/" 2>/dev/null || true
-cp -a "$INC" "$BK/" 2>/dev/null || true
-cp -a "$WEBROOT/index.html" "$BK/" 2>/dev/null || true
-
-chattr -i -R /etc/nginx 2>/dev/null || true
-write_html
-write_include
-inject_once
-
-nginx -t
-systemctl reload nginx || systemctl restart nginx
-
-echo "DONE"
-echo "Open: https://${DOMAIN}/wolverine/  (Ctrl+F5)"
-curl -skI --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/" | sed -n "1,12p" || true
+  ensure_webroot
+  deploy_dist_if_any
+  ensure_inc
+  patch_vhosts
+  reload_and_test
+  say "DONE"
+  say "BK: $BK"
+  say "Open: https://$DOMAIN$PATH_A"
+  say "Open: https://$DOMAIN$PATH_B"
 }
-main "$@"
+main
 BASH
-sed -i "s/\r$//" /root/WV_PUSH_HTML_AND_NGX_FIX.sh
-chmod +x /root/WV_PUSH_HTML_AND_NGX_FIX.sh
-/root/WV_PUSH_HTML_AND_NGX_FIX.sh'
+chmod +x /root/AQFIX.sh
+/root/AQFIX.sh'
