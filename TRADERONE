@@ -1,192 +1,188 @@
-cat >/root/MEGA_AQUILA_STACKING_WEBROUTE_FIX_V3_ONE_SHOT.sh<<'BASH'
+cat >/root/MEGA_AIAQUILA_FIX_404.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
-umask 027
-
 TS="$(date +%Y%m%d_%H%M%S)"
-say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
-die(){ say "ERR: $*"; exit 1; }
-
-[ "$(id -u)" -eq 0 ] || die "run as root"
-command -v nginx >/dev/null 2>&1 || die "nginx missing"
-command -v curl  >/dev/null 2>&1 || die "curl missing"
-command -v awk   >/dev/null 2>&1 || die "awk missing"
-command -v grep  >/dev/null 2>&1 || die "grep missing"
-
-DOMAIN="fireinners.online"
-WEBROOT="/var/www/aquila_stacking"
-PATH_A="/aquila_stacking/"
-PATH_B="/iaaquila/"
-INC="/etc/nginx/includes/aquila_stacking_routes.inc"
-
-BK="/root/AQUILA_STACKING_WEBROUTE_FIX_V3_BK_${TS}"
+BK="/root/AIAQUILA_FIX_404_${TS}"
 mkdir -p "$BK"
 
-ASKLIB="/opt/fireinners/sentinel/lib/askorupdate.sh"
-if [ -f "$ASKLIB" ]; then
-  # shellcheck disable=SC1090
-  . "$ASKLIB" || true
+say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
+need(){ command -v "$1" >/dev/null 2>&1 || { echo "ERR missing $1"; exit 1; }; }
+asroot(){ [ "$(id -u)" = "0" ] || { echo "ERR run as root"; exit 1; }; }
+
+asroot
+need nginx
+need curl
+need sed
+need awk
+need grep
+need find
+need stat
+
+DOMAIN="fireinners.online"
+SLUG="aiaquila"
+INC="/etc/nginx/includes/${SLUG}_routes.inc"
+PUB="/opt/${SLUG}/public"
+API_HOST="127.0.0.1"
+API_PORT="9688"
+API_BASE="http://${API_HOST}:${API_PORT}"
+NGINX_MAIN="/etc/nginx/nginx.conf"
+
+MARK_BEGIN="# --- ${SLUG} ROUTES BEGIN (managed) ---"
+MARK_END="# --- ${SLUG} ROUTES END (managed) ---"
+
+say "== 0) Backup =="
+cp -a "$NGINX_MAIN" "$BK/nginx.conf.bak" 2>/dev/null || true
+cp -a "$INC" "$BK/$(basename "$INC").bak" 2>/dev/null || true
+cp -a /etc/nginx/conf.d "$BK/conf.d.bak" 2>/dev/null || true
+cp -a /etc/nginx/sites-available "$BK/sites-available.bak" 2>/dev/null || true
+cp -a /etc/nginx/sites-enabled "$BK/sites-enabled.bak" 2>/dev/null || true
+
+say "== 1) Unfreeze nginx files (best-effort) =="
+chattr -i "$NGINX_MAIN" 2>/dev/null || true
+[ -d /etc/nginx/conf.d ] && find /etc/nginx/conf.d -maxdepth 1 -type f -name "*.conf" -print0 | xargs -0 -r chattr -i 2>/dev/null || true
+[ -d /etc/nginx/sites-available ] && find /etc/nginx/sites-available -maxdepth 1 -type f -print0 | xargs -0 -r chattr -i 2>/dev/null || true
+[ -d /etc/nginx/sites-enabled ] && find /etc/nginx/sites-enabled -maxdepth 1 -type f -print0 | xargs -0 -r chattr -i 2>/dev/null || true
+[ -d /etc/nginx/includes ] && find /etc/nginx/includes -maxdepth 1 -type f -print0 | xargs -0 -r chattr -i 2>/dev/null || true
+
+say "== 2) Ensure webroot =="
+mkdir -p "$PUB"
+if [ ! -f "$PUB/index.html" ]; then
+cat >"$PUB/index.html" <<'HTML'
+<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AQUILA</title><style>html,body{margin:0;padding:0;background:#05070b;color:#e6ebff;font-family:system-ui}main{max-width:980px;margin:40px auto;padding:16px}code{background:#0e1633;border:1px solid #2b3cff;padding:2px 6px;border-radius:6px}</style></head><body><main><h1>AQUILA</h1><p>UI servi via <code>/aiaquila/</code>. Si tu vois cette page, nginx route OK.</p></main></body></html>
+HTML
 fi
 
-write_file(){
-  local path="$1"; shift
-  local tmp; tmp="$(mktemp)"
-  cat >"$tmp"<<EOF
-$*
-EOF
-  if declare -F askorupdate_file >/dev/null 2>&1; then
-    ASKORUPDATE_ASK=0 askorupdate_file "$path" "$tmp" "AquilaStacking web routes v3" || { rm -f "$tmp"; die "askorupdate_file failed: $path"; }
-    rm -f "$tmp"
-  else
-    chattr -i "$path" 2>/dev/null || true
-    [ -f "$path" ] && cp -a "$path" "$BK/$(echo "$path" | sed 's#/#_#g').bak" || true
-    install -m 0644 "$tmp" "$path"
-    rm -f "$tmp"
-  fi
-}
-
-pick_vhost(){
-  local f
-  # prefer enabled vhosts, then conf.d, then available
-  while IFS= read -r f; do
-    [ -f "$f" ] || continue
-    grep -Eq "server_name[^;]*\b${DOMAIN}\b" "$f" || continue
-    grep -Eq "listen[^;]*\b443\b" "$f" || continue
-    echo "$f"
-    return 0
-  done < <( (grep -RIl "server_name[^;]*\b${DOMAIN}\b" /etc/nginx/sites-enabled 2>/dev/null || true; \
-            grep -RIl "server_name[^;]*\b${DOMAIN}\b" /etc/nginx/conf.d 2>/dev/null || true; \
-            grep -RIl "server_name[^;]*\b${DOMAIN}\b" /etc/nginx/sites-available 2>/dev/null || true) | awk '!seen[$0]++' )
-  # known fallback
-  [ -f "/etc/nginx/sites-available/fireinners.online-ssl" ] && echo "/etc/nginx/sites-available/fireinners.online-ssl" && return 0
-  return 1
-}
-
-patch_vhost_include(){
-  local VHOST="$1"
-  local tmp; tmp="$(mktemp)"
-  cp -a "$VHOST" "$BK/$(basename "$VHOST").bak"
-
-  # idempotent: if include already present anywhere in matching 443 server block, ok
-  if grep -Fq "$INC" "$VHOST"; then
-    say "VHOST already references include: $VHOST"
-    return 0
-  fi
-
-  # Patch: inject "include INC;" inside EACH server{...} that has server_name DOMAIN and listen 443
-  awk -v dom="$DOMAIN" -v inc="$INC" '
-  function flush(){
-    if(sb!=""){
-      block=sb
-      if(block ~ ("server_name[^;]*" dom) && block ~ /listen[^;]*443/){
-        if(block !~ inc){
-          n=split(sb, a, "\n")
-          out=""; inserted=0
-          for(i=1;i<=n;i++){
-            if(a[i]=="") continue
-            out=out a[i] "\n"
-            if(!inserted && a[i] ~ ("server_name[^;]*" dom)){
-              out=out "    include " inc ";\n"
-              inserted=1
-            }
-          }
-          sb=out
-          patched_any=1
-        }
-      }
-      printf "%s", sb
-    }
-    sb=""
-  }
-  BEGIN{sb="";in=0;depth=0;patched_any=0}
-  {
-    line=$0
-    if(!in){
-      if(line ~ /^[ \t]*server[ \t]*\{/){
-        in=1; depth=0; sb=line "\n"
-        # count braces on this line
-        for(j=1;j<=length(line);j++){
-          c=substr(line,j,1)
-          if(c=="{") depth++
-          else if(c=="}") depth--
-        }
-        if(depth==0){ in=0; flush() }
-        next
-      } else {
-        print line
-        next
-      }
-    } else {
-      sb=sb line "\n"
-      for(j=1;j<=length(line);j++){
-        c=substr(line,j,1)
-        if(c=="{") depth++
-        else if(c=="}") depth--
-      }
-      if(depth==0){ in=0; flush() }
-      next
-    }
-  }
-  END{
-    if(in) flush()
-  }' "$VHOST" >"$tmp"
-
-  chattr -i "$VHOST" 2>/dev/null || true
-  install -m 0644 "$tmp" "$VHOST"
-  rm -f "$tmp"
-}
-
-say "1) WEBROOT + index.html"
-mkdir -p "$WEBROOT"
-chmod 0755 "$WEBROOT" || true
-chown -R www-data:www-data "$WEBROOT" 2>/dev/null || true
-
-cat >"$WEBROOT/index.html"<<EOF
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AquilaStacking</title><style>body{font-family:system-ui,Segoe UI,Arial;margin:24px;max-width:980px}code{background:#0b1020;color:#d7e3ff;padding:2px 6px;border-radius:6px}pre{background:#0b1020;color:#d7e3ff;padding:12px;border-radius:10px;overflow:auto}a{color:#2b6fff;text-decoration:none}a:hover{text-decoration:underline}.box{border:1px solid #e5e7eb;border-radius:12px;padding:14px;margin:12px 0}</style></head><body><h1>AquilaStacking</h1><div class="box"><b>URLs</b><div>• <a href="${PATH_B}">${PATH_B}</a></div><div>• <a href="${PATH_A}">${PATH_A}</a></div></div><div class="box"><b>Webroot</b> <code>${WEBROOT}</code></div></body></html>
-EOF
-chown www-data:www-data "$WEBROOT/index.html" 2>/dev/null || true
-chmod 0644 "$WEBROOT/index.html" || true
-
-say "2) Write nginx include: $INC"
-ROUTES="### AQUILA_STACKING_WEBROUTES_V3_BEGIN
-location = ${PATH_B%/} { return 301 ${PATH_B}; }
-location ^~ ${PATH_B} {
-  alias ${WEBROOT}/;
+say "== 3) Write routes include (idempotent) =="
+mkdir -p "$(dirname "$INC")"
+cat >"$INC" <<EOF
+$MARK_BEGIN
+# Static UI
+location ^~ /${SLUG}/ {
+  alias ${PUB}/;
   index index.html;
-  add_header Cache-Control \"no-store\" always;
-  try_files \$uri \$uri/ ${PATH_B}index.html =404;
+  try_files \$uri \$uri/ /${SLUG}/index.html;
+  add_header Cache-Control "no-store" always;
 }
-location = ${PATH_A%/} { return 301 ${PATH_A}; }
-location ^~ ${PATH_A} {
-  alias ${WEBROOT}/;
-  index index.html;
-  add_header Cache-Control \"no-store\" always;
-  try_files \$uri \$uri/ ${PATH_A}index.html =404;
+
+# API proxy
+location ^~ /${SLUG}/api/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+  proxy_connect_timeout 5s;
+  proxy_send_timeout 30s;
+  proxy_read_timeout 30s;
+  proxy_pass ${API_BASE}/;
 }
-### AQUILA_STACKING_WEBROUTES_V3_END"
-write_file "$INC" "$ROUTES"
 
-say "3) Detect active 443 vhost for ${DOMAIN}"
-VHOST="$(pick_vhost)" || die "no vhost found for ${DOMAIN} listen 443"
-say "   VHOST: $VHOST"
+# Convenience redirect (no trailing slash)
+location = /${SLUG} { return 301 /${SLUG}/; }
+$MARK_END
+EOF
 
-say "4) Patch VHOST to include routes (idempotent)"
-patch_vhost_include "$VHOST"
+say "== 4) Find ALL server blocks for ${DOMAIN} on 443 and inject include =="
+tmp="/tmp/${SLUG}_targets_${TS}.txt"
+: >"$tmp"
 
-say "5) nginx test + reload"
+# Candidate nginx config files (conf.d + sites-available + sites-enabled)
+for d in /etc/nginx/conf.d /etc/nginx/sites-available /etc/nginx/sites-enabled; do
+  [ -d "$d" ] || continue
+  find "$d" -maxdepth 1 -type f -print0 2>/dev/null | while IFS= read -r -d '' f; do
+    # quick filter
+    if grep -Eq "server_name[[:space:]].*${DOMAIN}" "$f" 2>/dev/null; then
+      # also ensure it likely contains 443 listen
+      if grep -Eq "listen[[:space:]]+443" "$f" 2>/dev/null; then
+        echo "$f" >>"$tmp"
+      fi
+    fi
+  done
+done
+
+# De-dup
+sort -u "$tmp" -o "$tmp"
+
+if [ ! -s "$tmp" ]; then
+  say "WARN: No 443 server block file matched by grep. We'll also patch the vhost you use if present."
+  [ -f /etc/nginx/conf.d/000-fireinners.online-ssl.conf ] && echo "/etc/nginx/conf.d/000-fireinners.online-ssl.conf" >>"$tmp"
+  sort -u "$tmp" -o "$tmp"
+fi
+
+inject_into_file(){
+  local f="$1"
+  # If include already present, ensure it's inside server{} by moving to first server block if needed.
+  if grep -Fq "include ${INC};" "$f" 2>/dev/null; then
+    return 0
+  fi
+
+  # Insert "include INC;" right after the opening brace of the first matching server block.
+  # Strategy: find first line number of "server {" then insert include on next line.
+  local ln
+  ln="$(awk 'tolower($0) ~ /^[[:space:]]*server[[:space:]]*\{/ {print NR; exit}' "$f" 2>/dev/null || true)"
+  if [ -z "${ln:-}" ]; then
+    return 0
+  fi
+
+  # Insert with marker comment to avoid duplicates
+  awk -v INC="${INC}" -v MARK="## ${SLUG}_include_managed" -v ln="$ln" '
+    NR==ln {print; print "  "MARK; print "  include "INC";"; next}
+    {print}
+  ' "$f" >"${f}.tmp.${TS}"
+  mv "${f}.tmp.${TS}" "$f"
+}
+
+patched=0
+while IFS= read -r f; do
+  [ -f "$f" ] || continue
+  # only patch if it really targets the domain
+  if grep -Eq "server_name[[:space:]].*${DOMAIN}" "$f" 2>/dev/null; then
+    before="$(sha256sum "$f" 2>/dev/null | awk '{print $1}')"
+    inject_into_file "$f" || true
+    after="$(sha256sum "$f" 2>/dev/null | awk '{print $1}')"
+    if [ "$before" != "$after" ]; then
+      say "patched: $f"
+      patched=$((patched+1))
+    else
+      say "ok/nochange: $f"
+    fi
+  fi
+done <"$tmp"
+
+say "== 5) nginx -t + reload =="
 nginx -t
 systemctl reload nginx
 
-say "6) Local HTTPS verify (force localhost, no DNS dependency)"
-H1="$(curl -k -sS --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}${PATH_B}" | head -n 5 || true)"
-echo "$H1" | grep -qi "AquilaStacking" || { echo "$H1" >"$BK/resp_iaaquila_head.txt"; die "still 404 on ${PATH_B} (see $BK/resp_iaaquila_head.txt)"; }
-H2="$(curl -k -sS --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}${PATH_A}" | head -n 5 || true)"
-echo "$H2" | grep -qi "AquilaStacking" || { echo "$H2" >"$BK/resp_aquila_head.txt"; die "still 404 on ${PATH_A} (see $BK/resp_aquila_head.txt)"; }
+say "== 6) Smoke tests (expect 200 on HTTPS) =="
+echo "--- backend local ---"
+curl -fsS "${API_BASE}/api/health" || true
+echo
+echo "--- https /${SLUG}/api/health (forced resolve to localhost) ---"
+curl -kfsS --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/${SLUG}/api/health" || true
+echo
+echo "--- https /${SLUG}/ (headers) ---"
+curl -kI --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/${SLUG}/" | head -n 20 || true
+echo
+
+say "== 7) Freeze (chattr +i) and verify =="
+chattr +i "$NGINX_MAIN" 2>/dev/null || true
+chattr +i "$INC" 2>/dev/null || true
+# Freeze all files we touched
+while IFS= read -r f; do
+  [ -f "$f" ] && chattr +i "$f" 2>/dev/null || true
+done <"$tmp"
+
+lsattr "$NGINX_MAIN" 2>/dev/null || true
+lsattr "$INC" 2>/dev/null || true
+while IFS= read -r f; do
+  [ -f "$f" ] && lsattr "$f" 2>/dev/null || true
+done <"$tmp"
 
 say "DONE"
-say "Open: https://${DOMAIN}${PATH_B}"
-say "Open: https://${DOMAIN}${PATH_A}"
-say "BK: $BK"
+echo "URL: https://${DOMAIN}/${SLUG}/"
+echo "API: https://${DOMAIN}/${SLUG}/api/health"
+echo "INC: ${INC}"
+echo "BACKUP: ${BK}"
 BASH
-chmod +x /root/MEGA_AQUILA_STACKING_WEBROUTE_FIX_V3_ONE_SHOT.sh
-bash /root/MEGA_AQUILA_STACKING_WEBROUTE_FIX_V3_ONE_SHOT.sh
+chmod +x /root/MEGA_AIAQUILA_FIX_404.sh
+/root/MEGA_AIAQUILA_FIX_404.sh
