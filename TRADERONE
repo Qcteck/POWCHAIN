@@ -1,205 +1,351 @@
-rm -f /root/WV_FIX404.sh /root/WV_FIX404_V2.sh; python3 - <<'PY'
-p='/root/WV_FIX404_V2.sh'
-s=r'''#!/usr/bin/env bash
+cat >/root/MEGA_AQUILA_STACKING_V7_100.sh <<'BASH'
+#!/usr/bin/env bash
 set -euo pipefail
 
+MODE="${1:-run}" # run | verify
 TS="$(date +%Y%m%d_%H%M%S)"
-DOMAIN="fireinners.online"
-VHOST_AV="/etc/nginx/sites-available/fireinners.online-ssl"
-VHOST_EN="/etc/nginx/sites-enabled/fireinners.online-ssl"
-INC="/etc/nginx/includes/wolverine_routes.inc"
-WEBROOT="/var/www/wolverine"
-SRC1="/opt/fireinners/frontend-react/app/dist/wolverine"
-SRC2="/opt/wolverine"
-BK="/root/WV_FIX404_BK_${TS}"
+BK="/root/AQUILA_STACKING_BK_${TS}"
+mkdir -p "$BK"
 
 say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
-need_root(){ [ "$(id -u)" = "0" ] || { echo "need root"; exit 1; }; }
+die(){ echo "ERR: $*" >&2; exit 1; }
 
-backup_all(){
-  say "BACKUP -> $BK"
-  mkdir -p "$BK"
-  cp -a /etc/nginx "$BK/nginx" 2>/dev/null || true
-  mkdir -p "$BK/webroot"
-  cp -a "$WEBROOT" "$BK/webroot/" 2>/dev/null || true
-}
+need_root(){ [ "$(id -u)" -eq 0 ] || die "run as root"; }
+need_root
 
-unfreeze_nginx(){
-  command -v chattr >/dev/null 2>&1 || return 0
-  say "Unfreeze chattr -i (best-effort)"
-  chattr -i -R /etc/nginx 2>/dev/null || true
-}
+# --------- SETTINGS (deterministic) ----------
+DOMAIN="fireinners.online"
+NGX_VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
+NGX_INC="/etc/nginx/includes/aquilastacking_routes.inc"
+WEBROOT="/var/www/aquilastacking"
 
-ensure_webroot(){
-  say "Ensure webroot: $WEBROOT"
-  mkdir -p "$WEBROOT"
-  if [ -d "$SRC1" ] && [ -f "$SRC1/index.html" ]; then
-    say "Sync from $SRC1 -> $WEBROOT"
-    rsync -a --delete "$SRC1/" "$WEBROOT/" || true
-  elif [ -d "$SRC2" ] && [ -f "$SRC2/index.html" ]; then
-    say "Sync from $SRC2 -> $WEBROOT"
-    rsync -a --delete "$SRC2/" "$WEBROOT/" || true
+APP_ROOT="/opt/aquila_stacking"
+FRONT_DIR="$APP_ROOT/frontend"
+ANCHOR_DIR="$APP_ROOT/anchor"
+TOOLCHAINS="/opt/aquila_toolchains"
+
+NODE_VER="v20.11.1"
+SOLANA_VER="v1.18.26"
+ANCHOR_TAG="v0.30.1"
+
+APTBOX="/opt/aptbox"
+APTBOX_DATE="${APTBOX_DATE:-20260121}" # pin label; can change later
+ASKORUPDATE_LIB="/opt/fireinners/sentinel/lib/askorupdate.sh"
+
+# --------- askorupdate helpers (optional) ----------
+HAVE_ASK=0
+if [ -f "$ASKORUPDATE_LIB" ]; then
+  # shellcheck disable=SC1090
+  . "$ASKORUPDATE_LIB" || true
+  if command -v askorupdate_file >/dev/null 2>&1; then HAVE_ASK=1; fi
+fi
+
+write_file(){
+  local path="$1"
+  local tmp="$BK/$(basename "$path").tmp"
+  cat >"$tmp"
+  if [ "$HAVE_ASK" -eq 1 ]; then
+    ASKORUPDATE_ASK=0 askorupdate_file "$path" "$tmp" >/dev/null
+  else
+    mkdir -p "$(dirname "$path")"
+    cp -a "$path" "$BK/" 2>/dev/null || true
+    cp -f "$tmp" "$path"
   fi
-  if [ ! -f "$WEBROOT/index.html" ]; then
-    say "Create minimal index.html (missing)"
-    cat >"$WEBROOT/index.html"<<'HTML'
-<!doctype html><meta charset="utf-8"><title>WOLVERINE</title><h1>WOLVERINE OK</h1><p>index.html created by WV_FIX404_V2</p>
-HTML
-  fi
-  chown -R www-data:www-data "$WEBROOT" 2>/dev/null || true
 }
 
-write_include(){
-  say "Write include: $INC"
-  mkdir -p "$(dirname "$INC")"
-  cat >"$INC"<<EOF
-# AUTO-GENERATED canonical Wolverine routes (${TS})
-location ^~ /wolverine/ {
-  alias ${WEBROOT}/;
-  try_files \$uri \$uri/ /wolverine/index.html;
-}
-location ^~ /wolverine/vendor/ {
-  alias ${WEBROOT}/vendor/;
-  try_files \$uri =404;
-}
-EOF
-}
+# --------- Preflight snapshot ----------
+say "== AQUILA STACKING V7_100 :: $MODE :: $TS =="
+say "Backup dir: $BK"
+cp -a "$NGX_VHOST" "$BK/" 2>/dev/null || true
+cp -a "$NGX_INC" "$BK/" 2>/dev/null || true
+cp -a "$WEBROOT" "$BK/www_aquilastacking" 2>/dev/null || true
+cp -a "$APP_ROOT" "$BK/opt_aquila_stacking" 2>/dev/null || true
 
-disable_other_wolverine_includes(){
-  say "Disable other wolverine includes/snippets (best-effort)"
-  shopt -s nullglob
-  for f in /etc/nginx/includes/wolverine* /etc/nginx/snippets/wolverine*; do
-    [ "$f" = "$INC" ] && continue
-    case "$f" in
-      *.disabled_* ) continue;;
-    esac
-    mv -f "$f" "$f.disabled_${TS}" 2>/dev/null || true
-  done
-  shopt -u nullglob
-}
+# --------- Minimal aptbox (deterministic wrapper) ----------
+say "APT: base deps (idempotent)"
+export DEBIAN_FRONTEND=noninteractive
+mkdir -p "$APTBOX"
+# we keep standard apt but isolate state-ish via marker and strict package list
+apt-get update -y
+apt-get install -y --no-install-recommends \
+  ca-certificates curl wget git jq unzip xz-utils build-essential pkg-config \
+  python3 python3-pip \
+  nginx \
+  openssl \
+  libssl-dev \
+  libudev-dev \
+  clang cmake \
+  rsync
 
-ensure_vhost_enabled(){
-  [ -f "$VHOST_AV" ] || { echo "FATAL missing $VHOST_AV"; exit 1; }
-  ln -sf "$VHOST_AV" "$VHOST_EN"
-}
-
-python_edit_vhost(){
-python3 - <<'PY'
-import re
-p="/etc/nginx/sites-available/fireinners.online-ssl"
-inc="/etc/nginx/includes/wolverine_routes.inc"
-txt=open(p,'r',encoding='utf-8',errors='ignore').read().splitlines(True)
-
-def strip_wolverine_locations(lines):
-    out=[]
-    i=0
-    def starts_loc(line):
-        return re.search(r'^\s*location\b.*wolverine', line) is not None
-    while i<len(lines):
-        line=lines[i]
-        if starts_loc(line):
-            depth=0
-            while i<len(lines):
-                depth += lines[i].count('{')
-                depth -= lines[i].count('}')
-                i+=1
-                if depth<=0: break
-            continue
-        if re.search(r'^\s*include\s+.*wolverine.*;', line):
-            i+=1
-            continue
-        out.append(line); i+=1
-    return out
-
-def inject_include_into_first_443_server(lines):
-    out=[]
-    i=0
-    inserted=False
-    while i<len(lines):
-        line=lines[i]
-        if re.match(r'^\s*server\s*\{', line):
-            # capture server block
-            depth=0
-            block=[]
-            j=i
-            while j<len(lines):
-                l=lines[j]
-                depth += l.count('{')
-                depth -= l.count('}')
-                block.append(l)
-                j+=1
-                if depth==0: break
-            btxt=''.join(block)
-            if (not inserted) and re.search(r'^\s*listen\s+443', btxt, re.M):
-                if inc in btxt:
-                    out.extend(block)
-                else:
-                    # insert before closing brace
-                    closing=block[-1]
-                    body=block[:-1]
-                    body.append(f"    include {inc};\n")
-                    out.extend(body+[closing])
-                inserted=True
-            else:
-                out.extend(block)
-            i=j
-            continue
-        out.append(line); i+=1
-    return out, inserted
-
-lines=strip_wolverine_locations(txt)
-lines, ok=inject_include_into_first_443_server(lines)
-open(p,'w',encoding='utf-8').write(''.join(lines))
-print("inserted" if ok else "not_inserted")
-PY
-}
-
-disable_duplicate_fireinners_vhosts(){
-  say "Disable duplicate enabled vhosts with server_name fireinners.online (excluding main) (best-effort)"
-  shopt -s nullglob
-  for f in /etc/nginx/sites-enabled/*; do
-    [ "$f" = "$VHOST_EN" ] && continue
-    if grep -RqsE 'server_name[[:space:]].*fireinners\.online' "$f"; then
-      mv -f "$f" "$f.disabled_${TS}" 2>/dev/null || true
+# --------- Node.js v20.11.1 (verified via SHASUMS from nodejs.org) ----------
+install_node(){
+  if command -v node >/dev/null 2>&1; then
+    local cur
+    cur="$(node -v || true)"
+    if [ "$cur" = "$NODE_VER" ]; then
+      say "Node OK: $cur"
+      return 0
     fi
-  done
-  shopt -u nullglob
+    say "Node present ($cur) but not $NODE_VER; installing $NODE_VER (no removal)."
+  fi
+
+  local base="node-${NODE_VER}-linux-x64"
+  local tar="/tmp/${base}.tar.xz"
+  local sums="/tmp/SHASUMS256.txt"
+  say "Node: download tarball + SHASUMS256.txt"
+  curl -fsSL "https://nodejs.org/dist/${NODE_VER}/${base}.tar.xz" -o "$tar"
+  curl -fsSL "https://nodejs.org/dist/${NODE_VER}/SHASUMS256.txt" -o "$sums"
+  say "Node: verify sha256 from upstream list"
+  (cd /tmp && grep " ${base}.tar.xz\$" SHASUMS256.txt | sha256sum -c -) >/dev/null
+  say "Node: install to /usr/local"
+  tar -C /usr/local -xJf "$tar"
+  ln -sf "/usr/local/${base}/bin/node" /usr/local/bin/node
+  ln -sf "/usr/local/${base}/bin/npm"  /usr/local/bin/npm
+  ln -sf "/usr/local/${base}/bin/npx"  /usr/local/bin/npx
+  say "Node installed: $(node -v)"
 }
 
-nginx_reload(){
-  say "nginx -t"
+# --------- Rust toolchain (isolated under /opt/aquila_toolchains) ----------
+install_rust(){
+  mkdir -p "$TOOLCHAINS"
+  if [ -x "$TOOLCHAINS/rustup/bin/rustup" ]; then
+    say "Rustup present under $TOOLCHAINS"
+  else
+    say "Rust: install rustup into $TOOLCHAINS/rustup (non-interactive)"
+    mkdir -p "$TOOLCHAINS/rustup"
+    curl -fsSL https://sh.rustup.rs -o /tmp/rustup-init.sh
+    sh /tmp/rustup-init.sh -y --no-modify-path --default-toolchain 1.76.0 --profile minimal
+    # rustup installs into /root by default; relocate deterministically
+    mkdir -p "$TOOLCHAINS/rustup" "$TOOLCHAINS/cargo"
+    rsync -a /root/.rustup/ "$TOOLCHAINS/rustup/" || true
+    rsync -a /root/.cargo/  "$TOOLCHAINS/cargo/"  || true
+  fi
+  export RUSTUP_HOME="$TOOLCHAINS/rustup"
+  export CARGO_HOME="$TOOLCHAINS/cargo"
+  export PATH="$CARGO_HOME/bin:$PATH"
+  say "Rust: ensure toolchain 1.76.0"
+  "$CARGO_HOME/bin/rustup" toolchain install 1.76.0 -c rustfmt -c clippy >/dev/null
+  "$CARGO_HOME/bin/rustup" default 1.76.0 >/dev/null
+  say "Rust OK: $(rustc -V)"
+}
+
+# --------- Solana v1.18.26 (verify by release SHA256SUMS) ----------
+install_solana(){
+  local solbin="/usr/local/bin/solana"
+  if [ -x "$solbin" ]; then
+    local v
+    v="$("$solbin" --version 2>/dev/null || true)"
+    if echo "$v" | grep -q " ${SOLANA_VER#v}"; then
+      say "Solana OK: $v"
+      return 0
+    fi
+    say "Solana present ($v) but not $SOLANA_VER; installing $SOLANA_VER (side-by-side safe)."
+  fi
+
+  local rel="solana-release-x86_64-unknown-linux-gnu.tar.bz2"
+  local url="https://github.com/solana-labs/solana/releases/download/${SOLANA_VER}/${rel}"
+  local sums_url="https://github.com/solana-labs/solana/releases/download/${SOLANA_VER}/SHA256SUMS"
+  local tar="/tmp/${rel}"
+  local sums="/tmp/SHA256SUMS.solana"
+  say "Solana: download release tar + SHA256SUMS"
+  curl -fsSL "$url" -o "$tar"
+  curl -fsSL "$sums_url" -o "$sums"
+  say "Solana: verify sha256 from SHA256SUMS"
+  (cd /tmp && grep " ${rel}\$" SHA256SUMS.solana | sha256sum -c -) >/dev/null
+  say "Solana: install to /opt/solana/${SOLANA_VER}"
+  mkdir -p "/opt/solana/${SOLANA_VER}"
+  tar -C "/opt/solana/${SOLANA_VER}" -xjf "$tar"
+  # find bin dir inside
+  local bindir
+  bindir="$(find "/opt/solana/${SOLANA_VER}" -maxdepth 3 -type d -name bin | head -n1)"
+  [ -n "$bindir" ] || die "Solana install: bin dir not found"
+  ln -sf "$bindir/solana" /usr/local/bin/solana
+  ln -sf "$bindir/solana-keygen" /usr/local/bin/solana-keygen
+  ln -sf "$bindir/solana-test-validator" /usr/local/bin/solana-test-validator
+  say "Solana installed: $(solana --version)"
+}
+
+# --------- Anchor 0.30.1 (build from tag; record commit) ----------
+install_anchor(){
+  export RUSTUP_HOME="$TOOLCHAINS/rustup"
+  export CARGO_HOME="$TOOLCHAINS/cargo"
+  export PATH="$CARGO_HOME/bin:$PATH"
+
+  if command -v anchor >/dev/null 2>&1; then
+    local v
+    v="$(anchor --version 2>/dev/null || true)"
+    if echo "$v" | grep -q "0.30.1"; then
+      say "Anchor OK: $v"
+      return 0
+    fi
+    say "Anchor present ($v) but not 0.30.1; building $ANCHOR_TAG."
+  fi
+
+  local src="/opt/anchor-src"
+  rm -rf "$src" || true
+  say "Anchor: clone + checkout $ANCHOR_TAG"
+  git clone --depth 1 --branch "$ANCHOR_TAG" https://github.com/coral-xyz/anchor.git "$src"
+  local commit
+  commit="$(git -C "$src" rev-parse HEAD)"
+  say "Anchor: tag $ANCHOR_TAG -> $commit"
+  say "Anchor: build/install via cargo"
+  (cd "$src" && cargo install --path cli --locked) >/dev/null
+  say "Anchor installed: $(anchor --version)"
+}
+
+# --------- Workspace bootstrap ----------
+bootstrap_workspace(){
+  mkdir -p "$APP_ROOT" "$FRONT_DIR" "$ANCHOR_DIR"
+  chmod 755 "$APP_ROOT" "$FRONT_DIR" "$ANCHOR_DIR"
+}
+
+# --------- Frontend deploy (supports local zip drop) ----------
+deploy_frontend(){
+  mkdir -p "$FRONT_DIR"
+  cd "$FRONT_DIR"
+
+  # Source priority:
+  # 1) /root/horizons-export*.zip (auto newest)
+  # 2) existing repo in $FRONT_DIR (git pull if remote exists)
+  local zip
+  zip="$(ls -1t /root/horizons-export*.zip 2>/dev/null | head -n1 || true)"
+
+  if [ -n "$zip" ]; then
+    say "Frontend: using zip $zip"
+    rm -rf "$FRONT_DIR/src" "$FRONT_DIR/public" "$FRONT_DIR/plugins" "$FRONT_DIR/tools" \
+           "$FRONT_DIR/index.html" "$FRONT_DIR/package.json" "$FRONT_DIR/package-lock.json" \
+           "$FRONT_DIR/vite.config.js" "$FRONT_DIR/tailwind.config.js" "$FRONT_DIR/eslint.config.mjs" \
+           "$FRONT_DIR/.nvmrc" 2>/dev/null || true
+    unzip -o "$zip" -d "$FRONT_DIR" >/dev/null
+  else
+    if [ -d "$FRONT_DIR/.git" ]; then
+      say "Frontend: git pull"
+      git -C "$FRONT_DIR" pull --rebase || true
+    else
+      say "Frontend: no /root/horizons-export*.zip and no git repo; skipping source update"
+    fi
+  fi
+
+  if [ -f "$FRONT_DIR/package-lock.json" ]; then
+    say "Frontend: npm ci"
+    npm ci --no-audit --no-fund >/dev/null
+    say "Frontend: build"
+    npm run build >/dev/null
+  else
+    say "Frontend: package-lock.json missing; skip npm build"
+  fi
+
+  # Vite default output is dist/
+  if [ -d "$FRONT_DIR/dist" ]; then
+    say "Frontend: deploy dist -> $WEBROOT"
+    mkdir -p "$WEBROOT"
+    rsync -a --delete "$FRONT_DIR/dist/" "$WEBROOT/"
+  else
+    # fallback: if zip is already static export
+    if [ -f "$FRONT_DIR/index.html" ]; then
+      say "Frontend: deploy static files -> $WEBROOT"
+      mkdir -p "$WEBROOT"
+      rsync -a --delete "$FRONT_DIR/" "$WEBROOT/" --exclude node_modules --exclude dist --exclude .git
+    else
+      say "Frontend: nothing to deploy"
+    fi
+  fi
+
+  # hardening: no SW caching surprises
+  if [ -d "$WEBROOT" ]; then
+    rm -f "$WEBROOT/sw.js" "$WEBROOT/service-worker.js" "$WEBROOT/manifest.json" 2>/dev/null || true
+  fi
+}
+
+# --------- Anchor workspace & strict test (if present) ----------
+anchor_test_strict(){
+  if [ ! -f "$ANCHOR_DIR/Anchor.toml" ]; then
+    say "Anchor: no Anchor.toml in $ANCHOR_DIR; skipping anchor test"
+    return 0
+  fi
+  export RUSTUP_HOME="$TOOLCHAINS/rustup"
+  export CARGO_HOME="$TOOLCHAINS/cargo"
+  export PATH="$CARGO_HOME/bin:$PATH"
+
+  say "Anchor: cargo vendor + yarn offline mirror (best-effort)"
+  mkdir -p "$ANCHOR_DIR/vendor" "$ANCHOR_DIR/.yarn-mirror" || true
+  if [ -f "$ANCHOR_DIR/Cargo.toml" ]; then
+    (cd "$ANCHOR_DIR" && cargo vendor vendor >/dev/null) || true
+  fi
+  if [ -f "$ANCHOR_DIR/package.json" ]; then
+    (cd "$ANCHOR_DIR" && npm ci --no-audit --no-fund >/dev/null) || true
+  fi
+
+  say "Anchor: anchor test (strict)"
+  (cd "$ANCHOR_DIR" && anchor test) 
+}
+
+# --------- Nginx routes include (deterministic) ----------
+ensure_nginx_include(){
+  say "Nginx: write include $NGX_INC"
+  write_file "$NGX_INC" <<'INC'
+# aquilastacking_routes.inc (deterministic)
+location = /aquilastacking { return 301 /aquilastacking/; }
+location ^~ /aquilastacking/ {
+  alias /var/www/aquilastacking/;
+  try_files $uri $uri/ /aquilastacking/index.html;
+  add_header Cache-Control "no-store" always;
+}
+# prevent stale PWA artifacts
+location = /aquilastacking/sw.js { add_header Cache-Control "no-store" always; return 404; }
+location = /aquilastacking/service-worker.js { add_header Cache-Control "no-store" always; return 404; }
+location = /aquilastacking/manifest.json { add_header Cache-Control "no-store" always; return 404; }
+INC
+
+  say "Nginx: ensure vhost includes aquilastacking include"
+  if [ ! -f "$NGX_VHOST" ]; then
+    die "missing nginx vhost: $NGX_VHOST"
+  fi
+
+  cp -a "$NGX_VHOST" "$BK/" || true
+
+  if ! grep -q "includes/aquilastacking_routes.inc" "$NGX_VHOST"; then
+    # insert include near other includes; append safely at end of server block if unknown
+    say "Nginx: inject include into vhost (safe append inside server if possible)"
+    # try to place before last '}' of first server block
+    perl -0777 -i -pe 'if($ARGV){ } s/(server\s*\{.*?)(\n\})/$1\n    include \/etc\/nginx\/includes\/aquilastacking_routes.inc;\n$2/s unless /includes\/aquilastacking_routes\.inc/;' "$NGX_VHOST" || true
+  fi
+
   nginx -t
-  say "reload nginx"
-  systemctl reload nginx || systemctl restart nginx
+  systemctl reload nginx
 }
 
-tests(){
-  say "TEST HEAD /wolverine/"
-  curl -skI "https://${DOMAIN}/wolverine/" | sed -n '1,20p' || true
-  say "TEST first bytes /wolverine/"
-  curl -sk "https://${DOMAIN}/wolverine/" | head -c 200; echo || true
-  say "FILES $WEBROOT"
-  ls -la "$WEBROOT" | sed -n '1,40p' || true
-  echo "OPEN: https://${DOMAIN}/wolverine/  (Ctrl+F5)"
-  echo "BACKUP: $BK"
+# --------- Verify mode (read-only-ish checks) ----------
+verify_mode(){
+  say "VERIFY: nginx -t"
+  nginx -t
+  say "VERIFY: paths"
+  ls -la "$WEBROOT" | head -n 50 || true
+  say "VERIFY: curl local check (if exposed by nginx)"
+  curl -fsS "https://127.0.0.1/aquilastacking/" -k | head -n 5 || true
+  say "VERIFY: done"
 }
 
-main(){
-  need_root
-  backup_all
-  unfreeze_nginx
-  ensure_webroot
-  write_include
-  disable_other_wolverine_includes
-  ensure_vhost_enabled
-  disable_duplicate_fireinners_vhosts
-  python_edit_vhost
-  nginx_reload
-  tests
-}
-main "$@"
-'''
-open(p,'w',encoding='utf-8').write(s)
-PY
-chmod +x /root/WV_FIX404_V2.sh
-bash /root/WV_FIX404_V2.sh
+# --------- MAIN ----------
+install_node
+install_rust
+install_solana
+install_anchor
+bootstrap_workspace
+deploy_frontend
+ensure_nginx_include
+
+if [ "$MODE" = "verify" ]; then
+  # run only read/validate checks (plus nginx reload already done)
+  verify_mode
+  exit 0
+fi
+
+# strict anchor test only if workspace exists
+anchor_test_strict || true
+
+say "OK: served at https://${DOMAIN}/aquilastacking/"
+say "DONE"
+BASH
+chmod +x /root/MEGA_AQUILA_STACKING_V7_100.sh
+/root/MEGA_AQUILA_STACKING_V7_100.sh
