@@ -1,71 +1,51 @@
-bash -lc 'bash -s <<'"'"'BASH'"'"'
+cat >/root/MEGA_WV_FIX_404.sh <<'EOF'
+#!/usr/bin/env bash
 set -euo pipefail
 umask 022
 TS="$(date +%Y%m%d_%H%M%S)"
 DOMAIN="fireinners.online"
+
+# Paths fixes (selon ta doctrine)
 WEBROOT="/var/www/wolverine"
 DIST="/opt/fireinners/frontend-react/app/dist/wolverine"
 VHOST_A="/etc/nginx/sites-available/fireinners.online-ssl"
 VHOST_E="/etc/nginx/sites-enabled/fireinners.online-ssl"
-INC="/etc/nginx/includes/wolverine_static.inc"
+
+# Include dédié (unique source de vérité pour /wolverine/)
+INC="/etc/nginx/includes/wolverine_routes.inc"
+
 BK="/root/WV_FIX_${TS}"
 IMM="$BK/immut.list"
+
 say(){ printf "\n[%s] %s\n" "$(date +%H:%M:%S)" "$*"; }
 need_root(){ [ "$(id -u)" -eq 0 ] || { echo "RUN AS ROOT"; exit 1; }; }
 
-mkdir -p "$BK"; :> "$IMM"
-
-unfreeze_file(){ local f="$1"; [ -e "$f" ] || return 0; command -v lsattr >/dev/null 2>&1 || return 0; command -v chattr >/dev/null 2>&1 || return 0; if lsattr -d "$f" 2>/dev/null | awk "{print \$1}" | grep -q "i"; then echo "$f" >>"$IMM" || true; chattr -i "$f" 2>/dev/null || true; fi; }
+unfreeze_file(){ local f="$1"; [ -e "$f" ] || return 0; command -v lsattr >/dev/null 2>&1 || return 0; command -v chattr >/dev/null 2>&1 || return 0; if lsattr -d "$f" 2>/dev/null | awk '{print $1}' | grep -q 'i'; then echo "$f" >>"$IMM" || true; chattr -i "$f" 2>/dev/null || true; fi; }
 unfreeze_tree(){ local d="$1"; [ -d "$d" ] || return 0; while IFS= read -r -d "" f; do unfreeze_file "$f"; done < <(find "$d" -maxdepth 2 -type f -print0 2>/dev/null || true); }
 refreeze_all(){ [ -s "$IMM" ] || return 0; command -v chattr >/dev/null 2>&1 || return 0; while IFS= read -r f; do [ -e "$f" ] && chattr +i "$f" 2>/dev/null || true; done <"$IMM"; }
 
 backup_all(){
+  mkdir -p "$BK"
+  :> "$IMM"
   say "Backup -> $BK"
   cp -a /etc/nginx "$BK/nginx" 2>/dev/null || true
   [ -d "$WEBROOT" ] && cp -a "$WEBROOT" "$BK/webroot" 2>/dev/null || true
   [ -x /root/WOLVERINE_SAVEPOINT.sh ] && /root/WOLVERINE_SAVEPOINT.sh || true
 }
 
-disable_aquila_bad_include(){
+disable_bad_includes(){
+  # aquila include hors server{} (si présent)
   local f="/etc/nginx/includes/aquila_stacking_routes.inc"
   if [ -f "$f" ] && grep -qE "^[[:space:]]*location[[:space:]]" "$f"; then
     say "Disable aquila_stacking_routes.inc (bad include)"
     mv -f "$f" "${f}.disabled_${TS}" 2>/dev/null || true
   fi
-  while IFS= read -r file; do
-    [ -f "$file" ] || continue
-    sed -i -E "s|^([[:space:]]*include[[:space:]]+.*aquila_stacking_routes\.inc[^;]*;)|# WVFIX_${TS} DISABLED :: \\1|g" "$file" || true
+  # commente tout include aquila_stacking_routes.inc référencé
+  local g
+  while IFS= read -r g; do
+    [ -f "$g" ] || continue
+    sed -i -E "s|^([[:space:]]*include[[:space:]]+.*aquila_stacking_routes\.inc[^;]*;)|# WVFIX_${TS} DISABLED :: \\1|g" "$g" || true
   done < <(grep -RIl "aquila_stacking_routes\.inc" /etc/nginx 2>/dev/null || true)
-}
-
-comment_location_block(){
-  local file="$1" pat="$2"
-  [ -f "$file" ] || return 0
-  awk -v pat="$pat" -v ts="$TS" '
-    function cmt(s){ return "# WVFIX_"ts" "s }
-    BEGIN{inblk=0;depth=0}
-    {
-      if(inblk==0 && $0 ~ pat){ inblk=1 }
-      if(inblk==1){
-        n=gsub(/\{/,"{"); depth+=n
-        n=gsub(/\}/,"}"); depth-=n
-        print cmt($0)
-        if(depth<=0){ inblk=0; depth=0 }
-        next
-      }
-      print
-    }' "$file" >"${file}.tmp" && mv -f "${file}.tmp" "$file"
-}
-
-remove_other_wolverine_locations(){
-  say "Neutralize other location /wolverine/ (avoid duplicates)"
-  local f
-  while IFS= read -r f; do
-    [ -f "$f" ] || continue
-    [ "$f" = "$INC" ] && continue
-    [ "$f" = "$VHOST_A" ] && continue
-    comment_location_block "$f" "location[[:space:]]+\\^~[[:space:]]+/wolverine/|location[[:space:]]+/wolverine/"
-  done < <(grep -RIlE "location[[:space:]]+\^~[[:space:]]+/wolverine/|location[[:space:]]+/wolverine/" /etc/nginx 2>/dev/null || true)
 }
 
 ensure_webroot(){
@@ -76,23 +56,38 @@ ensure_webroot(){
     rsync -a --delete "$DIST"/ "$WEBROOT"/
   fi
   if [ ! -f "$WEBROOT/index.html" ]; then
-    cat >"$WEBROOT/index.html"<<EOF
+    cat >"$WEBROOT/index.html"<<HTML
 <!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WOLVERINE</title></head><body style="font-family:system-ui;margin:40px"><h1>WOLVERINE</h1><p>WEBROOT OK: /var/www/wolverine</p></body></html>
-EOF
+HTML
   fi
 }
 
-write_include(){
-  say "Write include: $INC"
+write_include_unique(){
+  say "Write include (unique): $INC"
   mkdir -p /etc/nginx/includes
-  cat >"$INC"<<EOF
-# WVFIX_${TS}
+  cat >"$INC"<<NGX
+# WVFIX_${TS} - UNIQUE /wolverine/ route
 location ^~ /wolverine/ {
   alias ${WEBROOT}/;
   index index.html;
   try_files \$uri \$uri/ /wolverine/index.html;
 }
-EOF
+NGX
+}
+
+disable_other_wolverine_location_defs(){
+  say "Disable other /wolverine/ location definitions (avoid duplicates)"
+  local f
+  # si un autre fichier définit /wolverine/ en dehors de NOTRE include, on le désactive (rename)
+  while IFS= read -r f; do
+    [ -f "$f" ] || continue
+    [ "$f" = "$INC" ] && continue
+    # seulement si le fichier contient une location /wolverine
+    if grep -qE "location[[:space:]]+(\^~[[:space:]]+)?/wolverine/" "$f"; then
+      say "Disable: $f"
+      mv -f "$f" "${f}.disabled_${TS}" 2>/dev/null || true
+    fi
+  done < <(grep -RIlE "location[[:space:]]+(\^~[[:space:]]+)?/wolverine/" /etc/nginx/includes /etc/nginx/snippets 2>/dev/null || true)
 }
 
 ensure_vhost_enabled(){
@@ -103,42 +98,48 @@ ensure_vhost_enabled(){
 
 disable_duplicate_enabled_vhosts(){
   say "Disable other enabled vhosts with server_name fireinners.online (keep fireinners.online-ssl)"
-  local f
-  while IFS= read -r f; do
-    [ -L "$f" ] || continue
-    [ "$f" = "$VHOST_E" ] && continue
-    if grep -qE "^[[:space:]]*server_name[[:space:]].*fireinners\.online" "$f" 2>/dev/null; then
-      mv -f "$f" "${f}.disabled_${TS}" 2>/dev/null || true
+  local l
+  while IFS= read -r l; do
+    [ -L "$l" ] || continue
+    [ "$l" = "$VHOST_E" ] && continue
+    if grep -qE "^[[:space:]]*server_name[[:space:]].*fireinners\.online" "$l" 2>/dev/null; then
+      mv -f "$l" "${l}.disabled_${TS}" 2>/dev/null || true
     fi
   done < <(find /etc/nginx/sites-enabled -maxdepth 1 -type l 2>/dev/null || true)
 }
 
-inject_include_into_443_server(){
-  say "Inject include into 443 server{} (only once)"
+inject_include_into_https_server(){
+  say "Inject include into HTTPS 443 server{} (deterministic)"
   unfreeze_file "$VHOST_A"
+  # déjà présent ?
   grep -qF "include ${INC};" "$VHOST_A" && return 0
-  awk -v inc="include ${INC};" '
-    BEGIN{in_srv=0;depth=0;is443=0;done=0}
+
+  # injecte juste après la 1ère ligne server_name dans le server{} qui écoute 443
+  awk -v inc="  include ${INC};" '
+    BEGIN{in_srv=0;depth=0;is443=0;done=0;seen_sn=0}
     /^[[:space:]]*server[[:space:]]*\{/{
-      in_srv=1; depth=1; is443=0
+      in_srv=1; depth=1; is443=0; seen_sn=0
       print; next
     }
     {
       if(in_srv){
         if($0 ~ /listen[[:space:]]+443/){ is443=1 }
+        if(is443 && !seen_sn && $0 ~ /^[[:space:]]*server_name[[:space:]]/){
+          seen_sn=1
+          print
+          if(!done){ print inc; done=1 }
+          next
+        }
         n=gsub(/\{/,"{"); depth+=n
         n=gsub(/\}/,"}"); depth-=n
-        if(is443 && !done && $0 !~ /^[[:space:]]*#/){
-          print "  "inc
-          done=1
-          is443=0
-        }
         print
-        if(depth<=0){ in_srv=0; depth=0; is443=0 }
+        if(depth<=0){ in_srv=0; depth=0; is443=0; seen_sn=0 }
         next
       }
       print
     }' "$VHOST_A" >"$VHOST_A.tmp" && mv -f "$VHOST_A.tmp" "$VHOST_A"
+
+  # fallback si awk n’a rien injecté
   grep -qF "include ${INC};" "$VHOST_A" || printf "\n# WVFIX_FALLBACK_%s\ninclude %s;\n" "$TS" "$INC" >>"$VHOST_A"
 }
 
@@ -152,20 +153,23 @@ nginx_reload(){
 tests(){
   say "Tests (SNI -> 127.0.0.1)"
   echo "== HTTPS /wolverine/ (HEAD) =="
-  curl -skI --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/" | sed -n "1,12p" || true
+  curl -skI --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/" | sed -n '1,15p' || true
   echo
-  echo "== HTTPS /wolverine/ (first bytes) =="
-  curl -sk --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/" | head -c 220 || true
+  echo "== HTTPS /wolverine/ (body first bytes) =="
+  curl -sk --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/" | head -c 250 || true
   echo; echo
-  echo "== ls webroot =="
-  ls -la "$WEBROOT" | sed -n "1,40p" || true
+  echo "== Local files =="
+  ls -la "$WEBROOT" | sed -n '1,40p' || true
+  echo
+  echo "== grep any remaining /wolverine location definitions =="
+  grep -RIn --color=never -E "location[[:space:]]+(\^~[[:space:]]+)?/wolverine/" /etc/nginx 2>/dev/null | head -n 30 || true
 }
 
 rollback(){
   say "ROLLBACK nginx (best-effort)"
   [ -d "$BK/nginx" ] || return 0
-  rm -rf /etc/nginx.broken_"$TS" 2>/dev/null || true
-  mv /etc/nginx /etc/nginx.broken_"$TS" 2>/dev/null || true
+  rm -rf "/etc/nginx.broken_${TS}" 2>/dev/null || true
+  mv /etc/nginx "/etc/nginx.broken_${TS}" 2>/dev/null || true
   cp -a "$BK/nginx" /etc/nginx 2>/dev/null || true
   nginx -t || true
   systemctl restart nginx || true
@@ -173,27 +177,38 @@ rollback(){
 
 main(){
   need_root
-  say "MEGA_WOLVERINE_FIX_404 :: start"
+  say "MEGA_WV_FIX_404 :: start"
   backup_all
+
   say "Unfreeze nginx trees (chattr -i)"
   unfreeze_tree "/etc/nginx/sites-available"
   unfreeze_tree "/etc/nginx/sites-enabled"
   unfreeze_tree "/etc/nginx/includes"
   unfreeze_tree "/etc/nginx/snippets"
-  disable_aquila_bad_include
+
+  disable_bad_includes
   disable_duplicate_enabled_vhosts
-  remove_other_wolverine_locations
+
   ensure_webroot
-  write_include
+  write_include_unique
+  disable_other_wolverine_location_defs
+
   ensure_vhost_enabled
-  inject_include_into_443_server
+  inject_include_into_https_server
+
   if ! nginx_reload; then rollback; fi
   tests
+
   say "Refreeze (best-effort)"
   refreeze_all
+
   say "DONE"
   echo "Backups: $BK"
-  echo "Open: https://${DOMAIN}/wolverine/ ثم Ctrl+F5"
+  echo "Open: https://${DOMAIN}/wolverine/ puis Ctrl+F5"
 }
 main
-BASH'
+EOF
+
+sed -i 's/\r$//' /root/MEGA_WV_FIX_404.sh
+chmod +x /root/MEGA_WV_FIX_404.sh
+bash /root/MEGA_WV_FIX_404.sh
