@@ -1,86 +1,120 @@
-cat >/root/WV_FIX_DUP_LOCATION.sh <<'BASH'
+cat >/root/MEGA_IAAQUILA_FIX_404.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 TS="$(date +%Y%m%d_%H%M%S)"
-BK="/root/WV_BK_DUP_${TS}"
-mkdir -p "$BK"
-say(){ printf "\n[%s] %s\n" "$(date +%H:%M:%S)" "$*"; }
-backup(){ local f="$1"; [ -e "$f" ] || return 0; mkdir -p "$BK$(dirname "$f")"; cp -a "$f" "$BK$f"; }
-unfreeze(){ local f="$1"; [ -e "$f" ] || return 0; chattr -i "$f" 2>/dev/null || true; }
+say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
+die(){ say "ERR: $*"; exit 1; }
+need(){ command -v "$1" >/dev/null 2>&1 || die "missing $1"; }
+asroot(){ [ "$(id -u)" = "0" ] || die "run as root"; }
 
-NGX="/etc/nginx"
+asroot
+need nginx
+need curl
+need awk
+need sed
+need grep
+need perl
+
+DOMAIN="fireinners.online"
+SLUG="iaaquila"
+
+APP="/opt/iaaquila"
+PUB="$APP/public"
+INC="/etc/nginx/includes/${SLUG}_routes.inc"
 VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
-SEN="/etc/nginx/sites-enabled/fireinners.online-ssl"
-INC_STATIC="/etc/nginx/includes/wolverine_static.inc"
-INC_DIR="/etc/nginx/includes"
-VAULT_PORT="8787"
 
-say "0) Savepoint (si dispo)"
-[ -x /root/WOLVERINE_SAVEPOINT.sh ] && /root/WOLVERINE_SAVEPOINT.sh || true
+BK="/root/${SLUG}_FIX404_BK_${TS}"
+mkdir -p "$BK"
 
-say "1) Backup + unfreeze fichiers nginx ciblés"
-for f in "$VHOST" "$SEN" "$INC_STATIC"; do backup "$f"; unfreeze "$f"; done
+say "== 0) Preflight =="
+[ -f "$VHOST" ] || die "missing vhost: $VHOST"
+mkdir -p "$PUB" /etc/nginx/includes
 
-say "2) Fix #1: wolverine_static.inc inclus plusieurs fois -> commenter les doublons"
-mapfile -t LINES < <(grep -RIn --color=never -E "include[[:space:]]+.*wolverine_static\.inc" "$NGX" 2>/dev/null || true)
-if [ "${#LINES[@]}" -gt 1 ]; then
-  say "Trouvé ${#LINES[@]} includes de wolverine_static.inc -> on garde le 1er, on commente les autres"
-  keep=1
-  for hit in "${LINES[@]}"; do
-    f="${hit%%:*}"; rest="${hit#*:}"; ln="${rest%%:*}"
-    if [ $keep -eq 1 ]; then keep=0; continue; fi
-    backup "$f"; unfreeze "$f"
-    # commente la ligne exacte
-    sed -i "${ln}s|^[[:space:]]*|# WV_DUP_${TS} |" "$f" || true
-  done
+say "== 1) Backup =="
+cp -a "$VHOST" "$BK/$(basename "$VHOST").bak" 2>/dev/null || true
+[ -f "$INC" ] && cp -a "$INC" "$BK/$(basename "$INC").bak" 2>/dev/null || true
+[ -f "$PUB/index.html" ] && cp -a "$PUB/index.html" "$BK/index.html.bak" 2>/dev/null || true
+
+say "== 2) Ensure front index.html exists (minimal fallback) =="
+if [ ! -f "$PUB/index.html" ]; then
+cat >"$PUB/index.html"<<'HTML'
+<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>IaAquila</title><body style="background:#070914;color:#fff;font-family:system-ui;padding:20px"><h3>IaAquila OK</h3><p>Static route works. If you see this, nginx location /iaaquila/ is correct.</p></body>
+HTML
 fi
 
-say "3) Fix #2: autres fichiers qui redéclarent /wolverine/ -> désactiver leur include (ou le fichier)"
-# détecte tout fichier qui contient une location /wolverine/
-mapfile -t LOCFILES < <(grep -RIl --color=never -E "location[[:space:]]+(\^~[[:space:]]+)?/wolverine/" "$NGX" 2>/dev/null | sort -u)
-if [ "${#LOCFILES[@]}" -gt 1 ]; then
-  say "Fichiers avec location /wolverine/:"
-  printf '%s\n' "${LOCFILES[@]}" | sed 's/^/ - /'
+say "== 3) Force include routes file =="
+cat >"$INC"<<INC
+# IaAquila routes (forced)
+location = /iaaquila { return 301 /iaaquila/; }
+
+location ^~ /iaaquila/api/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+  proxy_pass http://127.0.0.1:9688;
+}
+
+location ^~ /iaaquila/ {
+  alias ${PUB}/;
+  add_header Cache-Control "no-store" always;
+  try_files \$uri \$uri/ /iaaquila/index.html;
+}
+INC
+
+say "== 4) Inject include into vhost (safe) =="
+chattr -i "$VHOST" 2>/dev/null || true
+chattr -i "$INC" 2>/dev/null || true
+
+if ! grep -qF "$INC" "$VHOST"; then
+  # Insert include inside first server block, right after server_name if present, else after 'server {'.
+  perl -0777 -i -pe '
+    my $inc = "    include /etc/nginx/includes/iaaquila_routes.inc;\n";
+    if ($_ !~ /include\s+\/etc\/nginx\/includes\/iaaquila_routes\.inc;/) {
+      if ($_ =~ /(server_name\s+[^;]*;[^\n]*\n)/) {
+        $_ =~ s/(server_name\s+[^;]*;[^\n]*\n)/$1$inc/;
+      } elsif ($_ =~ /(server\s*\{\s*\n)/) {
+        $_ =~ s/(server\s*\{\s*\n)/$1$inc/;
+      }
+    }
+  ' "$VHOST"
 fi
 
-KEEP_FILE=""
-if [ -f "$INC_STATIC" ]; then KEEP_FILE="$INC_STATIC"; else KEEP_FILE="${LOCFILES[0]:-}"; fi
+say "== 5) Validate + reload nginx =="
+nginx -t >/dev/null 2>&1 || { say "NGINX TEST FAIL"; nginx -t; die "nginx invalid"; }
+systemctl reload nginx >/dev/null 2>&1 || true
 
-for f in "${LOCFILES[@]}"; do
-  [ -n "$f" ] || continue
-  if [ "$f" = "$KEEP_FILE" ]; then
-    continue
-  fi
-  # Si c'est un include .inc : on le renomme pour le sortir des includes wildcard
-  if [[ "$f" == "$INC_DIR/"*".inc" ]]; then
-    backup "$f"; unfreeze "$f"
-    mv -f "$f" "${f}.WV_DISABLED_${TS}" || true
-  fi
-  # Et on commente toute ligne "include <ce fichier>" trouvée dans /etc/nginx
-  mapfile -t IHITS < <(grep -RIn --color=never -F "include $f" "$NGX" 2>/dev/null || true)
-  for hit in "${IHITS[@]}"; do
-    cf="${hit%%:*}"; rest="${hit#*:}"; ln="${rest%%:*}"
-    backup "$cf"; unfreeze "$cf"
-    sed -i "${ln}s|^[[:space:]]*|# WV_DUP_LOC_${TS} |" "$cf" || true
-  done
-done
+# Re-freeze best-effort (won't fail batch if FS forbids)
+chattr +i "$INC" 2>/dev/null || true
+chattr +i "$VHOST" 2>/dev/null || true
 
-say "4) S'assurer que le vhost enabled pointe bien vers sites-available"
-[ -f "$VHOST" ] && ln -sf "$VHOST" "$SEN" || true
+say "== 6) Prove vhost has routes (nginx -T) =="
+NGT="$(nginx -T 2>/dev/null | grep -nE 'iaaquila_routes\.inc|location\s+\^~\s+/iaaquila/|location\s+\^~\s+/iaaquila/api/' || true)"
+if [ -z "$NGT" ]; then
+  say "WARN: nginx -T did not show iaaquila routes. Showing server_name blocks:"
+  nginx -T 2>/dev/null | grep -nE 'server_name|listen|include\s+/etc/nginx/includes/' | head -n 120 || true
+else
+  printf '%s\n' "$NGT"
+fi
 
-say "5) nginx -t + reload"
-nginx -t
-systemctl reload nginx
+say "== 7) Public tests =="
+HTTP1="$(curl -kfsSI "https://${DOMAIN}/iaaquila/" 2>/dev/null | head -n 1 || true)"
+HTTP2="$(curl -kfsSI "https://${DOMAIN}/iaaquila/index.html" 2>/dev/null | head -n 1 || true)"
+say "HEAD /iaaquila/        -> ${HTTP1:-NO}"
+say "HEAD /iaaquila/index.html -> ${HTTP2:-NO}"
 
-say "6) Tests Vault (DOIT être JSON, pas 307/HTML)"
-echo "-- vault direct:"; curl -sS "http://127.0.0.1:${VAULT_PORT}/health"; echo
-echo "-- vault via nginx Host:"; curl -sS -H "Host: fireinners.online" "http://127.0.0.1/wolverine/vault-api/health"; echo
-echo "-- create via nginx Host:"; curl -sS -H "Host: fireinners.online" -H "content-type: application/json" -X POST "http://127.0.0.1/wolverine/vault-api/create" -d "{}"; echo
+if echo "$HTTP1" | grep -q "200" || echo "$HTTP2" | grep -q "200"; then
+  say "OK: IaAquila is publicly reachable: https://${DOMAIN}/iaaquila/"
+  exit 0
+fi
 
-say "DONE"
-echo "Backups: $BK"
-echo "Ouvre: https://fireinners.online/wolverine/ puis Ctrl+F5"
+say "== 8) If still failing, dump exact evidence =="
+say "--- curl -kI https://${DOMAIN}/iaaquila/ ---"
+curl -kI "https://${DOMAIN}/iaaquila/" 2>/dev/null || true
+say "--- nginx -T (filtered) ---"
+nginx -T 2>/dev/null | grep -nE 'server_name|listen|include\s+/etc/nginx/includes/|iaaquila_routes\.inc|location\s+\^~\s+/iaaquila' || true
+die "public route still 404 (nginx routes not active on served vhost)"
 BASH
-
-chmod +x /root/WV_FIX_DUP_LOCATION.sh
-bash /root/WV_FIX_DUP_LOCATION.sh
+chmod +x /root/MEGA_IAAQUILA_FIX_404.sh
+/root/MEGA_IAAQUILA_FIX_404.sh
