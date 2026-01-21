@@ -1,85 +1,115 @@
-cat >/root/MEGA_BUNDLER_API_FORCE_9797.sh <<'BASH'
+bash -lc 'cat > /root/BUNDLER_FIX_404.sh <<'"'"'SH'"'"'
 #!/usr/bin/env bash
 set -euo pipefail
-umask 022
-TS="$(date +%Y%m%d_%H%M%S)"
-BK="/root/BUNDLER_API_FORCE_${TS}"
-mkdir -p "$BK"
 
-say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
+ts(){ date +%Y%m%d_%H%M%S; }
+say(){ printf "[%s] %s\n" "$(date +%H:%M:%S)" "$*"; }
 die(){ say "ERROR: $*"; exit 1; }
-[ "$(id -u)" -eq 0 ] || die "run as root"
+need_root(){ [ "$(id -u)" -eq 0 ] || die "run as root"; }
+need_root
 
 DOMAIN="fireinners.online"
+VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
+NGINX_CONF="/etc/nginx/nginx.conf"
+INC_DIR="/etc/nginx/includes"
+INC_FILE="${INC_DIR}/bundler_routes.inc"
+
+WEBROOT="/var/www/bundler"
 API_DIR="/opt/bundler_api"
 API_PORT="9797"
 API_HOST="127.0.0.1"
-API_SVC="/etc/systemd/system/bundler-api.service"
+SVC="/etc/systemd/system/bundler-api.service"
 
-unlock(){ chattr -i "$1" 2>/dev/null || true; }
-lockit(){ chattr +i "$1" 2>/dev/null || true; }
+BK="/root/BUNDLER_FIX_404_$(ts)"
+mkdir -p "$BK"
 
 say "backup: $BK"
-tar -C /opt -czf "$BK/opt_bundler_api.tgz" bundler_api >/dev/null 2>&1 || true
-cp -a "$API_SVC" "$BK/bundler-api.service.bak" 2>/dev/null || true
-tar -C /etc/nginx -czf "$BK/etc_nginx.tgz" . >/dev/null 2>&1 || true
+[ -f "$NGINX_CONF" ] && cp -a "$NGINX_CONF" "$BK/nginx.conf.bak" || true
+[ -f "$VHOST" ] && cp -a "$VHOST" "$BK/$(basename "$VHOST").bak" || true
+[ -f "$INC_FILE" ] && cp -a "$INC_FILE" "$BK/$(basename "$INC_FILE").bak" || true
+[ -f "$SVC" ] && cp -a "$SVC" "$BK/$(basename "$SVC").bak" || true
 
-say "node: ensure >= 20.18.x (some @solana packages require >=20.18)"
-need_upgrade=0
-if command -v node >/dev/null 2>&1; then
-  v="$(node -v | tr -d 'v' || true)"
-  maj="${v%%.*}"; rest="${v#*.}"; min="${rest%%.*}"
-  if [ "${maj:-0}" -lt 20 ] || { [ "${maj:-0}" -eq 20 ] && [ "${min:-0}" -lt 18 ]; }; then need_upgrade=1; fi
-else
-  need_upgrade=1
+say "ensure dirs"
+mkdir -p "$INC_DIR" "$WEBROOT" "$API_DIR"
+chmod 755 "$WEBROOT" || true
+
+say "write nginx include: $INC_FILE"
+cat > "$INC_FILE" <<EOF
+# === BUNDLER ROUTES (AUTOGEN) ===
+location = /bundler { return 301 /bundler/; }
+location ^~ /bundler/api/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+  proxy_set_header Connection "";
+  proxy_pass http://${API_HOST}:${API_PORT}/;
+}
+location ^~ /bundler/ {
+  alias ${WEBROOT}/;
+  try_files \$uri \$uri/ /bundler/index.html;
+  add_header Cache-Control "no-store";
+}
+EOF
+
+say "ensure vhost include present: $VHOST"
+[ -f "$VHOST" ] || die "missing vhost: $VHOST"
+if ! grep -qF "include $INC_FILE;" "$VHOST"; then
+  awk -v inc="    include '"$INC_FILE"';" '
+    BEGIN{inserver=0;done=0}
+    /^[[:space:]]*server[[:space:]]*\{/ {inserver=1}
+    inserver && $0 ~ /^[[:space:]]*\}/ && done==0 {print inc; done=1}
+    {print}
+  ' "$VHOST" > "$BK/vhost.new"
+  cp -a "$BK/vhost.new" "$VHOST"
 fi
-if [ "$need_upgrade" -eq 1 ]; then
-  say "node: upgrading via NodeSource 20.x"
-  apt-get update -y >/dev/null
-  apt-get install -y ca-certificates curl gnupg >/dev/null
-  curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null
-  apt-get install -y nodejs >/dev/null
+
+say "ensure UI index"
+if [ ! -f "$WEBROOT/index.html" ]; then
+  cat > "$WEBROOT/index.html" <<'"'"'HTML'"'"'
+<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Bundler</title><style>body{font-family:system-ui,Segoe UI,Roboto,Arial;margin:24px}code{background:#f3f3f3;padding:2px 6px;border-radius:6px}</style></head><body><h1>Bundler</h1><p>UI OK. API health: <code id="h">...</code></p><script>(async()=>{try{let r=await fetch("/bundler/api/health",{cache:"no-store"});document.getElementById("h").textContent=r.ok?await r.text():"HTTP "+r.status}catch(e){document.getElementById("h").textContent=String(e)}})();</script></body></html>
+HTML
 fi
-node -v || die "node missing"
-npm -v || die "npm missing"
 
-say "api: force minimal stable API on $API_HOST:$API_PORT"
-mkdir -p "$API_DIR"
-cd "$API_DIR"
-
-# Keep prior files (already backed up) then force clean minimal runtime
-rm -rf node_modules package-lock.json >/dev/null 2>&1 || true
-
-cat >package.json <<'JSON'
-{"name":"bundler-api","version":"1.0.0","private":true,"main":"server.js","type":"commonjs","scripts":{"start":"node server.js"},"dependencies":{"express":"^4.19.2"}}
+say "write minimal API (stable) under $API_DIR"
+cat > "$API_DIR/package.json" <<'"'"'JSON'"'"'
+{"name":"bundler-api","version":"1.0.0","private":true,"type":"commonjs","main":"server.js","dependencies":{"express":"^4.19.2"}}
 JSON
 
-cat >server.js <<'JS'
+cat > "$API_DIR/server.js" <<'"'"'JS'"'"'
+"use strict";
 const express=require("express");
 const app=express();
-app.disable("x-powered-by");
-app.get("/health",(req,res)=>res.json({ok:true,ts:new Date().toISOString()}));
-app.get("/",(req,res)=>res.type("text/plain").send("bundler-api ok\n"));
-const HOST=process.env.HOST||"127.0.0.1";
-const PORT=parseInt(process.env.PORT||"9797",10);
-app.listen(PORT,HOST,()=>console.log("bundler-api listening",HOST,PORT));
+app.use(express.json({limit:"1mb"}));
+app.get("/health",(req,res)=>res.status(200).type("text/plain").send("ok"));
+app.get("/",(req,res)=>res.status(200).json({ok:true,svc:"bundler-api"}));
+app.post("/create-token",(req,res)=>res.status(501).json({ok:false,code:"NOT_IMPLEMENTED",msg:"API stable up; wire real create-token here"}));
+const host=process.env.API_HOST||"127.0.0.1";
+const port=parseInt(process.env.API_PORT||"9797",10);
+app.listen(port,host,()=>console.log(JSON.stringify({ok:true,ts:new Date().toISOString(),host,port})));
 JS
 
-npm install --omit=dev >/dev/null
+say "install deps"
+cd "$API_DIR"
+if [ ! -d node_modules ]; then
+  npm i --silent
+else
+  npm i --silent || true
+fi
 
-say "systemd: write service"
-unlock "$API_SVC" || true
-cat >"$API_SVC" <<EOF
+say "write systemd service: $SVC"
+cat > "$SVC" <<EOF
 [Unit]
-Description=Bundler API (forced minimal stable)
+Description=Bundler API (create token)
 After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=$API_DIR
-Environment=HOST=$API_HOST
-Environment=PORT=$API_PORT
-ExecStart=/usr/bin/node $API_DIR/server.js
+WorkingDirectory=${API_DIR}
+Environment=API_HOST=${API_HOST}
+Environment=API_PORT=${API_PORT}
+ExecStart=/usr/bin/node ${API_DIR}/server.js
 Restart=always
 RestartSec=2
 User=root
@@ -87,30 +117,32 @@ User=root
 [Install]
 WantedBy=multi-user.target
 EOF
-chmod 644 "$API_SVC"
 
+say "systemd: reload + enable + restart"
 systemctl daemon-reload
-systemctl enable --now bundler-api >/dev/null 2>&1 || true
-systemctl restart bundler-api >/dev/null 2>&1 || true
+systemctl enable --now bundler-api.service >/dev/null 2>&1 || true
+systemctl restart bundler-api.service
 
-say "diag: status + last logs"
-systemctl is-active --quiet bundler-api && say "bundler-api: active" || say "bundler-api: NOT active"
-journalctl -u bundler-api --no-pager -n 40 || true
+say "nginx: test + reload"
+nginx -t
+systemctl reload nginx
 
-say "diag: port listening"
-ss -lntp | grep -E "(:$API_PORT\b)" || true
+say "diag: listeners"
+ss -lntp | grep -E ":(${API_PORT})\s" || true
 
-say "test: local curl"
-curl -fsS "http://$API_HOST:$API_PORT/health" || true
-echo
+say "tests: local api"
+set +e
+curl -fsS "http://${API_HOST}:${API_PORT}/health" && echo || echo "LOCAL_API_FAIL"
+set -e
 
-say "test: origin via nginx (bypass cloudflare)"
-curl -skI --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/bundler/api/health" | head -n 12 | tr -d '\r' || true
-curl -skI --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/bundler/" | head -n 12 | tr -d '\r' || true
+say "tests: origin nginx (bypass cloudflare)"
+set +e
+curl -k -sS -D- "https://${DOMAIN}/bundler/" -o /dev/null | sed -n "1,12p"
+curl -k -sS -D- "https://${DOMAIN}/bundler/api/health" -o /dev/null | sed -n "1,12p"
+set -e
 
 say "DONE"
 say "BACKUP: $BK"
-BASH
-
-chmod +x /root/MEGA_BUNDLER_API_FORCE_9797.sh
-/root/MEGA_BUNDLER_API_FORCE_9797.sh
+SH
+chmod +x /root/BUNDLER_FIX_404.sh
+/root/BUNDLER_FIX_404.sh'
