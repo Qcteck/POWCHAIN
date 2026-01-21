@@ -1,20 +1,12 @@
-cat >/root/MEGA_WV_FIX_404.sh <<'EOF'
+cat >/root/MEGA_WV_FIX_404_V2.sh <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-umask 022
 TS="$(date +%Y%m%d_%H%M%S)"
 DOMAIN="fireinners.online"
-
-# Paths fixes (selon ta doctrine)
 WEBROOT="/var/www/wolverine"
 DIST="/opt/fireinners/frontend-react/app/dist/wolverine"
-VHOST_A="/etc/nginx/sites-available/fireinners.online-ssl"
-VHOST_E="/etc/nginx/sites-enabled/fireinners.online-ssl"
-
-# Include dédié (unique source de vérité pour /wolverine/)
 INC="/etc/nginx/includes/wolverine_routes.inc"
-
-BK="/root/WV_FIX_${TS}"
+BK="/root/WV_FIX_V2_${TS}"
 IMM="$BK/immut.list"
 
 say(){ printf "\n[%s] %s\n" "$(date +%H:%M:%S)" "$*"; }
@@ -30,22 +22,6 @@ backup_all(){
   say "Backup -> $BK"
   cp -a /etc/nginx "$BK/nginx" 2>/dev/null || true
   [ -d "$WEBROOT" ] && cp -a "$WEBROOT" "$BK/webroot" 2>/dev/null || true
-  [ -x /root/WOLVERINE_SAVEPOINT.sh ] && /root/WOLVERINE_SAVEPOINT.sh || true
-}
-
-disable_bad_includes(){
-  # aquila include hors server{} (si présent)
-  local f="/etc/nginx/includes/aquila_stacking_routes.inc"
-  if [ -f "$f" ] && grep -qE "^[[:space:]]*location[[:space:]]" "$f"; then
-    say "Disable aquila_stacking_routes.inc (bad include)"
-    mv -f "$f" "${f}.disabled_${TS}" 2>/dev/null || true
-  fi
-  # commente tout include aquila_stacking_routes.inc référencé
-  local g
-  while IFS= read -r g; do
-    [ -f "$g" ] || continue
-    sed -i -E "s|^([[:space:]]*include[[:space:]]+.*aquila_stacking_routes\.inc[^;]*;)|# WVFIX_${TS} DISABLED :: \\1|g" "$g" || true
-  done < <(grep -RIl "aquila_stacking_routes\.inc" /etc/nginx 2>/dev/null || true)
 }
 
 ensure_webroot(){
@@ -63,10 +39,10 @@ HTML
 }
 
 write_include_unique(){
-  say "Write include (unique): $INC"
+  say "Write include: $INC"
   mkdir -p /etc/nginx/includes
   cat >"$INC"<<NGX
-# WVFIX_${TS} - UNIQUE /wolverine/ route
+# WV_FIX_V2_${TS} - UNIQUE /wolverine/ route
 location ^~ /wolverine/ {
   alias ${WEBROOT}/;
   index index.html;
@@ -75,72 +51,71 @@ location ^~ /wolverine/ {
 NGX
 }
 
-disable_other_wolverine_location_defs(){
-  say "Disable other /wolverine/ location definitions (avoid duplicates)"
-  local f
-  # si un autre fichier définit /wolverine/ en dehors de NOTRE include, on le désactive (rename)
+active_vhost_candidates(){
+  # retourne les fichiers réellement chargés via sites-enabled
+  find /etc/nginx/sites-enabled -maxdepth 1 -type f -o -type l 2>/dev/null | sort -u
+}
+
+inject_into_correct_https_server(){
+  say "Inject include into ACTIVE HTTPS server{} (listen 443 + server_name ${DOMAIN})"
+  local f tmp
+  local injected=0
   while IFS= read -r f; do
-    [ -f "$f" ] || continue
-    [ "$f" = "$INC" ] && continue
-    # seulement si le fichier contient une location /wolverine
-    if grep -qE "location[[:space:]]+(\^~[[:space:]]+)?/wolverine/" "$f"; then
-      say "Disable: $f"
-      mv -f "$f" "${f}.disabled_${TS}" 2>/dev/null || true
+    [ -e "$f" ] || continue
+    # ignore si déjà présent
+    if grep -qF "include ${INC};" "$f" 2>/dev/null; then
+      say "Already has include: $f"
+      injected=1
+      break
     fi
-  done < <(grep -RIlE "location[[:space:]]+(\^~[[:space:]]+)?/wolverine/" /etc/nginx/includes /etc/nginx/snippets 2>/dev/null || true)
-}
+    # doit contenir server_name domain quelque part, sinon skip
+    grep -qE "^[[:space:]]*server_name[[:space:]].*${DOMAIN//./\\.}" "$f" 2>/dev/null || continue
 
-ensure_vhost_enabled(){
-  say "Ensure vhost enabled"
-  [ -f "$VHOST_A" ] || { echo "MISSING: $VHOST_A"; exit 1; }
-  ln -sf "$VHOST_A" "$VHOST_E" || true
-}
+    unfreeze_file "$f"
+    tmp="${f}.tmp_${TS}"
 
-disable_duplicate_enabled_vhosts(){
-  say "Disable other enabled vhosts with server_name fireinners.online (keep fireinners.online-ssl)"
-  local l
-  while IFS= read -r l; do
-    [ -L "$l" ] || continue
-    [ "$l" = "$VHOST_E" ] && continue
-    if grep -qE "^[[:space:]]*server_name[[:space:]].*fireinners\.online" "$l" 2>/dev/null; then
-      mv -f "$l" "${l}.disabled_${TS}" 2>/dev/null || true
-    fi
-  done < <(find /etc/nginx/sites-enabled -maxdepth 1 -type l 2>/dev/null || true)
-}
+    awk -v dom="$DOMAIN" -v inc="  include /etc/nginx/includes/wolverine_routes.inc;" '
+      BEGIN{in_srv=0;depth=0;has_dom=0;has_443=0;done=0}
+      /^[[:space:]]*server[[:space:]]*\{/{
+        in_srv=1; depth=1; has_dom=0; has_443=0
+        print; next
+      }
+      {
+        if(in_srv){
+          if($0 ~ /^[[:space:]]*listen[[:space:]]+443/){ has_443=1 }
+          if($0 ~ /^[[:space:]]*server_name[[:space:]]/ && $0 ~ dom){ has_dom=1; print; next }
+          # track braces
+          n=gsub(/\{/,"{"); depth+=n
+          n=gsub(/\}/,"}"); depth-=n
 
-inject_include_into_https_server(){
-  say "Inject include into HTTPS 443 server{} (deterministic)"
-  unfreeze_file "$VHOST_A"
-  # déjà présent ?
-  grep -qF "include ${INC};" "$VHOST_A" && return 0
-
-  # injecte juste après la 1ère ligne server_name dans le server{} qui écoute 443
-  awk -v inc="  include ${INC};" '
-    BEGIN{in_srv=0;depth=0;is443=0;done=0;seen_sn=0}
-    /^[[:space:]]*server[[:space:]]*\{/{
-      in_srv=1; depth=1; is443=0; seen_sn=0
-      print; next
-    }
-    {
-      if(in_srv){
-        if($0 ~ /listen[[:space:]]+443/){ is443=1 }
-        if(is443 && !seen_sn && $0 ~ /^[[:space:]]*server_name[[:space:]]/){
-          seen_sn=1
+          # juste avant la fermeture du server{}, inject si match
+          if(depth==0){
+            if(has_443 && has_dom && !done){
+              print inc
+              done=1
+            }
+            print
+            in_srv=0
+            next
+          }
           print
-          if(!done){ print inc; done=1 }
           next
         }
-        n=gsub(/\{/,"{"); depth+=n
-        n=gsub(/\}/,"}"); depth-=n
         print
-        if(depth<=0){ in_srv=0; depth=0; is443=0; seen_sn=0 }
-        next
-      }
-      print
-    }' "$VHOST_A" >"$VHOST_A.tmp" && mv -f "$VHOST_A.tmp" "$VHOST_A"
+      }' "$f" >"$tmp" && mv -f "$tmp" "$f"
 
-  # fallback si awk n’a rien injecté
-  grep -qF "include ${INC};" "$VHOST_A" || printf "\n# WVFIX_FALLBACK_%s\ninclude %s;\n" "$TS" "$INC" >>"$VHOST_A"
+    if grep -qF "include /etc/nginx/includes/wolverine_routes.inc;" "$f" 2>/dev/null; then
+      say "Injected into: $f"
+      injected=1
+      break
+    fi
+  done < <(active_vhost_candidates)
+
+  if [ "$injected" -ne 1 ]; then
+    say "FATAL: could not inject into active vhost. Showing active 443 blocks (nginx -T grep):"
+    nginx -T 2>/dev/null | grep -nE "server_name[[:space:]].*${DOMAIN//./\\.}|listen[[:space:]]+443" | head -n 80 || true
+    exit 1
+  fi
 }
 
 nginx_reload(){
@@ -153,31 +128,21 @@ nginx_reload(){
 tests(){
   say "Tests (SNI -> 127.0.0.1)"
   echo "== HTTPS /wolverine/ (HEAD) =="
-  curl -skI --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/" | sed -n '1,15p' || true
+  curl -skI --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/" | sed -n '1,20p' || true
   echo
-  echo "== HTTPS /wolverine/ (body first bytes) =="
+  echo "== HTTPS /wolverine/ (first bytes) =="
   curl -sk --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/" | head -c 250 || true
   echo; echo
-  echo "== Local files =="
-  ls -la "$WEBROOT" | sed -n '1,40p' || true
+  echo "== CONFIRM include loaded (nginx -T) =="
+  nginx -T 2>/dev/null | grep -n "wolverine_routes\.inc" | head -n 20 || true
   echo
-  echo "== grep any remaining /wolverine location definitions =="
-  grep -RIn --color=never -E "location[[:space:]]+(\^~[[:space:]]+)?/wolverine/" /etc/nginx 2>/dev/null | head -n 30 || true
-}
-
-rollback(){
-  say "ROLLBACK nginx (best-effort)"
-  [ -d "$BK/nginx" ] || return 0
-  rm -rf "/etc/nginx.broken_${TS}" 2>/dev/null || true
-  mv /etc/nginx "/etc/nginx.broken_${TS}" 2>/dev/null || true
-  cp -a "$BK/nginx" /etc/nginx 2>/dev/null || true
-  nginx -t || true
-  systemctl restart nginx || true
+  echo "== ACTIVE defs only (NO backups) =="
+  grep -RIn --color=never -E "location[[:space:]]+(\^~[[:space:]]+)?/wolverine/" /etc/nginx/sites-enabled /etc/nginx/includes 2>/dev/null | head -n 40 || true
 }
 
 main(){
   need_root
-  say "MEGA_WV_FIX_404 :: start"
+  say "MEGA_WV_FIX_404_V2 :: start"
   backup_all
 
   say "Unfreeze nginx trees (chattr -i)"
@@ -186,17 +151,11 @@ main(){
   unfreeze_tree "/etc/nginx/includes"
   unfreeze_tree "/etc/nginx/snippets"
 
-  disable_bad_includes
-  disable_duplicate_enabled_vhosts
-
   ensure_webroot
   write_include_unique
-  disable_other_wolverine_location_defs
+  inject_into_correct_https_server
 
-  ensure_vhost_enabled
-  inject_include_into_https_server
-
-  if ! nginx_reload; then rollback; fi
+  nginx_reload
   tests
 
   say "Refreeze (best-effort)"
@@ -209,6 +168,6 @@ main(){
 main
 EOF
 
-sed -i 's/\r$//' /root/MEGA_WV_FIX_404.sh
-chmod +x /root/MEGA_WV_FIX_404.sh
-bash /root/MEGA_WV_FIX_404.sh
+sed -i 's/\r$//' /root/MEGA_WV_FIX_404_V2.sh
+chmod +x /root/MEGA_WV_FIX_404_V2.sh
+bash /root/MEGA_WV_FIX_404_V2.sh
