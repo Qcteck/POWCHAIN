@@ -1,254 +1,222 @@
-bash -lc 'cat >/root/IAQUILA_STACKING_MEGA.sh<<'"'"'BASH'"'"'
+cat >/root/MEGA_AQUILA_STACKING_ONLY.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
+umask 022
+
 TS="$(date +%Y%m%d_%H%M%S)"
-BK="/root/IAQUILA_STACKING_BK_${TS}"
+BK="/root/AQUILA_STACKING_ONLY_BK_${TS}"
 mkdir -p "$BK"
 
-say(){ printf "[%s] %s\n" "$(date +%H:%M:%S)" "$*"; }
+say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 die(){ echo "ERR: $*" >&2; exit 1; }
 
-# ====== CONFIG ======
+# ---- Targets (STACKING ONLY) ----
 DOMAIN="fireinners.online"
-PATH_A="/iaaquila"
-WEBROOT="/var/www/iaaquila"
-APP="/opt/aquila_stacking_react"
-INC="/etc/nginx/includes/iaqulia_routes.inc"
+PATH_APP="/aquilastacking"
+WEBROOT="/var/www/aquilastacking"
+SRC="/opt/aquila_stacking_react"              # if present, we build from here
+INC="/etc/nginx/includes/aquilastacking_routes.inc"
 VHOST_A="/etc/nginx/sites-available/fireinners.online-ssl"
 VHOST_E="/etc/nginx/sites-enabled/fireinners.online-ssl"
 
-# Optional: provide a zip export URL to deploy, e.g.:
-# export ZIP_URL="https://example.com/aquila_build.zip"
-ZIP_URL="${ZIP_URL:-}"
-
-# ====== SAFETY ======
-[ "$(id -u)" -eq 0 ] || die "run as root"
-umask 022
-
-ASKLIB="/opt/fireinners/sentinel/lib/askorupdate.sh"
-if [ -f "$ASKLIB" ]; then
-  # shellcheck disable=SC1090
-  . "$ASKLIB" || true
-fi
+# ---- Helpers ----
+have(){ command -v "$1" >/dev/null 2>&1; }
 
 backup_one(){
   local p="$1"
   [ -e "$p" ] || return 0
-  mkdir -p "$BK/$(dirname "$p")"
-  cp -a "$p" "$BK/$p.bak" 2>/dev/null || true
+  mkdir -p "$BK$(dirname "$p")"
+  cp -a "$p" "$BK$p" 2>/dev/null || true
 }
 
 write_file(){
   local path="$1"; shift
   local tmp; tmp="$(mktemp)"
-  cat >"$tmp"<<EOF
+  cat >"$tmp" <<EOF
 $*
 EOF
-  if declare -F askorupdate_file >/dev/null 2>&1; then
-    ASKORUPDATE_ASK=0 askorupdate_file "$path" "$tmp" "IAQUILA stacking deploy" || { rm -f "$tmp"; die "askorupdate_file failed for $path"; }
-    rm -f "$tmp"
-  else
-    backup_one "$path"
-    chattr -i "$path" 2>/dev/null || true
-    install -m 0644 "$tmp" "$path"
-    rm -f "$tmp"
+  if have sha256sum; then
+    printf '%s  %s\n' "$(sha256sum "$tmp" | awk '{print $1}')" "$(basename "$path")" >"$tmp.sha256" || true
   fi
-}
 
-# ====== 0) SANITIZE /root FILENAMES (fixes weird-name / too-long cascades) ======
-sanitize_root(){
-  say "0) Sanitize /root filenames (only suspicious ones)"
-  python3 - <<'PY'
-import os,re,hashlib
-root="/root"
-safe=re.compile(r'^[A-Za-z0-9._+-]{1,120}$')
-def bad(n):
-    if any(ord(c)<32 or ord(c)==127 for c in n): return True
-    if not safe.match(n): return True
-    return False
-for n in os.listdir(root):
-    p=os.path.join(root,n)
-    if not os.path.isfile(p): continue
-    if not bad(n): continue
-    h=hashlib.sha1(n.encode("utf-8","ignore")).hexdigest()[:10]
-    base=re.sub(r'[^A-Za-z0-9._+-]+','_',n).strip("._-")[:40] or "file"
-    new=f"SUSPECT_{h}_{base}"
-    dst=os.path.join(root,new)
-    i=0
-    while os.path.exists(dst):
-        i+=1
-        dst=os.path.join(root,f"{new}_{i}")
-    os.rename(p,dst)
-    print(f"RENAMED: {n} -> {os.path.basename(dst)}")
-PY
-}
+  mkdir -p "$(dirname "$path")"
+  backup_one "$path"
 
-# ====== 1) PACKAGES ======
-ensure_pkgs(){
-  say "1) Packages"
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update -y >/dev/null
-  apt-get install -y --no-install-recommends curl ca-certificates unzip nginx python3 rsync >/dev/null
-  if ! command -v node >/dev/null 2>&1; then
-    say "1b) Node missing -> install Node.js 20 (deb.nodesource)"
-    curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null
-    apt-get install -y nodejs >/dev/null
-  fi
-  node -v || true
-  npm -v || true
-}
-
-# ====== 2) FETCH/PLACE APP ======
-maybe_pull_zip(){
-  if [ -z "$ZIP_URL" ]; then
-    say "2) No ZIP_URL provided (will build from existing $APP if present)"
-    return 0
-  fi
-  say "2) Download ZIP_URL -> $APP"
-  backup_one "$APP"
-  rm -rf "$APP"
-  mkdir -p "$APP"
-  tmpzip="$BK/aquila.zip"
-  curl -fL "$ZIP_URL" -o "$tmpzip"
-  unzip -q "$tmpzip" -d "$APP"
-  # if zip contains a top folder, flatten
-  if [ -f "$APP/package.json" ]; then
-    :
-  else
-    top="$(find "$APP" -mindepth 1 -maxdepth 1 -type d | head -n 1 || true)"
-    if [ -n "$top" ] && [ -f "$top/package.json" ]; then
-      shopt -s dotglob
-      mv "$top"/* "$APP"/
-      rmdir "$top" || true
-      shopt -u dotglob
+  # Prefer askorupdate if available
+  local ASKLIB="/opt/fireinners/sentinel/lib/askorupdate.sh"
+  if [ -f "$ASKLIB" ]; then
+    # shellcheck disable=SC1090
+    . "$ASKLIB" || true
+    if declare -F askorupdate_file >/dev/null 2>&1; then
+      ASKORUPDATE_ASK=0 askorupdate_file "$path" "$tmp" "AQUILA stacking routes update" || { rm -f "$tmp" "$tmp.sha256"; die "askorupdate_file failed for $path"; }
+      rm -f "$tmp" "$tmp.sha256"
+      return 0
     fi
   fi
+
+  install -m 0644 "$tmp" "$path"
+  rm -f "$tmp" "$tmp.sha256"
 }
 
-# ====== 3) BUILD (VITE BASE MUST MATCH /iaaquila/) ======
-build_react(){
-  [ -d "$APP" ] || die "missing APP dir $APP (set ZIP_URL or create the app there)"
-  cd "$APP"
-  [ -f package.json ] || die "missing $APP/package.json"
-  say "3) npm install"
-  (npm ci --silent || npm install --silent)
-  say "3b) build with base=${PATH_A}/"
-  set +e
-  npm run build -- --base="${PATH_A}/" >/dev/null 2>&1
-  RC=$?
-  if [ $RC -ne 0 ]; then
-    npm run build >/dev/null 2>&1
-    RC=$?
-  fi
-  if [ $RC -ne 0 ]; then
-    npx -y vite build --base="${PATH_A}/" >/dev/null 2>&1
-    RC=$?
-  fi
-  set -e
-  [ $RC -eq 0 ] || die "build failed"
-  if [ -d dist ]; then
-    DIST="$APP/dist"
-  elif [ -d build ]; then
-    DIST="$APP/build"
-  else
-    die "no dist/ or build/ output found"
-  fi
-  [ -f "$DIST/index.html" ] || die "build output missing index.html"
-  echo "$DIST" >"$BK/DIST_PATH.txt"
-  say "3c) build OK: $DIST"
-}
-
-# ====== 4) DEPLOY STATIC ======
-deploy_static(){
-  say "4) Deploy -> $WEBROOT"
-  backup_one "$WEBROOT"
-  mkdir -p "$WEBROOT"
-  local DIST; DIST="$(cat "$BK/DIST_PATH.txt")"
-  rsync -a --delete "$DIST"/ "$WEBROOT"/
-  # Hard disable SW caching that can break buttons after updates
-  rm -f "$WEBROOT/sw.js" "$WEBROOT/service-worker.js" "$WEBROOT/manifest.webmanifest" 2>/dev/null || true
-}
-
-# ====== 5) NGINX ROUTES (NO TOUCH WOLVERINE) ======
-write_nginx_inc(){
-  say "5) Write nginx include $INC"
-  mkdir -p /etc/nginx/includes
-  write_file "$INC" "location = ${PATH_A} { return 301 ${PATH_A}/; }\nlocation ^~ ${PATH_A}/ {\n  alias ${WEBROOT}/;\n  try_files \$uri \$uri/ ${PATH_A}/index.html;\n  add_header Cache-Control \"no-store\" always;\n}\nlocation = ${PATH_A}/sw.js { add_header Cache-Control \"no-store\" always; return 404; }\nlocation = ${PATH_A}/service-worker.js { add_header Cache-Control \"no-store\" always; return 404; }\nlocation = ${PATH_A}/manifest.webmanifest { add_header Cache-Control \"no-store\" always; return 404; }\n"
-}
-
-patch_vhost_one(){
+patch_vhost_include(){
   local f="$1"
   [ -f "$f" ] || return 0
   backup_one "$f"
-  chattr -i "$f" 2>/dev/null || true
+
   python3 - "$f" "$INC" <<'PY'
 import sys,re
 p=sys.argv[1]; inc=sys.argv[2]
 s=open(p,'r',encoding='utf-8',errors='ignore').read()
-line=f"include {inc};"
-if line in s:
-    print("nochange")
-    sys.exit(0)
-# insert include inside each server { ... } block right after first '{' line
-out=[]
-lines=s.splitlines(True)
-i=0
-while i<len(lines):
-    out.append(lines[i])
-    if re.match(r'^\s*server\s*\{', lines[i]):
-        # after server { line, insert include if not already present in next ~30 lines
-        look=''.join(lines[i:i+40])
-        if line not in look:
-            out.append("    "+line+"\n")
-    i+=1
-new=''.join(out)
-open(p,'w',encoding='utf-8').write(new)
+if inc in s:
+  print("nochange")
+  sys.exit(0)
+
+# Insert include inside the first server { ... } block, near other includes if possible
+m=re.search(r'(?s)\bserver\s*\{', s)
+if not m:
+  print("noserver")
+  sys.exit(0)
+i=m.end()
+
+insert=f"\n    include {inc};\n"
+# Try to insert after existing includes in that server block
+srv=s[i:]
+m2=re.search(r'(?s)(\n\s*include\s+[^;]+;\s*)', srv)
+if m2:
+  j=i+m2.end()
+  out=s[:j]+insert+s[j:]
+else:
+  out=s[:i]+insert+s[i:]
+open(p,'w',encoding='utf-8').write(out)
 print("patched")
 PY
 }
 
+nginx_unfreeze(){
+  # Only unfreeze the exact files we touch
+  for f in /etc/nginx/nginx.conf "$VHOST_A" "$VHOST_E" "$INC"; do
+    [ -e "$f" ] || continue
+    chattr -i "$f" 2>/dev/null || true
+  done
+}
+
+nginx_refreeze(){
+  for f in /etc/nginx/nginx.conf "$VHOST_A" "$VHOST_E" "$INC"; do
+    [ -e "$f" ] || continue
+    chattr +i "$f" 2>/dev/null || true
+  done
+}
+
+ensure_packages(){
+  say "1) Packages (curl/unzip/nginx/node/npm if missing)"
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y >/dev/null || true
+  local pkgs=()
+  have curl || pkgs+=("curl")
+  have unzip || pkgs+=("unzip")
+  have nginx || pkgs+=("nginx")
+  have node || pkgs+=("nodejs")
+  have npm  || pkgs+=("npm")
+  if [ "${#pkgs[@]}" -gt 0 ]; then
+    apt-get install -y "${pkgs[@]}"
+  fi
+}
+
+build_or_placeholder(){
+  say "2) Build/Deploy stacking frontend (STACKING ONLY)"
+  mkdir -p "$WEBROOT"
+
+  if [ -d "$SRC" ] && [ -f "$SRC/package.json" ]; then
+    say "   Source detected: $SRC"
+    cd "$SRC"
+
+    if ! have node || ! have npm; then
+      die "node/npm missing"
+    fi
+
+    # Minimal & resilient install/build for vite/react
+    if [ ! -d node_modules ]; then
+      npm ci --no-audit --no-fund 2>/dev/null || npm install --no-audit --no-fund
+    fi
+
+    npm run build
+
+    local OUT=""
+    if [ -d "$SRC/dist" ]; then OUT="$SRC/dist"; fi
+    if [ -z "$OUT" ] && [ -d "$SRC/build" ]; then OUT="$SRC/build"; fi
+    [ -n "$OUT" ] || die "Build OK but dist/build folder not found"
+
+    backup_one "$WEBROOT"
+    mkdir -p "$BK/var/www"
+    tar -C /var/www -czf "$BK/var/www/aquilastacking_before.tgz" "aquilastacking" 2>/dev/null || true
+
+    # Sync (no surprises)
+    rsync -a --delete "$OUT"/ "$WEBROOT"/
+  else
+    say "   No source at $SRC -> installing placeholder page"
+    write_file "$WEBROOT/index.html" "<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>Aquila Stacking</title><style>body{margin:0;font-family:system-ui;background:#0b0f14;color:#e7eef7}main{max-width:900px;margin:40px auto;padding:24px}code{background:#111826;padding:2px 6px;border-radius:6px}</style></head><body><main><h1>Aquila Stacking</h1><p>Frontend deployed at <code>${PATH_APP}/</code>.</p><p>Source not found: <code>${SRC}</code></p></main></body></html>"
+  fi
+
+  chown -R www-data:www-data "$WEBROOT" 2>/dev/null || true
+  find "$WEBROOT" -type d -exec chmod 0755 {} \; 2>/dev/null || true
+  find "$WEBROOT" -type f -exec chmod 0644 {} \; 2>/dev/null || true
+}
+
+write_nginx_routes(){
+  say "3) Write nginx routes include: $INC"
+  write_file "$INC" "##
+## Aquila Stacking routes (STACKING ONLY)
+##
+location ^~ ${PATH_APP}/ {
+  alias ${WEBROOT}/;
+  try_files \$uri \$uri/ ${PATH_APP}/index.html;
+  add_header Cache-Control \"no-store\" always;
+}
+location = ${PATH_APP} { return 308 ${PATH_APP}/; }
+location = ${PATH_APP}/sw.js { add_header Cache-Control \"no-store\" always; return 404; }
+location = ${PATH_APP}/service-worker.js { add_header Cache-Control \"no-store\" always; return 404; }
+"
+}
+
 patch_vhosts(){
-  say "6) Patch vhosts to include routes"
-  patch_vhost_one "$VHOST_A"
-  patch_vhost_one "$VHOST_E"
+  say "4) Patch vhosts to include routes (no duplicates)"
+  nginx_unfreeze
+  patch_vhost_include "$VHOST_A" || true
+  patch_vhost_include "$VHOST_E" || true
 }
 
 reload_and_test(){
-  say "7) nginx -t + reload"
+  say "5) nginx -t + reload"
   nginx -t
   systemctl reload nginx
 
-  say "8) Local tests (must NOT be 404)"
-  echo "-- ${PATH_A}/ --"
-  curl -skI -H "Host: ${DOMAIN}" "https://127.0.0.1${PATH_A}/" | head -n 15 || true
+  say "6) Local tests (must NOT be 404)"
+  echo "--- ${PATH_APP}/ ---"
+  curl -skI -H "Host: ${DOMAIN}" "https://127.0.0.1${PATH_APP}/" | head -n 12 || true
+  echo "--- include hit ---"
+  nginx -T 2>/dev/null | grep -n "aquilastacking_routes" -n | head -n 20 || true
 
-  # verify first JS asset is reachable (if missing, UI buttons won't work)
-  idx="${WEBROOT}/index.html"
-  if [ -f "$idx" ]; then
-    js="$(grep -oE 'src="[^"]+"' "$idx" | head -n 1 | sed -E 's/^src="([^"]+)".*$/\1/')"
-    if [ -n "$js" ]; then
-      echo "-- first asset: $js --"
-      curl -skI -H "Host: ${DOMAIN}" "https://127.0.0.1${js}" | head -n 12 || true
-    fi
-  fi
-
-  say "DONE"
-  say "BK: $BK"
-  say "Open: https://${DOMAIN}${PATH_A}/"
+  nginx_refreeze
 }
 
 main(){
-  sanitize_root
-  ensure_pkgs
-  maybe_pull_zip
-  build_react
-  deploy_static
-  write_nginx_inc
+  [ "$(id -u)" -eq 0 ] || die "run as root"
+  say "BEGIN AQUILA STACKING ONLY @ ${TS}"
+  say "BK: $BK"
+
+  ensure_packages
+  build_or_placeholder
+  write_nginx_routes
   patch_vhosts
   reload_and_test
+
+  say "DONE"
+  say "BK: $BK"
+  say "Open: https://${DOMAIN}${PATH_APP}/"
 }
 
 main
 BASH
-chmod +x /root/IAQUILA_STACKING_MEGA.sh
-bash /root/IAQUILA_STACKING_MEGA.sh'
+
+chmod +x /root/MEGA_AQUILA_STACKING_ONLY.sh
+bash /root/MEGA_AQUILA_STACKING_ONLY.sh
