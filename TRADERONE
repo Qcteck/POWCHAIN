@@ -1,172 +1,161 @@
-cat >/root/MEGA_AQUILA_STACKING_ROUTE_FIX_V2_DETECT.sh<<'BASH'
+cat >/root/MEGA_WOLVERINE_FIX_404_UNFREEZE.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
-umask 027
+
 TS="$(date +%Y%m%d_%H%M%S)"
-say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
-die(){ say "ERR: $*"; exit 1; }
-need(){ command -v "$1" >/dev/null 2>&1 || die "missing: $1"; }
-
-[ "$(id -u)" -eq 0 ] || die "run as root"
-
-need nginx
-need perl
-need systemctl
-need grep
-need awk
-need sed
-
-APP="/opt/aquila_stacking"
-KEYS="${APP}/keys"
-PROG="aquila_stacking"
-
-INC="/etc/nginx/includes/aquila_stacking_routes.inc"
-WEBROOT="/var/www/aquila_stacking"
-HTML="${WEBROOT}/index.html"
-
-BK="/root/AQUILA_STAKING_ROUTE_FIX_V2_BK_${TS}"
+BK="/root/WOLVERINE_FIX404_${TS}"
 mkdir -p "$BK"
 
-# --- backup loaded nginx config dump (for diagnosis) ---
-nginx -T >"$BK/nginx.T.txt" 2>&1 || true
+WEBROOT="/var/www/wolverine"
+INDEX="$WEBROOT/index.html"
 
-# --- webroot ---
-say "1) WEBROOT: $WEBROOT"
-mkdir -p "$WEBROOT"
-chmod 0755 "$WEBROOT"
+NGX_CONF="/etc/nginx/nginx.conf"
+NGX_VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
+NGX_EN="/etc/nginx/sites-enabled/fireinners.online-ssl"
 
-# --- program id (optional) ---
-say "2) Program ID"
-PID="UNKNOWN"
-if command -v solana-keygen >/dev/null 2>&1 && [ -f "$KEYS/${PROG}-keypair.json" ]; then
-  PID="$(solana-keygen pubkey "$KEYS/${PROG}-keypair.json" 2>/dev/null || echo UNKNOWN)"
-fi
+INC_STATIC="/etc/nginx/includes/wolverine_static.inc"
+INC_ROUTES="/etc/nginx/includes/wolverine_routes.inc"
 
-# --- index.html ---
-say "3) index.html"
-cat >"$HTML"<<EOF
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AquilaStacking</title><style>body{font-family:system-ui,Segoe UI,Arial;margin:24px;max-width:980px}code{background:#0b1020;color:#d7e3ff;padding:10px;border-radius:10px;display:block;overflow:auto}h1{margin:0 0 12px}small{opacity:.8}</style></head><body><h1>AquilaStacking</h1><p><b>Program ID:</b><code>${PID}</code></p><p><b>Workspace:</b><code>${APP}</code></p><p><b>URL:</b><code>/aquila_stacking/</code></p><p><small>Redirect: /aquilastacking/ → /aquila_stacking/</small></p></body></html>
-EOF
-chown -R www-data:www-data "$WEBROOT" 2>/dev/null || true
-chmod -R 0755 "$WEBROOT"
+ORIGIN="https://fireinners.online"
 
-# --- include file with locations ---
-say "4) nginx routes include: $INC"
-cp -a "$INC" "$BK/aquila_stacking_routes.inc.bak" 2>/dev/null || true
-chattr -i "$INC" 2>/dev/null || true
-cat >"$INC"<<EOF
-# AQUILA_STACKING_ROUTES_V2
-location = /aquilastacking { return 301 /aquila_stacking/; }
-location ^~ /aquilastacking/ { return 301 /aquila_stacking/; }
-location = /aquila_stacking { return 301 /aquila_stacking/; }
-location ^~ /aquila_stacking/ { alias ${WEBROOT}/; index index.html; try_files \$uri \$uri/ /aquila_stacking/index.html; add_header Cache-Control "no-store" always; }
-# END_AQUILA_STACKING_ROUTES_V2
-EOF
+say(){ printf "\n[%s] %s\n" "$(date +%H:%M:%S)" "$*"; }
+die(){ echo "FATAL: $*" >&2; exit 1; }
 
-# --- find ACTIVE server blocks (fireinners.online) from nginx -T list of loaded files ---
-say "5) detect active vhost file(s) serving fireinners.online"
-mapfile -t FILES < <(awk '/^# configuration file /{print $4}' "$BK/nginx.T.txt" | sed 's/:$//' | sort -u)
-[ "${#FILES[@]}" -gt 0 ] || die "cannot parse nginx -T files"
+has(){ command -v "$1" >/dev/null 2>&1; }
 
-CAND="$BK/candidates.txt"
-: >"$CAND"
-for f in "${FILES[@]}"; do
-  [ -f "$f" ] || continue
-  if grep -qE 'server_name[^;]*\bfireinners\.online\b' "$f"; then
-    echo "$f" >>"$CAND"
-  fi
-done
-[ -s "$CAND" ] || die "no loaded file contains server_name fireinners.online (check $BK/nginx.T.txt)"
-
-say "candidates:"
-nl -ba "$CAND" | sed 's/^/[C] /'
-
-# --- patch: ensure include line INSIDE server blocks that match fireinners.online AND listen 443/80 ---
-say "6) patch candidates: ensure include is inside matching server blocks (80+443)"
-INCLUDE_LINE="include /etc/nginx/includes/aquila_stacking_routes.inc;"
-
-patch_one(){
+immut_flag(){
+  # retourne 0 si immutable (+i), 1 sinon
   local f="$1"
-  cp -a "$f" "$BK/$(basename "$f").bak" 2>/dev/null || true
-  chattr -i "$f" 2>/dev/null || true
+  [ -e "$f" ] || return 1
+  lsattr -d "$f" 2>/dev/null | awk '{print $1}' | grep -q 'i'
+}
 
-  perl -0777 -pe '
-    my $inc = q('"$INCLUDE_LINE"'\n);
-    my $changed = 0;
-    $_ =~ s{
-      server\s*\{
-      (.*?)
-      \}
-    }{
-      my $blk = $&;
-      my $body = $1;
-
-      my $has_name = ($body =~ /server_name\s+[^;]*\bfireinners\.online\b[^;]*;/s) ? 1 : 0;
-      my $has_listen80 = ($body =~ /listen\s+[^;]*\b80\b[^;]*;/s) ? 1 : 0;
-      my $has_listen443 = ($body =~ /listen\s+[^;]*\b443\b[^;]*ssl[^;]*;/s || $body =~ /listen\s+[^;]*\b443\b[^;]*;/s) ? 1 : 0;
-
-      if ($has_name && ($has_listen80 || $has_listen443)) {
-        if ($body !~ /\Q'"$INCLUDE_LINE"'\E/s) {
-          # insert right after server_name line (first occurrence)
-          $blk =~ s/(server_name\s+[^;]*\bfireinners\.online\b[^;]*;\s*\n)/$1# AQUILA_STACKING_INCLUDE_V2\n$inc# END_AQUILA_STACKING_INCLUDE_V2\n/s;
-          $changed = 1;
-        }
-      }
-      $blk
-    }gsex;
-
-    END { }
-  ' -i "$f"
-
-  # If insertion failed because server_name line format differs, do a second deterministic fallback: insert before first location inside matching blocks
-  if ! grep -qF "$INCLUDE_LINE" "$f"; then
-    perl -0777 -pe '
-      my $inc = q('"$INCLUDE_LINE"'\n);
-      $_ =~ s{
-        (server\s*\{)(.*?server_name\s+[^;]*\bfireinners\.online\b[^;]*;)(.*?)(\n\s*location\b)
-      }{
-        my ($a,$b,$c,$d)=($1,$2,$3,$4);
-        if (($a.$b.$c) !~ /\Q'"$INCLUDE_LINE"'\E/s) {
-          "$a$b$c\n  # AQUILA_STACKING_INCLUDE_V2\n  $inc  # END_AQUILA_STACKING_INCLUDE_V2\n$d"
-        } else {
-          "$a$b$c$d"
-        }
-      }gsex;
-    ' -i "$f" || true
+unfreeze(){
+  local f="$1"
+  [ -e "$f" ] || return 0
+  if immut_flag "$f"; then
+    echo "IMMUT=1 $f" >>"$BK/immut.list"
+    chattr -i "$f" 2>/dev/null || true
+  else
+    echo "IMMUT=0 $f" >>"$BK/immut.list"
   fi
 }
 
-while read -r f; do
-  say "patch: $f"
-  patch_one "$f"
-done <"$CAND"
+refreeze_all(){
+  [ -f "$BK/immut.list" ] || return 0
+  awk '$1=="IMMUT=1"{print $2}' "$BK/immut.list" | while read -r f; do
+    [ -e "$f" ] && chattr +i "$f" 2>/dev/null || true
+  done
+}
 
-# --- validate + reload (rollback if fail) ---
-say "7) nginx -t + reload (rollback all candidate files if fail)"
-if ! nginx -t; then
-  say "nginx invalid -> rollback"
-  while read -r f; do
-    b="$BK/$(basename "$f").bak"
-    [ -f "$b" ] && cp -a "$b" "$f" || true
-  done <"$CAND"
-  [ -f "$BK/aquila_stacking_routes.inc.bak" ] && cp -a "$BK/aquila_stacking_routes.inc.bak" "$INC" || true
-  nginx -t || true
-  die "rolled back (see $BK)"
+restore_latest_savepoint_webroot(){
+  local latest=""
+  latest="$(ls -1dt /root/WOLVERINE_SAVEPOINT_* 2>/dev/null | head -n1 || true)"
+  [ -n "$latest" ] || return 0
+
+  if [ -d "$latest/var/www/wolverine" ]; then
+    say "Restore webroot depuis $latest/var/www/wolverine"
+    rm -rf "$WEBROOT" || true
+    mkdir -p "$(dirname "$WEBROOT")"
+    cp -a "$latest/var/www/wolverine" "$WEBROOT"
+    return 0
+  fi
+  if [ -d "$latest/wolverine" ]; then
+    say "Restore webroot depuis $latest/wolverine"
+    rm -rf "$WEBROOT" || true
+    mkdir -p "$(dirname "$WEBROOT")"
+    cp -a "$latest/wolverine" "$WEBROOT"
+    return 0
+  fi
+  return 0
+}
+
+say "0) Savepoint + backup"
+if [ -x /root/WOLVERINE_SAVEPOINT.sh ]; then /root/WOLVERINE_SAVEPOINT.sh || true; fi
+cp -a "$NGX_VHOST" "$BK/fireinners.online-ssl.bak" 2>/dev/null || true
+cp -a "$NGX_CONF"  "$BK/nginx.conf.bak" 2>/dev/null || true
+[ -f "$INC_STATIC" ] && cp -a "$INC_STATIC" "$BK/wolverine_static.inc.bak" || true
+[ -f "$INC_ROUTES" ] && cp -a "$INC_ROUTES" "$BK/wolverine_routes.inc.bak" || true
+[ -f "$INDEX" ] && cp -a "$INDEX" "$BK/index.html.bak" || true
+
+say "1) Unfreeze nginx/vhost/includes (si chattr +i)"
+has lsattr || apt-get update -y && apt-get install -y e2fsprogs >/dev/null 2>&1 || true
+
+unfreeze "$NGX_CONF"
+unfreeze "$NGX_VHOST"
+unfreeze "$NGX_EN"
+unfreeze "/etc/nginx/sites-enabled"
+unfreeze "/etc/nginx/sites-available"
+unfreeze "/etc/nginx/includes"
+for f in /etc/nginx/includes/wolverine*.inc; do [ -e "$f" ] && unfreeze "$f"; done
+
+say "2) Assure webroot + index"
+mkdir -p "$WEBROOT"
+if [ ! -f "$INDEX" ]; then
+  say "index.html manquant -> restore dernier savepoint"
+  restore_latest_savepoint_webroot || true
 fi
+[ -f "$INDEX" ] || die "index.html introuvable: $INDEX"
+
+say "3) Assure vhost activé (sites-enabled)"
+[ -f "$NGX_VHOST" ] || die "Vhost manquant: $NGX_VHOST"
+ln -sf "$NGX_VHOST" "$NGX_EN" || true
+
+say "4) Force include statique /wolverine/ (évite 404)"
+cat >"$INC_STATIC" <<'INC'
+# AUTO-GEN: Wolverine static routes
+location ^~ /wolverine/ {
+  alias /var/www/wolverine/;
+  index index.html;
+  try_files $uri $uri/ /wolverine/index.html;
+  add_header Cache-Control "no-store";
+}
+INC
+
+say "5) Assure que le vhost inclut wolverine_static.inc + wolverine_routes.inc"
+python3 - <<PY
+import re
+p="$NGX_VHOST"
+s=open(p,'r',encoding='utf-8',errors='ignore').read()
+need1="include /etc/nginx/includes/wolverine_static.inc;"
+need2="include /etc/nginx/includes/wolverine_routes.inc;"
+if need1 in s and need2 in s:
+  print("OK includes déjà présents")
+  raise SystemExit(0)
+
+m=re.search(r"server\s*{", s)
+if not m:
+  raise SystemExit("No server block found in vhost")
+i=m.end()
+ins=""
+if need1 not in s: ins += "\n    "+need1+"\n"
+if need2 not in s: ins += "    "+need2+"\n"
+s = s[:i] + ins + s[i:]
+open(p,'w',encoding='utf-8').write(s)
+print("Injected missing includes into first server{}")
+PY
+
+say "6) nginx -t + reload"
+nginx -t
 systemctl reload nginx
 
-# --- local verify (no DNS dependency) ---
-say "8) local verify (curl via --resolve)"
-if command -v curl >/dev/null 2>&1; then
-  set +e
-  curl -skI --resolve fireinners.online:443:127.0.0.1 "https://fireinners.online/aquila_stacking/" | head -n 20
-  curl -sk  --resolve fireinners.online:443:127.0.0.1 "https://fireinners.online/aquila_stacking/" | head -n 5
-  set -e
-fi
+say "7) Refreeze (remet chattr +i si c'était immuté)"
+refreeze_all || true
+
+say "8) Tests HTTP"
+set +e
+echo "== /wolverine/ =="
+curl -sS -o /dev/null -w "HTTP %{http_code}\n" "$ORIGIN/wolverine/" || true
+echo "== /wolverine/index.html =="
+curl -sS -o /dev/null -w "HTTP %{http_code}\n" "$ORIGIN/wolverine/index.html" || true
+echo "== /wolverine/traderone/vault/health =="
+curl -sS -o /dev/null -w "HTTP %{http_code}\n" "$ORIGIN/wolverine/traderone/vault/health" || true
+set -e
 
 say "DONE"
-say "URL: https://fireinners.online/aquila_stacking/"
-say "BK: $BK"
+echo "Backup: $BK"
+echo "Ouvre: $ORIGIN/wolverine/ puis Ctrl+F5"
 BASH
-chmod +x /root/MEGA_AQUILA_STACKING_ROUTE_FIX_V2_DETECT.sh
-bash /root/MEGA_AQUILA_STACKING_ROUTE_FIX_V2_DETECT.sh
+
+chmod +x /root/MEGA_WOLVERINE_FIX_404_UNFREEZE.sh
+bash /root/MEGA_WOLVERINE_FIX_404_UNFREEZE.sh
