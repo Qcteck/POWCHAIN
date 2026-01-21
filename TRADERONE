@@ -1,173 +1,150 @@
-cat >/root/MEGA_WV_FIX_404_V2.sh <<'EOF'
+cat >/root/MEGA_IAQUILA_FIX_404.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 TS="$(date +%Y%m%d_%H%M%S)"
+BK="/root/IAQUILA_FIX_404_${TS}"
+mkdir -p "$BK"
+say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
+
+need(){ command -v "$1" >/dev/null 2>&1 || { echo "ERR missing: $1"; exit 1; }; }
+asroot(){ [ "$(id -u)" = "0" ] || { echo "ERR run as root"; exit 1; }; }
+
+asroot
+need nginx
+need curl
+need python3
+need lsattr
+need chattr
+
+SLUG="iaaquila"
 DOMAIN="fireinners.online"
-WEBROOT="/var/www/wolverine"
-DIST="/opt/fireinners/frontend-react/app/dist/wolverine"
-INC="/etc/nginx/includes/wolverine_routes.inc"
-BK="/root/WV_FIX_V2_${TS}"
-IMM="$BK/immut.list"
+VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
+INC="/etc/nginx/includes/${SLUG}_routes.inc"
+WEB="/var/www/${SLUG}"
+PORT="9688"
 
-say(){ printf "\n[%s] %s\n" "$(date +%H:%M:%S)" "$*"; }
-need_root(){ [ "$(id -u)" -eq 0 ] || { echo "RUN AS ROOT"; exit 1; }; }
+say "== 0) Backup =="
+cp -a "$VHOST" "$BK/$(basename "$VHOST").bak" 2>/dev/null || true
+cp -a "$INC" "$BK/$(basename "$INC").bak" 2>/dev/null || true
+cp -a "$WEB" "$BK/${SLUG}.webroot.bak" 2>/dev/null || true
+nginx -T >"$BK/nginx.T.txt" 2>/dev/null || true
 
-unfreeze_file(){ local f="$1"; [ -e "$f" ] || return 0; command -v lsattr >/dev/null 2>&1 || return 0; command -v chattr >/dev/null 2>&1 || return 0; if lsattr -d "$f" 2>/dev/null | awk '{print $1}' | grep -q 'i'; then echo "$f" >>"$IMM" || true; chattr -i "$f" 2>/dev/null || true; fi; }
-unfreeze_tree(){ local d="$1"; [ -d "$d" ] || return 0; while IFS= read -r -d "" f; do unfreeze_file "$f"; done < <(find "$d" -maxdepth 2 -type f -print0 2>/dev/null || true); }
-refreeze_all(){ [ -s "$IMM" ] || return 0; command -v chattr >/dev/null 2>&1 || return 0; while IFS= read -r f; do [ -e "$f" ] && chattr +i "$f" 2>/dev/null || true; done <"$IMM"; }
+say "== 1) Unfreeze (best-effort) =="
+chattr -i "$VHOST" 2>/dev/null || true
+chattr -i "$INC" 2>/dev/null || true
 
-backup_all(){
-  mkdir -p "$BK"
-  :> "$IMM"
-  say "Backup -> $BK"
-  cp -a /etc/nginx "$BK/nginx" 2>/dev/null || true
-  [ -d "$WEBROOT" ] && cp -a "$WEBROOT" "$BK/webroot" 2>/dev/null || true
-}
-
-ensure_webroot(){
-  say "Ensure WEBROOT: $WEBROOT"
-  mkdir -p "$WEBROOT"
-  if [ -d "$DIST" ]; then
-    say "Sync dist -> webroot"
-    rsync -a --delete "$DIST"/ "$WEBROOT"/
-  fi
-  if [ ! -f "$WEBROOT/index.html" ]; then
-    cat >"$WEBROOT/index.html"<<HTML
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WOLVERINE</title></head><body style="font-family:system-ui;margin:40px"><h1>WOLVERINE</h1><p>WEBROOT OK: /var/www/wolverine</p></body></html>
+say "== 2) Ensure webroot =="
+mkdir -p "$WEB"
+if [ ! -f "$WEB/index.html" ]; then
+cat >"$WEB/index.html" <<'HTML'
+<!doctype html><html lang="fr"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>IA AQUILA</title><style>body{font-family:system-ui,Segoe UI,Roboto,Arial;margin:24px}code{background:#f2f2f2;padding:2px 6px;border-radius:6px}</style><h1>IA AQUILA</h1><p>UI servie via <code>/iaaquila/</code></p><ul><li><a href="/iaaquila/api/health">/iaaquila/api/health</a></li></ul></html>
 HTML
-  fi
+fi
+
+say "== 3) Write routes include (deterministic) =="
+mkdir -p "$(dirname "$INC")"
+cat >"$INC" <<INCFILE
+# ${SLUG} routes (managed)
+location = /${SLUG} { return 301 /${SLUG}/; }
+location ^~ /${SLUG}/ {
+  root /var/www;
+  try_files \$uri \$uri/ /${SLUG}/index.html;
 }
-
-write_include_unique(){
-  say "Write include: $INC"
-  mkdir -p /etc/nginx/includes
-  cat >"$INC"<<NGX
-# WV_FIX_V2_${TS} - UNIQUE /wolverine/ route
-location ^~ /wolverine/ {
-  alias ${WEBROOT}/;
-  index index.html;
-  try_files \$uri \$uri/ /wolverine/index.html;
+location ^~ /${SLUG}/api/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+  proxy_set_header Connection "";
+  proxy_connect_timeout 5s;
+  proxy_send_timeout 60s;
+  proxy_read_timeout 60s;
+  proxy_pass http://127.0.0.1:${PORT}/api/;
 }
-NGX
+location ^~ /${SLUG}/exec/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+  proxy_set_header Connection "";
+  proxy_connect_timeout 5s;
+  proxy_send_timeout 60s;
+  proxy_read_timeout 60s;
+  proxy_pass http://127.0.0.1:${PORT}/exec/;
 }
+INCFILE
 
-active_vhost_candidates(){
-  # retourne les fichiers réellement chargés via sites-enabled
-  find /etc/nginx/sites-enabled -maxdepth 1 -type f -o -type l 2>/dev/null | sort -u
-}
+say "== 4) Inject include into vhost (idempotent) =="
+python3 - <<PY
+import re,sys,os
+vhost="${VHOST}"
+inc="include ${INC};"
+s=open(vhost,"r",encoding="utf-8",errors="ignore").read().splitlines(True)
+if any(inc in ln for ln in s):
+  print("OK include already present"); sys.exit(0)
 
-inject_into_correct_https_server(){
-  say "Inject include into ACTIVE HTTPS server{} (listen 443 + server_name ${DOMAIN})"
-  local f tmp
-  local injected=0
-  while IFS= read -r f; do
-    [ -e "$f" ] || continue
-    # ignore si déjà présent
-    if grep -qF "include ${INC};" "$f" 2>/dev/null; then
-      say "Already has include: $f"
-      injected=1
-      break
-    fi
-    # doit contenir server_name domain quelque part, sinon skip
-    grep -qE "^[[:space:]]*server_name[[:space:]].*${DOMAIN//./\\.}" "$f" 2>/dev/null || continue
+# find server block containing fireinners.online
+# strategy: locate a line with "server_name" and fireinners.online, then walk backwards to nearest "server" line, then forward counting braces to end.
+idx_sn=None
+for i,ln in enumerate(s):
+  if "server_name" in ln and "fireinners.online" in ln:
+    idx_sn=i; break
+if idx_sn is None:
+  print("ERR cannot find server_name fireinners.online in vhost"); sys.exit(2)
 
-    unfreeze_file "$f"
-    tmp="${f}.tmp_${TS}"
+# find start of server block
+start=None
+for j in range(idx_sn, -1, -1):
+  if re.match(r'^\s*server\s*\{', s[j]):
+    start=j; break
+if start is None:
+  print("ERR cannot find server { for that server_name"); sys.exit(3)
 
-    awk -v dom="$DOMAIN" -v inc="  include /etc/nginx/includes/wolverine_routes.inc;" '
-      BEGIN{in_srv=0;depth=0;has_dom=0;has_443=0;done=0}
-      /^[[:space:]]*server[[:space:]]*\{/{
-        in_srv=1; depth=1; has_dom=0; has_443=0
-        print; next
-      }
-      {
-        if(in_srv){
-          if($0 ~ /^[[:space:]]*listen[[:space:]]+443/){ has_443=1 }
-          if($0 ~ /^[[:space:]]*server_name[[:space:]]/ && $0 ~ dom){ has_dom=1; print; next }
-          # track braces
-          n=gsub(/\{/,"{"); depth+=n
-          n=gsub(/\}/,"}"); depth-=n
+brace=0
+end=None
+for k in range(start, len(s)):
+  brace += s[k].count("{")
+  brace -= s[k].count("}")
+  if brace==0 and k>start:
+    end=k; break
+if end is None:
+  print("ERR cannot find end of server block"); sys.exit(4)
 
-          # juste avant la fermeture du server{}, inject si match
-          if(depth==0){
-            if(has_443 && has_dom && !done){
-              print inc
-              done=1
-            }
-            print
-            in_srv=0
-            next
-          }
-          print
-          next
-        }
-        print
-      }' "$f" >"$tmp" && mv -f "$tmp" "$f"
+insert_at=end
+pad="  "
+# try to match indentation of nearby lines
+m=re.match(r'^(\s*)\}', s[end])
+if m: pad=m.group(1)
+s.insert(insert_at, f"{pad}{inc}\n")
+open(vhost,"w",encoding="utf-8").write("".join(s))
+print("OK injected")
+PY
 
-    if grep -qF "include /etc/nginx/includes/wolverine_routes.inc;" "$f" 2>/dev/null; then
-      say "Injected into: $f"
-      injected=1
-      break
-    fi
-  done < <(active_vhost_candidates)
+say "== 5) Nginx test + reload =="
+nginx -t
+systemctl reload nginx
 
-  if [ "$injected" -ne 1 ]; then
-    say "FATAL: could not inject into active vhost. Showing active 443 blocks (nginx -T grep):"
-    nginx -T 2>/dev/null | grep -nE "server_name[[:space:]].*${DOMAIN//./\\.}|listen[[:space:]]+443" | head -n 80 || true
-    exit 1
-  fi
-}
+say "== 6) Smoke tests (local TLS) =="
+CODE1="$(curl -k -sS -o /dev/null -w '%{http_code}' "https://127.0.0.1/${SLUG}/" -H "Host: ${DOMAIN}" || true)"
+CODE2="$(curl -k -sS -o /dev/null -w '%{http_code}' "https://127.0.0.1/${SLUG}/api/health" -H "Host: ${DOMAIN}" || true)"
+say "HTTP /${SLUG}/ => ${CODE1}"
+say "HTTP /${SLUG}/api/health => ${CODE2}"
+if [ "$CODE1" = "404" ]; then
+  say "ERR still 404 on /${SLUG}/ (nginx route not active)"
+  exit 10
+fi
 
-nginx_reload(){
-  say "nginx -t"
-  nginx -t
-  say "reload nginx"
-  systemctl reload nginx || systemctl restart nginx
-}
+say "== 7) Freeze back (chattr +i) + verify =="
+chattr +i "$INC" 2>/dev/null || true
+chattr +i "$VHOST" 2>/dev/null || true
+say "lsattr vhost/inc:"
+lsattr "$VHOST" "$INC" 2>/dev/null || true
 
-tests(){
-  say "Tests (SNI -> 127.0.0.1)"
-  echo "== HTTPS /wolverine/ (HEAD) =="
-  curl -skI --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/" | sed -n '1,20p' || true
-  echo
-  echo "== HTTPS /wolverine/ (first bytes) =="
-  curl -sk --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/" | head -c 250 || true
-  echo; echo
-  echo "== CONFIRM include loaded (nginx -T) =="
-  nginx -T 2>/dev/null | grep -n "wolverine_routes\.inc" | head -n 20 || true
-  echo
-  echo "== ACTIVE defs only (NO backups) =="
-  grep -RIn --color=never -E "location[[:space:]]+(\^~[[:space:]]+)?/wolverine/" /etc/nginx/sites-enabled /etc/nginx/includes 2>/dev/null | head -n 40 || true
-}
-
-main(){
-  need_root
-  say "MEGA_WV_FIX_404_V2 :: start"
-  backup_all
-
-  say "Unfreeze nginx trees (chattr -i)"
-  unfreeze_tree "/etc/nginx/sites-available"
-  unfreeze_tree "/etc/nginx/sites-enabled"
-  unfreeze_tree "/etc/nginx/includes"
-  unfreeze_tree "/etc/nginx/snippets"
-
-  ensure_webroot
-  write_include_unique
-  inject_into_correct_https_server
-
-  nginx_reload
-  tests
-
-  say "Refreeze (best-effort)"
-  refreeze_all
-
-  say "DONE"
-  echo "Backups: $BK"
-  echo "Open: https://${DOMAIN}/wolverine/ puis Ctrl+F5"
-}
-main
-EOF
-
-sed -i 's/\r$//' /root/MEGA_WV_FIX_404_V2.sh
-chmod +x /root/MEGA_WV_FIX_404_V2.sh
-bash /root/MEGA_WV_FIX_404_V2.sh
+say "== DONE =="
+say "Public: https://${DOMAIN}/${SLUG}/"
+say "API:    https://${DOMAIN}/${SLUG}/api/health"
+BASH
+chmod +x /root/MEGA_IAQUILA_FIX_404.sh
+/root/MEGA_IAQUILA_FIX_404.sh
