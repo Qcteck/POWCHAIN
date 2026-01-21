@@ -1,2 +1,155 @@
-curl -i https://fireinners.online/wolverine/vault-api/health
-curl -i -X POST https://fireinners.online/wolverine/vault-api/create -H "content-type: application/json" -d "{}"
+bash -lc 'set -euo pipefail
+rm -f /root/wvf307.sh
+cat >/root/wvf307.sh<<'"'"'BASH'"'"'
+#!/usr/bin/env bash
+set -euo pipefail
+TS="$(date +%Y%m%d_%H%M%S)"
+BK="/root/BK_WVF307_${TS}"
+mkdir -p "$BK"
+
+say(){ printf "[%s] %s\n" "$(date +%H:%M:%S)" "$*"; }
+
+NGXCONF="/etc/nginx/nginx.conf"
+VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
+VHOST_EN="/etc/nginx/sites-enabled/fireinners.online-ssl"
+INCDIR="/etc/nginx/includes"
+
+INC_ROUTES="${INCDIR}/wolverine_routes.inc"
+INC_STATIC="${INCDIR}/wolverine_static.inc"
+
+WEBROOT="/var/www/wolverine"
+VAULT_HOST="127.0.0.1"
+VAULT_PORT="8787"
+
+DRPC_URL="https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac"
+
+have(){ command -v "$1" >/dev/null 2>&1; }
+bk(){ [ -e "$1" ] && cp -a "$1" "$BK/$(basename "$1").bk" 2>/dev/null || true; }
+
+IMLIST="$BK/immutable.list"; : >"$IMLIST"
+unfreeze(){
+  local f="$1"; [ -e "$f" ] || return 0
+  if lsattr -d "$f" 2>/dev/null | grep -q "i"; then
+    echo "$f" >>"$IMLIST"
+    chattr -i "$f" 2>/dev/null || true
+  fi
+}
+refreeze(){
+  [ -s "$IMLIST" ] || return 0
+  while IFS= read -r f; do [ -e "$f" ] && chattr +i "$f" 2>/dev/null || true; done <"$IMLIST"
+}
+
+inject_in_server(){
+  local f="$1" line="$2"
+  grep -F "$line" "$f" >/dev/null 2>&1 && return 0
+  bk "$f"; unfreeze "$f"
+  awk -v ins="$line" '
+    BEGIN{done=0}
+    {print}
+    !done && $0 ~ /^[[:space:]]*server[[:space:]]*\{/ { print "    " ins; done=1 }
+  ' "$f" >"$f.tmp.$$" && mv "$f.tmp.$$" "$f"
+}
+
+say "0) Preflight"
+have nginx || { apt-get update -y; apt-get install -y nginx; }
+have curl  || { apt-get update -y; apt-get install -y curl; }
+
+say "1) Unfreeze nginx core files"
+unfreeze "$NGXCONF"
+unfreeze "$VHOST"
+unfreeze "$VHOST_EN"
+[ -d "$INCDIR" ] && for f in "$INCDIR"/*.inc 2>/dev/null; do unfreeze "$f" || true; done
+
+say "2) Ensure webroot /wolverine exists"
+mkdir -p "$WEBROOT"
+[ -f "$WEBROOT/index.html" ] || echo "<!doctype html><meta charset=utf-8><title>WOLVERINE</title>" >"$WEBROOT/index.html"
+
+say "3) HARD FIX: disable any redirect/rewrite for wolverine vault paths in ALL nginx files"
+# On commente les lignes de redirect/rewrite/return 30x qui touchent wolverine + vault
+while IFS= read -r f; do
+  [ -f "$f" ] || continue
+  if grep -nE "(wolverine/.*vault|vault-api|traderone/vault)" "$f" >/dev/null 2>&1; then
+    if grep -nE "^[[:space:]]*(return[[:space:]]+30[12378]|rewrite[[:space:]].*30[12378])" "$f" | grep -E "(wolverine/.*vault|vault-api|traderone/vault)" >/dev/null 2>&1; then
+      bk "$f"; unfreeze "$f"
+      perl -0777 -pe "s/^([ \\t]*(?:return[ \\t]+30[12378].*|rewrite[ \\t]+.*30[12378].*)\$)/# AUTOFIX_${TS} disabled: \\1/mg" -i "$f" || true
+      say "  disabled redirect/rewrite in: $f"
+    fi
+  fi
+done < <(find /etc/nginx -type f \( -name "*.conf" -o -name "*.inc" \) 2>/dev/null)
+
+say "4) Rewrite authoritative routes include (NO REDIRECTS, JSON only)"
+mkdir -p "$INCDIR"
+bk "$INC_ROUTES"
+cat >"$INC_ROUTES"<<EOF
+# AUTOGEN_${TS} - Wolverine routes authoritative (NO redirects)
+
+set \$vault_upstream http://${VAULT_HOST}:${VAULT_PORT};
+
+# Canonical Vault API (must return JSON, never redirect)
+location = /wolverine/vault-api/health { proxy_pass \$vault_upstream/health; }
+location = /wolverine/vault-api/create { proxy_pass \$vault_upstream/create; }
+
+# Compatibility aliases (also proxy, never redirect)
+location = /wolverine/vault/health { proxy_pass \$vault_upstream/health; }
+location = /wolverine/vault/create { proxy_pass \$vault_upstream/create; }
+location = /wolverine/traderone/vault/health { proxy_pass \$vault_upstream/health; }
+location = /wolverine/traderone/vault/create { proxy_pass \$vault_upstream/create; }
+location = /wolverine/vault/api/health { proxy_pass \$vault_upstream/health; }
+location = /wolverine/vault/api/create { proxy_pass \$vault_upstream/create; }
+
+proxy_http_version 1.1;
+proxy_set_header Host \$host;
+proxy_set_header X-Real-IP \$remote_addr;
+proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+
+# Solana RPC same-origin -> DRPC (POST JSON)
+location = /wolverine/solana-rpc {
+  resolver 1.1.1.1 8.8.8.8 valid=300s;
+  proxy_ssl_server_name on;
+  proxy_set_header Content-Type "application/json";
+  proxy_pass ${DRPC_URL};
+}
+EOF
+
+say "5) Ensure static include exists (avoid 404)"
+bk "$INC_STATIC"
+cat >"$INC_STATIC"<<EOF
+# AUTOGEN_${TS} - Wolverine static
+location ^~ /wolverine/ {
+  alias ${WEBROOT}/;
+  index index.html;
+  try_files \$uri \$uri/ /wolverine/index.html;
+}
+EOF
+
+say "6) Ensure vhost enabled + includes inside FIRST server{}"
+ln -sf "$VHOST" "$VHOST_EN" || true
+inject_in_server "$VHOST" "include ${INC_STATIC};"
+inject_in_server "$VHOST" "include ${INC_ROUTES};"
+
+say "7) nginx -t + reload"
+nginx -t
+systemctl reload nginx
+
+say "8) Tests (NO 307 expected)"
+echo "== vault-api health via nginx (Host) =="
+curl -sS -i -H "Host: fireinners.online" "http://127.0.0.1/wolverine/vault-api/health" | sed -n "1,20p"
+echo
+echo "== vault-api create via nginx (Host) =="
+curl -sS -i -H "Host: fireinners.online" -X POST "http://127.0.0.1/wolverine/vault-api/create" -H "content-type: application/json" -d "{}" | sed -n "1,40p"
+echo
+echo "== If you still see 307, show: grep results below =="
+grep -RIn --color=never -E "return[[:space:]]+30|rewrite[[:space:]].*30" /etc/nginx | grep -E "(wolverine/.*vault|vault-api|traderone/vault)" || true
+
+say "9) Refreeze immutables (if any)"
+refreeze
+
+say "DONE"
+echo "Open: https://fireinners.online/wolverine/ then Ctrl+F5"
+echo "Backups: $BK"
+BASH
+
+sed -i "s/\r$//" /root/wvf307.sh
+chmod +x /root/wvf307.sh
+bash /root/wvf307.sh
+'
