@@ -1,175 +1,116 @@
-cat >/root/MEGA_BUNDLER_FIX_404.sh <<'BASH'
+cat >/root/MEGA_BUNDLER_API_FORCE_9797.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 umask 022
-
 TS="$(date +%Y%m%d_%H%M%S)"
-BK="/root/BUNDLER_FIX404_${TS}"
+BK="/root/BUNDLER_API_FORCE_${TS}"
 mkdir -p "$BK"
 
 say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 die(){ say "ERROR: $*"; exit 1; }
-need_root(){ [ "$(id -u)" -eq 0 ] || die "run as root"; }
-
-need_root
+[ "$(id -u)" -eq 0 ] || die "run as root"
 
 DOMAIN="fireinners.online"
-INC_DIR="/etc/nginx/includes"
-INC_BUNDLER="${INC_DIR}/bundler_routes.inc"
-
-WEBROOT_BUNDLER="/var/www/bundler"
-DATA_DIR="/opt/bundler_data"
-
 API_DIR="/opt/bundler_api"
-API_HOST="127.0.0.1"
 API_PORT="9797"
+API_HOST="127.0.0.1"
 API_SVC="/etc/systemd/system/bundler-api.service"
-
-NGINX_CONF="/etc/nginx/nginx.conf"
 
 unlock(){ chattr -i "$1" 2>/dev/null || true; }
 lockit(){ chattr +i "$1" 2>/dev/null || true; }
 
-say "backup: nginx conf tree + include + service (best-effort)"
-tar -C /etc/nginx -czf "$BK/etc_nginx.tgz" . >/dev/null 2>&1 || true
-cp -a "$INC_BUNDLER" "$BK/bundler_routes.inc.bak" 2>/dev/null || true
+say "backup: $BK"
+tar -C /opt -czf "$BK/opt_bundler_api.tgz" bundler_api >/dev/null 2>&1 || true
 cp -a "$API_SVC" "$BK/bundler-api.service.bak" 2>/dev/null || true
+tar -C /etc/nginx -czf "$BK/etc_nginx.tgz" . >/dev/null 2>&1 || true
 
-say "ensure dirs"
-mkdir -p "$INC_DIR" "$WEBROOT_BUNDLER" "$DATA_DIR"
-chmod 755 "$WEBROOT_BUNDLER" "$DATA_DIR" || true
-
-# Ensure at least an index exists (prevents empty alias confusion)
-if [ ! -f "$WEBROOT_BUNDLER/index.html" ]; then
-  cat >"$WEBROOT_BUNDLER/index.html" <<'HTML'
-<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Bundler</title><body style="font-family:system-ui;background:#0b0f14;color:#e7eef7;margin:0;padding:24px"><h2>Bundler</h2><p>UI build not published yet (index placeholder).</p></body>
-HTML
-  chmod 644 "$WEBROOT_BUNDLER/index.html" || true
-fi
-
-say "nginx: write/force include $INC_BUNDLER"
-unlock "$INC_BUNDLER" || true
-cat >"$INC_BUNDLER" <<EOF
-# Bundler UI + API (forced $TS)
-# Redirects (fix /bundler without trailing slash)
-location = /bundler { return 301 /bundler/; }
-location = /bundler/api { return 301 /bundler/api/; }
-location = /bundler/data { return 301 /bundler/data/; }
-
-location ^~ /bundler/api/ {
-  proxy_pass http://$API_HOST:$API_PORT/;
-  proxy_http_version 1.1;
-  proxy_set_header Host \$host;
-  proxy_set_header X-Real-IP \$remote_addr;
-  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto \$scheme;
-}
-location ^~ /bundler/data/ {
-  alias $DATA_DIR/;
-  add_header Cache-Control "no-store" always;
-  try_files \$uri =404;
-}
-location ^~ /bundler/ {
-  alias $WEBROOT_BUNDLER/;
-  try_files \$uri \$uri/ /bundler/index.html;
-}
-EOF
-chmod 644 "$INC_BUNDLER" || true
-
-say "nginx: patch all vhosts containing server_name $DOMAIN to include bundler_routes.inc"
-patch_file(){
-  local f="$1"
-  [ -f "$f" ] || return 0
-  grep -qE "server_name[^;]*\b${DOMAIN//./\\.}\b" "$f" || return 0
-
-  # If already present anywhere, keep
-  if grep -qF "/etc/nginx/includes/bundler_routes.inc" "$f"; then
-    say "nginx: include already present in $f"
-    return 0
-  fi
-
-  unlock "$f" || true
-  cp -a "$f" "$BK/$(echo "$f" | sed 's#/#__#g').bak" 2>/dev/null || true
-
-  # Insert include just after the server_name line inside the matching server block
-  awk -v dom="$DOMAIN" -v inc="  include /etc/nginx/includes/bundler_routes.inc;" '
-    function countc(s,c,   i,n){ n=0; for(i=1;i<=length(s);i++) if(substr(s,i,1)==c) n++; return n }
-    BEGIN{inS=0;depth=0;hasDom=0;hasInc=0;inserted=0}
-    {
-      line=$0
-      # detect server start
-      if(!inS && line ~ /^[[:space:]]*server[[:space:]]*\{/){
-        inS=1; depth=1; hasDom=0; hasInc=0; inserted=0
-        print line
-        next
-      }
-      if(inS){
-        if(index(line,"/etc/nginx/includes/bundler_routes.inc")>0){ hasInc=1 }
-        if(line ~ /server_name/ && index(line,dom)>0){ hasDom=1 }
-        print line
-        if(hasDom && !hasInc && !inserted && line ~ /server_name/){
-          print inc
-          inserted=1
-          hasInc=1
-        }
-        depth += countc(line,"{") - countc(line,"}")
-        if(depth<=0){ inS=0; depth=0; hasDom=0; hasInc=0; inserted=0 }
-        next
-      }
-      print line
-    }
-  ' "$f" >"$BK/tmp.ngx" && cat "$BK/tmp.ngx" >"$f" && rm -f "$BK/tmp.ngx"
-
-  say "nginx: patched $f"
-}
-
-# Candidate config files (sites-enabled first matters most)
-mapfile -t CANDS < <( (ls -1 /etc/nginx/sites-enabled/* 2>/dev/null || true; ls -1 /etc/nginx/sites-available/* 2>/dev/null || true; ls -1 /etc/nginx/conf.d/*.conf 2>/dev/null || true) | awk '!seen[$0]++' )
-for f in "${CANDS[@]}"; do patch_file "$f"; done
-
-say "nginx: show matching server blocks (nginx -T extract)"
-nginx -T 2>&1 | awk -v dom="$DOMAIN" '
-  /^# configuration file /{file=$4; sub(":$","",file)}
-  /server_name/ && index($0,dom)>0 {print file ":" NR " " $0}
-' | tee "$BK/nginx_servers.txt" >/dev/null || true
-
-say "api: verify service listening (bundler-api)"
-if systemctl list-unit-files | grep -q '^bundler-api\.service'; then
-  systemctl restart bundler-api >/dev/null 2>&1 || true
-  systemctl is-active --quiet bundler-api && say "bundler-api: active" || say "bundler-api: not active"
+say "node: ensure >= 20.18.x (some @solana packages require >=20.18)"
+need_upgrade=0
+if command -v node >/dev/null 2>&1; then
+  v="$(node -v | tr -d 'v' || true)"
+  maj="${v%%.*}"; rest="${v#*.}"; min="${rest%%.*}"
+  if [ "${maj:-0}" -lt 20 ] || { [ "${maj:-0}" -eq 20 ] && [ "${min:-0}" -lt 18 ]; }; then need_upgrade=1; fi
 else
-  say "bundler-api: unit not found (expected if API not installed)"
+  need_upgrade=1
 fi
+if [ "$need_upgrade" -eq 1 ]; then
+  say "node: upgrading via NodeSource 20.x"
+  apt-get update -y >/dev/null
+  apt-get install -y ca-certificates curl gnupg >/dev/null
+  curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null
+  apt-get install -y nodejs >/dev/null
+fi
+node -v || die "node missing"
+npm -v || die "npm missing"
 
-say "tests: local api health"
-curl -fsS "http://$API_HOST:$API_PORT/health" | head -c 200; echo || say "WARN: local api not reachable on $API_HOST:$API_PORT"
+say "api: force minimal stable API on $API_HOST:$API_PORT"
+mkdir -p "$API_DIR"
+cd "$API_DIR"
 
-say "nginx: test + reload"
-unlock "$NGINX_CONF" || true
-nginx -t >/dev/null
-systemctl reload nginx >/dev/null
-lockit "$NGINX_CONF" || true
+# Keep prior files (already backed up) then force clean minimal runtime
+rm -rf node_modules package-lock.json >/dev/null 2>&1 || true
 
-# Re-lock edited files (best-effort)
-lockit "$INC_BUNDLER" || true
-for f in "${CANDS[@]}"; do [ -f "$f" ] && lockit "$f" || true; done
+cat >package.json <<'JSON'
+{"name":"bundler-api","version":"1.0.0","private":true,"main":"server.js","type":"commonjs","scripts":{"start":"node server.js"},"dependencies":{"express":"^4.19.2"}}
+JSON
 
-say "tests: ORIGIN bypass cloudflare (connect to nginx locally with SNI=$DOMAIN)"
-curl -skI --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/bundler/" | head -n 12 | tr -d '\r' || true
+cat >server.js <<'JS'
+const express=require("express");
+const app=express();
+app.disable("x-powered-by");
+app.get("/health",(req,res)=>res.json({ok:true,ts:new Date().toISOString()}));
+app.get("/",(req,res)=>res.type("text/plain").send("bundler-api ok\n"));
+const HOST=process.env.HOST||"127.0.0.1";
+const PORT=parseInt(process.env.PORT||"9797",10);
+app.listen(PORT,HOST,()=>console.log("bundler-api listening",HOST,PORT));
+JS
+
+npm install --omit=dev >/dev/null
+
+say "systemd: write service"
+unlock "$API_SVC" || true
+cat >"$API_SVC" <<EOF
+[Unit]
+Description=Bundler API (forced minimal stable)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=$API_DIR
+Environment=HOST=$API_HOST
+Environment=PORT=$API_PORT
+ExecStart=/usr/bin/node $API_DIR/server.js
+Restart=always
+RestartSec=2
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+chmod 644 "$API_SVC"
+
+systemctl daemon-reload
+systemctl enable --now bundler-api >/dev/null 2>&1 || true
+systemctl restart bundler-api >/dev/null 2>&1 || true
+
+say "diag: status + last logs"
+systemctl is-active --quiet bundler-api && say "bundler-api: active" || say "bundler-api: NOT active"
+journalctl -u bundler-api --no-pager -n 40 || true
+
+say "diag: port listening"
+ss -lntp | grep -E "(:$API_PORT\b)" || true
+
+say "test: local curl"
+curl -fsS "http://$API_HOST:$API_PORT/health" || true
+echo
+
+say "test: origin via nginx (bypass cloudflare)"
 curl -skI --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/bundler/api/health" | head -n 12 | tr -d '\r' || true
-
-# If we can detect public IPv4, test with it too
-PUBIP="$(ip -4 -o addr show scope global | awk '{print $4}' | cut -d/ -f1 | head -n1 || true)"
-if [ -n "${PUBIP:-}" ]; then
-  say "tests: ORIGIN via public IP (still bypasses cloudflare)"
-  curl -skI --resolve "$DOMAIN:443:$PUBIP" "https://$DOMAIN/bundler/" | head -n 12 | tr -d '\r' || true
-  curl -skI --resolve "$DOMAIN:443:$PUBIP" "https://$DOMAIN/bundler/api/health" | head -n 12 | tr -d '\r' || true
-fi
+curl -skI --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/bundler/" | head -n 12 | tr -d '\r' || true
 
 say "DONE"
 say "BACKUP: $BK"
-say "EXPECT: https://$DOMAIN/bundler/ should return 200 on origin tests above"
 BASH
 
-chmod +x /root/MEGA_BUNDLER_FIX_404.sh
-/root/MEGA_BUNDLER_FIX_404.sh
+chmod +x /root/MEGA_BUNDLER_API_FORCE_9797.sh
+/root/MEGA_BUNDLER_API_FORCE_9797.sh
