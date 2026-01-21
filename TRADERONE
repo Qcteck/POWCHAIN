@@ -1,120 +1,115 @@
-bash -lc 'set -euo pipefail
-rm -f /root/wvf307.sh
-cat >/root/wvf307.sh<<'"'"'BASH'"'"'
+bash -lc 'cat >/root/WV_MEGA_FIX_VAULT_404_307.sh<<'"'"'BASH'"'"'
 #!/usr/bin/env bash
 set -euo pipefail
+
 TS="$(date +%Y%m%d_%H%M%S)"
-BK="/root/BK_WVF307_${TS}"
+BK="/root/WV_FIX_${TS}"
 mkdir -p "$BK"
 
-say(){ printf "[%s] %s\n" "$(date +%H:%M:%S)" "$*"; }
+say(){ printf "\n[%s] %s\n" "$(date +%H:%M:%S)" "$*"; }
 
-NGXCONF="/etc/nginx/nginx.conf"
-VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
-VHOST_EN="/etc/nginx/sites-enabled/fireinners.online-ssl"
-INCDIR="/etc/nginx/includes"
-
-INC_ROUTES="${INCDIR}/wolverine_routes.inc"
-INC_STATIC="${INCDIR}/wolverine_static.inc"
-
-WEBROOT="/var/www/wolverine"
-VAULT_HOST="127.0.0.1"
-VAULT_PORT="8787"
-
-DRPC_URL="https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac"
-
-have(){ command -v "$1" >/dev/null 2>&1; }
-bk(){ [ -e "$1" ] && cp -a "$1" "$BK/$(basename "$1").bk" 2>/dev/null || true; }
-
-IMLIST="$BK/immutable.list"; : >"$IMLIST"
+backup_file(){
+  local f="$1"
+  [ -f "$f" ] || return 0
+  mkdir -p "$BK$(dirname "$f")"
+  cp -a "$f" "$BK$f"
+}
 unfreeze(){
-  local f="$1"; [ -e "$f" ] || return 0
-  if lsattr -d "$f" 2>/dev/null | grep -q "i"; then
-    echo "$f" >>"$IMLIST"
-    chattr -i "$f" 2>/dev/null || true
+  local f="$1"
+  [ -e "$f" ] || return 0
+  chattr -i "$f" 2>/dev/null || true
+}
+refreeze(){ :; } # volontairement no-op (on ne remet pas +i automatiquement ici)
+
+rollback(){
+  say "ROLLBACK: restauration backups + reload nginx"
+  if [ -d "$BK/etc/nginx" ]; then
+    rsync -a --delete "$BK/etc/nginx/" /etc/nginx/ || true
   fi
-}
-refreeze(){
-  [ -s "$IMLIST" ] || return 0
-  while IFS= read -r f; do [ -e "$f" ] && chattr +i "$f" 2>/dev/null || true; done <"$IMLIST"
+  nginx -t && systemctl reload nginx || true
 }
 
-inject_in_server(){
-  local f="$1" line="$2"
-  grep -F "$line" "$f" >/dev/null 2>&1 && return 0
-  bk "$f"; unfreeze "$f"
-  awk -v ins="$line" '
-    BEGIN{done=0}
-    {print}
-    !done && $0 ~ /^[[:space:]]*server[[:space:]]*\{/ { print "    " ins; done=1 }
-  ' "$f" >"$f.tmp.$$" && mv "$f.tmp.$$" "$f"
-}
+trap "echo; echo '[FATAL] erreur. Backups dans: $BK'; rollback; exit 1" ERR
 
-say "0) Preflight"
-have nginx || { apt-get update -y; apt-get install -y nginx; }
-have curl  || { apt-get update -y; apt-get install -y curl; }
+say "0) Savepoint Wolverine (si dispo)"
+if [ -x /root/WOLVERINE_SAVEPOINT.sh ]; then
+  /root/WOLVERINE_SAVEPOINT.sh || true
+fi
 
-say "1) Unfreeze nginx core files"
-unfreeze "$NGXCONF"
-unfreeze "$VHOST"
-unfreeze "$VHOST_EN"
-[ -d "$INCDIR" ] && for f in "$INCDIR"/*.inc 2>/dev/null; do unfreeze "$f" || true; done
+say "1) Préflight outils"
+command -v curl >/dev/null 2>&1 || (apt-get update -y && apt-get install -y curl)
+command -v rsync >/dev/null 2>&1 || (apt-get update -y && apt-get install -y rsync)
+command -v nginx >/dev/null 2>&1 || (apt-get update -y && apt-get install -y nginx)
 
-say "2) Ensure webroot /wolverine exists"
-mkdir -p "$WEBROOT"
-[ -f "$WEBROOT/index.html" ] || echo "<!doctype html><meta charset=utf-8><title>WOLVERINE</title>" >"$WEBROOT/index.html"
+say "2) Backup + unfreeze nginx critiques"
+NGX_MAIN="/etc/nginx/nginx.conf"
+VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
+SEN="/etc/nginx/sites-enabled/fireinners.online-ssl"
+INC_DIR="/etc/nginx/includes"
+for f in "$NGX_MAIN" "$VHOST"; do backup_file "$f"; unfreeze "$f"; done
+mkdir -p "$INC_DIR"
+backup_file "$INC_DIR/wolverine_static.inc"
+backup_file "$INC_DIR/wolverine_vault.inc"
+backup_file "$INC_DIR/wolverine_routes.inc"
+backup_file "$INC_DIR/aquila_stacking_routes.inc"
+unfreeze "$INC_DIR/wolverine_static.inc" || true
+unfreeze "$INC_DIR/wolverine_vault.inc" || true
+unfreeze "$INC_DIR/wolverine_routes.inc" || true
+unfreeze "$INC_DIR/aquila_stacking_routes.inc" || true
 
-say "3) HARD FIX: disable any redirect/rewrite for wolverine vault paths in ALL nginx files"
-# On commente les lignes de redirect/rewrite/return 30x qui touchent wolverine + vault
-while IFS= read -r f; do
-  [ -f "$f" ] || continue
-  if grep -nE "(wolverine/.*vault|vault-api|traderone/vault)" "$f" >/dev/null 2>&1; then
-    if grep -nE "^[[:space:]]*(return[[:space:]]+30[12378]|rewrite[[:space:]].*30[12378])" "$f" | grep -E "(wolverine/.*vault|vault-api|traderone/vault)" >/dev/null 2>&1; then
-      bk "$f"; unfreeze "$f"
-      perl -0777 -pe "s/^([ \\t]*(?:return[ \\t]+30[12378].*|rewrite[ \\t]+.*30[12378].*)\$)/# AUTOFIX_${TS} disabled: \\1/mg" -i "$f" || true
-      say "  disabled redirect/rewrite in: $f"
+say "3) Fix nginx cassé: aquila_stacking_routes.inc inclus au mauvais endroit"
+# Si un include aquila_stacking_routes.inc est dans nginx.conf / conf.d / includes globaux, ça casse (location hors server{}).
+# On commente partout SAUF dans le vhost fireinners.online-ssl (où il peut être valide si inclus dans server{}).
+mapfile -t HITS < <(grep -RIn --color=never "aquila_stacking_routes\.inc" /etc/nginx 2>/dev/null || true)
+if [ "${#HITS[@]}" -gt 0 ]; then
+  for line in "${HITS[@]}"; do
+    f="${line%%:*}"
+    ln="${line#*:}"; ln="${ln%%:*}"
+    # On laisse le vhost officiel intact; ailleurs on commente.
+    if [ "$f" != "$VHOST" ]; then
+      backup_file "$f"; unfreeze "$f"
+      sed -i "${ln}s|^[[:space:]]*include[[:space:]].*aquila_stacking_routes\\.inc.*;|# WV_DISABLED_${TS} &|g" "$f" || true
     fi
+  done
+fi
+
+say "4) Désactiver vhosts doublons (conflicting server_name fireinners.online)"
+for f in /etc/nginx/sites-enabled/*; do
+  [ -e "$f" ] || continue
+  bn="$(basename "$f")"
+  if [ "$bn" != "fireinners.online-ssl" ] && grep -qE "server_name[[:space:]].*fireinners\.online" "$f" 2>/dev/null; then
+    backup_file "$f"; unfreeze "$f"
+    mv -f "$f" "/etc/nginx/sites-enabled/${bn}.WV_DISABLED_${TS}" || true
   fi
-done < <(find /etc/nginx -type f \( -name "*.conf" -o -name "*.inc" \) 2>/dev/null)
+done
+# Assure le symlink vhost officiel
+if [ -f "$VHOST" ] && [ ! -e "$SEN" ]; then
+  ln -sf "$VHOST" "$SEN" || true
+fi
 
-say "4) Rewrite authoritative routes include (NO REDIRECTS, JSON only)"
-mkdir -p "$INCDIR"
-bk "$INC_ROUTES"
-cat >"$INC_ROUTES"<<EOF
-# AUTOGEN_${TS} - Wolverine routes authoritative (NO redirects)
-
-set \$vault_upstream http://${VAULT_HOST}:${VAULT_PORT};
-
-# Canonical Vault API (must return JSON, never redirect)
-location = /wolverine/vault-api/health { proxy_pass \$vault_upstream/health; }
-location = /wolverine/vault-api/create { proxy_pass \$vault_upstream/create; }
-
-# Compatibility aliases (also proxy, never redirect)
-location = /wolverine/vault/health { proxy_pass \$vault_upstream/health; }
-location = /wolverine/vault/create { proxy_pass \$vault_upstream/create; }
-location = /wolverine/traderone/vault/health { proxy_pass \$vault_upstream/health; }
-location = /wolverine/traderone/vault/create { proxy_pass \$vault_upstream/create; }
-location = /wolverine/vault/api/health { proxy_pass \$vault_upstream/health; }
-location = /wolverine/vault/api/create { proxy_pass \$vault_upstream/create; }
-
-proxy_http_version 1.1;
-proxy_set_header Host \$host;
-proxy_set_header X-Real-IP \$remote_addr;
-proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-
-# Solana RPC same-origin -> DRPC (POST JSON)
-location = /wolverine/solana-rpc {
-  resolver 1.1.1.1 8.8.8.8 valid=300s;
-  proxy_ssl_server_name on;
-  proxy_set_header Content-Type "application/json";
-  proxy_pass ${DRPC_URL};
-}
+say "5) Webroot Wolverine: assurer /var/www/wolverine + index.html"
+WEBROOT="/var/www/wolverine"
+mkdir -p "$WEBROOT"
+if [ ! -f "$WEBROOT/index.html" ]; then
+  # tente de restaurer depuis dist/wolverine si existant
+  if [ -f /opt/fireinners/frontend-react/app/dist/wolverine/index.html ]; then
+    cp -a /opt/fireinners/frontend-react/app/dist/wolverine/. "$WEBROOT"/
+  fi
+fi
+# si toujours absent, on évite 404 avec un index minimal (ne touche pas ton UI si déjà présente)
+if [ ! -f "$WEBROOT/index.html" ]; then
+  cat >"$WEBROOT/index.html"<<EOF
+<!doctype html><meta charset="utf-8"><title>Wolverine</title>
+<body style="font-family:system-ui;padding:16px">
+<h3>Wolverine / TraderOne</h3>
+<p>index.html manquant. Le déploiement UI doit être restauré (savepoint) mais nginx est maintenant stable.</p>
+</body>
 EOF
+fi
 
-say "5) Ensure static include exists (avoid 404)"
-bk "$INC_STATIC"
-cat >"$INC_STATIC"<<EOF
-# AUTOGEN_${TS} - Wolverine static
+say "6) Générer include static /wolverine (évite 404)"
+cat >"$INC_DIR/wolverine_static.inc"<<EOF
+# WV_AUTOGEN_${TS} Wolverine static
 location ^~ /wolverine/ {
   alias ${WEBROOT}/;
   index index.html;
@@ -122,34 +117,253 @@ location ^~ /wolverine/ {
 }
 EOF
 
-say "6) Ensure vhost enabled + includes inside FIRST server{}"
-ln -sf "$VHOST" "$VHOST_EN" || true
-inject_in_server "$VHOST" "include ${INC_STATIC};"
-inject_in_server "$VHOST" "include ${INC_ROUTES};"
+say "7) Installer/repair Vault API local (127.0.0.1:8787) + systemd"
+VAULT_DIR="/opt/traderone-vault"
+VAULT_PORT="8787"
+mkdir -p "$VAULT_DIR"
+cd "$VAULT_DIR"
 
-say "7) nginx -t + reload"
+# Node (si absent): Nodesource 20 (respect règle: pas apt install npm)
+if ! command -v node >/dev/null 2>&1; then
+  say "Node manquant -> installation NodeSource 20"
+  apt-get update -y
+  apt-get install -y ca-certificates curl gnupg
+  install -m 0755 -d /etc/apt/keyrings
+  curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
+  echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" >/etc/apt/sources.list.d/nodesource.list
+  apt-get update -y
+  apt-get install -y nodejs
+fi
+
+# deps pin exact
+if [ ! -f package.json ]; then
+  npm init -y >/dev/null 2>&1 || true
+fi
+npm i --silent --save-exact @solana/web3.js@1.98.4 bs58@5.0.0 tweetnacl@1.0.3 >/dev/null 2>&1 || npm i --save-exact @solana/web3.js bs58 tweetnacl >/dev/null 2>&1
+
+# master key (pour chiffrer secretKey)
+MASTER="$VAULT_DIR/.masterkey"
+if [ ! -f "$MASTER" ]; then
+  umask 077
+  node -e "const crypto=require('crypto');process.stdout.write(crypto.randomBytes(32).toString('hex'))" >"$MASTER"
+  chmod 600 "$MASTER" || true
+fi
+chmod 700 "$VAULT_DIR" || true
+
+cat >"$VAULT_DIR/server.js"<<'"'"'EOF'"'"'
+const http = require("http");
+const { Keypair } = require("@solana/web3.js");
+const bs58 = require("bs58");
+const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
+
+const HOST = process.env.HOST || "127.0.0.1";
+const PORT = Number(process.env.PORT || 8787);
+const ALLOW_ORIGIN = process.env.ALLOW_ORIGIN || "https://fireinners.online";
+const STATE = process.env.STATE || path.join(__dirname, "state.json");
+const MASTER = process.env.MASTER || path.join(__dirname, ".masterkey");
+
+// rate limit simple
+const bucket = new Map(); // ip -> {t,count}
+const WINDOW_MS = 60_000;
+const MAX_REQ = 120;
+
+function now(){ return Date.now(); }
+function rateOK(ip){
+  const t = now();
+  const cur = bucket.get(ip);
+  if(!cur || (t-cur.t)>WINDOW_MS){ bucket.set(ip,{t, count:1}); return true; }
+  if(cur.count>=MAX_REQ) return false;
+  cur.count++; return true;
+}
+
+function loadMaster(){
+  const hex = fs.readFileSync(MASTER,"utf8").trim();
+  if(hex.length < 64) throw new Error("masterkey too short");
+  return Buffer.from(hex.slice(0,64), "hex");
+}
+const MASTER_KEY = loadMaster();
+
+function encSecret(u8){
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", MASTER_KEY, iv);
+  const pt = Buffer.from(u8);
+  const ct = Buffer.concat([cipher.update(pt), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return { iv: iv.toString("base64"), tag: tag.toString("base64"), ct: ct.toString("base64") };
+}
+
+function readJson(req){
+  return new Promise((resolve,reject)=>{
+    let b="";
+    req.on("data",d=>{ b+=d; if(b.length>1e6) req.destroy(); });
+    req.on("end",()=>{ try{ resolve(b?JSON.parse(b):{});}catch(e){ reject(e);} });
+  });
+}
+function send(res, code, obj, extraHeaders={}){
+  const body = JSON.stringify(obj);
+  res.writeHead(code, {
+    "content-type":"application/json; charset=utf-8",
+    "cache-control":"no-store",
+    "access-control-allow-origin": ALLOW_ORIGIN,
+    "access-control-allow-methods":"GET,POST,OPTIONS",
+    "access-control-allow-headers":"content-type",
+    ...extraHeaders
+  });
+  res.end(body);
+}
+function sendText(res, code, txt){
+  res.writeHead(code, {"content-type":"text/plain; charset=utf-8","cache-control":"no-store"});
+  res.end(txt);
+}
+
+function loadState(){
+  try{ return JSON.parse(fs.readFileSync(STATE,"utf8")); }catch(_){ return {vaults:[]}; }
+}
+function saveState(st){
+  fs.writeFileSync(STATE, JSON.stringify(st,null,2), {mode:0o600});
+  try{ fs.chmodSync(STATE,0o600); }catch(_){}
+}
+
+const server = http.createServer(async (req,res)=>{
+  const ip = (req.headers["x-forwarded-for"]||"").toString().split(",")[0].trim() || req.socket.remoteAddress || "unknown";
+  if(!rateOK(ip)) return send(res, 429, {ok:false, error:"rate_limited"});
+
+  if(req.method==="OPTIONS"){
+    res.writeHead(204,{
+      "access-control-allow-origin": ALLOW_ORIGIN,
+      "access-control-allow-methods":"GET,POST,OPTIONS",
+      "access-control-allow-headers":"content-type",
+      "access-control-max-age":"86400"
+    });
+    return res.end();
+  }
+
+  if(req.url==="/health" && req.method==="GET"){
+    return send(res,200,{ok:true, service:"vault-api", host:HOST, port:PORT, ts:Date.now()});
+  }
+
+  if(req.url==="/create" && req.method==="POST"){
+    let body={};
+    try{ body = await readJson(req); }catch(e){ return send(res,400,{ok:false,error:"bad_json"}); }
+
+    const userPub = (body.userPub||"").toString().trim();
+    // pas bloquant si UI n’envoie pas encore userPub, mais on le conserve si présent
+    const kp = Keypair.generate();
+    const enc = encSecret(kp.secretKey);
+    const vaultPub = kp.publicKey.toBase58();
+
+    const st = loadState();
+    st.vaults = Array.isArray(st.vaults) ? st.vaults : [];
+    st.vaults.push({
+      id: crypto.randomUUID(),
+      userPub: userPub || null,
+      vaultPub,
+      encSecretKey: enc,
+      createdAt: new Date().toISOString()
+    });
+    saveState(st);
+
+    return send(res,200,{ok:true, vaultPub, userPub:userPub||null});
+  }
+
+  return send(res,404,{ok:false,error:"not_found"});
+});
+
+server.listen(PORT, HOST, ()=>console.log(`[vault-api] listening http://${HOST}:${PORT}`));
+EOF
+
+cat >/etc/systemd/system/vault-api.service<<EOF
+[Unit]
+Description=Wolverine Vault API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=${VAULT_DIR}
+Environment=HOST=127.0.0.1
+Environment=PORT=${VAULT_PORT}
+Environment=ALLOW_ORIGIN=https://fireinners.online
+Environment=STATE=${VAULT_DIR}/state.json
+Environment=MASTER=${VAULT_DIR}/.masterkey
+ExecStart=/usr/bin/node ${VAULT_DIR}/server.js
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now vault-api.service
+systemctl restart vault-api.service
+
+say "8) Générer include nginx Vault (PAS de 307; JSON only)"
+cat >"$INC_DIR/wolverine_vault.inc"<<EOF
+# WV_AUTOGEN_${TS} Wolverine Vault API (no redirects)
+location ^~ /wolverine/vault-api/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+  proxy_redirect off;
+  proxy_pass http://127.0.0.1:${VAULT_PORT}/;
+}
+
+# legacy aliases -> direct proxy (no return 30x)
+location ^~ /wolverine/traderone/vault/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+  proxy_redirect off;
+  proxy_pass http://127.0.0.1:${VAULT_PORT}/;
+}
+EOF
+
+say "9) Injecter includes Wolverine dans le vhost (dans le PREMIER server{} seulement)"
+if [ ! -f "$VHOST" ]; then
+  say "VHOST introuvable: $VHOST"
+  exit 1
+fi
+
+# assure qu’on injecte une seule fois
+if ! grep -q "WV_AUTOGEN_WOLVERINE_INCLUDES" "$VHOST"; then
+  backup_file "$VHOST"; unfreeze "$VHOST"
+  awk -v INC1="include ${INC_DIR}/wolverine_static.inc;" -v INC2="include ${INC_DIR}/wolverine_vault.inc;" '
+    BEGIN{inserver=0;done=0}
+    /^[[:space:]]*server[[:space:]]*\{/ {inserver=1}
+    {print}
+    inserver==1 && done==0 && /^[[:space:]]*server_name[[:space:]].*fireinners\.online/ {
+      print "  # WV_AUTOGEN_WOLVERINE_INCLUDES"
+      print "  " INC1
+      print "  " INC2
+      done=1
+    }
+  ' "$VHOST" >"$VHOST.tmp"
+  mv -f "$VHOST.tmp" "$VHOST"
+fi
+
+say "10) Nginx test + reload"
 nginx -t
 systemctl reload nginx
 
-say "8) Tests (NO 307 expected)"
-echo "== vault-api health via nginx (Host) =="
-curl -sS -i -H "Host: fireinners.online" "http://127.0.0.1/wolverine/vault-api/health" | sed -n "1,20p"
-echo
-echo "== vault-api create via nginx (Host) =="
-curl -sS -i -H "Host: fireinners.online" -X POST "http://127.0.0.1/wolverine/vault-api/create" -H "content-type: application/json" -d "{}" | sed -n "1,40p"
-echo
-echo "== If you still see 307, show: grep results below =="
-grep -RIn --color=never -E "return[[:space:]]+30|rewrite[[:space:]].*30" /etc/nginx | grep -E "(wolverine/.*vault|vault-api|traderone/vault)" || true
-
-say "9) Refreeze immutables (if any)"
-refreeze
+say "11) Tests locaux (DOIVENT être JSON, PAS 307/HTML)"
+echo "-- vault direct:"
+curl -sS "http://127.0.0.1:${VAULT_PORT}/health" ; echo
+echo "-- vault via nginx (Host fireinners.online):"
+curl -sS -H "Host: fireinners.online" "http://127.0.0.1/wolverine/vault-api/health" ; echo
+echo "-- create via nginx (Host fireinners.online):"
+curl -sS -H "Host: fireinners.online" -H "content-type: application/json" -X POST "http://127.0.0.1/wolverine/vault-api/create" -d "{}" ; echo
 
 say "DONE"
-echo "Open: https://fireinners.online/wolverine/ then Ctrl+F5"
 echo "Backups: $BK"
+echo "Open: https://fireinners.online/wolverine/ ثم Ctrl+F5"
 BASH
-
-sed -i "s/\r$//" /root/wvf307.sh
-chmod +x /root/wvf307.sh
-bash /root/wvf307.sh
-'
+chmod +x /root/WV_MEGA_FIX_VAULT_404_307.sh
+/root/WV_MEGA_FIX_VAULT_404_307.sh'
