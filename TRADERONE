@@ -1,148 +1,711 @@
-cat >/root/MEGA_AQUILA_STACKING_PROJECT_V2_DEPLOY_MODES.sh<<'BASH'
+cat >/root/MEGA_IAAQUILA_100.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
-umask 027
 TS="$(date +%Y%m%d_%H%M%S)"
 say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
-die(){ say "ERR: $*"; exit 1; }
-need(){ command -v "$1" >/dev/null 2>&1 || die "missing: $1"; }
+need(){ command -v "$1" >/dev/null 2>&1 || { echo "ERR: missing $1"; exit 1; }; }
+asroot(){ [ "$(id -u)" = "0" ] || { echo "ERR: run as root"; exit 1; }; }
 
-[ "$(id -u)" -eq 0 ] || die "run as root"
-need node; need corepack; need solana; need anchor; need yarn; need jq; need curl
+asroot
+need nginx
+need node
+need npm
+need curl
+need sha256sum
+need systemctl
 
-APP="/opt/aquila_stacking"
-PROG="aquila_stacking"
-BK="/root/AQUILA_STACKING_V2_DEPLOY_BK_${TS}"
+SLUG="iaaquila"
+DOMAIN="fireinners.online"
+VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
+INC="/etc/nginx/includes/${SLUG}_routes.inc"
+
+APP="/opt/${SLUG}"
+PUB="/var/www/${SLUG}"
+CFG="${APP}/config"
+DATA="${APP}/data"
+VENDOR="${PUB}/vendor"
+
+PORT="9688"
+HOST="127.0.0.1"
+
+SOL_RPC_PRIMARY_DEFAULT="https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac"
+SOL_RPC_BACKUP_DEFAULT="https://api.mainnet-beta.solana.com"
+USDC_MINT="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1"
+
+SVC="/etc/systemd/system/${SLUG}.service"
+BK="/root/${SLUG}_BK_${TS}"
 mkdir -p "$BK"
 
-MODE="${1:-localnet}" # localnet|devnet|mainnet
-case "$MODE" in localnet|devnet|mainnet) ;; *) die "usage: $0 [localnet|devnet|mainnet]";; esac
+say "== 0) Backup =="
+[ -d "$APP" ] && cp -a "$APP" "$BK/app.bak" 2>/dev/null || true
+[ -d "$PUB" ] && cp -a "$PUB" "$BK/www.bak" 2>/dev/null || true
+[ -f "$INC" ] && cp -a "$INC" "$BK/$(basename "$INC").bak" 2>/dev/null || true
+[ -f "$VHOST" ] && cp -a "$VHOST" "$BK/$(basename "$VHOST").bak" 2>/dev/null || true
+[ -f "$SVC" ] && cp -a "$SVC" "$BK/$(basename "$SVC").bak" 2>/dev/null || true
 
-say "0) Mode: $MODE"
-say "1) Workspace check"
-[ -d "$APP" ] || die "missing $APP (run project batch first)"
+say "== 1) Unfreeze nginx/service if immutable =="
+chattr -i "$VHOST" 2>/dev/null || true
+chattr -i "$INC" 2>/dev/null || true
+chattr -i "$SVC" 2>/dev/null || true
+
+say "== 2) Create dirs =="
+mkdir -p "$APP" "$CFG" "$DATA" "$PUB" "$VENDOR"
+
+say "== 3) Policy (deny-by-default + fine allowlist) =="
+if [ ! -f "$CFG/exec_allowlist.json" ]; then
+cat >"$CFG/exec_allowlist.json"<<JSON
+{
+  "KILL_SWITCH": false,
+  "ALLOW_ALL_IF_EMPTY": 0,
+  "timeoutsMs": { "quote": 8000, "swap": 12000, "confirm": 45000 },
+  "backoffMs": { "start": 650, "max": 4000, "factor": 1.65, "jitter": 0.25 },
+  "global": {
+    "maxTxPer24h": 6,
+    "maxUsdcPer24h": 250,
+    "maxSlippageBps": 120
+  },
+  "pairs": [
+    {
+      "name": "USDC->SOL",
+      "inMint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1",
+      "outMint": "So11111111111111111111111111111111111111112",
+      "dir": "BUY",
+      "maxTxPer24h": 4,
+      "maxInPerTx": 100,
+      "maxInPer24h": 200,
+      "maxSlippageBps": 90
+    }
+  ]
+}
+JSON
+fi
+
+if [ ! -f "$DATA/state.json" ]; then
+cat >"$DATA/state.json"<<JSON
+{
+  "version": 1,
+  "usageEvents": [],
+  "pending": {}
+}
+JSON
+fi
+
+say "== 4) Backend package.json (PIN exact) =="
+cat >"$APP/package.json"<<JSON
+{
+  "name": "iaaquila",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "dependencies": {
+    "express": "4.19.2",
+    "cors": "2.8.5",
+    "node-fetch": "3.3.2"
+  }
+}
+JSON
+
+say "== 5) Backend server.js (execution real + persistence atomic + idempotent) =="
+cat >"$APP/server.js"<<'JS'
+import fs from "fs";
+import path from "path";
+import crypto from "crypto";
+import express from "express";
+import cors from "cors";
+import fetch from "node-fetch";
+
+const APP_DIR = "/opt/iaaquila";
+const CFG_DIR = path.join(APP_DIR, "config");
+const DATA_DIR = path.join(APP_DIR, "data");
+const STATE_FILE = path.join(DATA_DIR, "state.json");
+const ALLOW_FILE = path.join(CFG_DIR, "exec_allowlist.json");
+
+const HOST = process.env.HOST || "127.0.0.1";
+const PORT = parseInt(process.env.PORT || "9688", 10);
+const SOL_RPC_PRIMARY = process.env.SOL_RPC_PRIMARY || "https://api.mainnet-beta.solana.com";
+const SOL_RPC_BACKUP = process.env.SOL_RPC_BACKUP || "https://api.mainnet-beta.solana.com";
+const JUP_BASE = process.env.JUP_BASE || "https://quote-api.jup.ag";
+const USDC_MINT = process.env.USDC_MINT || "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1";
+
+const app = express();
+app.disable("x-powered-by");
+app.use(cors());
+app.use(express.json({ limit: "1mb" }));
+
+const now = ()=>Date.now();
+const sha256 = (s)=>crypto.createHash("sha256").update(s).digest("hex");
+const rid = ()=>crypto.randomBytes(16).toString("hex");
+
+function readJson(p, fallback){
+  try{ return JSON.parse(fs.readFileSync(p,"utf8")); }catch(e){ return fallback; }
+}
+function atomicWriteJson(p, obj){
+  const tmp = p + ".tmp." + process.pid;
+  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2));
+  fs.renameSync(tmp, p);
+}
+
+function loadAllow(){ return readJson(ALLOW_FILE, {KILL_SWITCH:true,ALLOW_ALL_IF_EMPTY:0,global:{},pairs:[]}); }
+
+function backoffSleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
+function jitter(ms, frac){ const d = ms*frac; return Math.max(0, Math.floor(ms + (Math.random()*2-1)*d)); }
+
+async function fetchWithTimeout(url, opts, timeoutMs){
+  const ctrl = new AbortController();
+  const t = setTimeout(()=>ctrl.abort(), timeoutMs);
+  try{
+    const res = await fetch(url, { ...opts, signal: ctrl.signal });
+    return res;
+  } finally { clearTimeout(t); }
+}
+
+async function rpcCall(url, method, params, timeoutMs){
+  const body = JSON.stringify({ jsonrpc:"2.0", id:1, method, params });
+  const res = await fetchWithTimeout(url, { method:"POST", headers:{ "content-type":"application/json" }, body }, timeoutMs);
+  if(!res.ok) throw new Error("rpc_http_"+res.status);
+  const j = await res.json();
+  if(j.error) throw new Error("rpc_err_"+(j.error.message||"unknown"));
+  return j.result;
+}
+
+async function rpcCallWithFallback(method, params, timeoutMs){
+  try{ return await rpcCall(SOL_RPC_PRIMARY, method, params, timeoutMs); }
+  catch(e1){ return await rpcCall(SOL_RPC_BACKUP, method, params, timeoutMs); }
+}
+
+function pruneUsage(state){
+  const cutoff = now() - 24*60*60*1000;
+  state.usageEvents = (state.usageEvents||[]).filter(ev=>ev && ev.ts>=cutoff);
+}
+function usageAgg(state, userPub){
+  pruneUsage(state);
+  let tx=0, usdc=0;
+  for(const ev of state.usageEvents){
+    if(ev.userPub===userPub){
+      tx += (ev.txCount||0);
+      usdc += (ev.usdc||0);
+    }
+  }
+  return { tx, usdc };
+}
+
+function allowFor(allow, inMint, outMint, dir){
+  const pairs = Array.isArray(allow.pairs) ? allow.pairs : [];
+  for(const p of pairs){
+    if(p && p.inMint===inMint && p.outMint===outMint && (p.dir===dir || p.dir==="ANY")) return p;
+  }
+  return null;
+}
+
+function policyDeny(msg, code="DENY"){ const e=new Error(msg); e.code=code; return e; }
+
+async function jupQuote({ inMint, outMint, amount, slippageBps }, allow){
+  const tm = Math.max(2000, (allow?.timeoutsMs?.quote)||8000);
+  const url = `${JUP_BASE}/v6/quote?inputMint=${encodeURIComponent(inMint)}&outputMint=${encodeURIComponent(outMint)}&amount=${encodeURIComponent(String(amount))}&slippageBps=${encodeURIComponent(String(slippageBps))}`;
+  const res = await fetchWithTimeout(url, { method:"GET" }, tm);
+  if(!res.ok) throw new Error("jup_quote_http_"+res.status);
+  return await res.json();
+}
+
+async function jupSwap({ quote, userPublicKey }, allow){
+  const tm = Math.max(2500, (allow?.timeoutsMs?.swap)||12000);
+  const url = `${JUP_BASE}/v6/swap`;
+  const body = JSON.stringify({
+    quoteResponse: quote,
+    userPublicKey,
+    wrapAndUnwrapSol: true,
+    useSharedAccounts: true,
+    prioritizationFeeLamports: "auto"
+  });
+  const res = await fetchWithTimeout(url, { method:"POST", headers:{ "content-type":"application/json" }, body }, tm);
+  if(!res.ok) throw new Error("jup_swap_http_"+res.status);
+  return await res.json();
+}
+
+async function confirmFinalized(signature, allow){
+  const tm = Math.max(10000, (allow?.timeoutsMs?.confirm)||45000);
+  const start = now();
+  let delay = Math.max(300, (allow?.backoffMs?.start)||650);
+  const max = Math.max(delay, (allow?.backoffMs?.max)||4000);
+  const factor = (allow?.backoffMs?.factor)||1.65;
+  const jit = (allow?.backoffMs?.jitter)||0.25;
+
+  let seen = false;
+  while(now()-start < tm){
+    try{
+      const st = await rpcCallWithFallback("getSignatureStatuses", [[signature], { searchTransactionHistory: true }], 8000);
+      const s = st?.value?.[0] || null;
+      if(s){
+        seen = true;
+        if(s.confirmationStatus==="finalized" && !s.err) return { status:"FINALIZED", err:null };
+        if(s.err) return { status:"ERROR", err:s.err };
+      }
+    }catch(_){}
+    try{
+      const tx = await rpcCallWithFallback("getTransaction", [signature, { commitment:"finalized", maxSupportedTransactionVersion: 0 }], 8000);
+      if(tx){ return { status:"FINALIZED", err:null }; }
+    }catch(_){}
+    await backoffSleep(jitter(delay, jit));
+    delay = Math.min(max, Math.floor(delay*factor));
+  }
+  return { status: seen ? "TIMEOUT" : "NOT_FOUND", err:null };
+}
+
+app.get("/api/health", (_req,res)=>res.json({ ok:true, ts: now(), rpc:{ primary:SOL_RPC_PRIMARY, backup:SOL_RPC_BACKUP }, jup:JUP_BASE }));
+
+app.get("/api/policy", (_req,res)=>{
+  const a = loadAllow();
+  res.json({ KILL_SWITCH: !!a.KILL_SWITCH, ALLOW_ALL_IF_EMPTY: (a.ALLOW_ALL_IF_EMPTY?1:0), global:a.global||{}, pairs: Array.isArray(a.pairs)?a.pairs:[] });
+});
+
+app.post("/api/pending/create", (req,res)=>{
+  const { userPub, inMint, outMint, dir, amount, slippageBps, meta } = req.body||{};
+  if(!userPub || typeof userPub!=="string") return res.status(400).json({ ok:false, error:"userPub_required" });
+  if(!inMint || !outMint || !dir) return res.status(400).json({ ok:false, error:"mint_dir_required" });
+  if(!amount || !Number.isFinite(Number(amount)) || Number(amount)<=0) return res.status(400).json({ ok:false, error:"amount_required" });
+
+  const payload = { userPub, inMint, outMint, dir, amount: String(amount), slippageBps: Number(slippageBps||0), meta: meta||null };
+  const payloadHash = sha256(JSON.stringify(payload));
+  const pendingId = rid();
+
+  const state = readJson(STATE_FILE, {version:1,usageEvents:[],pending:{}});
+  state.pending = state.pending || {};
+  state.pending[pendingId] = { id:pendingId, createdAt: now(), status:"CREATED", approvedAt:null, executedAt:null, userPub, payload, payloadHash, approvalHash:null, execSig:null, commit:null };
+  atomicWriteJson(STATE_FILE, state);
+
+  res.json({ ok:true, pendingId, payloadHash });
+});
+
+app.post("/api/pending/approve", (req,res)=>{
+  const { pendingId, userPub, payloadHash } = req.body||{};
+  if(!pendingId || !userPub || !payloadHash) return res.status(400).json({ ok:false, error:"pendingId_userPub_payloadHash_required" });
+
+  const state = readJson(STATE_FILE, {version:1,usageEvents:[],pending:{}});
+  const p = state.pending?.[pendingId];
+  if(!p) return res.status(404).json({ ok:false, error:"pending_not_found" });
+  if(p.userPub !== userPub) return res.status(403).json({ ok:false, error:"user_mismatch" });
+  if(p.payloadHash !== payloadHash) return res.status(409).json({ ok:false, error:"payload_hash_mismatch" });
+  if(p.status==="EXECUTED") return res.status(409).json({ ok:false, error:"already_executed" });
+
+  p.status = "APPROVED";
+  p.approvedAt = now();
+  p.approvalHash = sha256(p.payloadHash + ":" + String(p.approvedAt));
+  atomicWriteJson(STATE_FILE, state);
+
+  res.json({ ok:true, pendingId, status:p.status, approvalHash:p.approvalHash });
+});
+
+app.post("/api/exec/tx", async (req,res)=>{
+  try{
+    const allow = loadAllow();
+    if(allow.KILL_SWITCH) throw policyDeny("kill_switch_enabled","KILL");
+
+    const { pendingId, userPub, rpcPrimary, rpcBackup } = req.body||{};
+    if(!pendingId || !userPub) return res.status(400).json({ ok:false, error:"pendingId_userPub_required" });
+
+    const state = readJson(STATE_FILE, {version:1,usageEvents:[],pending:{}});
+    const p = state.pending?.[pendingId];
+    if(!p) return res.status(404).json({ ok:false, error:"pending_not_found" });
+    if(p.userPub !== userPub) return res.status(403).json({ ok:false, error:"user_mismatch" });
+
+    if(p.status!=="APPROVED") return res.status(403).json({ ok:false, error:"not_approved" });
+    if(p.executedAt) return res.status(409).json({ ok:false, error:"already_executed" });
+
+    const pl = p.payload;
+    const global = allow.global||{};
+    const pairs = Array.isArray(allow.pairs)?allow.pairs:[];
+    if((pairs.length===0) && !allow.ALLOW_ALL_IF_EMPTY) throw policyDeny("allowlist_empty_denied","ALLOWLIST");
+
+    const pair = allowFor(allow, pl.inMint, pl.outMint, pl.dir);
+    if(!pair && !allow.ALLOW_ALL_IF_EMPTY) throw policyDeny("pair_not_allowed","ALLOWLIST");
+
+    const maxSlip = Math.min(Number(global.maxSlippageBps||0)||99999, Number(pair?.maxSlippageBps||99999));
+    const slip = Number(pl.slippageBps||0);
+    if(slip > maxSlip) throw policyDeny("slippage_too_high","LIMITS");
+
+    const amountNum = Number(pl.amount);
+    const maxInPerTx = Number(pair?.maxInPerTx||0) || 0;
+    if(maxInPerTx>0 && amountNum>maxInPerTx) throw policyDeny("amount_exceeds_pair_maxInPerTx","LIMITS");
+
+    const ua = usageAgg(state, userPub);
+    const maxTx24 = Number(global.maxTxPer24h||0) || 0;
+    const maxUsdc24 = Number(global.maxUsdcPer24h||0) || 0;
+    const pairMaxTx24 = Number(pair?.maxTxPer24h||0) || 0;
+    const pairMaxIn24 = Number(pair?.maxInPer24h||0) || 0;
+
+    if(maxTx24>0 && ua.tx >= maxTx24) throw policyDeny("global_tx_quota_exceeded","QUOTA");
+    if(pairMaxTx24>0){
+      let ptx=0;
+      for(const ev of (state.usageEvents||[])){ if(ev.userPub===userPub && ev.pairKey===`${pl.inMint}->${pl.outMint}:${pl.dir}`) ptx += (ev.txCount||0); }
+      if(ptx >= pairMaxTx24) throw policyDeny("pair_tx_quota_exceeded","QUOTA");
+    }
+    if(pl.inMint===USDC_MINT && maxUsdc24>0 && ua.usdc + amountNum > maxUsdc24) throw policyDeny("global_usdc_quota_exceeded","QUOTA");
+    if(pl.inMint===USDC_MINT && pairMaxIn24>0){
+      let pus=0;
+      for(const ev of (state.usageEvents||[])){ if(ev.userPub===userPub && ev.pairKey===`${pl.inMint}->${pl.outMint}:${pl.dir}`) pus += (ev.usdc||0); }
+      if(pus + amountNum > pairMaxIn24) throw policyDeny("pair_usdc_quota_exceeded","QUOTA");
+    }
+
+    const q = await jupQuote({ inMint:pl.inMint, outMint:pl.outMint, amount: pl.amount, slippageBps: pl.slippageBps }, allow);
+    const quote = q?.data?.[0];
+    if(!quote) throw new Error("no_quote");
+
+    const sw = await jupSwap({ quote, userPublicKey: userPub }, allow);
+    const txb64 = sw?.swapTransaction;
+    if(!txb64) throw new Error("no_swap_tx");
+
+    const txHash = sha256(String(txb64));
+    p.status = "TX_READY";
+    p.txHash = txHash;
+    p.txReadyAt = now();
+    atomicWriteJson(STATE_FILE, state);
+
+    res.json({ ok:true, pendingId, userPub, swapTransaction: txb64, txHash, quoteInfo: { inAmount: quote.inAmount, outAmount: quote.outAmount, otherAmountThreshold: quote.otherAmountThreshold } });
+  }catch(e){
+    res.status(400).json({ ok:false, error: e.code ? `${e.code}:${e.message}` : (e.message||"error") });
+  }
+});
+
+app.post("/api/exec/commit", async (req,res)=>{
+  try{
+    const allow = loadAllow();
+    if(allow.KILL_SWITCH) throw policyDeny("kill_switch_enabled","KILL");
+
+    const { pendingId, userPub, signature } = req.body||{};
+    if(!pendingId || !userPub || !signature) return res.status(400).json({ ok:false, error:"pendingId_userPub_signature_required" });
+
+    const state = readJson(STATE_FILE, {version:1,usageEvents:[],pending:{}});
+    const p = state.pending?.[pendingId];
+    if(!p) return res.status(404).json({ ok:false, error:"pending_not_found" });
+    if(p.userPub !== userPub) return res.status(403).json({ ok:false, error:"user_mismatch" });
+    if(p.executedAt) return res.status(409).json({ ok:false, error:"already_executed" });
+
+    if(p.commit && p.commit.signature===signature && (p.commit.status==="FINALIZED"||p.commit.status==="ERROR")) {
+      return res.json({ ok:true, pendingId, commit:p.commit });
+    }
+
+    const conf = await confirmFinalized(signature, allow);
+    p.execSig = signature;
+    p.commit = { signature, status: conf.status, err: conf.err || null, at: now() };
+
+    if(conf.status==="FINALIZED"){
+      const pl = p.payload;
+      const pairKey = `${pl.inMint}->${pl.outMint}:${pl.dir}`;
+      const ev = { ts: now(), userPub, pairKey, txCount: 1, usdc: (pl.inMint===USDC_MINT ? Number(pl.amount)||0 : 0), sig: signature };
+      state.usageEvents = state.usageEvents || [];
+      state.usageEvents.push(ev);
+
+      p.status = "EXECUTED";
+      p.executedAt = now();
+    }
+
+    atomicWriteJson(STATE_FILE, state);
+    res.json({ ok:true, pendingId, commit: p.commit, status:p.status });
+  }catch(e){
+    res.status(400).json({ ok:false, error: e.code ? `${e.code}:${e.message}` : (e.message||"error") });
+  }
+});
+
+app.get("/api/pending/:id", (req,res)=>{
+  const state = readJson(STATE_FILE, {version:1,usageEvents:[],pending:{}});
+  const p = state.pending?.[req.params.id];
+  if(!p) return res.status(404).json({ ok:false, error:"pending_not_found" });
+  res.json({ ok:true, pending:p });
+});
+
+app.post("/api/admin/kill", (req,res)=>{
+  const { enabled } = req.body||{};
+  const a = loadAllow();
+  a.KILL_SWITCH = !!enabled;
+  atomicWriteJson(ALLOW_FILE, a);
+  res.json({ ok:true, KILL_SWITCH: !!a.KILL_SWITCH });
+});
+
+app.listen(PORT, HOST, ()=>console.log(`iaaquila listening http://${HOST}:${PORT}`));
+JS
+
+say "== 6) Vendor (PIN + checksums) =="
+WEB3_VER="1.95.4"
+WEB3_URL="https://cdn.jsdelivr.net/npm/@solana/web3.js@${WEB3_VER}/lib/index.iife.min.js"
+WEB3_FILE="${VENDOR}/solana-web3.iife.min.js"
+
+if [ ! -f "$WEB3_FILE" ]; then
+  curl -fsSL "$WEB3_URL" -o "$WEB3_FILE"
+fi
+
+sha256sum "$WEB3_FILE" >"$VENDOR/vendor.sha256"
+
+say "== 7) Front index.html (Phantom real sign+send + explicit states + rpc fallback) =="
+cat >"$PUB/index.html"<<HTML
+<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>IA AQUILA • Execution</title><style>body{font-family:system-ui,Segoe UI,Roboto,Arial;margin:0;background:#0b0f14;color:#e6eef8}header{padding:14px 16px;border-bottom:1px solid #1d2a3a;display:flex;gap:10px;align-items:center;justify-content:space-between}main{padding:14px 16px;max-width:1100px;margin:0 auto}button,input,select{background:#0f1722;color:#e6eef8;border:1px solid #223247;border-radius:10px;padding:10px 12px;font-size:14px}button{cursor:pointer}button:disabled{opacity:.5;cursor:not-allowed}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.card{border:1px solid #1d2a3a;border-radius:14px;padding:12px;margin:10px 0;background:#0d131c}.ok{color:#7dffb3}.bad{color:#ff6b6b}.muted{color:#9ab0c8}.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:10px}.c6{grid-column:span 6}.c4{grid-column:span 4}.c3{grid-column:span 3}.c2{grid-column:span 2}.c12{grid-column:span 12}pre{white-space:pre-wrap;word-break:break-word;background:#091019;border:1px solid #1d2a3a;border-radius:14px;padding:10px;margin:0}</style></head><body><header><div><b>IA AQUILA</b> <span class="muted">/ Execution</span></div><div class="row"><button id="btnConnect">Connect Phantom</button><span id="w" class="muted">wallet: -</span></div></header><main>
+<div class="card grid">
+<div class="c6"><div class="muted">RPC Primary</div><input id="rpc1" style="width:100%"/></div>
+<div class="c6"><div class="muted">RPC Backup</div><input id="rpc2" style="width:100%"/></div>
+<div class="c3"><div class="muted">SOL</div><div id="sol" class="ok">-</div></div>
+<div class="c3"><div class="muted">USDC</div><div id="usdc" class="ok">-</div></div>
+<div class="c6"><div class="muted">Status</div><div id="status" class="muted">Idle</div></div>
+</div>
+
+<div class="card grid">
+<div class="c4"><div class="muted">In Mint</div><input id="inMint" style="width:100%"/></div>
+<div class="c4"><div class="muted">Out Mint</div><input id="outMint" style="width:100%"/></div>
+<div class="c2"><div class="muted">Dir</div><select id="dir" style="width:100%"><option>BUY</option><option>SELL</option><option>ANY</option></select></div>
+<div class="c2"><div class="muted">Slippage (bps)</div><input id="slip" type="number" value="80" style="width:100%"/></div>
+<div class="c3"><div class="muted">Amount (raw)</div><input id="amt" type="number" value="10" style="width:100%"/></div>
+<div class="c3"><div class="muted">Decimals</div><input id="dec" type="number" value="6" style="width:100%"/></div>
+<div class="c6"><div class="muted">Flow</div><div class="row">
+<button id="btnCreate">1) Create Pending</button>
+<button id="btnApprove" disabled>2) Approve</button>
+<button id="btnTx" disabled>3) Build TX</button>
+<button id="btnSignSend" disabled>4) Sign+Send</button>
+<button id="btnCommit" disabled>5) Commit (finalized)</button>
+</div></div>
+<div class="c6"><div class="muted">Pending</div><div id="pmeta" class="muted">-</div></div>
+<div class="c12"><div class="muted">Log</div><pre id="log"></pre></div>
+</div>
+
+<script>(function(){try{if(!globalThis.global)globalThis.global=globalThis; if(!globalThis.process)globalThis.process={env:{}}; if(!globalThis.Buffer){function b64ToU8(b){const s=atob(b);const a=new Uint8Array(s.length);for(let i=0;i<s.length;i++)a[i]=s.charCodeAt(i);return a;}function u8ToB64(u){let s="";for(let i=0;i<u.length;i++)s+=String.fromCharCode(u[i]);return btoa(s);}globalThis.Buffer={from:(x,enc)=>{if(enc==="base64"){return b64ToU8(x);} if(typeof x==="string"){const te=new TextEncoder();return te.encode(x);} if(x instanceof Uint8Array)return x; return new Uint8Array(x);},toString:(u,enc)=>{if(enc==="base64")return u8ToB64(u); const td=new TextDecoder();return td.decode(u);}};} }catch(e){}})();</script>
+<script src="/${SLUG}/vendor/solana-web3.iife.min.js"></script>
+<script>
+const API_BASE="/${SLUG}/api";
+const USDC="${USDC_MINT}";
+const DEFAULT_RPC1="${SOL_RPC_PRIMARY_DEFAULT}";
+const DEFAULT_RPC2="${SOL_RPC_BACKUP_DEFAULT}";
+const el=id=>document.getElementById(id);
+const log=(m)=>{el("log").textContent=(el("log").textContent?el("log").textContent+"\\n":"")+m;};
+const setStatus=(m,ok=null)=>{el("status").textContent=m; el("status").className=ok===true?"ok":ok===false?"bad":"muted";};
+const ls=(k,v)=>v===undefined?localStorage.getItem(k):localStorage.setItem(k,v);
+
+el("rpc1").value=ls("iaa_rpc1")||DEFAULT_RPC1;
+el("rpc2").value=ls("iaa_rpc2")||DEFAULT_RPC2;
+el("inMint").value=ls("iaa_in")||USDC;
+el("outMint").value=ls("iaa_out")||"So11111111111111111111111111111111111111112";
+
+let provider=null, pub=null;
+let pendingId=null, payloadHash=null, approvalHash=null, txb64=null, txHash=null, signature=null;
+
+async function conn(rpc){
+  return new solanaWeb3.Connection(rpc,{commitment:"confirmed"});
+}
+async function withRpcFallback(fn){
+  const r1=el("rpc1").value.trim(), r2=el("rpc2").value.trim();
+  try{ return await fn(await conn(r1)); }catch(e1){ log("RPC1 fail: "+(e1?.message||e1)); return await fn(await conn(r2)); }
+}
+async function refreshBalances(){
+  if(!pub){ el("sol").textContent="-"; el("usdc").textContent="-"; return; }
+  await withRpcFallback(async(c)=>{
+    const lam=await c.getBalance(pub);
+    el("sol").textContent=(lam/1e9).toFixed(6);
+    const accts=await c.getParsedTokenAccountsByOwner(pub,{programId:new solanaWeb3.PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")});
+    let us=0;
+    for(const it of accts.value){
+      const info=it.account.data.parsed.info;
+      if(info.mint===USDC){
+        const amt=Number(info.tokenAmount.uiAmount||0);
+        us+=amt;
+      }
+    }
+    el("usdc").textContent=us.toFixed(6);
+  });
+}
+async function api(path, body){
+  const res=await fetch(API_BASE+path,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body||{})});
+  const j=await res.json().catch(()=>({ok:false,error:"bad_json"}));
+  if(!res.ok || !j.ok) throw new Error(j.error||("http_"+res.status));
+  return j;
+}
+
+el("rpc1").addEventListener("change",()=>ls("iaa_rpc1",el("rpc1").value));
+el("rpc2").addEventListener("change",()=>ls("iaa_rpc2",el("rpc2").value));
+el("inMint").addEventListener("change",()=>ls("iaa_in",el("inMint").value));
+el("outMint").addEventListener("change",()=>ls("iaa_out",el("outMint").value));
+
+el("btnConnect").onclick=async()=>{
+  try{
+    if(!window.solana || !window.solana.isPhantom) throw new Error("Phantom_not_found");
+    provider=window.solana;
+    const r=await provider.connect();
+    pub=new solanaWeb3.PublicKey(r.publicKey.toString());
+    el("w").textContent="wallet: "+pub.toString();
+    setStatus("Connected",true);
+    await refreshBalances();
+  }catch(e){
+    setStatus("Connect failed",false);
+    log("Connect err: "+(e?.message||e));
+  }
+};
+
+el("btnCreate").onclick=async()=>{
+  try{
+    if(!pub) throw new Error("connect_wallet_first");
+    const inMint=el("inMint").value.trim(), outMint=el("outMint").value.trim(), dir=el("dir").value;
+    const slip=Number(el("slip").value||0);
+    const dec=Number(el("dec").value||0);
+    const amtUi=Number(el("amt").value||0);
+    const amountRaw=Math.floor(amtUi*Math.pow(10,dec));
+    if(amountRaw<=0) throw new Error("amount_invalid");
+    const j=await api("/pending/create",{userPub:pub.toString(),inMint,outMint,dir,amount:String(amountRaw),slippageBps:slip,meta:{dec,amtUi}});
+    pendingId=j.pendingId; payloadHash=j.payloadHash;
+    approvalHash=null; txb64=null; txHash=null; signature=null;
+    el("pmeta").textContent="pendingId="+pendingId+" payloadHash="+payloadHash;
+    el("btnApprove").disabled=false; el("btnTx").disabled=true; el("btnSignSend").disabled=true; el("btnCommit").disabled=true;
+    setStatus("Pending CREATED",true); log("CREATE ok: "+JSON.stringify(j));
+  }catch(e){ setStatus("Create failed",false); log("CREATE err: "+(e?.message||e)); }
+};
+
+el("btnApprove").onclick=async()=>{
+  try{
+    if(!pendingId||!payloadHash||!pub) throw new Error("missing_pending");
+    const j=await api("/pending/approve",{pendingId,userPub:pub.toString(),payloadHash});
+    approvalHash=j.approvalHash;
+    el("btnTx").disabled=false;
+    setStatus("Pending APPROVED",true); log("APPROVE ok: "+JSON.stringify(j));
+  }catch(e){ setStatus("Approve failed",false); log("APPROVE err: "+(e?.message||e)); }
+};
+
+el("btnTx").onclick=async()=>{
+  try{
+    if(!pendingId||!pub) throw new Error("missing_pending");
+    const j=await api("/exec/tx",{pendingId,userPub:pub.toString(),rpcPrimary:el("rpc1").value.trim(),rpcBackup:el("rpc2").value.trim()});
+    txb64=j.swapTransaction; txHash=j.txHash;
+    el("btnSignSend").disabled=false;
+    setStatus("TX READY",true); log("TX ok: txHash="+txHash);
+  }catch(e){ setStatus("Build TX failed",false); log("TX err: "+(e?.message||e)); }
+};
+
+el("btnSignSend").onclick=async()=>{
+  try{
+    if(!txb64||!provider||!pub) throw new Error("missing_tx");
+    const raw=Uint8Array.from(atob(txb64),c=>c.charCodeAt(0));
+    const tx=solanaWeb3.VersionedTransaction.deserialize(raw);
+    setStatus("SIGNING...",null);
+    const out=await provider.signAndSendTransaction(tx);
+    signature=out.signature || out;
+    el("btnCommit").disabled=false;
+    setStatus("SENT (signature acquired)",true);
+    log("SIGN+SEND ok: "+signature);
+  }catch(e){ setStatus("Sign+Send failed",false); log("SIGN+SEND err: "+(e?.message||e)); }
+};
+
+el("btnCommit").onclick=async()=>{
+  try{
+    if(!signature||!pendingId||!pub) throw new Error("missing_signature");
+    setStatus("COMMIT: confirming finalized...",null);
+    const j=await api("/exec/commit",{pendingId,userPub:pub.toString(),signature});
+    const st=j.commit?.status||"?";
+    if(st==="FINALIZED"){ setStatus("FINALIZED (quota consumed)",true); }
+    else if(st==="TIMEOUT"){ setStatus("TIMEOUT (not charged)",false); }
+    else if(st==="NOT_FOUND"){ setStatus("DROPPED/NOT_FOUND (not charged)",false); }
+    else if(st==="ERROR"){ setStatus("ERROR (not charged)",false); }
+    log("COMMIT: "+JSON.stringify(j));
+    await refreshBalances();
+  }catch(e){ setStatus("Commit failed",false); log("COMMIT err: "+(e?.message||e)); }
+};
+
+(async()=>{try{
+  const r=await fetch(API_BASE+"/health"); const j=await r.json(); log("HEALTH: "+JSON.stringify(j));
+  setStatus("Ready",true);
+}catch(e){ setStatus("API unreachable",false); log("HEALTH err: "+(e?.message||e)); }})();
+</script></main></body></html>
+HTML
+
+say "== 8) npm install (lockfile + npm ci) =="
 cd "$APP"
-
-corepack enable >/dev/null 2>&1 || true
-corepack prepare yarn@1.22.22 --activate >/dev/null 2>&1 || true
-
-say "2) Keypairs per cluster"
-KP_LOCAL="$APP/target/deploy/${PROG}-keypair.json"
-KP_DEV="$APP/keys/${PROG}-devnet-keypair.json"
-KP_MAIN="$APP/keys/${PROG}-mainnet-keypair.json"
-mkdir -p "$APP/keys" "$APP/target/deploy"
-
-mk_kp(){ local f="$1"; [ -f "$f" ] || solana-keygen new --no-bip39-passphrase --silent --outfile "$f" >/dev/null; }
-mk_kp "$KP_LOCAL"
-mk_kp "$KP_DEV"
-mk_kp "$KP_MAIN"
-
-PID_LOCAL="$(solana-keygen pubkey "$KP_LOCAL")"
-PID_DEV="$(solana-keygen pubkey "$KP_DEV")"
-PID_MAIN="$(solana-keygen pubkey "$KP_MAIN")"
-
-say "Program IDs:"
-say "  localnet: $PID_LOCAL"
-say "  devnet : $PID_DEV"
-say "  mainnet: $PID_MAIN"
-
-say "3) Configure provider cluster + wallet"
-case "$MODE" in
-  localnet)
-    solana config set --url http://127.0.0.1:8899 >/dev/null
-    solana config set --keypair "$KP_LOCAL" >/dev/null
-    PID="$PID_LOCAL"
-    ;;
-  devnet)
-    solana config set --url https://api.devnet.solana.com >/dev/null
-    solana config set --keypair "$KP_DEV" >/dev/null
-    PID="$PID_DEV"
-    ;;
-  mainnet)
-    solana config set --url https://api.mainnet-beta.solana.com >/dev/null
-    solana config set --keypair "$KP_MAIN" >/dev/null
-    PID="$PID_MAIN"
-    ;;
-esac
-
-say "4) Patch declare_id + Anchor.toml program id for selected mode"
-# backup
-cp -a "$APP/programs/$PROG/src/lib.rs" "$BK/lib.rs.bak"
-cp -a "$APP/Anchor.toml" "$BK/Anchor.toml.bak"
-
-# patch declare_id! line
-perl -0777 -pe "s/declare_id!\\(\\\"[^\\\"]+\\\"\\);/declare_id!(\\\"$PID\\\");/g" -i "$APP/programs/$PROG/src/lib.rs"
-
-# patch Anchor.toml: set programs.<mode>
-python3 - <<PY
-import re
-p="$PID"
-mode="$MODE"
-txt=open("$APP/Anchor.toml","r").read()
-# ensure sections exist, rewrite the right section deterministically
-def set_section(section, key, value, txt):
-    # section like [programs.devnet]
-    if section not in txt:
-        txt += "\n"+section+"\n"
-    # replace or add key line inside section
-    parts=txt.split(section)
-    pre=parts[0]
-    rest=section.join(parts[1:])
-    # find next section
-    m=re.search(r"\n\\[.*?\\]\n", rest)
-    body = rest[:m.start()] if m else rest
-    tail = rest[m.start():] if m else ""
-    # remove old key
-    body=re.sub(rf"^\s*{re.escape(key)}\s*=\s*\"[^\"]*\"\s*$", "", body, flags=re.M)
-    body = body.strip("\n")
-    if body and not body.endswith("\n"): body += "\n"
-    body += f"{key} = \"{value}\"\n"
-    return pre + section + "\n" + body + tail
-
-txt=set_section("[programs.%s]"%mode, "$PROG", p, txt)
-open("$APP/Anchor.toml","w").write(txt)
-PY
-
-say "5) Install deps (if missing) + build"
-yarn install --non-interactive
-anchor build
-
-say "6) Optional airdrop (devnet/localnet only) + deploy"
-if [ "$MODE" = "devnet" ]; then
-  say "6a) Airdrop 2 SOL devnet (best effort)"
-  solana airdrop 2 >/dev/null 2>&1 || true
+if [ ! -f "$APP/package-lock.json" ]; then
+  npm install --no-audit --no-fund
+else
+  npm ci --no-audit --no-fund
 fi
 
-if [ "$MODE" = "localnet" ]; then
-  say "6a) Ensure local validator running (best effort start in background if not)"
-  if ! curl -s http://127.0.0.1:8899 >/dev/null 2>&1; then
-    nohup solana-test-validator --reset >"$BK/solana-test-validator.log" 2>&1 &
-    sleep 2
-  fi
+say "== 9) systemd service =="
+cat >"$SVC"<<SERVICE
+[Unit]
+Description=IA Aquila (Execution)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=$APP
+Environment=HOST=$HOST
+Environment=PORT=$PORT
+Environment=SOL_RPC_PRIMARY=$SOL_RPC_PRIMARY_DEFAULT
+Environment=SOL_RPC_BACKUP=$SOL_RPC_BACKUP_DEFAULT
+Environment=USDC_MINT=$USDC_MINT
+Environment=JUP_BASE=https://quote-api.jup.ag
+ExecStart=/usr/bin/node $APP/server.js
+Restart=always
+RestartSec=2
+User=root
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+
+systemctl daemon-reload
+systemctl enable "${SLUG}.service" >/dev/null 2>&1 || true
+systemctl restart "${SLUG}.service"
+
+say "== 10) nginx routes include (deterministic) =="
+cat >"$INC"<<NGINX
+location = /$SLUG { return 301 /$SLUG/; }
+
+location ^~ /$SLUG/api/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+  proxy_connect_timeout 5s;
+  proxy_send_timeout 60s;
+  proxy_read_timeout 60s;
+  proxy_pass http://$HOST:$PORT/;
+}
+
+location ^~ /$SLUG/ {
+  alias $PUB/;
+  add_header Cache-Control "no-store" always;
+  try_files \$uri \$uri/ /$SLUG/index.html;
+}
+NGINX
+
+say "== 11) inject include into vhost (unique) =="
+if ! grep -qF "include $INC;" "$VHOST"; then
+  tmp="$VHOST.tmp.$TS"
+  awk -v inc="  include $INC;" '
+    BEGIN{done=0}
+    {
+      print $0
+      if(!done && $0 ~ /^[[:space:]]*server[[:space:]]*\{/){
+        print inc ";"
+        done=1
+      }
+    }
+  ' "$VHOST" >"$tmp"
+  cp -a "$VHOST" "$BK/$(basename "$VHOST").pre_inject"
+  mv "$tmp" "$VHOST"
 fi
 
-say "6b) anchor deploy (MODE=$MODE)"
-anchor deploy
+say "== 12) nginx test+reload =="
+nginx -t
+systemctl reload nginx
 
-say "7) Export IDL + addresses"
-IDL="$APP/target/idl/${PROG}.json"
-ADDR="$APP/DEPLOY_${MODE}.txt"
-mkdir -p "$APP/target/idl"
-[ -f "$IDL" ] && cp -a "$IDL" "$BK/${PROG}.idl.json" || true
+say "== 13) smoke tests (local + public) =="
+curl -fsS "http://$HOST:$PORT/api/health" >/dev/null
+curl -fsS "https://$DOMAIN/$SLUG/api/health" >/dev/null
 
-cat >"$ADDR"<<EOF
-MODE=$MODE
-PROGRAM=$PROG
-PROGRAM_ID=$PID
-SOLANA_URL=$(solana config get | awk -F': ' '/RPC URL/{print $2}')
-WALLET=$(solana config get | awk -F': ' '/Keypair Path/{print $2}')
-TS=$TS
-EOF
+say "== 14) verify include active (nginx -T contains it) =="
+nginx -T 2>/dev/null | grep -qF "include $INC;" || { echo "ERR: include not active"; exit 1; }
 
-say "8) Done"
-say "Program ID ($MODE): $PID"
-say "Deploy info: $ADDR"
-say "BK: $BK"
+say "== 15) freeze immutability (verify) =="
+chattr +i "$INC" 2>/dev/null || true
+chattr +i "$SVC" 2>/dev/null || true
+chattr +i "$VHOST" 2>/dev/null || true
+lsattr "$INC" "$SVC" "$VHOST" 2>/dev/null || true
+
+say "== DONE: https://$DOMAIN/$SLUG/ =="
 BASH
-chmod +x /root/MEGA_AQUILA_STACKING_PROJECT_V2_DEPLOY_MODES.sh
-bash /root/MEGA_AQUILA_STACKING_PROJECT_V2_DEPLOY_MODES.sh devnet
+chmod +x /root/MEGA_IAAQUILA_100.sh
+/root/MEGA_IAAQUILA_100.sh
