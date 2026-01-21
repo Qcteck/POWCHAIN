@@ -1,429 +1,518 @@
-bash -lc 'set -euo pipefail
-DOMAIN="fireinners.online"
-PUBLIC_BASE="https://${DOMAIN}"
-DEFAULT_RPC="https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac"
-SVC="bundler-api.service"
+cat >/root/MEGA_AIAQUILA_DEPLOY_V1.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+
 TS="$(date +%Y%m%d_%H%M%S)"
-BK="/root/BUNDLER_METADATA_ONCHAIN_${TS}"
+BK="/root/AIAQUILA_BK_$TS"
 mkdir -p "$BK"
 
-say(){ printf "[%s] %s\n" "$(date +%H:%M:%S)" "$*"; }
+say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
+die(){ say "ERR: $*"; exit 1; }
 
-say "detect API_DIR from systemd: ${SVC}"
-systemctl is-enabled "$SVC" >/dev/null 2>&1 || true
-UNIT="$(systemctl show -p FragmentPath --value "$SVC" 2>/dev/null || true)"
-WORKDIR="$(systemctl show -p WorkingDirectory --value "$SVC" 2>/dev/null || true)"
-EXECLINE="$(systemctl show -p ExecStart --value "$SVC" 2>/dev/null || true)"
+[ "$(id -u)" -eq 0 ] || die "run as root"
+command -v nginx >/dev/null 2>&1 || die "nginx missing"
+command -v curl  >/dev/null 2>&1 || die "curl missing"
+command -v sha256sum >/dev/null 2>&1 || die "sha256sum missing"
+command -v systemctl >/dev/null 2>&1 || die "systemctl missing"
 
-API_DIR=""
-if [ -n "${WORKDIR:-}" ] && [ -d "$WORKDIR" ]; then API_DIR="$WORKDIR"; fi
-if [ -z "$API_DIR" ]; then
-  # parse node .../server.js
-  API_JS="$(printf "%s" "$EXECLINE" | sed -nE "s/.*\/usr\/bin\/node[[:space:]]+([^ ;]+).*/\1/p" | head -n1)"
-  if [ -n "${API_JS:-}" ] && [ -f "$API_JS" ]; then API_DIR="$(dirname "$API_JS")"; fi
+DOMAIN="fireinners.online"
+SLUG="aiaquila"
+WEB="/var/www/$SLUG"
+VENDOR="$WEB/vendor"
+INC="/etc/nginx/includes/${SLUG}_routes.inc"
+
+# Prefer active vhost on your box (seen in logs)
+VHOST=""
+if [ -f /etc/nginx/conf.d/000-fireinners.online-ssl.conf ]; then
+  VHOST="/etc/nginx/conf.d/000-fireinners.online-ssl.conf"
+elif [ -f /etc/nginx/sites-available/fireinners.online-ssl ]; then
+  VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
+else
+  VHOST="$(nginx -T 2>/dev/null | awk '/# configuration file /{f=$4} /server_name/ && $0 ~ /fireinners\.online/{print f; exit}')"
 fi
-if [ -z "$API_DIR" ]; then
-  # common fallback
-  for d in /opt/bundler_api /opt/bundler-api /opt/bundler; do
-    [ -d "$d" ] && API_DIR="$d" && break
-  done
-fi
-[ -n "$API_DIR" ] && [ -d "$API_DIR" ] || { say "ERROR: cannot detect API_DIR"; exit 1; }
-say "API_DIR=$API_DIR"
+[ -n "${VHOST:-}" ] && [ -f "$VHOST" ] || die "cannot find vhost for $DOMAIN"
 
-say "backup (api dir + nginx include/vhost if present)"
-cp -a "$API_DIR" "$BK/api_dir" 2>/dev/null || true
-for f in /etc/nginx/sites-available/fireinners.online-ssl /etc/nginx/nginx.conf /etc/nginx/includes/bundler_routes.inc; do
-  [ -f "$f" ] && cp -a "$f" "$BK/$(basename "$f")" || true
-done
-[ -n "${UNIT:-}" ] && [ -f "$UNIT" ] && cp -a "$UNIT" "$BK/$(basename "$UNIT")" || true
-say "BACKUP=$BK"
+backup(){ local p="$1"; [ -e "$p" ] || return 0; mkdir -p "$BK/$(dirname "$p")"; cp -a "$p" "$BK/$p.bak" 2>/dev/null || true; }
+unfreeze(){ chattr -i /etc/nginx/nginx.conf 2>/dev/null || true; chattr -i "$VHOST" 2>/dev/null || true; chattr -i "$INC" 2>/dev/null || true; }
+freeze(){ chattr +i /etc/nginx/nginx.conf 2>/dev/null || true; chattr +i "$VHOST" 2>/dev/null || true; chattr +i "$INC" 2>/dev/null || true; }
 
-say "ensure api folders"
-mkdir -p "$API_DIR/public/assets"
-
-say "write .env (default RPC + public base) (non-destructive: append/replace keys)"
-ENVF="$API_DIR/.env"
-touch "$ENVF"
-python3 - "$ENVF" "$DEFAULT_RPC" "$PUBLIC_BASE" <<'"'"'PY'"'"'
-import sys,re
-p, rpc, base = sys.argv[1], sys.argv[2], sys.argv[3]
-s=open(p,"r",encoding="utf-8",errors="ignore").read().splitlines()
-kv={}
-out=[]
-def setk(k,v):
-  kv[k]=v
-for ln in s:
-  if not ln.strip() or ln.lstrip().startswith("#"):
-    out.append(ln); continue
-  m=re.match(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", ln)
-  if not m: out.append(ln); continue
-  k=m.group(1); v=m.group(2)
-  kv[k]=v
-for k,v in [("DEFAULT_RPC",rpc),("PUBLIC_BASE",base),("ASSETS_DIR","public/assets")]:
-  kv[k]=v
-# rebuild, preserving existing non-key lines, then ensure keys exist at end
-kept=set()
-new=[]
-for ln in out:
-  m=re.match(r"^([A-Za-z_][A-Za-z0-9_]*)=", ln or "")
-  if m and m.group(1) in kv:
-    k=m.group(1); new.append(f"{k}={kv[k]}"); kept.add(k)
-  else:
-    new.append(ln)
-for k in ["DEFAULT_RPC","PUBLIC_BASE","ASSETS_DIR"]:
-  if k not in kept:
-    new.append(f"{k}={kv[k]}")
-open(p,"w",encoding="utf-8").write("\n".join(new).rstrip()+"\n")
-print("OK .env updated:",p)
-PY
-
-say "ensure node deps (package.json + npm install in API_DIR)"
-cd "$API_DIR"
-if [ ! -f package.json ]; then
-  npm init -y >/dev/null 2>&1 || true
-fi
-# ensure deps
-npm i --silent express cors dotenv @solana/web3.js @solana/spl-token @metaplex-foundation/mpl-token-metadata >/dev/null 2>&1 || npm i express cors dotenv @solana/web3.js @solana/spl-token @metaplex-foundation/mpl-token-metadata
-
-say "write server.js (real create + on-chain metadata) with marker"
-cat > "$API_DIR/server.js" <<'"'"'JS'"'"'
-"use strict";
-const fs=require("fs");
-const path=require("path");
-const express=require("express");
-const cors=require("cors");
-require("dotenv").config({path:path.join(__dirname,".env")});
-const {Connection,Keypair,PublicKey,Transaction,SystemProgram}=require("@solana/web3.js");
-const spl=require("@solana/spl-token");
-const mpl=require("@metaplex-foundation/mpl-token-metadata");
-
-/*BUNDLER_SERVER_ONCHAIN_META_V1*/
-
-const APP=express();
-APP.use(cors({origin:"*",methods:["GET","POST","OPTIONS"],allowedHeaders:["Content-Type","X-API-Key"]}));
-APP.use(express.json({limit:"6mb"}));
-
-const API_KEY=(process.env.BUNDLER_API_KEY||process.env.API_KEY||"").trim();
-const DEFAULT_RPC=(process.env.DEFAULT_RPC||"").trim();
-const PUBLIC_BASE=(process.env.PUBLIC_BASE||"").trim()||"";
-const ASSETS_DIR=path.join(__dirname, (process.env.ASSETS_DIR||"public/assets").trim());
-const WALLET_PATH=process.env.WALLET_PATH ? process.env.WALLET_PATH.trim() : path.join(__dirname,"wallet.json");
-
-function now(){return new Date().toISOString();}
-function ok(res,obj){res.status(200).json(obj);}
-function bad(res,code,msg,extra){res.status(code).json(Object.assign({ok:false,error:String(msg||"ERROR")},extra||{}));}
-
-function loadPayer(){
-  if(!fs.existsSync(WALLET_PATH)) throw new Error("WALLET_MISSING:"+WALLET_PATH);
-  const raw=fs.readFileSync(WALLET_PATH,"utf8");
-  const sk=Uint8Array.from(JSON.parse(raw));
-  return Keypair.fromSecretKey(sk);
-}
-
-function trimName(n){n=String(n||"").trim(); if(!n) return ""; if(n.length>32) n=n.slice(0,32); return n;}
-function makeSymbolFromName(n){
-  n=String(n||"").trim().toUpperCase().replace(/[^A-Z0-9]/g,"");
-  if(!n) return "TOKEN";
-  if(n.length>10) n=n.slice(0,10);
-  return n;
-}
-function dataUrlToFile(dataUrl, outPath){
-  const m=String(dataUrl||"").match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
-  if(!m) throw new Error("LOGO_BAD_DATAURL");
-  const mime=m[1].toLowerCase();
-  const b64=m[2];
-  const buf=Buffer.from(b64,"base64");
-  if(buf.length>1024*1024*2) throw new Error("LOGO_TOO_LARGE");
-  let ext="png";
-  if(mime.includes("jpeg")||mime.includes("jpg")) ext="jpg";
-  else if(mime.includes("webp")) ext="webp";
-  else if(mime.includes("png")) ext="png";
-  else ext="img";
-  const file=outPath.endsWith("."+ext)?outPath:(outPath+"."+ext);
-  fs.mkdirSync(path.dirname(file),{recursive:true});
-  fs.writeFileSync(file,buf);
-  return {file,ext,mime,size:buf.length};
-}
-
-function requireApiKey(req,res){
-  if(!API_KEY) return true; // if no key configured, allow (dev)
-  const k=(req.headers["x-api-key"]||req.body?.apiKey||req.body?.key||"").toString().trim();
-  if(k!==API_KEY) { bad(res,401,"UNAUTHORIZED"); return false; }
-  return true;
-}
-
-APP.get("/health",(req,res)=>ok(res,{ok:true,ts:now(),host:"127.0.0.1"}));
-APP.get("/info",(req,res)=>ok(res,{ok:true,ts:now(),defaultRpc:DEFAULT_RPC||null,publicBase:PUBLIC_BASE||null,assetsDir:ASSETS_DIR,walletPath:WALLET_PATH,haveApiKey:!!API_KEY}));
-
-APP.post("/api/create-token", async (req,res)=>{
-  try{
-    if(!requireApiKey(req,res)) return;
-
-    const body=req.body||{};
-    const rpc=String(body.rpc||DEFAULT_RPC||"").trim();
-    if(!rpc) return bad(res,400,"RPC_MISSING");
-    const decimals=Number(body.decimals??6);
-    if(!Number.isFinite(decimals) || decimals<0 || decimals>9) return bad(res,400,"BAD_DECIMALS");
-    const supplyHuman=String(body.supply??body.amount??"0").trim();
-    if(!/^\d+$/.test(supplyHuman)) return bad(res,400,"BAD_SUPPLY");
-    const preflightOnly=!!body.preflightOnly;
-
-    const payer=loadPayer();
-    const ownerStr=String(body.owner||"").trim();
-    const owner=ownerStr? new PublicKey(ownerStr) : payer.publicKey;
-
-    // optional reuse mint
-    const reuseMintStr=String(body.mintAddress||body.mint||"").trim();
-    const reuseMint = reuseMintStr ? new PublicKey(reuseMintStr) : null;
-
-    const revokeMintAuth=!!body.revokeMintAuth;
-    const revokeFreezeAuth=!!body.revokeFreezeAuth;
-
-    // UI meta (name/logo)
-    const tokenName=trimName(body.tokenName||body.name||"");
-    const logoDataUrl=String(body.logo||"").trim();
-
-    const conn=new Connection(rpc,"confirmed");
-
-    // amount = supply * 10^decimals
-    const pow10 = BigInt("1" + "0".repeat(decimals));
-    const amount = BigInt(supplyHuman) * pow10;
-
-    // rent estimates (mint + ata + metadata, best-effort)
-    const mintRentLamports = await conn.getMinimumBalanceForRentExemption(spl.MINT_SIZE).catch(()=>0);
-    const ataRentLamports = await conn.getMinimumBalanceForRentExemption(spl.ACCOUNT_SIZE).catch(()=>0);
-    // metadata size is not exposed here; return 0 (program handles)
-    const est={mintRentLamports:Number(mintRentLamports)||0, mintRentSOL:(Number(mintRentLamports)||0)/1e9, ataRentLamports:Number(ataRentLamports)||0, ataRentSOL:(Number(ataRentLamports)||0)/1e9};
-
-    if(preflightOnly){
-      return ok(res,{ok:true,stub:false,result:{preflightOnly:true,rpc,payer:payer.publicKey.toBase58(),owner:owner.toBase58(),decimals,supplyHuman,amount:amount.toString(),reuseMint:reuseMint?reuseMint.toBase58():null,est,tokenName:tokenName||null,haveLogo:!!logoDataUrl,revokeMintAuth,revokeFreezeAuth}});
-    }
-
-    // REAL MODE (costs SOL)
-    let mintKp=null;
-    let mintPub=null;
-
-    if(reuseMint){
-      mintPub=reuseMint;
-    }else{
-      mintKp=Keypair.generate();
-      mintPub=mintKp.publicKey;
-      // create mint (payer as mintAuthority+freezeAuthority initially)
-      const lam=await conn.getMinimumBalanceForRentExemption(spl.MINT_SIZE);
-      const tx=new Transaction();
-      tx.add(SystemProgram.createAccount({fromPubkey:payer.publicKey,newAccountPubkey:mintPub,space:spl.MINT_SIZE,lamports:lam,programId:spl.TOKEN_PROGRAM_ID}));
-      tx.add(spl.createInitializeMintInstruction(mintPub,decimals,payer.publicKey,payer.publicKey,spl.TOKEN_PROGRAM_ID));
-      tx.feePayer=payer.publicKey;
-      tx.recentBlockhash=(await conn.getLatestBlockhash("confirmed")).blockhash;
-      tx.sign(payer,mintKp);
-      const sig=await conn.sendRawTransaction(tx.serialize(),{skipPreflight:false,maxRetries:5});
-      await conn.confirmTransaction(sig,"confirmed");
-    }
-
-    // ATA + mintTo
-    const ata = await spl.getOrCreateAssociatedTokenAccount(conn,payer,mintPub,owner,true,"confirmed");
-    const sigMintTo = await spl.mintTo(conn,payer,mintPub,ata.address,payer,amount,[],{commitment:"confirmed"});
-
-    // revoke authorities if requested
-    let sigRevokeMint=null, sigRevokeFreeze=null;
-    if(revokeMintAuth){
-      sigRevokeMint=await spl.setAuthority(conn,payer,mintPub,payer.publicKey,spl.AuthorityType.MintTokens,null,[],{commitment:"confirmed"});
-    }
-    if(revokeFreezeAuth){
-      sigRevokeFreeze=await spl.setAuthority(conn,payer,mintPub,payer.publicKey,spl.AuthorityType.FreezeAccount,null,[],{commitment:"confirmed"});
-    }
-
-    // on-chain metadata (URI points to our hosted JSON)
-    let metaSig=null, metadataPda=null, uri=null, imageUrl=null, jsonUrl=null, savedLogo=null;
-    if(tokenName){
-      fs.mkdirSync(ASSETS_DIR,{recursive:true});
-      const symbol=makeSymbolFromName(tokenName);
-
-      // save logo if provided
-      if(logoDataUrl){
-        const base=path.join(ASSETS_DIR, mintPub.toBase58());
-        const r=dataUrlToFile(logoDataUrl, base+"_logo");
-        savedLogo=path.basename(r.file);
-        imageUrl=(PUBLIC_BASE? (PUBLIC_BASE+"/bundler/assets/"+savedLogo) : ("/bundler/assets/"+savedLogo));
-      }
-
-      // write metadata json
-      const jsonName=mintPub.toBase58()+".json";
-      jsonUrl=(PUBLIC_BASE? (PUBLIC_BASE+"/bundler/assets/"+jsonName) : ("/bundler/assets/"+jsonName));
-      uri=jsonUrl;
-      const md={
-        name: tokenName,
-        symbol,
-        description: "Created via fireinners Bundler",
-        image: imageUrl || null,
-        external_url: PUBLIC_BASE? (PUBLIC_BASE+"/bundler/") : "/bundler/",
-        attributes:[]
-      };
-      fs.writeFileSync(path.join(ASSETS_DIR,jsonName), JSON.stringify(md,null,2));
-
-      const TOKEN_METADATA_PROGRAM_ID = mpl.PROGRAM_ID ? mpl.PROGRAM_ID : new PublicKey("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s");
-      const [pda] = PublicKey.findProgramAddressSync(
-        [Buffer.from("metadata"), TOKEN_METADATA_PROGRAM_ID.toBuffer(), mintPub.toBuffer()],
-        TOKEN_METADATA_PROGRAM_ID
-      );
-      metadataPda=pda.toBase58();
-
-      const ix = mpl.createCreateMetadataAccountV3Instruction(
-        {
-          metadata: pda,
-          mint: mintPub,
-          mintAuthority: payer.publicKey,
-          payer: payer.publicKey,
-          updateAuthority: payer.publicKey,
-          systemProgram: SystemProgram.programId,
-          rent: new PublicKey("SysvarRent111111111111111111111111111111111")
-        },
-        {
-          createMetadataAccountArgsV3: {
-            data: {
-              name: tokenName,
-              symbol: symbol,
-              uri: uri,
-              sellerFeeBasisPoints: 0,
-              creators: null,
-              collection: null,
-              uses: null
-            },
-            isMutable: true,
-            collectionDetails: null
-          }
-        }
-      );
-
-      const txm=new Transaction().add(ix);
-      txm.feePayer=payer.publicKey;
-      txm.recentBlockhash=(await conn.getLatestBlockhash("confirmed")).blockhash;
-      txm.sign(payer);
-      metaSig=await conn.sendRawTransaction(txm.serialize(),{skipPreflight:false,maxRetries:5});
-      await conn.confirmTransaction(metaSig,"confirmed");
-    }
-
-    return ok(res,{
-      ok:true,stub:false,
-      result:{
-        rpc,
-        payer:payer.publicKey.toBase58(),
-        owner:owner.toBase58(),
-        mint:mintPub.toBase58(),
-        ata:ata.address.toBase58(),
-        decimals,
-        supplyHuman,
-        amount:amount.toString(),
-        signatures:{mintTo:sigMintTo,revokeMint:sigRevokeMint,revokeFreeze:sigRevokeFreeze,metadata:metaSig},
-        metadata:{pda:metadataPda,uri,jsonUrl,imageUrl},
-        explorer:{
-          mint:"https://solscan.io/token/"+mintPub.toBase58(),
-          ata:"https://solscan.io/account/"+ata.address.toBase58()
-        }
-      }
-    });
-
-  }catch(e){
-    return bad(res,500,"SERVER_ERROR",{detail:String(e&&e.message||e)});
-  }
-});
-
-APP.use("/assets", express.static(path.join(__dirname,"public/assets")));
-
-const HOST=process.env.API_HOST||"127.0.0.1";
-const PORT=Number(process.env.API_PORT||9797);
-APP.listen(PORT,HOST,()=>console.log(JSON.stringify({ok:true,ts:now(),host:HOST,port:PORT,rpc:DEFAULT_RPC||null})));
-JS
-
-say "ensure nginx route for /bundler/assets/ (alias to API assets dir) + /bundler/api/ proxy"
-INC="/etc/nginx/includes/bundler_routes.inc"
-touch "$INC"
-python3 - "$INC" "$API_DIR" <<'"'"'PY'"'"'
-import sys,re
-inc=sys.argv[1]; api_dir=sys.argv[2]
-s=open(inc,"r",encoding="utf-8",errors="ignore").read()
-if "BUNDLER_ROUTES_META_V1" not in s:
-  block=f"""
-# BUNDLER_ROUTES_META_V1
-location ^~ /bundler/api/ {{
-  proxy_pass http://127.0.0.1:9797/;
-  proxy_http_version 1.1;
-  proxy_set_header Host $host;
-  proxy_set_header X-Real-IP $remote_addr;
-  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-}}
-location ^~ /bundler/assets/ {{
-  alias {api_dir}/public/assets/;
-  add_header Cache-Control "no-store";
-}}
-"""
-  s=(s.rstrip()+"\n\n"+block+"\n")
-open(inc,"w",encoding="utf-8").write(s)
-print("OK include:",inc)
-PY
-
-say "ensure vhost includes bundler_routes.inc (idempotent)"
-VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
-[ -f "$VHOST" ] || { say "ERROR: vhost not found: $VHOST"; exit 1; }
-grep -q "/etc/nginx/includes/bundler_routes.inc" "$VHOST" || {
-  # insert inside server { ... } after first server_name or listen line
-  python3 - "$VHOST" <<'"'"'PY'"'"'
-import sys,re
-p=sys.argv[1]
-s=open(p,"r",encoding="utf-8",errors="ignore").read().splitlines(True)
-out=[]
-in_server=False
-inserted=False
-depth=0
-for ln in s:
-  out.append(ln)
-  if re.search(r"^\s*server\s*\{", ln):
-    in_server=True
-    depth=1
-    continue
-  if in_server:
-    depth += ln.count("{")-ln.count("}")
-    if not inserted and re.search(r"^\s*(listen|server_name)\b", ln):
-      out.append("    include /etc/nginx/includes/bundler_routes.inc;\n")
-      inserted=True
-    if depth<=0:
-      in_server=False
-open(p,"w",encoding="utf-8").write("".join(out))
-print("OK injected include into",p)
-PY
-}
-
-say "systemd override to load env + keep workingdir"
-mkdir -p /etc/systemd/system/bundler-api.service.d
-cat > /etc/systemd/system/bundler-api.service.d/override.conf <<EOF
-[Service]
-WorkingDirectory=${API_DIR}
-EnvironmentFile=${API_DIR}/.env
-ExecStart=
-ExecStart=/usr/bin/node ${API_DIR}/server.js
-Restart=always
-RestartSec=2
-User=root
+write_file(){
+  local path="$1"; shift
+  backup "$path"
+  mkdir -p "$(dirname "$path")"
+  install -m 0644 /dev/null "$path"
+  cat >"$path" <<EOF
+$*
 EOF
+}
 
-say "reload systemd + restart api"
-systemctl daemon-reload
-systemctl enable --now "$SVC" >/dev/null 2>&1 || true
-systemctl restart "$SVC"
-sleep 1
-systemctl --no-pager -l status "$SVC" | sed -n "1,25p" || true
+dl(){
+  local url="$1" out="$2"
+  say "download: $out"
+  curl -fsSL "$url" -o "$out"
+}
 
-say "nginx test + reload"
+sha(){
+  local f="$1"
+  sha256sum "$f" | awk '{print $1}'
+}
+
+say "== 0) backup + unfreeze =="
+backup "$VHOST"
+backup "$INC"
+unfreeze
+
+say "== 1) web dirs =="
+mkdir -p "$VENDOR"
+chmod 0755 "$WEB" "$VENDOR" || true
+chown -R www-data:www-data "$WEB" 2>/dev/null || true
+
+say "== 2) vendor (PIN local) =="
+# PINNED versions (no @latest)
+# solana-web3 iife needs Buffer + process in many browsers
+SOLANA_VER="1.95.3"
+dl "https://unpkg.com/@solana/web3.js@${SOLANA_VER}/lib/index.iife.min.js" "$VENDOR/solana-web3.iife.min.js"
+dl "https://cdn.jsdelivr.net/npm/process@0.11.10/browser.js" "$VENDOR/process.min.js"
+dl "https://cdn.jsdelivr.net/npm/buffer@6.0.3/index.min.js" "$VENDOR/buffer.min.js"
+
+SOL_SHA="$(sha "$VENDOR/solana-web3.iife.min.js")"
+PROC_SHA="$(sha "$VENDOR/process.min.js")"
+BUF_SHA="$(sha "$VENDOR/buffer.min.js")"
+
+write_file "$VENDOR/SHA256SUMS.txt" "solana-web3.iife.min.js  $SOL_SHA
+process.min.js            $PROC_SHA
+buffer.min.js             $BUF_SHA
+"
+
+say "== 3) index.html (Phantom + finalized + idempotence + allowlist/quota) =="
+write_file "$WEB/index.html" "<!doctype html><html lang=\"fr\"><head><meta charset=\"utf-8\"/><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\"/><title>AIAQUILA • Execution Réel (Phantom) • Policy</title><style>
+:root{--bg:#05070b;--p:#0b1020;--b:#1b2450;--t:#e6ebff;--mut:rgba(230,235,255,.75);--ok:#3cff9e;--bad:#ff4d4d;}
+html,body{margin:0;padding:0;background:var(--bg);color:var(--t);font-family:system-ui}
+#top{padding:14px;border-bottom:1px solid var(--b);display:flex;gap:10px;align-items:center;justify-content:space-between;background:var(--p)}
+#grid{display:grid;grid-template-columns:420px 1fr;gap:12px;padding:12px}
+@media(max-width:980px){#grid{grid-template-columns:1fr}}
+.box{border:1px solid var(--b);border-radius:10px;padding:12px;background:rgba(7,12,24,.85)}
+.hd{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;white-space:pre-wrap;word-break:break-word;line-height:1.35}
+input,textarea,button{background:#0e1633;color:var(--t);border:1px solid #2b3cff;padding:10px;border-radius:10px;font-size:14px}
+textarea{width:100%;min-height:120px}
+button{cursor:pointer}
+.ok{border-color:var(--ok)}
+.bad{border-color:var(--bad)}
+.chip{display:inline-flex;gap:6px;align-items:center;border:1px solid var(--b);border-radius:999px;padding:6px 10px;font-size:12px;color:var(--mut);background:rgba(0,0,0,.18)}
+.small{font-size:12px;color:var(--mut)}
+hr{border:0;border-top:1px solid var(--b);margin:10px 0}
+</style></head><body>
+<div id=\"top\">
+  <div><b>AIAQUILA</b> <span class=\"small\">• Execution réelle Phantom • Policy (allowlist/quota) • finalized • idempotent</span></div>
+  <div class=\"row\">
+    <span class=\"chip\" id=\"chipNET\">NET: -</span>
+    <span class=\"chip\" id=\"chipRPC\">RPC: -</span>
+    <span class=\"chip\" id=\"chipW\">WALLET: -</span>
+    <span class=\"chip\" id=\"chipARM\">ARM: OFF</span>
+  </div>
+</div>
+
+<div id=\"grid\">
+  <div class=\"box\">
+    <div class=\"hd\"><b>Wallet + Policy</b><span class=\"chip\" id=\"chipPOL\">POLICY: -</span></div>
+    <div class=\"row\" style=\"margin-bottom:10px\">
+      <button class=\"ok\" id=\"btnConnect\">CONNECT PHANTOM</button>
+      <button class=\"bad\" id=\"btnDisconnect\">DISCONNECT</button>
+    </div>
+    <div class=\"row\" style=\"margin-bottom:10px\">
+      <button class=\"ok\" id=\"btnARM\">ARM</button>
+      <button class=\"bad\" id=\"btnDISARM\">DISARM</button>
+      <span class=\"small\" id=\"cooldown\"></span>
+    </div>
+
+    <div class=\"row\" style=\"margin-bottom:10px\">
+      <input id=\"dest\" placeholder=\"DEST (pubkey allowlist)\" style=\"flex:1;min-width:260px\"/>
+      <input id=\"lam\" placeholder=\"Lamports\" value=\"1000\" style=\"width:140px\"/>
+    </div>
+
+    <div class=\"row\" style=\"margin-bottom:14px\">
+      <button id=\"btnPropose\">PROPOSE (PENDING)</button>
+      <button class=\"ok\" id=\"btnApprove\">APPROUVER & SIGNER</button>
+      <button class=\"bad\" id=\"btnReject\">REJETER</button>
+      <button class=\"bad\" id=\"btnReset\">RESET PENDING</button>
+    </div>
+
+    <div class=\"small\">Allowlist JSON (dest→maxLamportsPerDay). Quota consommé uniquement après <b>finalized</b>.</div>
+    <textarea id=\"policy\"></textarea>
+    <div class=\"row\" style=\"margin-top:10px\">
+      <button id=\"btnSavePolicy\">SAVE POLICY</button>
+      <button id=\"btnLoadPolicy\">RELOAD</button>
+    </div>
+  </div>
+
+  <div class=\"box\">
+    <div class=\"hd\"><b>Console</b><span class=\"chip\" id=\"chipST\">STATE: -</span></div>
+    <div class=\"mono\" id=\"log\"></div>
+    <hr/>
+    <div class=\"small\">Pending</div>
+    <div class=\"mono\" id=\"pending\"></div>
+  </div>
+</div>
+
+<script src=\"/aiaquila/vendor/process.min.js\"></script>
+<script src=\"/aiaquila/vendor/buffer.min.js\"></script>
+<script src=\"/aiaquila/vendor/solana-web3.iife.min.js\"></script>
+<script>
+(function(){
+  // Buffer/process globals (safe)
+  try{ if(typeof globalThis.process==='undefined' && typeof process!=='undefined') globalThis.process=process; }catch(e){}
+  try{ if(typeof globalThis.Buffer==='undefined' && typeof buffer!=='undefined' && buffer.Buffer) globalThis.Buffer=buffer.Buffer; }catch(e){}
+
+  const {Connection,PublicKey,Transaction,SystemProgram,clusterApiUrl}=solanaWeb3;
+
+  const KEY='AIAQUILA_DB_V1';
+  const now=()=>Date.now();
+  const dayKey=()=>new Date().toISOString().slice(0,10); // UTC day
+  const $=id=>document.getElementById(id);
+
+  const DEFAULT_POLICY={
+    allowDests:{
+      \"11111111111111111111111111111111\": 5000
+    },
+    maxLamportsPerTx: 10000,
+    cooldownMsAfterFinalized: 15000
+  };
+
+  function load(){
+    try{ return JSON.parse(localStorage.getItem(KEY)||'null'); }catch(e){ return null; }
+  }
+  function save(db){
+    localStorage.setItem(KEY, JSON.stringify(db));
+  }
+  let DB=load()||{
+    arm:false,
+    wallet:null,
+    policy:DEFAULT_POLICY,
+    usage:{}, // {day:{dest:used}}
+    pending:null, // {id,status,dest,lamports,createdAt,signedB64,sig,blockhash,lastValidBlockHeight,err}
+    lastFinalizedAt:0,
+    logs:[]
+  };
+  save(DB);
+
+  function log(s){
+    DB.logs.push('['+new Date().toISOString()+'] '+s);
+    if(DB.logs.length>400) DB.logs=DB.logs.slice(-300);
+    save(DB);
+    render();
+  }
+
+  function setState(s){ $('chipST').textContent='STATE: '+s; }
+
+  // RPCs: primary DRPC + fallback mainnet
+  const RPCS=[
+    \"https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac\",
+    clusterApiUrl('mainnet-beta')
+  ];
+  let RPC_IDX=0;
+  function conn(commitment){ return new Connection(RPCS[RPC_IDX], commitment||'confirmed'); }
+  function rotateRPC(){ RPC_IDX=(RPC_IDX+1)%RPCS.length; $('chipRPC').textContent='RPC: '+RPC_IDX; }
+
+  async function withRetry(fn, label){
+    let wait=400;
+    for(let i=0;i<5;i++){
+      try{ return await fn(); }
+      catch(e){
+        const m=(e&&e.message)||String(e);
+        log(label+' fail '+(i+1)+'/5: '+m);
+        if(/429|rate|timeout|fetch|network/i.test(m)) rotateRPC();
+        await new Promise(r=>setTimeout(r, wait));
+        wait=Math.min(2500, Math.floor(wait*1.8));
+      }
+    }
+    throw new Error(label+' failed after retries');
+  }
+
+  function policyText(){ return JSON.stringify(DB.policy, null, 2); }
+  function parsePolicy(txt){
+    const p=JSON.parse(txt);
+    if(!p || typeof p!=='object') throw new Error('bad policy');
+    if(!p.allowDests || typeof p.allowDests!=='object') throw new Error('allowDests required');
+    p.maxLamportsPerTx = Number(p.maxLamportsPerTx||DEFAULT_POLICY.maxLamportsPerTx);
+    p.cooldownMsAfterFinalized = Number(p.cooldownMsAfterFinalized||DEFAULT_POLICY.cooldownMsAfterFinalized);
+    return p;
+  }
+
+  function usedToday(dest){
+    const d=dayKey();
+    const day=DB.usage[d]||{};
+    return Number(day[dest]||0);
+  }
+  function addUsageFinalized(dest, lamports){
+    const d=dayKey();
+    DB.usage[d]=DB.usage[d]||{};
+    DB.usage[d][dest]=Number(DB.usage[d][dest]||0)+Number(lamports||0);
+    save(DB);
+  }
+
+  function inCooldown(){
+    return now() < (DB.lastFinalizedAt + Number(DB.policy.cooldownMsAfterFinalized||0));
+  }
+
+  async function sha256Hex(str){
+    const enc=new TextEncoder().encode(str);
+    const buf=await crypto.subtle.digest('SHA-256', enc);
+    return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,'0')).join('');
+  }
+
+  let provider=null;
+
+  async function connectWallet(){
+    if(!window.solana) throw new Error('Phantom requis (sur iPhone: ouvrir dans le navigateur Phantom)');
+    provider=window.solana;
+    if(!provider.isPhantom) log('WARN: window.solana present but not Phantom');
+    const r=await provider.connect();
+    DB.wallet=r.publicKey.toString();
+    save(DB);
+    log('Wallet connecté: '+DB.wallet);
+  }
+
+  async function disconnectWallet(){
+    try{ if(provider && provider.disconnect) await provider.disconnect(); }catch(e){}
+    DB.wallet=null; save(DB);
+    log('Wallet déconnecté');
+  }
+
+  function validatePropose(destStr, lamStr){
+    if(!DB.arm) throw new Error('ARM requis');
+    if(!DB.wallet) throw new Error('Wallet requis');
+    if(inCooldown()) throw new Error('Cooldown actif');
+    const lam=Number(lamStr||0);
+    if(!Number.isFinite(lam) || lam<=0) throw new Error('Lamports invalid');
+    if(lam > Number(DB.policy.maxLamportsPerTx||0)) throw new Error('Depasse maxLamportsPerTx');
+    const dest=destStr.trim();
+    if(!dest) throw new Error('DEST requis');
+    if(!DB.policy.allowDests[dest]) throw new Error('DEST pas dans allowlist');
+    const maxDay=Number(DB.policy.allowDests[dest]);
+    const used=usedToday(dest);
+    if(used + lam > maxDay) throw new Error('Quota depasse (today '+used+'/'+maxDay+')');
+    return {dest,lam};
+  }
+
+  async function propose(){
+    const {dest,lam}=validatePropose($('dest').value, $('lam').value);
+    const id=await sha256Hex(DB.wallet+'|'+dest+'|'+lam+'|'+dayKey()+'|'+now());
+    DB.pending={id,status:'PROPOSED',dest,lamports:lam,createdAt:now(),signedB64:null,sig:null,blockhash:null,lastValidBlockHeight:null,err:null};
+    save(DB);
+    log('Proposed pending id='+id+' dest='+dest+' lamports='+lam);
+  }
+
+  function reject(){
+    if(DB.pending){ DB.pending.status='REJECTED'; DB.pending.err='user_reject'; save(DB); log('Pending rejeté'); }
+  }
+
+  function resetPending(){
+    DB.pending=null; save(DB); log('Pending reset');
+  }
+
+  async function approveAndSend(){
+    if(!DB.pending) throw new Error('No pending');
+    if(DB.pending.status==='FINALIZED') throw new Error('Already finalized');
+    if(!DB.arm) throw new Error('ARM requis');
+    if(!DB.wallet) throw new Error('Wallet requis');
+    if(inCooldown()) throw new Error('Cooldown actif');
+    const dest=DB.pending.dest, lam=Number(DB.pending.lamports);
+
+    // If already signed, reuse signed bytes (idempotent)
+    if(DB.pending.signedB64){
+      setState('SENDING');
+      const signedBytes=Uint8Array.from(atob(DB.pending.signedB64), c=>c.charCodeAt(0));
+      const c=conn('confirmed');
+      const sig=await withRetry(()=>c.sendRawTransaction(signedBytes,{skipPreflight:false,maxRetries:3}), 'sendRawTransaction');
+      DB.pending.sig=sig; DB.pending.status='SENT'; save(DB);
+      log('TX resent (idempotent) sig='+sig);
+      await confirmFinalized();
+      return;
+    }
+
+    setState('PREPARE');
+    const c=conn('confirmed');
+    const from=new PublicKey(DB.wallet);
+    const to=new PublicKey(dest);
+
+    const latest=await withRetry(()=>c.getLatestBlockhash('confirmed'), 'getLatestBlockhash');
+    const tx=new Transaction().add(SystemProgram.transfer({fromPubkey:from,toPubkey:to,lamports:lam}));
+    tx.feePayer=from;
+    tx.recentBlockhash=latest.blockhash;
+
+    DB.pending.blockhash=latest.blockhash;
+    DB.pending.lastValidBlockHeight=latest.lastValidBlockHeight;
+    DB.pending.status='SIGNING';
+    save(DB);
+    log('Signing...');
+
+    let signed;
+    try{
+      signed=await provider.signTransaction(tx);
+    }catch(e){
+      DB.pending.status='REJECTED'; DB.pending.err='sign_reject'; save(DB);
+      throw e;
+    }
+
+    const bytes=signed.serialize();
+    DB.pending.signedB64=btoa(String.fromCharCode.apply(null, Array.from(bytes)));
+    DB.pending.status='SIGNED';
+    save(DB);
+    log('Signed OK (stored signed tx for replay-safe)');
+
+    setState('SENDING');
+    const sig=await withRetry(()=>c.sendRawTransaction(bytes,{skipPreflight:false,maxRetries:3}), 'sendRawTransaction');
+    DB.pending.sig=sig;
+    DB.pending.status='SENT';
+    save(DB);
+    log('Sent sig='+sig);
+
+    await confirmFinalized();
+  }
+
+  async function confirmFinalized(){
+    if(!DB.pending || !DB.pending.sig) throw new Error('No sig to confirm');
+    setState('CONFIRMING_FINALIZED');
+    const c=conn('finalized');
+    const sig=DB.pending.sig;
+    const bh=DB.pending.blockhash;
+    const lvh=DB.pending.lastValidBlockHeight;
+
+    await withRetry(async()=>{
+      // confirmTransaction can take {signature,blockhash,lastValidBlockHeight}
+      await c.confirmTransaction({signature:sig,blockhash:bh,lastValidBlockHeight:lvh}, 'finalized');
+      return true;
+    }, 'confirmTransaction(finalized)');
+
+    DB.pending.status='FINALIZED';
+    DB.lastFinalizedAt=now();
+    addUsageFinalized(DB.pending.dest, DB.pending.lamports);
+    save(DB);
+    log('FINALIZED ✅ sig='+sig+' (quota consumed)');
+    setState('FINALIZED');
+  }
+
+  function render(){
+    $('chipARM').textContent='ARM: '+(DB.arm?'ON':'OFF');
+    $('chipW').textContent='WALLET: '+(DB.wallet?DB.wallet.slice(0,4)+'…'+DB.wallet.slice(-4):'-');
+    $('chipNET').textContent='NET: mainnet';
+    $('chipRPC').textContent='RPC: '+RPC_IDX;
+    $('policy').value=policyText();
+    $('chipPOL').textContent='POLICY: '+Object.keys(DB.policy.allowDests||{}).length+' dest(s)';
+    $('log').textContent=(DB.logs||[]).slice(-120).join('\\n');
+    $('pending').textContent=DB.pending?JSON.stringify(DB.pending,null,2):'-';
+    const cd=inCooldown()?Math.max(0, Math.ceil((DB.lastFinalizedAt+Number(DB.policy.cooldownMsAfterFinalized||0)-now())/1000)):0;
+    $('cooldown').textContent=cd?('cooldown '+cd+'s'):'';
+  }
+  render();
+  setState('IDLE');
+
+  // Resume confirm if refresh happened after send
+  (async()=>{
+    try{
+      if(DB.pending && (DB.pending.status==='SENT' || DB.pending.status==='SIGNED') && DB.pending.sig){
+        log('Resume pending confirm...');
+        await confirmFinalized();
+      }
+    }catch(e){
+      log('Resume failed: '+((e&&e.message)||String(e)));
+    }
+  })();
+
+  $('btnConnect').onclick=async()=>{ try{ setState('CONNECT'); await connectWallet(); setState('READY'); }catch(e){ log('Connect err: '+((e&&e.message)||String(e))); setState('ERR'); } };
+  $('btnDisconnect').onclick=async()=>{ try{ await disconnectWallet(); setState('IDLE'); }catch(e){ log('Disconnect err: '+((e&&e.message)||String(e))); } };
+
+  $('btnARM').onclick=()=>{ DB.arm=true; save(DB); log('ARM ON'); render(); };
+  $('btnDISARM').onclick=()=>{ DB.arm=false; save(DB); log('ARM OFF'); render(); };
+
+  $('btnPropose').onclick=async()=>{ try{ setState('PROPOSE'); await propose(); setState('PROPOSED'); }catch(e){ log('Propose err: '+((e&&e.message)||String(e))); setState('ERR'); } };
+  $('btnApprove').onclick=async()=>{ try{ await approveAndSend(); }catch(e){ DB.pending && (DB.pending.status='FAILED', DB.pending.err=((e&&e.message)||String(e)), save(DB)); log('Approve/send err: '+((e&&e.message)||String(e))); setState('FAILED'); } };
+  $('btnReject').onclick=()=>{ try{ reject(); setState('REJECTED'); }catch(e){} };
+  $('btnReset').onclick=()=>{ resetPending(); setState('IDLE'); };
+
+  $('btnSavePolicy').onclick=()=>{ try{ DB.policy=parsePolicy($('policy').value); save(DB); log('Policy saved'); render(); }catch(e){ log('Policy parse err: '+((e&&e.message)||String(e))); } };
+  $('btnLoadPolicy').onclick=()=>{ render(); log('Policy reloaded'); };
+
+})();
+</script>
+</body></html>
+"
+
+say "== 4) nginx include routes =="
+write_file "$INC" "# ${SLUG} routes (AUTO)
+location = /${SLUG} { return 301 /${SLUG}/; }
+location ^~ /${SLUG}/ {
+  alias ${WEB}/;
+  try_files \$uri \$uri/ /${SLUG}/index.html;
+  add_header Cache-Control \"no-store\" always;
+}
+"
+
+say "== 5) inject include into vhost (idempotent) =="
+MARK=\"# ${SLUG}_AUTOINC\"
+if ! grep -qF "$INC" "$VHOST"; then
+  python3 - "$VHOST" "$DOMAIN" "$INC" "$MARK" <<'PY'
+import re,sys
+p,dom,inc,mark=sys.argv[1],sys.argv[2],sys.argv[3],sys.argv[4]
+s=open(p,'r',encoding='utf-8',errors='ignore').read()
+def patch(block):
+  if inc in block: return block, False
+  if not re.search(r'\blisten\b[^;]*\b443\b', block): return block, False
+  if not re.search(r'\bserver_name\b[^;]*\b'+re.escape(dom)+r'\b', block): return block, False
+  lines=block.splitlines()
+  ins=None
+  for i,l in enumerate(lines):
+    if re.search(r'\bserver_name\b', l):
+      ins=i+1; break
+  if ins is None: ins=1
+  lines.insert(ins, f\"    {mark}\")
+  lines.insert(ins+1, f\"    include {inc};\")
+  return \"\\n\".join(lines), True
+
+out=[]; changed=False; pos=0
+for m in re.finditer(r'server\\s*\\{', s):
+  start=m.start(); out.append(s[pos:start])
+  i=start; depth=0
+  while i < len(s):
+    c=s[i]
+    if c=='{': depth+=1
+    elif c=='}':
+      depth-=1
+      if depth==0:
+        end=i+1; b=s[start:end]
+        nb,ch=patch(b)
+        out.append(nb); changed=changed or ch; pos=end
+        break
+    i+=1
+new=\"\".join(out)+s[pos:]
+if changed:
+  open(p,'w',encoding='utf-8').write(new)
+PY
+fi
+
+say "== 6) nginx test + reload =="
 nginx -t
 systemctl reload nginx
 
-say "smoke tests (origin localhost)"
-curl -sS "http://127.0.0.1:9797/health" || true
-curl -k -sS --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/bundler/api/health" || true
-curl -k -sS --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/bundler/assets/" -I | sed -n "1,5p" || true
+say "== 7) smoke tests (local TLS) =="
+echo "--- /${SLUG}/ ---"
+curl -skI -H "Host: ${DOMAIN}" "https://127.0.0.1/${SLUG}/" | head -n 15 || true
+echo "--- vendor solana-web3 ---"
+curl -skI -H "Host: ${DOMAIN}" "https://127.0.0.1/${SLUG}/vendor/solana-web3.iife.min.js" | head -n 15 || true
+echo "--- include present ---"
+nginx -T 2>/dev/null | grep -n "${SLUG}_routes" | head -n 20 || true
+
+say "== 8) freeze nginx files =="
+freeze
 
 say "DONE"
-say "BACKUP=$BK"
-say "NOTE: For on-chain metadata, fill Token Name + (optional) Logo, UNCHECK PREFLIGHT_ONLY, then Create. This will spend SOL from the server payer wallet."
-'
+say "URL: https://${DOMAIN}/${SLUG}/"
+say "FS:  ${WEB}/index.html"
+say "INC: ${INC}"
+say "VHOST:${VHOST}"
+say "BK:  ${BK}"
+BASH
+chmod 755 /root/MEGA_AIAQUILA_DEPLOY_V1.sh
+bash /root/MEGA_AIAQUILA_DEPLOY_V1.sh
