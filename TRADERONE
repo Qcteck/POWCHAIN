@@ -1,48 +1,77 @@
-cat >/root/MEGA_AQFIX_VERIFY.sh <<'BASH'
+cat >/root/MEGA_AIAQUILA_FIX_NPM_LOCK.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
-umask 022
-cd /root
+TS="$(date +%Y%m%d_%H%M%S)"
 say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
+die(){ say "ERR: $*"; exit 1; }
+[ "$(id -u)" -eq 0 ] || die "run as root"
 
-DOMAIN="fireinners.online"
-PATH_A="/iaaquila"
-PATH_B="/aquila_stacking"
-WEBROOT="/var/www/iaaquila"
-INC="/etc/nginx/includes/iaaquila_routes.inc"
+APP="/opt/aiaquila"
+PUB="/var/www/aiaquila"
+SVC="aiaquila.service"
+BK="/root/AIAQUILA_FIX_NPM_${TS}"
+mkdir -p "$BK"
 
-say "== VERIFY IAAQUILA =="
-say "1) /root suspicious filenames (top 30 by length)"
-ls -1 /root 2>/dev/null | awk '{print length($0),$0}' | sort -nr | head -n 30 || true
+need(){ command -v "$1" >/dev/null 2>&1 || die "missing: $1"; }
+need node; need npm; need systemctl; need curl
 
-say "2) Webroot sanity"
-ls -la "$WEBROOT" 2>/dev/null | sed -n '1,120p' || true
-test -f "$WEBROOT/index.html" && say "OK: index.html present" || say "WARN: no index.html in $WEBROOT"
+say "== 1) backup =="
+tar -C / -czf "$BK/app.tgz" "opt/aiaquila" 2>/dev/null || true
+tar -C / -czf "$BK/pub.tgz" "var/www/aiaquila" 2>/dev/null || true
 
-say "3) Nginx include sanity"
-test -f "$INC" && { say "OK: $INC exists"; sed -n '1,220p' "$INC" | sed -n '1,120p'; } || say "ERR: missing $INC"
+say "== 2) stop service =="
+systemctl stop "$SVC" 2>/dev/null || true
 
-say "4) Nginx config test"
-nginx -t
+say "== 3) normalize package.json (pin exact) =="
+cd "$APP"
+cat >"$APP/package.json"<<'JSON'
+{"name":"aiaquila","version":"1.0.0","type":"module","private":true,
+"dependencies":{"cors":"2.8.5","express":"4.19.2"},
+"devDependencies":{"esbuild":"0.21.5","@solana/web3.js":"1.95.4","buffer":"6.0.3"}}
+JSON
 
-say "5) Reload nginx"
-systemctl reload nginx || true
+say "== 4) clean lock + node_modules (regen lock on VPS) =="
+rm -rf "$APP/node_modules" "$APP/package-lock.json" 2>/dev/null || true
 
-say "6) Local HTTPS tests (must NOT be 404)"
-echo "--- ${PATH_A}/ ---"
-curl -skI -H "Host: ${DOMAIN}" "https://127.0.0.1${PATH_A}/" | head -n 20 || true
-echo "--- ${PATH_B}/ ---"
-curl -skI -H "Host: ${DOMAIN}" "https://127.0.0.1${PATH_B}/" | head -n 20 || true
+say "== 5) npm install (creates fresh lock for this machine) =="
+npm install --no-audit --no-fund
 
-say "7) Include hit (nginx -T)"
-nginx -T 2>/dev/null | grep -n "iaaquila_routes\.inc" -n | head -n 50 || true
+say "== 6) rebuild vendor bundle (no CDN) =="
+cat >"$APP/build-vendor.mjs"<<'MJS'
+import esbuild from"esbuild";
+await esbuild.build({
+ entryPoints:["./vendor-entry.js"],
+ bundle:true,format:"esm",platform:"browser",target:["es2020"],
+ outfile:"/var/www/aiaquila/vendor/solana-web3-bundle.js",
+ define:{"global":"globalThis","process.env.NODE_ENV":"\"production\""},
+ logLevel:"silent"
+});
+MJS
+cat >"$APP/vendor-entry.js"<<'JS'
+import {Buffer} from"buffer";
+if(!globalThis.Buffer) globalThis.Buffer=Buffer;
+export * from"@solana/web3.js";
+JS
+mkdir -p "$PUB/vendor"
+node "$APP/build-vendor.mjs"
+test -s "$PUB/vendor/solana-web3-bundle.js" || die "vendor bundle missing"
 
-say "8) nginx errors (last 80 lines)"
-tail -n 80 /var/log/nginx/error.log 2>/dev/null || true
+say "== 7) start service =="
+systemctl daemon-reload
+systemctl start "$SVC"
+sleep 1
+systemctl --no-pager --full status "$SVC" | sed -n '1,18p' || true
 
-say "DONE"
-say "Open: https://${DOMAIN}${PATH_A}/"
-say "Open: https://${DOMAIN}${PATH_B}/"
+say "== 8) smoke tests =="
+BASE="/aiaquila"
+PORT="${AIAQUILA_PORT:-9690}"
+curl -fsS "http://127.0.0.1:9690${BASE}/api/health" | sed 's/^/API(LOCAL): /' || true
+curl -fsSI "https://127.0.0.1${BASE}/" -H "Host: fireinners.online" -k | head -n 12 || true
+
+say "DONE:"
+say "BK: $BK"
+say "URL: https://fireinners.online${BASE}/"
+say "API: https://fireinners.online${BASE}/api/health"
 BASH
-chmod +x /root/MEGA_AQFIX_VERIFY.sh
-bash /root/MEGA_AQFIX_VERIFY.sh
+chmod 755 /root/MEGA_AIAQUILA_FIX_NPM_LOCK.sh
+bash /root/MEGA_AIAQUILA_FIX_NPM_LOCK.sh
