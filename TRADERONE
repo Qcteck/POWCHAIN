@@ -1,1 +1,238 @@
-nginx -T 2>/dev/null | grep -n "location /aquilastacking" -n | head -n 50
+cat >/root/MEGA_AQUILA_STACKING_GLOBAL_DEDUP_FIX.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+umask 022
+TS="$(date +%Y%m%d_%H%M%S)"
+BK="/root/AQUILA_STACKING_GLOBAL_DEDUP_BK_${TS}"
+mkdir -p "$BK"
+say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
+die(){ echo "ERR: $*" >&2; exit 1; }
+
+DOMAIN="fireinners.online"
+PATH_APP="/aquilastacking"
+WEBROOT="/var/www/aquilastacking"
+INC="/etc/nginx/includes/aquilastacking_routes.inc"
+NGX="/etc/nginx/nginx.conf"
+VHOST_A="/etc/nginx/sites-available/fireinners.online-ssl"
+VHOST_E="/etc/nginx/sites-enabled/fireinners.online-ssl"
+
+backup_one(){ local p="$1"; [ -e "$p" ] || return 0; mkdir -p "$BK/$(dirname "$p")"; cp -a "$p" "$BK/$p.bak" 2>/dev/null || true; }
+lsattr_safe(){ lsattr "$1" 2>/dev/null | awk '{print $1}' || echo ""; }
+unfreeze_one(){ local f="$1"; [ -e "$f" ] || return 0; local a; a="$(lsattr_safe "$f")"; if echo "$a" | grep -q 'i'; then say "UNFREEZE: chattr -i $f"; chattr -i "$f" 2>/dev/null || true; fi; }
+refreeze_one(){ local f="$1"; [ -e "$f" ] || return 0; say "REFREEZE: chattr +i $f"; chattr +i "$f" 2>/dev/null || true; }
+
+ensure_webroot(){
+  mkdir -p "$WEBROOT"
+  if [ ! -f "$WEBROOT/index.html" ]; then
+    say "Create placeholder index.html"
+    cat >"$WEBROOT/index.html"<<'EOF'
+<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Aquila Stacking</title>
+<body style="margin:0;font-family:system-ui;background:#0b0f14;color:#e6eef8">
+<div style="max-width:860px;margin:40px auto;padding:24px">
+<h1 style="margin:0 0 12px">Aquila Stacking</h1>
+<p>Placeholder (build non déployé). Dépose ton build dans <b>/var/www/aquilastacking</b>.</p>
+</div></body>
+EOF
+  fi
+  chown -R www-data:www-data "$WEBROOT" 2>/dev/null || true
+  chmod -R a+rX "$WEBROOT" 2>/dev/null || true
+}
+
+write_inc_clean(){
+  say "Rewrite include CLEAN: $INC"
+  backup_one "$INC"
+  mkdir -p "$(dirname "$INC")"
+  cat >"$INC"<<EOF
+## aquilastacking_routes (clean canonical)
+location = ${PATH_APP} { return 301 ${PATH_APP}/; }
+location ${PATH_APP}/ {
+  alias ${WEBROOT}/;
+  index index.html;
+  try_files \$uri \$uri/ /index.html;
+  add_header Cache-Control "no-store" always;
+}
+location = ${PATH_APP}/sw.js { add_header Cache-Control "no-store" always; return 404; }
+location = ${PATH_APP}/service-worker.js { add_header Cache-Control "no-store" always; return 404; }
+location = ${PATH_APP}/manifest.json { add_header Cache-Control "no-store" always; return 404; }
+EOF
+}
+
+scan_report(){
+  say "Scan occurrences in /etc/nginx (before cleanup)"
+  grep -RIn --color=never -E "aquilastacking|location[[:space:]]+=?[[:space:]]*/aquilastacking" /etc/nginx 2>/dev/null | head -n 200 || true
+}
+
+global_cleanup(){
+  say "Global cleanup: remove ALL location blocks for ${PATH_APP} outside canonical include, and dedup include lines"
+  python3 - "$INC" <<'PY'
+import os,re,sys
+
+CANON=sys.argv[1]
+root="/etc/nginx"
+
+loc_re=re.compile(r'^\s*location\s+(?:=|~\*|~|\^~)?\s*/aquilastacking(?:/|\s|\{)', re.I)
+inc_re=re.compile(r'^\s*include\s+([^;]*aquilastacking_routes\.inc)\s*;\s*$', re.I)
+
+def read(p):
+    try: return open(p,'r',encoding='utf-8',errors='ignore').read().splitlines(True)
+    except: return None
+
+def write(p,lines):
+    tmp=p+".tmp"
+    with open(tmp,'w',encoding='utf-8') as f: f.writelines(lines)
+    os.replace(tmp,p)
+
+def remove_location_blocks(lines):
+    out=[]
+    i=0
+    removed=0
+    while i<len(lines):
+        line=lines[i]
+        if loc_re.match(line):
+            # remove the whole block by brace depth
+            depth=line.count('{')-line.count('}')
+            i+=1
+            while i<len(lines) and depth>0:
+                depth += lines[i].count('{')-lines[i].count('}')
+                i+=1
+            removed+=1
+            continue
+        out.append(line); i+=1
+    return out, removed
+
+def dedup_include_lines(lines):
+    out=[]
+    seen=False
+    removed=0
+    for line in lines:
+        m=inc_re.match(line)
+        if m:
+            if not seen:
+                out.append(line); seen=True
+            else:
+                removed+=1
+            continue
+        out.append(line)
+    return out, removed
+
+targets=[]
+for dirpath,_,filenames in os.walk(root):
+    for fn in filenames:
+        if not (fn.endswith(".conf") or fn.endswith(".inc") or fn in ("nginx.conf",)): continue
+        p=os.path.join(dirpath,fn)
+        targets.append(p)
+
+changes=[]
+for p in sorted(targets):
+    txt=read(p)
+    if txt is None: 
+        continue
+    s="".join(txt)
+    if "aquilastacking" not in s and "/aquilastacking" not in s:
+        continue
+
+    # canonical include: keep location blocks, just ensure no duplicate include lines inside it (rare)
+    if os.path.realpath(p)==os.path.realpath(CANON):
+        new, di = dedup_include_lines(txt)
+        if di:
+            changes.append((p,f"dedup include lines: -{di}"))
+            write(p,new)
+        continue
+
+    new=txt
+    new, rl = remove_location_blocks(new)
+    new, di = dedup_include_lines(new)
+    if rl or di:
+        changes.append((p,f"removed location blocks:{rl}, dedup include lines:{di}"))
+        write(p,new)
+
+print("CHANGES:")
+for p,msg in changes:
+    print(" -",p,":",msg)
+if not changes:
+    print(" (none)")
+PY
+}
+
+ensure_vhost_has_include_once(){
+  say "Ensure vhost has canonical include ONCE (sites-available + sites-enabled if file exists)"
+  for v in "$VHOST_A" "$VHOST_E"; do
+    [ -f "$v" ] || continue
+    backup_one "$v"
+    python3 - "$v" "$INC" <<'PY'
+import sys,re
+p,inc=sys.argv[1],sys.argv[2]
+s=open(p,'r',encoding='utf-8',errors='ignore').read().splitlines(True)
+
+needle=f"include {inc};"
+has_any=any(needle in line for line in s)
+
+# remove duplicates of the exact needle line
+out=[]
+seen=False
+removed=0
+for line in s:
+    if needle in line:
+        if not seen:
+            out.append(line); seen=True
+        else:
+            removed+=1
+        continue
+    out.append(line)
+
+# if no include at all, inject inside server{ ... } near top (after listen/server_name if possible)
+if not has_any:
+    idx=None
+    for i,line in enumerate(out):
+        if re.match(r'^\s*server\s*\{', line):
+            idx=i+1; break
+    if idx is None:
+        # no server block, just append at end
+        out.append("\n"+needle+"\n")
+    else:
+        out.insert(idx, "  "+needle+"\n")
+
+open(p,'w',encoding='utf-8').write("".join(out))
+print(f"vhost {p}: removed_dups={removed}, injected={0 if has_any else 1}")
+PY
+  done
+}
+
+main(){
+  say "BEGIN STACKING GLOBAL DEDUP FIX @ $TS"
+  say "BK: $BK"
+
+  # unfreeze likely files
+  for f in "$NGX" "$VHOST_A" "$VHOST_E" "$INC"; do unfreeze_one "$f"; done
+  # also unfreeze all nginx includes + vhosts (safe, only chattr flags)
+  for f in /etc/nginx/sites-available/* /etc/nginx/sites-enabled/* /etc/nginx/includes/*.inc; do unfreeze_one "$f"; done
+
+  ensure_webroot
+  write_inc_clean
+  scan_report
+  global_cleanup
+  ensure_vhost_has_include_once
+
+  say "Scan occurrences in /etc/nginx (after cleanup)"
+  grep -RIn --color=never -E "aquilastacking|location[[:space:]]+=?[[:space:]]*/aquilastacking" /etc/nginx 2>/dev/null | head -n 200 || true
+
+  say "nginx -t"
+  nginx -t
+  say "reload nginx"
+  systemctl reload nginx
+
+  say "Quick check"
+  curl -skI -H "Host: ${DOMAIN}" "https://127.0.0.1${PATH_APP}/" | head -n 12 || true
+
+  # refreeze main files + include (leave other files as-is)
+  refreeze_one "$INC"
+  refreeze_one "$VHOST_A"
+  refreeze_one "$NGX"
+
+  say "DONE"
+  say "Open: https://${DOMAIN}${PATH_APP}/"
+}
+main
+BASH
+chmod +x /root/MEGA_AQUILA_STACKING_GLOBAL_DEDUP_FIX.sh
+bash /root/MEGA_AQUILA_STACKING_GLOBAL_DEDUP_FIX.sh
