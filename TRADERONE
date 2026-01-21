@@ -1,107 +1,297 @@
-bash -lc 'cat > /root/BUNDLER_FIX_404.sh <<'"'"'SH'"'"'
+cat > /root/MEGA_BUNDLER_FIX_404.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-ts(){ date +%Y%m%d_%H%M%S; }
-say(){ printf "[%s] %s\n" "$(date +%H:%M:%S)" "$*"; }
-die(){ say "ERROR: $*"; exit 1; }
-need_root(){ [ "$(id -u)" -eq 0 ] || die "run as root"; }
+need_root(){ [ "$(id -u)" -eq 0 ] || { echo "RUN AS ROOT"; exit 1; }; }
 need_root
 
-DOMAIN="fireinners.online"
-VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
-NGINX_CONF="/etc/nginx/nginx.conf"
+DOMAIN="${DOMAIN:-fireinners.online}"
+ORIGIN_IP="${ORIGIN_IP:-72.61.79.12}"        # IP VPS attendu (bypass Cloudflare)
 INC_DIR="/etc/nginx/includes"
 INC_FILE="${INC_DIR}/bundler_routes.inc"
 
 WEBROOT="/var/www/bundler"
 API_DIR="/opt/bundler_api"
-API_PORT="9797"
-API_HOST="127.0.0.1"
+API_PORT="${API_PORT:-9797}"
+API_HOST="${API_HOST:-127.0.0.1}"
 SVC="/etc/systemd/system/bundler-api.service"
 
-BK="/root/BUNDLER_FIX_404_$(ts)"
+TS="$(date +%Y%m%d_%H%M%S)"
+BK="/root/BUNDLER_FIX_${TS}"
 mkdir -p "$BK"
 
+say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
+
 say "backup: $BK"
-[ -f "$NGINX_CONF" ] && cp -a "$NGINX_CONF" "$BK/nginx.conf.bak" || true
-[ -f "$VHOST" ] && cp -a "$VHOST" "$BK/$(basename "$VHOST").bak" || true
-[ -f "$INC_FILE" ] && cp -a "$INC_FILE" "$BK/$(basename "$INC_FILE").bak" || true
-[ -f "$SVC" ] && cp -a "$SVC" "$BK/$(basename "$SVC").bak" || true
+cp -a /etc/nginx "$BK/nginx" 2>/dev/null || true
+cp -a /etc/systemd/system "$BK/systemd_system" 2>/dev/null || true
+mkdir -p "$BK/www" && cp -a "$WEBROOT" "$BK/www/bundler" 2>/dev/null || true
+mkdir -p "$BK/opt" && cp -a "$API_DIR" "$BK/opt/bundler_api" 2>/dev/null || true
 
-say "ensure dirs"
-mkdir -p "$INC_DIR" "$WEBROOT" "$API_DIR"
-chmod 755 "$WEBROOT" || true
+say "nginx: extract active vhost for ${DOMAIN}"
+NGT="$BK/nginx_T.txt"
+nginx -T >"$NGT" 2>&1 || { tail -n 200 "$NGT" || true; exit 1; }
 
-say "write nginx include: $INC_FILE"
-cat > "$INC_FILE" <<EOF
-# === BUNDLER ROUTES (AUTOGEN) ===
+ACTIVE_SSL_FILE="$(python3 - <<PY
+import re,sys
+p=open("$NGT","r",errors="ignore").read().splitlines()
+cur=None
+blocks=[]
+buf=[]
+for ln in p:
+  m=re.match(r'^# configuration file (.+?):', ln)
+  if m: cur=m.group(1); continue
+  if cur: blocks.append((cur, ln))
+# parse server blocks roughly using brace depth on combined stream while tracking file
+servers=[]
+depth=0; in_server=False; s_lines=[]; s_file=None
+def count_braces(s): return s.count('{'), s.count('}')
+for f,ln in blocks:
+  l=ln.strip()
+  if l.startswith('#'): continue
+  if not in_server:
+    if re.search(r'\\bserver\\s*\\{', l):
+      in_server=True; s_lines=[ln]; s_file=f
+      ob,cb=count_braces(ln); depth=ob-cb
+      continue
+  else:
+    s_lines.append(ln)
+    ob,cb=count_braces(ln); depth += ob-cb
+    if depth<=0:
+      txt="\\n".join(s_lines)
+      servers.append((s_file, txt))
+      in_server=False; s_lines=[]; s_file=None; depth=0
+      continue
+
+dom=re.compile(r'\\bserver_name\\b[^;]*\\b'+re.escape("$DOMAIN")+r'\\b', re.I)
+listen443=re.compile(r'\\blisten\\b[^;]*\\b443\\b[^;]*\\bssl\\b', re.I)
+
+for f,txt in servers:
+  if dom.search(txt) and listen443.search(txt):
+    print(f); sys.exit(0)
+print("")
+PY
+)"
+
+ACTIVE_HTTP_FILE="$(python3 - <<PY
+import re,sys
+p=open("$NGT","r",errors="ignore").read().splitlines()
+cur=None
+blocks=[]
+for ln in p:
+  m=re.match(r'^# configuration file (.+?):', ln)
+  if m: cur=m.group(1); continue
+  if cur: blocks.append((cur, ln))
+servers=[]
+depth=0; in_server=False; s_lines=[]; s_file=None
+def count_braces(s): return s.count('{'), s.count('}')
+for f,ln in blocks:
+  l=ln.strip()
+  if l.startswith('#'): continue
+  if not in_server:
+    if re.search(r'\\bserver\\s*\\{', l):
+      in_server=True; s_lines=[ln]; s_file=f
+      ob,cb=count_braces(ln); depth=ob-cb
+      continue
+  else:
+    s_lines.append(ln)
+    ob,cb=count_braces(ln); depth += ob-cb
+    if depth<=0:
+      txt="\\n".join(s_lines)
+      servers.append((s_file, txt))
+      in_server=False; s_lines=[]; s_file=None; depth=0
+      continue
+
+dom=re.compile(r'\\bserver_name\\b[^;]*\\b'+re.escape("$DOMAIN")+r'\\b', re.I)
+listen80=re.compile(r'\\blisten\\b[^;]*\\b80\\b', re.I)
+
+for f,txt in servers:
+  if dom.search(txt) and listen80.search(txt):
+    print(f); sys.exit(0)
+print("")
+PY
+)"
+
+say "active ssl file: ${ACTIVE_SSL_FILE:-NONE}"
+say "active http file: ${ACTIVE_HTTP_FILE:-NONE}"
+
+[ -n "${ACTIVE_SSL_FILE:-}" ] || { say "FAIL: no active SSL vhost found for ${DOMAIN}"; exit 1; }
+
+say "nginx: write include ${INC_FILE}"
+mkdir -p "$INC_DIR"
+cat >"$INC_FILE" <<EOF
+# AUTO: bundler routes (${TS})
 location = /bundler { return 301 /bundler/; }
+location ^~ /bundler/ {
+  alias ${WEBROOT}/;
+  try_files \$uri \$uri/ /bundler/index.html;
+}
+location = /bundler/api { return 301 /bundler/api/; }
 location ^~ /bundler/api/ {
   proxy_http_version 1.1;
   proxy_set_header Host \$host;
   proxy_set_header X-Real-IP \$remote_addr;
   proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
   proxy_set_header X-Forwarded-Proto \$scheme;
-  proxy_set_header Connection "";
   proxy_pass http://${API_HOST}:${API_PORT}/;
-}
-location ^~ /bundler/ {
-  alias ${WEBROOT}/;
-  try_files \$uri \$uri/ /bundler/index.html;
-  add_header Cache-Control "no-store";
 }
 EOF
 
-say "ensure vhost include present: $VHOST"
-[ -f "$VHOST" ] || die "missing vhost: $VHOST"
-if ! grep -qF "include $INC_FILE;" "$VHOST"; then
-  awk -v inc="    include '"$INC_FILE"';" '
-    BEGIN{inserver=0;done=0}
-    /^[[:space:]]*server[[:space:]]*\{/ {inserver=1}
-    inserver && $0 ~ /^[[:space:]]*\}/ && done==0 {print inc; done=1}
-    {print}
-  ' "$VHOST" > "$BK/vhost.new"
-  cp -a "$BK/vhost.new" "$VHOST"
+say "nginx: inject include into active ssl server{} (first match)"
+python3 - <<PY
+import re,sys,shutil
+path="$ACTIVE_SSL_FILE"
+bk="$BK/$(path.strip('/').replace('/','_'))"
+shutil.copy2(path,bk)
+
+lines=open(path,'r',errors='ignore').read().splitlines(True)
+
+dom=re.compile(r'\\bserver_name\\b[^;]*\\b'+re.escape("$DOMAIN")+r'\\b', re.I)
+listen443=re.compile(r'\\blisten\\b[^;]*\\b443\\b[^;]*\\bssl\\b', re.I)
+inc=re.compile(r'\\binclude\\s+'+re.escape("$INC_FILE")+r'\\s*;', re.I)
+
+out=[]
+depth=0
+in_srv=False
+srv_has_dom=False
+srv_has_443=False
+srv_has_inc=False
+injected=False
+
+def brace_delta(s):
+  return s.count('{')-s.count('}')
+
+for i,ln in enumerate(lines):
+  stripped=ln.strip()
+  if not in_srv and re.search(r'\\bserver\\s*\\{', stripped):
+    in_srv=True; srv_has_dom=False; srv_has_443=False; srv_has_inc=False
+    depth += brace_delta(ln)
+    out.append(ln)
+    continue
+
+  if in_srv:
+    if dom.search(stripped): srv_has_dom=True
+    if listen443.search(stripped): srv_has_443=True
+    if inc.search(stripped): srv_has_inc=True
+
+    # if this line closes the server block
+    if depth + brace_delta(ln) <= 0:
+      if (not injected) and srv_has_dom and srv_has_443 and (not srv_has_inc):
+        out.append(f"  include {\"$INC_FILE\"};\\n")
+        injected=True
+      out.append(ln)
+      depth += brace_delta(ln)
+      in_srv=False
+      continue
+
+    out.append(ln)
+    depth += brace_delta(ln)
+    continue
+
+  out.append(ln)
+
+open(path,'w').write(''.join(out))
+print("injected:", injected)
+PY
+
+if [ -n "${ACTIVE_HTTP_FILE:-}" ] && [ -f "$ACTIVE_HTTP_FILE" ]; then
+  say "nginx: inject include into active http server{} (optional)"
+  python3 - <<PY
+import re,sys,shutil
+path="$ACTIVE_HTTP_FILE"
+bk="$BK/$(path.strip('/').replace('/','_'))"
+shutil.copy2(path,bk)
+
+lines=open(path,'r',errors='ignore').read().splitlines(True)
+
+dom=re.compile(r'\\bserver_name\\b[^;]*\\b'+re.escape("$DOMAIN")+r'\\b', re.I)
+listen80=re.compile(r'\\blisten\\b[^;]*\\b80\\b', re.I)
+inc=re.compile(r'\\binclude\\s+'+re.escape("$INC_FILE")+r'\\s*;', re.I)
+
+out=[]
+depth=0
+in_srv=False
+srv_has_dom=False
+srv_has_80=False
+srv_has_inc=False
+injected=False
+
+def brace_delta(s):
+  return s.count('{')-s.count('}')
+
+for ln in lines:
+  stripped=ln.strip()
+  if not in_srv and re.search(r'\\bserver\\s*\\{', stripped):
+    in_srv=True; srv_has_dom=False; srv_has_80=False; srv_has_inc=False
+    depth += brace_delta(ln)
+    out.append(ln); continue
+  if in_srv:
+    if dom.search(stripped): srv_has_dom=True
+    if listen80.search(stripped): srv_has_80=True
+    if inc.search(stripped): srv_has_inc=True
+    if depth + brace_delta(ln) <= 0:
+      if (not injected) and srv_has_dom and srv_has_80 and (not srv_has_inc):
+        out.append(f"  include {\"$INC_FILE\"};\\n")
+        injected=True
+      out.append(ln)
+      depth += brace_delta(ln)
+      in_srv=False
+      continue
+    out.append(ln); depth += brace_delta(ln); continue
+  out.append(ln)
+open(path,'w').write(''.join(out))
+print("injected:", injected)
+PY
 fi
 
-say "ensure UI index"
+say "web: ensure ${WEBROOT}"
+mkdir -p "$WEBROOT"
 if [ ! -f "$WEBROOT/index.html" ]; then
-  cat > "$WEBROOT/index.html" <<'"'"'HTML'"'"'
-<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Bundler</title><style>body{font-family:system-ui,Segoe UI,Roboto,Arial;margin:24px}code{background:#f3f3f3;padding:2px 6px;border-radius:6px}</style></head><body><h1>Bundler</h1><p>UI OK. API health: <code id="h">...</code></p><script>(async()=>{try{let r=await fetch("/bundler/api/health",{cache:"no-store"});document.getElementById("h").textContent=r.ok?await r.text():"HTTP "+r.status}catch(e){document.getElementById("h").textContent=String(e)}})();</script></body></html>
-HTML
+  cat >"$WEBROOT/index.html" <<'EOF'
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Bundler</title></head><body style="font-family:system-ui;margin:40px"><h1>Bundler</h1><p>UI placeholder (build manquant). Nginx route OK.</p></body></html>
+EOF
 fi
+chmod 755 "$WEBROOT" || true
 
-say "write minimal API (stable) under $API_DIR"
-cat > "$API_DIR/package.json" <<'"'"'JSON'"'"'
-{"name":"bundler-api","version":"1.0.0","private":true,"type":"commonjs","main":"server.js","dependencies":{"express":"^4.19.2"}}
-JSON
-
-cat > "$API_DIR/server.js" <<'"'"'JS'"'"'
-"use strict";
-const express=require("express");
-const app=express();
-app.use(express.json({limit:"1mb"}));
-app.get("/health",(req,res)=>res.status(200).type("text/plain").send("ok"));
-app.get("/",(req,res)=>res.status(200).json({ok:true,svc:"bundler-api"}));
-app.post("/create-token",(req,res)=>res.status(501).json({ok:false,code:"NOT_IMPLEMENTED",msg:"API stable up; wire real create-token here"}));
+say "api: write minimal stable node http server (${API_HOST}:${API_PORT})"
+mkdir -p "$API_DIR"
+cat >"$API_DIR/server.js" <<'EOF'
+const http=require("http");
 const host=process.env.API_HOST||"127.0.0.1";
 const port=parseInt(process.env.API_PORT||"9797",10);
-app.listen(port,host,()=>console.log(JSON.stringify({ok:true,ts:new Date().toISOString(),host,port})));
-JS
+const apiKey=process.env.BUNDLER_API_KEY||"";
+function send(res,code,obj,headers){res.writeHead(code,Object.assign({"content-type":"application/json"},headers||{}));res.end(JSON.stringify(obj));}
+const srv=http.createServer((req,res)=>{
+  const u=new URL(req.url,"http://x");
+  if(u.pathname==="/health"){return send(res,200,{ok:true,ts:new Date().toISOString(),host,port});}
+  if(u.pathname==="/"){return send(res,200,{ok:true,paths:["/health","/create-token"]});}
+  if(u.pathname==="/create-token"){
+    if(req.method!=="POST") return send(res,405,{ok:false,error:"METHOD_NOT_ALLOWED"});
+    const got=(req.headers["x-api-key"]||"").toString();
+    if(apiKey && got!==apiKey) return send(res,401,{ok:false,error:"UNAUTHORIZED"});
+    let body=""; req.on("data",d=>body+=d); req.on("end",()=>{
+      let payload={}; try{payload=body?JSON.parse(body):{};}catch(e){}
+      send(res,200,{ok:true,stub:true,message:"create-token stub (stable). replace later with real solana logic.",payload});
+    });
+    return;
+  }
+  send(res,404,{ok:false,error:"NOT_FOUND",path:u.pathname});
+});
+srv.listen(port,host,()=>console.log(JSON.stringify({ok:true,ts:new Date().toISOString(),host,port})));
+EOF
 
-say "install deps"
-cd "$API_DIR"
-if [ ! -d node_modules ]; then
-  npm i --silent
-else
-  npm i --silent || true
+say "api: key file"
+API_KEY_FILE="${API_DIR}/.api_key"
+if [ ! -f "$API_KEY_FILE" ]; then
+  tr -dc 'A-Za-z0-9' </dev/urandom | head -c 48 >"$API_KEY_FILE"
 fi
+chmod 600 "$API_KEY_FILE" || true
+BUNDLER_API_KEY="$(cat "$API_KEY_FILE")"
 
-say "write systemd service: $SVC"
-cat > "$SVC" <<EOF
+say "systemd: write service ${SVC}"
+cat >"$SVC" <<EOF
 [Unit]
-Description=Bundler API (create token)
+Description=Bundler API (stable minimal)
 After=network.target
 
 [Service]
@@ -109,6 +299,7 @@ Type=simple
 WorkingDirectory=${API_DIR}
 Environment=API_HOST=${API_HOST}
 Environment=API_PORT=${API_PORT}
+Environment=BUNDLER_API_KEY=${BUNDLER_API_KEY}
 ExecStart=/usr/bin/node ${API_DIR}/server.js
 Restart=always
 RestartSec=2
@@ -128,21 +319,29 @@ nginx -t
 systemctl reload nginx
 
 say "diag: listeners"
-ss -lntp | grep -E ":(${API_PORT})\s" || true
+ss -lntp | grep -E "(:${API_PORT}\s)" || true
 
 say "tests: local api"
 set +e
-curl -fsS "http://${API_HOST}:${API_PORT}/health" && echo || echo "LOCAL_API_FAIL"
+curl -fsS "http://${API_HOST}:${API_PORT}/health" && echo " LOCAL_API_OK" || echo " LOCAL_API_FAIL"
 set -e
 
-say "tests: origin nginx (bypass cloudflare)"
+say "tests: origin (bypass cloudflare) /bundler/"
 set +e
-curl -k -sS -D- "https://${DOMAIN}/bundler/" -o /dev/null | sed -n "1,12p"
-curl -k -sS -D- "https://${DOMAIN}/bundler/api/health" -o /dev/null | sed -n "1,12p"
+curl -k -sS -o /dev/null -D - --resolve "${DOMAIN}:443:${ORIGIN_IP}" "https://${DOMAIN}/bundler/" | sed -n '1,12p'
+curl -k -sS -o /dev/null -D - --resolve "${DOMAIN}:443:${ORIGIN_IP}" "https://${DOMAIN}/bundler/api/health" | sed -n '1,12p'
+set -e
+
+say "tests: public (via cloudflare) /bundler/"
+set +e
+curl -k -sS -o /dev/null -D - "https://${DOMAIN}/bundler/" | sed -n '1,12p'
+curl -k -sS -o /dev/null -D - "https://${DOMAIN}/bundler/api/health" | sed -n '1,12p'
 set -e
 
 say "DONE"
-say "BACKUP: $BK"
+say "BACKUP: ${BK}"
+say "ACTIVE_SSL_FILE: ${ACTIVE_SSL_FILE}"
+say "ACTIVE_HTTP_FILE: ${ACTIVE_HTTP_FILE:-}"
 SH
-chmod +x /root/BUNDLER_FIX_404.sh
-/root/BUNDLER_FIX_404.sh'
+chmod +x /root/MEGA_BUNDLER_FIX_404.sh
+/root/MEGA_BUNDLER_FIX_404.sh
