@@ -1,33 +1,137 @@
 bash -lc 'set -euo pipefail
-RPC="https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac"
-WALLET="/opt/bundler_api/wallet.json"
-APPDIR="/opt/bundler_api"
+DOMAIN="fireinners.online"
+URL="https://${DOMAIN}/bundler/"
+RESOLVE="--resolve ${DOMAIN}:443:127.0.0.1"
+TMP="$(mktemp)";trap "rm -f $TMP" EXIT
 
-echo "== check wallet.json =="
-test -s "$WALLET" || { echo "ERROR: missing $WALLET"; ls -la "$APPDIR" || true; exit 1; }
+echo "== fetch current /bundler/ html (origin localhost) =="
+curl -k -sS $RESOLVE "$URL" >"$TMP" || { echo "ERROR: curl failed"; exit 1; }
+H="$(sha256sum "$TMP" | awk "{print \$1}")"
+echo "HTML_SHA256=$H"
 
-echo "== deps: @solana/web3.js =="
-cd "$APPDIR"
-if ! node -e "require(\"@solana/web3.js\")" >/dev/null 2>&1; then
-  echo "installing @solana/web3.js in $APPDIR ..."
-  test -f package.json || npm init -y >/dev/null 2>&1 || true
-  npm i @solana/web3.js >/dev/null
+echo "== find matching index.html on disk =="
+MATCH=""
+while IFS= read -r f; do
+  sh="$(sha256sum "$f" 2>/dev/null | awk "{print \$1}")" || continue
+  if [ "$sh" = "$H" ]; then MATCH="$f"; break; fi
+done < <(find /var/www /opt -maxdepth 6 -type f \( -name index.html -o -name bundler.html \) 2>/dev/null)
+
+if [ -z "$MATCH" ]; then
+  for f in /var/www/bundler/index.html /var/www/html/bundler/index.html /opt/fireinners/frontend-react/app/dist/bundler/index.html; do
+    if [ -f "$f" ]; then MATCH="$f"; break; fi
+  done
 fi
 
-echo "== payer balance =="
-RPC="$RPC" node - <<'"'"'JS'"'"'
-const fs=require("fs");
-const {Connection,Keypair,LAMPORTS_PER_SOL}=require("@solana/web3.js");
-(async()=>{
-  const rpc=process.env.RPC;
-  const p="/opt/bundler_api/wallet.json";
-  const sk=Uint8Array.from(JSON.parse(fs.readFileSync(p,"utf8")));
-  const kp=Keypair.fromSecretKey(sk);
-  const c=new Connection(rpc,"confirmed");
-  const lam=await c.getBalance(kp.publicKey);
-  console.log("PAYER_PUBKEY:", kp.publicKey.toBase58());
-  console.log("PAYER_SOL:", (lam/LAMPORTS_PER_SOL).toFixed(9));
-  console.log("RPC:", rpc);
-})().catch(e=>{console.error(e);process.exit(1);});
-JS
+test -n "$MATCH" || { echo "ERROR: cannot locate served bundler HTML on disk"; exit 1; }
+echo "UI_FILE=$MATCH"
+
+echo "== backup =="
+BK="/root/BUNDLER_UI_META_PATCH_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$BK"
+cp -a "$MATCH" "$BK/$(basename "$MATCH")"
+echo "BACKUP=$BK"
+
+echo "== patch UI: add Token Name + Logo upload (idempotent) =="
+python3 - "$MATCH" <<'"'"'PY'"'"'
+import re,sys,os
+p=sys.argv[1]
+s=open(p,"r",encoding="utf-8",errors="ignore").read()
+
+if "id=\"tokenName\"" in s and "id=\"tokenLogo\"" in s:
+  print("SKIP: already patched")
+  sys.exit(0)
+
+# 1) Inject HTML block near the form (best-effort: before OWNER or before MINT_ADDRESS or before submit button)
+block = r"""
+<div style="display:flex;gap:12px;flex-wrap:wrap;margin:10px 0">
+  <div style="flex:1;min-width:240px">
+    <div style="font-size:12px;opacity:.85;margin:0 0 6px">Token Name (off-chain)</div>
+    <input id="tokenName" placeholder="Ex: FIREINNERS" style="width:100%;box-sizing:border-box;padding:10px;border-radius:10px;border:1px solid rgba(120,180,255,.35);background:rgba(0,0,0,.15);color:#d8ecff;outline:none">
+  </div>
+  <div style="flex:1;min-width:240px">
+    <div style="font-size:12px;opacity:.85;margin:0 0 6px">Logo (PNG/JPG)</div>
+    <input id="tokenLogo" type="file" accept="image/*" style="width:100%;box-sizing:border-box;padding:8px;border-radius:10px;border:1px solid rgba(120,180,255,.35);background:rgba(0,0,0,.15);color:#d8ecff;outline:none">
+    <div style="margin-top:8px;display:flex;align-items:center;gap:10px">
+      <img id="tokenLogoPreview" alt="" style="display:none;height:40px;width:40px;object-fit:cover;border-radius:10px;border:1px solid rgba(120,180,255,.35)">
+      <div id="tokenLogoInfo" style="display:none;font-size:12px;opacity:.85"></div>
+    </div>
+  </div>
+</div>
+""".strip("\n")
+
+# Heuristics for insertion point
+cands=[
+  (r'(OWNER\s*\(optionnel\)[\s\S]{0,200})', True),
+  (r'(MINT_ADDRESS\s*\(optionnel,\s*reuse\)[\s\S]{0,200})', True),
+  (r'(<button[^>]*>\s*Cr[ée]er\s+le\s+token\s*</button>)', False),
+  (r'(<button[^>]*id="createToken"[^>]*>[\s\S]*?</button>)', False),
+]
+inserted=False
+for pat, after in cands:
+  m=re.search(pat,s,re.IGNORECASE)
+  if m:
+    i=m.end(1) if after else m.start(1)
+    s=s[:i]+"\n"+block+"\n"+s[i:]
+    inserted=True
+    break
+if not inserted:
+  # fallback: before closing form if exists
+  m=re.search(r'(</form\s*>)',s,re.IGNORECASE)
+  if m:
+    s=s[:m.start(1)]+"\n"+block+"\n"+s[m.start(1):]
+    inserted=True
+if not inserted:
+  # last resort: before </body>
+  m=re.search(r'(</body\s*>)',s,re.IGNORECASE)
+  if m:
+    s=s[:m.start(1)]+"\n"+block+"\n"+s[m.start(1):]
+    inserted=True
+
+# 2) Inject JS to handle file -> dataURL + persist in localStorage (idempotent marker)
+marker="/*BUNDLER_TOKEN_META_UI_V1*/"
+if marker not in s:
+  js = r"""
+<script>/*BUNDLER_TOKEN_META_UI_V1*/(()=>{try{const $=id=>document.getElementById(id);const n=$("tokenName"),f=$("tokenLogo"),img=$("tokenLogoPreview"),info=$("tokenLogoInfo");const ls=window.localStorage;const keyN="BUNDLER_TOKEN_NAME",keyL="BUNDLER_TOKEN_LOGO_DATAURL";const setLogo=(u)=>{window.__BUNDLER_LOGO_DATAURL=u||"";if(u){if(img){img.src=u;img.style.display="block"}if(info){info.textContent=(u.split(",")[0]||"image")+" · loaded";info.style.display="block"}try{ls.setItem(keyL,u)}catch(e){}}else{if(img){img.style.display="none"}if(info){info.style.display="none"}try{ls.removeItem(keyL)}catch(e){}}};const setName=(v)=>{window.__BUNDLER_TOKEN_NAME=(v||"").trim();try{ls.setItem(keyN,window.__BUNDLER_TOKEN_NAME)}catch(e){}};try{const sn=ls.getItem(keyN)||"";if(n){n.value=sn;setName(sn)}const sl=ls.getItem(keyL)||"";if(sl){setLogo(sl)}}catch(e){};if(n){n.addEventListener("input",()=>setName(n.value))}if(f){f.addEventListener("change",()=>{const file=f.files&&f.files[0];if(!file){setLogo("");return}const r=new FileReader();r.onload=()=>setLogo(String(r.result||""));r.readAsDataURL(file);})}window.__BUNDLER_GET_META=()=>({tokenName:(window.__BUNDLER_TOKEN_NAME||""),logo:(window.__BUNDLER_LOGO_DATAURL||"")});}catch(e){console.error(e)}})();</script>
+""".strip("\n")
+  # place before </body> if possible
+  m=re.search(r'(</body\s*>)',s,re.IGNORECASE)
+  if m: s=s[:m.start(1)]+"\n"+js+"\n"+s[m.start(1):]
+  else: s=s+"\n"+js+"\n"
+
+# 3) Best-effort: if UI builds payload variable, attach tokenName/logo to request (non-breaking if backend ignores)
+if "/*BUNDLER_META_ATTACH_V1*/" not in s:
+  attach = r"""
+;(()=>{try{
+  const meta=()=>{try{return (window.__BUNDLER_GET_META&&window.__BUNDLER_GET_META())||{tokenName:"",logo:""}}catch(e){return {tokenName:"",logo:""}}};
+  const _fetch=window.fetch;
+  window.fetch=async function(input,init){
+    try{
+      const u=typeof input==="string"?input:(input&&input.url)||"";
+      if(u.includes("/bundler/api/create-token") && init && init.body && typeof init.body==="string" && init.headers){
+        try{
+          const j=JSON.parse(init.body);
+          const m=meta();
+          if(m.tokenName) j.tokenName=m.tokenName;
+          if(m.logo) j.logo=m.logo;
+          init.body=JSON.stringify(j);
+        }catch(e){}
+      }
+    }catch(e){}
+    return _fetch.apply(this,arguments);
+  };
+}catch(e){}})();/*BUNDLER_META_ATTACH_V1*/"""
+  m=re.search(r'(</script\s*>\s*</body\s*>)',s,re.IGNORECASE)
+  if m: s=s[:m.start(1)]+"\n<script>"+attach+"</script>\n"+s[m.start(1):]
+  else:
+    m=re.search(r'(</body\s*>)',s,re.IGNORECASE)
+    if m: s=s[:m.start(1)]+"\n<script>"+attach+"</script>\n"+s[m.start(1):]
+    else: s=s+"\n<script>"+attach+"</script>\n"
+
+open(p,"w",encoding="utf-8").write(s)
+print("PATCHED:",p)
+PY
+
+echo "== smoke test (origin localhost) =="
+curl -k -sS $RESOLVE "$URL" | head -n 5 >/dev/null
+echo "OK: reloaded HTML; open $URL and you will see Token Name + Logo fields."
 '
