@@ -1,1 +1,432 @@
-curl -skI https://fireinners.online/wolverine/ | sed -n "1,15p"
+cat >/root/MEGA_AQUILA_REACT_STACKING_DEPLOY_V1.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+TS="$(date +%Y%m%d_%H%M%S)"
+BK="/root/AQUILA_REACT_STACKING_BK_${TS}"
+mkdir -p "$BK"
+
+say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
+die(){ say "ERR: $*"; exit 1; }
+
+[ "$(id -u)" = "0" ] || die "run as root"
+command -v nginx >/dev/null 2>&1 || die "nginx missing"
+command -v python3 >/dev/null 2>&1 || die "python3 missing"
+command -v curl >/dev/null 2>&1 || die "curl missing"
+
+DOMAIN="fireinners.online"
+WEBROOT="/var/www/aquila_stacking"
+INC_DIR="/etc/nginx/includes"
+INC="$INC_DIR/aquila_stacking_routes.inc"
+
+APP="/opt/aquila_stacking_react"
+SRC="$APP/src"
+PUB="$APP/public"
+
+ASKLIB="/opt/fireinners/sentinel/lib/askorupdate.sh"
+if [ -f "$ASKLIB" ]; then
+  # shellcheck disable=SC1090
+  . "$ASKLIB" || true
+fi
+
+write_file(){
+  local path="$1"; shift
+  local tmp; tmp="$(mktemp)"
+  cat >"$tmp"<<EOF
+$*
+EOF
+  if declare -F askorupdate_file >/dev/null 2>&1; then
+    ASKORUPDATE_ASK=0 askorupdate_file "$path" "$tmp" "Aquila React Stacking deploy" || { rm -f "$tmp"; die "askorupdate_file failed: $path"; }
+    rm -f "$tmp"
+  else
+    chattr -i "$path" 2>/dev/null || true
+    [ -f "$path" ] && cp -a "$path" "$BK/$(echo "$path" | sed 's#/#_#g').bak" || true
+    install -m 0644 "$tmp" "$path"
+    rm -f "$tmp"
+  fi
+}
+
+say "0) Backup nginx dump"
+nginx -T >"$BK/nginx_T.txt" 2>&1 || true
+
+say "1) Ensure packages (node build prerequisites)"
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -y >/dev/null
+apt-get install -y ca-certificates curl git build-essential unzip >/dev/null
+
+say "2) Ensure Node.js (>=18) + npm"
+need_node=1
+if command -v node >/dev/null 2>&1; then
+  v="$(node -v | sed 's/^v//')"
+  major="${v%%.*}"
+  if [ "${major:-0}" -ge 18 ]; then need_node=0; fi
+fi
+if [ "$need_node" = "1" ]; then
+  say "   Installing Node 20 (NodeSource)"
+  curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null 2>&1
+  apt-get install -y nodejs >/dev/null
+fi
+command -v node >/dev/null 2>&1 || die "node install failed"
+command -v npm  >/dev/null 2>&1 || die "npm missing after install"
+
+say "3) Build React (Vite) app in $APP"
+mkdir -p "$APP" "$SRC" "$PUB"
+cd "$APP"
+
+# package.json
+cat >"$APP/package.json"<<'JSON'
+{
+  "name": "aquila-stacking-ui",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0 --port 5173",
+    "build": "vite build",
+    "build:aquila": "vite build --base=/aquila_stacking/",
+    "preview": "vite preview --host 0.0.0.0 --port 4173"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.1",
+    "vite": "^5.4.2"
+  }
+}
+JSON
+
+# vite config
+cat >"$APP/vite.config.js"<<'JS'
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+export default defineConfig({
+  plugins: [react()],
+  build: { sourcemap: false }
+})
+JS
+
+# index.html
+cat >"$APP/index.html"<<'HTML'
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1.0" />
+    <title>Aquila Stacking</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
+HTML
+
+# styles
+cat >"$SRC/styles.css"<<'CSS'
+:root{color-scheme:dark}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial}
+body{background:
+radial-gradient(1200px 700px at 15% 10%, rgba(56,189,248,.22), transparent 60%),
+radial-gradient(900px 600px at 80% 20%, rgba(168,85,247,.22), transparent 55%),
+radial-gradient(900px 700px at 50% 90%, rgba(34,197,94,.18), transparent 55%),
+linear-gradient(180deg, #070A12 0%, #060813 45%, #05060F 100%);
+color:#EAF0FF}
+a{color:inherit;text-decoration:none}
+.wrap{min-height:100%;display:flex;flex-direction:column}
+.topbar{position:sticky;top:0;z-index:50;backdrop-filter:blur(14px);background:rgba(5,6,15,.55);border-bottom:1px solid rgba(255,255,255,.08)}
+.topbar_in{max-width:1200px;margin:0 auto;padding:14px 18px;display:flex;gap:12px;align-items:center;justify-content:space-between}
+.brand{display:flex;gap:10px;align-items:center}
+.badge{width:34px;height:34px;border-radius:10px;background:
+radial-gradient(circle at 30% 30%, rgba(56,189,248,.9), rgba(168,85,247,.45) 55%, rgba(34,197,94,.25) 100%);
+box-shadow:0 10px 30px rgba(0,0,0,.5), inset 0 1px 0 rgba(255,255,255,.15)}
+.brand h1{margin:0;font-size:14px;letter-spacing:.6px;text-transform:uppercase}
+.nav{display:flex;gap:10px;flex-wrap:wrap}
+.pill{padding:8px 10px;border:1px solid rgba(255,255,255,.10);border-radius:999px;background:rgba(255,255,255,.03)}
+.pill:hover{background:rgba(255,255,255,.06)}
+.main{flex:1}
+.container{max-width:1200px;margin:0 auto;padding:26px 18px 60px}
+.hero{display:grid;grid-template-columns:1.15fr .85fr;gap:18px;align-items:stretch}
+@media (max-width:980px){.hero{grid-template-columns:1fr}}
+.card{border:1px solid rgba(255,255,255,.10);background:linear-gradient(180deg, rgba(255,255,255,.06), rgba(255,255,255,.03));border-radius:18px;box-shadow:0 18px 60px rgba(0,0,0,.45);overflow:hidden}
+.card_in{padding:18px}
+.h_title{font-size:36px;line-height:1.05;margin:0 0 10px}
+.sub{opacity:.86;max-width:58ch}
+.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:16px}
+@media (max-width:980px){.grid{grid-template-columns:1fr}}
+.kpi{padding:14px;border-radius:16px;border:1px solid rgba(255,255,255,.10);background:rgba(0,0,0,.18)}
+.kpi b{display:block;font-size:12px;opacity:.75;margin-bottom:6px;text-transform:uppercase;letter-spacing:.6px}
+.kpi span{display:block;font-size:22px}
+.btnrow{display:flex;gap:10px;flex-wrap:wrap;margin-top:16px}
+.btn{cursor:pointer;border:1px solid rgba(255,255,255,.14);background:rgba(255,255,255,.06);color:#EAF0FF;padding:10px 12px;border-radius:12px}
+.btn:hover{background:rgba(255,255,255,.10)}
+.btn.pri{border-color:rgba(56,189,248,.55);background:linear-gradient(180deg, rgba(56,189,248,.22), rgba(168,85,247,.12))}
+.btn.pri:hover{filter:brightness(1.08)}
+.panel{display:grid;grid-template-columns:1fr;gap:12px}
+.row{display:flex;gap:10px;align-items:center;justify-content:space-between;padding:12px 14px;border:1px solid rgba(255,255,255,.10);border-radius:14px;background:rgba(0,0,0,.16)}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:12px;opacity:.9}
+.footer{opacity:.65;margin-top:18px;font-size:12px}
+.spark{position:relative;height:170px}
+.spark:before{content:"";position:absolute;inset:-40px;background:
+radial-gradient(300px 200px at 15% 30%, rgba(56,189,248,.25), transparent 60%),
+radial-gradient(260px 200px at 65% 55%, rgba(168,85,247,.22), transparent 60%),
+radial-gradient(240px 200px at 45% 85%, rgba(34,197,94,.18), transparent 60%);
+filter:blur(6px)}
+.spark svg{position:absolute;inset:0;width:100%;height:100%}
+.small{font-size:12px;opacity:.7}
+CSS
+
+# App.jsx
+cat >"$SRC/App.jsx"<<'JSX'
+import React, { useMemo, useState } from 'react'
+
+function fmt(n){ try{ return new Intl.NumberFormat('en-US',{maximumFractionDigits:2}).format(n) }catch{return String(n)} }
+
+export default function App(){
+  const [wallet,setWallet]=useState('Not connected')
+  const [network,setNetwork]=useState('mainnet')
+  const kpis = useMemo(()=>({
+    tvl: 1249321.55,
+    apr: 18.42,
+    stakers: 7391
+  }),[])
+  return (
+    <div className="wrap">
+      <div className="topbar">
+        <div className="topbar_in">
+          <div className="brand">
+            <div className="badge" />
+            <div>
+              <h1>Aquila Stacking</h1>
+              <div className="small">fireinners.online/aquila_stacking</div>
+            </div>
+          </div>
+          <div className="nav">
+            <a className="pill" href="#stake">Stake</a>
+            <a className="pill" href="#stats">Stats</a>
+            <a className="pill" href="#docs">Docs</a>
+            <a className="pill" href="#health">Health</a>
+          </div>
+        </div>
+      </div>
+
+      <div className="main">
+        <div className="container">
+          <div className="hero">
+            <div className="card">
+              <div className="card_in">
+                <h2 className="h_title">Staking UI prêt pour prod</h2>
+                <div className="sub">
+                  UI React (Vite) optimisée pour un déploiement en sous-chemin <span className="mono">/aquila_stacking/</span>,
+                  avec fallback SPA nginx. Tu peux brancher ici tes endpoints API, RPC, ou dashboard Anchor.
+                </div>
+
+                <div className="grid" id="stats">
+                  <div className="kpi"><b>TVL</b><span>${fmt(kpis.tvl)}</span></div>
+                  <div className="kpi"><b>APR</b><span>{fmt(kpis.apr)}%</span></div>
+                  <div className="kpi"><b>Stakers</b><span>{fmt(kpis.stakers)}</span></div>
+                </div>
+
+                <div className="btnrow" id="stake">
+                  <button className="btn pri" onClick={()=>setWallet('Phantom (stub)')}>Connect Wallet</button>
+                  <button className="btn" onClick={()=>setNetwork(n=>n==='mainnet'?'devnet':'mainnet')}>Toggle Network ({network})</button>
+                  <button className="btn" onClick={()=>alert('Action stake (placeholder)')}>Stake</button>
+                  <button className="btn" onClick={()=>alert('Action unstake (placeholder)')}>Unstake</button>
+                </div>
+
+                <div className="footer" id="docs">
+                  Prochain branchement : endpoints /api, programme Anchor, états on-chain, et actions signées.
+                </div>
+              </div>
+            </div>
+
+            <div className="panel">
+              <div className="card">
+                <div className="card_in">
+                  <div className="row"><div>Wallet</div><div className="mono">{wallet}</div></div>
+                  <div className="row"><div>Network</div><div className="mono">{network}</div></div>
+                  <div className="row"><div>Base Path</div><div className="mono">/aquila_stacking/</div></div>
+                  <div className="row" id="health"><div>Nginx SPA Fallback</div><div className="mono">try_files → index.html</div></div>
+                </div>
+              </div>
+
+              <div className="card spark">
+                <svg viewBox="0 0 1200 260" preserveAspectRatio="none">
+                  <defs>
+                    <linearGradient id="g" x1="0" x2="1">
+                      <stop offset="0" stopColor="rgba(56,189,248,0.95)"/>
+                      <stop offset="0.5" stopColor="rgba(168,85,247,0.85)"/>
+                      <stop offset="1" stopColor="rgba(34,197,94,0.75)"/>
+                    </linearGradient>
+                  </defs>
+                  <path d="M0,190 C140,120 220,220 340,160 C460,100 540,210 660,150 C780,90 860,210 980,150 C1070,110 1130,140 1200,120 L1200,260 L0,260 Z" fill="url(#g)" opacity="0.22"/>
+                  <path d="M0,190 C140,120 220,220 340,160 C460,100 540,210 660,150 C780,90 860,210 980,150 C1070,110 1130,140 1200,120" fill="none" stroke="rgba(234,240,255,0.75)" strokeWidth="2"/>
+                </svg>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  )
+}
+JSX
+
+# main.jsx
+cat >"$SRC/main.jsx"<<'JSX'
+import React from 'react'
+import { createRoot } from 'react-dom/client'
+import App from './App.jsx'
+import './styles.css'
+createRoot(document.getElementById('root')).render(<App />)
+JSX
+
+say "4) npm install + build (base=/aquila_stacking/)"
+npm install --no-fund --no-audit >/dev/null
+npm run build:aquila >/dev/null
+
+say "5) Deploy dist -> $WEBROOT"
+mkdir -p "$WEBROOT"
+if [ -d "$WEBROOT" ]; then
+  tar -C "$WEBROOT" -cf "$BK/webroot_prev.tar" . 2>/dev/null || true
+fi
+rm -rf "$WEBROOT"/*
+cp -a "$APP/dist/." "$WEBROOT/"
+chown -R www-data:www-data "$WEBROOT" 2>/dev/null || true
+chmod -R a+rX "$WEBROOT" || true
+
+say "6) Write nginx include routes -> $INC"
+mkdir -p "$INC_DIR"
+write_file "$INC" "$(cat <<EOF
+# Aquila Stacking (React SPA) routes
+location = /aquila_stacking { return 301 /aquila_stacking/; }
+location ^~ /aquila_stacking/ {
+  alias $WEBROOT/;
+  add_header Cache-Control "no-store" always;
+  try_files \$uri \$uri/ /aquila_stacking/index.html;
+}
+location = /iaaquila { return 301 /iaaquila/; }
+location ^~ /iaaquila/ {
+  alias $WEBROOT/;
+  add_header Cache-Control "no-store" always;
+  try_files \$uri \$uri/ /iaaquila/index.html;
+}
+location ~* ^/(aquila_stacking|iaaquila)/assets/ {
+  alias $WEBROOT/assets/;
+  add_header Cache-Control "public, max-age=31536000, immutable" always;
+}
+EOF
+)"
+
+say "7) Patch ALL nginx server blocks for $DOMAIN (80 + 443) to include routes"
+python3 - <<'PY'
+import re, subprocess, os, sys, datetime, shutil
+
+DOMAIN=os.environ.get("DOMAIN","fireinners.online")
+INC=os.environ.get("INC","/etc/nginx/includes/aquila_stacking_routes.inc")
+BK=os.environ.get("BK","/root/BK")
+
+try:
+    out=subprocess.check_output(["nginx","-T"], stderr=subprocess.STDOUT, text=True)
+except Exception as e:
+    print("ERR: nginx -T failed", e); sys.exit(1)
+
+# Parse file sections from nginx -T output
+files=[]
+cur=None; buf=[]
+for line in out.splitlines():
+    m=re.match(r'^# configuration file (.+?):$', line.strip())
+    if m:
+        if cur and buf:
+            files.append((cur, "\n".join(buf)))
+        cur=m.group(1).strip()
+        buf=[]
+    else:
+        if cur is not None:
+            buf.append(line)
+if cur and buf:
+    files.append((cur, "\n".join(buf)))
+
+candidates=[]
+for path,content in files:
+    if "server_name" in content and DOMAIN in content:
+        candidates.append(path)
+
+candidates=sorted(set(candidates))
+if not candidates:
+    print("WARN: no candidates found containing server_name", DOMAIN)
+    sys.exit(0)
+
+def patch_file(content):
+    # Patch each server block that contains server_name DOMAIN by inserting include if missing
+    lines=content.splitlines(True)
+    out=[]
+    i=0
+    while i < len(lines):
+        line=lines[i]
+        if re.match(r'^\s*server\s*\{', line):
+            # capture block
+            start=i
+            depth=0
+            block=[]
+            while i < len(lines):
+                l=lines[i]
+                if '{' in l: depth += l.count('{')
+                if '}' in l: depth -= l.count('}')
+                block.append(l)
+                i += 1
+                if depth==0: break
+            b="".join(block)
+            if re.search(r'\bserver_name\b[^;]*\b'+re.escape(DOMAIN)+r'\b', b):
+                if INC not in b:
+                    # insert include after opening line
+                    blk=block[:]
+                    ins='  include '+INC+';\n'
+                    # after first line
+                    blk.insert(1, ins)
+                    block=blk
+            out.append("".join(block))
+            continue
+        out.append(line)
+        i += 1
+    return "".join(out)
+
+for path in candidates:
+    try:
+        with open(path,'r',encoding='utf-8',errors='ignore') as f:
+            orig=f.read()
+    except Exception:
+        continue
+    new=patch(orig)
+    if new!=orig:
+        os.makedirs(BK, exist_ok=True)
+        shutil.copy2(path, os.path.join(BK, path.replace('/','_')+'.bak'))
+        try:
+            subprocess.run(["chattr","-i",path], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+        with open(path,'w',encoding='utf-8') as f:
+            f.write(new)
+        print("patched:", path)
+    else:
+        print("ok:", path)
+PY
+
+say "8) nginx -t + reload"
+nginx -t
+systemctl reload nginx
+
+say "9) Verify locally (Host header)"
+curl -kIs "https://127.0.0.1/aquila_stacking/" -H "Host: ${DOMAIN}" | head -n 12 || true
+curl -kIs "https://127.0.0.1/iaaquila/" -H "Host: ${DOMAIN}" | head -n 12 || true
+
+say "DONE"
+echo "OPEN: https://${DOMAIN}/aquila_stacking/"
+echo "ALT : https://${DOMAIN}/iaaquila/"
+echo "BK  : ${BK}"
+BASH
+chmod +x /root/MEGA_AQUILA_REACT_STACKING_DEPLOY_V1.sh
+/root/MEGA_AQUILA_REACT_STACKING_DEPLOY_V1.sh
