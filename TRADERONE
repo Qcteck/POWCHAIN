@@ -1,208 +1,86 @@
-cat >/root/MEGA_AQUILA_STACKING_ONE_SHOT_ROOT_V8_WORKING.sh<<'BASH'
+cat >/root/WV_FIX_DUP_LOCATION.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
-umask 027
 TS="$(date +%Y%m%d_%H%M%S)"
-say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
-die(){ say "ERR: $*"; exit 1; }
-need(){ command -v "$1" >/dev/null 2>&1 || die "missing: $1"; }
-[ "$(id -u)" -eq 0 ] || die "run as root"
-need nginx; need systemctl; need python3; need curl; need sed; need awk; need grep
-
-DOMAIN="fireinners.online"
-PATH_OK="/aquila_stacking/"
-WEBROOT="/var/www/aquila_stacking"
-HTML="$WEBROOT/index.html"
-
-APP="/opt/aquila_stacking"
-KEYS="$APP/keys"
-PROG="aquila_stacking"
-
-BK="/root/AQUILA_STACKING_ONESHOT_V8_BK_${TS}"
+BK="/root/WV_BK_DUP_${TS}"
 mkdir -p "$BK"
+say(){ printf "\n[%s] %s\n" "$(date +%H:%M:%S)" "$*"; }
+backup(){ local f="$1"; [ -e "$f" ] || return 0; mkdir -p "$BK$(dirname "$f")"; cp -a "$f" "$BK$f"; }
+unfreeze(){ local f="$1"; [ -e "$f" ] || return 0; chattr -i "$f" 2>/dev/null || true; }
 
-say "1) WEBROOT + index.html"
-mkdir -p "$WEBROOT"
-chmod 0755 "$WEBROOT"
+NGX="/etc/nginx"
+VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
+SEN="/etc/nginx/sites-enabled/fireinners.online-ssl"
+INC_STATIC="/etc/nginx/includes/wolverine_static.inc"
+INC_DIR="/etc/nginx/includes"
+VAULT_PORT="8787"
 
-PID="UNKNOWN"
-if command -v solana-keygen >/dev/null 2>&1 && [ -f "$KEYS/${PROG}-keypair.json" ]; then
-  PID="$(solana-keygen pubkey "$KEYS/${PROG}-keypair.json" 2>/dev/null || echo UNKNOWN)"
-fi
+say "0) Savepoint (si dispo)"
+[ -x /root/WOLVERINE_SAVEPOINT.sh ] && /root/WOLVERINE_SAVEPOINT.sh || true
 
-cat >"$HTML"<<EOF
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AquilaStacking</title><style>body{font-family:system-ui,Segoe UI,Arial;margin:24px;max-width:980px}code{background:#0b1020;color:#d7e3ff;padding:10px;border-radius:10px;display:block;overflow:auto}h1{margin:0 0 12px}small{opacity:.8}</style></head><body><h1>AquilaStacking</h1><p><b>Program ID:</b><code>${PID}</code></p><p><b>Workspace:</b><code>${APP}</code></p><p><b>URL:</b><code>${PATH_OK}</code></p><p><small>TS: ${TS}</small></p></body></html>
-EOF
-chown -R www-data:www-data "$WEBROOT" 2>/dev/null || true
-chmod -R 0755 "$WEBROOT"
+say "1) Backup + unfreeze fichiers nginx ciblés"
+for f in "$VHOST" "$SEN" "$INC_STATIC"; do backup "$f"; unfreeze "$f"; done
 
-say "2) Patch ACTIVE nginx 443 fireinners.online server blocks (direct location, with header)"
-export BK DOMAIN PATH_OK WEBROOT
-python3 - <<'PY'
-import os, re, shutil, subprocess, datetime
-
-BK=os.environ["BK"]
-DOMAIN=os.environ["DOMAIN"]
-PATH_OK=os.environ["PATH_OK"]
-WEBROOT=os.environ["WEBROOT"]
-TAG="AQUILA_STACKING_V8"
-HDR="X-AquilaStacking"
-
-def run(cmd):
-    return subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
-
-ngT = run(["nginx","-T"])
-open(os.path.join(BK,"nginx.T.txt"),"w").write(ngT)
-
-# list loaded file paths in nginx -T order
-files=[]
-for line in ngT.splitlines():
-    m=re.match(r"^# configuration file (\S+):\d+", line)
-    if m:
-        f=m.group(1)
-        if f not in files:
-            files.append(f)
-
-# filter likely vhost files (loaded) that mention fireinners.online or cert path
-cand=[]
-for f in files:
-    if not os.path.isfile(f): 
-        continue
-    try:
-        txt=open(f,"r",errors="ignore").read()
-    except Exception:
-        continue
-    if re.search(r"\bfireinners\.online\b", txt) or "letsencrypt/live/fireinners.online" in txt or "fireinners.online-ssl" in txt:
-        cand.append(f)
-
-open(os.path.join(BK,"candidates.txt"),"w").write("\n".join(cand)+"\n")
-
-loc_block=f"""
-  # {TAG} BEGIN
-  location = /aquilastacking {{ return 301 {PATH_OK}; }}
-  location ^~ /aquilastacking/ {{ return 301 {PATH_OK}; }}
-  location = {PATH_OK.rstrip('/')} {{ return 301 {PATH_OK}; }}
-  location ^~ {PATH_OK} {{
-    alias {WEBROOT}/;
-    index index.html;
-    try_files $uri $uri/ {PATH_OK}index.html;
-    add_header {HDR} "1" always;
-    add_header Cache-Control "no-store" always;
-  }}
-  # {TAG} END
-""".lstrip("\n")
-
-def remove_tag_blocks(s:str)->str:
-    # remove any previous tagged blocks (any version) to avoid duplication
-    return re.sub(r"\n?[ \t]*#\s*AQUILA_STACKING_[A-Z0-9_]*\s+BEGIN.*?#\s*AQUILA_STACKING_[A-Z0-9_]*\s+END\s*\n", "\n", s, flags=re.S)
-
-def patch_server_blocks(text:str)->tuple[str,int]:
-    out=[]
-    i=0
-    n=len(text)
-    patched=0
-
-    pat=re.compile(r"\bserver\s*\{", re.M)
-    for m in pat.finditer(text):
-        s=m.start()
-        out.append(text[i:s])
-        brace=text.find("{", s)
-        if brace==-1:
-            out.append(text[s:]); i=n; break
-
-        depth=0
-        k=brace
-        while k<n:
-            if text[k]=="{": depth+=1
-            elif text[k]=="}":
-                depth-=1
-                if depth==0:
-                    end=k+1
-                    break
-            k+=1
-        else:
-            out.append(text[s:]); i=n; break
-
-        block=text[s:end]
-
-        # must be 443 + server_name fireinners.online (effective block)
-        has_443 = re.search(r"listen\s+[^;]*\b443\b", block) is not None
-        has_name = re.search(r"server_name\s+[^;]*\b"+re.escape(DOMAIN)+r"\b", block) is not None
-
-        if has_443 and has_name:
-            b=remove_tag_blocks(block)
-            if TAG not in b:
-                lines=b.splitlines(True)
-                ins=None
-                for idx,ln in enumerate(lines):
-                    if re.match(r"^\s*location\s+", ln):
-                        ins=idx; break
-                if ins is None:
-                    # insert before last closing brace
-                    ins=len(lines)-1
-                # ensure there is a newline before insertion
-                if ins>0 and not lines[ins-1].endswith("\n"):
-                    lines[ins-1]=lines[ins-1]+"\n"
-                lines.insert(ins, loc_block if loc_block.endswith("\n") else loc_block+"\n")
-                block="".join(lines)
-                patched+=1
-
-        out.append(block)
-        i=end
-
-    out.append(text[i:])
-    return "".join(out), patched
-
-touched=[]
-for f in cand:
-    try:
-        src=open(f,"r",errors="ignore").read()
-    except Exception:
-        continue
-    new, cnt = patch_server_blocks(src)
-    if cnt>0:
-        # backup
-        bak=os.path.join(BK, f.replace("/","_")+".bak")
-        shutil.copy2(f, bak)
-        # unlock immutable if needed
-        subprocess.run(["bash","-lc", f"chattr -i '{f}' 2>/dev/null || true"], check=False)
-        shutil.copy2(f, f+f".bak.{datetime.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}")
-        open(f,"w").write(new)
-        touched.append((f,cnt))
-
-open(os.path.join(BK,"patched.txt"),"w").write("\n".join([f"{a} :: {b}" for a,b in touched])+"\n")
-
-if not touched:
-    raise SystemExit("No 443 fireinners.online server block was patched. See BK/nginx.T.txt and BK/candidates.txt")
-
-print("[OK] patched files:")
-for a,b in touched:
-    print(" -",a,"(server blocks patched:",b,")")
-PY
-
-say "3) nginx -t + reload (rollback if fail)"
-if ! nginx -t; then
-  say "nginx invalid -> rollback"
-  for b in "$BK"/*.bak; do
-    [ -f "$b" ] || continue
-    orig="$(echo "$b" | sed "s#^$BK/##" | sed 's#_#/#g' | sed 's/\.bak$//')"
-    [ -f "$orig" ] && cp -a "$b" "$orig" || true
+say "2) Fix #1: wolverine_static.inc inclus plusieurs fois -> commenter les doublons"
+mapfile -t LINES < <(grep -RIn --color=never -E "include[[:space:]]+.*wolverine_static\.inc" "$NGX" 2>/dev/null || true)
+if [ "${#LINES[@]}" -gt 1 ]; then
+  say "Trouvé ${#LINES[@]} includes de wolverine_static.inc -> on garde le 1er, on commente les autres"
+  keep=1
+  for hit in "${LINES[@]}"; do
+    f="${hit%%:*}"; rest="${hit#*:}"; ln="${rest%%:*}"
+    if [ $keep -eq 1 ]; then keep=0; continue; fi
+    backup "$f"; unfreeze "$f"
+    # commente la ligne exacte
+    sed -i "${ln}s|^[[:space:]]*|# WV_DUP_${TS} |" "$f" || true
   done
-  nginx -t || true
-  die "rolled back (see $BK)"
 fi
+
+say "3) Fix #2: autres fichiers qui redéclarent /wolverine/ -> désactiver leur include (ou le fichier)"
+# détecte tout fichier qui contient une location /wolverine/
+mapfile -t LOCFILES < <(grep -RIl --color=never -E "location[[:space:]]+(\^~[[:space:]]+)?/wolverine/" "$NGX" 2>/dev/null | sort -u)
+if [ "${#LOCFILES[@]}" -gt 1 ]; then
+  say "Fichiers avec location /wolverine/:"
+  printf '%s\n' "${LOCFILES[@]}" | sed 's/^/ - /'
+fi
+
+KEEP_FILE=""
+if [ -f "$INC_STATIC" ]; then KEEP_FILE="$INC_STATIC"; else KEEP_FILE="${LOCFILES[0]:-}"; fi
+
+for f in "${LOCFILES[@]}"; do
+  [ -n "$f" ] || continue
+  if [ "$f" = "$KEEP_FILE" ]; then
+    continue
+  fi
+  # Si c'est un include .inc : on le renomme pour le sortir des includes wildcard
+  if [[ "$f" == "$INC_DIR/"*".inc" ]]; then
+    backup "$f"; unfreeze "$f"
+    mv -f "$f" "${f}.WV_DISABLED_${TS}" || true
+  fi
+  # Et on commente toute ligne "include <ce fichier>" trouvée dans /etc/nginx
+  mapfile -t IHITS < <(grep -RIn --color=never -F "include $f" "$NGX" 2>/dev/null || true)
+  for hit in "${IHITS[@]}"; do
+    cf="${hit%%:*}"; rest="${hit#*:}"; ln="${rest%%:*}"
+    backup "$cf"; unfreeze "$cf"
+    sed -i "${ln}s|^[[:space:]]*|# WV_DUP_LOC_${TS} |" "$cf" || true
+  done
+done
+
+say "4) S'assurer que le vhost enabled pointe bien vers sites-available"
+[ -f "$VHOST" ] && ln -sf "$VHOST" "$SEN" || true
+
+say "5) nginx -t + reload"
+nginx -t
 systemctl reload nginx
 
-say "4) prove LOADED config contains aquila_stacking block"
-nginx -T 2>/dev/null | grep -n "AQUILA_STACKING_V8" | head -n 50 || true
-
-say "5) local verify (must be 200 + header X-AquilaStacking: 1)"
-curl -skI --resolve ${DOMAIN}:443:127.0.0.1 "https://${DOMAIN}${PATH_OK}" | head -n 60
-curl -sk  --resolve ${DOMAIN}:443:127.0.0.1 "https://${DOMAIN}${PATH_OK}" | head -n 12
+say "6) Tests Vault (DOIT être JSON, pas 307/HTML)"
+echo "-- vault direct:"; curl -sS "http://127.0.0.1:${VAULT_PORT}/health"; echo
+echo "-- vault via nginx Host:"; curl -sS -H "Host: fireinners.online" "http://127.0.0.1/wolverine/vault-api/health"; echo
+echo "-- create via nginx Host:"; curl -sS -H "Host: fireinners.online" -H "content-type: application/json" -X POST "http://127.0.0.1/wolverine/vault-api/create" -d "{}"; echo
 
 say "DONE"
-say "URL: https://${DOMAIN}${PATH_OK}"
-say "BK: $BK"
+echo "Backups: $BK"
+echo "Ouvre: https://fireinners.online/wolverine/ puis Ctrl+F5"
 BASH
-chmod +x /root/MEGA_AQUILA_STACKING_ONE_SHOT_ROOT_V8_WORKING.sh
-bash /root/MEGA_AQUILA_STACKING_ONE_SHOT_ROOT_V8_WORKING.sh
+
+chmod +x /root/WV_FIX_DUP_LOCATION.sh
+bash /root/WV_FIX_DUP_LOCATION.sh
