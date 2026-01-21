@@ -1,199 +1,193 @@
-cat >/root/MEGA_AQUILA_STACKING_WEBROUTE_FIX_V2_ONE_SHOT.sh<<'BASH'
+cat >/root/wvfix.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
-umask 027
-
-TS="$(date +%Y%m%d_%H%M%S)"
-say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
-die(){ say "ERR: $*"; exit 1; }
-
-[ "$(id -u)" -eq 0 ] || die "run as root"
-command -v nginx >/dev/null 2>&1 || die "nginx missing"
-command -v python3 >/dev/null 2>&1 || die "python3 missing"
-command -v curl >/dev/null 2>&1 || die "curl missing"
-
 DOMAIN="fireinners.online"
-WEBROOT="/var/www/aquila_stacking"
-PATH_A="/aquila_stacking/"
-PATH_B="/iaaquila/"
-INC="/etc/nginx/includes/aquila_stacking_routes.inc"
-BK="/root/AQUILA_STACKING_WEBROUTE_FIX_V2_BK_${TS}"
-mkdir -p "$BK"
+WEBROOT="/var/www/wolverine"
+INC="/etc/nginx/includes/wolverine_routes.inc"
+VHOST_AV="/etc/nginx/sites-available/fireinners.online-ssl"
+TS="$(date +%Y%m%d_%H%M%S)"
+BK="/root/WVFIX_${TS}"
+VAULT_PORT="8787"
 
-ASKLIB="/opt/fireinners/sentinel/lib/askorupdate.sh"
-if [ -f "$ASKLIB" ]; then
-  # shellcheck disable=SC1090
-  . "$ASKLIB" || true
-fi
+say(){ echo "[$(date +%H:%M:%S)] $*"; }
+need_root(){ [ "$(id -u)" = "0" ] || { echo "ROOT only"; exit 1; }; }
 
-write_file(){
-  local path="$1"; shift
-  local tmp; tmp="$(mktemp)"
-  cat >"$tmp"<<EOF
-$*
-EOF
-  if declare -F askorupdate_file >/dev/null 2>&1; then
-    ASKORUPDATE_ASK=0 askorupdate_file "$path" "$tmp" "AquilaStacking web routes v2" || { rm -f "$tmp"; die "askorupdate_file failed: $path"; }
-    rm -f "$tmp"
-  else
-    chattr -i "$path" 2>/dev/null || true
-    [ -f "$path" ] && cp -a "$path" "$BK/$(echo "$path" | sed 's#/#_#g').bak" || true
-    install -m 0644 "$tmp" "$path"
-    rm -f "$tmp"
-  fi
-}
-
-say "1) WEBROOT + index.html"
-mkdir -p "$WEBROOT"
-chmod 0755 "$WEBROOT" || true
-chown -R www-data:www-data "$WEBROOT" 2>/dev/null || true
-
-APP="/opt/aquila_stacking"
-PROG="aquila_stacking"
-PID_LOCAL="UNKNOWN"; PID_DEV="UNKNOWN"; PID_MAIN="UNKNOWN"
-if command -v solana-keygen >/dev/null 2>&1; then
-  [ -f "$APP/target/deploy/${PROG}-keypair.json" ] && PID_LOCAL="$(solana-keygen pubkey "$APP/target/deploy/${PROG}-keypair.json" 2>/dev/null || echo UNKNOWN)"
-  [ -f "$APP/keys/${PROG}-devnet-keypair.json" ] && PID_DEV="$(solana-keygen pubkey "$APP/keys/${PROG}-devnet-keypair.json" 2>/dev/null || echo UNKNOWN)"
-  [ -f "$APP/keys/${PROG}-mainnet-keypair.json" ] && PID_MAIN="$(solana-keygen pubkey "$APP/keys/${PROG}-mainnet-keypair.json" 2>/dev/null || echo UNKNOWN)"
-fi
-
-cat >"$WEBROOT/index.html"<<EOF
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AquilaStacking</title><style>body{font-family:system-ui,Segoe UI,Arial;margin:24px;max-width:980px}code{background:#0b1020;color:#d7e3ff;padding:2px 6px;border-radius:6px}pre{background:#0b1020;color:#d7e3ff;padding:12px;border-radius:10px;overflow:auto}a{color:#2b6fff;text-decoration:none}a:hover{text-decoration:underline}.box{border:1px solid #e5e7eb;border-radius:12px;padding:14px;margin:12px 0}</style></head><body><h1>AquilaStacking</h1><div class="box"><b>URLs</b><div>• <a href="${PATH_B}">${PATH_B}</a></div><div>• <a href="${PATH_A}">${PATH_A}</a></div></div><div class="box"><b>Program IDs</b><pre>localnet: ${PID_LOCAL}\ndevnet : ${PID_DEV}\nmainnet: ${PID_MAIN}</pre></div><div class="box"><b>Paths</b><div><b>Workspace</b> <code>${APP}</code></div><div><b>Webroot</b> <code>${WEBROOT}</code></div><div><b>Include</b> <code>${INC}</code></div></div></body></html>
-EOF
-chown www-data:www-data "$WEBROOT/index.html" 2>/dev/null || true
-chmod 0644 "$WEBROOT/index.html" || true
-
-say "2) Write nginx include (routes)"
-ROUTES="### AQUILA_STACKING_WEBROUTES_V2_BEGIN
-location = ${PATH_B%/} { return 301 ${PATH_B}; }
-location ^~ ${PATH_B} {
-  alias ${WEBROOT}/;
-  index index.html;
-  add_header Cache-Control \"no-store\" always;
-  try_files \$uri \$uri/ ${PATH_B}index.html =404;
-}
-location = ${PATH_A%/} { return 301 ${PATH_A}; }
-location ^~ ${PATH_A} {
-  alias ${WEBROOT}/;
-  index index.html;
-  add_header Cache-Control \"no-store\" always;
-  try_files \$uri \$uri/ ${PATH_A}index.html =404;
-}
-### AQUILA_STACKING_WEBROUTES_V2_END"
-write_file "$INC" "$ROUTES"
-
-say "3) Snapshot nginx config + patch ALL 443 server blocks (covers conflicts/defaults)"
-nginx -T >"$BK/nginx_T.txt" 2>&1 || die "nginx -T failed"
-
-python3 - <<'PY'
-import os,re,shutil,sys
-BK=os.environ["BK"]
-INC=os.environ["INC"]
-MARK_B="AQUILA_STACKING_WEBROUTES_V2_BEGIN"
-T=open(os.path.join(BK,"nginx_T.txt"),"r",errors="ignore").read()
-
-files=[]
-for m in re.finditer(r"^# configuration file (.+?):", T, flags=re.M):
-    p=m.group(1).strip()
-    if p.startswith("/") and os.path.isfile(p):
-        files.append(p)
-files=sorted(set(files))
-
-def patch_server_blocks(txt):
-    # inject "include INC;" into every server{...} block that has listen 443, unless already has marker/include
-    pat=re.compile(r"\bserver\s*\{", re.I)
-    out=[]
-    idx=0
-    n=len(txt)
-    changed=False
-    while True:
-        m=pat.search(txt, idx)
-        if not m:
-            out.append(txt[idx:])
-            break
-        out.append(txt[idx:m.start()])
-        brace=txt.find("{", m.end()-1)
-        if brace==-1:
-            out.append(txt[m.start():]); break
-        depth=0
-        j=brace
-        while j<n:
-            c=txt[j]
-            if c=="{": depth+=1
-            elif c=="}":
-                depth-=1
-                if depth==0:
-                    end=j+1; break
-            j+=1
-        else:
-            out.append(txt[m.start():]); break
-        block=txt[m.start():end]
-        idx=end
-
-        if (MARK_B in block) or (INC in block):
-            out.append(block); continue
-
-        if re.search(r"(?m)^\s*listen\s+[^;]*\b443\b", block):
-            # insert include after opening line
-            k=block.find("{")
-            k2=block.find("\n", k)
-            if k2==-1: k2=k+1
-            ins=f"\n    include {INC};\n"
-            block=block[:k2+1]+ins+block[k2+1:]
-            changed=True
-
-        out.append(block)
-    return "".join(out), changed
-
-patched=[]
-for p in files:
-    try:
-        txt=open(p,"r",errors="ignore").read()
-    except:
-        continue
-    newtxt,chg=patch_server_blocks(txt)
-    if chg:
-        shutil.copy2(p, os.path.join(BK, os.path.basename(p)+".bak"))
-        os.system(f"chattr -i {p} 2>/dev/null || true")
-        open(p,"w").write(newtxt)
-        patched.append(p)
-
-open(os.path.join(BK,"patched_443_files.txt"),"w").write("\n".join(patched)+"\n")
-print("patched_443_count=",len(patched))
-PY
-
-say "4) nginx test + reload (rollback on fail)"
-if ! nginx -t; then
-  say "nginx -t failed -> rollback"
-  while IFS= read -r b; do
-    [ -f "$b" ] || continue
-    orig="/etc/nginx/$(basename "$b" .bak)" # not used
-  done < <(find "$BK" -maxdepth 1 -type f -name "*.bak" -print)
-  # restore exact
-  for b in "$BK"/*.bak; do
-    [ -f "$b" ] || continue
-    base="$(basename "$b")"
-    # guess original by searching file list
-    # we stored basename-only backups; restore by matching same basename in /etc/nginx tree
-    tgt="$(grep -Rsl -- "$base" /etc/nginx 2>/dev/null | head -n1 || true)"
-    # fallback: restore to same-name path if exists
-    if [ -n "$tgt" ]; then :; fi
+unfreeze(){
+  command -v chattr >/dev/null 2>&1 || return 0
+  for p in /etc/nginx/sites-available /etc/nginx/sites-enabled /etc/nginx/includes /etc/nginx/snippets /etc/nginx/nginx.conf; do
+    [ -e "$p" ] || continue
+    say "chattr -i (best-effort) $p"
+    find "$p" -xdev -print0 2>/dev/null | xargs -0 -r chattr -i 2>/dev/null || true
   done
-  die "nginx config invalid; BK=$BK (manual restore from BK/*.bak)"
-fi
+}
 
-systemctl reload nginx
+backup(){
+  say "Backup => $BK"
+  mkdir -p "$BK"
+  cp -a /etc/nginx "$BK/nginx" 2>/dev/null || true
+  mkdir -p "$BK/www"
+  cp -a "$WEBROOT" "$BK/www/wolverine" 2>/dev/null || true
+}
 
-say "5) Local HTTPS verify (force localhost)"
-A="$(curl -k -sS --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}${PATH_B}" | head -n 5 || true)"
-B="$(curl -k -sS --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}${PATH_A}" | head -n 5 || true)"
-echo "$A" | grep -qi "AquilaStacking" || { echo "$A" >"$BK/resp_iaaquila_head.txt"; die "still not serving ${PATH_B} (see $BK/resp_iaaquila_head.txt)"; }
-echo "$B" | grep -qi "AquilaStacking" || { echo "$B" >"$BK/resp_aquila_head.txt"; die "still not serving ${PATH_A} (see $BK/resp_aquila_head.txt)"; }
+ensure_webroot(){
+  mkdir -p "$WEBROOT"
+  if [ ! -f "$WEBROOT/index.html" ]; then
+    say "Create placeholder $WEBROOT/index.html"
+    cat >"$WEBROOT/index.html"<<EOF
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WOLVERINE</title></head><body style="font-family:system-ui;padding:24px"><h1>WOLVERINE</h1><p>placeholder</p></body></html>
+EOF
+  fi
+  say "Webroot content:"
+  ls -la "$WEBROOT" | sed -n '1,30p' || true
+}
 
-say "DONE"
-say "Open: https://${DOMAIN}${PATH_B}"
-say "Open: https://${DOMAIN}${PATH_A}"
-say "BK: $BK"
+disable_dup_vhosts(){
+  say "Disable duplicate enabled vhosts for ${DOMAIN} (keep fireinners.online + fireinners.online-ssl)"
+  shopt -s nullglob
+  for f in /etc/nginx/sites-enabled/*; do
+    [ -f "$f" ] || continue
+    if grep -qE "server_name[[:space:]].*\\b${DOMAIN//./\\.}\\b" "$f"; then
+      b="$(basename "$f")"
+      if [ "$b" != "fireinners.online" ] && [ "$b" != "fireinners.online-ssl" ]; then
+        say "Disable: $f"
+        mv -f "$f" "$f.WV_DISABLED_${TS}" || true
+      fi
+    fi
+  done
+}
+
+disable_other_wolverine_includes(){
+  say "Disable other includes/snippets redefining /wolverine* (keep only $INC)"
+  shopt -s nullglob
+  for f in /etc/nginx/includes/* /etc/nginx/snippets/*; do
+    [ -f "$f" ] || continue
+    [ "$f" = "$INC" ] && continue
+    if grep -qE "location[[:space:]]+\\^~[[:space:]]+/wolverine/|location[[:space:]]+=[[:space:]]+/wolverine\\b|/wolverine/vault-api/" "$f"; then
+      say "Disable: $f"
+      mv -f "$f" "$f.WV_DISABLED_${TS}" || true
+    fi
+  done
+}
+
+write_inc(){
+  say "Write canonical include => $INC"
+  mkdir -p "$(dirname "$INC")"
+  cat >"$INC"<<EOF
+# WV_CANONICAL ${TS}
+location = /wolverine { return 301 /wolverine/; }
+location ^~ /wolverine/ {
+  alias ${WEBROOT}/;
+  index index.html;
+  try_files \$uri \$uri/ /wolverine/index.html;
+  add_header Cache-Control "no-store" always;
+}
+location ^~ /wolverine/vault-api/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+  proxy_pass http://127.0.0.1:${VAULT_PORT}/;
+}
+location ^~ /wolverine/traderone/vault/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+  proxy_pass http://127.0.0.1:${VAULT_PORT}/;
+}
+EOF
+}
+
+strip_old_wolverine_from_vhost(){
+  say "Strip old wolverine include/location from vhost (best-effort)"
+  [ -f "$VHOST_AV" ] || { say "ERROR: missing $VHOST_AV"; exit 1; }
+  sed -i -E "/include[[:space:]]+[^;]*wolverine[^;]*;/d" "$VHOST_AV" || true
+  python3 - <<PY
+import re
+p="${VHOST_AV}"
+s=open(p,"r",encoding="utf-8",errors="ignore").read()
+# remove any location blocks matching /wolverine*
+pat=re.compile(r'\\blocation\\b[^\\n]*?(/wolverine[^\\s{]*)[^\\n]*\\{',re.I)
+out=[]; i=0; n=len(s)
+while True:
+    m=pat.search(s,i)
+    if not m: out.append(s[i:]); break
+    out.append(s[i:m.start()])
+    j=m.end()-1
+    depth=0; k=j
+    while k<n:
+        if s[k]=='{': depth+=1
+        elif s[k]=='}':
+            depth-=1
+            if depth==0: k+=1; break
+        k+=1
+    i=k
+open(p,"w",encoding="utf-8").write("".join(out))
+PY
+}
+
+inject_into_443(){
+  say "Inject include into correct 443 server block in $VHOST_AV"
+  grep -qF "include $INC;" "$VHOST_AV" && { say "Already injected"; return 0; }
+  awk -v dom="$DOMAIN" -v inc="$INC" '
+  BEGIN{inS=0;depth=0;is443=0;isDom=0;done=0;}
+  function c(s,ch){ n=gsub(ch,"",s); return n }
+  {
+    line=$0
+    if (line ~ /^[[:space:]]*server[[:space:]]*\{/){ inS=1; depth=1; is443=0; isDom=0; }
+    if (inS){
+      t=line
+      depth += c(t,/\{/)-c(t,/\}/)
+      if (line ~ /listen[[:space:]]+443/){ is443=1 }
+      if (line ~ /server_name/ && line ~ dom){ isDom=1 }
+    }
+    print $0
+    if (inS && !done && is443 && isDom && line ~ /server_name/ && line ~ dom){
+      print "    include " inc ";"
+      done=1
+    }
+    if (inS && depth<=0){ inS=0; depth=0; is443=0; isDom=0; }
+  }' "$VHOST_AV" >"$VHOST_AV.tmp" && mv -f "$VHOST_AV.tmp" "$VHOST_AV"
+  grep -nF "include $INC;" "$VHOST_AV" || true
+}
+
+reload_nginx(){
+  say "nginx -t"
+  nginx -t
+  say "systemctl reload nginx"
+  systemctl reload nginx || systemctl restart nginx
+}
+
+tests(){
+  say "Port vault ${VAULT_PORT} listening?"
+  ss -lntp | grep -q ":${VAULT_PORT} " && say "OK: listening" || say "WARN: not found"
+  say "SNI TEST: /wolverine/ (HEAD)"
+  curl -skI --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/" | sed -n '1,12p' || true
+  say "SNI TEST: /wolverine/ (first bytes)"
+  curl -sk --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/" | head -c 200 || true; echo
+  say "SNI TEST: /wolverine/vault-api/health (MUST JSON)"
+  curl -sk --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/vault-api/health" || true; echo
+}
+
+main(){
+  need_root
+  backup
+  unfreeze
+  ensure_webroot
+  disable_dup_vhosts
+  disable_other_wolverine_includes
+  write_inc
+  strip_old_wolverine_from_vhost
+  inject_into_443
+  reload_nginx
+  tests
+  say "DONE"
+  echo "Backups: $BK"
+  echo "Open: https://${DOMAIN}/wolverine/ (Ctrl+F5)"
+}
+main "$@"
 BASH
-chmod +x /root/MEGA_AQUILA_STACKING_WEBROUTE_FIX_V2_ONE_SHOT.sh
-BK="/root/AQUILA_STACKING_WEBROUTE_FIX_V2_BK_$(date +%Y%m%d_%H%M%S)" INC="/etc/nginx/includes/aquila_stacking_routes.inc" bash /root/MEGA_AQUILA_STACKING_WEBROUTE_FIX_V2_ONE_SHOT.sh
+chmod +x /root/wvfix.sh
+bash /root/wvfix.sh
