@@ -1,77 +1,254 @@
-cat >/root/MEGA_AIAQUILA_FIX_NPM_LOCK.sh <<'BASH'
+bash -lc 'cat >/root/IAQUILA_STACKING_MEGA.sh<<'"'"'BASH'"'"'
 #!/usr/bin/env bash
 set -euo pipefail
 TS="$(date +%Y%m%d_%H%M%S)"
-say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
-die(){ say "ERR: $*"; exit 1; }
-[ "$(id -u)" -eq 0 ] || die "run as root"
-
-APP="/opt/aiaquila"
-PUB="/var/www/aiaquila"
-SVC="aiaquila.service"
-BK="/root/AIAQUILA_FIX_NPM_${TS}"
+BK="/root/IAQUILA_STACKING_BK_${TS}"
 mkdir -p "$BK"
 
-need(){ command -v "$1" >/dev/null 2>&1 || die "missing: $1"; }
-need node; need npm; need systemctl; need curl
+say(){ printf "[%s] %s\n" "$(date +%H:%M:%S)" "$*"; }
+die(){ echo "ERR: $*" >&2; exit 1; }
 
-say "== 1) backup =="
-tar -C / -czf "$BK/app.tgz" "opt/aiaquila" 2>/dev/null || true
-tar -C / -czf "$BK/pub.tgz" "var/www/aiaquila" 2>/dev/null || true
+# ====== CONFIG ======
+DOMAIN="fireinners.online"
+PATH_A="/iaaquila"
+WEBROOT="/var/www/iaaquila"
+APP="/opt/aquila_stacking_react"
+INC="/etc/nginx/includes/iaqulia_routes.inc"
+VHOST_A="/etc/nginx/sites-available/fireinners.online-ssl"
+VHOST_E="/etc/nginx/sites-enabled/fireinners.online-ssl"
 
-say "== 2) stop service =="
-systemctl stop "$SVC" 2>/dev/null || true
+# Optional: provide a zip export URL to deploy, e.g.:
+# export ZIP_URL="https://example.com/aquila_build.zip"
+ZIP_URL="${ZIP_URL:-}"
 
-say "== 3) normalize package.json (pin exact) =="
-cd "$APP"
-cat >"$APP/package.json"<<'JSON'
-{"name":"aiaquila","version":"1.0.0","type":"module","private":true,
-"dependencies":{"cors":"2.8.5","express":"4.19.2"},
-"devDependencies":{"esbuild":"0.21.5","@solana/web3.js":"1.95.4","buffer":"6.0.3"}}
-JSON
+# ====== SAFETY ======
+[ "$(id -u)" -eq 0 ] || die "run as root"
+umask 022
 
-say "== 4) clean lock + node_modules (regen lock on VPS) =="
-rm -rf "$APP/node_modules" "$APP/package-lock.json" 2>/dev/null || true
+ASKLIB="/opt/fireinners/sentinel/lib/askorupdate.sh"
+if [ -f "$ASKLIB" ]; then
+  # shellcheck disable=SC1090
+  . "$ASKLIB" || true
+fi
 
-say "== 5) npm install (creates fresh lock for this machine) =="
-npm install --no-audit --no-fund
+backup_one(){
+  local p="$1"
+  [ -e "$p" ] || return 0
+  mkdir -p "$BK/$(dirname "$p")"
+  cp -a "$p" "$BK/$p.bak" 2>/dev/null || true
+}
 
-say "== 6) rebuild vendor bundle (no CDN) =="
-cat >"$APP/build-vendor.mjs"<<'MJS'
-import esbuild from"esbuild";
-await esbuild.build({
- entryPoints:["./vendor-entry.js"],
- bundle:true,format:"esm",platform:"browser",target:["es2020"],
- outfile:"/var/www/aiaquila/vendor/solana-web3-bundle.js",
- define:{"global":"globalThis","process.env.NODE_ENV":"\"production\""},
- logLevel:"silent"
-});
-MJS
-cat >"$APP/vendor-entry.js"<<'JS'
-import {Buffer} from"buffer";
-if(!globalThis.Buffer) globalThis.Buffer=Buffer;
-export * from"@solana/web3.js";
-JS
-mkdir -p "$PUB/vendor"
-node "$APP/build-vendor.mjs"
-test -s "$PUB/vendor/solana-web3-bundle.js" || die "vendor bundle missing"
+write_file(){
+  local path="$1"; shift
+  local tmp; tmp="$(mktemp)"
+  cat >"$tmp"<<EOF
+$*
+EOF
+  if declare -F askorupdate_file >/dev/null 2>&1; then
+    ASKORUPDATE_ASK=0 askorupdate_file "$path" "$tmp" "IAQUILA stacking deploy" || { rm -f "$tmp"; die "askorupdate_file failed for $path"; }
+    rm -f "$tmp"
+  else
+    backup_one "$path"
+    chattr -i "$path" 2>/dev/null || true
+    install -m 0644 "$tmp" "$path"
+    rm -f "$tmp"
+  fi
+}
 
-say "== 7) start service =="
-systemctl daemon-reload
-systemctl start "$SVC"
-sleep 1
-systemctl --no-pager --full status "$SVC" | sed -n '1,18p' || true
+# ====== 0) SANITIZE /root FILENAMES (fixes weird-name / too-long cascades) ======
+sanitize_root(){
+  say "0) Sanitize /root filenames (only suspicious ones)"
+  python3 - <<'PY'
+import os,re,hashlib
+root="/root"
+safe=re.compile(r'^[A-Za-z0-9._+-]{1,120}$')
+def bad(n):
+    if any(ord(c)<32 or ord(c)==127 for c in n): return True
+    if not safe.match(n): return True
+    return False
+for n in os.listdir(root):
+    p=os.path.join(root,n)
+    if not os.path.isfile(p): continue
+    if not bad(n): continue
+    h=hashlib.sha1(n.encode("utf-8","ignore")).hexdigest()[:10]
+    base=re.sub(r'[^A-Za-z0-9._+-]+','_',n).strip("._-")[:40] or "file"
+    new=f"SUSPECT_{h}_{base}"
+    dst=os.path.join(root,new)
+    i=0
+    while os.path.exists(dst):
+        i+=1
+        dst=os.path.join(root,f"{new}_{i}")
+    os.rename(p,dst)
+    print(f"RENAMED: {n} -> {os.path.basename(dst)}")
+PY
+}
 
-say "== 8) smoke tests =="
-BASE="/aiaquila"
-PORT="${AIAQUILA_PORT:-9690}"
-curl -fsS "http://127.0.0.1:9690${BASE}/api/health" | sed 's/^/API(LOCAL): /' || true
-curl -fsSI "https://127.0.0.1${BASE}/" -H "Host: fireinners.online" -k | head -n 12 || true
+# ====== 1) PACKAGES ======
+ensure_pkgs(){
+  say "1) Packages"
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y >/dev/null
+  apt-get install -y --no-install-recommends curl ca-certificates unzip nginx python3 rsync >/dev/null
+  if ! command -v node >/dev/null 2>&1; then
+    say "1b) Node missing -> install Node.js 20 (deb.nodesource)"
+    curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null
+    apt-get install -y nodejs >/dev/null
+  fi
+  node -v || true
+  npm -v || true
+}
 
-say "DONE:"
-say "BK: $BK"
-say "URL: https://fireinners.online${BASE}/"
-say "API: https://fireinners.online${BASE}/api/health"
+# ====== 2) FETCH/PLACE APP ======
+maybe_pull_zip(){
+  if [ -z "$ZIP_URL" ]; then
+    say "2) No ZIP_URL provided (will build from existing $APP if present)"
+    return 0
+  fi
+  say "2) Download ZIP_URL -> $APP"
+  backup_one "$APP"
+  rm -rf "$APP"
+  mkdir -p "$APP"
+  tmpzip="$BK/aquila.zip"
+  curl -fL "$ZIP_URL" -o "$tmpzip"
+  unzip -q "$tmpzip" -d "$APP"
+  # if zip contains a top folder, flatten
+  if [ -f "$APP/package.json" ]; then
+    :
+  else
+    top="$(find "$APP" -mindepth 1 -maxdepth 1 -type d | head -n 1 || true)"
+    if [ -n "$top" ] && [ -f "$top/package.json" ]; then
+      shopt -s dotglob
+      mv "$top"/* "$APP"/
+      rmdir "$top" || true
+      shopt -u dotglob
+    fi
+  fi
+}
+
+# ====== 3) BUILD (VITE BASE MUST MATCH /iaaquila/) ======
+build_react(){
+  [ -d "$APP" ] || die "missing APP dir $APP (set ZIP_URL or create the app there)"
+  cd "$APP"
+  [ -f package.json ] || die "missing $APP/package.json"
+  say "3) npm install"
+  (npm ci --silent || npm install --silent)
+  say "3b) build with base=${PATH_A}/"
+  set +e
+  npm run build -- --base="${PATH_A}/" >/dev/null 2>&1
+  RC=$?
+  if [ $RC -ne 0 ]; then
+    npm run build >/dev/null 2>&1
+    RC=$?
+  fi
+  if [ $RC -ne 0 ]; then
+    npx -y vite build --base="${PATH_A}/" >/dev/null 2>&1
+    RC=$?
+  fi
+  set -e
+  [ $RC -eq 0 ] || die "build failed"
+  if [ -d dist ]; then
+    DIST="$APP/dist"
+  elif [ -d build ]; then
+    DIST="$APP/build"
+  else
+    die "no dist/ or build/ output found"
+  fi
+  [ -f "$DIST/index.html" ] || die "build output missing index.html"
+  echo "$DIST" >"$BK/DIST_PATH.txt"
+  say "3c) build OK: $DIST"
+}
+
+# ====== 4) DEPLOY STATIC ======
+deploy_static(){
+  say "4) Deploy -> $WEBROOT"
+  backup_one "$WEBROOT"
+  mkdir -p "$WEBROOT"
+  local DIST; DIST="$(cat "$BK/DIST_PATH.txt")"
+  rsync -a --delete "$DIST"/ "$WEBROOT"/
+  # Hard disable SW caching that can break buttons after updates
+  rm -f "$WEBROOT/sw.js" "$WEBROOT/service-worker.js" "$WEBROOT/manifest.webmanifest" 2>/dev/null || true
+}
+
+# ====== 5) NGINX ROUTES (NO TOUCH WOLVERINE) ======
+write_nginx_inc(){
+  say "5) Write nginx include $INC"
+  mkdir -p /etc/nginx/includes
+  write_file "$INC" "location = ${PATH_A} { return 301 ${PATH_A}/; }\nlocation ^~ ${PATH_A}/ {\n  alias ${WEBROOT}/;\n  try_files \$uri \$uri/ ${PATH_A}/index.html;\n  add_header Cache-Control \"no-store\" always;\n}\nlocation = ${PATH_A}/sw.js { add_header Cache-Control \"no-store\" always; return 404; }\nlocation = ${PATH_A}/service-worker.js { add_header Cache-Control \"no-store\" always; return 404; }\nlocation = ${PATH_A}/manifest.webmanifest { add_header Cache-Control \"no-store\" always; return 404; }\n"
+}
+
+patch_vhost_one(){
+  local f="$1"
+  [ -f "$f" ] || return 0
+  backup_one "$f"
+  chattr -i "$f" 2>/dev/null || true
+  python3 - "$f" "$INC" <<'PY'
+import sys,re
+p=sys.argv[1]; inc=sys.argv[2]
+s=open(p,'r',encoding='utf-8',errors='ignore').read()
+line=f"include {inc};"
+if line in s:
+    print("nochange")
+    sys.exit(0)
+# insert include inside each server { ... } block right after first '{' line
+out=[]
+lines=s.splitlines(True)
+i=0
+while i<len(lines):
+    out.append(lines[i])
+    if re.match(r'^\s*server\s*\{', lines[i]):
+        # after server { line, insert include if not already present in next ~30 lines
+        look=''.join(lines[i:i+40])
+        if line not in look:
+            out.append("    "+line+"\n")
+    i+=1
+new=''.join(out)
+open(p,'w',encoding='utf-8').write(new)
+print("patched")
+PY
+}
+
+patch_vhosts(){
+  say "6) Patch vhosts to include routes"
+  patch_vhost_one "$VHOST_A"
+  patch_vhost_one "$VHOST_E"
+}
+
+reload_and_test(){
+  say "7) nginx -t + reload"
+  nginx -t
+  systemctl reload nginx
+
+  say "8) Local tests (must NOT be 404)"
+  echo "-- ${PATH_A}/ --"
+  curl -skI -H "Host: ${DOMAIN}" "https://127.0.0.1${PATH_A}/" | head -n 15 || true
+
+  # verify first JS asset is reachable (if missing, UI buttons won't work)
+  idx="${WEBROOT}/index.html"
+  if [ -f "$idx" ]; then
+    js="$(grep -oE 'src="[^"]+"' "$idx" | head -n 1 | sed -E 's/^src="([^"]+)".*$/\1/')"
+    if [ -n "$js" ]; then
+      echo "-- first asset: $js --"
+      curl -skI -H "Host: ${DOMAIN}" "https://127.0.0.1${js}" | head -n 12 || true
+    fi
+  fi
+
+  say "DONE"
+  say "BK: $BK"
+  say "Open: https://${DOMAIN}${PATH_A}/"
+}
+
+main(){
+  sanitize_root
+  ensure_pkgs
+  maybe_pull_zip
+  build_react
+  deploy_static
+  write_nginx_inc
+  patch_vhosts
+  reload_and_test
+}
+
+main
 BASH
-chmod 755 /root/MEGA_AIAQUILA_FIX_NPM_LOCK.sh
-bash /root/MEGA_AIAQUILA_FIX_NPM_LOCK.sh
+chmod +x /root/IAQUILA_STACKING_MEGA.sh
+bash /root/IAQUILA_STACKING_MEGA.sh'
