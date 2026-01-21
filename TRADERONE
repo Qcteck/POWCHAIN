@@ -1,580 +1,290 @@
-cat >/root/MEGA_AIAQUILA_INSTALL.sh <<'BASH'
+cat >/root/MEGA_AQFIX_TOO_LONG.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
-TS="$(date +%Y%m%d_%H%M%S)"
+umask 022
+cd /root
+
 say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
-die(){ say "ERR: $*"; exit 1; }
+die(){ echo "ERR: $*" >&2; exit 1; }
+
 [ "$(id -u)" -eq 0 ] || die "run as root"
 
-DOMAIN="fireinners.online"
-PATH_BASE="/aiaquila"
-APP="/opt/aiaquila"
-PUB="/var/www/aiaquila"
-DATA="$APP/data"
-PORT="9690"
-SVC="/etc/systemd/system/aiaquila.service"
-INC="/etc/nginx/includes/aiaquila_routes.inc"
-VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
-BK="/root/AIAQUILA_BK_${TS}"
+TS="$(date +%Y%m%d_%H%M%S)"
+BK="/root/AQFIX_TOO_LONG_BK_${TS}"
 mkdir -p "$BK"
 
-backup(){ local p="$1"; [ -e "$p" ] || return 0; mkdir -p "$BK$(dirname "$p")"; cp -a "$p" "$BK$p" 2>/dev/null || true; }
-unlock(){ chattr -i "$1" 2>/dev/null || true; }
-lock(){ chattr +i "$1" 2>/dev/null || true; }
-need(){ command -v "$1" >/dev/null 2>&1 || die "missing: $1"; }
+say "BEGIN AQFIX TOO_LONG @ $TS"
+say "BK: $BK"
 
-say "== 0) prereqs =="
-need curl; need python3; need nginx; need systemctl; need awk; need sed
+# --- 0) Snapshot minimal ---
+( ls -lb /root || true ) >"$BK/ls_root_lb.txt" 2>&1 || true
+getconf NAME_MAX >"$BK/NAME_MAX.txt" 2>/dev/null || true
+getconf PATH_MAX >"$BK/PATH_MAX.txt" 2>/dev/null || true
 
-say "== 1) node (NodeSource 20) =="
+# --- 1) Hard fix: rename suspicious /root filenames (nonprintable, wildcards, arrows, braces, etc.) ---
+say "1) Sanitizing /root filenames (rename suspicious)"
+python3 - <<'PY'
+import os, re, hashlib, time
+root="/root"
+safe_re=re.compile(r'^[A-Za-z0-9._+-]+$')
+def is_bad(name:str)->bool:
+    if name in (".",".."): return False
+    if len(name)>120: return True
+    if any(ord(c)<32 or ord(c)==127 for c in name): return True
+    if not safe_re.match(name): return True
+    return False
+
+ren=[]
+for name in os.listdir(root):
+    p=os.path.join(root,name)
+    if not os.path.isfile(p): continue
+    if not is_bad(name): continue
+    h=hashlib.sha1(name.encode("utf-8","ignore")).hexdigest()[:10]
+    base=re.sub(r'[^A-Za-z0-9._+-]+','_',name).strip('_')
+    base=(base[:40] or "file")
+    new=f"SUSPECT_{h}_{base}"
+    dst=os.path.join(root,new)
+    i=0
+    while os.path.exists(dst):
+        i+=1
+        dst=os.path.join(root,f"{new}_{i}")
+    ren.append((p,dst))
+for src,dst in ren:
+    try:
+        os.rename(src,dst)
+        print("RENAMED:",os.path.basename(src),"->",os.path.basename(dst))
+    except Exception as e:
+        print("FAILED:",os.path.basename(src), ":", e)
+PY
+
+( ls -lb /root || true ) >"$BK/ls_root_lb_after.txt" 2>&1 || true
+
+# --- 2) Ensure baseline packages ---
+say "2) Packages (curl/wget/unzip/nginx/node/npm if missing)"
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -y >/dev/null 2>&1 || true
+apt-get install -y curl wget ca-certificates unzip nginx >/dev/null
+
 if ! command -v node >/dev/null 2>&1; then
-  say "installing nodejs (NodeSource 20.x)"
-  apt-get update -y
-  apt-get install -y ca-certificates curl gnupg
-  install -d -m 0755 /etc/apt/keyrings
-  curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
-  echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" >/etc/apt/sources.list.d/nodesource.list
-  apt-get update -y
-  apt-get install -y nodejs
+  say "Installing Node.js (Ubuntu repo)"
+  apt-get install -y nodejs npm >/dev/null
 fi
-need node; need npm
-node -v; npm -v
 
-say "== 2) create dirs =="
-mkdir -p "$APP" "$DATA" "$PUB" "$APP/vendor"
-chmod 0755 "$APP" "$DATA" "$PUB" || true
+say "node: $(node -v 2>/dev/null || echo NA) / npm: $(npm -v 2>/dev/null || echo NA)"
 
-say "== 3) write backend (server.js) =="
-backup "$APP/server.js"
-cat >"$APP/server.js"<<'JS'
-import fs from"fs";import path from"path";import crypto from"crypto";import os from"os";
-import express from"express";import cors from"cors";
-const app=express();app.disable("x-powered-by");app.use(cors());app.use(express.json({limit:"2mb"}));
-const ENV=(k,d)=>process.env[k]??d;
-const PORT=parseInt(ENV("AIAQUILA_PORT","9690"),10);
-const BASE=ENV("AIAQUILA_BASE","/aiaquila");
-const DATA_DIR=ENV("AIAQUILA_DATA","/opt/aiaquila/data");
-const RPC_PRIMARY=ENV("AIAQUILA_RPC_PRIMARY","https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac");
-const RPC_BACKUP =ENV("AIAQUILA_RPC_BACKUP","https://api.mainnet-beta.solana.com");
-const ALLOW_ALL_IF_EMPTY=ENV("AIAQUILA_ALLOW_ALL_IF_EMPTY","0")==="1"?1:0;
+# --- 3) Pick ZIP or build fallback React (Vite) ---
+DOMAIN="fireinners.online"
+PATH_A="/iaaquila"
+PATH_B="/aquila_stacking"
+WEBROOT="/var/www/iaaquila"
+APP="/opt/iaaquila_react"
+INC="/etc/nginx/includes/iaaquila_routes.inc"
+VHOST_A="/etc/nginx/sites-available/fireinners.online-ssl"
+VHOST_E="/etc/nginx/sites-enabled/fireinners.online-ssl"
 
-/* POLICY (server-enforced) */
-const POLICY={
-  killSwitch: ENV("AIAQUILA_KILL","0")==="1",
-  allowAllIfEmpty: ALLOW_ALL_IF_EMPTY,
-  allowlist:{
-    destinations:(ENV("AIAQUILA_ALLOW_DESTS","")||"").split(",").map(s=>s.trim()).filter(Boolean), // base58 pubkeys
-  },
-  limits:{
-    maxLamportsPerTx: parseInt(ENV("AIAQUILA_MAX_LAMPORTS_PER_TX","2000000"),10), // 0.002 SOL
-    maxTxPerHour: parseInt(ENV("AIAQUILA_MAX_TX_PER_HOUR","3"),10),
-    maxTxPerDay: parseInt(ENV("AIAQUILA_MAX_TX_PER_DAY","12"),10),
-    confirmTimeoutMs: parseInt(ENV("AIAQUILA_CONFIRM_TIMEOUT_MS","20000"),10),
-  }
-};
+mkdir -p "$WEBROOT" "$APP"
 
-const sha=x=>crypto.createHash("sha256").update(String(x||"")).digest("hex");
-const now=()=>Date.now();
-const jpath=()=>path.join(DATA_DIR,"state.json");
-function readState(){
-  try{const s=fs.readFileSync(jpath(),"utf8");return JSON.parse(s);}catch(e){
-    return {t:now(),pending:[],usage:{hour:{t:0,n:0},day:{t:0,n:0}},events:[]};
-  }
-}
-function writeStateAtomic(st){
-  const tmp=jpath()+".tmp."+process.pid;
-  fs.writeFileSync(tmp,JSON.stringify(st,null,0));
-  fs.renameSync(tmp,jpath());
-}
-function pushEvent(st,level,msg,extra){
-  st.events.push({t:now(),level,msg:String(msg||""),extra:extra||null});
-  st.events=st.events.slice(-400);
-}
-function hourKey(t){const d=new Date(t);d.setMinutes(0,0,0);return d.getTime();}
-function dayKey(t){const d=new Date(t);d.setHours(0,0,0,0);return d.getTime();}
-function resetWindows(st){
-  const t=now();
-  if(st.usage.hour.t!==hourKey(t)){st.usage.hour={t:hourKey(t),n:0};}
-  if(st.usage.day.t!==dayKey(t)){st.usage.day={t:dayKey(t),n:0};}
-}
-function policyOk(st){
-  if(POLICY.killSwitch) return {ok:false,why:"KILL_SWITCH"};
-  resetWindows(st);
-  if(st.usage.hour.n>=POLICY.limits.maxTxPerHour) return {ok:false,why:"HOURLY_QUOTA"};
-  if(st.usage.day.n>=POLICY.limits.maxTxPerDay) return {ok:false,why:"DAILY_QUOTA"};
-  return {ok:true};
-}
-function allowDest(dest){
-  const list=POLICY.allowlist.destinations||[];
-  if(list.length===0) return POLICY.allowAllIfEmpty===1;
-  return list.includes(dest);
-}
-function badReq(res,err){res.status(400).json({ok:false,err});}
-
-/* CONFIRM FINALIZED (explicit states) */
-async function confirmFinalized(sig){
-  const timeout=POLICY.limits.confirmTimeoutMs;
-  const t0=Date.now(); let last=null;
-  const urls=[RPC_PRIMARY,RPC_BACKUP];
-  const sleep=ms=>new Promise(r=>setTimeout(r,ms));
-  while(Date.now()-t0<timeout){
-    for(const rpc of urls){
-      try{
-        const r=await fetch(rpc,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({jsonrpc:"2.0",id:1,method:"getSignatureStatuses",params:[[sig],{searchTransactionHistory:true}]})});
-        const j=await r.json();
-        const v=j?.result?.value?.[0];
-        if(!v){last={rpc,st:"NOT_FOUND"};continue;}
-        if(v.err){return {ok:false,st:"FAILED",rpc,err:v.err};}
-        const conf=v.confirmationStatus||"processed";
-        if(conf==="finalized") return {ok:true,st:"FINALIZED",rpc,slot:v.slot||null,confirmations:v.confirmations??null};
-        last={rpc,st:"PENDING",conf,slot:v.slot||null};
-      }catch(e){last={rpc,st:"RPC_ERR"};}
-    }
-    await sleep(650);
-  }
-  return {ok:false,st:"TIMEOUT",last};
+maybe_pull_zip(){
+  local z="/root/iaaquila.zip"
+  if [ -n "${ZIP_URL:-}" ]; then
+    say "3) Download ZIP_URL -> $z"
+    rm -f "$z"
+    wget -O "$z" "$ZIP_URL"
+    echo "$z"
+    return 0
+  fi
+  local last
+  last="$(ls -1t /root/*.zip 2>/dev/null | head -n 1 || true)"
+  if [ -n "$last" ]; then
+    say "3) Found local zip: $last"
+    echo "$last"
+    return 0
+  fi
+  echo ""
 }
 
-/* ROUTES */
-app.get(`${BASE}/api/health`,(req,res)=>res.json({ok:true,base:BASE,port:PORT,policy:POLICY,rpc:{primary:RPC_PRIMARY,backup:RPC_BACKUP},t:now()}));
-app.get(`${BASE}/api/state`,(req,res)=>{const st=readState();resetWindows(st);res.json({ok:true,st,policy:POLICY,rpc:{primary:RPC_PRIMARY,backup:RPC_BACKUP}});});
+ZIP="$(maybe_pull_zip || true)"
 
-app.post(`${BASE}/api/pending/propose`,(req,res)=>{
-  const {kind,desc,payload}=req.body||{};
-  if(!kind||!desc) return badReq(res,"missing kind/desc");
-  const st=readState(); resetWindows(st);
-  const id="P_"+Date.now()+"_"+Math.random().toString(16).slice(2);
-  const ph=sha(JSON.stringify(payload||{}));
-  st.pending.push({id,kind,desc:String(desc).slice(0,400),payload:payload||{},payloadHash:ph,status:"PENDING",t:now()});
-  st.pending=st.pending.slice(-300);
-  pushEvent(st,"INFO","PENDING_CREATED",{id,kind});
-  writeStateAtomic(st);
-  res.json({ok:true,id,payloadHash:ph});
-});
-
-app.post(`${BASE}/api/pending/resolve`,(req,res)=>{
-  const {id,ok}=req.body||{};
-  if(!id) return badReq(res,"missing id");
-  const st=readState(); resetWindows(st);
-  const p=st.pending.find(x=>x.id===id);
-  if(!p) return badReq(res,"pending not found");
-  if(p.status!=="PENDING") return badReq(res,"pending already resolved");
-  p.status=ok?"APPROVED":"REFUSED"; p.resolvedAt=now();
-  pushEvent(st,"INFO",ok?"PENDING_APPROVED":"PENDING_REFUSED",{id});
-  writeStateAtomic(st);
-  res.json({ok:true,p});
-});
-
-/* EXECUTION: server builds UNSIGNED transfer tx message (client signs with Phantom). */
-app.post(`${BASE}/api/exec/prepare_transfer`,async(req,res)=>{
-  try{
-    const {pendingId,from,to,lamports,clientId}=req.body||{};
-    if(!pendingId||!from||!to||!lamports) return badReq(res,"missing pendingId/from/to/lamports");
-    const st=readState(); resetWindows(st);
-    const okp=policyOk(st); if(!okp.ok) return res.status(403).json({ok:false,err:"POLICY_"+okp.why});
-    const p=st.pending.find(x=>x.id===pendingId);
-    if(!p||p.status!=="APPROVED") return res.status(403).json({ok:false,err:"PENDING_NOT_APPROVED"});
-    const payloadHash=sha(JSON.stringify({from,to,lamports:Number(lamports)}));
-    if(payloadHash!==p.payloadHash) return res.status(403).json({ok:false,err:"PAYLOAD_HASH_MISMATCH"});
-    if(!allowDest(to)) return res.status(403).json({ok:false,err:"DEST_NOT_ALLOWED"});
-    const L=Number(lamports);
-    if(!Number.isFinite(L)||L<=0||L>POLICY.limits.maxLamportsPerTx) return res.status(403).json({ok:false,err:"LAMPORTS_LIMIT"});
-    const nonce="N_"+Date.now()+"_"+Math.random().toString(16).slice(2);
-    const prepId="PREP_"+Date.now()+"_"+Math.random().toString(16).slice(2);
-    const prepHash=sha(prepId+"|"+pendingId+"|"+nonce+"|"+payloadHash);
-    st.pending=st.pending.map(x=>x.id===pendingId?({...x,exec:{prepId,prepHash,nonce,preparedAt:now(),clientId:clientId||null}}):x);
-    pushEvent(st,"INFO","EXEC_PREPARED",{pendingId,prepId});
-    writeStateAtomic(st);
-    res.json({ok:true,prepId,prepHash,nonce,from,to,lamports:L,rpc:{primary:RPC_PRIMARY,backup:RPC_BACKUP}});
-  }catch(e){res.status(500).json({ok:false,err:String(e)});}
-});
-
-/* COMMIT: consume quota ONLY after finalized proof */
-app.post(`${BASE}/api/exec/commit`,async(req,res)=>{
-  try{
-    const {pendingId,prepId,prepHash,txid}=req.body||{};
-    if(!pendingId||!prepId||!prepHash||!txid) return badReq(res,"missing pendingId/prepId/prepHash/txid");
-    const st=readState(); resetWindows(st);
-    const p=st.pending.find(x=>x.id===pendingId);
-    if(!p||p.status!=="APPROVED") return res.status(403).json({ok:false,err:"PENDING_NOT_APPROVED"});
-    const ex=p.exec||{};
-    if(ex.prepId!==prepId||ex.prepHash!==prepHash) return res.status(403).json({ok:false,err:"PREP_MISMATCH"});
-    if(p.committedTxid) return res.json({ok:true,st:"IDEMPOTENT_ALREADY_COMMITTED",txid:p.committedTxid});
-    const conf=await confirmFinalized(txid);
-    if(!conf.ok){
-      pushEvent(st,"WARN","COMMIT_NOT_FINALIZED",{pendingId,txid,st:conf.st,last:conf.last||null,err:conf.err||null});
-      writeStateAtomic(st);
-      return res.status(409).json({ok:false,st:conf.st,last:conf.last||null,err:conf.err||null});
-    }
-    st.usage.hour.n+=1; st.usage.day.n+=1;
-    p.committedTxid=txid; p.committedAt=now(); p.commitRpc=conf.rpc; p.commitSlot=conf.slot||null;
-    pushEvent(st,"INFO","COMMIT_FINALIZED",{pendingId,txid,rpc:conf.rpc,slot:conf.slot||null});
-    writeStateAtomic(st);
-    res.json({ok:true,st:"FINALIZED",txid,rpc:conf.rpc,slot:conf.slot||null,usage:st.usage});
-  }catch(e){res.status(500).json({ok:false,err:String(e)});}
-});
-
-/* STATIC */
-app.use(`${BASE}/`,express.static("/var/www/aiaquila",{index:"index.html"}));
-
-app.listen(PORT,"127.0.0.1",()=>console.log("AIAQUILA on 127.0.0.1:"+PORT+" base "+BASE));
-JS
-
-say "== 4) write frontend (index.html) + local vendor bundle =="
-backup "$PUB/index.html"
-cat >"$PUB/index.html"<<'HTML'
-<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>AiAquila • Execution Réel (Phantom) • Policy</title><style>
-:root{--bg:#05060b;--c:#19f7ff;--p:#ff2cf7;--g:#39ff14;--y:#ffe600;--r:#ff3b3b;--t:#eaf3ff}
-html,body{margin:0;height:100%;background:radial-gradient(1100px 800px at 70% 20%,rgba(255,44,247,.16),rgba(25,247,255,.10),rgba(0,0,0,1));color:var(--t);font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu}
-*{box-sizing:border-box}button,input{border-radius:12px;border:2px solid rgba(25,247,255,.20);background:rgba(0,0,0,.28);color:var(--t);padding:12px 12px;font-weight:1000}
-button{cursor:pointer;text-transform:uppercase;letter-spacing:.12em;font-size:12px}
-button.ok{border-color:rgba(57,255,20,.55)}button.bad{border-color:rgba(255,59,59,.70)}
-#app{display:flex;flex-direction:column;gap:12px;min-height:100dvh;padding:calc(12px + env(safe-area-inset-top)) 12px calc(12px + env(safe-area-inset-bottom)) 12px}
-#top{display:flex;gap:10px;flex-wrap:wrap;align-items:center;justify-content:space-between;border:2px solid rgba(25,247,255,.18);background:linear-gradient(180deg,rgba(255,44,247,.14),rgba(0,0,0,.24));border-radius:16px;padding:12px 14px}
-#top b{letter-spacing:.16em} .chip{border:2px solid rgba(255,230,0,.18);border-radius:999px;padding:7px 10px;font-size:12px;letter-spacing:.12em;text-transform:uppercase;font-weight:1100;background:rgba(0,0,0,.22)}
-.good{border-color:rgba(57,255,20,.28)}.warn{border-color:rgba(255,230,0,.25)}.bad{border-color:rgba(255,59,59,.30)}
-#grid{flex:1;display:grid;grid-template-columns:410px 1fr;gap:12px;min-height:0}
-.box{border:2px solid rgba(25,247,255,.16);background:linear-gradient(180deg,rgba(0,0,0,.34),rgba(0,0,0,.18));border-radius:16px;box-shadow:0 35px 90px rgba(0,0,0,.60);overflow:hidden;min-height:0}
-.hd{padding:14px;border-bottom:2px solid rgba(25,247,255,.10);display:flex;align-items:center;justify-content:space-between;gap:10px}
-.hd b{letter-spacing:.16em;text-transform:uppercase;font-size:12px}
-.pad{padding:14px;overflow:auto;min-height:0}
-.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:12.5px;white-space:pre-wrap;word-break:break-word;line-height:1.35}
-.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
-a{color:var(--c);text-decoration:none}
-@media(max-width:980px){#grid{grid-template-columns:1fr}}
-</style></head><body><div id="app">
-<div id="top">
-<div><b>AiAquila • Execution Réel (Phantom) • Policy</b><div style="opacity:.8;font-size:12px;letter-spacing:.12em;text-transform:uppercase;margin-top:4px">pending → approve → prepare → sign → send → commit(finalized)</div></div>
-<div class="row">
-<span class="chip" id="chipNET">NET:—</span>
-<span class="chip" id="chipRPC">RPC:—</span>
-<span class="chip" id="chipW">WALLET:—</span>
-<span class="chip" id="chipARM">ARM:OFF</span>
-</div>
-</div>
-
-<div id="grid">
-<div class="box">
-<div class="hd"><b>Wallet + Policy</b><span class="chip warn" id="chipPOL">POLICY:—</span></div>
-<div class="pad">
-<div class="row" style="margin-bottom:10px">
-<button class="ok" id="btnConnect">CONNECT PHANTOM</button>
-<button class="bad" id="btnDisconnect">DISCONNECT</button>
-</div>
-<div class="row" style="margin-bottom:10px">
-<button class="ok" id="btnARM">ARM</button>
-<button class="bad" id="btnDISARM">DISARM</button>
-</div>
-
-<div class="row" style="margin-bottom:10px">
-<input id="to" placeholder="DEST (pubkey allowlist)" style="flex:1;min-width:240px">
-<input id="lam" placeholder="Lamports" value="1000" style="width:140px">
-</div>
-<div class="row" style="margin-bottom:14px">
-<button id="btnPropose">PROPOSE (PENDING)</button>
-</div>
-
-<div class="mono" id="policyBox">—</div>
-</div>
-</div>
-
-<div class="box">
-<div class="hd"><b>Console</b><span class="chip" id="chipST">STATE:—</span></div>
-<div class="pad">
-<div class="mono" id="log"></div>
-<div style="height:10px"></div>
-<div class="row">
-<button id="btnRefresh">REFRESH</button>
-<button id="btnPullPending">LIST PENDING</button>
-</div>
-<div style="height:10px"></div>
-<div class="mono" id="pendingBox">—</div>
-</div>
-</div>
-</div>
-
-<script type="module">
-import {Connection,PublicKey,Transaction,SystemProgram} from "./vendor/solana-web3-bundle.js";
-
-const BASE="/aiaquila";
-const api=p=>fetch(`${BASE}/api/${p}`,{cache:"no-store"});
-const post=(p,b)=>fetch(`${BASE}/api/${p}`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(b||{})});
-const $=id=>document.getElementById(id);
-const logEl=$("log"),pendEl=$("pendingBox");
-
-let ARM=false;
-let provider=null;
-let pub=null;
-let rpcPrimary=null;
-let rpcBackup=null;
-let lastState=null;
-
-const log=(t)=>{logEl.textContent+=`[${new Date().toLocaleTimeString("fr-CA",{hour12:false})}] ${t}\n`;logEl.scrollTop=logEl.scrollHeight;};
-const chip=(id,txt,cls)=>{const e=$(id);e.textContent=txt;e.className="chip "+(cls||"");};
-
-function setARM(v){ARM=!!v;chip("chipARM","ARM:"+(ARM?"ON":"OFF"),ARM?"good":"bad");}
-setARM(false);
-
-async function refresh(){
-  chip("chipNET","NET:"+(navigator.onLine?"ONLINE":"OFFLINE"),navigator.onLine?"good":"bad");
-  const h=await api("health").then(r=>r.json());
-  rpcPrimary=h.rpc.primary; rpcBackup=h.rpc.backup;
-  chip("chipRPC","RPC:DRPC+BACKUP","good");
-  const st=await api("state").then(r=>r.json());
-  lastState=st;
-  const ks=st.policy.killSwitch?"KILL=ON":"KILL=OFF";
-  chip("chipPOL","POLICY:"+ks,st.policy.killSwitch?"bad":"good");
-  chip("chipST","STATE:OK","good");
-  $("policyBox").textContent=JSON.stringify({policy:st.policy,usage:st.st.usage},null,2);
-}
-
-async function connect(){
-  if(!window.solana) return alert("Phantom requis");
-  provider=window.solana;
-  const r=await provider.connect();
-  pub=r.publicKey.toString();
-  chip("chipW","WALLET:"+pub.slice(0,4)+"…"+pub.slice(-4),"good");
-  log("wallet connected "+pub);
-}
-
-async function disconnect(){
-  try{await provider?.disconnect?.();}catch(e){}
-  provider=null; pub=null;
-  chip("chipW","WALLET:—","warn");
-  log("wallet disconnected");
-}
-
-async function listPending(){
-  const st=await api("state").then(r=>r.json());
-  const p=(st.st.pending||[]).slice(-25).reverse();
-  if(!p.length){pendEl.textContent="(aucun pending)";return;}
-  pendEl.textContent=p.map(x=>`${x.id} | ${x.status} | ${x.kind} | ${x.desc} | ${new Date(x.t).toLocaleString()}`).join("\n");
-  log("pending listed: "+p.length);
-}
-
-async function propose(){
-  if(!ARM) return alert("ARM requis");
-  if(!pub) return alert("wallet requis");
-  const to=$("to").value.trim();
-  const lam=parseInt($("lam").value.trim(),10);
-  if(!to||!Number.isFinite(lam)||lam<=0) return alert("dest + lamports requis");
-  const payload={from:pub,to,lamports:lam};
-  const r=await post("pending/propose",{kind:"TRANSFER_SOL",desc:`Transfer ${lam} lamports -> ${to}`,payload}).then(x=>x.json());
-  if(!r.ok) return alert("propose error");
-  log("PENDING created "+r.id+" payloadHash "+r.payloadHash);
-  await listPending();
-  alert("Pending créé. Va l'approuver (bouton LIST PENDING puis APPROVE via API si besoin) — ou utilise l’endpoint /pending/resolve.");
-}
-
-async function approveLatest(){
-  const st=await api("state").then(r=>r.json());
-  const p=(st.st.pending||[]).filter(x=>x.status==="PENDING").slice(-1)[0];
-  if(!p) return alert("aucun pending");
-  const rr=await post("pending/resolve",{id:p.id,ok:true}).then(r=>r.json());
-  log("approved "+rr.p.id);
-  await listPending();
-  return rr.p;
-}
-
-function pickRPC(){
-  return rpcPrimary||"https://api.mainnet-beta.solana.com";
-}
-
-async function execApprovedTransfer(p){
-  if(!ARM) return alert("ARM requis");
-  if(!pub||!provider) return alert("wallet requis");
-  if(p.kind!=="TRANSFER_SOL") return alert("kind mismatch");
-  const {from,to,lamports}=p.payload||{};
-  if(from!==pub) return alert("pending.from != wallet");
-  log("prepare_transfer pendingId="+p.id);
-
-  const prep=await post("exec/prepare_transfer",{pendingId:p.id,from,to,lamports,clientId:"browser"}).then(r=>r.json());
-  if(!prep.ok){log("prepare denied "+JSON.stringify(prep));return alert("prepare denied: "+(prep.err||""));}
-
-  const conn=new Connection(pickRPC(),"confirmed");
-  let bh=null;
-  try{bh=await conn.getLatestBlockhash();}catch(e){log("getLatestBlockhash failed"); throw e;}
-
-  const tx=new Transaction().add(SystemProgram.transfer({fromPubkey:new PublicKey(from),toPubkey:new PublicKey(to),lamports:Number(lamports)}));
-  tx.feePayer=new PublicKey(from);
-  tx.recentBlockhash=bh.blockhash;
-
-  let signed=null;
-  try{signed=await provider.signTransaction(tx);}catch(e){log("user rejected / sign failed"); return alert("signature refusée");}
-
-  let sig=null;
-  try{sig=await conn.sendRawTransaction(signed.serialize(),{skipPreflight:false,maxRetries:3});}
-  catch(e){log("sendRawTransaction failed: "+String(e)); return alert("send error");}
-
-  log("sent txid "+seen(sig));
-  const committed=await commitWithStates(prep,p.id,sig);
-  if(committed.ok) log("COMMIT OK FINALIZED "+sig);
-  else log("COMMIT FAIL "+JSON.stringify(committed));
-}
-
-const seen=s=>String(s||"").slice(0,6)+"…"+String(s||"").slice(-6);
-
-async function commitWithStates(prep,pendingId,txid){
-  log("commit (server confirm finalized) ...");
-  const r=await post("exec/commit",{pendingId,prepId:prep.prepId,prepHash:prep.prepHash,txid}).then(async resp=>{
-    const j=await resp.json().catch(()=>({ok:false,st:"BAD_JSON"}));
-    if(resp.ok) return j;
-    return j;
-  });
-  if(r.ok){alert("FINALIZED: "+txid);return r;}
-  if(r.st==="TIMEOUT"){alert("TIMEOUT: tx peut être pending. Réessaie COMMIT.");return r;}
-  if(r.st==="FAILED"){alert("FAILED (on-chain error).");return r;}
-  alert("NOT FINALIZED: "+(r.st||"ERR"));return r;
-}
-
-/* UI binds */
-$("btnConnect").onclick=async()=>{await connect();};
-$("btnDisconnect").onclick=async()=>{await disconnect();};
-$("btnARM").onclick=()=>{setARM(true);log("ARM ON");};
-$("btnDISARM").onclick=()=>{setARM(false);log("ARM OFF");};
-$("btnRefresh").onclick=async()=>{await refresh();};
-$("btnPullPending").onclick=async()=>{await listPending();};
-$("btnPropose").onclick=async()=>{await refresh();await propose();};
-
-/* one-button demo: approve latest + execute */
-const demoBtn=document.createElement("button");demoBtn.textContent="APPROVE LATEST + EXEC";demoBtn.className="ok";
-demoBtn.onclick=async()=>{await refresh();const p=await approveLatest(); if(p) await execApprovedTransfer(p);};
-document.querySelector(".row").appendChild(demoBtn);
-
-await refresh();
-log("ready. ARM OFF. connect wallet then ARM then propose.");
-</script>
-</body></html>
-HTML
-
-say "== 5) npm deps + pinned vendor bundle (no CDN) =="
-backup "$APP/package.json"; backup "$APP/package-lock.json" || true
-cat >"$APP/package.json"<<'JSON'
-{"name":"aiaquila","version":"1.0.0","type":"module","private":true,
-"dependencies":{"cors":"2.8.5","express":"4.19.2"},
-"devDependencies":{"esbuild":"0.21.5","@solana/web3.js":"1.95.3","buffer":"6.0.3"}}
-JSON
-
-cd "$APP"
-if [ -f package-lock.json ]; then
-  say "npm ci"
-  npm ci --no-audit --no-fund
-else
-  say "npm install (generates lock)"
+build_from_zip(){
+  local z="$1"
+  rm -rf "$APP"
+  mkdir -p "$APP"
+  say "4) Unzip -> $APP"
+  unzip -q "$z" -d "$APP"
+  local pkg
+  pkg="$(find "$APP" -maxdepth 4 -name package.json -print -quit || true)"
+  if [ -z "$pkg" ]; then
+    say "WARN: no package.json in zip; will serve static as-is"
+    return 0
+  fi
+  local dir
+  dir="$(dirname "$pkg")"
+  say "5) npm install + build in $dir"
+  cd "$dir"
   npm install --no-audit --no-fund
+  if npm run | grep -qE ' build'; then
+    npm run build
+  else
+    say "WARN: no build script; skip"
+  fi
+  cd /root
+}
+
+build_fallback_vite(){
+  say "3) No zip found. Building fallback React(Vite) app."
+  rm -rf "$APP"
+  mkdir -p "$APP"
+  cd /opt
+  rm -rf "$APP"
+  mkdir -p "$APP"
+  cd "$APP"
+  if [ ! -f package.json ]; then
+    npm create vite@latest . -- --template react >/dev/null 2>&1 || true
+  fi
+  npm install --no-audit --no-fund
+  npm run build || true
+  cd /root
+}
+
+if [ -n "$ZIP" ]; then
+  build_from_zip "$ZIP"
+else
+  build_fallback_vite
 fi
 
-say "build browser vendor bundle"
-cat >"$APP/build-vendor.mjs"<<'MJS'
-import esbuild from"esbuild";
-await esbuild.build({
- entryPoints:["./vendor-entry.js"],
- bundle:true,format:"esm",platform:"browser",target:["es2020"],
- outfile:"/var/www/aiaquila/vendor/solana-web3-bundle.js",
- define:{"global":"globalThis","process.env.NODE_ENV":"\"production\""},
- logLevel:"silent"
-});
-MJS
-cat >"$APP/vendor-entry.js"<<'JS'
-import {Buffer} from"buffer";
-if(!globalThis.Buffer) globalThis.Buffer=Buffer;
-export * from"@solana/web3.js";
-JS
-mkdir -p "$PUB/vendor"
-node "$APP/build-vendor.mjs"
-test -s "$PUB/vendor/solana-web3-bundle.js" || die "vendor bundle missing"
+# --- 4) Deploy dist/out or raw index.html ---
+say "6) Deploy to $WEBROOT"
+rm -rf "${WEBROOT:?}/"* || true
 
-say "== 6) systemd service =="
-backup "$SVC"
-cat >"$SVC"<<EOF
-[Unit]
-Description=AiAquila (Policy + Pending + Phantom Execution)
-After=network-online.target nginx.service
-Wants=network-online.target
+# Find typical outputs
+OUT_DIR=""
+for cand in \
+  "$(find "$APP" -maxdepth 6 -type d -name dist -print -quit 2>/dev/null || true)" \
+  "$(find "$APP" -maxdepth 6 -type d -name out  -print -quit 2>/dev/null || true)" \
+  "$(find "$APP" -maxdepth 6 -type d -name build -print -quit 2>/dev/null || true)"
+do
+  if [ -n "$cand" ] && [ -d "$cand" ]; then OUT_DIR="$cand"; break; fi
+done
 
-[Service]
-Type=simple
-WorkingDirectory=$APP
-Environment=AIAQUILA_PORT=$PORT
-Environment=AIAQUILA_BASE=$PATH_BASE
-Environment=AIAQUILA_DATA=$DATA
-Environment=AIAQUILA_RPC_PRIMARY=$RPC_PRIMARY
-Environment=AIAQUILA_RPC_BACKUP=$RPC_BACKUP
-# POLICY defaults: allowlist mandatory unless AIAQUILA_ALLOW_ALL_IF_EMPTY=1
-Environment=AIAQUILA_ALLOW_ALL_IF_EMPTY=0
-Environment=AIAQUILA_ALLOW_DESTS=
-Environment=AIAQUILA_MAX_LAMPORTS_PER_TX=2000000
-Environment=AIAQUILA_MAX_TX_PER_HOUR=3
-Environment=AIAQUILA_MAX_TX_PER_DAY=12
-Environment=AIAQUILA_CONFIRM_TIMEOUT_MS=20000
-Environment=AIAQUILA_KILL=0
-ExecStart=/usr/bin/node $APP/server.js
-Restart=always
-RestartSec=2
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=full
-ProtectHome=true
-ReadWritePaths=$DATA
-AmbientCapabilities=
-CapabilityBoundingSet=
+if [ -n "$OUT_DIR" ]; then
+  say "Copy output: $OUT_DIR -> $WEBROOT"
+  cp -a "$OUT_DIR"/. "$WEBROOT"/
+else
+  # If zip already is static export (contains index.html)
+  SRC_STATIC="$(find "$APP" -maxdepth 4 -type f -name index.html -print -quit 2>/dev/null || true)"
+  if [ -n "$SRC_STATIC" ]; then
+    say "Static index found: $(dirname "$SRC_STATIC") -> $WEBROOT"
+    cp -a "$(dirname "$SRC_STATIC")"/. "$WEBROOT"/
+  else
+    say "No build output found; writing minimal index.html"
+    cat >"$WEBROOT/index.html"<<'HTML'
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>IAAQUILA</title></head><body style="font-family:system-ui;margin:40px"><h1>IAAQUILA</h1><p>Deploy OK, but no build output detected.</p></body></html>
+HTML
+  fi
+fi
 
-[Install]
-WantedBy=multi-user.target
-EOF
+chown -R www-data:www-data "$WEBROOT" || true
+find "$WEBROOT" -type d -exec chmod 0755 {} \; 2>/dev/null || true
+find "$WEBROOT" -type f -exec chmod 0644 {} \; 2>/dev/null || true
 
-systemctl daemon-reload
-systemctl enable --now aiaquila.service
+# --- 5) Write nginx include (short, deterministic) ---
+say "7) Write nginx include: $INC"
+mkdir -p /etc/nginx/includes
+cp -a "$INC" "$BK/iaaquila_routes.inc.bak" 2>/dev/null || true
 
-say "== 7) nginx include (/aiaquila) =="
-mkdir -p "$(dirname "$INC")"
-backup "$INC"
-unlock "$INC"
 cat >"$INC"<<EOF
-# AiAquila routes (static + api)
-location = $PATH_BASE { return 301 $PATH_BASE/; }
-location ^~ $PATH_BASE/ {
-  root /var/www;
-  try_files \$uri \$uri/ $PATH_BASE/index.html;
+# AUTOGEN IAAQUILA ${TS}
+location = ${PATH_A} { return 302 ${PATH_A}/; }
+location ${PATH_A}/ {
+  alias ${WEBROOT}/;
+  try_files \$uri \$uri/ /index.html;
   add_header Cache-Control "no-store" always;
 }
-location ^~ $PATH_BASE/api/ {
-  proxy_pass http://127.0.0.1:$PORT$PATH_BASE/api/;
-  proxy_http_version 1.1;
-  proxy_set_header Host \$host;
-  proxy_set_header X-Real-IP \$remote_addr;
-  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+location = ${PATH_B} { return 302 ${PATH_B}/; }
+location ${PATH_B}/ {
+  alias ${WEBROOT}/;
+  try_files \$uri \$uri/ /index.html;
   add_header Cache-Control "no-store" always;
 }
+location = ${PATH_A}/sw.js { add_header Cache-Control "no-store" always; return 404; }
+location = ${PATH_B}/sw.js { add_header Cache-Control "no-store" always; return 404; }
 EOF
 
-say "== 8) inject include into fireinners.online vhost (unique) + immutability =="
-backup "$VHOST"
-unlock "$VHOST"
-if ! grep -qF "include $INC;" "$VHOST"; then
-  awk -v ins="  include $INC;" '
-    {print}
-    $0 ~ /server\s*\{/ && done!=1 {done=1; print ins}
-  ' "$VHOST" >"$VHOST.tmp.$TS" && mv "$VHOST.tmp.$TS" "$VHOST"
-fi
+# --- 6) Patch vhosts to include INC (and avoid insane-long backup names by hashing) ---
+bkname(){ echo -n "$1" | sha256sum | awk '{print $1}'; }
 
+patch_one_vhost(){
+  local f="$1"
+  [ -f "$f" ] || return 0
+  cp -a "$f" "$BK/$(bkname "$f").bak" 2>/dev/null || true
+  if grep -qF "include $INC;" "$f"; then
+    say "vhost already includes INC: $f"
+    return 0
+  fi
+  # insert include inside first server { ... } block (after server_name or listen)
+  python3 - "$f" "$INC" <<'PY'
+import sys,re
+p=sys.argv[1]; inc=sys.argv[2]
+s=open(p,'r',encoding='utf-8',errors='ignore').read().splitlines(True)
+out=[]
+inserted=False
+in_server=False
+depth=0
+for line in s:
+    if re.match(r'^\s*server\s*\{', line):
+        in_server=True
+        depth=1
+        out.append(line)
+        continue
+    if in_server:
+        # track braces to know when server block ends
+        depth += line.count('{') - line.count('}')
+        # insert after first server_name or listen line inside server
+        if (not inserted) and re.search(r'^\s*(server_name|listen)\s+', line):
+            out.append(line)
+            out.append(f"    include {inc};\n")
+            inserted=True
+            continue
+        if depth<=0:
+            in_server=False
+    out.append(line)
+if not inserted:
+    # fallback: append include at end of file
+    out.append(f"\ninclude {inc};\n")
+open(p,'w',encoding='utf-8').write(''.join(out))
+print("patched")
+PY
+  say "patched: $f"
+}
+
+say "8) Patch nginx vhosts (fireinners.online) with include"
+patch_one_vhost "$VHOST_A"
+patch_one_vhost "$VHOST_E"
+
+# Also patch any other vhost containing server_name fireinners.online
+for f in /etc/nginx/sites-available/* /etc/nginx/sites-enabled/*; do
+  [ -f "$f" ] || continue
+  grep -qE 'server_name[[:space:]].*\bfireinners\.online\b' "$f" 2>/dev/null || continue
+  patch_one_vhost "$f"
+done
+
+# --- 7) Reload nginx and local test ---
+say "9) nginx -t + reload"
 nginx -t
 systemctl reload nginx
 
-# lock nginx files (best-effort + verify)
-lock "$INC"; lock "$VHOST" || true
-lsattr "$INC" "$VHOST" 2>/dev/null || true
+say "10) Local tests (must NOT be 404)"
+echo "--- ${PATH_A} ---"
+curl -skI -H "Host: ${DOMAIN}" "https://127.0.0.1${PATH_A}/" | head -n 12 || true
+echo "--- ${PATH_B} ---"
+curl -skI -H "Host: ${DOMAIN}" "https://127.0.0.1${PATH_B}/" | head -n 12 || true
+echo "--- include hit ---"
+nginx -T 2>/dev/null | grep -n "iaaquila_routes\.inc" -n | head -n 30 || true
 
-say "== 9) smoke tests =="
-curl -fsS "http://127.0.0.1:$PORT$PATH_BASE/api/health" | sed 's/^/API(LOCAL): /'
-curl -fsS "https://127.0.0.1$PATH_BASE/api/health" -H "Host: $DOMAIN" -k | sed 's/^/API(NGX): /' || true
-curl -fsSI "https://127.0.0.1$PATH_BASE/" -H "Host: $DOMAIN" -k | head -n 12 || true
-
-say "DONE:"
-say " - https://$DOMAIN$PATH_BASE/"
-say " - https://$DOMAIN$PATH_BASE/api/health"
-say "IMPORTANT: set allowlist destinations (server) via:"
-say "  systemctl edit aiaquila.service  (Environment=AIAQUILA_ALLOW_DESTS=PUBKEY1,PUBKEY2)"
+say "DONE"
+say "BK: $BK"
+say "Open: https://${DOMAIN}${PATH_A}/"
+say "Open: https://${DOMAIN}${PATH_B}/"
 BASH
-chmod 755 /root/MEGA_AIAQUILA_INSTALL.sh
-bash /root/MEGA_AIAQUILA_INSTALL.sh
+chmod +x /root/MEGA_AQFIX_TOO_LONG.sh
+bash /root/MEGA_AQFIX_TOO_LONG.sh
