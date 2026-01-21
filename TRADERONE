@@ -1,290 +1,48 @@
-cat >/root/MEGA_AQFIX_TOO_LONG.sh <<'BASH'
+cat >/root/MEGA_AQFIX_VERIFY.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 umask 022
 cd /root
-
 say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
-die(){ echo "ERR: $*" >&2; exit 1; }
 
-[ "$(id -u)" -eq 0 ] || die "run as root"
-
-TS="$(date +%Y%m%d_%H%M%S)"
-BK="/root/AQFIX_TOO_LONG_BK_${TS}"
-mkdir -p "$BK"
-
-say "BEGIN AQFIX TOO_LONG @ $TS"
-say "BK: $BK"
-
-# --- 0) Snapshot minimal ---
-( ls -lb /root || true ) >"$BK/ls_root_lb.txt" 2>&1 || true
-getconf NAME_MAX >"$BK/NAME_MAX.txt" 2>/dev/null || true
-getconf PATH_MAX >"$BK/PATH_MAX.txt" 2>/dev/null || true
-
-# --- 1) Hard fix: rename suspicious /root filenames (nonprintable, wildcards, arrows, braces, etc.) ---
-say "1) Sanitizing /root filenames (rename suspicious)"
-python3 - <<'PY'
-import os, re, hashlib, time
-root="/root"
-safe_re=re.compile(r'^[A-Za-z0-9._+-]+$')
-def is_bad(name:str)->bool:
-    if name in (".",".."): return False
-    if len(name)>120: return True
-    if any(ord(c)<32 or ord(c)==127 for c in name): return True
-    if not safe_re.match(name): return True
-    return False
-
-ren=[]
-for name in os.listdir(root):
-    p=os.path.join(root,name)
-    if not os.path.isfile(p): continue
-    if not is_bad(name): continue
-    h=hashlib.sha1(name.encode("utf-8","ignore")).hexdigest()[:10]
-    base=re.sub(r'[^A-Za-z0-9._+-]+','_',name).strip('_')
-    base=(base[:40] or "file")
-    new=f"SUSPECT_{h}_{base}"
-    dst=os.path.join(root,new)
-    i=0
-    while os.path.exists(dst):
-        i+=1
-        dst=os.path.join(root,f"{new}_{i}")
-    ren.append((p,dst))
-for src,dst in ren:
-    try:
-        os.rename(src,dst)
-        print("RENAMED:",os.path.basename(src),"->",os.path.basename(dst))
-    except Exception as e:
-        print("FAILED:",os.path.basename(src), ":", e)
-PY
-
-( ls -lb /root || true ) >"$BK/ls_root_lb_after.txt" 2>&1 || true
-
-# --- 2) Ensure baseline packages ---
-say "2) Packages (curl/wget/unzip/nginx/node/npm if missing)"
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -y >/dev/null 2>&1 || true
-apt-get install -y curl wget ca-certificates unzip nginx >/dev/null
-
-if ! command -v node >/dev/null 2>&1; then
-  say "Installing Node.js (Ubuntu repo)"
-  apt-get install -y nodejs npm >/dev/null
-fi
-
-say "node: $(node -v 2>/dev/null || echo NA) / npm: $(npm -v 2>/dev/null || echo NA)"
-
-# --- 3) Pick ZIP or build fallback React (Vite) ---
 DOMAIN="fireinners.online"
 PATH_A="/iaaquila"
 PATH_B="/aquila_stacking"
 WEBROOT="/var/www/iaaquila"
-APP="/opt/iaaquila_react"
 INC="/etc/nginx/includes/iaaquila_routes.inc"
-VHOST_A="/etc/nginx/sites-available/fireinners.online-ssl"
-VHOST_E="/etc/nginx/sites-enabled/fireinners.online-ssl"
 
-mkdir -p "$WEBROOT" "$APP"
+say "== VERIFY IAAQUILA =="
+say "1) /root suspicious filenames (top 30 by length)"
+ls -1 /root 2>/dev/null | awk '{print length($0),$0}' | sort -nr | head -n 30 || true
 
-maybe_pull_zip(){
-  local z="/root/iaaquila.zip"
-  if [ -n "${ZIP_URL:-}" ]; then
-    say "3) Download ZIP_URL -> $z"
-    rm -f "$z"
-    wget -O "$z" "$ZIP_URL"
-    echo "$z"
-    return 0
-  fi
-  local last
-  last="$(ls -1t /root/*.zip 2>/dev/null | head -n 1 || true)"
-  if [ -n "$last" ]; then
-    say "3) Found local zip: $last"
-    echo "$last"
-    return 0
-  fi
-  echo ""
-}
+say "2) Webroot sanity"
+ls -la "$WEBROOT" 2>/dev/null | sed -n '1,120p' || true
+test -f "$WEBROOT/index.html" && say "OK: index.html present" || say "WARN: no index.html in $WEBROOT"
 
-ZIP="$(maybe_pull_zip || true)"
+say "3) Nginx include sanity"
+test -f "$INC" && { say "OK: $INC exists"; sed -n '1,220p' "$INC" | sed -n '1,120p'; } || say "ERR: missing $INC"
 
-build_from_zip(){
-  local z="$1"
-  rm -rf "$APP"
-  mkdir -p "$APP"
-  say "4) Unzip -> $APP"
-  unzip -q "$z" -d "$APP"
-  local pkg
-  pkg="$(find "$APP" -maxdepth 4 -name package.json -print -quit || true)"
-  if [ -z "$pkg" ]; then
-    say "WARN: no package.json in zip; will serve static as-is"
-    return 0
-  fi
-  local dir
-  dir="$(dirname "$pkg")"
-  say "5) npm install + build in $dir"
-  cd "$dir"
-  npm install --no-audit --no-fund
-  if npm run | grep -qE ' build'; then
-    npm run build
-  else
-    say "WARN: no build script; skip"
-  fi
-  cd /root
-}
-
-build_fallback_vite(){
-  say "3) No zip found. Building fallback React(Vite) app."
-  rm -rf "$APP"
-  mkdir -p "$APP"
-  cd /opt
-  rm -rf "$APP"
-  mkdir -p "$APP"
-  cd "$APP"
-  if [ ! -f package.json ]; then
-    npm create vite@latest . -- --template react >/dev/null 2>&1 || true
-  fi
-  npm install --no-audit --no-fund
-  npm run build || true
-  cd /root
-}
-
-if [ -n "$ZIP" ]; then
-  build_from_zip "$ZIP"
-else
-  build_fallback_vite
-fi
-
-# --- 4) Deploy dist/out or raw index.html ---
-say "6) Deploy to $WEBROOT"
-rm -rf "${WEBROOT:?}/"* || true
-
-# Find typical outputs
-OUT_DIR=""
-for cand in \
-  "$(find "$APP" -maxdepth 6 -type d -name dist -print -quit 2>/dev/null || true)" \
-  "$(find "$APP" -maxdepth 6 -type d -name out  -print -quit 2>/dev/null || true)" \
-  "$(find "$APP" -maxdepth 6 -type d -name build -print -quit 2>/dev/null || true)"
-do
-  if [ -n "$cand" ] && [ -d "$cand" ]; then OUT_DIR="$cand"; break; fi
-done
-
-if [ -n "$OUT_DIR" ]; then
-  say "Copy output: $OUT_DIR -> $WEBROOT"
-  cp -a "$OUT_DIR"/. "$WEBROOT"/
-else
-  # If zip already is static export (contains index.html)
-  SRC_STATIC="$(find "$APP" -maxdepth 4 -type f -name index.html -print -quit 2>/dev/null || true)"
-  if [ -n "$SRC_STATIC" ]; then
-    say "Static index found: $(dirname "$SRC_STATIC") -> $WEBROOT"
-    cp -a "$(dirname "$SRC_STATIC")"/. "$WEBROOT"/
-  else
-    say "No build output found; writing minimal index.html"
-    cat >"$WEBROOT/index.html"<<'HTML'
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>IAAQUILA</title></head><body style="font-family:system-ui;margin:40px"><h1>IAAQUILA</h1><p>Deploy OK, but no build output detected.</p></body></html>
-HTML
-  fi
-fi
-
-chown -R www-data:www-data "$WEBROOT" || true
-find "$WEBROOT" -type d -exec chmod 0755 {} \; 2>/dev/null || true
-find "$WEBROOT" -type f -exec chmod 0644 {} \; 2>/dev/null || true
-
-# --- 5) Write nginx include (short, deterministic) ---
-say "7) Write nginx include: $INC"
-mkdir -p /etc/nginx/includes
-cp -a "$INC" "$BK/iaaquila_routes.inc.bak" 2>/dev/null || true
-
-cat >"$INC"<<EOF
-# AUTOGEN IAAQUILA ${TS}
-location = ${PATH_A} { return 302 ${PATH_A}/; }
-location ${PATH_A}/ {
-  alias ${WEBROOT}/;
-  try_files \$uri \$uri/ /index.html;
-  add_header Cache-Control "no-store" always;
-}
-location = ${PATH_B} { return 302 ${PATH_B}/; }
-location ${PATH_B}/ {
-  alias ${WEBROOT}/;
-  try_files \$uri \$uri/ /index.html;
-  add_header Cache-Control "no-store" always;
-}
-location = ${PATH_A}/sw.js { add_header Cache-Control "no-store" always; return 404; }
-location = ${PATH_B}/sw.js { add_header Cache-Control "no-store" always; return 404; }
-EOF
-
-# --- 6) Patch vhosts to include INC (and avoid insane-long backup names by hashing) ---
-bkname(){ echo -n "$1" | sha256sum | awk '{print $1}'; }
-
-patch_one_vhost(){
-  local f="$1"
-  [ -f "$f" ] || return 0
-  cp -a "$f" "$BK/$(bkname "$f").bak" 2>/dev/null || true
-  if grep -qF "include $INC;" "$f"; then
-    say "vhost already includes INC: $f"
-    return 0
-  fi
-  # insert include inside first server { ... } block (after server_name or listen)
-  python3 - "$f" "$INC" <<'PY'
-import sys,re
-p=sys.argv[1]; inc=sys.argv[2]
-s=open(p,'r',encoding='utf-8',errors='ignore').read().splitlines(True)
-out=[]
-inserted=False
-in_server=False
-depth=0
-for line in s:
-    if re.match(r'^\s*server\s*\{', line):
-        in_server=True
-        depth=1
-        out.append(line)
-        continue
-    if in_server:
-        # track braces to know when server block ends
-        depth += line.count('{') - line.count('}')
-        # insert after first server_name or listen line inside server
-        if (not inserted) and re.search(r'^\s*(server_name|listen)\s+', line):
-            out.append(line)
-            out.append(f"    include {inc};\n")
-            inserted=True
-            continue
-        if depth<=0:
-            in_server=False
-    out.append(line)
-if not inserted:
-    # fallback: append include at end of file
-    out.append(f"\ninclude {inc};\n")
-open(p,'w',encoding='utf-8').write(''.join(out))
-print("patched")
-PY
-  say "patched: $f"
-}
-
-say "8) Patch nginx vhosts (fireinners.online) with include"
-patch_one_vhost "$VHOST_A"
-patch_one_vhost "$VHOST_E"
-
-# Also patch any other vhost containing server_name fireinners.online
-for f in /etc/nginx/sites-available/* /etc/nginx/sites-enabled/*; do
-  [ -f "$f" ] || continue
-  grep -qE 'server_name[[:space:]].*\bfireinners\.online\b' "$f" 2>/dev/null || continue
-  patch_one_vhost "$f"
-done
-
-# --- 7) Reload nginx and local test ---
-say "9) nginx -t + reload"
+say "4) Nginx config test"
 nginx -t
-systemctl reload nginx
 
-say "10) Local tests (must NOT be 404)"
-echo "--- ${PATH_A} ---"
-curl -skI -H "Host: ${DOMAIN}" "https://127.0.0.1${PATH_A}/" | head -n 12 || true
-echo "--- ${PATH_B} ---"
-curl -skI -H "Host: ${DOMAIN}" "https://127.0.0.1${PATH_B}/" | head -n 12 || true
-echo "--- include hit ---"
-nginx -T 2>/dev/null | grep -n "iaaquila_routes\.inc" -n | head -n 30 || true
+say "5) Reload nginx"
+systemctl reload nginx || true
+
+say "6) Local HTTPS tests (must NOT be 404)"
+echo "--- ${PATH_A}/ ---"
+curl -skI -H "Host: ${DOMAIN}" "https://127.0.0.1${PATH_A}/" | head -n 20 || true
+echo "--- ${PATH_B}/ ---"
+curl -skI -H "Host: ${DOMAIN}" "https://127.0.0.1${PATH_B}/" | head -n 20 || true
+
+say "7) Include hit (nginx -T)"
+nginx -T 2>/dev/null | grep -n "iaaquila_routes\.inc" -n | head -n 50 || true
+
+say "8) nginx errors (last 80 lines)"
+tail -n 80 /var/log/nginx/error.log 2>/dev/null || true
 
 say "DONE"
-say "BK: $BK"
 say "Open: https://${DOMAIN}${PATH_A}/"
 say "Open: https://${DOMAIN}${PATH_B}/"
 BASH
-chmod +x /root/MEGA_AQFIX_TOO_LONG.sh
-bash /root/MEGA_AQFIX_TOO_LONG.sh
+chmod +x /root/MEGA_AQFIX_VERIFY.sh
+bash /root/MEGA_AQFIX_VERIFY.sh
