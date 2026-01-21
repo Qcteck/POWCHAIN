@@ -1,27 +1,45 @@
-cat >/root/MEGA_AQUILA_REACT_STACKING_DEPLOY_V2_FIXNGX.sh <<'BASH'
+bash -lc 'cat >/root/MEGA_AQUILA_REACT_STACKING_DEPLOY.sh<<'\''BASH'\''
 #!/usr/bin/env bash
 set -euo pipefail
 TS="$(date +%Y%m%d_%H%M%S)"
-BK="/root/AQUILA_REACT_STACKING_FIXNGX_BK_${TS}"
+BK="/root/AQUILA_REACT_STACKING_DEPLOY_BK_${TS}"
 mkdir -p "$BK"
-say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
+
+say(){ printf "[%s] %s\n" "$(date +%H:%M:%S)" "$*"; }
 die(){ say "ERR: $*"; exit 1; }
-[ "$(id -u)" = "0" ] || die "run as root"
-command -v nginx >/dev/null 2>&1 || die "nginx missing"
-command -v python3 >/dev/null 2>&1 || die "python3 missing"
-command -v curl >/dev/null 2>&1 || die "curl missing"
 
+# ---- config (change only if you want) ----
 DOMAIN="fireinners.online"
+PATH_A="/aquila_stacking/"
+PATH_B="/iaaquila/"
 WEBROOT="/var/www/aquila_stacking"
-INC_DIR="/etc/nginx/includes"
-INC_A="$INC_DIR/aquila_stacking_routes.inc"
-INC_B="$INC_DIR/aquila_stacking_routes.inc"  # same target, keep compatibility
+LINKROOT="/var/www/iaaquila"
+INC="/etc/nginx/includes/aquila_stacking_routes.inc"
+VHOST_A="/etc/nginx/sites-available/fireinners.online-ssl"
+VHOST_B="/etc/nginx/conf.d/000-fireinners.online-ssl.conf"
+VHOST_C="/etc/nginx/sites-enabled/fireinners.online-ssl"
+APP="/opt/aquila_stacking_react"
 
+# Optional: set ZIP_URL env to auto-download a React export zip into /root/
+ZIP_URL="${ZIP_URL:-}"
+
+# ---- safety checks ----
+[ "$(id -u)" -eq 0 ] || die "run as root"
+umask 022
+
+# ---- bring in askorupdate if present ----
 ASKLIB="/opt/fireinners/sentinel/lib/askorupdate.sh"
 if [ -f "$ASKLIB" ]; then
   # shellcheck disable=SC1090
   . "$ASKLIB" || true
 fi
+
+backup_one(){
+  local p="$1"
+  [ -e "$p" ] || return 0
+  mkdir -p "$BK/$(dirname "$p")"
+  cp -a "$p" "$BK/$p.bak" 2>/dev/null || true
+}
 
 write_file(){
   local path="$1"; shift
@@ -30,165 +48,388 @@ write_file(){
 $*
 EOF
   if declare -F askorupdate_file >/dev/null 2>&1; then
-    ASKORUPDATE_ASK=0 askorupdate_file "$path" "$tmp" "Aquila React Stacking nginx routes" || { rm -f "$tmp"; die "askorupdate_file failed: $path"; }
+    ASKORUPDATE_ASK=0 askorupdate_file "$path" "$tmp" "Aquila React Stacking deploy" || { rm -f "$tmp"; die "askorupdate_file failed: $path"; }
     rm -f "$tmp"
   else
+    backup_one "$path"
     chattr -i "$path" 2>/dev/null || true
-    [ -f "$path" ] && cp -a "$path" "$BK/$(echo "$path" | sed 's#/#_#g').bak" || true
     install -m 0644 "$tmp" "$path"
     rm -f "$tmp"
   fi
 }
 
-say "0) Sanity"
-[ -d "$WEBROOT" ] || die "missing $WEBROOT (deploy webroot first)"
-[ -f "$WEBROOT/index.html" ] || die "missing $WEBROOT/index.html"
-mkdir -p "$INC_DIR"
+ensure_pkgs(){
+  say "0) Packages"
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y >/dev/null
+  apt-get install -y nginx curl unzip rsync python3 python3-venv ca-certificates gnupg >/dev/null
+  if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
+    # try Ubuntu repo first (stable enough for Vite)
+    apt-get install -y nodejs npm >/dev/null || true
+  fi
+  command -v node >/dev/null 2>&1 || die "node missing (install nodejs >=18)"
+  command -v npm  >/dev/null 2>&1 || die "npm missing"
+  local NV; NV="$(node -v | tr -d v || true)"
+  local MAJOR="${NV%%.*}"
+  [ "${MAJOR:-0}" -ge 18 ] || die "node >=18 required (current: $NV)"
+}
 
-say "1) Write nginx include (routes)"
-ROUTES="$(cat <<EOF
-# Aquila Stacking (React SPA) routes
-location = /aquila_stacking { return 301 /aquila_stacking/; }
-location ^~ /aquila_stacking/ {
-  alias $WEBROOT/;
-  add_header Cache-Control "no-store" always;
-  try_files \$uri \$uri/ /aquila_stacking/index.html;
+find_or_get_zip(){
+  local z=""
+  if [ -n "$ZIP_URL" ]; then
+    say "1) Download ZIP_URL -> /root/aquila_ui.zip"
+    curl -fsSL "$ZIP_URL" -o /root/aquila_ui.zip || die "download failed"
+    z="/root/aquila_ui.zip"
+  else
+    # pick newest horizons-export*.zip or aquila_ui.zip
+    z="$(ls -1t /root/horizons-export-*.zip /root/aquila_ui.zip 2>/dev/null | head -n1 || true)"
+  fi
+  echo "$z"
 }
-location = /iaaquila { return 301 /iaaquila/; }
-location ^~ /iaaquila/ {
-  alias $WEBROOT/;
-  add_header Cache-Control "no-store" always;
-  try_files \$uri \$uri/ /iaaquila/index.html;
+
+make_fallback_vite(){
+  say "2) Build fallback React (Vite) in $APP"
+  rm -rf "$APP"
+  mkdir -p "$APP"
+  cd "$APP"
+
+  npm create vite@latest . -- --template react >/dev/null 2>&1 || die "vite init failed"
+  npm install >/dev/null 2>&1 || die "npm install failed"
+
+  # Replace App with a clean dark “stacking” landing (SPA)
+  cat >"$APP/src/App.jsx"<<'\''EOF'\''
+import React,{useMemo,useState} from "react";
+const fmt=(n)=>{try{return new Intl.NumberFormat("en-US",{maximumFractionDigits:2}).format(n);}catch{return String(n)}};
+export default function App(){
+  const [stake,setStake]=useState(1000);
+  const [apy,setApy]=useState(18);
+  const [days,setDays]=useState(30);
+  const out=useMemo(()=>{
+    const p=Math.max(0,Number(stake)||0);
+    const r=Math.max(0,Number(apy)||0)/100;
+    const t=Math.max(0,Number(days)||0)/365;
+    const earn=p*r*t;
+    const total=p+earn;
+    return {p,r,t,earn,total};
+  },[stake,apy,days]);
+  return(
+    <div className="wrap">
+      <div className="bg"/>
+      <header className="top">
+        <div className="brand">
+          <div className="logo">A</div>
+          <div>
+            <div className="t">Aquila Stacking</div>
+            <div className="s">React UI • deployed on /aquila_stacking and /iaaquila</div>
+          </div>
+        </div>
+        <div className="pill">fireinners.online</div>
+      </header>
+
+      <main className="grid">
+        <section className="card">
+          <h2>Estimateur de rendement</h2>
+          <div className="row">
+            <label>Stake</label>
+            <input type="number" value={stake} onChange={e=>setStake(e.target.value)} />
+            <span className="unit">USD</span>
+          </div>
+          <div className="row">
+            <label>APY</label>
+            <input type="number" value={apy} onChange={e=>setApy(e.target.value)} />
+            <span className="unit">%</span>
+          </div>
+          <div className="row">
+            <label>Durée</label>
+            <input type="number" value={days} onChange={e=>setDays(e.target.value)} />
+            <span className="unit">jours</span>
+          </div>
+          <div className="hr"/>
+          <div className="kpis">
+            <div className="k"><div className="k1">Gain estimé</div><div className="k2">{fmt(out.earn)} USD</div></div>
+            <div className="k"><div className="k1">Total</div><div className="k2">{fmt(out.total)} USD</div></div>
+          </div>
+          <div className="note">Cette UI est une base design. Tu peux remplacer par ton export “horizons” dès que le zip est présent sur le VPS.</div>
+        </section>
+
+        <section className="card">
+          <h2>Status</h2>
+          <ul className="list">
+            <li><span className="dot ok"/> Nginx routes include</li>
+            <li><span className="dot ok"/> Webroot: /var/www/aquila_stacking</li>
+            <li><span className="dot ok"/> SPA fallback: index.html</li>
+            <li><span className="dot ok"/> Paths: /aquila_stacking/ & /iaaquila/</li>
+          </ul>
+          <div className="hr"/>
+          <div className="cta">
+            <a className="btn" href="/aquila_stacking/">Open /aquila_stacking</a>
+            <a className="btn" href="/iaaquila/">Open /iaaquila</a>
+          </div>
+        </section>
+      </main>
+    </div>
+  );
 }
-location ~* ^/(aquila_stacking|iaaquila)/assets/ {
-  alias $WEBROOT/assets/;
-  add_header Cache-Control "public, max-age=31536000, immutable" always;
+EOF
+
+  cat >"$APP/src/index.css"<<'\''EOF'\''
+:root{color-scheme:dark}
+*{box-sizing:border-box}
+html,body,#root{height:100%}
+body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;background:#05070c;color:#e9eefc;overflow-x:hidden}
+.wrap{min-height:100%;position:relative;padding:28px 20px 60px}
+.bg{position:absolute;inset:-40vh -20vw;filter:blur(60px);opacity:.55;pointer-events:none;
+background:
+radial-gradient(closest-side at 20% 20%,#2b6bff55,transparent 60%),
+radial-gradient(closest-side at 75% 35%,#00ffd555,transparent 60%),
+radial-gradient(closest-side at 50% 80%,#ff2bd655,transparent 60%);
+}
+.top{position:relative;z-index:1;display:flex;justify-content:space-between;align-items:center;gap:14px;max-width:1100px;margin:0 auto 18px}
+.brand{display:flex;align-items:center;gap:12px}
+.logo{width:44px;height:44px;border-radius:14px;display:grid;place-items:center;
+background:linear-gradient(135deg,#2b6bff,#00ffd5);color:#00121a;font-weight:900}
+.t{font-weight:800;font-size:18px;letter-spacing:.3px}
+.s{opacity:.7;font-size:12px;margin-top:2px}
+.pill{padding:8px 12px;border:1px solid #ffffff1a;border-radius:999px;background:#0b1020cc;backdrop-filter:blur(10px);font-size:12px;opacity:.9}
+.grid{position:relative;z-index:1;max-width:1100px;margin:0 auto;display:grid;grid-template-columns:1.2fr .8fr;gap:16px}
+@media(max-width:900px){.grid{grid-template-columns:1fr}}
+.card{border:1px solid #ffffff1a;background:#0b1020cc;backdrop-filter:blur(12px);
+border-radius:18px;padding:18px 18px 16px;box-shadow:0 20px 80px #00000066}
+h2{margin:0 0 14px;font-size:16px;letter-spacing:.2px}
+.row{display:grid;grid-template-columns:90px 1fr 48px;gap:10px;align-items:center;margin:10px 0}
+label{opacity:.8;font-size:12px}
+input{width:100%;padding:10px 12px;border-radius:12px;border:1px solid #ffffff1a;background:#070a14;color:#e9eefc;outline:none}
+input:focus{border-color:#2b6bff88;box-shadow:0 0 0 4px #2b6bff22}
+.unit{opacity:.7;font-size:12px;text-align:right}
+.hr{height:1px;background:#ffffff14;margin:14px 0}
+.kpis{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.k{padding:12px;border:1px solid #ffffff12;background:#070a14;border-radius:14px}
+.k1{opacity:.7;font-size:12px}
+.k2{margin-top:6px;font-size:18px;font-weight:900}
+.note{margin-top:12px;opacity:.65;font-size:12px;line-height:1.35}
+.list{list-style:none;padding:0;margin:0;display:grid;gap:10px}
+.list li{display:flex;align-items:center;gap:10px;opacity:.85}
+.dot{width:10px;height:10px;border-radius:50%}
+.ok{background:#00ffd5;box-shadow:0 0 0 4px #00ffd522}
+.cta{display:flex;gap:10px;flex-wrap:wrap}
+.btn{display:inline-block;padding:10px 12px;border-radius:12px;text-decoration:none;color:#00121a;font-weight:900;
+background:linear-gradient(135deg,#2b6bff,#00ffd5);border:0}
+EOF
+
+  npm run build >/dev/null 2>&1 || die "npm build failed"
+}
+
+unpack_and_build_zip(){
+  local z="$1"
+  say "2) Unpack + build from zip: $z"
+  rm -rf "$APP"
+  mkdir -p "$APP"
+  unzip -q "$z" -d "$APP/unpacked" || die "unzip failed"
+
+  # try to locate a package.json
+  local PKG
+  PKG="$(python3 - <<PY
+import os
+root=os.path.abspath("'"$APP"'"+"/unpacked")
+best=None
+for d,_,f in os.walk(root):
+  if "package.json" in f:
+    best=os.path.join(d,"package.json"); break
+print(best or "")
+PY
+)"
+  if [ -n "$PKG" ]; then
+    local DIR; DIR="$(dirname "$PKG")"
+    say "   found package.json in: $DIR"
+    cd "$DIR"
+    npm install >/dev/null 2>&1 || die "npm install failed"
+    npm run build >/dev/null 2>&1 || die "npm run build failed"
+
+    # find dist/build/out
+    local DIST
+    DIST="$(python3 - <<PY
+import os
+cand=["dist","build","out"]
+base=os.path.abspath("'"$DIR"'")
+for c in cand:
+  p=os.path.join(base,c)
+  if os.path.isdir(p) and os.path.isfile(os.path.join(p,"index.html")):
+    print(p); raise SystemExit
+print("")
+PY
+)"
+    [ -n "$DIST" ] || die "build ok but could not find dist/build/out with index.html"
+    echo "$DIST"
+    return 0
+  fi
+
+  # zip might already contain dist
+  local DIST2
+  DIST2="$(python3 - <<PY
+import os
+root=os.path.abspath("'"$APP"'"+"/unpacked")
+for d,_,f in os.walk(root):
+  if "index.html" in f and (d.endswith("/dist") or d.endswith("/build") or d.endswith("/out")):
+    print(d); raise SystemExit
+print("")
+PY
+)"
+  [ -n "$DIST2" ] || die "zip does not look like a React/Vite/Next export (no package.json, no dist/build/out index.html)"
+  echo "$DIST2"
+}
+
+deploy_dist(){
+  local dist="$1"
+  say "3) Deploy dist -> $WEBROOT"
+  mkdir -p "$WEBROOT"
+  backup_one "$WEBROOT"
+  rsync -a --delete "$dist"/ "$WEBROOT"/
+  chown -R www-data:www-data "$WEBROOT" 2>/dev/null || true
+
+  # symlink /var/www/iaaquila -> /var/www/aquila_stacking (safe for SPA root mapping)
+  if [ -L "$LINKROOT" ] || [ -e "$LINKROOT" ]; then
+    backup_one "$LINKROOT"
+    rm -rf "$LINKROOT" || true
+  fi
+  ln -s "$WEBROOT" "$LINKROOT"
+}
+
+write_nginx_include(){
+  say "4) Write nginx include: $INC"
+  local inc_txt
+  inc_txt="$(cat <<EOF
+# Aquila Stacking (React static SPA)
+# Webroot: $WEBROOT (and symlink $LINKROOT)
+location = ${PATH_A%/} { return 301 $PATH_A; }
+location ^~ $PATH_A {
+  root /var/www;
+  try_files \$uri \$uri/ ${PATH_A}index.html;
+  add_header Cache-Control "no-store" always;
+}
+location = ${PATH_B%/} { return 301 $PATH_B; }
+location ^~ $PATH_B {
+  root /var/www;
+  try_files \$uri \$uri/ ${PATH_B}index.html;
+  add_header Cache-Control "no-store" always;
 }
 EOF
 )"
-write_file "$INC_A" "$ROUTES"
-[ "$INC_B" = "$INC_A" ] || write_file "$INC_B" "$ROUTES"
+  mkdir -p "$(dirname "$INC")"
+  write_file "$INC" "$inc_txt"
+}
 
-say "2) Backup nginx -T"
-nginx -T >"$BK/nginx_T.txt" 2>&1 || true
+patch_vhost_includes(){
+  say "5) Patch vhosts to include $INC"
+  backup_one "$VHOST_A"
+  backup_one "$VHOST_B"
+  backup_one "$VHOST_C"
 
-say "3) Patch ALL vhost files that contain server_name $DOMAIN (80/443) to include $INC_A"
-python3 - <<PY
-import os,re,subprocess,sys,shutil,datetime
+  python3 - <<PY
+import os,re,sys
+INC=r"$INC"
+DOMAIN=r"$DOMAIN"
+targets=[r"$VHOST_A",r"$VHOST_B",r"$VHOST_C"]
+def patch_file(p):
+  if not os.path.isfile(p): return False
+  s=open(p,"r",encoding="utf-8",errors="ignore").read()
+  if INC in s: return False
+  # patch only server blocks that listen 443 and contain server_name DOMAIN
+  out=[]
+  i=0
+  changed=False
+  # naive server block parse by braces
+  token=re.compile(r"(server\s*\{)|(\{)|(\})",re.M)
+  stack=[]
+  last=0
+  for m in token.finditer(s):
+    if m.group(1): # server {
+      stack.append(("server",m.start()))
+    elif m.group(2):
+      stack.append(("{",m.start()))
+    elif m.group(3):
+      # pop one level
+      if stack: stack.pop()
+      # if closing a server block (best-effort): look back from last server { start
+    # continue
+  # best-effort approach: patch using regex over server blocks
+  def repl(match):
+    nonlocal changed
+    block=match.group(0)
+    if re.search(r"\\blisten\\s+[^;]*443",block) and re.search(r"\\bserver_name\\s+[^;]*\\b"+re.escape(DOMAIN)+r"\\b",block):
+      if INC in block: return block
+      # insert include near top (after server_name if present else after first line)
+      lines=block.splitlines()
+      ins=None
+      for idx,l in enumerate(lines):
+        if "server_name" in l:
+          ins=idx+1; break
+      if ins is None: ins=1
+      lines.insert(ins, f"    include {INC};")
+      changed=True
+      return "\\n".join(lines)
+    return block
+  new=re.sub(r"server\\s*\\{[\\s\\S]*?\\n\\}",repl,s)
+  if changed:
+    open(p,"w",encoding="utf-8").write(new)
+  return changed
 
-DOMAIN=os.environ.get("DOMAIN","fireinners.online")
-INC=os.environ.get("INC_A","/etc/nginx/includes/aquila_stacking_routes.inc")
-BK=os.environ.get("BK","/root/BK")
-
-def run(cmd):
-    return subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
-
-try:
-    out = run(["nginx","-T"])
-except Exception as e:
-    print("ERR: nginx -T failed"); print(e); sys.exit(1)
-
-# Extract config file list from nginx -T
-paths=[]
-for line in out.splitlines():
-    m=re.match(r'^# configuration file (.+?):$', line.strip())
-    if m:
-        p=m.group(1).strip()
-        paths.append(p)
-
-paths=sorted(set(paths))
-
-# Keep only real files likely to contain server blocks
-cands=[]
-for p in paths:
-    if not p.startswith("/"): 
-        continue
-    if not os.path.isfile(p):
-        continue
-    try:
-        s=open(p,'r',encoding='utf-8',errors='ignore').read()
-    except Exception:
-        continue
-    if "server_name" in s and DOMAIN in s:
-        cands.append(p)
-
-cands=sorted(set(cands))
-if not cands:
-    print("WARN: no vhost candidates found for", DOMAIN)
-    sys.exit(0)
-
-def patch_content(text):
-    lines=text.splitlines(True)
-    out=[]
-    i=0
-    changed=False
-
-    def find_matching_server(block_text):
-        return re.search(r'\bserver_name\b[^;]*\b'+re.escape(DOMAIN)+r'\b', block_text) is not None
-
-    while i < len(lines):
-        line=lines[i]
-        if re.match(r'^\s*server\s*\{', line):
-            depth=0
-            block=[]
-            start=i
-            while i < len(lines):
-                l=lines[i]
-                depth += l.count('{')
-                depth -= l.count('}')
-                block.append(l)
-                i+=1
-                if depth==0:
-                    break
-            b="".join(block)
-            if find_matching_server(b) and INC not in b:
-                # Insert include right after opening "server {"
-                block.insert(1, "  include %s;\n" % INC)
-                changed=True
-            out.append("".join(block))
-        else:
-            out.append(line)
-            i+=1
-
-    return "".join(out), changed
-
-patched_any=False
-for p in cands:
-    try:
-        orig=open(p,'r',encoding='utf-8',errors='ignore').read()
-    except Exception:
-        continue
-    new,chg=patch_content(orig)
-    if chg and new!=orig:
-        os.makedirs(BK, exist_ok=True)
-        shutil.copy2(p, os.path.join(BK, p.replace('/','_')+'.bak'))
-        try:
-            subprocess.run(["chattr","-i",p], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception:
-            pass
-        with open(p,'w',encoding='utf-8') as f:
-            f.write(new)
-        print("patched:", p)
-        patched_any=True
-    else:
-        print("ok:", p)
-
-if not patched_any:
-    print("no changes needed")
+any_change=False
+for p in targets:
+  try:
+    if patch_file(p):
+      any_change=True
+  except Exception as e:
+    pass
+print("patched" if any_change else "nochange")
 PY
+}
 
-say "4) nginx -t + reload"
-nginx -t
-systemctl reload nginx
+nginx_test_reload(){
+  say "6) nginx -t + reload"
+  nginx -t
+  systemctl reload nginx
+}
 
-say "5) Verify locally (HTTPS via Host header)"
-curl -kIs "https://127.0.0.1/aquila_stacking/" -H "Host: ${DOMAIN}" | head -n 15 || true
-curl -kIs "https://127.0.0.1/iaaquila/"       -H "Host: ${DOMAIN}" | head -n 15 || true
+local_verify(){
+  say "7) Local verify (Host header)"
+  set +e
+  echo "--- /aquila_stacking/ ---"
+  curl -skI -H "Host: $DOMAIN" "https://127.0.0.1$PATH_A" | head -n 20
+  echo
+  echo "--- /iaaquila/ ---"
+  curl -skI -H "Host: $DOMAIN" "https://127.0.0.1$PATH_B" | head -n 20
+  echo
+  set -e
+}
 
-say "DONE"
-echo "OPEN: https://${DOMAIN}/aquila_stacking/"
-echo "ALT : https://${DOMAIN}/iaaquila/"
-echo "BK  : ${BK}"
+main(){
+  say "BEGIN Aquila React Stacking deploy"
+  ensure_pkgs
+
+  say "1) Backup nginx dump"
+  nginx -T >"$BK/nginx.T.txt" 2>&1 || true
+
+  local z; z="$(find_or_get_zip)"
+  if [ -n "$z" ] && [ -f "$z" ]; then
+    dist="$(unpack_and_build_zip "$z")"
+  else
+    dist=""
+    make_fallback_vite
+    dist="$APP/dist"
+  fi
+
+  deploy_dist "$dist"
+  write_nginx_include
+  patch_vhost_includes
+  nginx_test_reload
+  local_verify
+
+  say "DONE"
+  say "Backups: $BK"
+  say "Open: https://$DOMAIN${PATH_A}"
+  say "Open: https://$DOMAIN${PATH_B}"
+}
+main
 BASH
-chmod +x /root/MEGA_AQUILA_REACT_STACKING_DEPLOY_V2_FIXNGX.sh
-/root/MEGA_AQUILA_REACT_STACKING_DEPLOY_V2_FIXNGX.sh
+chmod +x /root/MEGA_AQUILA_REACT_STACKING_DEPLOY.sh
+/root/MEGA_AQUILA_REACT_STACKING_DEPLOY.sh'
