@@ -1,658 +1,210 @@
-cat >/root/MEGA_AIAQUILA_DEPLOY_V1.sh <<'BASH'
+cat >/root/MEGA_AQUILA_STACKING_WEBROUTE_FIX_V4_ONE_SHOT.sh<<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
+umask 027
 
 TS="$(date +%Y%m%d_%H%M%S)"
-SLUG="aiaquila"
-DOMAIN="fireinners.online"
-
-APP="/opt/aiaquila"
-APPJS="$APP/app"
-CFG="$APP/config"
-DATA="$APP/data"
-
-WEB="/var/www/aiaquila"
-VENDOR="$WEB/vendor"
-
-INC="/etc/nginx/includes/${SLUG}_routes.inc"
-BK="/root/${SLUG^^}_BK_${TS}"
-mkdir -p "$BK"
-
 say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
+die(){ say "ERR: $*"; exit 1; }
 
-need(){ command -v "$1" >/dev/null 2>&1 || { echo "ERR missing: $1"; exit 1; }; }
-need bash
-need awk
-need sed
-need grep
-need curl
-need sha256sum
-need systemctl
-need nginx || true
-need node
-need npm
+[ "$(id -u)" -eq 0 ] || die "run as root"
+command -v nginx >/dev/null 2>&1 || die "nginx missing"
+command -v python3 >/dev/null 2>&1 || die "python3 missing"
+command -v curl >/dev/null 2>&1 || die "curl missing"
 
-# -------------------------
-# 0) Detect ACTIVE vhost
-# -------------------------
-detect_vhost(){
-  local cand=""
-  if [ -f /etc/nginx/conf.d/000-fireinners.online-ssl.conf ]; then
-    cand="/etc/nginx/conf.d/000-fireinners.online-ssl.conf"
-  elif [ -f /etc/nginx/sites-available/fireinners.online-ssl ]; then
-    cand="/etc/nginx/sites-available/fireinners.online-ssl"
-  else
-    cand="$(nginx -T 2>/dev/null | awk '
-      $0 ~ /# configuration file/ {f=$4}
-      $0 ~ /server_name/ && $0 ~ /fireinners\.online/ {print f; exit}
-    ')"
-  fi
-  if [ -z "${cand:-}" ] || [ ! -f "$cand" ]; then
-    echo "ERR: cannot detect active vhost for ${DOMAIN}" >&2
-    exit 1
-  fi
-  echo "$cand"
-}
-VHOST="$(detect_vhost)"
-say "ACTIVE_VHOST=$VHOST"
+DOMAIN="fireinners.online"
+WEBROOT="/var/www/aquila_stacking"
+PATH_A="/aquila_stacking/"
+PATH_B="/iaaquila/"
+INC="/etc/nginx/includes/aquila_stacking_routes.inc"
 
-# -------------------------
-# 1) Backup
-# -------------------------
-say "== 1) Backup =="
+BK="/root/AQUILA_STACKING_WEBROUTE_FIX_V4_BK_${TS}"
 mkdir -p "$BK"
-cp -a "$VHOST" "$BK/$(basename "$VHOST").bak" 2>/dev/null || true
-cp -a "$INC" "$BK/$(basename "$INC").bak" 2>/dev/null || true
-cp -a "$APP" "$BK/app.bak" 2>/dev/null || true
-cp -a "$WEB" "$BK/web.bak" 2>/dev/null || true
-nginx -T >"$BK/nginx.T.txt" 2>/dev/null || true
 
-# -------------------------
-# 2) Unfreeze (best-effort)
-# -------------------------
-say "== 2) Unfreeze nginx/app (best-effort) =="
-chattr -i /etc/nginx/nginx.conf 2>/dev/null || true
-chattr -i "$VHOST" 2>/dev/null || true
-chattr -i "$INC" 2>/dev/null || true
-
-# -------------------------
-# 3) Dirs
-# -------------------------
-say "== 3) Create dirs =="
-mkdir -p "$APPJS" "$CFG" "$DATA" "$WEB" "$VENDOR"
-
-# -------------------------
-# 4) Policy (deny-by-default)
-# -------------------------
-say "== 4) Write policy (deny-by-default) =="
-if [ ! -f "$CFG/exec_allowlist.json" ]; then
-cat >"$CFG/exec_allowlist.json"<<'JSON'
-{
-  "KILL_SWITCH": false,
-  "ALLOW_ALL_IF_EMPTY": 0,
-  "global": {
-    "maxTxPer24h": 6,
-    "maxLamportsPerTx": 20000,
-    "maxConfirmSeconds": 30,
-    "maxSendRetries": 4,
-    "backoffMs": 600
-  },
-  "transfers": [
-    {
-      "name": "TREASURY_MICRO",
-      "to": "11111111111111111111111111111111",
-      "maxLamports": 20000
-    }
-  ]
-}
-JSON
+ASKLIB="/opt/fireinners/sentinel/lib/askorupdate.sh"
+if [ -f "$ASKLIB" ]; then
+  # shellcheck disable=SC1090
+  . "$ASKLIB" || true
 fi
 
-if [ ! -f "$CFG/admin.token" ]; then
-  (umask 077; tr -dc 'a-zA-Z0-9' </dev/urandom | head -c 32 >"$CFG/admin.token")
-fi
-
-cat >"$CFG/env"<<EOF
-PORT=9688
-HOST=127.0.0.1
-SOL_RPC_PRIMARY=https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac
-SOL_RPC_BACKUP=https://api.mainnet-beta.solana.com
+write_file(){
+  local path="$1"; shift
+  local tmp; tmp="$(mktemp)"
+  cat >"$tmp"<<EOF
+$*
 EOF
-
-# -------------------------
-# 5) Backend package.json (PIN exact) + server.js
-# -------------------------
-say "== 5) Backend package.json (PIN exact) =="
-cat >"$APPJS/package.json"<<'JSON'
-{
-  "name": "aiaquila",
-  "version": "1.0.0",
-  "private": true,
-  "type": "commonjs",
-  "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  },
-  "dependencies": {
-    "cors": "2.8.5",
-    "express": "4.19.2"
-  }
-}
-JSON
-
-say "== 6) Backend server.js (pending/usage atomic + commit finalized + rpc fallback) =="
-cat >"$APPJS/server.js"<<'JS'
-const fs = require("fs");
-const fsp = fs.promises;
-const path = require("path");
-const crypto = require("crypto");
-const express = require("express");
-const cors = require("cors");
-
-const ENVFILE = "/opt/aiaquila/config/env";
-function loadEnvFile(p){
-  try{
-    const s = fs.readFileSync(p,"utf8");
-    for (const line of s.split("\n")){
-      const t=line.trim(); if(!t||t.startsWith("#")) continue;
-      const i=t.indexOf("="); if(i<0) continue;
-      const k=t.slice(0,i).trim(); const v=t.slice(i+1).trim();
-      if(!(k in process.env)) process.env[k]=v;
-    }
-  }catch{}
-}
-loadEnvFile(ENVFILE);
-
-const PORT = Number(process.env.PORT||9688);
-const HOST = process.env.HOST||"127.0.0.1";
-const RPC_PRIMARY = process.env.SOL_RPC_PRIMARY||"https://api.mainnet-beta.solana.com";
-const RPC_BACKUP  = process.env.SOL_RPC_BACKUP ||"https://api.mainnet-beta.solana.com";
-
-const CFG_DIR="/opt/aiaquila/config";
-const DATA_DIR="/opt/aiaquila/data";
-const STATE_PATH=path.join(DATA_DIR,"state.json");
-const POLICY_PATH=path.join(CFG_DIR,"exec_allowlist.json");
-const ADMIN_TOKEN_PATH=path.join(CFG_DIR,"admin.token");
-
-function now(){ return Date.now(); }
-function dayKey(ts=Date.now()){
-  const d=new Date(ts);
-  const y=d.getUTCFullYear();
-  const m=String(d.getUTCMonth()+1).padStart(2,"0");
-  const da=String(d.getUTCDate()).padStart(2,"0");
-  return `${y}${m}${da}`;
-}
-function sha256(x){ return crypto.createHash("sha256").update(x).digest("hex"); }
-
-async function readJSON(p, fallback){
-  try{ return JSON.parse(await fsp.readFile(p,"utf8")); }catch{ return fallback; }
-}
-async function writeJSONAtomic(p, obj){
-  const tmp = p + ".tmp." + process.pid;
-  const s = JSON.stringify(obj,null,2);
-  await fsp.writeFile(tmp, s, "utf8");
-  await fsp.rename(tmp, p);
-}
-async function loadPolicy(){
-  const pol = await readJSON(POLICY_PATH, null);
-  if(!pol) throw new Error("missing policy");
-  return pol;
-}
-async function loadState(){
-  const st = await readJSON(STATE_PATH, null);
-  if(st) return st;
-  const init={ pending:{}, usage:{}, audit:[] };
-  await writeJSONAtomic(STATE_PATH, init);
-  return init;
-}
-function auditPush(st, msg){
-  st.audit.push({ts:now(), msg});
-  if(st.audit.length>1000) st.audit=st.audit.slice(-1000);
+  if declare -F askorupdate_file >/dev/null 2>&1; then
+    ASKORUPDATE_ASK=0 askorupdate_file "$path" "$tmp" "AquilaStacking routes v4" || { rm -f "$tmp"; die "askorupdate_file failed: $path"; }
+    rm -f "$tmp"
+  else
+    chattr -i "$path" 2>/dev/null || true
+    [ -f "$path" ] && cp -a "$path" "$BK/$(echo "$path" | sed 's#/#_#g').bak" || true
+    install -m 0644 "$tmp" "$path"
+    rm -f "$tmp"
+  fi
 }
 
-function withTimeout(ms, p){
-  let to;
-  const t = new Promise((_,rej)=> to=setTimeout(()=>rej(new Error("timeout")), ms));
-  return Promise.race([p.finally(()=>clearTimeout(to)), t]);
-}
+say "1) WEBROOT + index.html"
+mkdir -p "$WEBROOT"
+chmod 0755 "$WEBROOT" || true
+chown -R www-data:www-data "$WEBROOT" 2>/dev/null || true
 
-async function rpcCall(url, method, params){
-  const body = {jsonrpc:"2.0", id:1, method, params};
-  const res = await withTimeout(8000, fetch(url,{
-    method:"POST",
-    headers:{"content-type":"application/json"},
-    body: JSON.stringify(body)
-  }));
-  if(!res.ok) throw new Error(`rpc_http_${res.status}`);
-  const j = await res.json();
-  if(j.error) throw new Error(`rpc_${j.error.code||"err"}_${j.error.message||"error"}`);
-  return j.result;
-}
-
-async function getTxFinalized(sig){
-  // getTransaction is best signal for finalized existence
-  // try primary then backup
-  try{
-    return await rpcCall(RPC_PRIMARY,"getTransaction",[sig,{encoding:"json",commitment:"finalized",maxSupportedTransactionVersion:0}]);
-  }catch(e1){
-    return await rpcCall(RPC_BACKUP,"getTransaction",[sig,{encoding:"json",commitment:"finalized",maxSupportedTransactionVersion:0}]);
-  }
-}
-
-async function policyCheckTransfer(pol, to, lamports, usageCount24h){
-  if(pol.KILL_SWITCH) return {ok:false, why:"KILL_SWITCH"};
-  const gl=pol.global||{};
-  const allowAll = Number(pol.ALLOW_ALL_IF_EMPTY||0);
-  const list = Array.isArray(pol.transfers)? pol.transfers : [];
-  if(list.length===0 && !allowAll) return {ok:false, why:"ALLOWLIST_EMPTY_DENY"};
-  let rule=null;
-  if(list.length>0){
-    rule = list.find(r=>String(r.to||"")===String(to));
-    if(!rule) return {ok:false, why:"DEST_NOT_ALLOWED"};
-  }
-  const maxTx = Number(gl.maxTxPer24h||0);
-  if(maxTx>0 && usageCount24h>=maxTx) return {ok:false, why:"QUOTA_24H"};
-  const maxLam = Number((rule&&rule.maxLamports) || gl.maxLamportsPerTx || 0);
-  if(maxLam>0 && lamports>maxLam) return {ok:false, why:"LAMPORTS_TOO_HIGH"};
-  return {ok:true};
-}
-
-const app = express();
-app.use(cors());
-app.use(express.json({limit:"1mb"}));
-
-app.get("/api/health", async (_req,res)=>{
-  try{
-    const pol = await loadPolicy();
-    res.json({ok:true, ts:now(), rpc:{primary:RPC_PRIMARY, backup:RPC_BACKUP}, policy:{KILL_SWITCH:pol.KILL_SWITCH, ALLOW_ALL_IF_EMPTY:pol.ALLOW_ALL_IF_EMPTY}});
-  }catch(e){
-    res.status(500).json({ok:false, err:String(e.message||e)});
-  }
-});
-
-app.get("/api/audit", async (_req,res)=>{
-  const st = await loadState();
-  res.json({ok:true, audit: st.audit.slice(-200)});
-});
-
-app.post("/api/pending/create", async (req,res)=>{
-  try{
-    const {type,to,lamports,fromPub} = req.body||{};
-    if(type!=="transfer") return res.status(400).json({ok:false, err:"type_required_transfer"});
-    if(!to || typeof to!=="string") return res.status(400).json({ok:false, err:"to_required"});
-    const lam = Number(lamports);
-    if(!Number.isFinite(lam) || lam<=0) return res.status(400).json({ok:false, err:"lamports_invalid"});
-    const st = await loadState();
-    const pol = await loadPolicy();
-    const dk = dayKey();
-    const used = Number((st.usage[dk]||0));
-    const chk = await policyCheckTransfer(pol,to,lam,used);
-    if(!chk.ok) return res.status(403).json({ok:false, err:chk.why});
-
-    const payload = {type:"transfer", to, lamports: lam, fromPub: String(fromPub||"")};
-    const payloadHash = sha256(JSON.stringify(payload));
-    const pendingId = crypto.randomUUID();
-    st.pending[pendingId] = {pendingId, status:"PENDING", payload, payloadHash, createdAt: now(), sig:null, committedAt:null};
-    auditPush(st, `PENDING_CREATE ${pendingId} ${payloadHash}`);
-    await writeJSONAtomic(STATE_PATH, st);
-    res.json({ok:true, pendingId, payload, payloadHash, status:"PENDING"});
-  }catch(e){
-    res.status(500).json({ok:false, err:String(e.message||e)});
-  }
-});
-
-app.post("/api/pending/approve", async (req,res)=>{
-  try{
-    const token = String(req.headers["x-aiaquila-admin"]||"");
-    const real = (await fsp.readFile(ADMIN_TOKEN_PATH,"utf8")).trim();
-    if(!token || token!==real) return res.status(401).json({ok:false, err:"admin_token_required"});
-    const {pendingId} = req.body||{};
-    if(!pendingId) return res.status(400).json({ok:false, err:"pendingId_required"});
-    const st = await loadState();
-    const p = st.pending[pendingId];
-    if(!p) return res.status(404).json({ok:false, err:"pending_not_found"});
-    if(p.status!=="PENDING") return res.json({ok:true, status:p.status});
-    p.status="APPROVED";
-    p.approvedAt=now();
-    auditPush(st, `PENDING_APPROVE ${pendingId}`);
-    await writeJSONAtomic(STATE_PATH, st);
-    res.json({ok:true, pendingId, status:"APPROVED"});
-  }catch(e){
-    res.status(500).json({ok:false, err:String(e.message||e)});
-  }
-});
-
-app.post("/api/exec/commit", async (req,res)=>{
-  try{
-    const {pendingId, sig, payloadHash} = req.body||{};
-    if(!pendingId||!sig||!payloadHash) return res.status(400).json({ok:false, err:"pendingId_sig_payloadHash_required"});
-    const st = await loadState();
-    const p = st.pending[pendingId];
-    if(!p) return res.status(404).json({ok:false, err:"pending_not_found"});
-    if(p.payloadHash!==payloadHash) return res.status(403).json({ok:false, err:"payload_hash_mismatch"});
-    if(p.status!=="APPROVED") return res.status(403).json({ok:false, err:"not_approved"});
-    if(p.sig && p.sig===sig && p.status==="COMMITTED") return res.json({ok:true, status:"COMMITTED", sig});
-
-    // Confirm finalized (explicit)
-    const pol = await loadPolicy();
-    const maxSec = Number((pol.global&&pol.global.maxConfirmSeconds) || 30);
-    const start = now();
-    let tx=null, lastErr=null;
-    while((now()-start) < maxSec*1000){
-      try{
-        tx = await getTxFinalized(sig);
-        if(tx) break;
-      }catch(e){ lastErr=String(e.message||e); }
-      await new Promise(r=>setTimeout(r, 600));
-    }
-    if(!tx) return res.status(504).json({ok:false, err:"finalized_timeout", lastErr});
-
-    // Consume quota AFTER proof
-    const dk = dayKey();
-    st.usage[dk] = Number((st.usage[dk]||0)) + 1;
-    p.sig = sig;
-    p.status = "COMMITTED";
-    p.committedAt = now();
-    auditPush(st, `COMMIT_OK ${pendingId} sig=${sig}`);
-    await writeJSONAtomic(STATE_PATH, st);
-
-    res.json({ok:true, status:"COMMITTED", sig});
-  }catch(e){
-    res.status(500).json({ok:false, err:String(e.message||e)});
-  }
-});
-
-app.listen(PORT, HOST, ()=>console.log(`[aiaquila] listening on http://${HOST}:${PORT}`));
-JS
-
-# -------------------------
-# 7) Install deps (PIN exact, lock present)
-# -------------------------
-say "== 7) npm install (PIN exact) =="
-cd "$APPJS"
-npm install --save-exact --no-audit --no-fund >/dev/null
-npm ci --omit=dev --no-audit --no-fund >/dev/null
-
-# -------------------------
-# 8) Frontend (PIN local vendor, Phantom real sign+send + commit)
-# -------------------------
-say "== 8) Front index.html =="
-cat >"$WEB/index.html"<<'HTML'
-<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AQUILA • Execution Réelle</title><style>
-html,body{margin:0;padding:0;background:#05070b;color:#e6ebff;font-family:system-ui}
-#app{display:grid;grid-template-columns:320px 1fr;height:100vh}
-aside{background:#0a0f1c;border-right:1px solid #1b2450;padding:14px;overflow:auto}
-main{padding:14px;overflow:auto}
-h1,h2,h3{margin:.4em 0}
-button,input{background:#0e1633;color:#e6ebff;border:1px solid #2b3cff;padding:7px 9px;border-radius:6px}
-button{cursor:pointer}
-.ok{border-color:#3cff9e;color:#b7ffe1}
-.warn{border-color:#ff4d4d;color:#ffb3b3}
-.card{border:1px solid #1b2450;border-radius:8px;padding:10px;margin-bottom:10px;background:#070c18}
-.log{font-family:ui-monospace,monospace;font-size:12px;white-space:pre-wrap}
-.small{font-size:12px;opacity:.85}
-.sep{height:1px;background:#1b2450;margin:10px 0}
-</style></head><body>
-<div id="app">
-<aside>
-<h2>AQUILA</h2>
-<div class="small">Execution réelle: Phantom sign → sendRawTransaction → commit finalized</div>
-<div class="sep"></div>
-
-<div class="card">
-<h3>Wallet</h3>
-<div id="wallet" class="log">Déconnecté</div>
-<button id="connect" class="ok">Connect Phantom</button>
-</div>
-
-<div class="card">
-<h3>ARM</h3>
-<div>ARM: <b id="arm">OFF</b></div>
-<button id="armBtn" class="ok">ARM</button>
-<button id="disarmBtn" class="warn">DISARM</button>
-</div>
-
-<div class="card">
-<h3>Execution</h3>
-<div class="small">Action: micro-transfer (allowlist serveur)</div>
-<input id="to" placeholder="Destination (pubkey)" value="11111111111111111111111111111111" style="width:100%">
-<input id="lamports" placeholder="Lamports" value="1000" style="width:100%;margin-top:6px">
-<button id="propose" class="ok" style="margin-top:6px">Créer pending</button>
-<button id="approveSrv" class="ok" style="margin-top:6px">APPROUVER (token admin)</button>
-<button id="signSend" class="ok" style="margin-top:6px">SIGN + SEND + COMMIT</button>
-<button id="reject" class="warn" style="margin-top:6px">REJETER</button>
-</div>
-
-<div class="card">
-<h3>API</h3>
-<div class="small"><a href="/aiaquila/api/health" style="color:#b7ffe1">/aiaquila/api/health</a></div>
-</div>
-
-</aside>
-
-<main>
-<h2>Console</h2>
-<div class="card"><h3>Pending</h3><div id="pending" class="log"></div></div>
-<div class="card"><h3>Audit</h3><div id="audit" class="log"></div></div>
-</main>
-</div>
-
-<script src="/aiaquila/vendor/solana-web3.iife.min.js"></script>
-<script>
-(function(){
-  const {Connection,PublicKey,Transaction,SystemProgram} = window.solanaWeb3 || {};
-  if(!Connection){ document.getElementById("audit").textContent="ERR: solana-web3 vendor manquant"; return; }
-
-  const KEY="AIAQUILA_UI_V1";
-  const load=()=>{try{return JSON.parse(localStorage.getItem(KEY)||"null")}catch{return null}};
-  const save=(d)=>localStorage.setItem(KEY, JSON.stringify(d));
-  let DB=load()||{arm:false,audit:[],pending:null,adminToken:""};
-  const $=id=>document.getElementById(id);
-
-  function log(t){ DB.audit.push(`[${new Date().toISOString()}] ${t}`); if(DB.audit.length>300) DB.audit=DB.audit.slice(-300); save(DB); render(); }
-  function render(){
-    $("arm").textContent = DB.arm?"ON":"OFF";
-    $("pending").textContent = DB.pending ? JSON.stringify(DB.pending,null,2) : "(none)";
-    $("audit").textContent = DB.audit.slice(-120).join("\n");
-  }
-  render();
-
-  let provider=null, pubkey=null;
-
-  $("connect").onclick=async()=>{
-    if(!window.solana) return alert("Phantom requis");
-    provider=window.solana;
-    const r=await provider.connect();
-    pubkey=r.publicKey.toString();
-    $("wallet").textContent=pubkey;
-    log("Wallet connecté");
-  };
-
-  $("armBtn").onclick=()=>{ DB.arm=true; save(DB); render(); log("ARM activé"); };
-  $("disarmBtn").onclick=()=>{ DB.arm=false; save(DB); render(); log("DISARM"); };
-
-  async function api(path, method, body, headers){
-    const res = await fetch("/aiaquila/api"+path, {method, headers:Object.assign({"content-type":"application/json"}, headers||{}), body: body?JSON.stringify(body):undefined});
-    const txt = await res.text();
-    let j=null; try{ j=JSON.parse(txt);}catch{}
-    if(!res.ok) throw new Error((j&&j.err)||txt||("HTTP_"+res.status));
-    return j||{ok:true, raw:txt};
-  }
-
-  $("propose").onclick=async()=>{
-    try{
-      if(!DB.arm) return alert("ARM requis");
-      if(!pubkey) return alert("Wallet requis");
-      const to = $("to").value.trim();
-      const lamports = Number($("lamports").value.trim());
-      const j = await api("/pending/create","POST",{type:"transfer",to,lamports,fromPub:pubkey});
-      DB.pending = j;
-      save(DB); render();
-      log("Pending créé");
-    }catch(e){ log("ERR propose: "+String(e.message||e)); alert(String(e.message||e)); }
-  };
-
-  $("approveSrv").onclick=async()=>{
-    try{
-      if(!DB.pending||!DB.pending.pendingId) return alert("Pending requis");
-      const token = prompt("Admin token (serveur) :", DB.adminToken||"") || "";
-      if(!token) return alert("token requis");
-      DB.adminToken = token; save(DB);
-      const j = await api("/pending/approve","POST",{pendingId:DB.pending.pendingId},{"x-aiaquila-admin":token});
-      DB.pending.status = j.status;
-      save(DB); render();
-      log("Pending approuvé serveur");
-    }catch(e){ log("ERR approve: "+String(e.message||e)); alert(String(e.message||e)); }
-  };
-
-  $("signSend").onclick=async()=>{
-    try{
-      if(!DB.arm) return alert("ARM requis");
-      if(!provider||!pubkey) return alert("Wallet requis");
-      if(!DB.pending||DB.pending.status!=="APPROVED") return alert("Pending APPROVED requis");
-      const conn = new Connection((await (await fetch("/aiaquila/api/health")).json()).rpc.primary, "confirmed");
-
-      const to = new PublicKey(DB.pending.payload.to);
-      const from = new PublicKey(pubkey);
-      const lamports = Number(DB.pending.payload.lamports);
-
-      const tx = new Transaction().add(SystemProgram.transfer({fromPubkey:from,toPubkey:to,lamports}));
-      tx.feePayer = from;
-      tx.recentBlockhash = (await conn.getLatestBlockhash()).blockhash;
-
-      const signed = await provider.signTransaction(tx);
-      const sig = await conn.sendRawTransaction(signed.serialize(), {skipPreflight:false, maxRetries:3});
-      log("sendRawTransaction sig="+sig);
-
-      const commit = await api("/exec/commit","POST",{pendingId:DB.pending.pendingId, sig, payloadHash:DB.pending.payloadHash});
-      DB.pending.status = commit.status;
-      DB.pending.sig = sig;
-      save(DB); render();
-      log("COMMIT finalized OK");
-      alert("OK: "+sig);
-    }catch(e){ log("ERR sign/send/commit: "+String(e.message||e)); alert(String(e.message||e)); }
-  };
-
-  $("reject").onclick=()=>{ DB.pending=null; save(DB); render(); log("Pending rejeté"); };
-
-})();
-</script>
-</body></html>
-HTML
-
-# -------------------------
-# 9) Vendor (PIN local)
-# -------------------------
-say "== 9) Vendor (PIN local) =="
-# Prefer existing pinned vendor from wolverine if present
-if [ -f /var/www/wolverine/vendor/solana-web3.iife.min.js ]; then
-  cp -a /var/www/wolverine/vendor/solana-web3.iife.min.js "$VENDOR/solana-web3.iife.min.js"
-else
-  curl -fsSL "https://unpkg.com/@solana/web3.js@1.95.2/lib/index.iife.min.js" -o "$VENDOR/solana-web3.iife.min.js"
-fi
-sha256sum "$VENDOR/solana-web3.iife.min.js" >"$VENDOR/solana-web3.iife.min.js.sha256"
-
-# -------------------------
-# 10) systemd service
-# -------------------------
-say "== 10) systemd service =="
-cat >/etc/systemd/system/${SLUG}.service<<EOF
-[Unit]
-Description=AIAQUILA backend (pending/commit)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-WorkingDirectory=$APPJS
-EnvironmentFile=$CFG/env
-ExecStart=$(command -v node) $APPJS/server.js
-Restart=always
-RestartSec=1
-User=root
-
-[Install]
-WantedBy=multi-user.target
+cat >"$WEBROOT/index.html"<<EOF
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AquilaStacking</title><style>body{font-family:system-ui,Segoe UI,Arial;margin:24px;max-width:980px}code{background:#0b1020;color:#d7e3ff;padding:2px 6px;border-radius:6px}pre{background:#0b1020;color:#d7e3ff;padding:12px;border-radius:10px;overflow:auto}a{color:#2b6fff;text-decoration:none}a:hover{text-decoration:underline}.box{border:1px solid #e5e7eb;border-radius:12px;padding:14px;margin:12px 0}</style></head><body><h1>AquilaStacking</h1><div class="box"><b>URLs</b><div>• <a href="${PATH_B}">${PATH_B}</a></div><div>• <a href="${PATH_A}">${PATH_A}</a></div></div><div class="box"><b>Webroot</b> <code>${WEBROOT}</code></div></body></html>
 EOF
-systemctl daemon-reload
-systemctl enable --now "${SLUG}.service"
-systemctl restart "${SLUG}.service"
+chown www-data:www-data "$WEBROOT/index.html" 2>/dev/null || true
+chmod 0644 "$WEBROOT/index.html" || true
 
-# -------------------------
-# 11) nginx include routes (deterministic)
-# -------------------------
-say "== 11) nginx routes include =="
-cat >"$INC"<<EOF
-# ${SLUG}_routes.inc (managed)
-location = /${SLUG} { return 301 /${SLUG}/; }
+say "2) Write nginx include (routes) => $INC"
+ROUTES="### AQUILA_STACKING_WEBROUTES_V4_BEGIN
+# Debug header to prove the active vhost is using these routes
+add_header X-AquilaStacking \"1\" always;
 
-location ^~ /${SLUG}/api/ {
-  proxy_http_version 1.1;
-  proxy_set_header Host \$host;
-  proxy_set_header X-Real-IP \$remote_addr;
-  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto \$scheme;
-  proxy_pass http://127.0.0.1:9688/api/;
-}
-
-location ^~ /${SLUG}/ {
-  alias $WEB/;
+location = ${PATH_B%/} { return 301 ${PATH_B}; }
+location ^~ ${PATH_B} {
+  alias ${WEBROOT}/;
   index index.html;
-  try_files \$uri \$uri/ /${SLUG}/index.html;
+  add_header Cache-Control \"no-store\" always;
+  try_files \$uri \$uri/ ${PATH_B}index.html =404;
 }
-EOF
 
-# -------------------------
-# 12) Inject include into ACTIVE_VHOST (unique marker)
-# -------------------------
-say "== 12) Inject include into vhost (unique marker) =="
-MARK_BEGIN="# AIAQUILA_INCLUDE_BEGIN"
-MARK_END="# AIAQUILA_INCLUDE_END"
-if ! grep -qF "$MARK_BEGIN" "$VHOST"; then
-  tmp="$BK/vhost.tmp"
-  awk -v mb="$MARK_BEGIN" -v me="$MARK_END" -v inc="$INC" '
-    {print}
-    # inject before last "}" if inside any server block; pragmatic and idempotent by marker
-    END{
-    }
-  ' "$VHOST" >"$tmp"
-  # simple safe inject: insert markers + include right before final closing brace of file
-  # (works even if multiple servers; include file has ^~ so it wins for that path)
-  sed -i "s|^[[:space:]]*}$|  ${MARK_BEGIN}\n  include ${INC};\n  ${MARK_END}\n}|" "$tmp"
-  cp -a "$tmp" "$VHOST"
+location = ${PATH_A%/} { return 301 ${PATH_A}; }
+location ^~ ${PATH_A} {
+  alias ${WEBROOT}/;
+  index index.html;
+  add_header Cache-Control \"no-store\" always;
+  try_files \$uri \$uri/ ${PATH_A}index.html =404;
+}
+### AQUILA_STACKING_WEBROUTES_V4_END"
+write_file "$INC" "$ROUTES"
+
+say "3) Dump nginx -T + find candidate vhost files"
+nginx -T >"$BK/nginx_T.txt" 2>&1 || die "nginx -T failed"
+
+python3 - <<'PY'
+import os,re,sys,shutil
+BK=os.environ["BK"]
+DOMAIN=os.environ["DOMAIN"]
+INC=os.environ["INC"]
+T=open(os.path.join(BK,"nginx_T.txt"),"r",errors="ignore").read()
+
+# Keep config files in nginx -T order
+files=[]
+for m in re.finditer(r"^# configuration file (.+?):", T, flags=re.M):
+    p=m.group(1).strip()
+    if p.startswith("/") and os.path.isfile(p):
+        files.append(p)
+
+# Candidate files: those that mention domain OR known fireinners ssl names
+cand=[]
+for p in files:
+    try:
+        txt=open(p,"r",errors="ignore").read()
+    except:
+        continue
+    if re.search(r"server_name\s+[^;]*\b"+re.escape(DOMAIN)+r"\b", txt) or ("fireinners.online-ssl" in p) or ("fireinners.online" in p and "/etc/nginx/sites-" in p) or ("fireinners.online" in p and "/etc/nginx/conf.d/" in p):
+        cand.append(p)
+
+cand=list(dict.fromkeys(cand))
+open(os.path.join(BK,"candidates.txt"),"w").write("\n".join(cand)+"\n")
+
+def patch_443_domain_server_blocks(txt):
+    # Patch every server{...} with listen 443 and server_name includes DOMAIN by inserting include INC; after server_name line
+    # Idempotent if include already present in that server block.
+    pat=re.compile(r"\bserver\s*\{", re.I)
+    out=[]
+    idx=0
+    n=len(txt)
+    changed=False
+    while True:
+        m=pat.search(txt, idx)
+        if not m:
+            out.append(txt[idx:])
+            break
+        out.append(txt[idx:m.start()])
+        brace=txt.find("{", m.end()-1)
+        if brace==-1:
+            out.append(txt[m.start():]); break
+        depth=0
+        j=brace
+        while j<n:
+            c=txt[j]
+            if c=="{": depth+=1
+            elif c=="}":
+                depth-=1
+                if depth==0:
+                    end=j+1; break
+            j+=1
+        else:
+            out.append(txt[m.start():]); break
+
+        block=txt[m.start():end]
+        idx=end
+
+        if INC in block:
+            out.append(block); continue
+
+        if re.search(r"(?m)^\s*listen\s+[^;]*\b443\b", block) and re.search(r"(?m)^\s*server_name\s+[^;]*\b"+re.escape(DOMAIN)+r"\b", block):
+            lines=block.splitlines(True)
+            nb=[]
+            inserted=False
+            for ln in lines:
+                nb.append(ln)
+                if (not inserted) and re.search(r"^\s*server_name\s+[^;]*\b"+re.escape(DOMAIN)+r"\b", ln):
+                    nb.append(f"    include {INC};\n")
+                    inserted=True
+            if inserted:
+                block="".join(nb)
+                changed=True
+
+        out.append(block)
+    return "".join(out), changed
+
+patched=[]
+for p in cand:
+    try:
+        txt=open(p,"r",errors="ignore").read()
+    except:
+        continue
+    newtxt,chg=patch_443_domain_server_blocks(txt)
+    if chg:
+        shutil.copy2(p, os.path.join(BK, os.path.basename(p)+".bak"))
+        os.system(f"chattr -i {p} 2>/dev/null || true")
+        open(p,"w").write(newtxt)
+        patched.append(p)
+
+open(os.path.join(BK,"patched.txt"),"w").write("\n".join(patched)+"\n")
+print("patched_files=",len(patched))
+PY
+
+say "4) nginx test + reload"
+if ! nginx -t; then
+  die "nginx -t failed (see $BK/nginx_T.txt and $BK/*.bak backups)"
 fi
-
-# -------------------------
-# 13) nginx test + reload
-# -------------------------
-say "== 13) nginx test + reload =="
-nginx -t
 systemctl reload nginx
 
-# -------------------------
-# 14) Smoke tests (local TLS resolve)
-# -------------------------
-say "== 14) Smoke tests =="
-echo "---- /aiaquila/ (HEAD) ----"
-curl -kIsS --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/${SLUG}/" | head -n 12 || true
-echo "---- /aiaquila/api/health ----"
-curl -kSs --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/${SLUG}/api/health" || true
-echo
+say "5) Local HTTPS verify (force localhost) + check debug header"
+HDR_A="$(curl -k -sSI --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}${PATH_B}" | tr -d '\r' | head -n 40 || true)"
+echo "$HDR_A" >"$BK/head_iaaquila.txt"
+echo "$HDR_A" | grep -qi "^HTTP/" || die "no HTTP response for ${PATH_B} (see $BK/head_iaaquila.txt)"
+echo "$HDR_A" | grep -qi "X-AquilaStacking: 1" || die "routes not active for ${PATH_B} (missing header) (see $BK/head_iaaquila.txt)"
 
-# -------------------------
-# 15) Freeze nginx files (confirmed)
-# -------------------------
-say "== 15) Freeze (chattr +i) =="
-chattr +i /etc/nginx/nginx.conf 2>/dev/null || true
-chattr +i "$VHOST" 2>/dev/null || true
-chattr +i "$INC" 2>/dev/null || true
+HDR_B="$(curl -k -sSI --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}${PATH_A}" | tr -d '\r' | head -n 40 || true)"
+echo "$HDR_B" >"$BK/head_aquila_stacking.txt"
+echo "$HDR_B" | grep -qi "^HTTP/" || die "no HTTP response for ${PATH_A} (see $BK/head_aquila_stacking.txt)"
+echo "$HDR_B" | grep -qi "X-AquilaStacking: 1" || die "routes not active for ${PATH_A} (missing header) (see $BK/head_aquila_stacking.txt)"
+
+say "6) Body verify (must contain AquilaStacking)"
+BODY_A="$(curl -k -sS --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}${PATH_B}" | head -n 5 || true)"
+echo "$BODY_A" | grep -qi "AquilaStacking" || { echo "$BODY_A" >"$BK/body_iaaquila_head.txt"; die "still not serving page on ${PATH_B} (see $BK/body_iaaquila_head.txt)"; }
+
+BODY_B="$(curl -k -sS --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}${PATH_A}" | head -n 5 || true)"
+echo "$BODY_B" | grep -qi "AquilaStacking" || { echo "$BODY_B" >"$BK/body_aquila_head.txt"; die "still not serving page on ${PATH_A} (see $BK/body_aquila_head.txt)"; }
 
 say "DONE"
-echo "URL: https://${DOMAIN}/${SLUG}/"
-echo "API: https://${DOMAIN}/${SLUG}/api/health"
-echo -n "ADMIN_TOKEN: "; cat "$CFG/admin.token"; echo
-echo "POLICY: $CFG/exec_allowlist.json"
-echo "BACKUP: $BK"
+say "Open: https://${DOMAIN}${PATH_B}"
+say "Open: https://${DOMAIN}${PATH_A}"
+say "BK: $BK"
 BASH
-chmod +x /root/MEGA_AIAQUILA_DEPLOY_V1.sh
-bash /root/MEGA_AIAQUILA_DEPLOY_V1.sh
+chmod +x /root/MEGA_AQUILA_STACKING_WEBROUTE_FIX_V4_ONE_SHOT.sh
+BK="/root/AQUILA_STACKING_WEBROUTE_FIX_V4_BK_$(date +%Y%m%d_%H%M%S)" DOMAIN="fireinners.online" INC="/etc/nginx/includes/aquila_stacking_routes.inc" bash /root/MEGA_AQUILA_STACKING_WEBROUTE_FIX_V4_ONE_SHOT.sh
