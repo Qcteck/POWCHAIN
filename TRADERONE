@@ -1,218 +1,208 @@
-cat >/root/WV_MEGA_FIX.sh <<'BASH'
+cat >/root/MEGA_AQUILA_STACKING_ONE_SHOT_ROOT_V8_WORKING.sh<<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
+umask 027
 TS="$(date +%Y%m%d_%H%M%S)"
-BK="/root/WV_BK_${TS}"
+say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
+die(){ say "ERR: $*"; exit 1; }
+need(){ command -v "$1" >/dev/null 2>&1 || die "missing: $1"; }
+[ "$(id -u)" -eq 0 ] || die "run as root"
+need nginx; need systemctl; need python3; need curl; need sed; need awk; need grep
+
+DOMAIN="fireinners.online"
+PATH_OK="/aquila_stacking/"
+WEBROOT="/var/www/aquila_stacking"
+HTML="$WEBROOT/index.html"
+
+APP="/opt/aquila_stacking"
+KEYS="$APP/keys"
+PROG="aquila_stacking"
+
+BK="/root/AQUILA_STACKING_ONESHOT_V8_BK_${TS}"
 mkdir -p "$BK"
-say(){ printf "\n[%s] %s\n" "$(date +%H:%M:%S)" "$*"; }
-backup(){ local f="$1"; [ -e "$f" ] || return 0; mkdir -p "$BK$(dirname "$f")"; cp -a "$f" "$BK$f"; }
-unfreeze(){ local f="$1"; [ -e "$f" ] || return 0; chattr -i "$f" 2>/dev/null || true; }
-rollback(){ say "ROLLBACK (best-effort)"; [ -d "$BK/etc/nginx" ] && rsync -a "$BK/etc/nginx/" /etc/nginx/ || true; nginx -t && systemctl reload nginx || true; }
-trap 'echo; echo "[FATAL] erreur. Backups: '"$BK"'"; rollback; exit 1' ERR
 
-say "0) Savepoint (si dispo)"
-[ -x /root/WOLVERINE_SAVEPOINT.sh ] && /root/WOLVERINE_SAVEPOINT.sh || true
-
-say "1) Outils"
-command -v curl >/dev/null 2>&1 || (apt-get update -y && apt-get install -y curl)
-command -v nginx >/dev/null 2>&1 || (apt-get update -y && apt-get install -y nginx)
-command -v rsync >/dev/null 2>&1 || (apt-get update -y && apt-get install -y rsync)
-
-NGX_MAIN="/etc/nginx/nginx.conf"
-VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
-SEN="/etc/nginx/sites-enabled/fireinners.online-ssl"
-INC_DIR="/etc/nginx/includes"
-mkdir -p "$INC_DIR"
-
-say "2) Backup + unfreeze nginx"
-for f in "$NGX_MAIN" "$VHOST" "$INC_DIR/aquila_stacking_routes.inc" "$INC_DIR/wolverine_static.inc" "$INC_DIR/wolverine_vault.inc"; do backup "$f"; unfreeze "$f"; done
-
-say "3) Fix nginx cassé: aquila_stacking_routes.inc hors server{}"
-mapfile -t HITS < <(grep -RIn --color=never "aquila_stacking_routes\.inc" /etc/nginx 2>/dev/null || true)
-if [ "${#HITS[@]}" -gt 0 ]; then
-  for h in "${HITS[@]}"; do
-    f="${h%%:*}"; ln="${h#*:}"; ln="${ln%%:*}"
-    [ "$f" = "$VHOST" ] && continue
-    backup "$f"; unfreeze "$f"
-    sed -i "${ln}s|^[[:space:]]*include[[:space:]].*aquila_stacking_routes\\.inc.*;|# WV_DISABLED_${TS} &|g" "$f" || true
-  done
-fi
-
-say "4) Désactiver vhosts doublons fireinners.online (conflicting server_name)"
-for f in /etc/nginx/sites-enabled/*; do
-  [ -e "$f" ] || continue
-  bn="$(basename "$f")"
-  if [ "$bn" != "fireinners.online-ssl" ] && grep -qE "server_name[[:space:]].*fireinners\.online" "$f" 2>/dev/null; then
-    backup "$f"; unfreeze "$f"
-    mv -f "$f" "/etc/nginx/sites-enabled/${bn}.WV_DISABLED_${TS}" || true
-  fi
-done
-[ -f "$VHOST" ] && ln -sf "$VHOST" "$SEN" || true
-
-say "5) Webroot Wolverine (évite 404)"
-WEBROOT="/var/www/wolverine"
+say "1) WEBROOT + index.html"
 mkdir -p "$WEBROOT"
-if [ ! -f "$WEBROOT/index.html" ] && [ -f /opt/fireinners/frontend-react/app/dist/wolverine/index.html ]; then
-  cp -a /opt/fireinners/frontend-react/app/dist/wolverine/. "$WEBROOT"/
-fi
-if [ ! -f "$WEBROOT/index.html" ]; then
-  cat >"$WEBROOT/index.html"<<EOF
-<!doctype html><meta charset="utf-8"><title>Wolverine</title>
-<body style="font-family:system-ui;padding:16px">
-<h3>Wolverine / TraderOne</h3>
-<p>UI manquante dans /var/www/wolverine. Nginx + Vault seront stables; on restaurera ensuite le vrai UI.</p>
-</body>
-EOF
+chmod 0755 "$WEBROOT"
+
+PID="UNKNOWN"
+if command -v solana-keygen >/dev/null 2>&1 && [ -f "$KEYS/${PROG}-keypair.json" ]; then
+  PID="$(solana-keygen pubkey "$KEYS/${PROG}-keypair.json" 2>/dev/null || echo UNKNOWN)"
 fi
 
-say "6) Include static /wolverine"
-cat >"$INC_DIR/wolverine_static.inc"<<EOF
-# WV_AUTOGEN_${TS}
-location ^~ /wolverine/ {
-  alias ${WEBROOT}/;
-  index index.html;
-  try_files \$uri \$uri/ /wolverine/index.html;
-}
+cat >"$HTML"<<EOF
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AquilaStacking</title><style>body{font-family:system-ui,Segoe UI,Arial;margin:24px;max-width:980px}code{background:#0b1020;color:#d7e3ff;padding:10px;border-radius:10px;display:block;overflow:auto}h1{margin:0 0 12px}small{opacity:.8}</style></head><body><h1>AquilaStacking</h1><p><b>Program ID:</b><code>${PID}</code></p><p><b>Workspace:</b><code>${APP}</code></p><p><b>URL:</b><code>${PATH_OK}</code></p><p><small>TS: ${TS}</small></p></body></html>
 EOF
+chown -R www-data:www-data "$WEBROOT" 2>/dev/null || true
+chmod -R 0755 "$WEBROOT"
 
-say "7) Vault API local + systemd (127.0.0.1:8787)"
-VAULT_DIR="/opt/traderone-vault"
-VAULT_PORT="8787"
-mkdir -p "$VAULT_DIR"
-cd "$VAULT_DIR"
+say "2) Patch ACTIVE nginx 443 fireinners.online server blocks (direct location, with header)"
+export BK DOMAIN PATH_OK WEBROOT
+python3 - <<'PY'
+import os, re, shutil, subprocess, datetime
 
-if ! command -v node >/dev/null 2>&1; then
-  say "Node manquant -> NodeSource 20 (sans apt install npm)"
-  apt-get update -y
-  apt-get install -y ca-certificates curl gnupg
-  install -m 0755 -d /etc/apt/keyrings
-  curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
-  echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" >/etc/apt/sources.list.d/nodesource.list
-  apt-get update -y
-  apt-get install -y nodejs
+BK=os.environ["BK"]
+DOMAIN=os.environ["DOMAIN"]
+PATH_OK=os.environ["PATH_OK"]
+WEBROOT=os.environ["WEBROOT"]
+TAG="AQUILA_STACKING_V8"
+HDR="X-AquilaStacking"
+
+def run(cmd):
+    return subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
+
+ngT = run(["nginx","-T"])
+open(os.path.join(BK,"nginx.T.txt"),"w").write(ngT)
+
+# list loaded file paths in nginx -T order
+files=[]
+for line in ngT.splitlines():
+    m=re.match(r"^# configuration file (\S+):\d+", line)
+    if m:
+        f=m.group(1)
+        if f not in files:
+            files.append(f)
+
+# filter likely vhost files (loaded) that mention fireinners.online or cert path
+cand=[]
+for f in files:
+    if not os.path.isfile(f): 
+        continue
+    try:
+        txt=open(f,"r",errors="ignore").read()
+    except Exception:
+        continue
+    if re.search(r"\bfireinners\.online\b", txt) or "letsencrypt/live/fireinners.online" in txt or "fireinners.online-ssl" in txt:
+        cand.append(f)
+
+open(os.path.join(BK,"candidates.txt"),"w").write("\n".join(cand)+"\n")
+
+loc_block=f"""
+  # {TAG} BEGIN
+  location = /aquilastacking {{ return 301 {PATH_OK}; }}
+  location ^~ /aquilastacking/ {{ return 301 {PATH_OK}; }}
+  location = {PATH_OK.rstrip('/')} {{ return 301 {PATH_OK}; }}
+  location ^~ {PATH_OK} {{
+    alias {WEBROOT}/;
+    index index.html;
+    try_files $uri $uri/ {PATH_OK}index.html;
+    add_header {HDR} "1" always;
+    add_header Cache-Control "no-store" always;
+  }}
+  # {TAG} END
+""".lstrip("\n")
+
+def remove_tag_blocks(s:str)->str:
+    # remove any previous tagged blocks (any version) to avoid duplication
+    return re.sub(r"\n?[ \t]*#\s*AQUILA_STACKING_[A-Z0-9_]*\s+BEGIN.*?#\s*AQUILA_STACKING_[A-Z0-9_]*\s+END\s*\n", "\n", s, flags=re.S)
+
+def patch_server_blocks(text:str)->tuple[str,int]:
+    out=[]
+    i=0
+    n=len(text)
+    patched=0
+
+    pat=re.compile(r"\bserver\s*\{", re.M)
+    for m in pat.finditer(text):
+        s=m.start()
+        out.append(text[i:s])
+        brace=text.find("{", s)
+        if brace==-1:
+            out.append(text[s:]); i=n; break
+
+        depth=0
+        k=brace
+        while k<n:
+            if text[k]=="{": depth+=1
+            elif text[k]=="}":
+                depth-=1
+                if depth==0:
+                    end=k+1
+                    break
+            k+=1
+        else:
+            out.append(text[s:]); i=n; break
+
+        block=text[s:end]
+
+        # must be 443 + server_name fireinners.online (effective block)
+        has_443 = re.search(r"listen\s+[^;]*\b443\b", block) is not None
+        has_name = re.search(r"server_name\s+[^;]*\b"+re.escape(DOMAIN)+r"\b", block) is not None
+
+        if has_443 and has_name:
+            b=remove_tag_blocks(block)
+            if TAG not in b:
+                lines=b.splitlines(True)
+                ins=None
+                for idx,ln in enumerate(lines):
+                    if re.match(r"^\s*location\s+", ln):
+                        ins=idx; break
+                if ins is None:
+                    # insert before last closing brace
+                    ins=len(lines)-1
+                # ensure there is a newline before insertion
+                if ins>0 and not lines[ins-1].endswith("\n"):
+                    lines[ins-1]=lines[ins-1]+"\n"
+                lines.insert(ins, loc_block if loc_block.endswith("\n") else loc_block+"\n")
+                block="".join(lines)
+                patched+=1
+
+        out.append(block)
+        i=end
+
+    out.append(text[i:])
+    return "".join(out), patched
+
+touched=[]
+for f in cand:
+    try:
+        src=open(f,"r",errors="ignore").read()
+    except Exception:
+        continue
+    new, cnt = patch_server_blocks(src)
+    if cnt>0:
+        # backup
+        bak=os.path.join(BK, f.replace("/","_")+".bak")
+        shutil.copy2(f, bak)
+        # unlock immutable if needed
+        subprocess.run(["bash","-lc", f"chattr -i '{f}' 2>/dev/null || true"], check=False)
+        shutil.copy2(f, f+f".bak.{datetime.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}")
+        open(f,"w").write(new)
+        touched.append((f,cnt))
+
+open(os.path.join(BK,"patched.txt"),"w").write("\n".join([f"{a} :: {b}" for a,b in touched])+"\n")
+
+if not touched:
+    raise SystemExit("No 443 fireinners.online server block was patched. See BK/nginx.T.txt and BK/candidates.txt")
+
+print("[OK] patched files:")
+for a,b in touched:
+    print(" -",a,"(server blocks patched:",b,")")
+PY
+
+say "3) nginx -t + reload (rollback if fail)"
+if ! nginx -t; then
+  say "nginx invalid -> rollback"
+  for b in "$BK"/*.bak; do
+    [ -f "$b" ] || continue
+    orig="$(echo "$b" | sed "s#^$BK/##" | sed 's#_#/#g' | sed 's/\.bak$//')"
+    [ -f "$orig" ] && cp -a "$b" "$orig" || true
+  done
+  nginx -t || true
+  die "rolled back (see $BK)"
 fi
-
-[ -f package.json ] || npm init -y >/dev/null 2>&1 || true
-npm i --silent --save-exact @solana/web3.js@1.98.4 bs58@5.0.0 tweetnacl@1.0.3 >/dev/null 2>&1 || npm i --save-exact @solana/web3.js bs58 tweetnacl >/dev/null 2>&1
-
-MASTER="$VAULT_DIR/.masterkey"
-if [ ! -f "$MASTER" ]; then
-  umask 077
-  node -e "const crypto=require('crypto');process.stdout.write(crypto.randomBytes(32).toString('hex'))" >"$MASTER"
-  chmod 600 "$MASTER" || true
-fi
-chmod 700 "$VAULT_DIR" || true
-
-cat >"$VAULT_DIR/server.js"<<'EOF'
-const http=require("http");
-const {Keypair}=require("@solana/web3.js");
-const crypto=require("crypto");
-const fs=require("fs");
-const path=require("path");
-const HOST=process.env.HOST||"127.0.0.1";
-const PORT=Number(process.env.PORT||8787);
-const ALLOW_ORIGIN=process.env.ALLOW_ORIGIN||"https://fireinners.online";
-const STATE=process.env.STATE||path.join(__dirname,"state.json");
-const MASTER=process.env.MASTER||path.join(__dirname,".masterkey");
-const bucket=new Map(); const WINDOW_MS=60000; const MAX_REQ=120;
-function rateOK(ip){const t=Date.now();const cur=bucket.get(ip);if(!cur||t-cur.t>WINDOW_MS){bucket.set(ip,{t,count:1});return true;}if(cur.count>=MAX_REQ)return false;cur.count++;return true;}
-function loadMaster(){const hex=fs.readFileSync(MASTER,"utf8").trim();if(hex.length<64)throw new Error("masterkey too short");return Buffer.from(hex.slice(0,64),"hex");}
-const MASTER_KEY=loadMaster();
-function encSecret(u8){const iv=crypto.randomBytes(12);const c=crypto.createCipheriv("aes-256-gcm",MASTER_KEY,iv);const ct=Buffer.concat([c.update(Buffer.from(u8)),c.final()]);const tag=c.getAuthTag();return{iv:iv.toString("base64"),tag:tag.toString("base64"),ct:ct.toString("base64")};}
-function readJson(req){return new Promise((res,rej)=>{let b="";req.on("data",d=>{b+=d;if(b.length>1e6)req.destroy();});req.on("end",()=>{try{res(b?JSON.parse(b):{});}catch(e){rej(e);}});});}
-function send(res,code,obj){const body=JSON.stringify(obj);res.writeHead(code,{"content-type":"application/json; charset=utf-8","cache-control":"no-store","access-control-allow-origin":ALLOW_ORIGIN,"access-control-allow-methods":"GET,POST,OPTIONS","access-control-allow-headers":"content-type"});res.end(body);}
-function loadState(){try{return JSON.parse(fs.readFileSync(STATE,"utf8"));}catch(_){return{vaults:[]};}}
-function saveState(st){fs.writeFileSync(STATE,JSON.stringify(st,null,2),{mode:0o600});try{fs.chmodSync(STATE,0o600);}catch(_){}} 
-const server=http.createServer(async(req,res)=>{const ip=((req.headers["x-forwarded-for"]||"")+"").split(",")[0].trim()||req.socket.remoteAddress||"unknown";if(!rateOK(ip))return send(res,429,{ok:false,error:"rate_limited"});
-if(req.method==="OPTIONS"){res.writeHead(204,{"access-control-allow-origin":ALLOW_ORIGIN,"access-control-allow-methods":"GET,POST,OPTIONS","access-control-allow-headers":"content-type","access-control-max-age":"86400"});return res.end();}
-if(req.url==="/health"&&req.method==="GET")return send(res,200,{ok:true,service:"vault-api",host:HOST,port:PORT,ts:Date.now()});
-if(req.url==="/create"&&req.method==="POST"){let body={};try{body=await readJson(req);}catch(_){return send(res,400,{ok:false,error:"bad_json"});}
-const userPub=((body.userPub||"")+"").trim()||null;const kp=Keypair.generate();const enc=encSecret(kp.secretKey);const vaultPub=kp.publicKey.toBase58();
-const st=loadState();st.vaults=Array.isArray(st.vaults)?st.vaults:[];st.vaults.push({id:crypto.randomUUID(),userPub,vaultPub,encSecretKey:enc,createdAt:new Date().toISOString()});saveState(st);
-return send(res,200,{ok:true,vaultPub,userPub});}
-return send(res,404,{ok:false,error:"not_found"});});
-server.listen(PORT,HOST,()=>console.log(`[vault-api] http://${HOST}:${PORT}`));
-EOF
-
-cat >/etc/systemd/system/vault-api.service<<EOF
-[Unit]
-Description=Wolverine Vault API
-After=network-online.target
-Wants=network-online.target
-[Service]
-Type=simple
-User=root
-WorkingDirectory=${VAULT_DIR}
-Environment=HOST=127.0.0.1
-Environment=PORT=${VAULT_PORT}
-Environment=ALLOW_ORIGIN=https://fireinners.online
-Environment=STATE=${VAULT_DIR}/state.json
-Environment=MASTER=${VAULT_DIR}/.masterkey
-ExecStart=/usr/bin/node ${VAULT_DIR}/server.js
-Restart=always
-RestartSec=2
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl daemon-reload
-systemctl enable --now vault-api.service
-systemctl restart vault-api.service
-
-say "8) Include nginx Vault (proxy direct, pas de 307)"
-cat >"$INC_DIR/wolverine_vault.inc"<<EOF
-# WV_AUTOGEN_${TS}
-location ^~ /wolverine/vault-api/ {
-  proxy_http_version 1.1;
-  proxy_set_header Host \$host;
-  proxy_set_header X-Real-IP \$remote_addr;
-  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto \$scheme;
-  proxy_redirect off;
-  proxy_pass http://127.0.0.1:${VAULT_PORT}/;
-}
-location ^~ /wolverine/traderone/vault/ {
-  proxy_http_version 1.1;
-  proxy_set_header Host \$host;
-  proxy_set_header X-Real-IP \$remote_addr;
-  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto \$scheme;
-  proxy_redirect off;
-  proxy_pass http://127.0.0.1:${VAULT_PORT}/;
-}
-EOF
-
-say "9) Injecter includes dans le vhost (1 seule fois)"
-[ -f "$VHOST" ] || (echo "VHOST introuvable: $VHOST" && exit 1)
-if ! grep -q "WV_AUTOGEN_WOLVERINE_INCLUDES" "$VHOST"; then
-  backup "$VHOST"; unfreeze "$VHOST"
-  awk -v INC1="include ${INC_DIR}/wolverine_static.inc;" -v INC2="include ${INC_DIR}/wolverine_vault.inc;" '
-    BEGIN{inserver=0;done=0}
-    /^[[:space:]]*server[[:space:]]*\{/ {inserver=1}
-    {print}
-    inserver==1 && done==0 && /^[[:space:]]*server_name[[:space:]].*fireinners\.online/ {
-      print "  # WV_AUTOGEN_WOLVERINE_INCLUDES"
-      print "  " INC1
-      print "  " INC2
-      done=1
-    }
-  ' "$VHOST" >"$VHOST.tmp"
-  mv -f "$VHOST.tmp" "$VHOST"
-fi
-
-say "10) nginx -t + reload"
-nginx -t
 systemctl reload nginx
 
-say "11) Tests (DOIVENT être JSON)"
-echo "-- vault direct:"; curl -sS "http://127.0.0.1:${VAULT_PORT}/health"; echo
-echo "-- vault via nginx Host:"; curl -sS -H "Host: fireinners.online" "http://127.0.0.1/wolverine/vault-api/health"; echo
-echo "-- create via nginx Host:"; curl -sS -H "Host: fireinners.online" -H "content-type: application/json" -X POST "http://127.0.0.1/wolverine/vault-api/create" -d "{}"; echo
+say "4) prove LOADED config contains aquila_stacking block"
+nginx -T 2>/dev/null | grep -n "AQUILA_STACKING_V8" | head -n 50 || true
+
+say "5) local verify (must be 200 + header X-AquilaStacking: 1)"
+curl -skI --resolve ${DOMAIN}:443:127.0.0.1 "https://${DOMAIN}${PATH_OK}" | head -n 60
+curl -sk  --resolve ${DOMAIN}:443:127.0.0.1 "https://${DOMAIN}${PATH_OK}" | head -n 12
 
 say "DONE"
-echo "Backups: $BK"
-echo "Ouvre: https://fireinners.online/wolverine/ puis Ctrl+F5"
+say "URL: https://${DOMAIN}${PATH_OK}"
+say "BK: $BK"
 BASH
-
-chmod +x /root/WV_MEGA_FIX.sh
-bash /root/WV_MEGA_FIX.sh
+chmod +x /root/MEGA_AQUILA_STACKING_ONE_SHOT_ROOT_V8_WORKING.sh
+bash /root/MEGA_AQUILA_STACKING_ONE_SHOT_ROOT_V8_WORKING.sh
