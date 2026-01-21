@@ -1,10 +1,10 @@
-cat >/root/MEGA_BUNDLER_FORCE_INCLUDE_ALL_VHOSTS.sh <<'BASH'
+cat >/root/MEGA_BUNDLER_FIX_404_VHOST_DETECT.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 umask 022
 
 TS="$(date +%Y%m%d_%H%M%S)"
-BK="/root/BUNDLER_FORCE_${TS}"
+BK="/root/BUNDLER_FIX404_${TS}"
 mkdir -p "$BK"
 say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 die(){ say "ERROR: $*"; exit 1; }
@@ -13,21 +13,39 @@ die(){ say "ERROR: $*"; exit 1; }
 DOMAIN="fireinners.online"
 INC_DIR="/etc/nginx/includes"
 INC_BUNDLER="${INC_DIR}/bundler_routes.inc"
+NGINX_CONF="/etc/nginx/nginx.conf"
+
 WEBROOT_BUNDLER="/var/www/bundler"
 DATA_DIR="/opt/bundler_data"
 API_HOST="127.0.0.1"
 API_PORT="9797"
 
-say "backup: /etc/nginx"
+say "backup: /etc/nginx + bundler paths"
 tar -C /etc -czf "$BK/etc_nginx.tgz" nginx >/dev/null 2>&1 || true
+tar -C /var/www -czf "$BK/var_www_bundler.tgz" bundler >/dev/null 2>&1 || true
+tar -C /opt -czf "$BK/opt_bundler_data.tgz" bundler_data >/dev/null 2>&1 || true
 
 say "ensure dirs"
 mkdir -p "$INC_DIR" "$WEBROOT_BUNDLER" "$DATA_DIR"
 chmod 755 "$WEBROOT_BUNDLER" "$DATA_DIR" || true
 
-say "write include: $INC_BUNDLER"
+say "ensure UI index exists (write fallback if missing)"
+if [ ! -f "$WEBROOT_BUNDLER/index.html" ]; then
+  cat >"$WEBROOT_BUNDLER/index.html" <<'HTML'
+<!doctype html><meta charset="utf-8"><title>Bundler</title><style>body{font-family:system-ui;margin:40px;background:#0b0f14;color:#e7eef7}a{color:#7ec8ff}</style><h1>Bundler</h1><p>index.html fallback present. Your Vite build did not publish here.</p>
+HTML
+  chmod 644 "$WEBROOT_BUNDLER/index.html" || true
+fi
+
+say "write include (WITH exact-match redirects for missing trailing slash)"
 cat >"$INC_BUNDLER" <<EOF
-# Bundler UI + API (force include $TS)
+# Bundler UI + API (fix404 $TS)
+
+# handle /bundler (no trailing slash)
+location = /bundler { return 301 /bundler/; }
+location = /bundler/api { return 301 /bundler/api/; }
+location = /bundler/data { return 301 /bundler/data/; }
+
 location ^~ /bundler/api/ {
   proxy_pass http://$API_HOST:$API_PORT/;
   proxy_http_version 1.1;
@@ -47,47 +65,117 @@ location ^~ /bundler/ {
 }
 EOF
 
-say "unlock nginx files"
-chattr -i /etc/nginx/nginx.conf 2>/dev/null || true
-find /etc/nginx/sites-available /etc/nginx/sites-enabled -maxdepth 1 -type f -print0 2>/dev/null | xargs -0 -r chattr -i 2>/dev/null || true
+say "nginx -T capture"
+nginx -T >"$BK/nginx_T.txt" 2>&1 || true
 
-patch_file(){
+say "detect ACTIVE vhost files for $DOMAIN (first match for 443 + 80)"
+python3 - <<'PY' "$DOMAIN" "$BK/nginx_T.txt" >"$BK/detected_vhosts.txt"
+import re,sys
+domain=sys.argv[1]
+txt=open(sys.argv[2],"r",errors="ignore").read().splitlines()
+
+cur_file=None
+servers=[]
+i=0
+while i<len(txt):
+    line=txt[i]
+    m=re.match(r'# configuration file (.*?):\d+', line)
+    if m: cur_file=m.group(1)
+    if re.match(r'\s*server\s*\{', line):
+        start_i=i
+        brace=0
+        block=[]
+        f=cur_file
+        while i<len(txt):
+            l=txt[i]
+            if '{' in l: brace += l.count('{')
+            if '}' in l: brace -= l.count('}')
+            block.append(l)
+            i+=1
+            if brace<=0: break
+        b="\n".join(block)
+        if re.search(r'^\s*server_name\b.*\b'+re.escape(domain)+r'\b', b, re.M):
+            has443=bool(re.search(r'^\s*listen\b.*\b443\b', b, re.M))
+            has80=bool(re.search(r'^\s*listen\b.*\b80\b', b, re.M))
+            servers.append((f,has443,has80))
+        continue
+    i+=1
+
+# pick first for 443 and first for 80
+f443=None; f80=None
+for f,h443,h80 in servers:
+    if h443 and not f443: f443=f
+    if h80 and not f80: f80=f
+print("SSL_443_FILE="+(f443 or ""))
+print("HTTP_80_FILE="+(f80 or ""))
+PY
+
+cat "$BK/detected_vhosts.txt" | tee "$BK/detected_vhosts.echo"
+
+SSL_FILE="$(grep -E '^SSL_443_FILE=' "$BK/detected_vhosts.txt" | head -n1 | cut -d= -f2- || true)"
+HTTP_FILE="$(grep -E '^HTTP_80_FILE=' "$BK/detected_vhosts.txt" | head -n1 | cut -d= -f2- || true)"
+
+say "unlock nginx files"
+chattr -i "$NGINX_CONF" 2>/dev/null || true
+[ -n "${SSL_FILE:-}" ] && chattr -i "$SSL_FILE" 2>/dev/null || true
+[ -n "${HTTP_FILE:-}" ] && chattr -i "$HTTP_FILE" 2>/dev/null || true
+
+inject(){
   local f="$1"
+  [ -n "$f" ] || return 0
   [ -f "$f" ] || return 0
-  grep -qE '^\s*server\s*\{' "$f" || return 0
-  if grep -qF "include /etc/nginx/includes/bundler_routes.inc;" "$f"; then return 0; fi
   cp -a "$f" "$BK/$(basename "$f").bak" 2>/dev/null || true
-  perl -0777 -pe 's/(server\s*\{\s*\n)/$1  include \/etc\/nginx\/includes\/bundler_routes\.inc;\n/sg' "$f" >"$BK/tmp.$(basename "$f")"
-  cp -a "$BK/tmp.$(basename "$f")" "$f"
+  if grep -qF "include $INC_BUNDLER;" "$f"; then
+    return 0
+  fi
+  perl -0777 -pe 's/(server\s*\{\s*\n)/$1  include \/etc\/nginx\/includes\/bundler_routes\.inc;\n/s' "$f" >"$BK/$(basename "$f").new"
+  cp -a "$BK/$(basename "$f").new" "$f"
 }
 
-say "inject include into ALL vhosts (sites-enabled + sites-available)"
-while IFS= read -r -d '' f; do patch_file "$f"; done < <(find /etc/nginx/sites-enabled -maxdepth 1 -type f -print0 2>/dev/null || true)
-while IFS= read -r -d '' f; do patch_file "$f"; done < <(find /etc/nginx/sites-available -maxdepth 1 -type f -print0 2>/dev/null || true)
+say "inject include into detected vhosts"
+inject "$SSL_FILE"
+inject "$HTTP_FILE"
 
-say "nginx -t (show conflicts if any)"
-nginx -t || true
+# also ensure canonical file is included if present
+CAN="/etc/nginx/sites-available/fireinners.online-ssl"
+if [ -f "$CAN" ]; then inject "$CAN"; fi
+
+say "nginx -t"
+nginx -t >/dev/null
 
 say "reload nginx"
-systemctl reload nginx >/dev/null || systemctl restart nginx >/dev/null || true
+systemctl reload nginx >/dev/null
 
 say "re-lock nginx files"
-chattr +i /etc/nginx/nginx.conf 2>/dev/null || true
-find /etc/nginx/sites-available /etc/nginx/sites-enabled -maxdepth 1 -type f -print0 2>/dev/null | xargs -0 -r chattr +i 2>/dev/null || true
+chattr +i "$NGINX_CONF" 2>/dev/null || true
+[ -n "${SSL_FILE:-}" ] && chattr +i "$SSL_FILE" 2>/dev/null || true
+[ -n "${HTTP_FILE:-}" ] && chattr +i "$HTTP_FILE" 2>/dev/null || true
+[ -f "$CAN" ] && chattr +i "$CAN" 2>/dev/null || true
 
-say "origin tests (bypass Cloudflare)"
+say "origin tests (bypass Cloudflare) — IMPORTANT: test /bundler (no slash) and /bundler/"
 curl -fsS "http://127.0.0.1:${API_PORT}/health" | head -c 200; echo
-curl -fsSI --resolve "${DOMAIN}:80:127.0.0.1" "http://${DOMAIN}/bundler/" | head -n 12 | tr -d '\r' || true
-curl -k -fsSI --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/bundler/" | head -n 12 | tr -d '\r' || true
-curl -k -fsSI --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/bundler/api/health" | head -n 12 | tr -d '\r' || true
 
-say "public tests (via Cloudflare)"
-curl -fsSI "https://${DOMAIN}/bundler/" | head -n 12 | tr -d '\r' || true
-curl -fsSI "https://${DOMAIN}/bundler/api/health" | head -n 12 | tr -d '\r' || true
+echo "--- ORIGIN HTTP /bundler"
+curl -fsSI --resolve "${DOMAIN}:80:127.0.0.1" "http://${DOMAIN}/bundler" | head -n 20 | tr -d '\r' || true
+echo "--- ORIGIN HTTP /bundler/"
+curl -fsSI --resolve "${DOMAIN}:80:127.0.0.1" "http://${DOMAIN}/bundler/" | head -n 20 | tr -d '\r' || true
+
+echo "--- ORIGIN HTTPS /bundler"
+curl -k -fsSI --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/bundler" | head -n 20 | tr -d '\r' || true
+echo "--- ORIGIN HTTPS /bundler/"
+curl -k -fsSI --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/bundler/" | head -n 20 | tr -d '\r' || true
+echo "--- ORIGIN HTTPS /bundler/index.html"
+curl -k -fsSI --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/bundler/index.html" | head -n 20 | tr -d '\r' || true
+echo "--- ORIGIN HTTPS /bundler/api/health"
+curl -k -fsSI --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/bundler/api/health" | head -n 20 | tr -d '\r' || true
+
+say "public tests (Cloudflare)"
+curl -fsSI "https://${DOMAIN}/bundler" | head -n 20 | tr -d '\r' || true
+curl -fsSI "https://${DOMAIN}/bundler/" | head -n 20 | tr -d '\r' || true
 
 say "DONE"
 say "BACKUP: $BK"
 BASH
 
-chmod +x /root/MEGA_BUNDLER_FORCE_INCLUDE_ALL_VHOSTS.sh
-/root/MEGA_BUNDLER_FORCE_INCLUDE_ALL_VHOSTS.sh
+chmod +x /root/MEGA_BUNDLER_FIX_404_VHOST_DETECT.sh
+/root/MEGA_BUNDLER_FIX_404_VHOST_DETECT.sh
