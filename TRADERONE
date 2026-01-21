@@ -1,10 +1,10 @@
-cat >/root/MEGA_BUNDLER_NGINX_FIX_404.sh <<'BASH'
+cat >/root/MEGA_BUNDLER_FORCE_INCLUDE_ALL_VHOSTS.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 umask 022
 
 TS="$(date +%Y%m%d_%H%M%S)"
-BK="/root/BUNDLER_NGXFIX_${TS}"
+BK="/root/BUNDLER_FORCE_${TS}"
 mkdir -p "$BK"
 say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 die(){ say "ERROR: $*"; exit 1; }
@@ -13,13 +13,12 @@ die(){ say "ERROR: $*"; exit 1; }
 DOMAIN="fireinners.online"
 INC_DIR="/etc/nginx/includes"
 INC_BUNDLER="${INC_DIR}/bundler_routes.inc"
-
 WEBROOT_BUNDLER="/var/www/bundler"
 DATA_DIR="/opt/bundler_data"
 API_HOST="127.0.0.1"
 API_PORT="9797"
 
-say "backup: nginx tree"
+say "backup: /etc/nginx"
 tar -C /etc -czf "$BK/etc_nginx.tgz" nginx >/dev/null 2>&1 || true
 
 say "ensure dirs"
@@ -28,7 +27,7 @@ chmod 755 "$WEBROOT_BUNDLER" "$DATA_DIR" || true
 
 say "write include: $INC_BUNDLER"
 cat >"$INC_BUNDLER" <<EOF
-# Bundler UI + API (nginx fix $TS)
+# Bundler UI + API (force include $TS)
 location ^~ /bundler/api/ {
   proxy_pass http://$API_HOST:$API_PORT/;
   proxy_http_version 1.1;
@@ -48,64 +47,37 @@ location ^~ /bundler/ {
 }
 EOF
 
-say "find vhosts that mention fireinners.online"
-mapfile -t CANDS < <(grep -RIl --include="*" -E "server_name[^;]*\b${DOMAIN//./\\.}\b" /etc/nginx/sites-available /etc/nginx/sites-enabled 2>/dev/null | sort -u || true)
-if [ "${#CANDS[@]}" -eq 0 ]; then
-  say "WARNING: no vhost found by grep; dumping nginx -T to backup"
-  nginx -T >"$BK/nginx_T.txt" 2>&1 || true
-else
-  printf '%s\n' "${CANDS[@]}" >"$BK/vhost_candidates.txt"
-fi
-
-say "make nginx files editable"
+say "unlock nginx files"
 chattr -i /etc/nginx/nginx.conf 2>/dev/null || true
-for f in "${CANDS[@]:-}"; do chattr -i "$f" 2>/dev/null || true; done
+find /etc/nginx/sites-available /etc/nginx/sites-enabled -maxdepth 1 -type f -print0 2>/dev/null | xargs -0 -r chattr -i 2>/dev/null || true
 
-inject_one(){
+patch_file(){
   local f="$1"
   [ -f "$f" ] || return 0
+  grep -qE '^\s*server\s*\{' "$f" || return 0
+  if grep -qF "include /etc/nginx/includes/bundler_routes.inc;" "$f"; then return 0; fi
   cp -a "$f" "$BK/$(basename "$f").bak" 2>/dev/null || true
-  if grep -qF "include $INC_BUNDLER;" "$f"; then
-    return 0
-  fi
-  # only inject if file contains server_name fireinners.online somewhere
-  if ! grep -Eq "server_name[^;]*\b${DOMAIN//./\\.}\b" "$f"; then
-    return 0
-  fi
-  perl -0777 -pe "s/(server\\s*\\{\\s*\\n)/\$1  include \\/etc\\/nginx\\/includes\\/bundler_routes\\.inc;\\n/s" "$f" >"$BK/tmp_$(basename "$f")"
-  cp -a "$BK/tmp_$(basename "$f")" "$f"
+  perl -0777 -pe 's/(server\s*\{\s*\n)/$1  include \/etc\/nginx\/includes\/bundler_routes\.inc;\n/sg' "$f" >"$BK/tmp.$(basename "$f")"
+  cp -a "$BK/tmp.$(basename "$f")" "$f"
 }
 
-say "inject include into ALL matching vhosts (sites-available + sites-enabled)"
-for f in "${CANDS[@]:-}"; do inject_one "$f"; done
+say "inject include into ALL vhosts (sites-enabled + sites-available)"
+while IFS= read -r -d '' f; do patch_file "$f"; done < <(find /etc/nginx/sites-enabled -maxdepth 1 -type f -print0 2>/dev/null || true)
+while IFS= read -r -d '' f; do patch_file "$f"; done < <(find /etc/nginx/sites-available -maxdepth 1 -type f -print0 2>/dev/null || true)
 
-# Also ensure the canonical file is enabled if it exists
-CAN="/etc/nginx/sites-available/fireinners.online-ssl"
-if [ -f "$CAN" ]; then
-  if [ ! -e "/etc/nginx/sites-enabled/fireinners.online-ssl" ]; then
-    ln -sf "$CAN" "/etc/nginx/sites-enabled/fireinners.online-ssl" || true
-  fi
-  inject_one "$CAN"
-  inject_one "/etc/nginx/sites-enabled/fireinners.online-ssl"
-fi
-
-say "nginx -t"
-nginx -t >/dev/null
+say "nginx -t (show conflicts if any)"
+nginx -t || true
 
 say "reload nginx"
-systemctl reload nginx >/dev/null
+systemctl reload nginx >/dev/null || systemctl restart nginx >/dev/null || true
 
 say "re-lock nginx files"
 chattr +i /etc/nginx/nginx.conf 2>/dev/null || true
-for f in "${CANDS[@]:-}"; do chattr +i "$f" 2>/dev/null || true; done
-[ -f "$CAN" ] && chattr +i "$CAN" 2>/dev/null || true
+find /etc/nginx/sites-available /etc/nginx/sites-enabled -maxdepth 1 -type f -print0 2>/dev/null | xargs -0 -r chattr +i 2>/dev/null || true
 
-say "origin tests (bypass Cloudflare) + api test"
+say "origin tests (bypass Cloudflare)"
 curl -fsS "http://127.0.0.1:${API_PORT}/health" | head -c 200; echo
-
-# HTTP (origin)
 curl -fsSI --resolve "${DOMAIN}:80:127.0.0.1" "http://${DOMAIN}/bundler/" | head -n 12 | tr -d '\r' || true
-# HTTPS (origin)
 curl -k -fsSI --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/bundler/" | head -n 12 | tr -d '\r' || true
 curl -k -fsSI --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/bundler/api/health" | head -n 12 | tr -d '\r' || true
 
@@ -117,5 +89,5 @@ say "DONE"
 say "BACKUP: $BK"
 BASH
 
-chmod +x /root/MEGA_BUNDLER_NGINX_FIX_404.sh
-/root/MEGA_BUNDLER_NGINX_FIX_404.sh
+chmod +x /root/MEGA_BUNDLER_FORCE_INCLUDE_ALL_VHOSTS.sh
+/root/MEGA_BUNDLER_FORCE_INCLUDE_ALL_VHOSTS.sh
