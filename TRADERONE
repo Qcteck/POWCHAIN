@@ -1,95 +1,45 @@
-cat > /root/MEGA_BUNDLER_ADD_RPC_V1.sh <<'SH'
+cat > /root/MEGA_BUNDLER_KEY_TEST_V1.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 [ "$(id -u)" -eq 0 ] || { echo "RUN AS ROOT"; exit 1; }
 
+DOMAIN="fireinners.online"
 API_DIR="/opt/bundler_api"
-SVC="/etc/systemd/system/bundler-api.service"
-RPC_DEFAULT="https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac"
-SOLANA_RPC="${SOLANA_RPC:-$RPC_DEFAULT}"
-
-TS="$(date +%Y%m%d_%H%M%S)"
-BK="/root/BUNDLER_RPC_${TS}"
-mkdir -p "$BK"
+KEY_FILE="$API_DIR/.api_key"
+PORT="9797"
+HOST="127.0.0.1"
 
 say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 
-say "backup => $BK"
-[ -d "$API_DIR" ] || { echo "MISSING $API_DIR"; exit 1; }
-cp -a "$API_DIR/server.js" "$BK/server.js" 2>/dev/null || true
-cp -a "$SVC" "$BK/bundler-api.service" 2>/dev/null || true
+say "read key"
+if [ ! -f "$KEY_FILE" ]; then echo "MISSING_KEY_FILE=$KEY_FILE"; exit 1; fi
+KEY="$(tr -d '\r\n' < "$KEY_FILE" | head -c 256)"
+if [ -z "$KEY" ]; then echo "EMPTY_KEY_FILE"; exit 1; fi
 
-say "patch server.js (expose rpc + prepare connection)"
-python3 - "$API_DIR/server.js" "$SOLANA_RPC" <<'PY'
-import sys, re
-p=sys.argv[1]; rpc=sys.argv[2]
-s=open(p,'r',errors='ignore').read()
-
-if "SOLANA_RPC" not in s:
-  s = s.replace(
-    "const host=process.env.API_HOST||\"127.0.0.1\";\nconst port=parseInt(process.env.API_PORT||\"9797\",10);\nconst key=process.env.BUNDLER_API_KEY||\"\";\n",
-    "const host=process.env.API_HOST||\"127.0.0.1\";\nconst port=parseInt(process.env.API_PORT||\"9797\",10);\nconst key=process.env.BUNDLER_API_KEY||\"\";\nconst SOLANA_RPC=process.env.SOLANA_RPC||\""+rpc.replace('"','\\"')+"\";\n"
-  )
-
-if "@solana/web3.js" not in s:
-  # best-effort: add optional web3 import (keeps current behavior)
-  s = s.replace("const {z}=require(\"zod\");\n", "const {z}=require(\"zod\");\nlet web3=null;try{web3=require(\"@solana/web3.js\");}catch(e){}\n")
-
-# add connection helper (safe even if web3 missing)
-if "function getConn" not in s:
-  s = s.replace("app.get(\"/health\"",( "function getConn(){try{return web3?new web3.Connection(SOLANA_RPC,\"confirmed\"):null;}catch(e){return null;}}\n\napp.get(\"/health\""))
-# enrich /health payload
-s = re.sub(r"res\.json\(\{ok:true,ts:new Date\(\)\.toISOString\(\),host,port\}\)",
-           "res.json({ok:true,ts:new Date().toISOString(),host,port,rpc:SOLANA_RPC,web3:!!web3})", s)
-
-open(p,'w').write(s)
-print("OK")
-PY
-
-say "ensure systemd env SOLANA_RPC"
-python3 - "$SVC" "$SOLANA_RPC" <<'PY'
-import sys,re
-p=sys.argv[1]; rpc=sys.argv[2]
-lines=open(p,'r',errors='ignore').read().splitlines(True)
-out=[]
-has=False
-for ln in lines:
-  if ln.strip().startswith("Environment=SOLANA_RPC="):
-    out.append(f"Environment=SOLANA_RPC={rpc}\n"); has=True
-  else:
-    out.append(ln)
-if not has:
-  # insert after API_PORT if possible, else before ExecStart
-  inserted=False
-  res=[]
-  for ln in out:
-    res.append(ln)
-    if (not inserted) and ln.strip().startswith("Environment=API_PORT="):
-      res.append(f"Environment=SOLANA_RPC={rpc}\n"); inserted=True
-  if not inserted:
-    res=[]
-    for ln in out:
-      if (not inserted) and ln.strip().startswith("ExecStart="):
-        res.append(f"Environment=SOLANA_RPC={rpc}\n"); inserted=True
-      res.append(ln)
-  out=res
-open(p,'w').write("".join(out))
-print("OK")
-PY
-
-say "restart service"
-systemctl daemon-reload
-systemctl restart bundler-api.service
-
-say "local health"
-curl -fsS "http://127.0.0.1:9797/health" || true
+say "LOCAL /health"
+curl -fsS "http://$HOST:$PORT/health" || true
 echo
 
-say "status"
-systemctl --no-pager --full status bundler-api.service | sed -n '1,18p' || true
+say "PUBLIC /bundler/api/health (via nginx, bypass cloudflare)"
+curl -k -sS -D- "https://$DOMAIN/bundler/api/health" -o /dev/null | sed -n '1,12p' || true
 
+echo
+echo "===================="
+echo "BUNDLER_API_KEY=$KEY"
+echo "===================="
+echo
+echo "COLLE CETTE CLE DANS LE CHAMP 'API Key' (remplace le texte BUNDLER_API_KEY) PUIS REESSAYE."
+echo
+
+say "AUTH TEST (create-token preflight) via nginx"
+curl -k -sS -D- "https://$DOMAIN/bundler/api/create-token" \
+  -H "content-type: application/json" \
+  -H "x-api-key: $KEY" \
+  --data '{"decimals":6,"supplyHuman":"1000000","preflightOnly":true}' \
+  | sed -n '1,60p' || true
+
+echo
 say "DONE"
-say "BACKUP=$BK"
 SH
-chmod +x /root/MEGA_BUNDLER_ADD_RPC_V1.sh
-/root/MEGA_BUNDLER_ADD_RPC_V1.sh
+chmod +x /root/MEGA_BUNDLER_KEY_TEST_V1.sh
+/root/MEGA_BUNDLER_KEY_TEST_V1.sh
