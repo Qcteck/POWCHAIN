@@ -1,117 +1,148 @@
-cat >/root/WV_FIX_VAULT_301.sh <<'BASH'
+cat >/root/MEGA_AQUILA_STACKING_PROJECT_V2_DEPLOY_MODES.sh<<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
+umask 027
 TS="$(date +%Y%m%d_%H%M%S)"
-BK="/root/WV_BK_VAULT301_${TS}"
+say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
+die(){ say "ERR: $*"; exit 1; }
+need(){ command -v "$1" >/dev/null 2>&1 || die "missing: $1"; }
+
+[ "$(id -u)" -eq 0 ] || die "run as root"
+need node; need corepack; need solana; need anchor; need yarn; need jq; need curl
+
+APP="/opt/aquila_stacking"
+PROG="aquila_stacking"
+BK="/root/AQUILA_STACKING_V2_DEPLOY_BK_${TS}"
 mkdir -p "$BK"
-say(){ printf "\n[%s] %s\n" "$(date +%H:%M:%S)" "$*"; }
-backup(){ local f="$1"; [ -e "$f" ] || return 0; mkdir -p "$BK$(dirname "$f")"; cp -a "$f" "$BK$f"; }
-unfreeze(){ local f="$1"; [ -e "$f" ] || return 0; chattr -i "$f" 2>/dev/null || true; }
 
-VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
-SEN="/etc/nginx/sites-enabled/fireinners.online-ssl"
-INC="/etc/nginx/includes/wv_vault_api.inc"
-VAULT_PORT="8787"
-HOST="fireinners.online"
+MODE="${1:-localnet}" # localnet|devnet|mainnet
+case "$MODE" in localnet|devnet|mainnet) ;; *) die "usage: $0 [localnet|devnet|mainnet]";; esac
 
-say "0) Savepoint (si dispo)"
-[ -x /root/WOLVERINE_SAVEPOINT.sh ] && /root/WOLVERINE_SAVEPOINT.sh || true
+say "0) Mode: $MODE"
+say "1) Workspace check"
+[ -d "$APP" ] || die "missing $APP (run project batch first)"
+cd "$APP"
 
-say "1) Backup + unfreeze"
-for f in "$VHOST" "$SEN" "$INC"; do backup "$f"; unfreeze "$f"; done
+corepack enable >/dev/null 2>&1 || true
+corepack prepare yarn@1.22.22 --activate >/dev/null 2>&1 || true
 
-say "2) Créer include Vault API (NO REDIRECT, proxy direct)"
-cat >"$INC" <<EOF
-# WV_VAULT_API ${TS}
-location ^~ /wolverine/vault-api/ {
-  proxy_http_version 1.1;
-  proxy_set_header Host \$host;
-  proxy_set_header X-Real-IP \$remote_addr;
-  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto \$scheme;
-  proxy_pass http://127.0.0.1:${VAULT_PORT}/;
-}
-EOF
+say "2) Keypairs per cluster"
+KP_LOCAL="$APP/target/deploy/${PROG}-keypair.json"
+KP_DEV="$APP/keys/${PROG}-devnet-keypair.json"
+KP_MAIN="$APP/keys/${PROG}-mainnet-keypair.json"
+mkdir -p "$APP/keys" "$APP/target/deploy"
 
-say "3) Injecter include dans CHAQUE server{} du vhost (80 + 443) (1 seule fois/server)"
-python3 - <<'PY'
-import re,sys
-path="/etc/nginx/sites-available/fireinners.online-ssl"
-inc="include /etc/nginx/includes/wv_vault_api.inc;"
-s=open(path,"r",encoding="utf-8",errors="ignore").read().splitlines(True)
+mk_kp(){ local f="$1"; [ -f "$f" ] || solana-keygen new --no-bip39-passphrase --silent --outfile "$f" >/dev/null; }
+mk_kp "$KP_LOCAL"
+mk_kp "$KP_DEV"
+mk_kp "$KP_MAIN"
 
-out=[]
-i=0
-n=len(s)
+PID_LOCAL="$(solana-keygen pubkey "$KP_LOCAL")"
+PID_DEV="$(solana-keygen pubkey "$KP_DEV")"
+PID_MAIN="$(solana-keygen pubkey "$KP_MAIN")"
 
-def brace_delta(line:str)->int:
-    return line.count("{")-line.count("}")
+say "Program IDs:"
+say "  localnet: $PID_LOCAL"
+say "  devnet : $PID_DEV"
+say "  mainnet: $PID_MAIN"
 
-while i<n:
-    line=s[i]
-    m=re.search(r'^\s*server\s*\{', line)
-    if not m:
-        out.append(line); i+=1; continue
+say "3) Configure provider cluster + wallet"
+case "$MODE" in
+  localnet)
+    solana config set --url http://127.0.0.1:8899 >/dev/null
+    solana config set --keypair "$KP_LOCAL" >/dev/null
+    PID="$PID_LOCAL"
+    ;;
+  devnet)
+    solana config set --url https://api.devnet.solana.com >/dev/null
+    solana config set --keypair "$KP_DEV" >/dev/null
+    PID="$PID_DEV"
+    ;;
+  mainnet)
+    solana config set --url https://api.mainnet-beta.solana.com >/dev/null
+    solana config set --keypair "$KP_MAIN" >/dev/null
+    PID="$PID_MAIN"
+    ;;
+esac
 
-    # buffer server block
-    block=[line]
-    depth=brace_delta(line)
-    i+=1
-    while i<n and depth>0:
-        block.append(s[i])
-        depth += brace_delta(s[i])
-        i+=1
+say "4) Patch declare_id + Anchor.toml program id for selected mode"
+# backup
+cp -a "$APP/programs/$PROG/src/lib.rs" "$BK/lib.rs.bak"
+cp -a "$APP/Anchor.toml" "$BK/Anchor.toml.bak"
 
-    txt="".join(block)
-    if "include /etc/nginx/includes/wv_vault_api.inc;" in txt:
-        out.extend(block); continue
+# patch declare_id! line
+perl -0777 -pe "s/declare_id!\\(\\\"[^\\\"]+\\\"\\);/declare_id!(\\\"$PID\\\");/g" -i "$APP/programs/$PROG/src/lib.rs"
 
-    # insert include after first server_name if present, else after opening
-    inserted=False
-    nb=[]
-    for ln in block:
-        nb.append(ln)
-        if (not inserted) and re.search(r'^\s*server_name\s+', ln):
-            nb.append("  "+inc+"\n")
-            inserted=True
-    if not inserted:
-        nb.insert(1,"  "+inc+"\n")
-    out.extend(nb)
+# patch Anchor.toml: set programs.<mode>
+python3 - <<PY
+import re
+p="$PID"
+mode="$MODE"
+txt=open("$APP/Anchor.toml","r").read()
+# ensure sections exist, rewrite the right section deterministically
+def set_section(section, key, value, txt):
+    # section like [programs.devnet]
+    if section not in txt:
+        txt += "\n"+section+"\n"
+    # replace or add key line inside section
+    parts=txt.split(section)
+    pre=parts[0]
+    rest=section.join(parts[1:])
+    # find next section
+    m=re.search(r"\n\\[.*?\\]\n", rest)
+    body = rest[:m.start()] if m else rest
+    tail = rest[m.start():] if m else ""
+    # remove old key
+    body=re.sub(rf"^\s*{re.escape(key)}\s*=\s*\"[^\"]*\"\s*$", "", body, flags=re.M)
+    body = body.strip("\n")
+    if body and not body.endswith("\n"): body += "\n"
+    body += f"{key} = \"{value}\"\n"
+    return pre + section + "\n" + body + tail
 
-open(path,"w",encoding="utf-8").write("".join(out))
+txt=set_section("[programs.%s]"%mode, "$PROG", p, txt)
+open("$APP/Anchor.toml","w").write(txt)
 PY
 
-say "4) S'assurer que sites-enabled pointe bien vers le vhost"
-ln -sf "$VHOST" "$SEN" || true
+say "5) Install deps (if missing) + build"
+yarn install --non-interactive
+anchor build
 
-say "5) nginx -t + reload"
-nginx -t
-systemctl reload nginx
-
-say "6) Vérifier que Vault écoute"
-if ! ss -ltnp 2>/dev/null | grep -q ":${VAULT_PORT}"; then
-  say "Vault n'écoute PAS sur ${VAULT_PORT}. Status+logs:"
-  systemctl status vault-api.service --no-pager || true
-  journalctl -u vault-api.service -n 120 --no-pager || true
-  exit 1
+say "6) Optional airdrop (devnet/localnet only) + deploy"
+if [ "$MODE" = "devnet" ]; then
+  say "6a) Airdrop 2 SOL devnet (best effort)"
+  solana airdrop 2 >/dev/null 2>&1 || true
 fi
 
-say "7) Tests (DOIT être JSON partout, pas 301/HTML)"
-echo "-- direct:"; curl -sS "http://127.0.0.1:${VAULT_PORT}/health"; echo
+if [ "$MODE" = "localnet" ]; then
+  say "6a) Ensure local validator running (best effort start in background if not)"
+  if ! curl -s http://127.0.0.1:8899 >/dev/null 2>&1; then
+    nohup solana-test-validator --reset >"$BK/solana-test-validator.log" 2>&1 &
+    sleep 2
+  fi
+fi
 
-echo "-- via nginx HTTP (port 80) SANS redirect attendu:"
-curl -sS -i -H "Host: ${HOST}" "http://127.0.0.1/wolverine/vault-api/health" | head -n 20; echo
+say "6b) anchor deploy (MODE=$MODE)"
+anchor deploy
 
-echo "-- via nginx HTTPS (port 443) (SNI via --resolve):"
-curl -k -sS --resolve "${HOST}:443:127.0.0.1" "https://${HOST}/wolverine/vault-api/health"; echo
+say "7) Export IDL + addresses"
+IDL="$APP/target/idl/${PROG}.json"
+ADDR="$APP/DEPLOY_${MODE}.txt"
+mkdir -p "$APP/target/idl"
+[ -f "$IDL" ] && cp -a "$IDL" "$BK/${PROG}.idl.json" || true
 
-echo "-- create HTTPS:"
-curl -k -sS --resolve "${HOST}:443:127.0.0.1" -H "content-type: application/json" -X POST "https://${HOST}/wolverine/vault-api/create" -d "{}"; echo
+cat >"$ADDR"<<EOF
+MODE=$MODE
+PROGRAM=$PROG
+PROGRAM_ID=$PID
+SOLANA_URL=$(solana config get | awk -F': ' '/RPC URL/{print $2}')
+WALLET=$(solana config get | awk -F': ' '/Keypair Path/{print $2}')
+TS=$TS
+EOF
 
-say "DONE"
-echo "Backups: $BK"
-echo "Ouvre: https://${HOST}/wolverine/ puis Ctrl+F5"
+say "8) Done"
+say "Program ID ($MODE): $PID"
+say "Deploy info: $ADDR"
+say "BK: $BK"
 BASH
-
-chmod +x /root/WV_FIX_VAULT_301.sh
-bash /root/WV_FIX_VAULT_301.sh
+chmod +x /root/MEGA_AQUILA_STACKING_PROJECT_V2_DEPLOY_MODES.sh
+bash /root/MEGA_AQUILA_STACKING_PROJECT_V2_DEPLOY_MODES.sh devnet
