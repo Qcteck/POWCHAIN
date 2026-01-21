@@ -1,191 +1,274 @@
-cat >/root/MEGA_AQUILA_STACKING_ONE_SHOT_ROOT_V7_FINAL.sh<<'BASH'
+cat >/root/MEGA_IAAQUILA_INSTALL_100.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
-umask 027
 TS="$(date +%Y%m%d_%H%M%S)"
 say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 die(){ say "ERR: $*"; exit 1; }
-need(){ command -v "$1" >/dev/null 2>&1 || die "missing: $1"; }
-[ "$(id -u)" -eq 0 ] || die "run as root"
-need nginx; need systemctl; need python3; need curl
+asroot(){ [ "$(id -u)" = "0" ] || die "run as root"; }
+need(){ command -v "$1" >/dev/null 2>&1 || die "missing $1"; }
+
+asroot
+need nginx
+need curl
+need node
+need npm
 
 DOMAIN="fireinners.online"
-PATH_OK="/aquila_stacking/"
-WEBROOT="/var/www/aquila_stacking"
-HTML="$WEBROOT/index.html"
+VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
 
-APP="/opt/aquila_stacking"
-KEYS="$APP/keys"
-PROG="aquila_stacking"
+SLUG="iaaquila"
+APP="/opt/iaaquila"
+PUB="$APP/public"
+CFG="$APP/config"
+DATA="$APP/data"
+VENDOR="$PUB/vendor"
 
-BK="/root/AQUILA_STACKING_ONESHOT_V7_BK_${TS}"
+PORT="9688"
+HOST="127.0.0.1"
+
+SOL_RPC_PRIMARY="https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac"
+SOL_RPC_BACKUP="https://api.mainnet-beta.solana.com"
+
+INC="/etc/nginx/includes/${SLUG}_routes.inc"
+SVC="/etc/systemd/system/${SLUG}.service"
+
+BK="/root/${SLUG}_BK_${TS}"
 mkdir -p "$BK"
 
-say "1) WEBROOT + index.html"
-mkdir -p "$WEBROOT"
-chmod 0755 "$WEBROOT"
+say "== 0) Backup =="
+[ -d "$APP" ] && cp -a "$APP" "$BK/app.bak" 2>/dev/null || true
+[ -f "$INC" ] && cp -a "$INC" "$BK/$(basename "$INC").bak" 2>/dev/null || true
+[ -f "$VHOST" ] && cp -a "$VHOST" "$BK/$(basename "$VHOST").bak" 2>/dev/null || true
+[ -f "$SVC" ] && cp -a "$SVC" "$BK/$(basename "$SVC").bak" 2>/dev/null || true
 
-PID="UNKNOWN"
-if command -v solana-keygen >/dev/null 2>&1 && [ -f "$KEYS/${PROG}-keypair.json" ]; then
-  PID="$(solana-keygen pubkey "$KEYS/${PROG}-keypair.json" 2>/dev/null || echo UNKNOWN)"
+say "== 1) Create dirs =="
+mkdir -p "$APP" "$PUB" "$CFG" "$DATA" "$VENDOR"
+
+say "== 2) Write policy (deny-by-default) =="
+if [ ! -f "$CFG/exec_allowlist.json" ]; then
+cat >"$CFG/exec_allowlist.json"<<'JSON'
+{"killSwitch":false,"ALLOW_ALL_IF_EMPTY":0,"global":{"maxTxPer24h":6,"maxUsdPer24h":250,"maxSlippageBps":120},"pairs":[]}
+JSON
 fi
 
-cat >"$HTML"<<EOF
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AquilaStacking</title><style>body{font-family:system-ui,Segoe UI,Arial;margin:24px;max-width:980px}code{background:#0b1020;color:#d7e3ff;padding:10px;border-radius:10px;display:block;overflow:auto}h1{margin:0 0 12px}small{opacity:.8}</style></head><body><h1>AquilaStacking</h1><p><b>Program ID:</b><code>${PID}</code></p><p><b>Workspace:</b><code>${APP}</code></p><p><b>URL:</b><code>${PATH_OK}</code></p><p><small>TS: ${TS}</small></p></body></html>
-EOF
-chown -R www-data:www-data "$WEBROOT" 2>/dev/null || true
-chmod -R 0755 "$WEBROOT"
+say "== 3) Backend package.json (PIN exact) =="
+cat >"$APP/package.json"<<'JSON'
+{"name":"iaaquila","version":"1.0.0","private":true,"type":"module","main":"server.js","dependencies":{"express":"4.19.2","cors":"2.8.5","node-fetch":"3.3.2"}}
+JSON
 
-say "2) Detect ACTIVE 443 vhost file (first matching server block in nginx -T order) + patch it (direct location block)"
-python3 - <<'PY'
-import os, re, subprocess, sys, shutil, datetime, textwrap
+say "== 4) Backend server.js =="
+cat >"$APP/server.js"<<'JS'
+import express from "express";
+import cors from "cors";
+import fs from "fs";
+import path from "path";
+import crypto from "crypto";
+import fetch from "node-fetch";
 
-BK=os.environ.get("BK")
-DOMAIN=os.environ.get("DOMAIN","fireinners.online")
-PATH_OK=os.environ.get("PATH_OK","/aquila_stacking/")
-WEBROOT=os.environ.get("WEBROOT","/var/www/aquila_stacking")
-TAG="AQUILA_STACKING_ONESHOT_V7"
+const app=express();app.disable("x-powered-by");app.use(cors());app.use(express.json({limit:"10mb"}));
+const ENV=(k,d)=>process.env[k]??d;
+const PORT=parseInt(ENV("PORT","9688"),10);
+const HOST=ENV("HOST","127.0.0.1");
+const SOL_RPC_PRIMARY=ENV("SOL_RPC_PRIMARY","https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac");
+const SOL_RPC_BACKUP=ENV("SOL_RPC_BACKUP","https://api.mainnet-beta.solana.com");
+const JUP_PROXY=(ENV("JUP_PROXY","")||"").replace(/\/$/,"");
 
-def run(cmd):
-    return subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
+const APP_DIR=new URL(".",import.meta.url).pathname.replace(/\/$/,"");
+const PUB_DIR=path.join(APP_DIR,"public");
+const CFG_DIR=path.join(APP_DIR,"config");
+const DATA_DIR=path.join(APP_DIR,"data");
+const ALLOW_FILE=path.join(CFG_DIR,"exec_allowlist.json");
+const PENDING_FILE=path.join(DATA_DIR,"pending_state.json");
+const EXEC_FILE=path.join(DATA_DIR,"exec_state.json");
 
-ngT = run(["nginx","-T"])
-open(os.path.join(BK,"nginx.T.txt"),"w").write(ngT)
+const sha=x=>crypto.createHash("sha256").update(String(x??"")).digest("hex");
+const now=()=>Date.now();
+function atomicWrite(file,obj){const tmp=file+".tmp_"+now()+"_"+Math.random().toString(16).slice(2);fs.mkdirSync(path.dirname(file),{recursive:true});fs.writeFileSync(tmp,JSON.stringify(obj));fs.renameSync(tmp,file);}
+function loadJSON(file,def){try{return JSON.parse(fs.readFileSync(file,"utf8"));}catch{return def;}}
+let allow=loadJSON(ALLOW_FILE,{killSwitch:false,ALLOW_ALL_IF_EMPTY:0,global:{maxTxPer24h:0,maxUsdPer24h:0,maxSlippageBps:120},pairs:[]});
+let pending=(loadJSON(PENDING_FILE,{pending:[]}).pending)||[];
+let execState=loadJSON(EXEC_FILE,{usage:{windowStart:0,tx24h:0,usd24h:0,byPair:{}},executed:{}});
+function persist(){atomicWrite(PENDING_FILE,{t:now(),pending});atomicWrite(EXEC_FILE,{t:now(),...execState});}
+function usageResetIfNeeded(){const U=execState.usage;const w=U.windowStart||0;const t=now();if(!w||(t-w)>(24*3600*1000)){U.windowStart=t;U.tx24h=0;U.usd24h=0;U.byPair={};}}
+function norm(s){return String(s||"").trim();}
+function bad(msg,code=400){const e=new Error(String(msg));e.status=code;throw e;}
+function inAllowlist(inMint,outMint,dir){const im=norm(inMint),om=norm(outMint),d=String(dir||"IN_TO_OUT");return (allow.pairs||[]).find(p=>norm(p.inMint)===im&&norm(p.outMint)===om&&String(p.direction||"IN_TO_OUT")===d)||null;}
+function pairKey(i,o){return sha(norm(i)+"->"+norm(o)).slice(0,16);}
+async function fetchJSON(url,opts={},ms=15000){const ac=new AbortController();const t=setTimeout(()=>ac.abort(),ms);try{const r=await fetch(url,{cache:"no-store",signal:ac.signal,...opts});if(!r.ok) throw new Error("HTTP "+r.status);return await r.json();}finally{clearTimeout(t);}}
+async function rpcCall(url,method,params,ms=9000){return await fetchJSON(url,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({jsonrpc:"2.0",id:1,method,params})},ms);}
+async function confirmFinalized(sig,timeoutMs=22000){const started=now();let last=null;while(now()-started<timeoutMs){for(const rpc of [SOL_RPC_PRIMARY,SOL_RPC_BACKUP]){try{const tx=await rpcCall(rpc,"getTransaction",[sig,{encoding:"json",commitment:"finalized",maxSupportedTransactionVersion:0}],9000).catch(()=>null);if(tx&&tx.result) return {ok:true,finalized:true,slot:tx.result.slot||null,rpc,via:"getTransaction"};const st=await rpcCall(rpc,"getSignatureStatuses",[[sig],{searchTransactionHistory:true}],9000).catch(()=>null);const v=st?.result?.value?.[0]||null;if(v){if(v.err) return {ok:false,finalized:false,err:v.err,conf:v.confirmationStatus||null,rpc};if(v.confirmationStatus==="finalized") return {ok:true,finalized:true,slot:v.slot||null,rpc,via:"statuses"};last={ok:true,finalized:false,conf:v.confirmationStatus||null,slot:v.slot||null,rpc};}}catch(e){last={ok:false,finalized:false,err:String(e),rpc};}}await new Promise(r=>setTimeout(r,900));}return last||{ok:false,finalized:false,err:"timeout"};}
+function pushPending(desc,payload){const id="ACT_"+now()+"_"+Math.random().toString(16).slice(2);const rec={id,desc:String(desc||"Action"),status:"PENDING",payload:payload||{},payloadHash:sha(JSON.stringify(payload||{})),createdAt:now()};pending.push(rec);pending=pending.slice(-400);persist();return id;}
+function resolvePending(id,ok){const a=pending.find(x=>x.id===id);if(!a) return null;a.status=ok?"APPROVED":"REFUSED";a.resolvedAt=now();persist();return a;}
+function mustApproved(pendingId,payload){const a=pending.find(x=>x.id===pendingId);if(!a) bad("pending not found");if(a.status!=="APPROVED") bad("pending not APPROVED");const h=sha(JSON.stringify(payload||{}));if(h!==a.payloadHash) bad("payload hash mismatch");if(a.executedAt||a.txSig||a.status==="EXECUTED") bad("pending already executed");return a;}
+function markExecuted(id,txSig){const a=pending.find(x=>x.id===id);if(!a) return null;a.executedAt=now();a.txSig=txSig||null;a.status="EXECUTED";persist();return a;}
 
-# --- locate first server block (in nginx -T order) that has server_name DOMAIN and listen 443 ---
-cur_file=None
-best_file=None
+app.use("/iaaquila/",express.static(PUB_DIR,{etag:false,maxAge:0}));
 
-lines=ngT.splitlines()
-i=0
-while i < len(lines):
-    line=lines[i]
-    m=re.match(r"^# configuration file (\S+):\d+", line)
-    if m:
-        cur_file=m.group(1)
-        i+=1
-        continue
+app.get("/iaaquila/api/health",(req,res)=>res.json({ok:true,t:now(),port:PORT,rpc:{primary:SOL_RPC_PRIMARY,backup:SOL_RPC_BACKUP},jupProxy:JUP_PROXY||null}));
 
-    if re.match(r"^\s*server\s*\{\s*$", line):
-        start_file=cur_file
-        depth=0
-        block=[]
-        # read block with brace tracking
-        j=i
-        while j < len(lines):
-            l=lines[j]
-            block.append(l)
-            depth += l.count("{")
-            depth -= l.count("}")
-            if depth==0 and j>i:
-                break
-            j+=1
-        blk="\n".join(block)
-        has_name = re.search(r"server_name\s+[^;]*\b"+re.escape(DOMAIN)+r"\b", blk) is not None
-        has_443  = re.search(r"listen\s+[^;]*\b443\b", blk) is not None
-        if has_name and has_443 and start_file and os.path.isfile(start_file):
-            best_file=start_file
-            break
-        i=j+1
-        continue
+app.get("/iaaquila/api/exec/policy",(req,res)=>{allow=loadJSON(ALLOW_FILE,allow);usageResetIfNeeded();persist();res.json({ok:true,allow,usage:execState.usage,rpc:{primary:SOL_RPC_PRIMARY,backup:SOL_RPC_BACKUP}});});
 
-    i+=1
+app.post("/iaaquila/api/decision/propose",(req,res)=>{const {desc,payload}=req.body||{};const id=pushPending(desc||"Action",payload||{});res.json({ok:true,id});});
+app.post("/iaaquila/api/decision/resolve",(req,res)=>{const {id,ok}=req.body||{};const a=resolvePending(id,!!ok);res.json({ok:!!a,action:a});});
 
-if not best_file:
-    raise SystemExit(f"no active 443 server block found for {DOMAIN} in nginx -T (see {BK}/nginx.T.txt)")
+app.post("/iaaquila/api/exec/swap/propose",(req,res)=>{try{allow=loadJSON(ALLOW_FILE,allow);usageResetIfNeeded();const {inMint,outMint,amountIn,slippageBps,dir}=req.body||{};const im=norm(inMint),om=norm(outMint);const amt=Number(amountIn||0),slip=Number(slippageBps||0);if(!im||!om) bad("missing mints");if(!(Number.isFinite(amt)&&amt>0)) bad("bad amountIn");if(!(Number.isFinite(slip)&&slip>0&&slip<=500)) bad("bad slippage");if(allow.killSwitch) bad("killSwitch ON");const pair=inAllowlist(im,om,dir||"IN_TO_OUT");if(!pair||!allow.ALLOW_ALL_IF_EMPTY) bad("pair not allowlisted");const maxSlip=Math.min(Number(pair.maxSlippageBps||allow.global?.maxSlippageBps||120),Number(allow.global?.maxSlippageBps||120));if(slip>maxSlip) bad("slippage too high");const maxAmt=Number(pair.maxAmountIn||0);if(maxAmt>0&&amt>maxAmt) bad("amount exceeds maxAmountIn");const payload={kind:"EXEC_SWAP",dir:dir||"IN_TO_OUT",inMint:im,outMint:om,amountIn:amt,slippageBps:slip};const id=pushPending("EXEC SWAP (requires APPROVE)",payload);res.json({ok:true,id,payload});}catch(e){res.status(e.status||500).json({ok:false,err:String(e.message||e)});}});
 
-# backup target file
-base=os.path.basename(best_file).replace("/","_")
-shutil.copy2(best_file, os.path.join(BK, f"active_vhost_{base}.bak"))
+async function jupQuote(inMint,outMint,amountRaw,slipBps){const base=(JUP_PROXY||"https://quote-api.jup.ag").replace(/\/$/,"");const url=base+`/v6/quote?inputMint=${encodeURIComponent(inMint)}&outputMint=${encodeURIComponent(outMint)}&amount=${encodeURIComponent(String(amountRaw))}&slippageBps=${encodeURIComponent(String(slipBps))}`;return await fetchJSON(url,{},15000);}
+async function jupSwap(quote,userPub){const base=(JUP_PROXY||"https://quote-api.jup.ag").replace(/\/$/,"");const url=base+"/v6/swap";const body={quoteResponse:quote,userPublicKey:userPub,wrapAndUnwrapSol:true,asLegacyTransaction:false,computeUnitPriceMicroLamports:"auto"};return await fetchJSON(url,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)},20000);}
 
-# --- patch target file: insert location block inside matching 443 server{} (domain) ---
-src=open(best_file,"r").read()
+app.post("/iaaquila/api/exec/swap/prepare",async(req,res)=>{try{allow=loadJSON(ALLOW_FILE,allow);usageResetIfNeeded();const {pendingId,userPub,decimalsIn}=req.body||{};if(!pendingId||!userPub) bad("missing pendingId/userPub");const a=pending.find(x=>x.id===pendingId);if(!a) bad("pending not found");const p=a.payload||{};mustApproved(pendingId,p);if(allow.killSwitch) bad("killSwitch ON");const pair=inAllowlist(p.inMint,p.outMint,p.dir||"IN_TO_OUT");if(!pair||!allow.ALLOW_ALL_IF_EMPTY) bad("pair not allowlisted");const U=execState.usage;const gTx=Number(allow.global?.maxTxPer24h||0);if(gTx>0&&U.tx24h>=gTx) bad("global tx quota exceeded");const k=pairKey(p.inMint,p.outMint);U.byPair[k]=U.byPair[k]||{tx24h:0,usd24h:0};const pTx=Number(pair.maxTxPer24h||0);if(pTx>0&&U.byPair[k].tx24h>=pTx) bad("pair tx quota exceeded");const dec=Number(decimalsIn||6);if(!Number.isFinite(dec)||dec<0||dec>12) bad("bad decimalsIn");const amountRaw=String(Math.floor(Number(p.amountIn)*Math.pow(10,dec)));if(!/^\d+$/.test(amountRaw)) bad("cannot compute amountRaw");const quote=await jupQuote(p.inMint,p.outMint,amountRaw,Number(p.slippageBps||120));const sw=await jupSwap(quote,userPub);const txB64=sw?.swapTransaction||null;if(!txB64) bad("no swapTransaction");persist();res.json({ok:true,pendingId,userPub,amountRaw,swapTransactionBase64:txB64});}catch(e){res.status(e.status||500).json({ok:false,err:String(e.message||e)});}});
 
-loc_block=textwrap.dedent(f"""\
-  # {TAG} BEGIN
-  location = /aquilastacking {{ return 301 {PATH_OK}; }}
-  location ^~ /aquilastacking/ {{ return 301 {PATH_OK}; }}
-  location = {PATH_OK.rstrip('/')} {{ return 301 {PATH_OK}; }}
-  location ^~ {PATH_OK} {{
-    alias {WEBROOT}/;
-    index index.html;
-    try_files $uri $uri/ {PATH_OK}index.html;
-    add_header Cache-Control "no-store" always;
-  }}
-  # {TAG} END
-""")
+app.post("/iaaquila/api/exec/commit",async(req,res)=>{try{usageResetIfNeeded();const {pendingId,txSig}=req.body||{};if(!pendingId||!txSig) bad("missing pendingId/txSig");const a=pending.find(x=>x.id===pendingId);if(!a) bad("pending not found");const p=a.payload||{};mustApproved(pendingId,p);if(execState.executed[pendingId]) bad("already committed");const conf=await confirmFinalized(String(txSig),22000);if(!(conf&&conf.ok&&conf.finalized)) return res.status(409).json({ok:false,finalized:false,conf});const U=execState.usage;const k=pairKey(p.inMint,p.outMint);U.tx24h++;U.byPair[k]=U.byPair[k]||{tx24h:0,usd24h:0};U.byPair[k].tx24h++;execState.executed[pendingId]={t:now(),txSig:String(txSig)};markExecuted(pendingId,String(txSig));persist();res.json({ok:true,finalized:true,txSig:String(txSig),conf});}catch(e){res.status(e.status||500).json({ok:false,err:String(e.message||e)});}});
 
-def patch_servers(text:str)->tuple[str,int]:
-    out=[]
-    n=len(text)
-    pos=0
-    patched=0
+app.use((err,req,res,next)=>res.status(err.status||500).json({ok:false,err:String(err.message||err)}));
+app.listen(PORT,HOST,()=>console.log("IaAquila listening "+HOST+":"+PORT));
+JS
 
-    # scan for "server" blocks with brace matching
-    pat=re.compile(r"\bserver\s*\{", re.M)
-    for m in pat.finditer(text):
-        s=m.start()
-        # append chunk before this server
-        out.append(text[pos:s])
-        # find opening brace
-        brace_pos=text.find("{", s)
-        if brace_pos==-1:
-            out.append(text[s:]); pos=n; break
-        # walk braces
-        depth=0
-        k=brace_pos
-        while k < n:
-            if text[k]=="{": depth+=1
-            elif text[k]=="}":
-                depth-=1
-                if depth==0:
-                    end=k+1
-                    break
-            k+=1
-        else:
-            out.append(text[s:]); pos=n; break
+say "== 5) Front index.html (Phantom real sign+send) =="
+cat >"$PUB/index.html"<<'HTML'
+<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>IaAquila • Execution</title><style>html,body{height:100%;margin:0;background:#070914;color:#f2fbff;font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Helvetica,Arial,sans-serif}*{box-sizing:border-box}#app{min-height:100dvh;padding:14px;display:flex;flex-direction:column;gap:12px}h1{margin:0;font-size:14px;letter-spacing:.12em;text-transform:uppercase}#grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}label{display:block;margin:0 0 6px 0;opacity:.75;font-weight:900;letter-spacing:.10em;text-transform:uppercase;font-size:11px}input,select{width:100%;padding:10px 12px;border-radius:10px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.06);color:#fff;outline:none}button{padding:10px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.14);background:rgba(90,120,255,.18);color:#fff;font-weight:800;letter-spacing:.06em;cursor:pointer}button:hover{background:rgba(90,120,255,.28)}#log{white-space:pre-wrap;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:12px;line-height:1.35;padding:12px;border-radius:12px;border:1px solid rgba(255,255,255,.12);background:rgba(0,0,0,.35);min-height:240px;max-height:44vh;overflow:auto}</style></head><body>
+<script src="/iaaquila/vendor/buffer.iife.min.js"></script>
+<script src="/iaaquila/vendor/solana-web3.iife.min.js"></script>
+<div id="app">
+<h1>IaAquila • Execution (PENDING → APPROVE → PREPARE → Phantom SIGN+SEND → COMMIT finalized)</h1>
+<div id="grid">
+<div><label>RPC</label><input id="rpc" placeholder="RPC URL"></div>
+<div><label>Wallet</label><input id="pub" readonly placeholder="—"></div>
+<div><label>InMint</label><select id="inMint"><option value="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1">USDC</option><option value="So11111111111111111111111111111111111111112">SOL (wSOL)</option></select></div>
+<div><label>OutMint</label><input id="outMint" placeholder="mint cible"></div>
+<div><label>AmountIn</label><input id="amt" placeholder="ex: 25"></div>
+<div><label>Slippage (bps)</label><input id="slip" value="120"></div>
+<div><label>PendingId</label><input id="pid" placeholder="—"></div>
+<div><label>TxSig</label><input id="sig" placeholder="—"></div>
+</div>
+<div style="display:flex;gap:10px;flex-wrap:wrap">
+<button id="bPolicy">POLICY</button>
+<button id="bConnect">CONNECT PHANTOM</button>
+<button id="bPropose">PROPOSE</button>
+<button id="bApprove">APPROVE</button>
+<button id="bPrepare">PREPARE</button>
+<button id="bSignSend">SIGN+SEND</button>
+<button id="bCommit">COMMIT</button>
+</div>
+<div id="log"></div>
+</div>
+<script>(()=>{"use strict";
+const API="/iaaquila/api/";const log=s=>{const el=document.getElementById("log");el.textContent=(el.textContent?el.textContent+"\n":"")+String(s);el.scrollTop=el.scrollHeight;};
+const post=(p,b)=>fetch(API+p,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(b||{}),cache:"no-store"}).then(r=>r.json());
+const get=p=>fetch(API+p,{cache:"no-store"}).then(r=>r.json());
+let phantom=null,txB64=null;
+const num=v=>{const n=Number(String(v||"").trim());return (Number.isFinite(n)?n:NaN);};
+async function policy(){const j=await get("exec/policy");if(j.rpc&&j.rpc.primary&&!document.getElementById("rpc").value)document.getElementById("rpc").value=j.rpc.primary;log("policy: killSwitch="+(j.allow&&j.allow.killSwitch)+" ALLOW_ALL_IF_EMPTY="+(j.allow&&j.allow.ALLOW_ALL_IF_EMPTY));}
+async function connect(){phantom=window.solana;if(!phantom||!phantom.isPhantom){log("ERR: Phantom absent");return;}const r=await phantom.connect();const pub=(r&&r.publicKey)?r.publicKey.toString():(phantom.publicKey?phantom.publicKey.toString():"");document.getElementById("pub").value=pub;log("phantom: "+pub);}
+async function propose(){const inMint=document.getElementById("inMint").value.trim();const outMint=document.getElementById("outMint").value.trim();const amt=num(document.getElementById("amt").value);const slip=num(document.getElementById("slip").value);
+const r=await post("exec/swap/propose",{inMint,outMint,amountIn:amt,slippageBps:slip,dir:"IN_TO_OUT"});if(!r.ok){log("PROPOSE FAIL: "+r.err);return;}document.getElementById("pid").value=r.id;log("pending: "+r.id);}
+async function approve(){const id=document.getElementById("pid").value.trim();const r=await post("decision/resolve",{id,ok:true});log(r.ok?"approved":"approve fail");}
+async function prepare(){const id=document.getElementById("pid").value.trim();const pub=document.getElementById("pub").value.trim();if(!id||!pub){log("ERR: pendingId/pub");return;}
+const inMint=document.getElementById("inMint").value.trim();const dec=inMint.startsWith("So111")?9:6;
+const r=await post("exec/swap/prepare",{pendingId:id,userPub:pub,decimalsIn:dec});if(!r.ok){log("PREP FAIL: "+r.err);return;}txB64=r.swapTransactionBase64;log("tx ready");}
+async function signSend(){if(!phantom){log("ERR: no phantom");return;}if(!txB64){log("ERR: no tx");return;}
+const rpc=document.getElementById("rpc").value.trim();if(!rpc){log("ERR: rpc empty");return;}
+const {Connection,VersionedTransaction}=window.solanaWeb3;const conn=new Connection(rpc,{commitment:"confirmed"});
+const tx=VersionedTransaction.deserialize(Uint8Array.from(atob(txB64),c=>c.charCodeAt(0)));
+const signed=await phantom.signTransaction(tx);
+const sig=await conn.sendRawTransaction(signed.serialize(),{skipPreflight:false,maxRetries:3});
+document.getElementById("sig").value=sig;log("sent: "+sig);}
+async function commit(){const pid=document.getElementById("pid").value.trim();const sig=document.getElementById("sig").value.trim();const r=await post("exec/commit",{pendingId:pid,txSig:sig});log(r.ok?"commit OK":"commit FAIL: "+JSON.stringify(r));}
+document.getElementById("bPolicy").onclick=policy;
+document.getElementById("bConnect").onclick=connect;
+document.getElementById("bPropose").onclick=propose;
+document.getElementById("bApprove").onclick=approve;
+document.getElementById("bPrepare").onclick=prepare;
+document.getElementById("bSignSend").onclick=signSend;
+document.getElementById("bCommit").onclick=commit;
+policy();log("ready");})();</script></body></html>
+HTML
 
-        block=text[s:end]
-        # decide if this server block should be patched
-        has_name = re.search(r"server_name\s+[^;]*\b"+re.escape(DOMAIN)+r"\b", block) is not None
-        has_443  = re.search(r"listen\s+[^;]*\b443\b", block) is not None
+say "== 6) Vendor (PIN + local) =="
+WEB3_VER="1.95.5"
+BUF_VER="6.0.3"
+okdl(){ curl -fsSL "$1" -o "$2" >/dev/null 2>&1; }
+if ! okdl "https://cdn.jsdelivr.net/npm/@solana/web3.js@${WEB3_VER}/lib/index.iife.min.js" "$VENDOR/solana-web3.iife.min.js"; then
+  if [ -f "/var/www/wolverine/vendor/solana-web3.min.js" ]; then cp -a "/var/www/wolverine/vendor/solana-web3.min.js" "$VENDOR/solana-web3.iife.min.js"; else die "cannot download solana web3 iife and no fallback"; fi
+fi
+if ! okdl "https://cdn.jsdelivr.net/npm/buffer@${BUF_VER}/index.min.js" "$VENDOR/buffer.iife.min.js"; then
+  if [ -f "/var/www/wolverine/vendor/buffer.min.js" ]; then cp -a "/var/www/wolverine/vendor/buffer.min.js" "$VENDOR/buffer.iife.min.js"; else die "cannot download buffer iife and no fallback"; fi
+fi
 
-        if has_name and has_443 and (TAG not in block):
-            lines=block.splitlines(True)
-            # find insert point: before first "location" line, else before final "}"
-            ins=None
-            for idx,ln in enumerate(lines):
-                if re.match(r"^\s*location\s+", ln):
-                    ins=idx
-                    break
-            if ins is None:
-                # insert before last closing brace line
-                ins=len(lines)-1
-            # ensure block ends with newline before brace (best effort)
-            lines.insert(ins, loc_block + ("\n" if not loc_block.endswith("\n") else ""))
-            block="".join(lines)
-            patched+=1
+say "== 7) npm install (no ^ drift) =="
+cd "$APP"
+npm install --omit=dev >/dev/null 2>&1 || die "npm install failed"
+npm prune --omit=dev >/dev/null 2>&1 || true
 
-        out.append(block)
-        pos=end
+say "== 8) systemd service =="
+cat >"$SVC"<<SVC
+[Unit]
+Description=IaAquila (Execution Gate)
+After=network-online.target
+Wants=network-online.target
 
-    out.append(text[pos:])
-    return "".join(out), patched
+[Service]
+Type=simple
+WorkingDirectory=$APP
+Environment=PORT=$PORT
+Environment=HOST=$HOST
+Environment=SOL_RPC_PRIMARY=$SOL_RPC_PRIMARY
+Environment=SOL_RPC_BACKUP=$SOL_RPC_BACKUP
+Environment=JUP_PROXY=
+ExecStart=/usr/bin/node $APP/server.js
+Restart=always
+RestartSec=1
+User=root
 
-new, cnt = patch_servers(src)
-if cnt==0:
-    # still write unchanged? no. fail to force visibility
-    raise SystemExit(f"target vhost {best_file} had no patchable server{{}} blocks (or already patched).")
+[Install]
+WantedBy=multi-user.target
+SVC
 
-# write back with a direct .bak timestamp too
-shutil.copy2(best_file, best_file+f".bak.{datetime.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}")
-open(best_file,"w").write(new)
+systemctl daemon-reload >/dev/null 2>&1 || true
+systemctl enable --now "${SLUG}.service" >/dev/null 2>&1 || true
 
-print(f"[OK] active 443 vhost patched: {best_file} (server blocks patched: {cnt})")
-PY
-# export env for python block
+say "== 9) nginx routes include =="
+cat >"$INC"<<INC
+# IaAquila routes (auto)
+location ^~ /iaaquila/api/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+  proxy_pass http://127.0.0.1:${PORT};
+}
+location ^~ /iaaquila/ {
+  alias ${PUB}/;
+  add_header Cache-Control "no-store" always;
+  try_files \$uri \$uri/ /iaaquila/index.html;
+}
+INC
+
+say "== 10) inject include into vhost (immutable-safe) =="
+chattr -i "$VHOST" 2>/dev/null || true
+if ! grep -q "${SLUG}_routes.inc" "$VHOST"; then
+  awk -v inc="    include ${INC};" '
+    $0 ~ /server\s*\{/ {print; inserver=1; next}
+    inserver && $0 ~ /^\s*include\s+\/etc\/nginx\/includes\/.*routes\.inc;/ {print; next}
+    inserver && !done && $0 ~ /^\s*location\s+/ {print inc; done=1; print; next}
+    {print}
+  ' "$VHOST" >"$VHOST.tmp_${TS}"
+  mv "$VHOST.tmp_${TS}" "$VHOST"
+fi
+nginx -t >/dev/null 2>&1 || { say "NGINX TEST FAIL - rollback"; cp -a "$BK/$(basename "$VHOST").bak" "$VHOST" 2>/dev/null || true; nginx -t; die "nginx invalid"; }
+systemctl reload nginx >/dev/null 2>&1 || true
+chattr +i "$VHOST" 2>/dev/null || true
+chattr +i "$INC" 2>/dev/null || true
+
+say "== 11) smoke tests =="
+sleep 0.5
+systemctl is-active --quiet "${SLUG}.service" || die "service not active"
+curl -fsS "http://127.0.0.1:${PORT}/iaaquila/api/health" >/dev/null || die "health endpoint fail"
+curl -fsS "https://${DOMAIN}/iaaquila/" >/dev/null || die "public route fail"
+
+say "OK: https://${DOMAIN}/iaaquila/  (API: /iaaquila/api/health)"
+say "Policy: ${CFG}/exec_allowlist.json (deny-by-default; pairs=[]; ALLOW_ALL_IF_EMPTY=0)"
 BASH
-# Re-run with env exported (bash heredoc limitation)
-sed -i "1iBK=\"$BK\"\nDOMAIN=\"$DOMAIN\"\nPATH_OK=\"$PATH_OK\"\nWEBROOT=\"$WEBROOT\"\n" /root/MEGA_AQUILA_STACKING_ONE_SHOT_ROOT_V7_FINAL.sh
-bash /root/MEGA_AQUILA_STACKING_ONE_SHOT_ROOT_V7_FINAL.sh.__run 2>/dev/null || true
-BASH
+chmod +x /root/MEGA_IAAQUILA_INSTALL_100.sh
+/root/MEGA_IAAQUILA_INSTALL_100.sh
