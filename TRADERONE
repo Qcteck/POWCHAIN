@@ -1,972 +1,204 @@
-cat >/root/MEGA_PUMPFUN_BUNDLER_PATCH_ROTATE_TRACE_V1.sh <<'BASH'
+bash -lc 'cat >/root/MEGA_AQUILA_ROUTES_VERIFY_FIX_V2.sh<<'\''BASH'\''
 #!/usr/bin/env bash
 set -euo pipefail
-
 TS="$(date +%Y%m%d_%H%M%S)"
-BK="/root/PUMPFUN_BUNDLER_PATCH_${TS}"
-APP="${PUMPBUNDLER_DIR:-/opt/pumpfun-bundler}"
-REPO="${PUMPBUNDLER_REPO:-https://github.com/cicere/pumpfun-bundler.git}"
-
-say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
-die(){ say "ERROR: $*"; exit 1; }
+BK="/root/AQUILA_VERIFY_FIX_V2_BK_${TS}"
+mkdir -p "$BK"
+say(){ printf "[%s] %s\n" "$(date +%H:%M:%S)" "$*"; }
+die(){ say "ERR: $*"; exit 1; }
 
 [ "$(id -u)" -eq 0 ] || die "run as root"
+umask 022
 
-mkdir -p "$BK"
+DOMAIN="fireinners.online"
+PATH_A="/aquila_stacking/"
+PATH_B="/iaaquila/"
+WEBROOT="/var/www/aquila_stacking"
+LINKROOT="/var/www/iaaquila"
+INC="/etc/nginx/includes/aquila_stacking_routes.inc"
 
-say "apt: prereqs"
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -y >/dev/null
-apt-get install -y --no-install-recommends ca-certificates curl git >/dev/null
+REACT_APP="/opt/aquila_stacking_react"
+REACT_DIST="$REACT_APP/dist"
 
-if ! command -v node >/dev/null 2>&1; then
-  say "node: install Node 20 (NodeSource)"
-  curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null
-  apt-get install -y --no-install-recommends nodejs >/dev/null
+ASKLIB="/opt/fireinners/sentinel/lib/askorupdate.sh"
+if [ -f "$ASKLIB" ]; then
+  # shellcheck disable=SC1090
+  . "$ASKLIB" || true
 fi
 
-say "env: versions"
-say "node: $(node -v)"
-say "npm : $(npm -v)"
+backup_one(){ local p="$1"; [ -e "$p" ] || return 0; mkdir -p "$BK/$(dirname "$p")"; cp -a "$p" "$BK/$p.bak" 2>/dev/null || true; }
 
-if [ ! -d "$APP/.git" ]; then
-  say "git: clone -> $APP"
-  rm -rf "$APP"
-  git clone --depth 1 "$REPO" "$APP" >/dev/null
-else
-  say "git: update -> $APP"
-  ( cd "$APP" && git fetch --all --prune >/dev/null )
-  ( cd "$APP" && git pull --ff-only >/dev/null ) || true
-fi
-
-say "backup: snapshot"
-tar -C "$(dirname "$APP")" -czf "$BK/app.tgz" "$(basename "$APP")" >/dev/null 2>&1 || true
-( cd "$APP" && git rev-parse HEAD ) >"$BK/git_commit.txt" 2>/dev/null || true
-
-find_one(){ find "$APP" -maxdepth 6 -type f -name "$1" 2>/dev/null | head -n1; }
-
-ROTATE_TS="$(find_one rotate.ts || true)"
-SOLERR_TS="$(find_one solana_errors.ts || true)"
-WATCH_TS="$(find_one watch_new_tokens.ts || true)"
-CREATE_TS="$(find_one create_spl_token.ts || true)"
-
-[ -n "$ROTATE_TS" ] || die "rotate.ts not found"
-[ -n "$SOLERR_TS" ] || die "solana_errors.ts not found"
-[ -n "$WATCH_TS" ] || die "watch_new_tokens.ts not found"
-[ -n "$CREATE_TS" ] || die "create_spl_token.ts not found"
-
-LIBDIR="$(dirname "$ROTATE_TS")"
-NDJSON_TS="$LIBDIR/ndjson_writer.ts"
-
-say "paths:"
-say " - rotate         : $ROTATE_TS"
-say " - ndjson_writer   : $NDJSON_TS"
-say " - watch_new_tokens: $WATCH_TS"
-say " - solana_errors   : $SOLERR_TS"
-say " - create_spl_token: $CREATE_TS"
-
-say "write: rotate.ts"
-cp -a "$ROTATE_TS" "$BK/rotate.ts.bak" 2>/dev/null || true
-cat >"$ROTATE_TS" <<'TS'
-import fs from "node:fs";
-import path from "node:path";
-
-export function ensureDir(p: string) {
-  fs.mkdirSync(p, { recursive: true });
+write_file(){
+  local path="$1"; shift
+  local tmp; tmp="$(mktemp)"
+  cat >"$tmp"<<EOF
+$*
+EOF
+  if declare -F askorupdate_file >/dev/null 2>&1; then
+    ASKORUPDATE_ASK=0 askorupdate_file "$path" "$tmp" "Aquila routes verify/fix v2" || { rm -f "$tmp"; die "askorupdate_file failed: $path"; }
+  else
+    chattr -i "$path" 2>/dev/null || true
+    [ -f "$path" ] && cp -a "$path" "$BK/$(echo "$path" | sed "s#/#_#g").bak" 2>/dev/null || true
+    install -m 0644 "$tmp" "$path"
+  fi
+  rm -f "$tmp"
 }
 
-export function fileSize(p: string): number {
-  try {
-    return fs.statSync(p).size;
-  } catch {
-    return 0;
-  }
+ensure_webroot(){
+  say "1) Ensure WEBROOT exists"
+  mkdir -p "$WEBROOT"
+  chmod 0755 "$WEBROOT" || true
+  chown -R www-data:www-data "$WEBROOT" 2>/dev/null || true
 }
 
-export type RotationInfo = {
-  from: string;
-  to: string;
-  ts: string;
-};
+deploy_dist_if_any(){
+  say "2) Deploy React dist if available"
+  if [ -d "$REACT_DIST" ] && [ -f "$REACT_DIST/index.html" ]; then
+    say "   dist found: $REACT_DIST => deploy to $WEBROOT"
+    rm -rf "$WEBROOT"/*
+    cp -a "$REACT_DIST"/. "$WEBROOT"/
+    chown -R www-data:www-data "$WEBROOT" 2>/dev/null || true
+    chmod -R a+rX "$WEBROOT" 2>/dev/null || true
+  else
+    say "   dist missing => keep existing $WEBROOT (no overwrite)"
+  fi
 
-export function rotateBySize(filePath: string, maxBytes: number, keep: number): RotationInfo | null {
-  if (!fs.existsSync(filePath)) return null;
+  if [ ! -f "$WEBROOT/index.html" ]; then
+    say "   creating minimal index.html (fallback)"
+    cat >"$WEBROOT/index.html"<<EOF
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Aquila Stacking</title><style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;margin:24px;background:#0b1020;color:#d7e3ff}code{background:#111a33;padding:3px 6px;border-radius:6px}</style></head><body><h1>Aquila Stacking</h1><p>Fallback page served. React dist not found.</p><p>WEBROOT: <code>/var/www/aquila_stacking</code></p><p>Paths: <code>/aquila_stacking/</code> and <code>/iaaquila/</code></p></body></html>
+EOF
+    chown -R www-data:www-data "$WEBROOT" 2>/dev/null || true
+    chmod -R a+rX "$WEBROOT" 2>/dev/null || true
+  fi
 
-  const sz = fileSize(filePath);
-  if (sz < maxBytes) return null;
-
-  const dir = path.dirname(filePath);
-  const base = path.basename(filePath);
-  const tsIso = new Date().toISOString();
-  const ts = tsIso.replace(/[:.]/g, "-");
-
-  const rotated = path.join(dir, `${base}.${ts}.log`);
-  fs.renameSync(filePath, rotated);
-
-  const files = fs
-    .readdirSync(dir)
-    .filter((f) => f.startsWith(base + ".") && f.endsWith(".log"))
-    .map((f) => path.join(dir, f))
-    .sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
-
-  for (let i = keep; i < files.length; i++) {
-    try {
-      fs.unlinkSync(files[i]);
-    } catch {}
-  }
-
-  return { from: filePath, to: rotated, ts: tsIso };
+  if [ ! -e "$LINKROOT" ]; then
+    say "   link $LINKROOT -> $WEBROOT"
+    ln -s "$WEBROOT" "$LINKROOT" 2>/dev/null || true
+  fi
 }
 
-export function writeJsonAtomic(filePath: string, obj: any) {
-  const dir = path.dirname(filePath);
-  ensureDir(dir);
-  const tmp = `${filePath}.tmp.${Date.now()}`;
-  fs.writeFileSync(tmp, JSON.stringify(obj));
-  fs.renameSync(tmp, filePath);
-}
-TS
-
-say "write: ndjson_writer.ts"
-cp -a "$NDJSON_TS" "$BK/ndjson_writer.ts.bak" 2>/dev/null || true
-cat >"$NDJSON_TS" <<'TS'
-import fs from "node:fs";
-import path from "node:path";
-import { ensureDir } from "./rotate.js";
-
-export type NdjsonFlushInfo = {
-  ts: string;
-  lines: number;
-  bytes: number;
-  flushMs: number;
-  fsyncApplied: boolean;
-  fsyncEvery: number;
-};
-
-export type NdjsonWriterOpts = {
-  bufferLines: number;
-  flushMs: number;
-  fsync: boolean;
-  fsyncEvery: number;
-  onFlush?: (info: NdjsonFlushInfo) => void;
-};
-
-export type NdjsonWriterStats = {
-  flushes: number;
-  fsyncs: number;
-  lines: number;
-  bytes: number;
-  avgFlushMs: number;
-  maxFlushMs: number;
-};
-
-function iso() {
-  return new Date().toISOString();
+ensure_inc(){
+  say "3) Write nginx include routes => $INC"
+  mkdir -p "$(dirname "$INC")"
+  write_file "$INC" \
+"# Aquila Stacking (React static SPA)\n\
+location = ${PATH_A%/} { return 301 $PATH_A; }\n\
+location ^~ $PATH_A {\n\
+  root /var/www;\n\
+  try_files \$uri \$uri/ ${PATH_A}index.html;\n\
+  add_header Cache-Control \"no-store\" always;\n\
+}\n\
+location = ${PATH_B%/} { return 301 $PATH_B; }\n\
+location ^~ $PATH_B {\n\
+  root /var/www;\n\
+  try_files \$uri \$uri/ ${PATH_B}index.html;\n\
+  add_header Cache-Control \"no-store\" always;\n\
+}\n"
 }
 
-export class NdjsonWriter {
-  private filePath: string;
-  private opts: NdjsonWriterOpts;
-  private fd: number | null = null;
+patch_vhosts(){
+  say "4) Patch nginx vhosts (server_name $DOMAIN listen 443) to include $INC"
+  local files
+  files="$(grep -RIl --exclude-dir=snippets --exclude-dir=modules-enabled --exclude='*.dpkg-*' --exclude='*.bak' -E "server_name[[:space:]].*\\b${DOMAIN}\\b" /etc/nginx/sites-enabled /etc/nginx/sites-available /etc/nginx/conf.d 2>/dev/null || true)"
+  [ -n "$files" ] || { say "   WARN: no vhost files found by grep"; return 0; }
 
-  private q: string[] = [];
-  private timer: NodeJS.Timeout | null = null;
+  while IFS= read -r f; do
+    [ -f "$f" ] || continue
+    backup_one "$f"
+    if grep -qF "$INC" "$f"; then
+      say "   already has include: $f"
+      continue
+    fi
+    python3 - "$f" "$DOMAIN" "$INC" <<'PY'
+import re,sys
+p,dom,inc=sys.argv[1],sys.argv[2],sys.argv[3]
+s=open(p,'r',encoding='utf-8',errors='ignore').read()
+def patch(block):
+  if inc in block: return block, False
+  if not re.search(r'\blisten\b[^;]*\b443\b', block): return block, False
+  if not re.search(r'\bserver_name\b[^;]*\b'+re.escape(dom)+r'\b', block): return block, False
+  lines=block.splitlines()
+  ins=None
+  for i,l in enumerate(lines):
+    if re.search(r'\bserver_name\b', l):
+      ins=i+1; break
+  if ins is None: ins=1
+  lines.insert(ins, "    include %s;"%inc)
+  return "\n".join(lines), True
 
-  private flushCount = 0;
-  private fsyncCount = 0;
-  private linesCount = 0;
-  private bytesCount = 0;
-
-  private flushLatencySumMs = 0;
-  private flushLatencyMaxMs = 0;
-
-  constructor(filePath: string, opts: Partial<NdjsonWriterOpts> = {}) {
-    this.filePath = filePath;
-    this.opts = {
-      bufferLines: Math.max(1, opts.bufferLines ?? 50),
-      flushMs: Math.max(0, opts.flushMs ?? 1000),
-      fsync: !!(opts.fsync ?? false),
-      fsyncEvery: Math.max(1, opts.fsyncEvery ?? 1),
-      onFlush: opts.onFlush,
-    };
-  }
-
-  start() {
-    this.open();
-    if (this.opts.flushMs > 0) {
-      this.timer = setInterval(() => {
-        try { this.flush(); } catch {}
-      }, this.opts.flushMs);
-      this.timer.unref();
-    }
-  }
-
-  write(obj: any) {
-    const line = JSON.stringify(obj) + "\n";
-    if (this.opts.bufferLines <= 1) {
-      this.writeNow(line);
-      return;
-    }
-    this.q.push(line);
-    if (this.q.length >= this.opts.bufferLines) this.flush();
-  }
-
-  flush() {
-    if (!this.fd) this.open();
-    if (!this.q.length) return;
-
-    const lines = this.q.length;
-    const data = this.q.join("");
-    this.q.length = 0;
-
-    const start = process.hrtime.bigint();
-
-    fs.writeSync(this.fd!, data, undefined, "utf8");
-
-    this.flushCount += 1;
-    let fsyncApplied = false;
-    if (this.opts.fsync && (this.flushCount % this.opts.fsyncEvery === 0)) {
-      try {
-        fs.fsyncSync(this.fd!);
-        this.fsyncCount += 1;
-        fsyncApplied = true;
-      } catch {}
-    }
-
-    const end = process.hrtime.bigint();
-    const flushMs = Number(end - start) / 1e6;
-
-    const bytes = Buffer.byteLength(data, "utf8");
-    this.linesCount += lines;
-    this.bytesCount += bytes;
-    this.flushLatencySumMs += flushMs;
-    if (flushMs > this.flushLatencyMaxMs) this.flushLatencyMaxMs = flushMs;
-
-    this.opts.onFlush?.({
-      ts: iso(),
-      lines,
-      bytes,
-      flushMs,
-      fsyncApplied,
-      fsyncEvery: this.opts.fsyncEvery,
-    });
-  }
-
-  reopen() {
-    this.flush();
-    if (this.fd) {
-      try { fs.closeSync(this.fd); } catch {}
-      this.fd = null;
-    }
-    this.open();
-  }
-
-  close() {
-    if (this.timer) {
-      clearInterval(this.timer);
-      this.timer = null;
-    }
-    this.flush();
-    if (this.fd) {
-      try { fs.closeSync(this.fd); } catch {}
-      this.fd = null;
-    }
-  }
-
-  consumeStats(reset = true): NdjsonWriterStats {
-    const flushes = this.flushCount;
-    const fsyncs = this.fsyncCount;
-    const lines = this.linesCount;
-    const bytes = this.bytesCount;
-    const avgFlushMs = flushes ? (this.flushLatencySumMs / flushes) : 0;
-    const maxFlushMs = this.flushLatencyMaxMs;
-
-    if (reset) {
-      this.flushCount = 0;
-      this.fsyncCount = 0;
-      this.linesCount = 0;
-      this.bytesCount = 0;
-      this.flushLatencySumMs = 0;
-      this.flushLatencyMaxMs = 0;
-    }
-
-    return { flushes, fsyncs, lines, bytes, avgFlushMs, maxFlushMs };
-  }
-
-  private open() {
-    const dir = path.dirname(this.filePath);
-    ensureDir(dir);
-    this.fd = fs.openSync(this.filePath, "a");
-  }
-
-  private writeNow(line: string) {
-    if (!this.fd) this.open();
-
-    const start = process.hrtime.bigint();
-
-    fs.writeSync(this.fd!, line, undefined, "utf8");
-
-    this.flushCount += 1;
-    let fsyncApplied = false;
-    if (this.opts.fsync && (this.flushCount % this.opts.fsyncEvery === 0)) {
-      try {
-        fs.fsyncSync(this.fd!);
-        this.fsyncCount += 1;
-        fsyncApplied = true;
-      } catch {}
-    }
-
-    const end = process.hrtime.bigint();
-    const flushMs = Number(end - start) / 1e6;
-
-    const bytes = Buffer.byteLength(line, "utf8");
-    this.linesCount += 1;
-    this.bytesCount += bytes;
-    this.flushLatencySumMs += flushMs;
-    if (flushMs > this.flushLatencyMaxMs) this.flushLatencyMaxMs = flushMs;
-
-    this.opts.onFlush?.({
-      ts: iso(),
-      lines: 1,
-      bytes,
-      flushMs,
-      fsyncApplied,
-      fsyncEvery: this.opts.fsyncEvery,
-    });
-  }
-}
-TS
-
-say "write: solana_errors.ts"
-cp -a "$SOLERR_TS" "$BK/solana_errors.ts.bak" 2>/dev/null || true
-cat >"$SOLERR_TS" <<'TS'
-export type SolanaErrCode =
-  | "RPC_429"
-  | "BLOCKHASH_NOT_FOUND"
-  | "SIMULATION_FAILED"
-  | "ACCOUNT_IN_USE"
-  | "INSUFFICIENT_FUNDS"
-  | "RATE_LIMIT"
-  | "NODE_BEHIND"
-  | "TIMEOUT"
-  | "NETWORK"
-  | "AUTH_MISMATCH"
-  | "DECIMALS_MISMATCH"
-  | "UNKNOWN";
-
-export type SolanaErrClass = {
-  code: SolanaErrCode;
-  retriable: boolean;
-  message: string;
-};
-
-function hasAny(m: string, needles: string[]) {
-  const s = m.toLowerCase();
-  return needles.some((n) => s.includes(n.toLowerCase()));
+out=[]
+changed=False
+pos=0
+for m in re.finditer(r'server\s*\{', s):
+  start=m.start()
+  out.append(s[pos:start])
+  # find matching closing brace (simple stack)
+  i=start
+  depth=0
+  while i < len(s):
+    if s.startswith('server', i): pass
+    c=s[i]
+    if c=='{': depth+=1
+    elif c=='}':
+      depth-=1
+      if depth==0:
+        end=i+1
+        block=s[start:end]
+        newb, ch = patch(block)
+        out.append(newb)
+        changed = changed or ch
+        pos=end
+        break
+    i+=1
+else:
+  out=[s]
+new="".join(out)+s[pos:]
+if changed:
+  open(p,'w',encoding='utf-8').write(new)
+  print("patched")
+else:
+  print("nochange")
+PY
+    if grep -qF "$INC" "$f"; then
+      say "   patched: $f"
+    else
+      say "   WARN: not patched: $f"
+    fi
+  done <<<"$files"
 }
 
-export function classifySolanaError(e: any): SolanaErrClass {
-  const msg = String(e?.message ?? e ?? "unknown error");
-
-  if (hasAny(msg, ["aborterror", "timed out", "etimedout", "econnreset", "fetch failed", "network"])) {
-    return { code: "NETWORK", retriable: true, message: msg };
-  }
-  if (hasAny(msg, ["timeout", "time out"])) {
-    return { code: "TIMEOUT", retriable: true, message: msg };
-  }
-
-  if (hasAny(msg, ["http 429", "429 too many requests", "too many requests"])) {
-    return { code: "RPC_429", retriable: true, message: msg };
-  }
-  if (hasAny(msg, ["rate limit", "ratelimit", "request limit"])) {
-    return { code: "RATE_LIMIT", retriable: true, message: msg };
-  }
-
-  if (hasAny(msg, ["blockhash not found"])) {
-    return { code: "BLOCKHASH_NOT_FOUND", retriable: true, message: msg };
-  }
-
-  if (hasAny(msg, ["node is behind", "slot was skipped", "behind", "not caught up"])) {
-    return { code: "NODE_BEHIND", retriable: true, message: msg };
-  }
-
-  if (hasAny(msg, ["simulation failed", "transaction simulation failed", "custom program error"])) {
-    return { code: "SIMULATION_FAILED", retriable: false, message: msg };
-  }
-
-  if (hasAny(msg, ["account in use", "already in use", "lock", "resource is busy"])) {
-    return { code: "ACCOUNT_IN_USE", retriable: true, message: msg };
-  }
-
-  if (hasAny(msg, ["insufficient funds", "insufficient lamports", "insufficient balance"])) {
-    return { code: "INSUFFICIENT_FUNDS", retriable: false, message: msg };
-  }
-
-  return { code: "UNKNOWN", retriable: false, message: msg };
-}
-TS
-
-say "write: watch_new_tokens.ts"
-cp -a "$WATCH_TS" "$BK/watch_new_tokens.ts.bak" 2>/dev/null || true
-cat >"$WATCH_TS" <<'TS'
-import fs from "node:fs";
-import path from "node:path";
-import process from "node:process";
-import { PublicKey } from "@solana/web3.js";
-import { env, envBool, envInt, log, sleep, withRetry } from "./lib/util.js";
-import { classifySolanaError } from "./lib/solana_errors.js";
-import { ensureDir, rotateBySize, writeJsonAtomic } from "./lib/rotate.js";
-import { NdjsonWriter } from "./lib/ndjson_writer.js";
-
-type TokenProfile = {
-  chainId?: string;
-  tokenAddress?: string;
-  url?: string;
-  description?: string;
-  [k: string]: any;
-};
-
-type SeenDB = Record<string, number>;
-
-function safeReadJson<T>(file: string, fallback: T): T {
-  try {
-    if (!fs.existsSync(file)) return fallback;
-    const raw = fs.readFileSync(file, "utf8").trim();
-    if (!raw) return fallback;
-    return JSON.parse(raw) as T;
-  } catch {
-    return fallback;
-  }
+nginx_reload_test(){
+  say "5) nginx -t + reload"
+  nginx -t
+  systemctl reload nginx
 }
 
-function isValidSolanaAddress(addr: string): boolean {
-  try { new PublicKey(addr); return true; } catch { return false; }
+local_tests(){
+  say "6) Local tests (must NOT be 404)"
+  echo "--- ${PATH_A} ---"
+  curl -skI -H "Host: $DOMAIN" "https://127.0.0.1$PATH_A" | head -n 12 || true
+  echo
+  echo "--- ${PATH_B} ---"
+  curl -skI -H "Host: $DOMAIN" "https://127.0.0.1$PATH_B" | head -n 12 || true
+  echo
+  say "nginx include hit lines:"
+  nginx -T 2>/dev/null | grep -n "aquila_stacking_routes" -n | head -n 20 || true
 }
 
-function pruneSeen(seen: SeenDB, max: number, ttlMs: number) {
-  const now = Date.now();
-  for (const [k, v] of Object.entries(seen)) {
-    if (now - v > ttlMs) delete seen[k];
-  }
-  const keys = Object.keys(seen);
-  if (keys.length <= max) return;
-  keys.sort((a, b) => (seen[a] ?? 0) - (seen[b] ?? 0));
-  const toRemove = keys.length - max;
-  for (let i = 0; i < toRemove; i++) delete seen[keys[i]];
+main(){
+  ensure_webroot
+  deploy_dist_if_any
+  ensure_inc
+  patch_vhosts
+  nginx_reload_test
+  local_tests
+  say "DONE"
+  say "BK: $BK"
+  say "Open: https://$DOMAIN$PATH_A"
+  say "Open: https://$DOMAIN$PATH_B"
 }
-
-async function fetchProfiles(endpoint: string, timeoutMs: number, retries: number): Promise<TokenProfile[]> {
-  return withRetry<TokenProfile[]>(
-    async () => {
-      const ac = new AbortController();
-      const t = setTimeout(() => ac.abort(), timeoutMs);
-      try {
-        const res = await fetch(endpoint, { headers: { accept: "application/json" }, signal: ac.signal });
-        if (!res.ok) {
-          const text = await res.text().catch(() => "");
-          throw new Error(`HTTP ${res.status} ${res.statusText} ${text}`.trim());
-        }
-        return (await res.json()) as TokenProfile[];
-      } finally {
-        clearTimeout(t);
-      }
-    },
-    {
-      retries,
-      onRetry: (_a, _w, e) => {
-        const c = classifySolanaError(e);
-        log("warn", "watch_fetch_retry_classified", { code: c.code });
-      },
-    }
-  );
-}
-
-async function main() {
-  const chain = env("WATCH_CHAIN", "solana").toLowerCase();
-  const endpoint = env("WATCH_ENDPOINT", "https://api.dexscreener.com/token-profiles/latest/v1");
-  const intervalMs = envInt("WATCH_INTERVAL_MS", "15000");
-  const timeoutMs = envInt("WATCH_TIMEOUT_MS", "8000");
-  const retries = envInt("WATCH_RETRIES", "5");
-
-  const dataDir = env("DATA_DIR", "./data");
-  ensureDir(dataDir);
-
-  const seenSnapshot = env("SEEN_SNAPSHOT", path.join(dataDir, "seen.snapshot.json"));
-  const eventsLog = env("EVENTS_LOG", path.join(dataDir, "events.ndjson"));
-
-  const ndjsonBufferLines = envInt("NDJSON_BUFFER_LINES", "50");
-  const ndjsonFlushMs = envInt("NDJSON_FLUSH_MS", "1000");
-  const ndjsonFsync = envBool("NDJSON_FSYNC", "false");
-  const ndjsonFsyncEvery = envInt("NDJSON_FSYNC_EVERY", "1");
-
-  const rotateMaxBytes = envInt("ROTATE_MAX_BYTES", String(10 * 1024 * 1024));
-  const rotateKeep = envInt("ROTATE_KEEP", "10");
-  const compactEverySec = envInt("COMPACT_EVERY_SEC", "300");
-  const seenMax = envInt("SEEN_MAX", "50000");
-  const seenTtlSec = envInt("SEEN_TTL_SEC", String(14 * 24 * 3600));
-  const onlyWithUrl = envBool("ONLY_WITH_URL", "false");
-
-  const metricsEverySec = envInt("METRICS_EVERY_SEC", "60");
-  const metricsWindowSec = envInt("METRICS_WINDOW_SEC", "300");
-
-  let seen: SeenDB = safeReadJson<SeenDB>(seenSnapshot, {});
-  pruneSeen(seen, seenMax, seenTtlSec * 1000);
-
-  const tokenEvents: number[] = [];
-  const errorEvents: number[] = [];
-
-  let lastCompact = 0;
-  let lastMetrics = 0;
-
-  const writer = new NdjsonWriter(eventsLog, {
-    bufferLines: ndjsonBufferLines,
-    flushMs: ndjsonFlushMs,
-    fsync: ndjsonFsync,
-    fsyncEvery: Math.max(1, ndjsonFsyncEvery),
-  });
-  writer.start();
-
-  const shutdown = (code: number) => {
-    try { writer.close(); } catch {}
-    process.exit(code);
-  };
-
-  process.on("SIGINT", () => shutdown(130));
-  process.on("SIGTERM", () => shutdown(143));
-  process.on("beforeExit", () => { try { writer.close(); } catch {} });
-
-  log("info", "watch_start", {
-    chain, endpoint, intervalMs, timeoutMs, retries,
-    dataDir, seenSnapshot, eventsLog,
-    rotateMaxBytes, rotateKeep, compactEverySec,
-    seenMax, seenTtlSec, onlyWithUrl,
-    metricsEverySec, metricsWindowSec,
-    seenLoaded: Object.keys(seen).length,
-    ndjson: {
-      bufferLines: ndjsonBufferLines,
-      flushMs: ndjsonFlushMs,
-      fsync: ndjsonFsync,
-      fsyncEvery: Math.max(1, ndjsonFsyncEvery),
-    },
-  });
-
-  while (true) {
-    const loopStart = Date.now();
-
-    try {
-      writer.flush();
-      const rot = rotateBySize(eventsLog, rotateMaxBytes, rotateKeep);
-      if (rot) {
-        writer.write({
-          ts: new Date().toISOString(),
-          type: "rotated",
-          from: rot.from,
-          to: rot.to,
-          rotatedAt: rot.ts,
-        });
-        writer.flush();
-        writer.reopen();
-      }
-
-      const profiles = await fetchProfiles(endpoint, timeoutMs, retries);
-
-      const filtered = profiles
-        .filter((x) => (x.chainId ?? "").toLowerCase() === chain)
-        .filter((x) => !!x.tokenAddress)
-        .filter((x) => (onlyWithUrl ? !!x.url : true));
-
-      for (const t of filtered) {
-        const addr = t.tokenAddress!.trim();
-        if (!addr) continue;
-        if (chain === "solana" && !isValidSolanaAddress(addr)) continue;
-        if (seen[addr]) continue;
-
-        const now = Date.now();
-        seen[addr] = now;
-        tokenEvents.push(now);
-
-        writer.write({
-          ts: new Date(now).toISOString(),
-          type: "new_token",
-          chain,
-          tokenAddress: addr,
-          url: t.url ?? null,
-          description: t.description ? String(t.description).slice(0, 200) : null,
-        });
-
-        log("info", "new_token", { tokenAddress: addr, url: t.url ?? null });
-      }
-    } catch (e: any) {
-      const c = classifySolanaError(e);
-      const now = Date.now();
-      errorEvents.push(now);
-
-      writer.write({
-        ts: new Date(now).toISOString(),
-        type: "error",
-        code: c.code,
-        message: c.message,
-      });
-
-      log("error", "watch_error", { code: c.code, err: c.message });
-    }
-
-    const now = Date.now();
-
-    if (now - lastMetrics >= metricsEverySec * 1000) {
-      lastMetrics = now;
-
-      const winMs = metricsWindowSec * 1000;
-      while (tokenEvents.length && now - tokenEvents[0] > winMs) tokenEvents.shift();
-      while (errorEvents.length && now - errorEvents[0] > winMs) errorEvents.shift();
-
-      const tokensPerMin = (tokenEvents.length / (metricsWindowSec / 60)).toFixed(2);
-      const errorsPerMin = (errorEvents.length / (metricsWindowSec / 60)).toFixed(2);
-
-      const nd = writer.consumeStats(true);
-
-      log("info", "metrics", {
-        windowSec: metricsWindowSec,
-        tokensPerMin: Number(tokensPerMin),
-        errorsPerMin: Number(errorsPerMin),
-        seenCount: Object.keys(seen).length,
-        ndjson: {
-          flushes: nd.flushes,
-          fsyncs: nd.fsyncs,
-          lines: nd.lines,
-          bytes: nd.bytes,
-          avgFlushMs: Number(nd.avgFlushMs.toFixed(3)),
-          maxFlushMs: Number(nd.maxFlushMs.toFixed(3)),
-        },
-      });
-    }
-
-    if (now - lastCompact >= compactEverySec * 1000) {
-      lastCompact = now;
-
-      pruneSeen(seen, seenMax, seenTtlSec * 1000);
-      writeJsonAtomic(seenSnapshot, seen);
-
-      writer.write({
-        ts: new Date(now).toISOString(),
-        type: "compact",
-        seenCount: Object.keys(seen).length,
-      });
-
-      log("debug", "compacted", { seenCount: Object.keys(seen).length });
-    }
-
-    const elapsed = Date.now() - loopStart;
-    const wait = Math.max(250, intervalMs - elapsed);
-    await sleep(wait);
-  }
-}
-
-main().catch((e) => {
-  log("error", "fatal", { err: String((e as any)?.message ?? e) });
-  process.exit(1);
-});
-TS
-
-say "write: create_spl_token.ts (DECIMALS_MISMATCH + AUTH_MISMATCH)"
-cp -a "$CREATE_TS" "$BK/create_spl_token.ts.bak" 2>/dev/null || true
-cat >"$CREATE_TS" <<'TS'
-import fs from "node:fs";
-import path from "node:path";
-import process from "node:process";
-import {
-  Connection,
-  Keypair,
-  PublicKey,
-  clusterApiUrl,
-  LAMPORTS_PER_SOL,
-} from "@solana/web3.js";
-import {
-  createMint,
-  getAssociatedTokenAddress,
-  getOrCreateAssociatedTokenAccount,
-  mintTo,
-  setAuthority,
-  AuthorityType,
-  getMint,
-} from "@solana/spl-token";
-import { classifySolanaError } from "./lib/solana_errors.js";
-import { die, env, envBool, envInt, envOpt, log, withRetry } from "./lib/util.js";
-
-type Result = {
-  ok: boolean;
-  rpc: string;
-  payer: string;
-  decimals?: number;
-  supplyHuman?: string;
-  mode?: "PREFLIGHT_ONLY" | "EXECUTE";
-  mint?: string | null;
-  owner?: string | null;
-  ownerAta?: string | null;
-  reused?: { mint: boolean; ata: boolean; };
-  signatures?: { mintTo?: string | null; revokeMintAuth?: string | null; revokeFreezeAuth?: string | null; };
-  error?: { code: string; message: string; } | null;
-};
-
-function loadKeypairFromFile(filePath: string): Keypair {
-  const abs = path.resolve(filePath);
-  if (!fs.existsSync(abs)) die(`Keypair file not found`, { path: abs });
-  const raw = fs.readFileSync(abs, "utf8").trim();
-  let arr: number[];
-  try { arr = JSON.parse(raw); } catch { die(`Keypair must be JSON array of numbers`, { path: abs }); }
-  return Keypair.fromSecretKey(Uint8Array.from(arr));
-}
-
-function assertDecimals(decimals: number) {
-  if (!Number.isInteger(decimals) || decimals < 0 || decimals > 12) {
-    die(`TOKEN_DECIMALS must be integer 0..12`, { decimals });
-  }
-}
-
-function parseBigIntAmount(human: string, decimals: number): bigint {
-  const s = human.trim();
-  if (!/^\d+(\.\d+)?$/.test(s)) die(`Invalid TOKEN_SUPPLY`, { value: human });
-  const [i, f = ""] = s.split(".");
-  const frac = (f + "0".repeat(decimals)).slice(0, decimals);
-  return BigInt(i + frac);
-}
-
-function printResultAndExit(res: Result, code = 0): never {
-  console.log(JSON.stringify(res));
-  process.exit(code);
-}
-
-async function main() {
-  const rpc =
-    process.env.SOLANA_RPC_URL ??
-    clusterApiUrl((process.env.SOLANA_CLUSTER as any) ?? "mainnet-beta");
-
-  const keypairPath = env("SOLANA_KEYPAIR");
-  const payer = loadKeypairFromFile(keypairPath);
-  const conn = new Connection(rpc, "confirmed");
-
-  const decimals = envInt("TOKEN_DECIMALS", "6");
-  assertDecimals(decimals);
-
-  const supplyHuman = env("TOKEN_SUPPLY");
-  const amount = parseBigIntAmount(supplyHuman, decimals);
-  if (amount <= 0n) die(`TOKEN_SUPPLY must be > 0`, { supplyHuman });
-
-  const preflightOnly = envBool("PREFLIGHT_ONLY", "false");
-  const revokeMintAuth = envBool("REVOKE_MINT_AUTH", "false");
-  const revokeFreezeAuth = envBool("REVOKE_FREEZE_AUTH", "true");
-
-  const mintAddressOpt = envOpt("MINT_ADDRESS");
-  const ownerOpt = envOpt("OWNER_ADDRESS");
-  const ataAddressOpt = envOpt("ATA_ADDRESS");
-  const reuseAtaIfExists = envBool("REUSE_ATA_IF_EXISTS", "true");
-
-  const ownerPk = ownerOpt ? new PublicKey(ownerOpt) : payer.publicKey;
-
-  const res: Result = {
-    ok: false,
-    rpc,
-    payer: payer.publicKey.toBase58(),
-    decimals,
-    supplyHuman,
-    mode: preflightOnly ? "PREFLIGHT_ONLY" : "EXECUTE",
-    mint: null,
-    owner: ownerPk.toBase58(),
-    ownerAta: null,
-    reused: { mint: false, ata: false },
-    signatures: { mintTo: null, revokeMintAuth: null, revokeFreezeAuth: null },
-    error: null,
-  };
-
-  try {
-    log("info", "config", {
-      rpc,
-      payer: res.payer,
-      owner: res.owner,
-      decimals,
-      supplyHuman,
-      preflightOnly,
-      mintAddressOpt,
-      ataAddressOpt,
-      reuseAtaIfExists,
-      revokeMintAuth,
-      revokeFreezeAuth,
-    });
-
-    const version = await withRetry(async () => conn.getVersion(), { retries: 5 });
-    log("info", "rpc_ok", { version });
-
-    const lamports = await withRetry(async () => conn.getBalance(payer.publicKey, "confirmed"), { retries: 5 });
-    log("info", "payer_balance", { lamports, sol: lamports / LAMPORTS_PER_SOL });
-
-    let mintPk: PublicKey;
-
-    if (mintAddressOpt) {
-      mintPk = new PublicKey(mintAddressOpt);
-      res.mint = mintPk.toBase58();
-      res.reused!.mint = true;
-      log("info", "mint_reused", { mint: res.mint });
-
-      const mintInfo = await withRetry(async () => getMint(conn, mintPk, "confirmed"), { retries: 4 });
-
-      if (mintInfo.decimals !== decimals) {
-        res.ok = false;
-        res.error = {
-          code: "DECIMALS_MISMATCH",
-          message: `on-chain decimals=${mintInfo.decimals} != TOKEN_DECIMALS=${decimals}`,
-        };
-        log("error", "decimals_mismatch", {
-          mint: res.mint,
-          onChainDecimals: mintInfo.decimals,
-          tokenDecimals: decimals,
-        });
-        return printResultAndExit(res, 1);
-      }
-
-      const payerStr = payer.publicKey.toBase58();
-      const mintAuthStr = mintInfo.mintAuthority ? mintInfo.mintAuthority.toBase58() : null;
-      const freezeAuthStr = mintInfo.freezeAuthority ? mintInfo.freezeAuthority.toBase58() : null;
-
-      const reasons: string[] = [];
-
-      if (!mintInfo.mintAuthority) {
-        reasons.push("mintAuthority is null (cannot mint)");
-      } else if (mintAuthStr !== payerStr) {
-        reasons.push(`mintAuthority mismatch (on-chain=${mintAuthStr}, payer=${payerStr})`);
-      }
-
-      if (revokeFreezeAuth && mintInfo.freezeAuthority && freezeAuthStr !== payerStr) {
-        reasons.push(`freezeAuthority mismatch (on-chain=${freezeAuthStr}, payer=${payerStr})`);
-      }
-
-      if (revokeMintAuth && mintAuthStr !== payerStr) {
-        reasons.push(`cannot revoke mint authority (payer is not current mintAuthority)`);
-      }
-
-      if (reasons.length) {
-        res.ok = false;
-        res.error = { code: "AUTH_MISMATCH", message: reasons.join(" | ") };
-        log("error", "auth_mismatch", {
-          mint: res.mint,
-          mintAuthority: mintAuthStr,
-          freezeAuthority: freezeAuthStr,
-          payer: payerStr,
-          reasons,
-        });
-        return printResultAndExit(res, 1);
-      }
-    } else {
-      if (preflightOnly) {
-        res.ok = true;
-        return printResultAndExit({ ...res, ok: true, error: null } as any, 0);
-      }
-
-      mintPk = await withRetry(
-        async () => createMint(conn, payer, payer.publicKey, payer.publicKey, decimals),
-        { retries: 4 }
-      );
-      res.mint = mintPk.toBase58();
-      log("info", "mint_created", { mint: res.mint });
-    }
-
-    if (ataAddressOpt) {
-      const ataPk = new PublicKey(ataAddressOpt);
-      res.ownerAta = ataPk.toBase58();
-      res.reused!.ata = true;
-      log("info", "ata_reused", { ata: res.ownerAta });
-    } else {
-      const expectedAta = await getAssociatedTokenAddress(mintPk, ownerPk, false);
-      res.ownerAta = expectedAta.toBase58();
-
-      if (preflightOnly) {
-        res.ok = true;
-        return printResultAndExit({ ...res, ok: true, error: null } as any, 0);
-      }
-
-      const ata = await withRetry(
-        async () => getOrCreateAssociatedTokenAccount(conn, payer, mintPk, ownerPk),
-        { retries: 4 }
-      );
-      res.ownerAta = ata.address.toBase58();
-      res.reused!.ata = reuseAtaIfExists;
-      log("info", "ata_ready", { ata: res.ownerAta });
-    }
-
-    if (preflightOnly) {
-      res.ok = true;
-      return printResultAndExit(res, 0);
-    }
-
-    const sigMintTo = await withRetry(
-      async () => mintTo(conn, payer, mintPk, new PublicKey(res.ownerAta!), payer, amount),
-      {
-        retries: 4,
-        onRetry: (_a, _w, e) => {
-          const c = classifySolanaError(e);
-          log("warn", "mintTo_retry_classified", { code: c.code });
-        },
-      }
-    );
-    res.signatures!.mintTo = sigMintTo;
-    log("info", "mint_to_ok", { signature: sigMintTo });
-
-    if (revokeMintAuth) {
-      const s = await withRetry(
-        async () => setAuthority(conn, payer, mintPk, payer.publicKey, AuthorityType.MintTokens, null),
-        { retries: 4 }
-      );
-      res.signatures!.revokeMintAuth = s;
-      log("info", "mint_auth_revoked", { signature: s });
-    }
-
-    if (revokeFreezeAuth) {
-      const s = await withRetry(
-        async () => setAuthority(conn, payer, mintPk, payer.publicKey, AuthorityType.FreezeAccount, null),
-        { retries: 4 }
-      );
-      res.signatures!.revokeFreezeAuth = s;
-      log("info", "freeze_auth_revoked", { signature: s });
-    }
-
-    res.ok = true;
-    res.error = null;
-    return printResultAndExit(res, 0);
-  } catch (e: any) {
-    const c = classifySolanaError(e);
-    res.ok = false;
-    res.error = { code: c.code, message: c.message };
-    log("error", "create_token_failed", { code: c.code, err: c.message });
-    return printResultAndExit(res, 1);
-  }
-}
-
-main().catch((e) => {
-  die("fatal", { err: String((e as any)?.message ?? e) });
-});
-TS
-
-say "npm: install"
-cd "$APP"
-if [ -f package-lock.json ]; then
-  npm ci
-else
-  npm install
-fi
-
-say "npm: build"
-if npm run -s | grep -qE '^\s*build\b'; then
-  npm run build
-elif [ -f tsconfig.json ]; then
-  npx tsc -p tsconfig.json
-else
-  say "build: no build script and no tsconfig.json (skipped)"
-fi
-
-say "done"
-say "backup: $BK"
-say "app   : $APP"
-say "hint  : NDJSON_FSYNC=true NDJSON_FSYNC_EVERY=10 (ex)"
+main
 BASH
-
-chmod +x /root/MEGA_PUMPFUN_BUNDLER_PATCH_ROTATE_TRACE_V1.sh
-/root/MEGA_PUMPFUN_BUNDLER_PATCH_ROTATE_TRACE_V1.sh
+chmod +x /root/MEGA_AQUILA_ROUTES_VERIFY_FIX_V2.sh
+/root/MEGA_AQUILA_ROUTES_VERIFY_FIX_V2.sh'
