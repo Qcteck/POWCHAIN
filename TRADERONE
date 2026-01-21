@@ -1,351 +1,128 @@
-cat >/root/MEGA_AQUILA_STACKING_V7_100.sh <<'BASH'
+bash -lc 'cat >/root/WV_FIX_404.sh<<'"'"'BASH'"'"'
 #!/usr/bin/env bash
 set -euo pipefail
-
-MODE="${1:-run}" # run | verify
 TS="$(date +%Y%m%d_%H%M%S)"
-BK="/root/AQUILA_STACKING_BK_${TS}"
-mkdir -p "$BK"
-
-say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
-die(){ echo "ERR: $*" >&2; exit 1; }
-
-need_root(){ [ "$(id -u)" -eq 0 ] || die "run as root"; }
-need_root
-
-# --------- SETTINGS (deterministic) ----------
 DOMAIN="fireinners.online"
-NGX_VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
-NGX_INC="/etc/nginx/includes/aquilastacking_routes.inc"
-WEBROOT="/var/www/aquilastacking"
+WEBROOT="/var/www/wolverine"
+VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
+VHOST_EN="/etc/nginx/sites-enabled/fireinners.online-ssl"
+INC="/etc/nginx/includes/wolverine_routes.inc"
+BK="/root/WV_FIX_404_${TS}"
+say(){ echo "[$(date +%H:%M:%S)] $*"; }
+need_root(){ [ "$(id -u)" -eq 0 ] || { echo "ROOT ONLY"; exit 1; }; }
+unfreeze(){ command -v chattr >/dev/null 2>&1 || return 0; chattr -i "$@" 2>/dev/null || true; }
+refreeze(){ command -v chattr >/dev/null 2>&1 || return 0; chattr +i "$@" 2>/dev/null || true; }
 
-APP_ROOT="/opt/aquila_stacking"
-FRONT_DIR="$APP_ROOT/frontend"
-ANCHOR_DIR="$APP_ROOT/anchor"
-TOOLCHAINS="/opt/aquila_toolchains"
-
-NODE_VER="v20.11.1"
-SOLANA_VER="v1.18.26"
-ANCHOR_TAG="v0.30.1"
-
-APTBOX="/opt/aptbox"
-APTBOX_DATE="${APTBOX_DATE:-20260121}" # pin label; can change later
-ASKORUPDATE_LIB="/opt/fireinners/sentinel/lib/askorupdate.sh"
-
-# --------- askorupdate helpers (optional) ----------
-HAVE_ASK=0
-if [ -f "$ASKORUPDATE_LIB" ]; then
-  # shellcheck disable=SC1090
-  . "$ASKORUPDATE_LIB" || true
-  if command -v askorupdate_file >/dev/null 2>&1; then HAVE_ASK=1; fi
-fi
-
-write_file(){
-  local path="$1"
-  local tmp="$BK/$(basename "$path").tmp"
-  cat >"$tmp"
-  if [ "$HAVE_ASK" -eq 1 ]; then
-    ASKORUPDATE_ASK=0 askorupdate_file "$path" "$tmp" >/dev/null
-  else
-    mkdir -p "$(dirname "$path")"
-    cp -a "$path" "$BK/" 2>/dev/null || true
-    cp -f "$tmp" "$path"
-  fi
+inject_include_into_ssl_server(){
+  local f="$1" incLine="include ${INC};"
+  grep -qF "$incLine" "$f" && return 0
+  awk -v inc="$incLine" '
+    BEGIN{in_srv=0;depth=0;is443=0;done=0;}
+    /^[[:space:]]*server[[:space:]]*\{/ {in_srv=1;depth=1;is443=0;}
+    {
+      if(in_srv){
+        if($0 ~ /listen[[:space:]]+443/){is443=1;}
+        n=gsub(/\{/,"{"); depth+=n;
+        n=gsub(/\}/,"}"); depth-=n;
+        if(depth==0){
+          if(is443 && !done){
+            print "    " inc;
+            done=1;
+          }
+          in_srv=0;
+        }
+      }
+      print
+    }
+  ' "$f" >"${f}.tmp" && mv -f "${f}.tmp" "$f"
 }
 
-# --------- Preflight snapshot ----------
-say "== AQUILA STACKING V7_100 :: $MODE :: $TS =="
-say "Backup dir: $BK"
-cp -a "$NGX_VHOST" "$BK/" 2>/dev/null || true
-cp -a "$NGX_INC" "$BK/" 2>/dev/null || true
-cp -a "$WEBROOT" "$BK/www_aquilastacking" 2>/dev/null || true
-cp -a "$APP_ROOT" "$BK/opt_aquila_stacking" 2>/dev/null || true
-
-# --------- Minimal aptbox (deterministic wrapper) ----------
-say "APT: base deps (idempotent)"
-export DEBIAN_FRONTEND=noninteractive
-mkdir -p "$APTBOX"
-# we keep standard apt but isolate state-ish via marker and strict package list
-apt-get update -y
-apt-get install -y --no-install-recommends \
-  ca-certificates curl wget git jq unzip xz-utils build-essential pkg-config \
-  python3 python3-pip \
-  nginx \
-  openssl \
-  libssl-dev \
-  libudev-dev \
-  clang cmake \
-  rsync
-
-# --------- Node.js v20.11.1 (verified via SHASUMS from nodejs.org) ----------
-install_node(){
-  if command -v node >/dev/null 2>&1; then
-    local cur
-    cur="$(node -v || true)"
-    if [ "$cur" = "$NODE_VER" ]; then
-      say "Node OK: $cur"
-      return 0
-    fi
-    say "Node present ($cur) but not $NODE_VER; installing $NODE_VER (no removal)."
-  fi
-
-  local base="node-${NODE_VER}-linux-x64"
-  local tar="/tmp/${base}.tar.xz"
-  local sums="/tmp/SHASUMS256.txt"
-  say "Node: download tarball + SHASUMS256.txt"
-  curl -fsSL "https://nodejs.org/dist/${NODE_VER}/${base}.tar.xz" -o "$tar"
-  curl -fsSL "https://nodejs.org/dist/${NODE_VER}/SHASUMS256.txt" -o "$sums"
-  say "Node: verify sha256 from upstream list"
-  (cd /tmp && grep " ${base}.tar.xz\$" SHASUMS256.txt | sha256sum -c -) >/dev/null
-  say "Node: install to /usr/local"
-  tar -C /usr/local -xJf "$tar"
-  ln -sf "/usr/local/${base}/bin/node" /usr/local/bin/node
-  ln -sf "/usr/local/${base}/bin/npm"  /usr/local/bin/npm
-  ln -sf "/usr/local/${base}/bin/npx"  /usr/local/bin/npx
-  say "Node installed: $(node -v)"
+disable_other_wolverine_includes(){
+  local d="/etc/nginx/includes"
+  [ -d "$d" ] || return 0
+  shopt -s nullglob
+  for f in "$d"/wolverine*; do
+    [ "$f" = "$INC" ] && continue
+    local base; base="$(basename "$f")"
+    case "$base" in
+      DISABLED_*|*.bak|*.bak_*) continue ;;
+    esac
+    mv -f "$f" "$d/DISABLED_${TS}__${base}" 2>/dev/null || true
+  done
 }
 
-# --------- Rust toolchain (isolated under /opt/aquila_toolchains) ----------
-install_rust(){
-  mkdir -p "$TOOLCHAINS"
-  if [ -x "$TOOLCHAINS/rustup/bin/rustup" ]; then
-    say "Rustup present under $TOOLCHAINS"
-  else
-    say "Rust: install rustup into $TOOLCHAINS/rustup (non-interactive)"
-    mkdir -p "$TOOLCHAINS/rustup"
-    curl -fsSL https://sh.rustup.rs -o /tmp/rustup-init.sh
-    sh /tmp/rustup-init.sh -y --no-modify-path --default-toolchain 1.76.0 --profile minimal
-    # rustup installs into /root by default; relocate deterministically
-    mkdir -p "$TOOLCHAINS/rustup" "$TOOLCHAINS/cargo"
-    rsync -a /root/.rustup/ "$TOOLCHAINS/rustup/" || true
-    rsync -a /root/.cargo/  "$TOOLCHAINS/cargo/"  || true
-  fi
-  export RUSTUP_HOME="$TOOLCHAINS/rustup"
-  export CARGO_HOME="$TOOLCHAINS/cargo"
-  export PATH="$CARGO_HOME/bin:$PATH"
-  say "Rust: ensure toolchain 1.76.0"
-  "$CARGO_HOME/bin/rustup" toolchain install 1.76.0 -c rustfmt -c clippy >/dev/null
-  "$CARGO_HOME/bin/rustup" default 1.76.0 >/dev/null
-  say "Rust OK: $(rustc -V)"
-}
-
-# --------- Solana v1.18.26 (verify by release SHA256SUMS) ----------
-install_solana(){
-  local solbin="/usr/local/bin/solana"
-  if [ -x "$solbin" ]; then
-    local v
-    v="$("$solbin" --version 2>/dev/null || true)"
-    if echo "$v" | grep -q " ${SOLANA_VER#v}"; then
-      say "Solana OK: $v"
-      return 0
-    fi
-    say "Solana present ($v) but not $SOLANA_VER; installing $SOLANA_VER (side-by-side safe)."
-  fi
-
-  local rel="solana-release-x86_64-unknown-linux-gnu.tar.bz2"
-  local url="https://github.com/solana-labs/solana/releases/download/${SOLANA_VER}/${rel}"
-  local sums_url="https://github.com/solana-labs/solana/releases/download/${SOLANA_VER}/SHA256SUMS"
-  local tar="/tmp/${rel}"
-  local sums="/tmp/SHA256SUMS.solana"
-  say "Solana: download release tar + SHA256SUMS"
-  curl -fsSL "$url" -o "$tar"
-  curl -fsSL "$sums_url" -o "$sums"
-  say "Solana: verify sha256 from SHA256SUMS"
-  (cd /tmp && grep " ${rel}\$" SHA256SUMS.solana | sha256sum -c -) >/dev/null
-  say "Solana: install to /opt/solana/${SOLANA_VER}"
-  mkdir -p "/opt/solana/${SOLANA_VER}"
-  tar -C "/opt/solana/${SOLANA_VER}" -xjf "$tar"
-  # find bin dir inside
-  local bindir
-  bindir="$(find "/opt/solana/${SOLANA_VER}" -maxdepth 3 -type d -name bin | head -n1)"
-  [ -n "$bindir" ] || die "Solana install: bin dir not found"
-  ln -sf "$bindir/solana" /usr/local/bin/solana
-  ln -sf "$bindir/solana-keygen" /usr/local/bin/solana-keygen
-  ln -sf "$bindir/solana-test-validator" /usr/local/bin/solana-test-validator
-  say "Solana installed: $(solana --version)"
-}
-
-# --------- Anchor 0.30.1 (build from tag; record commit) ----------
-install_anchor(){
-  export RUSTUP_HOME="$TOOLCHAINS/rustup"
-  export CARGO_HOME="$TOOLCHAINS/cargo"
-  export PATH="$CARGO_HOME/bin:$PATH"
-
-  if command -v anchor >/dev/null 2>&1; then
-    local v
-    v="$(anchor --version 2>/dev/null || true)"
-    if echo "$v" | grep -q "0.30.1"; then
-      say "Anchor OK: $v"
-      return 0
-    fi
-    say "Anchor present ($v) but not 0.30.1; building $ANCHOR_TAG."
-  fi
-
-  local src="/opt/anchor-src"
-  rm -rf "$src" || true
-  say "Anchor: clone + checkout $ANCHOR_TAG"
-  git clone --depth 1 --branch "$ANCHOR_TAG" https://github.com/coral-xyz/anchor.git "$src"
-  local commit
-  commit="$(git -C "$src" rev-parse HEAD)"
-  say "Anchor: tag $ANCHOR_TAG -> $commit"
-  say "Anchor: build/install via cargo"
-  (cd "$src" && cargo install --path cli --locked) >/dev/null
-  say "Anchor installed: $(anchor --version)"
-}
-
-# --------- Workspace bootstrap ----------
-bootstrap_workspace(){
-  mkdir -p "$APP_ROOT" "$FRONT_DIR" "$ANCHOR_DIR"
-  chmod 755 "$APP_ROOT" "$FRONT_DIR" "$ANCHOR_DIR"
-}
-
-# --------- Frontend deploy (supports local zip drop) ----------
-deploy_frontend(){
-  mkdir -p "$FRONT_DIR"
-  cd "$FRONT_DIR"
-
-  # Source priority:
-  # 1) /root/horizons-export*.zip (auto newest)
-  # 2) existing repo in $FRONT_DIR (git pull if remote exists)
-  local zip
-  zip="$(ls -1t /root/horizons-export*.zip 2>/dev/null | head -n1 || true)"
-
-  if [ -n "$zip" ]; then
-    say "Frontend: using zip $zip"
-    rm -rf "$FRONT_DIR/src" "$FRONT_DIR/public" "$FRONT_DIR/plugins" "$FRONT_DIR/tools" \
-           "$FRONT_DIR/index.html" "$FRONT_DIR/package.json" "$FRONT_DIR/package-lock.json" \
-           "$FRONT_DIR/vite.config.js" "$FRONT_DIR/tailwind.config.js" "$FRONT_DIR/eslint.config.mjs" \
-           "$FRONT_DIR/.nvmrc" 2>/dev/null || true
-    unzip -o "$zip" -d "$FRONT_DIR" >/dev/null
-  else
-    if [ -d "$FRONT_DIR/.git" ]; then
-      say "Frontend: git pull"
-      git -C "$FRONT_DIR" pull --rebase || true
-    else
-      say "Frontend: no /root/horizons-export*.zip and no git repo; skipping source update"
-    fi
-  fi
-
-  if [ -f "$FRONT_DIR/package-lock.json" ]; then
-    say "Frontend: npm ci"
-    npm ci --no-audit --no-fund >/dev/null
-    say "Frontend: build"
-    npm run build >/dev/null
-  else
-    say "Frontend: package-lock.json missing; skip npm build"
-  fi
-
-  # Vite default output is dist/
-  if [ -d "$FRONT_DIR/dist" ]; then
-    say "Frontend: deploy dist -> $WEBROOT"
-    mkdir -p "$WEBROOT"
-    rsync -a --delete "$FRONT_DIR/dist/" "$WEBROOT/"
-  else
-    # fallback: if zip is already static export
-    if [ -f "$FRONT_DIR/index.html" ]; then
-      say "Frontend: deploy static files -> $WEBROOT"
-      mkdir -p "$WEBROOT"
-      rsync -a --delete "$FRONT_DIR/" "$WEBROOT/" --exclude node_modules --exclude dist --exclude .git
-    else
-      say "Frontend: nothing to deploy"
-    fi
-  fi
-
-  # hardening: no SW caching surprises
-  if [ -d "$WEBROOT" ]; then
-    rm -f "$WEBROOT/sw.js" "$WEBROOT/service-worker.js" "$WEBROOT/manifest.json" 2>/dev/null || true
-  fi
-}
-
-# --------- Anchor workspace & strict test (if present) ----------
-anchor_test_strict(){
-  if [ ! -f "$ANCHOR_DIR/Anchor.toml" ]; then
-    say "Anchor: no Anchor.toml in $ANCHOR_DIR; skipping anchor test"
-    return 0
-  fi
-  export RUSTUP_HOME="$TOOLCHAINS/rustup"
-  export CARGO_HOME="$TOOLCHAINS/cargo"
-  export PATH="$CARGO_HOME/bin:$PATH"
-
-  say "Anchor: cargo vendor + yarn offline mirror (best-effort)"
-  mkdir -p "$ANCHOR_DIR/vendor" "$ANCHOR_DIR/.yarn-mirror" || true
-  if [ -f "$ANCHOR_DIR/Cargo.toml" ]; then
-    (cd "$ANCHOR_DIR" && cargo vendor vendor >/dev/null) || true
-  fi
-  if [ -f "$ANCHOR_DIR/package.json" ]; then
-    (cd "$ANCHOR_DIR" && npm ci --no-audit --no-fund >/dev/null) || true
-  fi
-
-  say "Anchor: anchor test (strict)"
-  (cd "$ANCHOR_DIR" && anchor test) 
-}
-
-# --------- Nginx routes include (deterministic) ----------
-ensure_nginx_include(){
-  say "Nginx: write include $NGX_INC"
-  write_file "$NGX_INC" <<'INC'
-# aquilastacking_routes.inc (deterministic)
-location = /aquilastacking { return 301 /aquilastacking/; }
-location ^~ /aquilastacking/ {
-  alias /var/www/aquilastacking/;
-  try_files $uri $uri/ /aquilastacking/index.html;
+write_include(){
+  mkdir -p "$(dirname "$INC")"
+  cat >"$INC"<<EOF
+# CANONICAL Wolverine routes (auto) ${TS}
+location ^~ /wolverine/ {
+  alias ${WEBROOT}/;
+  try_files \$uri \$uri/ /wolverine/index.html;
   add_header Cache-Control "no-store" always;
 }
-# prevent stale PWA artifacts
-location = /aquilastacking/sw.js { add_header Cache-Control "no-store" always; return 404; }
-location = /aquilastacking/service-worker.js { add_header Cache-Control "no-store" always; return 404; }
-location = /aquilastacking/manifest.json { add_header Cache-Control "no-store" always; return 404; }
-INC
-
-  say "Nginx: ensure vhost includes aquilastacking include"
-  if [ ! -f "$NGX_VHOST" ]; then
-    die "missing nginx vhost: $NGX_VHOST"
-  fi
-
-  cp -a "$NGX_VHOST" "$BK/" || true
-
-  if ! grep -q "includes/aquilastacking_routes.inc" "$NGX_VHOST"; then
-    # insert include near other includes; append safely at end of server block if unknown
-    say "Nginx: inject include into vhost (safe append inside server if possible)"
-    # try to place before last '}' of first server block
-    perl -0777 -i -pe 'if($ARGV){ } s/(server\s*\{.*?)(\n\})/$1\n    include \/etc\/nginx\/includes\/aquilastacking_routes.inc;\n$2/s unless /includes\/aquilastacking_routes\.inc/;' "$NGX_VHOST" || true
-  fi
-
-  nginx -t
-  systemctl reload nginx
+EOF
 }
 
-# --------- Verify mode (read-only-ish checks) ----------
-verify_mode(){
-  say "VERIFY: nginx -t"
-  nginx -t
-  say "VERIFY: paths"
-  ls -la "$WEBROOT" | head -n 50 || true
-  say "VERIFY: curl local check (if exposed by nginx)"
-  curl -fsS "https://127.0.0.1/aquilastacking/" -k | head -n 5 || true
-  say "VERIFY: done"
+write_index_html(){
+  mkdir -p "$WEBROOT"
+  cat >"$WEBROOT/index.html"<<'"'"'HTML'"'"'
+<!doctype html><html lang="fr"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Wolverine / TraderOne</title><style>:root{--bg:#07090d;--bg2:#0b0f18;--panel:#0e1526;--line:#1b2a4a;--txt:#e7eefc;--mut:#9fb3d9;--ok:#39d98a;--bad:#ff4d4d;--warn:#ffcc66;--acc:#3aa0ff;--acc2:#7a5cff;--shadow:0 18px 60px rgba(0,0,0,.55)}*{box-sizing:border-box}html,body{height:100%}body{margin:0;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;letter-spacing:.2px;background:radial-gradient(1200px 700px at 25% 10%,rgba(58,160,255,.14),transparent 55%),radial-gradient(900px 700px at 85% 25%,rgba(122,92,255,.12),transparent 60%),linear-gradient(180deg,var(--bg),#05070b 60%,#03040a);color:var(--txt)}a{color:inherit;text-decoration:none}button,input,select{font:inherit}#app{height:100%;display:grid;grid-template-columns:280px 1fr;grid-template-rows:64px 1fr;grid-template-areas:"side top""side main"}#side{grid-area:side;border-right:1px solid var(--line);background:linear-gradient(180deg,rgba(14,21,38,.92),rgba(7,9,13,.92));backdrop-filter:blur(10px);padding:18px 14px;display:flex;flex-direction:column;gap:14px}#brand{display:flex;align-items:center;gap:12px;padding:10px 10px;border:1px solid var(--line);border-radius:14px;background:rgba(12,18,32,.55);box-shadow:var(--shadow)}#logo{width:36px;height:36px;border-radius:12px;background:linear-gradient(135deg,var(--acc),var(--acc2));display:grid;place-items:center;font-weight:800}#brand h1{margin:0;font-size:15px;line-height:1.1}#brand small{display:block;color:var(--mut);font-size:11px;margin-top:2px}.nav{display:flex;flex-direction:column;gap:8px}.nav a{display:flex;align-items:center;gap:10px;padding:10px 12px;border-radius:12px;border:1px solid transparent;color:var(--mut)}.nav a:hover{background:rgba(58,160,255,.08);border-color:rgba(58,160,255,.18);color:var(--txt)}.nav a.active{background:rgba(58,160,255,.12);border-color:rgba(58,160,255,.28);color:var(--txt)}.pill{font-size:11px;padding:2px 8px;border-radius:999px;border:1px solid var(--line);color:var(--mut);margin-left:auto}.pill.ok{color:var(--ok);border-color:rgba(57,217,138,.35);background:rgba(57,217,138,.08)}.pill.bad{color:var(--bad);border-color:rgba(255,77,77,.35);background:rgba(255,77,77,.08)}.pill.warn{color:var(--warn);border-color:rgba(255,204,102,.35);background:rgba(255,204,102,.08)}#top{grid-area:top;display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--line);background:linear-gradient(180deg,rgba(11,15,24,.82),rgba(7,9,13,.35));backdrop-filter:blur(10px)}#top .left{display:flex;align-items:center;gap:10px}#top .right{display:flex;align-items:center;gap:10px}.chip{display:flex;align-items:center;gap:8px;padding:10px 12px;border-radius:14px;border:1px solid var(--line);background:rgba(12,18,32,.55)}.dot{width:8px;height:8px;border-radius:999px;background:var(--warn);box-shadow:0 0 0 3px rgba(255,204,102,.14)}.dot.ok{background:var(--ok);box-shadow:0 0 0 3px rgba(57,217,138,.14)}.dot.bad{background:var(--bad);box-shadow:0 0 0 3px rgba(255,77,77,.14)}#main{grid-area:main;padding:16px;overflow:auto}#grid{display:grid;grid-template-columns:1.15fr .85fr;gap:14px}@media(max-width:1060px){#app{grid-template-columns:1fr;grid-template-rows:auto auto 1fr;grid-template-areas:"top""side""main"}#side{border-right:none;border-bottom:1px solid var(--line)}#grid{grid-template-columns:1fr}}.card{border:1px solid var(--line);border-radius:16px;background:linear-gradient(180deg,rgba(14,21,38,.65),rgba(7,9,13,.55));box-shadow:var(--shadow);overflow:hidden}.card .hd{padding:12px 14px;border-bottom:1px solid rgba(27,42,74,.6);display:flex;align-items:center;gap:10px}.card .hd b{font-size:13px}.card .hd small{color:var(--mut);font-size:11px}.card .bd{padding:14px}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.grow{flex:1}.btn{cursor:pointer;border:1px solid rgba(58,160,255,.35);background:linear-gradient(180deg,rgba(58,160,255,.18),rgba(58,160,255,.10));color:var(--txt);padding:10px 12px;border-radius:12px;font-weight:650}.btn:hover{filter:brightness(1.08)}.btn.ghost{border-color:var(--line);background:rgba(12,18,32,.45);color:var(--mut)}.btn.danger{border-color:rgba(255,77,77,.35);background:linear-gradient(180deg,rgba(255,77,77,.18),rgba(255,77,77,.10))}.btn.ok{border-color:rgba(57,217,138,.35);background:linear-gradient(180deg,rgba(57,217,138,.18),rgba(57,217,138,.10))}.inp,select{border:1px solid var(--line);background:rgba(7,9,13,.45);color:var(--txt);padding:10px 12px;border-radius:12px;outline:none;min-width:180px}select{min-width:200px}.kv{display:grid;grid-template-columns:150px 1fr;gap:8px 12px;align-items:center}.k{color:var(--mut);font-size:12px}.v{font-size:12px;word-break:break-all}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:12px}.term{background:rgba(0,0,0,.35);border:1px solid rgba(27,42,74,.55);border-radius:14px;padding:12px;max-height:340px;overflow:auto}.tag{display:inline-flex;align-items:center;gap:8px;padding:6px 10px;border-radius:999px;border:1px solid rgba(27,42,74,.7);background:rgba(12,18,32,.45);color:var(--mut);font-size:12px}.tag b{color:var(--txt)}.split{display:grid;grid-template-columns:1fr 1fr;gap:10px}@media(max-width:680px){.split{grid-template-columns:1fr}}.hr{height:1px;background:rgba(27,42,74,.55);margin:12px 0}.warnbox{border:1px solid rgba(255,204,102,.35);background:rgba(255,204,102,.08);color:#ffe6a6;border-radius:14px;padding:10px 12px;font-size:12px}.badbox{border:1px solid rgba(255,77,77,.35);background:rgba(255,77,77,.08);color:#ffd0d0;border-radius:14px;padding:10px 12px;font-size:12px}</style></head><body><div id="app"><aside id="side"><div id="brand"><div id="logo">W</div><div><h1>Wolverine / TraderOne</h1><small id="sub">UI officielle (static)</small></div></div><div class="nav" id="nav"><a href="#/dashboard" data-r="dashboard">Dashboard<span class="pill" id="pillDash">UI</span></a><a href="#/trade" data-r="trade">Trade<span class="pill" id="pillTrade">API</span></a><a href="#/positions" data-r="positions">Positions</a><a href="#/orders" data-r="orders">Orders</a><a href="#/history" data-r="history">History</a><a href="#/wallet" data-r="wallet">Wallet</a><a href="#/settings" data-r="settings">Settings</a><a href="#/health" data-r="health">Health<span class="pill" id="pillHealth">check</span></a></div><div class="card"><div class="hd"><b>WalletBox</b><small>Phantom (Solana)</small></div><div class="bd"><div class="row"><button class="btn" id="btnConnect">Connect Phantom</button><button class="btn ghost" id="btnDisconnect" disabled>Disconnect</button></div><div class="hr"></div><div class="kv"><div class="k">Address</div><div class="v mono" id="wAddr">—</div><div class="k">SOL</div><div class="v mono" id="wSol">—</div><div class="k">USDC</div><div class="v mono" id="wUsdc">—</div></div><div class="hr"></div><div class="row"><button class="btn ghost" id="btnRefresh" disabled>Refresh balances</button><span class="tag"><b>RPC</b><span class="mono" id="rpcShort">drpc</span></span></div><div class="hr"></div><div id="libWarn" class="warnbox" style="display:none">Lib Solana manquante. Assure-toi que <span class="mono">/wolverine/vendor/solana-web3.min.js</span> est servi.</div></div></div></aside><header id="top"><div class="left"><div class="chip"><span class="dot" id="dotApi"></span><div><div class="mono" style="font-weight:700">API</div><div class="mono" id="apiBase" style="color:var(--mut)">/wolverine/traderone/api</div></div></div><div class="chip"><span class="dot" id="dotVault"></span><div><div class="mono" style="font-weight:700">Vault</div><div class="mono" id="vaultBase" style="color:var(--mut)">/wolverine/vault-api/health</div></div></div></div><div class="right"><span class="tag"><b>UI</b><span class="mono" id="uiVer">OFFICIEL</span></span><span class="tag"><b>Path</b><span class="mono">/wolverine/</span></span></div></header><main id="main"><div id="grid"><section class="card"><div class="hd"><b id="viewTitle">Dashboard</b><small id="viewSub">Vue globale</small></div><div class="bd" id="view"></div></section><aside class="card"><div class="hd"><b>Terminal</b><small>logs & réponses backend</small></div><div class="bd"><div class="row"><button class="btn ghost" id="btnClearLog">Clear</button><button class="btn" id="btnPing">Ping Health</button><button class="btn ghost" id="btnCopyLog">Copy</button></div><div class="hr"></div><div class="term mono" id="log"></div></div></aside></div></main></div><script src="/wolverine/vendor/solana-web3.min.js" onerror="window.__SOLANA_LIB_MISSING__=1"></script><script>(function(){const CFG={RPC:"https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac",USDC_MINT:"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1",API_BASE:"/wolverine/traderone/api",VAULT_HEALTH:"/wolverine/vault-api/health",START:"/wolverine/api/start",MODE:"/wolverine/api/traderone/mode",WITHDRAW:"/wolverine/api/traderone/withdraw",INVESTED:(pub)=>"/wolverine/api/invested?pub="+encodeURIComponent(pub)};const $=s=>document.querySelector(s);const logEl=$("#log");const wAddr=$("#wAddr"),wSol=$("#wSol"),wUsdc=$("#wUsdc");const btnConnect=$("#btnConnect"),btnDisconnect=$("#btnDisconnect"),btnRefresh=$("#btnRefresh");const dotApi=$("#dotApi"),dotVault=$("#dotVault");const pillHealth=$("#pillHealth"),pillTrade=$("#pillTrade"),pillDash=$("#pillDash");const libWarn=$("#libWarn");const rpcShort=$("#rpcShort");rpcShort.textContent=CFG.RPC.replace(/^https?:\/\//,"").slice(0,26)+"…";function log(t,type){const ts=new Date().toISOString().split("T")[1].replace("Z","");const c=type==="bad"?"color:var(--bad)":type==="ok"?"color:var(--ok)":type==="warn"?"color:var(--warn)":"color:var(--mut)";logEl.insertAdjacentHTML("beforeend",`<div><span style="color:var(--mut)">[${ts}]</span> <span style="${c}">${esc(t)}</span></div>`);logEl.scrollTop=logEl.scrollHeight}function esc(s){return String(s).replace(/[&<>"']/g,m=>({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[m]))}function setDot(el,st){el.classList.remove("ok","bad");if(st==="ok")el.classList.add("ok");else if(st==="bad")el.classList.add("bad")}function setPill(el,st,txt){el.classList.remove("ok","bad","warn");if(st==="ok")el.classList.add("ok");else if(st==="bad")el.classList.add("bad");else if(st==="warn")el.classList.add("warn");if(txt)el.textContent=txt}async function jget(url){const r=await fetch(url,{credentials:"same-origin"});const tx=await r.text();return{ok:r.ok,status:r.status,txt:tx,headers:[...r.headers.entries()]}}async function jpost(url,obj){const r=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(obj||{}),credentials:"same-origin"});const tx=await r.text();return{ok:r.ok,status:r.status,txt:tx}}function hasSolanaLib(){return !!(window.solanaWeb3&&window.solanaWeb3.Connection)}function phantom(){return window.solana&&window.solana.isPhantom?window.solana:null}let conn=null;let pub=null;function shortPub(p){return p?p.slice(0,4)+"…"+p.slice(-4):"—"}async function connect(){示;const ph=phantom();if(!ph){log("Phantom introuvable (extension)","bad");return}try{const res=await ph.connect({onlyIfTrusted:false});pub=res.publicKey.toString();wAddr.textContent=pub;btnDisconnect.disabled=false;btnRefresh.disabled=false;log("Connected: "+shortPub(pub),"ok");await refreshBalances()}catch(e){log("Connect error: "+(e&&e.message?e.message:e),"bad")}}async function disconnect(){const ph=phantom();try{if(ph&&ph.disconnect)await ph.disconnect();}catch(_){}pub=null;wAddr.textContent="—";wSol.textContent="—";wUsdc.textContent="—";btnDisconnect.disabled=true;btnRefresh.disabled=true;log("Disconnected","warn")}async function refreshBalances(){if(!pub){log("No wallet connected","warn");return}if(!hasSolanaLib()){log("Solana lib missing","bad");libWarn.style.display="block";return}libWarn.style.display="none";conn=new solanaWeb3.Connection(CFG.RPC,"confirmed");try{const lam=await conn.getBalance(new solanaWeb3.PublicKey(pub));const sol=lam/1e9;wSol.textContent=sol.toFixed(6);log("SOL balance: "+wSol.textContent,"ok")}catch(e){log("SOL balance error: "+(e&&e.message?e.message:e),"bad")}try{const owner=new solanaWeb3.PublicKey(pub);const resp=await conn.getParsedTokenAccountsByOwner(owner,{programId:new solanaWeb3.PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")});let sum=0;for(const it of resp.value){const info=it.account.data.parsed.info;const mint=info.mint;const amt=info.tokenAmount; if(mint===CFG.USDC_MINT){sum+=Number(amt.uiAmount||0)}}wUsdc.textContent=sum.toFixed(6);log("USDC balance: "+wUsdc.textContent,"ok")}catch(e){log("USDC balance error: "+(e&&e.message?e.message:e),"bad")}}async function ping(){log("Ping…","");try{const a=await jget(CFG.API_BASE+"/health").catch(()=>null);if(a&&a.ok){setDot(dotApi,"ok");setPill(pillTrade,"ok","API OK");log("API health "+a.status+": "+a.txt.slice(0,220),"ok")}else{setDot(dotApi,"bad");setPill(pillTrade,"bad","API BAD");log("API health FAIL "+(a?a.status:"(no)"),"bad")} }catch(e){setDot(dotApi,"bad");setPill(pillTrade,"bad","API BAD");log("API ping error: "+(e&&e.message?e.message:e),"bad")}try{const v=await jget(CFG.VAULT_HEALTH).catch(()=>null);if(v&&v.ok&&/^\s*\{/.test(v.txt)){setDot(dotVault,"ok");setPill(pillHealth,"ok","VAULT OK");log("Vault "+v.status+": "+v.txt.slice(0,220),"ok")}else{setDot(dotVault,"bad");setPill(pillHealth,"bad","VAULT BAD");log("Vault FAIL "+(v?v.status:"(no)")+" body="+(v?v.txt.slice(0,60):""),"bad")} }catch(e){setDot(dotVault,"bad");setPill(pillHealth,"bad","VAULT BAD");log("Vault ping error: "+(e&&e.message?e.message:e),"bad")} }const routes={dashboard:{t:"Dashboard",s:"Vue globale",h:()=>"<div class=\\"warnbox\\">UI chargée. Si tu vois encore 404: nginx/alias/include.</div>"},trade:{t:"Trade",s:"Commandes backend",h:()=>"<div class=\\"warnbox\\">Trade UI prête (backend requis).</div>"},positions:{t:"Positions",s:"Portefeuille",h:()=>"<div class=\\"warnbox\\">Positions (backend requis).</div>"},orders:{t:"Orders",s:"Ordres",h:()=>"<div class=\\"warnbox\\">Orders (backend requis).</div>"},history:{t:"History",s:"Historique",h:()=>"<div class=\\"warnbox\\">History (backend requis).</div>"},wallet:{t:"Wallet",s:"Phantom & balances",h:()=>"<div class=\\"warnbox\\">Connect wallet dans la colonne gauche.</div>"},settings:{t:"Settings",s:"Config UI",h:()=>"<div class=\\"warnbox\\">Config: RPC/USDC/API.</div>"},health:{t:"Health",s:"Ping endpoints",h:()=>"<div class=\\"warnbox\\">Clique Ping dans Terminal.</div>"}};function setActive(r){document.querySelectorAll("#nav a").forEach(a=>a.classList.toggle("active",a.dataset.r===r))}function render(){const r=(location.hash||"#/dashboard").replace(/^#\//,"").split("?")[0]||"dashboard";const R=routes[r]||routes.dashboard;$("#viewTitle").textContent=R.t;$("#viewSub").textContent=R.s;$("#view").innerHTML=R.h();setActive(r)}btnConnect.onclick=connect;btnDisconnect.onclick=disconnect;btnRefresh.onclick=refreshBalances;$("#btnClearLog").onclick=()=>logEl.innerHTML="";$("#btnCopyLog").onclick=async()=>{const t=logEl.innerText;try{await navigator.clipboard.writeText(t);log("Log copied","ok")}catch(e){log("Copy failed: "+e,"bad")}};$("#btnPing").onclick=ping;window.addEventListener("hashchange",render);if(window.__SOLANA_LIB_MISSING__||!hasSolanaLib()){libWarn.style.display="block";log("WARNING: solana-web3 lib not loaded from /wolverine/vendor/solana-web3.min.js","warn")}setPill(pillDash,"ok","UI OK");render();ping();})();</script></body></html>
+HTML
 }
 
-# --------- MAIN ----------
-install_node
-install_rust
-install_solana
-install_anchor
-bootstrap_workspace
-deploy_frontend
-ensure_nginx_include
+main(){
+  need_root
+  mkdir -p "$BK"
+  say "Backup -> $BK"
+  [ -f "$VHOST" ] && cp -a "$VHOST" "$BK/" || true
+  [ -f "$INC" ] && cp -a "$INC" "$BK/" || true
+  [ -d "$WEBROOT" ] && cp -a "$WEBROOT" "$BK/webroot" || true
 
-if [ "$MODE" = "verify" ]; then
-  # run only read/validate checks (plus nginx reload already done)
-  verify_mode
-  exit 0
-fi
+  say "Unfreeze nginx (best-effort)"
+  unfreeze /etc/nginx/nginx.conf "$VHOST" "$INC Remember" 2>/dev/null || true
+  unfreeze "$VHOST" "$INC" 2>/dev/null || true
 
-# strict anchor test only if workspace exists
-anchor_test_strict || true
+  say "Disable other wolverine includes"
+  disable_other_wolverine_includes
 
-say "OK: served at https://${DOMAIN}/aquilastacking/"
-say "DONE"
+  say "Write canonical include"
+  write_include
+
+  say "Write UI index.html"
+  write_index_html
+  mkdir -p "$WEBROOT/vendor" || true
+
+  say "Ensure vhost enabled"
+  [ -f "$VHOST" ] || { echo "MISSING VHOST: $VHOST"; exit 1; }
+  ln -sf "$VHOST" "$VHOST_EN"
+
+  say "Inject include into SSL server"
+  inject_include_into_ssl_server "$VHOST"
+
+  say "nginx -t"
+  nginx -t
+
+  say "reload nginx"
+  systemctl reload nginx || systemctl restart nginx
+
+  say "Tests"
+  echo "== local SNI -> 127.0.0.1 (HEAD) =="
+  curl -skI --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/" | sed -n "1,12p" || true
+  echo "== public (HEAD) =="
+  curl -skI "https://${DOMAIN}/wolverine/" | sed -n "1,12p" || true
+  echo "== webroot (ls) =="
+  ls -la "$WEBROOT" | sed -n "1,30p" || true
+
+  say "DONE"
+  echo "Backups: $BK"
+  echo "Open: https://${DOMAIN}/wolverine/ (Ctrl+F5)"
+}
+
+main "$@"
 BASH
-chmod +x /root/MEGA_AQUILA_STACKING_V7_100.sh
-/root/MEGA_AQUILA_STACKING_V7_100.sh
+chmod +x /root/WV_FIX_404.sh
+bash /root/WV_FIX_404.sh'
+
+
+
+nginx -T | grep -nE "server_name|listen 443|include /etc/nginx/includes/wolverine_routes.inc|location \^~ /wolverine/" | head -n 200
