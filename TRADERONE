@@ -1,28 +1,35 @@
-bash -lc 'rm -f /root/aqfix.sh; python3 - <<'"'"'PY'"'"'
-s=r"""#!/bin/bash
+bash -lc 'set -euo pipefail
+cat >/root/a.sh<<'"'"'BASH'"'"'
+#!/usr/bin/env bash
 set -euo pipefail
 TS="$(date +%Y%m%d_%H%M%S)"
-BK="/root/AQFIX_BK_${TS}"
+BK="/root/AQFIX_${TS}"
 mkdir -p "$BK"
 say(){ printf "[%s] %s\n" "$(date +%H:%M:%S)" "$*"; }
 die(){ say "ERR: $*"; exit 1; }
+
 [ "$(id -u)" -eq 0 ] || die "run as root"
+command -v nginx >/dev/null 2>&1 || die "nginx missing"
+command -v curl  >/dev/null 2>&1 || die "curl missing"
+command -v python3 >/dev/null 2>&1 || die "python3 missing"
 umask 022
 
 DOMAIN="fireinners.online"
+VHOST_A="/etc/nginx/sites-available/fireinners.online-ssl"
+VHOST_E="/etc/nginx/sites-enabled/fireinners.online-ssl"
+
 PATH_A="/aquila_stacking/"
 PATH_B="/iaaquila/"
+
 WEBROOT="/var/www/aquila_stacking"
 LINKROOT="/var/www/iaaquila"
 INC="/etc/nginx/includes/aquila_stacking_routes.inc"
 
 REACT_APP="/opt/aquila_stacking_react"
-REACT_DIST="$REACT_APP/dist"
+ZIP_URL="${ZIP_URL:-}"
 
 ASKLIB="/opt/fireinners/sentinel/lib/askorupdate.sh"
-if [ -f "$ASKLIB" ]; then
-  . "$ASKLIB" || true
-fi
+if [ -f "$ASKLIB" ]; then . "$ASKLIB" || true; fi
 
 backup_one(){ local p="$1"; [ -e "$p" ] || return 0; mkdir -p "$BK/$(dirname "$p")"; cp -a "$p" "$BK/$p.bak" 2>/dev/null || true; }
 
@@ -33,7 +40,7 @@ write_file(){
 $*
 EOF
   if declare -F askorupdate_file >/dev/null 2>&1; then
-    ASKORUPDATE_ASK=0 askorupdate_file "$path" "$tmp" "AQ routes fix" || { rm -f "$tmp"; die "askorupdate_file failed: $path"; }
+    ASKORUPDATE_ASK=0 askorupdate_file "$path" "$tmp" "Aquila routes fix" || { rm -f "$tmp"; die "askorupdate_file failed: $path"; }
   else
     chattr -i "$path" 2>/dev/null || true
     [ -f "$path" ] && cp -a "$path" "$BK/$(echo "$path" | sed "s#/#_#g").bak" 2>/dev/null || true
@@ -42,41 +49,68 @@ EOF
   rm -f "$tmp"
 }
 
-ensure_webroot(){
-  say "1) Ensure WEBROOT"
+ensure_dirs(){
+  say "1) Ensure webroot"
   mkdir -p "$WEBROOT"
   chmod 0755 "$WEBROOT" || true
   chown -R www-data:www-data "$WEBROOT" 2>/dev/null || true
+  if [ ! -e "$LINKROOT" ]; then ln -s "$WEBROOT" "$LINKROOT" 2>/dev/null || true; fi
 }
 
-deploy_dist_if_any(){
-  say "2) Deploy React dist if present"
-  if [ -d "$REACT_DIST" ] && [ -f "$REACT_DIST/index.html" ]; then
-    say "   dist found -> deploy"
-    rm -rf "$WEBROOT"/*
-    cp -a "$REACT_DIST"/. "$WEBROOT"/
-    chown -R www-data:www-data "$WEBROOT" 2>/dev/null || true
-    chmod -R a+rX "$WEBROOT" 2>/dev/null || true
+maybe_pull_zip(){
+  [ -n "$ZIP_URL" ] || return 0
+  say "2) Download ZIP_URL -> $REACT_APP"
+  mkdir -p "$REACT_APP"
+  local z="/root/aquila_ui_${TS}.zip"
+  curl -fsSL "$ZIP_URL" -o "$z" || die "download failed"
+  rm -rf "$REACT_APP"/*
+  unzip -oq "$z" -d "$REACT_APP"
+}
+
+ensure_node(){
+  command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1 && return 0
+  say "3) Install Node/NPM (apt)"
+  apt-get update -y
+  apt-get install -y nodejs npm
+}
+
+build_react_if_needed(){
+  [ -d "$REACT_APP" ] || return 0
+  if [ -f "$REACT_APP/package.json" ]; then
+    ensure_node
+    say "4) Build React app in $REACT_APP"
+    cd "$REACT_APP"
+    npm ci --no-audit --no-fund 2>/dev/null || npm install --no-audit --no-fund
+    npm run build
   else
-    say "   dist missing -> keep existing"
+    say "4) No package.json in $REACT_APP (skip build)"
+  fi
+}
+
+deploy_to_webroot(){
+  say "5) Deploy to $WEBROOT"
+  local SRC=""
+  if [ -d "$REACT_APP/dist" ] && [ -f "$REACT_APP/dist/index.html" ]; then SRC="$REACT_APP/dist"; fi
+  if [ -z "$SRC" ] && [ -d "$REACT_APP/out" ] && [ -f "$REACT_APP/out/index.html" ]; then SRC="$REACT_APP/out"; fi
+  if [ -z "$SRC" ] && [ -d "$REACT_APP/build" ] && [ -f "$REACT_APP/build/index.html" ]; then SRC="$REACT_APP/build"; fi
+
+  if [ -n "$SRC" ]; then
+    rm -rf "$WEBROOT"/*
+    cp -a "$SRC"/. "$WEBROOT"/
   fi
 
   if [ ! -f "$WEBROOT/index.html" ]; then
-    say "   create fallback index.html"
     cat >"$WEBROOT/index.html"<<EOF
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Aquila</title><style>body{font-family:system-ui;margin:24px;background:#0b1020;color:#d7e3ff}code{background:#111a33;padding:3px 6px;border-radius:6px}</style></head><body><h1>Aquila Stacking</h1><p>Fallback served (React dist not found).</p><p>WEBROOT <code>/var/www/aquila_stacking</code></p><p>Paths <code>/aquila_stacking/</code> and <code>/iaaquila/</code></p></body></html>
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Aquila</title><style>body{font-family:system-ui;margin:24px;background:#0b1020;color:#d7e3ff}code{background:#111a33;padding:3px 6px;border-radius:6px}</style></head><body><h1>Aquila Stacking</h1><p>Fallback served (no React dist detected).</p><p>WEBROOT <code>/var/www/aquila_stacking</code></p><p>Paths <code>/aquila_stacking/</code> and <code>/iaaquila/</code></p></body></html>
 EOF
-    chown -R www-data:www-data "$WEBROOT" 2>/dev/null || true
-    chmod -R a+rX "$WEBROOT" 2>/dev/null || true
   fi
 
-  if [ ! -e "$LINKROOT" ]; then
-    ln -s "$WEBROOT" "$LINKROOT" 2>/dev/null || true
-  fi
+  chown -R www-data:www-data "$WEBROOT" 2>/dev/null || true
+  chmod -R a+rX "$WEBROOT" 2>/dev/null || true
 }
 
-ensure_inc(){
-  say "3) Write nginx include $INC"
+write_inc(){
+  say "6) Write nginx include $INC"
   mkdir -p "$(dirname "$INC")"
   write_file "$INC" \
 "# Aquila Stacking routes
@@ -95,19 +129,12 @@ location ^~ $PATH_B {
 "
 }
 
-patch_vhosts(){
-  say "4) Patch vhosts to include routes"
-  local files
-  files="$(grep -RIl --exclude='\''*.dpkg-*'\'' --exclude='\''*.bak'\'' -E "server_name[[:space:]].*\\b${DOMAIN}\\b" /etc/nginx/sites-enabled /etc/nginx/sites-available /etc/nginx/conf.d 2>/dev/null || true)"
-  [ -n "$files" ] || { say "WARN: no vhost found for $DOMAIN"; return 0; }
-  while IFS= read -r f; do
-    [ -f "$f" ] || continue
-    backup_one "$f"
-    if grep -qF "$INC" "$f"; then
-      say "   ok include already: $f"
-      continue
-    fi
-    python3 - "$f" "$DOMAIN" "$INC" <<'\''PY'\''
+patch_one_vhost(){
+  local f="$1"
+  [ -f "$f" ] || return 0
+  backup_one "$f"
+  if grep -qF "$INC" "$f"; then say "   include already in $f"; return 0; fi
+  python3 - "$f" "$DOMAIN" "$INC" <<'PY'
 import re,sys
 p,dom,inc=sys.argv[1],sys.argv[2],sys.argv[3]
 s=open(p,'r',encoding='utf-8',errors='ignore').read()
@@ -145,8 +172,6 @@ for m in re.finditer(r'server\s*\{', s):
         pos=end
         break
     i+=1
-else:
-  out=[s]
 new="".join(out)+s[pos:]
 if changed:
   open(p,'w',encoding='utf-8').write(new)
@@ -154,32 +179,39 @@ if changed:
 else:
   print("nochange")
 PY
-    if grep -qF "$INC" "$f"; then
-      say "   patched: $f"
-    else
-      say "   WARN not patched: $f"
-    fi
-  done <<<"$files"
+  if grep -qF "$INC" "$f"; then say "   patched $f"; else say "   WARN not patched $f"; fi
+}
+
+patch_vhosts(){
+  say "7) Patch vhosts"
+  patch_one_vhost "$VHOST_A"
+  patch_one_vhost "$VHOST_E"
+  local files
+  files="$(grep -RIl --exclude='*.dpkg-*' --exclude='*.bak' -E "server_name[[:space:]].*\\b${DOMAIN}\\b" /etc/nginx/sites-enabled /etc/nginx/sites-available /etc/nginx/conf.d 2>/dev/null || true)"
+  while IFS= read -r f; do [ -n "$f" ] && patch_one_vhost "$f"; done <<<"$files"
 }
 
 reload_and_test(){
-  say "5) nginx -t + reload"
+  say "8) nginx -t + reload"
   nginx -t
   systemctl reload nginx
 
-  say "6) Local tests (must NOT be 404)"
+  say "9) Local tests (must NOT be 404)"
   echo "--- ${PATH_A} ---"
   curl -skI -H "Host: $DOMAIN" "https://127.0.0.1$PATH_A" | head -n 12 || true
   echo "--- ${PATH_B} ---"
   curl -skI -H "Host: $DOMAIN" "https://127.0.0.1$PATH_B" | head -n 12 || true
-  echo "include hit:"
+  echo "--- include hit ---"
   nginx -T 2>/dev/null | grep -n "aquila_stacking_routes" -n | head -n 20 || true
 }
 
 main(){
-  ensure_webroot
-  deploy_dist_if_any
-  ensure_inc
+  say "BEGIN AQFIX @ $TS"
+  ensure_dirs
+  maybe_pull_zip
+  build_react_if_needed
+  deploy_to_webroot
+  write_inc
   patch_vhosts
   reload_and_test
   say "DONE"
@@ -188,8 +220,6 @@ main(){
   say "Open: https://$DOMAIN$PATH_B"
 }
 main
-"""
-open("/root/aqfix.sh","wb").write(s.encode("utf-8"))
-PY
-chmod 755 /root/aqfix.sh
-/bin/bash /root/aqfix.sh'
+BASH
+chmod 755 /root/a.sh
+/root/a.sh'
