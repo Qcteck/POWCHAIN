@@ -1,535 +1,34 @@
-cat >/root/MEGA_BUNDLER_FIX_9797_ONE_SHOT.sh <<'BASH'
+cat >/root/MEGA_BUNDLER_NGINX_FIX_404.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 umask 022
 
 TS="$(date +%Y%m%d_%H%M%S)"
-BK="/root/BUNDLER_FIX_${TS}"
+BK="/root/BUNDLER_NGXFIX_${TS}"
 mkdir -p "$BK"
-
 say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 die(){ say "ERROR: $*"; exit 1; }
 [ "$(id -u)" -eq 0 ] || die "run as root"
 
 DOMAIN="fireinners.online"
-VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
-NGINX_CONF="/etc/nginx/nginx.conf"
 INC_DIR="/etc/nginx/includes"
 INC_BUNDLER="${INC_DIR}/bundler_routes.inc"
 
 WEBROOT_BUNDLER="/var/www/bundler"
 DATA_DIR="/opt/bundler_data"
-
-API_DIR="/opt/bundler_api"
-API_PORT="9797"
 API_HOST="127.0.0.1"
-API_SVC="/etc/systemd/system/bundler-api.service"
+API_PORT="9797"
 
-UI_DIR="/opt/bundler_ui"
+say "backup: nginx tree"
+tar -C /etc -czf "$BK/etc_nginx.tgz" nginx >/dev/null 2>&1 || true
 
-PUMP_DIR="${PUMPBUNDLER_DIR:-/opt/pumpfun-bundler}"
-PUMP_REPO="${PUMPBUNDLER_REPO:-https://github.com/cicere/pumpfun-bundler.git}"
-
-say "backup: nginx + service + dirs"
-cp -a "$VHOST" "$BK/fireinners.online-ssl.bak" 2>/dev/null || true
-cp -a "$INC_BUNDLER" "$BK/bundler_routes.inc.bak" 2>/dev/null || true
-cp -a "$API_SVC" "$BK/bundler-api.service.bak" 2>/dev/null || true
-tar -C /var/www -czf "$BK/var_www_bundler.tgz" "bundler" >/dev/null 2>&1 || true
-tar -C /opt -czf "$BK/opt_bundler_api.tgz" "bundler_api" >/dev/null 2>&1 || true
-tar -C /opt -czf "$BK/opt_bundler_ui.tgz" "bundler_ui" >/dev/null 2>&1 || true
-
-say "apt: prereqs"
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -y >/dev/null
-apt-get install -y --no-install-recommends ca-certificates curl git nginx python3 >/dev/null
-
-need_node20(){
-  if ! command -v node >/dev/null 2>&1; then return 0; fi
-  local v; v="$(node -v | tr -d 'v' || true)"
-  local maj="${v%%.*}"
-  [ "${maj:-0}" -lt 20 ] && return 0 || return 1
-}
-if need_node20; then
-  say "node: install/upgrade Node 20 (NodeSource)"
-  curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null
-  apt-get install -y --no-install-recommends nodejs >/dev/null
-fi
-
-say "versions: node=$(node -v) npm=$(npm -v) nginx=$(nginx -v 2>&1 | tr -d '\n')"
-
-say "dirs: web + data + api + ui + includes"
-mkdir -p "$WEBROOT_BUNDLER" "$DATA_DIR" "$API_DIR" "$UI_DIR" "$INC_DIR"
+say "ensure dirs"
+mkdir -p "$INC_DIR" "$WEBROOT_BUNDLER" "$DATA_DIR"
 chmod 755 "$WEBROOT_BUNDLER" "$DATA_DIR" || true
 
-say "git: pumpfun-bundler (optional clone/update) -> $PUMP_DIR"
-if [ ! -d "$PUMP_DIR/.git" ]; then
-  rm -rf "$PUMP_DIR"
-  git clone --depth 1 "$PUMP_REPO" "$PUMP_DIR" >/dev/null 2>&1 || true
-else
-  ( cd "$PUMP_DIR" && git fetch --all --prune >/dev/null 2>&1 && git pull --ff-only >/dev/null 2>&1 ) || true
-fi
-( cd "$PUMP_DIR" && git rev-parse HEAD ) >"$BK/pumpfun-bundler.commit" 2>/dev/null || true
-
-gen_key_py(){ python3 - <<'PY'
-import secrets,string
-alphabet=string.ascii_letters+string.digits
-print(''.join(secrets.choice(alphabet) for _ in range(48)),end='')
-PY
-}
-
-API_KEY_FILE="$API_DIR/.api_key"
-if [ -f "$API_KEY_FILE" ]; then
-  BUNDLER_API_KEY="$(tr -d '\n' <"$API_KEY_FILE" || true)"
-else
-  BUNDLER_API_KEY="$(gen_key_py)"
-  printf '%s' "$BUNDLER_API_KEY" >"$API_KEY_FILE"
-  chmod 600 "$API_KEY_FILE" || true
-fi
-
-KEYPAIR_PATH="$API_DIR/keypair.json"
-
-say "api: write package.json + server.js"
-cat >"$API_DIR/package.json" <<'JSON'
-{"name":"bundler-api","private":true,"type":"module","version":"1.0.0","main":"server.js","scripts":{"start":"node server.js"},"dependencies":{"@solana/spl-token":"^0.4.14","@solana/web3.js":"^1.98.0","bs58":"^6.0.0","express":"^4.19.2"}}
-JSON
-
-cat >"$API_DIR/server.js" <<'JS'
-import fs from "node:fs";
-import path from "node:path";
-import process from "node:process";
-import express from "express";
-import { Connection, Keypair, PublicKey, clusterApiUrl } from "@solana/web3.js";
-import { createMint, getAssociatedTokenAddress, getOrCreateAssociatedTokenAccount, mintTo, setAuthority, AuthorityType, getMint } from "@solana/spl-token";
-
-const APP_HOST = process.env.HOST || "127.0.0.1";
-const APP_PORT = parseInt(process.env.PORT || "9797", 10);
-const DATA_DIR = process.env.DATA_DIR || "/opt/bundler_data";
-const API_KEY = (process.env.BUNDLER_API_KEY || "").trim();
-const KEYPAIR_PATH = process.env.SOLANA_KEYPAIR || "/opt/bundler_api/keypair.json";
-const DEFAULT_RPC = process.env.SOLANA_RPC_URL || clusterApiUrl(process.env.SOLANA_CLUSTER || "mainnet-beta");
-
-function iso(){ return new Date().toISOString(); }
-function j(o){ return JSON.stringify(o); }
-function safeJson(x){ try{ return JSON.parse(x); }catch{ return null; } }
-function loadKeypair(p){
-  const raw = fs.readFileSync(p,"utf8").trim();
-  const arr = safeJson(raw);
-  if(!Array.isArray(arr)) throw new Error("KEYPAIR_INVALID_JSON");
-  const u8 = Uint8Array.from(arr);
-  return Keypair.fromSecretKey(u8);
-}
-function hasAny(m, needles){
-  const s = String(m||"").toLowerCase();
-  return needles.some(n => s.includes(String(n).toLowerCase()));
-}
-function classify(e){
-  const msg = String(e?.message ?? e ?? "unknown error");
-  if (hasAny(msg, ["http 429","429 too many requests","too many requests"])) return {code:"RPC_429",retriable:true,message:msg};
-  if (hasAny(msg, ["rate limit","ratelimit","request limit"])) return {code:"RATE_LIMIT",retriable:true,message:msg};
-  if (hasAny(msg, ["blockhash not found"])) return {code:"BLOCKHASH_NOT_FOUND",retriable:true,message:msg};
-  if (hasAny(msg, ["account in use","already in use","resource is busy","lock"])) return {code:"ACCOUNT_IN_USE",retriable:true,message:msg};
-  if (hasAny(msg, ["simulation failed","transaction simulation failed","custom program error"])) return {code:"SIMULATION_FAILED",retriable:false,message:msg};
-  if (hasAny(msg, ["insufficient funds","insufficient lamports","insufficient balance"])) return {code:"INSUFFICIENT_FUNDS",retriable:false,message:msg};
-  if (hasAny(msg, ["timeout","timed out","etimedout"])) return {code:"TIMEOUT",retriable:true,message:msg};
-  if (hasAny(msg, ["network","fetch failed","econnreset","aborterror"])) return {code:"NETWORK",retriable:true,message:msg};
-  return {code:"UNKNOWN",retriable:false,message:msg};
-}
-async function withRetry(fn,{retries=4,base=350,max=4000}={}){
-  let last;
-  for(let i=0;i<=retries;i++){
-    try{ return await fn(); }catch(e){ last=e;
-      const c=classify(e);
-      if(i===retries || !c.retriable) throw e;
-      const w=Math.min(max, base*(2**i)) + Math.floor(Math.random()*200);
-      await new Promise(r=>setTimeout(r,w));
-    }
-  }
-  throw last;
-}
-function assertDecimals(d){
-  if(!Number.isInteger(d) || d<0 || d>12) throw new Error("TOKEN_DECIMALS_INVALID");
-}
-function parseAmount(human,decimals){
-  const s=String(human||"").trim();
-  if(!/^\d+(\.\d+)?$/.test(s)) throw new Error("TOKEN_SUPPLY_INVALID");
-  const parts=s.split(".");
-  const i=parts[0];
-  const f=(parts[1]||"");
-  const frac=(f+"0".repeat(decimals)).slice(0,decimals);
-  return BigInt(i+frac);
-}
-function ndjsonWrite(obj){
-  try{
-    fs.mkdirSync(DATA_DIR,{recursive:true});
-    fs.appendFileSync(path.join(DATA_DIR,"api.ndjson"), j(obj)+"\n");
-  }catch{}
-}
-
-const app = express();
-app.disable("x-powered-by");
-app.use(express.json({limit:"1mb"}));
-
-app.get("/health",(req,res)=>res.json({ok:true,ts:iso()}));
-
-app.post("/create-token", async (req,res)=>{
-  const started = Date.now();
-  const headerKey = String(req.headers["x-api-key"]||"").trim();
-  const bodyKey = String(req.body?.apiKey||"").trim();
-  if(!API_KEY || (headerKey!==API_KEY && bodyKey!==API_KEY)){
-    return res.status(401).json({ok:false,error:{code:"UNAUTHORIZED",message:"bad api key"}});
-  }
-
-  const rpc = String(req.body?.rpc||DEFAULT_RPC).trim();
-  const decimals = parseInt(String(req.body?.decimals ?? "6"),10);
-  const supplyHuman = String(req.body?.supply ?? "0").trim();
-  const ownerOpt = String(req.body?.owner||"").trim();
-  const mintOpt = String(req.body?.mint||"").trim();
-  const preflightOnly = !!req.body?.preflightOnly;
-  const revokeMintAuth = !!req.body?.revokeMintAuth;
-  const revokeFreezeAuth = !!req.body?.revokeFreezeAuth;
-
-  const out = {ok:false,rpc,decimals,supplyHuman,mode:preflightOnly?"PREFLIGHT_ONLY":"EXECUTE",mint:null,owner:ownerOpt||null,ownerAta:null,reused:{mint:false,ata:false},signatures:{mintTo:null,revokeMintAuth:null,revokeFreezeAuth:null},error:null,ms:0};
-
-  try{
-    assertDecimals(decimals);
-    const amount = parseAmount(supplyHuman, decimals);
-    if(amount<=0n) throw new Error("TOKEN_SUPPLY_ZERO");
-
-    const payer = loadKeypair(KEYPAIR_PATH);
-    const payerStr = payer.publicKey.toBase58();
-
-    const ownerPk = ownerOpt ? new PublicKey(ownerOpt) : payer.publicKey;
-    out.owner = ownerPk.toBase58();
-
-    const conn = new Connection(rpc,"confirmed");
-
-    await withRetry(()=>conn.getVersion(),{retries:5});
-    await withRetry(()=>conn.getBalance(payer.publicKey,"confirmed"),{retries:5});
-
-    let mintPk;
-
-    if(mintOpt){
-      mintPk = new PublicKey(mintOpt);
-      out.mint = mintPk.toBase58();
-      out.reused.mint = true;
-
-      const mintInfo = await withRetry(()=>getMint(conn,mintPk,"confirmed"),{retries:4});
-
-      if(mintInfo.decimals !== decimals){
-        out.error = {code:"DECIMALS_MISMATCH",message:`on-chain decimals=${mintInfo.decimals} != TOKEN_DECIMALS=${decimals}`};
-        out.ms = Date.now()-started;
-        ndjsonWrite({ts:iso(),type:"create_token",ok:false,error:out.error,mint:out.mint});
-        return res.status(400).json(out);
-      }
-
-      const mintAuthStr = mintInfo.mintAuthority ? mintInfo.mintAuthority.toBase58() : null;
-      const freezeAuthStr = mintInfo.freezeAuthority ? mintInfo.freezeAuthority.toBase58() : null;
-
-      const reasons=[];
-      if(!mintInfo.mintAuthority) reasons.push("mintAuthority is null (cannot mint)");
-      else if(mintAuthStr !== payerStr) reasons.push(`mintAuthority mismatch (on-chain=${mintAuthStr}, payer=${payerStr})`);
-
-      if(revokeFreezeAuth && mintInfo.freezeAuthority && freezeAuthStr !== payerStr){
-        reasons.push(`freezeAuthority mismatch (on-chain=${freezeAuthStr}, payer=${payerStr})`);
-      }
-      if(revokeMintAuth && mintAuthStr !== payerStr){
-        reasons.push("cannot revoke mint authority (payer is not current mintAuthority)");
-      }
-      if(reasons.length){
-        out.error = {code:"AUTH_MISMATCH",message:reasons.join(" | ")};
-        out.ms = Date.now()-started;
-        ndjsonWrite({ts:iso(),type:"create_token",ok:false,error:out.error,mint:out.mint});
-        return res.status(400).json(out);
-      }
-    } else {
-      if(preflightOnly){
-        out.ok = true;
-        out.ms = Date.now()-started;
-        ndjsonWrite({ts:iso(),type:"create_token",ok:true,mode:"PREFLIGHT_ONLY"});
-        return res.json(out);
-      }
-      mintPk = await withRetry(()=>createMint(conn,payer,payer.publicKey,payer.publicKey,decimals),{retries:4});
-      out.mint = mintPk.toBase58();
-    }
-
-    const expectedAta = await getAssociatedTokenAddress(mintPk, ownerPk, false);
-    out.ownerAta = expectedAta.toBase58();
-
-    if(preflightOnly){
-      out.ok = true;
-      out.ms = Date.now()-started;
-      ndjsonWrite({ts:iso(),type:"create_token",ok:true,mode:"PREFLIGHT_ONLY",mint:out.mint});
-      return res.json(out);
-    }
-
-    const ata = await withRetry(()=>getOrCreateAssociatedTokenAccount(conn,payer,mintPk,ownerPk),{retries:4});
-    out.ownerAta = ata.address.toBase58();
-    out.reused.ata = true;
-
-    const sigMintTo = await withRetry(()=>mintTo(conn,payer,mintPk,ata.address,payer,amount),{retries:4});
-    out.signatures.mintTo = sigMintTo;
-
-    if(revokeMintAuth){
-      const s = await withRetry(()=>setAuthority(conn,payer,mintPk,payer.publicKey,AuthorityType.MintTokens,null),{retries:4});
-      out.signatures.revokeMintAuth = s;
-    }
-    if(revokeFreezeAuth){
-      const s = await withRetry(()=>setAuthority(conn,payer,mintPk,payer.publicKey,AuthorityType.FreezeAccount,null),{retries:4});
-      out.signatures.revokeFreezeAuth = s;
-    }
-
-    out.ok = true;
-    out.ms = Date.now()-started;
-    ndjsonWrite({ts:iso(),type:"create_token",ok:true,mint:out.mint,owner:out.owner,ms:out.ms});
-    return res.json(out);
-
-  }catch(e){
-    const c=classify(e);
-    out.error = {code:c.code,message:c.message};
-    out.ms = Date.now()-started;
-    ndjsonWrite({ts:iso(),type:"create_token",ok:false,error:out.error,ms:out.ms});
-    return res.status(500).json(out);
-  }
-});
-
-app.listen(APP_PORT, APP_HOST, ()=> {
-  ndjsonWrite({ts:iso(),type:"api_start",host:APP_HOST,port:APP_PORT});
-  console.log(j({ok:true,ts:iso(),host:APP_HOST,port:APP_PORT,dataDir:DATA_DIR}));
-});
-JS
-
-say "api: install deps"
-cd "$API_DIR"
-npm install >/dev/null
-
-if [ ! -f "$KEYPAIR_PATH" ]; then
-  say "api: generate Solana keypair -> $KEYPAIR_PATH"
-  node - <<'NODE' "$KEYPAIR_PATH"
-const fs=require("fs");
-const {Keypair}=require("@solana/web3.js");
-const kp=Keypair.generate();
-fs.writeFileSync(process.argv[1],JSON.stringify(Array.from(kp.secretKey)));
-NODE
-fi
-chmod 600 "$KEYPAIR_PATH" "$API_KEY_FILE" 2>/dev/null || true
-
-say "api: systemd service write + start"
-cat >"$API_SVC" <<EOF
-[Unit]
-Description=Bundler API (create token)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-WorkingDirectory=$API_DIR
-Environment=HOST=$API_HOST
-Environment=PORT=$API_PORT
-Environment=DATA_DIR=$DATA_DIR
-Environment=BUNDLER_API_KEY=$BUNDLER_API_KEY
-Environment=SOLANA_KEYPAIR=$KEYPAIR_PATH
-# Environment=SOLANA_RPC_URL=https://your-rpc
-ExecStart=/usr/bin/node $API_DIR/server.js
-Restart=always
-RestartSec=2
-User=root
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl daemon-reload
-systemctl enable bundler-api >/dev/null 2>&1 || true
-systemctl restart bundler-api >/dev/null 2>&1 || systemctl start bundler-api >/dev/null 2>&1 || true
-
-say "ui: write Vite+React (base=/bundler/)"
-rm -rf "$UI_DIR"
-mkdir -p "$UI_DIR/src"
-
-cat >"$UI_DIR/package.json" <<'JSON'
-{"name":"bundler-ui","private":true,"version":"1.0.0","type":"module","scripts":{"dev":"vite --host 127.0.0.1 --port 5179","build":"vite build"},"dependencies":{"react":"^18.3.1","react-dom":"^18.3.1"},"devDependencies":{"@vitejs/plugin-react":"^4.3.1","vite":"^5.4.8"}}
-JSON
-
-cat >"$UI_DIR/vite.config.js" <<'JS'
-import { defineConfig } from "vite";
-import react from "@vitejs/plugin-react";
-export default defineConfig({ base: "/bundler/", plugins: [react()] });
-JS
-
-cat >"$UI_DIR/index.html" <<'HTML'
-<!doctype html><html lang="fr"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Bundler</title><style>html,body{margin:0;padding:0;background:#0b0f14;color:#e7eef7;font:14px/1.35 system-ui,-apple-system,Segoe UI,Roboto,Arial}*{box-sizing:border-box}a{color:#7ec8ff}input,button,select,textarea{background:#111826;color:#e7eef7;border:1px solid #223047;border-radius:10px;padding:10px 12px;outline:none}button{cursor:pointer}button:hover{border-color:#3a7bd5}.wrap{max-width:1200px;margin:0 auto;padding:16px}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.card{background:#0f1520;border:1px solid #1e2a3f;border-radius:14px;padding:12px}.grow{flex:1}.muted{color:#9fb2c9}.tabs{display:flex;gap:8px}.tab{padding:8px 12px;border:1px solid #223047;border-radius:999px;background:#0c121c;cursor:pointer}.tab.on{border-color:#3a7bd5}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:12px;white-space:pre-wrap;word-break:break-word}.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.kpi{display:flex;gap:10px;flex-wrap:wrap}.k{min-width:180px}.k b{display:block;font-size:18px}.pill{display:inline-block;padding:2px 8px;border-radius:999px;border:1px solid #2a3c57;background:#0c121c;font-size:12px}.ok{border-color:#2f8f5f}.bad{border-color:#b24a4a}.log{max-height:420px;overflow:auto}.tbl{width:100%;border-collapse:collapse;font-size:12px}.tbl th,.tbl td{border-bottom:1px solid #1d2a40;padding:8px;text-align:left;vertical-align:top}</style></head><body><div id="root"></div><script type="module" src="/src/main.jsx"></script></body></html>
-HTML
-
-cat >"$UI_DIR/src/main.jsx" <<'JSX'
-import React from "react";
-import { createRoot } from "react-dom/client";
-import App from "./App.jsx";
-createRoot(document.getElementById("root")).render(<App/>);
-JSX
-
-cat >"$UI_DIR/src/App.jsx" <<'JSX'
-import React,{useEffect,useState} from "react";
-const now=()=>Date.now();
-const fmt=(n,d=2)=>isFinite(n)?Number(n).toFixed(d):"0";
-const j=(o)=>JSON.stringify(o,null,2);
-function safeJSON(s){try{return JSON.parse(s)}catch{return null}}
-function hashStr(s){let h=2166136261>>>0;for(let i=0;i<s.length;i++){h^=s.charCodeAt(i);h=Math.imul(h,16777619)}return ("00000000"+(h>>>0).toString(16)).slice(-8)}
-function Logs(){
-  const [src,setSrc]=useState("/bundler/data/api.ndjson");
-  const [auto,setAuto]=useState(false);
-  const [ms,setMs]=useState(5000);
-  const [win,setWin]=useState(300);
-  const [status,setStatus]=useState("idle");
-  const [meta,setMeta]=useState("");
-  const [h,setH]=useState("");
-  const [data,setData]=useState({tpm:0,epm:0,last:[],lines:0});
-  async function loadOnce(){
-    setStatus("loading");
-    const r=await fetch(src+(src.includes("?")?"&":"?")+"t="+Date.now(),{cache:"no-store"});
-    if(!r.ok) throw new Error("HTTP "+r.status);
-    const text=await r.text();
-    const hh=hashStr(text);
-    if(hh===h){ setStatus("nochange"); return; }
-    setH(hh);
-    const lines=text.split("\n").filter(Boolean);
-    const wMs=Math.max(10,parseInt(win,10)||300)*1000;
-    const t0=now()-wMs;
-    let tokens=0,errs=0; let lastTs=0;
-    const ev=[];
-    for(const s of lines){
-      const o=safeJSON(s); if(!o||!o.type) continue;
-      const ts=Date.parse(o.ts||"")||0; if(ts>lastTs) lastTs=ts;
-      if(ts>=t0){
-        if(o.type==="create_token" && o.ok) tokens++;
-        if(o.type==="create_token" && !o.ok) errs++;
-      }
-      ev.push(o);
-    }
-    const wSec=Math.max(10,parseInt(win,10)||300);
-    setData({tpm:tokens/(wSec/60),epm:errs/(wSec/60),last:ev.slice(-80).reverse(),lines:lines.length});
-    setMeta(`last:${lastTs?new Date(lastTs).toISOString():""}`);
-    setStatus("ok");
-  }
-  useEffect(()=>{
-    if(!auto) return;
-    let t=setInterval(()=>loadOnce().catch(e=>{setStatus("error");setMeta(String(e?.message||e))}), Math.max(500,parseInt(ms,10)||5000));
-    loadOnce().catch(()=>{});
-    return ()=>clearInterval(t);
-  },[auto,ms,src,win]);
-  return (
-    <div className="grid">
-      <div className="card">
-        <div className="row">
-          <div className="grow">
-            <div className="muted">Source NDJSON</div>
-            <div className="row">
-              <input className="grow" value={src} onChange={e=>setSrc(e.target.value)} />
-              <button onClick={()=>loadOnce().catch(e=>{setStatus("error");setMeta(String(e?.message||e))})}>Charger</button>
-              <button onClick={()=>setAuto(v=>!v)}>{auto?"Auto: ON":"Auto: OFF"}</button>
-              <input style={{width:120}} value={ms} onChange={e=>setMs(e.target.value)} title="interval ms"/>
-            </div>
-            <div className="muted">/bundler/data/api.ndjson</div>
-          </div>
-          <div>
-            <div className="muted">Fenêtre (s)</div>
-            <input style={{width:120}} value={win} onChange={e=>setWin(e.target.value)} />
-          </div>
-        </div>
-        <div className="kpi" style={{marginTop:10}}>
-          <div className="card k"><div className="muted">OK/min</div><b>{fmt(data.tpm,2)}</b><div className="muted">fenêtre {win}s</div></div>
-          <div className="card k"><div className="muted">ERR/min</div><b>{fmt(data.epm,2)}</b><div className="muted">lignes {data.lines}</div></div>
-        </div>
-        <div className="row" style={{marginTop:10}}>
-          <span className="pill ok">{status}</span>
-          <span className="muted">{meta}</span>
-        </div>
-      </div>
-      <div className="card">
-        <div className="row"><b>Derniers événements</b></div>
-        <div className="log" style={{marginTop:10}}>
-          <div className="mono">{data.last.map((o,i)=><div key={i} style={{marginBottom:10}}><span className="pill ok">{o.type}</span>{" "}{o.ts}<div className="muted">{j(o)}</div></div>)}</div>
-        </div>
-      </div>
-    </div>
-  );
-}
-function CreateToken(){
-  const [apiKey,setApiKey]=useState("");
-  const [rpc,setRpc]=useState("");
-  const [decimals,setDecimals]=useState("6");
-  const [supply,setSupply]=useState("1000000");
-  const [owner,setOwner]=useState("");
-  const [mint,setMint]=useState("");
-  const [preflightOnly,setPreflightOnly]=useState(false);
-  const [revokeMintAuth,setRevokeMintAuth]=useState(false);
-  const [revokeFreezeAuth,setRevokeFreezeAuth]=useState(true);
-  const [out,setOut]=useState(null);
-  const [st,setSt]=useState("idle");
-  async function go(){
-    setSt("sending"); setOut(null);
-    const body={apiKey,rpc:rpc||undefined,decimals:parseInt(decimals,10),supply,owner:owner||undefined,mint:mint||undefined,preflightOnly,revokeMintAuth,revokeFreezeAuth};
-    const r=await fetch("/bundler/api/create-token",{method:"POST",headers:{"content-type":"application/json","x-api-key":apiKey||""},body:JSON.stringify(body)});
-    const jsn=await r.json().catch(()=>({ok:false,error:{code:"BAD_JSON",message:"bad response"}}));
-    setOut(jsn); setSt(r.ok?"ok":"error");
-  }
-  return (
-    <div className="card">
-      <div className="row">
-        <div className="grow"><b>Créer un token (SPL)</b><div className="muted">API: /bundler/api/create-token</div></div>
-        <span className={"pill "+(st==="ok"?"ok":st==="error"?"bad":"")}>{st}</span>
-      </div>
-      <div className="grid" style={{marginTop:10}}>
-        <div className="card">
-          <div className="muted">API Key</div><input value={apiKey} onChange={e=>setApiKey(e.target.value)} placeholder="BUNDLER_API_KEY" />
-          <div className="muted" style={{marginTop:10}}>RPC (optionnel)</div><input value={rpc} onChange={e=>setRpc(e.target.value)} placeholder="https://..." />
-          <div className="row" style={{marginTop:10}}>
-            <div className="grow"><div className="muted">Decimals</div><input value={decimals} onChange={e=>setDecimals(e.target.value)} /></div>
-            <div className="grow"><div className="muted">Supply (humain)</div><input value={supply} onChange={e=>setSupply(e.target.value)} /></div>
-          </div>
-          <div className="muted" style={{marginTop:10}}>OWNER (optionnel)</div><input value={owner} onChange={e=>setOwner(e.target.value)} placeholder="Adresse owner (sinon payer)" />
-          <div className="muted" style={{marginTop:10}}>MINT_ADDRESS (optionnel, reuse)</div><input value={mint} onChange={e=>setMint(e.target.value)} placeholder="Adresse mint existant (sinon create)" />
-          <div className="row" style={{marginTop:10}}>
-            <label className="pill"><input type="checkbox" checked={preflightOnly} onChange={e=>setPreflightOnly(e.target.checked)} /> PREFLIGHT_ONLY</label>
-            <label className="pill"><input type="checkbox" checked={revokeMintAuth} onChange={e=>setRevokeMintAuth(e.target.checked)} /> REVOKE_MINT_AUTH</label>
-            <label className="pill"><input type="checkbox" checked={revokeFreezeAuth} onChange={e=>setRevokeFreezeAuth(e.target.checked)} /> REVOKE_FREEZE_AUTH</label>
-          </div>
-          <div className="row" style={{marginTop:10}}><button onClick={()=>go().catch(e=>{setSt("error");setOut({ok:false,error:{code:"CLIENT_ERR",message:String(e?.message||e)}})})}>Créer le token</button></div>
-        </div>
-        <div className="card"><b>Réponse</b><div className="mono" style={{marginTop:10}}>{out?j(out):"—"}</div></div>
-      </div>
-    </div>
-  );
-}
-export default function App(){
-  const [tab,setTab]=useState("create");
-  return (
-    <div className="wrap">
-      <div className="row">
-        <div className="grow"><div className="muted">fireinners.online</div><h2 style={{margin:"6px 0"}}>Bundler</h2></div>
-        <div className="tabs">
-          <div className={"tab "+(tab==="create"?"on":"")} onClick={()=>setTab("create")}>Create Token</div>
-          <div className={"tab "+(tab==="logs"?"on":"")} onClick={()=>setTab("logs")}>Logs</div>
-        </div>
-      </div>
-      <div style={{marginTop:12}}>{tab==="create"?<CreateToken/>:<Logs/>}</div>
-    </div>
-  );
-}
-JSX
-
-say "ui: install + build"
-cd "$UI_DIR"
-npm install >/dev/null
-npm run build >/dev/null
-
-say "ui: publish -> $WEBROOT_BUNDLER"
-rm -rf "$WEBROOT_BUNDLER"/*
-cp -a "$UI_DIR/dist/." "$WEBROOT_BUNDLER/"
-chmod -R 755 "$WEBROOT_BUNDLER" || true
-
-say "nginx: write include $INC_BUNDLER"
+say "write include: $INC_BUNDLER"
 cat >"$INC_BUNDLER" <<EOF
-# Bundler UI + API (generated $TS)
+# Bundler UI + API (nginx fix $TS)
 location ^~ /bundler/api/ {
   proxy_pass http://$API_HOST:$API_PORT/;
   proxy_http_version 1.1;
@@ -549,33 +48,74 @@ location ^~ /bundler/ {
 }
 EOF
 
-say "nginx: include in vhost"
-chattr -i "$NGINX_CONF" "$VHOST" 2>/dev/null || true
-if ! grep -qF "include /etc/nginx/includes/bundler_routes.inc;" "$VHOST"; then
-  cp -a "$VHOST" "$BK/fireinners.online-ssl.preinclude" 2>/dev/null || true
-  perl -0777 -pe 's/(server\s*\{\s*\n)/$1  include \/etc\/nginx\/includes\/bundler_routes\.inc;\n/s' "$VHOST" >"$BK/vhost.new"
-  cp -a "$BK/vhost.new" "$VHOST"
+say "find vhosts that mention fireinners.online"
+mapfile -t CANDS < <(grep -RIl --include="*" -E "server_name[^;]*\b${DOMAIN//./\\.}\b" /etc/nginx/sites-available /etc/nginx/sites-enabled 2>/dev/null | sort -u || true)
+if [ "${#CANDS[@]}" -eq 0 ]; then
+  say "WARNING: no vhost found by grep; dumping nginx -T to backup"
+  nginx -T >"$BK/nginx_T.txt" 2>&1 || true
+else
+  printf '%s\n' "${CANDS[@]}" >"$BK/vhost_candidates.txt"
 fi
 
-nginx -t >/dev/null
-systemctl reload nginx >/dev/null
-chattr +i "$NGINX_CONF" "$VHOST" 2>/dev/null || true
+say "make nginx files editable"
+chattr -i /etc/nginx/nginx.conf 2>/dev/null || true
+for f in "${CANDS[@]:-}"; do chattr -i "$f" 2>/dev/null || true; done
 
-say "tests: service + ports + curl"
-systemctl is-active bundler-api >/dev/null 2>&1 && say "bundler-api: active" || (systemctl status bundler-api --no-pager -l | sed -n '1,140p' || true)
-ss -ltnp | awk 'NR==1||/(:9797|:80|:443)\b/' || true
-curl -fsS "http://127.0.0.1:9797/health" | head -c 300; echo
-curl -fsSI "https://$DOMAIN/bundler/" | head -n 12 | tr -d '\r'
-curl -fsSI "https://$DOMAIN/bundler/api/health" | head -n 12 | tr -d '\r'
+inject_one(){
+  local f="$1"
+  [ -f "$f" ] || return 0
+  cp -a "$f" "$BK/$(basename "$f").bak" 2>/dev/null || true
+  if grep -qF "include $INC_BUNDLER;" "$f"; then
+    return 0
+  fi
+  # only inject if file contains server_name fireinners.online somewhere
+  if ! grep -Eq "server_name[^;]*\b${DOMAIN//./\\.}\b" "$f"; then
+    return 0
+  fi
+  perl -0777 -pe "s/(server\\s*\\{\\s*\\n)/\$1  include \\/etc\\/nginx\\/includes\\/bundler_routes\\.inc;\\n/s" "$f" >"$BK/tmp_$(basename "$f")"
+  cp -a "$BK/tmp_$(basename "$f")" "$f"
+}
+
+say "inject include into ALL matching vhosts (sites-available + sites-enabled)"
+for f in "${CANDS[@]:-}"; do inject_one "$f"; done
+
+# Also ensure the canonical file is enabled if it exists
+CAN="/etc/nginx/sites-available/fireinners.online-ssl"
+if [ -f "$CAN" ]; then
+  if [ ! -e "/etc/nginx/sites-enabled/fireinners.online-ssl" ]; then
+    ln -sf "$CAN" "/etc/nginx/sites-enabled/fireinners.online-ssl" || true
+  fi
+  inject_one "$CAN"
+  inject_one "/etc/nginx/sites-enabled/fireinners.online-ssl"
+fi
+
+say "nginx -t"
+nginx -t >/dev/null
+
+say "reload nginx"
+systemctl reload nginx >/dev/null
+
+say "re-lock nginx files"
+chattr +i /etc/nginx/nginx.conf 2>/dev/null || true
+for f in "${CANDS[@]:-}"; do chattr +i "$f" 2>/dev/null || true; done
+[ -f "$CAN" ] && chattr +i "$CAN" 2>/dev/null || true
+
+say "origin tests (bypass Cloudflare) + api test"
+curl -fsS "http://127.0.0.1:${API_PORT}/health" | head -c 200; echo
+
+# HTTP (origin)
+curl -fsSI --resolve "${DOMAIN}:80:127.0.0.1" "http://${DOMAIN}/bundler/" | head -n 12 | tr -d '\r' || true
+# HTTPS (origin)
+curl -k -fsSI --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/bundler/" | head -n 12 | tr -d '\r' || true
+curl -k -fsSI --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/bundler/api/health" | head -n 12 | tr -d '\r' || true
+
+say "public tests (via Cloudflare)"
+curl -fsSI "https://${DOMAIN}/bundler/" | head -n 12 | tr -d '\r' || true
+curl -fsSI "https://${DOMAIN}/bundler/api/health" | head -n 12 | tr -d '\r' || true
 
 say "DONE"
-say "URL: https://$DOMAIN/bundler/"
-say "API: https://$DOMAIN/bundler/api/health"
-say "DATA: https://$DOMAIN/bundler/data/api.ndjson"
-say "BUNDLER_API_KEY: $BUNDLER_API_KEY"
-say "KEYPAIR_PATH: $KEYPAIR_PATH"
 say "BACKUP: $BK"
 BASH
 
-chmod +x /root/MEGA_BUNDLER_FIX_9797_ONE_SHOT.sh
-/root/MEGA_BUNDLER_FIX_9797_ONE_SHOT.sh
+chmod +x /root/MEGA_BUNDLER_NGINX_FIX_404.sh
+/root/MEGA_BUNDLER_NGINX_FIX_404.sh
