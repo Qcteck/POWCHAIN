@@ -1,114 +1,169 @@
-cat >/root/MEGA_NGINX_FIX_AQUILA_LOCATION_CONTEXT.sh <<'BASH'
+cat >/root/MEGA_AQUILA_STACKING_ROUTE_FIX_V3_AWK.sh<<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
-
+umask 027
 TS="$(date +%Y%m%d_%H%M%S)"
-BK="/root/NGINX_FIX_AQUILA_${TS}"
+say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
+die(){ say "ERR: $*"; exit 1; }
+need(){ command -v "$1" >/dev/null 2>&1 || die "missing: $1"; }
+
+[ "$(id -u)" -eq 0 ] || die "run as root"
+need nginx
+need systemctl
+need awk
+need grep
+need sed
+need cp
+need mkdir
+need chmod
+
+APP="/opt/aquila_stacking"
+KEYS="${APP}/keys"
+PROG="aquila_stacking"
+
+INC="/etc/nginx/includes/aquila_stacking_routes.inc"
+WEBROOT="/var/www/aquila_stacking"
+HTML="${WEBROOT}/index.html"
+
+VHOST_A="/etc/nginx/sites-available/fireinners.online-ssl"
+VHOST_E="/etc/nginx/sites-enabled/fireinners.online-ssl"
+VHOST_C="/etc/nginx/conf.d/000-fireinners.online-ssl.conf"
+
+INCLUDE_LINE="include /etc/nginx/includes/aquila_stacking_routes.inc;"
+MARK_BEG="# AQUILA_STACKING_INCLUDE_V3"
+MARK_END="# END_AQUILA_STACKING_INCLUDE_V3"
+
+BK="/root/AQUILA_STAKING_ROUTE_FIX_V3_BK_${TS}"
 mkdir -p "$BK"
+nginx -T >"$BK/nginx.T.txt" 2>&1 || true
 
-NGX_CONF="/etc/nginx/nginx.conf"
-VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
-AQUILA_INC="/etc/nginx/includes/aquila_stacking_routes.inc"
+backup_one(){ local f="$1"; [ -f "$f" ] && cp -a "$f" "$BK/$(echo "$f" | sed 's#/#_#g').bak" || true; }
 
-say(){ printf "\n[%s] %s\n" "$(date +%H:%M:%S)" "$*"; }
-die(){ echo "FATAL: $*" >&2; exit 1; }
-has(){ command -v "$1" >/dev/null 2>&1; }
+backup_one "$INC"
+backup_one "$VHOST_A"
+backup_one "$VHOST_E"
+backup_one "$VHOST_C"
+[ -d "$WEBROOT" ] && cp -a "$WEBROOT" "$BK/webroot_aquila_stacking.bak" || true
 
-immut_flag(){
+say "1) WEBROOT: $WEBROOT"
+mkdir -p "$WEBROOT"
+chmod 0755 "$WEBROOT"
+
+say "2) Program ID"
+PID="UNKNOWN"
+if command -v solana-keygen >/dev/null 2>&1 && [ -f "$KEYS/${PROG}-keypair.json" ]; then
+  PID="$(solana-keygen pubkey "$KEYS/${PROG}-keypair.json" 2>/dev/null || echo UNKNOWN)"
+fi
+
+say "3) index.html"
+cat >"$HTML"<<EOF
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AquilaStacking</title><style>body{font-family:system-ui,Segoe UI,Arial;margin:24px;max-width:980px}code{background:#0b1020;color:#d7e3ff;padding:10px;border-radius:10px;display:block;overflow:auto}h1{margin:0 0 12px}small{opacity:.8}</style></head><body><h1>AquilaStacking</h1><p><b>Program ID:</b><code>${PID}</code></p><p><b>Workspace:</b><code>${APP}</code></p><p><b>URL:</b><code>/aquila_stacking/</code></p><p><small>Redirect: /aquilastacking/ → /aquila_stacking/</small></p></body></html>
+EOF
+chown -R www-data:www-data "$WEBROOT" 2>/dev/null || true
+chmod -R 0755 "$WEBROOT"
+
+say "4) nginx include routes: $INC"
+chattr -i "$INC" 2>/dev/null || true
+cat >"$INC"<<EOF
+# AQUILA_STACKING_ROUTES_V3
+location = /aquilastacking { return 301 /aquila_stacking/; }
+location ^~ /aquilastacking/ { return 301 /aquila_stacking/; }
+location = /aquila_stacking { return 301 /aquila_stacking/; }
+location ^~ /aquila_stacking/ { alias ${WEBROOT}/; index index.html; try_files \$uri \$uri/ /aquila_stacking/index.html; add_header Cache-Control "no-store" always; }
+# END_AQUILA_STACKING_ROUTES_V3
+EOF
+
+patch_file(){
   local f="$1"
-  [ -e "$f" ] || return 1
-  lsattr -d "$f" 2>/dev/null | awk '{print $1}' | grep -q 'i'
-}
-
-unfreeze(){
-  local f="$1"
-  [ -e "$f" ] || return 0
-  if immut_flag "$f"; then
-    echo "IMMUT=1 $f" >>"$BK/immut.list"
-    chattr -i "$f" 2>/dev/null || true
-  else
-    echo "IMMUT=0 $f" >>"$BK/immut.list"
+  [ -f "$f" ] || return 0
+  if ! grep -qE 'server_name[^;]*\bfireinners\.online\b' "$f"; then
+    say "skip (no fireinners.online): $f"
+    return 0
   fi
+  if grep -qF "$INCLUDE_LINE" "$f"; then
+    say "ok (already has include): $f"
+    return 0
+  fi
+
+  say "patch: $f"
+  chattr -i "$f" 2>/dev/null || true
+
+  local tmp; tmp="$(mktemp)"
+  awk -v inc="$INCLUDE_LINE" -v mb="$MARK_BEG" -v me="$MARK_END" '
+  function emit_inc(){ print "  " mb; print "  " inc; print "  " me; }
+  BEGIN{inserver=0;depth=0;saw=0;inserted=0;}
+  {
+    line=$0
+    if(!inserver){
+      print line
+      if(line ~ /^[[:space:]]*server[[:space:]]*\{/){
+        inserver=1; depth=1; saw=0; inserted=0;
+      }
+      next
+    }
+
+    # in server block
+    if(line ~ /server_name[[:space:]]+[^;]*\bfireinners\.online\b[^;]*;/){ saw=1 }
+
+    # insert before first location once we know it is the right server
+    if(saw && !inserted && line ~ /^[[:space:]]*location[[:space:]]/){
+      emit_inc()
+      inserted=1
+    }
+
+    # track braces to know when server ends
+    # count { and } occurrences
+    oc=gsub(/\{/,"&",line); cc=gsub(/\}/,"&",line)
+    depth += oc
+    depth -= cc
+
+    # if this is the closing line of the server and we never inserted, insert before }
+    if(depth<=0){
+      if(saw && !inserted){
+        # if line is just "}" or has "}" we emit include before printing closing
+        emit_inc()
+        inserted=1
+      }
+      print line
+      inserver=0; depth=0; saw=0; inserted=0
+      next
+    }
+
+    print line
+  }' "$f" >"$tmp"
+
+  cp -a "$f" "$f.bak.$TS" 2>/dev/null || true
+  cat "$tmp" >"$f"
+  rm -f "$tmp"
 }
 
-refreeze_all(){
-  [ -f "$BK/immut.list" ] || return 0
-  awk '$1=="IMMUT=1"{print $2}' "$BK/immut.list" | while read -r f; do
-    [ -e "$f" ] && chattr +i "$f" 2>/dev/null || true
+say "5) patch all likely active vhosts (conf.d + sites-enabled + sites-available)"
+patch_file "$VHOST_C"
+patch_file "$VHOST_E"
+patch_file "$VHOST_A"
+
+say "6) nginx -t + reload (rollback if fail)"
+if ! nginx -t; then
+  say "nginx invalid -> rollback"
+  for p in "$INC" "$VHOST_C" "$VHOST_E" "$VHOST_A"; do
+    b="$BK/$(echo "$p" | sed 's#/#_#g').bak"
+    [ -f "$b" ] && cp -a "$b" "$p" || true
   done
-}
-
-say "0) Savepoint + backups"
-if [ -x /root/WOLVERINE_SAVEPOINT.sh ]; then /root/WOLVERINE_SAVEPOINT.sh || true; fi
-cp -a "$NGX_CONF" "$BK/nginx.conf.bak" 2>/dev/null || true
-cp -a "$VHOST" "$BK/fireinners.online-ssl.bak" 2>/dev/null || true
-[ -f "$AQUILA_INC" ] && cp -a "$AQUILA_INC" "$BK/aquila_stacking_routes.inc.bak" || true
-
-say "1) Unfreeze (chattr -i si besoin)"
-has lsattr || (apt-get update -y && apt-get install -y e2fsprogs >/dev/null 2>&1) || true
-unfreeze "$NGX_CONF"
-unfreeze "$VHOST"
-unfreeze "/etc/nginx/includes"
-[ -f "$AQUILA_INC" ] && unfreeze "$AQUILA_INC"
-
-say "2) Vérifs"
-[ -f "$VHOST" ] || die "Vhost manquant: $VHOST"
-[ -f "$AQUILA_INC" ] || die "Include manquant: $AQUILA_INC"
-
-say "3) Trouver toutes les inclusions de aquila_stacking_routes.inc"
-MATCHES="$(grep -RIn --exclude-dir=sites-enabled --exclude='*.bak*' "aquila_stacking_routes\.inc" /etc/nginx 2>/dev/null || true)"
-echo "$MATCHES" | tee "$BK/matches.txt" >/dev/null
-
-say "4) Commenter les includes invalides (où qu'ils soient) sauf si déjà dans fireinners.online-ssl"
-# On commente toute ligne include qui pointe vers aquila_stacking_routes.inc dans tout /etc/nginx
-# Puis on ré-injecte proprement dans le vhost (server{}).
-while IFS= read -r line; do
-  [ -n "$line" ] || continue
-  file="${line%%:*}"
-  lineno_rest="${line#*:}"
-  lineno="${lineno_rest%%:*}"
-  # skip if it's the vhost itself (on gère par injection propre)
-  if [ "$file" != "$VHOST" ]; then
-    # commente la ligne précise si elle contient include
-    sed -i "${lineno}s/^[[:space:]]*include[[:space:]].*aquila_stacking_routes\.inc.*$/# AUTO-COMMENT (fix context): &/" "$file" || true
-  fi
-done <<<"$MATCHES"
-
-say "5) Injecter l'include au bon endroit: dans le premier server{} du vhost"
-python3 - <<PY
-import re
-p="$VHOST"
-inc="include /etc/nginx/includes/aquila_stacking_routes.inc;"
-s=open(p,'r',encoding='utf-8',errors='ignore').read()
-
-# retire les anciennes occurrences (on nettoie)
-s=re.sub(r'^[ \t]*include[ \t]+/etc/nginx/includes/aquila_stacking_routes\.inc;[ \t]*\n', '', s, flags=re.M)
-
-# trouve le premier "server {"
-m=re.search(r'\bserver\s*\{', s)
-if not m:
-    raise SystemExit("No server block found in vhost")
-
-i=m.end()
-# injecte juste après l'ouverture de server{
-inject="\n    "+inc+"\n"
-s=s[:i]+inject+s[i:]
-
-open(p,'w',encoding='utf-8').write(s)
-print("Injected include into vhost server{}")
-PY
-
-say "6) Test + reload nginx"
-nginx -t
+  nginx -t || true
+  die "rolled back (see $BK)"
+fi
 systemctl reload nginx
 
-say "7) Refreeze si needed"
-refreeze_all || true
+say "7) local verify (no DNS dependency)"
+if command -v curl >/dev/null 2>&1; then
+  set +e
+  curl -skI --resolve fireinners.online:443:127.0.0.1 "https://fireinners.online/aquila_stacking/" | head -n 30
+  curl -sk  --resolve fireinners.online:443:127.0.0.1 "https://fireinners.online/aquila_stacking/" | head -n 5
+  set -e
+fi
 
-say "DONE"
-echo "Backup: $BK"
-echo "Teste: curl -I https://fireinners.online/ ; curl -I https://fireinners.online/wolverine/"
+say "DONE: https://fireinners.online/aquila_stacking/"
+say "BK: $BK"
 BASH
-
-chmod +x /root/MEGA_NGINX_FIX_AQUILA_LOCATION_CONTEXT.sh
-bash /root/MEGA_NGINX_FIX_AQUILA_LOCATION_CONTEXT.sh
+chmod +x /root/MEGA_AQUILA_STACKING_ROUTE_FIX_V3_AWK.sh
+bash /root/MEGA_AQUILA_STACKING_ROUTE_FIX_V3_AWK.sh
