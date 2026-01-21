@@ -1,213 +1,150 @@
-cat >/root/MEGA_AQUILA_FIX_ANCHOR_AND_DEPLOY_V2.sh<<'BASH'
+cat >/root/MEGA_IAQUILA_FIX_404.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
-umask 027
 TS="$(date +%Y%m%d_%H%M%S)"
-say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
-die(){ say "ERR: $*"; exit 1; }
-need(){ command -v "$1" >/dev/null 2>&1 || die "missing: $1"; }
-
-[ "$(id -u)" -eq 0 ] || die "run as root"
-
-MODE="${1:-devnet}" # localnet|devnet|mainnet
-case "$MODE" in localnet|devnet|mainnet) ;; *) die "usage: $0 [localnet|devnet|mainnet]";; esac
-
-APP="/opt/aquila_stacking"
-PROG="aquila_stacking"
-BK="/root/AQUILA_FIX_ANCHOR_DEPLOY_V2_BK_${TS}"
+BK="/root/IAQUILA_FIX_404_${TS}"
 mkdir -p "$BK"
+say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 
-say "0) Pre-check"
-need bash
+need(){ command -v "$1" >/dev/null 2>&1 || { echo "ERR missing: $1"; exit 1; }; }
+asroot(){ [ "$(id -u)" = "0" ] || { echo "ERR run as root"; exit 1; }; }
+
+asroot
+need nginx
 need curl
-need git
 need python3
-need node
-need corepack
-need solana
-need solana-keygen
+need lsattr
+need chattr
 
-say "1) Ensure build deps for Rust/Anchor (idempotent)"
-export DEBIAN_FRONTEND hooking=noninteractive
-apt-get update -y >/dev/null
-apt-get install -y --no-install-recommends \
-  ca-certificates curl git jq \
-  build-essential pkg-config libssl-dev \
-  clang cmake make \
-  >/dev/null
+SLUG="iaaquila"
+DOMAIN="fireinners.online"
+VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
+INC="/etc/nginx/includes/${SLUG}_routes.inc"
+WEB="/var/www/${SLUG}"
+PORT="9688"
 
-say "2) Install Rust toolchain (isolated) if missing cargo"
-RUSTUP_HOME="/opt/aquila_toolchains/rustup"
-CARGO_HOME="/opt/aquila_toolchains/cargo"
-mkdir -p "$RUSTUP_HOME" "$CARGO_HOME"
-chmod 755 /opt/aquila_toolchains || true
-export RUSTUP_HOME CARGO_HOME
-export PATH="$CARGO_HOME/bin:$PATH"
+say "== 0) Backup =="
+cp -a "$VHOST" "$BK/$(basename "$VHOST").bak" 2>/dev/null || true
+cp -a "$INC" "$BK/$(basename "$INC").bak" 2>/dev/null || true
+cp -a "$WEB" "$BK/${SLUG}.webroot.bak" 2>/dev/null || true
+nginx -T >"$BK/nginx.T.txt" 2>/dev/null || true
 
-if ! command -v cargo >/dev/null 2>&1; then
-  say "2a) rustup install (non-interactive)"
-  curl -fsSL https://sh.rustup.rs -o "$BK/rustup.sh"
-  sh "$BK/rustup.sh" -y --no-modify-path >/dev/null
+say "== 1) Unfreeze (best-effort) =="
+chattr -i "$VHOST" 2>/dev/null || true
+chattr -i "$INC" 2>/dev/null || true
+
+say "== 2) Ensure webroot =="
+mkdir -p "$WEB"
+if [ ! -f "$WEB/index.html" ]; then
+cat >"$WEB/index.html" <<'HTML'
+<!doctype html><html lang="fr"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>IA AQUILA</title><style>body{font-family:system-ui,Segoe UI,Roboto,Arial;margin:24px}code{background:#f2f2f2;padding:2px 6px;border-radius:6px}</style><h1>IA AQUILA</h1><p>UI servie via <code>/iaaquila/</code></p><ul><li><a href="/iaaquila/api/health">/iaaquila/api/health</a></li></ul></html>
+HTML
 fi
 
-# pin Rust (matches your AquilaStacking stack)
-say "2b) rustup pin 1.76.0"
-rustup toolchain install 1.76.0 >/dev/null
-rustup default 1.76.0 >/dev/null
-rustc -V || true
-cargo -V || true
+say "== 3) Write routes include (deterministic) =="
+mkdir -p "$(dirname "$INC")"
+cat >"$INC" <<INCFILE
+# ${SLUG} routes (managed)
+location = /${SLUG} { return 301 /${SLUG}/; }
+location ^~ /${SLUG}/ {
+  root /var/www;
+  try_files \$uri \$uri/ /${SLUG}/index.html;
+}
+location ^~ /${SLUG}/api/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+  proxy_set_header Connection "";
+  proxy_connect_timeout 5s;
+  proxy_send_timeout 60s;
+  proxy_read_timeout 60s;
+  proxy_pass http://127.0.0.1:${PORT}/api/;
+}
+location ^~ /${SLUG}/exec/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+  proxy_set_header Connection "";
+  proxy_connect_timeout 5s;
+  proxy_send_timeout 60s;
+  proxy_read_timeout 60s;
+  proxy_pass http://127.0.0.1:${PORT}/exec/;
+}
+INCFILE
 
-say "3) Install Anchor CLI 0.30.1 if missing"
-if ! command -v anchor >/dev/null 2>&1; then
-  say "3a) cargo install anchor-cli v0.30.1 (git tag)"
-  # faster/reliable: git tag; locked enforces Cargo.lock
-  cargo install --git https://github.com/coral-xyz/anchor --tag v0.30.1 anchor-cli --locked
-fi
-
-say "3b) Verify anchor"
-anchor --version || die "anchor still missing after install"
-
-say "4) Ensure workspace exists: $APP"
-[ -d "$APP" ] || die "missing $APP (run MEGA_AQUILA_STACKING_PROJECT_V1_100 first)"
-
-say "5) Recreate deploy-modes script (clean) + run ($MODE)"
-cat >/root/MEGA_AQUILA_STACKING_PROJECT_V2_DEPLOY_MODES.sh<<'DEP'
-#!/usr/bin/env bash
-set -euo pipefail
-umask 027
-TS="$(date +%Y%m%d_%H%M%S)"
-say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
-die(){ say "ERR: $*"; exit 1; }
-need(){ command -v "$1" >/dev/null 2>&1 || die "missing: $1"; }
-
-[ "$(id -u)" -eq 0 ] || die "run as root"
-need node; need corepack; need solana; need anchor; need yarn; need jq; need curl; need python3
-
-APP="/opt/aquila_stacking"
-PROG="aquila_stacking"
-BK="/root/AQUILA_STACKING_V2_DEPLOY_BK_${TS}"
-mkdir -p "$BK"
-
-MODE="${1:-localnet}" # localnet|devnet|mainnet
-case "$MODE" in localnet|devnet|mainnet) ;; *) die "usage: $0 [localnet|devnet|mainnet]";; esac
-
-say "0) Mode: $MODE"
-[ -d "$APP" ] || die "missing $APP (run project batch first)"
-cd "$APP"
-
-corepack enable >/dev/null 2>&1 || true
-corepack prepare yarn@1.22.22 --activate >/dev/null 2>&1 || true
-
-say "1) Keypairs per cluster"
-KP_LOCAL="$APP/target/deploy/${PROG}-keypair.json"
-KP_DEV="$APP/keys/${PROG}-devnet-keypair.json"
-KP_MAIN="$APP/keys/${PROG}-mainnet-keypair.json"
-mkdir -p "$APP/keys" "$APP/target/deploy"
-
-mk_kp(){ local f="$1"; [ -f "$f" ] || solana-keygen new --no-bip39-passphrase --silent --outfile "$f" >/dev/null; }
-mk_kp "$KP_LOCAL"
-mk_kp "$KP_DEV"
-mk_kp "$KP_MAIN"
-
-PID_LOCAL="$(solana-keygen pubkey "$KP_LOCAL")"
-PID_DEV="$(solana-keygen pubkey "$KP_DEV")"
-PID_MAIN="$(solana-keygen pubkey "$KP_MAIN")"
-
-say "Program IDs:"
-say "  localnet: $PID_LOCAL"
-say "  devnet : $PID_DEV"
-say "  mainnet: $PID_MAIN"
-
-say "2) Configure provider cluster + wallet"
-case "$MODE" in
-  localnet)
-    solana config set --url http://127.0.0.1:8899 >/dev/null
-    solana config set --keypair "$KP_LOCAL" >/dev/null
-    PID="$PID_LOCAL"
-    ;;
-  devnet)
-    solana config set --url https://api.devnet.solana.com >/dev/null
-    solana config set --keypair "$KP_DEV" >/dev/null
-    PID="$PID_DEV"
-    ;;
-  mainnet)
-    solana config set --url https://api.mainnet-beta.solana.com >/dev/null
-    solana config set --keypair "$KP_MAIN" >/dev/null
-    PID="$PID_MAIN"
-    ;;
-esac
-
-say "3) Patch declare_id + Anchor.toml for selected mode"
-cp -a "$APP/programs/$PROG/src/lib.rs" "$BK/lib.rs.bak"
-cp -a "$APP/Anchor.toml" "$BK/Anchor.toml.bak"
-
-perl -0777 -pe "s/declare_id!\\(\\\"[^\\\"]+\\\"\\);/declare_id!(\\\"$PID\\\");/g" -i "$APP/programs/$PROG/src/lib.rs"
-
+say "== 4) Inject include into vhost (idempotent) =="
 python3 - <<PY
-import re
-APP="$APP"
-PROG="$PROG"
-PID="$PID"
-MODE="$MODE"
-txt=open(f"{APP}/Anchor.toml","r").read()
-section=f"[programs.{MODE}]"
-if section not in txt:
-    txt += "\n"+section+"\n"
-parts=txt.split(section,1)
-pre,rest=parts[0],parts[1]
-m=re.search(r"\n\\[.*?\\]\n", rest)
-body = rest[:m.start()] if m else rest
-tail = rest[m.start():] if m else ""
-body=re.sub(rf"^\\s*{re.escape(PROG)}\\s*=\\s*\\\"[^\\\"]*\\\"\\s*$","",body,flags=re.M)
-body=body.strip("\n")
-if body and not body.endswith("\n"): body+="\n"
-body += f'{PROG} = "{PID}"\n'
-open(f"{APP}/Anchor.toml","w").write(pre+section+"\n"+body+tail)
+import re,sys,os
+vhost="${VHOST}"
+inc="include ${INC};"
+s=open(vhost,"r",encoding="utf-8",errors="ignore").read().splitlines(True)
+if any(inc in ln for ln in s):
+  print("OK include already present"); sys.exit(0)
+
+# find server block containing fireinners.online
+# strategy: locate a line with "server_name" and fireinners.online, then walk backwards to nearest "server" line, then forward counting braces to end.
+idx_sn=None
+for i,ln in enumerate(s):
+  if "server_name" in ln and "fireinners.online" in ln:
+    idx_sn=i; break
+if idx_sn is None:
+  print("ERR cannot find server_name fireinners.online in vhost"); sys.exit(2)
+
+# find start of server block
+start=None
+for j in range(idx_sn, -1, -1):
+  if re.match(r'^\s*server\s*\{', s[j]):
+    start=j; break
+if start is None:
+  print("ERR cannot find server { for that server_name"); sys.exit(3)
+
+brace=0
+end=None
+for k in range(start, len(s)):
+  brace += s[k].count("{")
+  brace -= s[k].count("}")
+  if brace==0 and k>start:
+    end=k; break
+if end is None:
+  print("ERR cannot find end of server block"); sys.exit(4)
+
+insert_at=end
+pad="  "
+# try to match indentation of nearby lines
+m=re.match(r'^(\s*)\}', s[end])
+if m: pad=m.group(1)
+s.insert(insert_at, f"{pad}{inc}\n")
+open(vhost,"w",encoding="utf-8").write("".join(s))
+print("OK injected")
 PY
 
-say "4) Install deps + build"
-yarn install --non-interactive
-anchor build
+say "== 5) Nginx test + reload =="
+nginx -t
+systemctl reload nginx
 
-say "5) Local validator (if localnet)"
-if [ "$MODE" = "localnet" ]; then
-  if ! curl -s http://127.0.0.1:8899 >/dev/null 2>&1; then
-    nohup solana-test-validator --reset >"$BK/solana-test-validator.log" 2>&1 &
-    sleep 2
-  fi
+say "== 6) Smoke tests (local TLS) =="
+CODE1="$(curl -k -sS -o /dev/null -w '%{http_code}' "https://127.0.0.1/${SLUG}/" -H "Host: ${DOMAIN}" || true)"
+CODE2="$(curl -k -sS -o /dev/null -w '%{http_code}' "https://127.0.0.1/${SLUG}/api/health" -H "Host: ${DOMAIN}" || true)"
+say "HTTP /${SLUG}/ => ${CODE1}"
+say "HTTP /${SLUG}/api/health => ${CODE2}"
+if [ "$CODE1" = "404" ]; then
+  say "ERR still 404 on /${SLUG}/ (nginx route not active)"
+  exit 10
 fi
 
-say "6) Airdrop (devnet best effort)"
-if [ "$MODE" = "devnet" ]; then
-  solana airdrop 2 >/dev/null 2>&1 || true
-fi
+say "== 7) Freeze back (chattr +i) + verify =="
+chattr +i "$INC" 2>/dev/null || true
+chattr +i "$VHOST" 2>/dev/null || true
+say "lsattr vhost/inc:"
+lsattr "$VHOST" "$INC" 2>/dev/null || true
 
-say "7) Deploy"
-anchor deploy
-
-say "8) Write deploy info"
-ADDR="$APP/DEPLOY_${MODE}.txt"
-cat >"$ADDR"<<EOF
-MODE=$MODE
-PROGRAM=$PROG
-PROGRAM_ID=$PID
-RPC_URL=$(solana config get | awk -F': ' '/RPC URL/{print $2}')
-WALLET=$(solana config get | awk -F': ' '/Keypair Path/{print $2}')
-TS=$TS
-EOF
-
-say "DONE: $ADDR"
-say "BK: $BK"
-DEP
-chmod +x /root/MEGA_AQUILA_STACKING_PROJECT_V2_DEPLOY_MODES.sh
-
-bash /root/MEGA_AQUILA_STACKING_PROJECT_V2_DEPLOY_MODES.sh "$MODE"
-
-say "9) Summary"
-say "anchor: $(anchor --version 2>/dev/null || true)"
-say "solana: $(solana --version 2>/dev/null || true)"
-say "Workspace: $APP"
-say "Backups: $BK"
+say "== DONE =="
+say "Public: https://${DOMAIN}/${SLUG}/"
+say "API:    https://${DOMAIN}/${SLUG}/api/health"
 BASH
-chmod +x /root/MEGA_AQUILA_FIX_ANCHOR_AND_DEPLOY_V2.sh
-bash /root/MEGA_AQUILA_FIX_ANCHOR_AND_DEPLOY_V2.sh devnet
+chmod +x /root/MEGA_IAQUILA_FIX_404.sh
+/root/MEGA_IAQUILA_FIX_404.sh
