@@ -1,1 +1,340 @@
-curl -i https://fireinners.online/wolverine/vault-api/health
+bash -lc 'cat >/root/WV_FIX_VAULT_FINAL.sh<<'"'"'BASH'"'"'
+#!/usr/bin/env bash
+set -euo pipefail
+
+TS="$(date +%Y%m%d_%H%M%S)"
+BK="/root/BK_WV_${TS}"
+mkdir -p "$BK"
+
+WEBROOT="/var/www/wolverine"
+NGXCONF="/etc/nginx/nginx.conf"
+VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
+VHOST_EN="/etc/nginx/sites-enabled/fireinners.online-ssl"
+INCDIR="/etc/nginx/includes"
+
+INC_STATIC="${INCDIR}/wolverine_static.inc"
+INC_ROUTES="${INCDIR}/wolverine_routes.inc"
+
+AQUILA_BAD="${INCDIR}/aquila_stacking_routes.inc"
+
+VAULT_DIR="/opt/traderone-vault"
+VAULT_HOST="127.0.0.1"
+VAULT_PORT="8787"
+VAULT_SVC="/etc/systemd/system/vault-api.service"
+
+DRPC_URL="https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac"
+
+say(){ printf "[%s] %s\n" "$(date +%H:%M:%S)" "$*"; }
+
+have(){ command -v "$1" >/dev/null 2>&1; }
+
+# short backups (avoid long names)
+BKI=0
+bkfile(){
+  local f="$1"
+  [ -e "$f" ] || return 0
+  BKI=$((BKI+1))
+  cp -a "$f" "$BK/bk_${BKI}" 2>/dev/null || true
+}
+
+IMLIST="$BK/immutable.list"
+touch "$IMLIST"
+
+unfreeze_one(){
+  local f="$1"
+  [ -e "$f" ] || return 0
+  if lsattr -d "$f" 2>/dev/null | grep -q 'i'; then
+    echo "$f" >>"$IMLIST"
+    chattr -i "$f" 2>/dev/null || true
+  fi
+}
+refreeze_all(){
+  [ -s "$IMLIST" ] || return 0
+  while IFS= read -r f; do
+    [ -e "$f" ] && chattr +i "$f" 2>/dev/null || true
+  done <"$IMLIST"
+}
+
+comment_includes_everywhere(){
+  local pat="$1"
+  say "Disable wrong-context includes: $pat"
+  while IFS= read -r f; do
+    [ -f "$f" ] || continue
+    if grep -nE "^[[:space:]]*include[[:space:]]+.*${pat}.*;" "$f" >/dev/null 2>&1; then
+      bkfile "$f"
+      unfreeze_one "$f"
+      perl -0777 -pe "s/^([ \\t]*include[ \\t]+[^;]*${pat}[^;]*;)/# AUTOFIX_${TS} disabled: \\1/mg" -i "$f" || true
+      say "  disabled in: $f"
+    fi
+  done < <(find /etc/nginx -type f \( -name "*.conf" -o -name "*.inc" \) 2>/dev/null)
+}
+
+inject_in_server_block(){
+  local f="$1"
+  local want="$2"
+  grep -F "$want" "$f" >/dev/null 2>&1 && return 0
+  bkfile "$f"
+  unfreeze_one "$f"
+  awk -v ins="$want" '
+    BEGIN{done=0}
+    {print}
+    !done && $0 ~ /^[[:space:]]*server[[:space:]]*\{/ { print "    " ins; done=1 }
+  ' "$f" >"$f.tmp.$$" && mv "$f.tmp.$$" "$f"
+}
+
+say "0) Preflight"
+have nginx || { apt-get update -y; apt-get install -y nginx curl; }
+have curl || { apt-get update -y; apt-get install -y curl; }
+have node || { echo "ERROR: node missing. Fix Node/ npm first then rerun."; exit 1; }
+have npm  || { echo "ERROR: npm missing. Fix Node/ npm first then rerun."; exit 1; }
+
+say "1) Unfreeze nginx core files if immutable"
+unfreeze_one "$NGXCONF"
+unfreeze_one "$VHOST"
+unfreeze_one "$VHOST_EN"
+[ -d "$INCDIR" ] && for f in "$INCDIR"/*.inc "$INCDIR"/*.conf 2>/dev/null; do unfreeze_one "$f" || true; done
+
+say "2) Fix nginx hard fail (location not allowed here) => disable aquila_stacking_routes.inc includes (wrong context)"
+comment_includes_everywhere "aquila_stacking_routes\\.inc"
+
+say "3) Ensure Wolverine webroot (avoid /wolverine 404)"
+mkdir -p "$WEBROOT"
+if [ ! -f "$WEBROOT/index.html" ]; then
+  cat >"$WEBROOT/index.html"<<EOF
+<!doctype html><meta charset="utf-8">
+<title>WOLVERINE</title>
+<h1>WOLVERINE</h1>
+<p>index.html missing. Deploy the Wolverine UI export into /var/www/wolverine.</p>
+EOF
+fi
+
+say "4) Write canonical nginx includes (static + routes)"
+mkdir -p "$INCDIR"
+
+bkfile "$INC_STATIC"
+cat >"$INC_STATIC"<<EOF
+# AUTOGEN_${TS} - Wolverine static
+location ^~ /wolverine/ {
+  alias ${WEBROOT}/;
+  index index.html;
+  try_files \$uri \$uri/ /wolverine/index.html;
+}
+EOF
+
+bkfile "$INC_ROUTES"
+cat >"$INC_ROUTES"<<EOF
+# AUTOGEN_${TS} - Wolverine routes (Vault + Solana RPC proxy)
+
+set \$vault_upstream http://${VAULT_HOST}:${VAULT_PORT};
+
+# Vault API (no redirects; always JSON)
+location = /wolverine/vault-api/health            { proxy_pass \$vault_upstream/health; }
+location = /wolverine/vault-api/create            { proxy_pass \$vault_upstream/create; }
+location = /wolverine/vault/health                { proxy_pass \$vault_upstream/health; }
+location = /wolverine/vault/create                { proxy_pass \$vault_upstream/create; }
+location = /wolverine/traderone/vault/health      { proxy_pass \$vault_upstream/health; }
+location = /wolverine/traderone/vault/create      { proxy_pass \$vault_upstream/create; }
+location = /wolverine/vault/api/health            { proxy_pass \$vault_upstream/health; }
+location = /wolverine/vault/api/create            { proxy_pass \$vault_upstream/create; }
+
+proxy_http_version 1.1;
+proxy_set_header Host \$host;
+proxy_set_header X-Real-IP \$remote_addr;
+proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+
+# Solana RPC (same-origin -> DRPC)
+location = /wolverine/solana-rpc {
+  resolver 1.1.1.1 8.8.8.8 valid=300s;
+  proxy_ssl_server_name on;
+  proxy_set_header Content-Type "application/json";
+  proxy_pass ${DRPC_URL};
+}
+EOF
+
+chmod 0644 "$INC_STATIC" "$INC_ROUTES" || true
+
+say "5) Ensure vhost enabled + includes inside server{}"
+[ -f "$VHOST" ] || { echo "ERROR: missing vhost: $VHOST"; exit 1; }
+ln -sf "$VHOST" "$VHOST_EN" || true
+inject_in_server_block "$VHOST" "include ${INC_STATIC};"
+inject_in_server_block "$VHOST" "include ${INC_ROUTES};"
+
+say "6) Install/repair Vault API backend (${VAULT_HOST}:${VAULT_PORT})"
+mkdir -p "$VAULT_DIR/state"
+
+cat >"$VAULT_DIR/package.json"<<'EOF'
+{
+  "name": "vault-api",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "dependencies": {
+    "@solana/web3.js": "1.95.4",
+    "bs58": "5.0.0"
+  }
+}
+EOF
+
+cat >"$VAULT_DIR/server.js"<<'EOF'
+const http = require("http");
+const { URL } = require("url");
+const fs = require("fs");
+const path = require("path");
+const bs58 = require("bs58");
+const { Keypair } = require("@solana/web3.js");
+
+const HOST = process.env.HOST || "127.0.0.1";
+const PORT = Number(process.env.PORT || "8787");
+const STATE_DIR = process.env.STATE_DIR || path.join(__dirname, "state");
+const STATE_FILE = process.env.STATE_FILE || path.join(STATE_DIR, "state.json");
+
+fs.mkdirSync(STATE_DIR, { recursive: true });
+
+function loadState() {
+  try { return JSON.parse(fs.readFileSync(STATE_FILE, "utf8")); } catch {}
+  return { vaults: {}, createdAt: new Date().toISOString() };
+}
+function saveState(s) { fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2)); }
+
+function send(res, code, obj) {
+  const body = JSON.stringify(obj);
+  res.writeHead(code, {
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store"
+  });
+  res.end(body);
+}
+
+function readJson(req) {
+  return new Promise((resolve, reject) => {
+    let data = "";
+    req.on("data", c => {
+      data += c;
+      if (data.length > 1_000_000) { reject(new Error("payload_too_large")); req.destroy(); }
+    });
+    req.on("end", () => {
+      if (!data) return resolve({});
+      try { resolve(JSON.parse(data)); } catch { reject(new Error("bad_json")); }
+    });
+  });
+}
+
+// soft rate-limit (per IP): 60 requests / 10 min
+const RL = new Map();
+function rateLimit(ip) {
+  const now = Date.now(), win = 10*60*1000, lim = 60;
+  const rec = RL.get(ip) || { t: now, n: 0 };
+  if (now - rec.t > win) { rec.t = now; rec.n = 0; }
+  rec.n++; RL.set(ip, rec);
+  return rec.n <= lim;
+}
+
+http.createServer(async (req, res) => {
+  const u = new URL(req.url, "http://x");
+  const ip = (req.headers["x-forwarded-for"] || "").toString().split(",")[0].trim() || req.socket.remoteAddress || "unknown";
+  if (!rateLimit(ip)) return send(res, 429, { ok:false, error:"rate_limited" });
+
+  if (req.method === "GET" && u.pathname === "/health") {
+    return send(res, 200, { ok:true, service:"vault-api", host:HOST, port:PORT });
+  }
+
+  if (req.method === "POST" && u.pathname === "/create") {
+    let body;
+    try { body = await readJson(req); } catch (e) { return send(res, 400, { ok:false, error:e.message }); }
+
+    const userPub = (body.userPub || body.pub || body.owner || "").toString().trim();
+    const state = loadState();
+    state.vaults = state.vaults || {};
+
+    if (userPub && state.vaults[userPub]?.vaultPub) {
+      return send(res, 200, { ok:true, userPub, vaultPub: state.vaults[userPub].vaultPub, existing:true });
+    }
+
+    const kp = Keypair.generate();
+    const vaultPub = kp.publicKey.toBase58();
+    const secret58 = bs58.encode(Buffer.from(kp.secretKey));
+
+    const key = userPub || `anon:${vaultPub}`;
+    state.vaults[key] = { vaultPub, secret58, createdAt: new Date().toISOString() };
+    saveState(state);
+
+    return send(res, 200, { ok:true, userPub: userPub || null, vaultPub, existing:false });
+  }
+
+  return send(res, 404, { ok:false, error:"not_found" });
+}).listen(PORT, HOST, () => {
+  console.log(JSON.stringify({ ok:true, service:"vault-api", host:HOST, port:PORT }));
+});
+EOF
+
+(
+  cd "$VAULT_DIR"
+  if [ ! -f package-lock.json ]; then
+    npm install --omit=dev --no-fund --no-audit
+  else
+    npm ci --omit=dev --no-fund --no-audit || npm install --omit=dev --no-fund --no-audit
+  fi
+)
+
+cat >"$VAULT_SVC"<<EOF
+[Unit]
+Description=WOLVERINE Vault API
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=${VAULT_DIR}
+Environment=HOST=${VAULT_HOST}
+Environment=PORT=${VAULT_PORT}
+Environment=STATE_DIR=${VAULT_DIR}/state
+Environment=STATE_FILE=${VAULT_DIR}/state/state.json
+ExecStart=/usr/bin/node ${VAULT_DIR}/server.js
+Restart=always
+RestartSec=2
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now vault-api.service
+systemctl restart vault-api.service
+
+say "7) Verify Vault is listening"
+if ! ss -ltnp 2>/dev/null | grep -q ":${VAULT_PORT}"; then
+  say "Vault NOT listening. Showing status + logs:"
+  systemctl status vault-api.service --no-pager || true
+  journalctl -u vault-api.service -n 120 --no-pager || true
+  exit 1
+fi
+
+say "8) nginx -t + reload"
+nginx -t
+systemctl reload nginx
+
+say "9) Local tests"
+echo "== local vault health =="
+curl -sS "http://${VAULT_HOST}:${VAULT_PORT}/health" ; echo
+echo "== local vault create (anon) =="
+curl -sS -X POST "http://${VAULT_HOST}:${VAULT_PORT}/create" -H "content-type: application/json" -d '{}' ; echo
+
+say "10) Through nginx (Host header fireinners.online)"
+echo "== nginx -> vault health =="
+curl -sS -H "Host: fireinners.online" "http://127.0.0.1/wolverine/vault-api/health" ; echo
+echo "== nginx -> vault create =="
+curl -sS -H "Host: fireinners.online" -X POST "http://127.0.0.1/wolverine/vault-api/create" -H "content-type: application/json" -d '{}' ; echo
+echo "== nginx -> solana-rpc getHealth =="
+curl -sS -H "Host: fireinners.online" -X POST "http://127.0.0.1/wolverine/solana-rpc" \
+  -H "content-type: application/json" \
+  -d '"'"'{"jsonrpc":"2.0","id":1,"method":"getHealth"}'"'"' ; echo
+
+say "11) Refreeze immutable files (if any)"
+refreeze_all
+
+say "DONE"
+echo "Open: https://fireinners.online/wolverine/  then Ctrl+F5"
+echo "Backups: $BK"
+BASH
+chmod +x /root/WV_FIX_VAULT_FINAL.sh
+bash /root/WV_FIX_VAULT_FINAL.sh'
