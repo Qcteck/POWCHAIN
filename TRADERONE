@@ -1,223 +1,150 @@
-cat >/root/MEGA_AQUILA_STACKING_WEBROUTE_FIX_V1.sh<<'BASH'
+cat >/root/MEGA_IAQUILA_FIX_404.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
-umask 027
-
 TS="$(date +%Y%m%d_%H%M%S)"
-say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
-die(){ say "ERR: $*"; exit 1; }
-
-[ "$(id -u)" -eq 0 ] || die "run as root"
-command -v nginx >/dev/null 2>&1 || die "nginx missing"
-command -v python3 >/dev/null 2>&1 || die "python3 missing"
-command -v curl >/dev/null 2>&1 || die "curl missing"
-
-DOMAIN="fireinners.online"
-WEBROOT="/var/www/aquila_stacking"
-# Expose BOTH paths to the same WEBROOT (fixes /iaaquila/ 404)
-PATH_A="/aquila_stacking/"
-PATH_B="/iaaquila/"
-
-INC="/etc/nginx/includes/aquila_stacking_routes.inc"
-BK="/root/AQUILA_STACKING_WEBROUTE_FIX_BK_${TS}"
+BK="/root/IAQUILA_FIX_404_${TS}"
 mkdir -p "$BK"
+say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 
-ASKLIB="/opt/fireinners/sentinel/lib/askorupdate.sh"
-if [ -f "$ASKLIB" ]; then
-  # shellcheck disable=SC1090
-  . "$ASKLIB" || true
+need(){ command -v "$1" >/dev/null 2>&1 || { echo "ERR missing: $1"; exit 1; }; }
+asroot(){ [ "$(id -u)" = "0" ] || { echo "ERR run as root"; exit 1; }; }
+
+asroot
+need nginx
+need curl
+need python3
+need lsattr
+need chattr
+
+SLUG="iaaquila"
+DOMAIN="fireinners.online"
+VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
+INC="/etc/nginx/includes/${SLUG}_routes.inc"
+WEB="/var/www/${SLUG}"
+PORT="9688"
+
+say "== 0) Backup =="
+cp -a "$VHOST" "$BK/$(basename "$VHOST").bak" 2>/dev/null || true
+cp -a "$INC" "$BK/$(basename "$INC").bak" 2>/dev/null || true
+cp -a "$WEB" "$BK/${SLUG}.webroot.bak" 2>/dev/null || true
+nginx -T >"$BK/nginx.T.txt" 2>/dev/null || true
+
+say "== 1) Unfreeze (best-effort) =="
+chattr -i "$VHOST" 2>/dev/null || true
+chattr -i "$INC" 2>/dev/null || true
+
+say "== 2) Ensure webroot =="
+mkdir -p "$WEB"
+if [ ! -f "$WEB/index.html" ]; then
+cat >"$WEB/index.html" <<'HTML'
+<!doctype html><html lang="fr"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>IA AQUILA</title><style>body{font-family:system-ui,Segoe UI,Roboto,Arial;margin:24px}code{background:#f2f2f2;padding:2px 6px;border-radius:6px}</style><h1>IA AQUILA</h1><p>UI servie via <code>/iaaquila/</code></p><ul><li><a href="/iaaquila/api/health">/iaaquila/api/health</a></li></ul></html>
+HTML
 fi
 
-write_file(){
-  local path="$1"; shift
-  local tmp; tmp="$(mktemp)"
-  cat >"$tmp"<<EOF
-$*
-EOF
-  if declare -F askorupdate_file >/dev/null 2>&1; then
-    ASKORUPDATE_ASK=0 askorupdate_file "$path" "$tmp" "aquila_stacking web routes" || { rm -f "$tmp"; die "askorupdate_file failed for $path"; }
-    rm -f "$tmp"
-  else
-    chattr -i "$path" 2>/dev/null || true
-    [ -f "$path" ] && cp -a "$path" "$BK/$(echo "$path" | sed 's#/#_#g').bak" || true
-    install -m 0644 "$tmp" "$path"
-    rm -f "$tmp"
-  fi
+say "== 3) Write routes include (deterministic) =="
+mkdir -p "$(dirname "$INC")"
+cat >"$INC" <<INCFILE
+# ${SLUG} routes (managed)
+location = /${SLUG} { return 301 /${SLUG}/; }
+location ^~ /${SLUG}/ {
+  root /var/www;
+  try_files \$uri \$uri/ /${SLUG}/index.html;
 }
-
-say "1) Ensure WEBROOT + index.html"
-mkdir -p "$WEBROOT"
-chmod 0755 "$WEBROOT" || true
-chown -R www-data:www-data "$WEBROOT" 2>/dev/null || true
-
-APP="/opt/aquila_stacking"
-PROG="aquila_stacking"
-PID_LOCAL="UNKNOWN"
-PID_DEV="UNKNOWN"
-PID_MAIN="UNKNOWN"
-if command -v solana-keygen >/dev/null 2>&1; then
-  [ -f "$APP/target/deploy/${PROG}-keypair.json" ] && PID_LOCAL="$(solana-keygen pubkey "$APP/target/deploy/${PROG}-keypair.json" 2>/dev/null || echo UNKNOWN)"
-  [ -f "$APP/keys/${PROG}-devnet-keypair.json" ] && PID_DEV="$(solana-keygen pubkey "$APP/keys/${PROG}-devnet-keypair.json" 2>/dev/null || echo UNKNOWN)"
-  [ -f "$APP/keys/${PROG}-mainnet-keypair.json" ] && PID_MAIN="$(solana-keygen pubkey "$APP/keys/${PROG}-mainnet-keypair.json" 2>/dev/null || echo UNKNOWN)"
-fi
-
-cat >"$WEBROOT/index.html"<<EOF
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AquilaStacking</title><style>body{font-family:system-ui,Segoe UI,Arial;margin:24px;max-width:980px}code{background:#0b1020;color:#d7e3ff;padding:2px 6px;border-radius:6px}pre{background:#0b1020;color:#d7e3ff;padding:12px;border-radius:10px;overflow:auto}a{color:#2b6fff;text-decoration:none}a:hover{text-decoration:underline}.box{border:1px solid #e5e7eb;border-radius:12px;padding:14px;margin:12px 0}</style></head><body><h1>AquilaStacking</h1><div class="box"><b>Public URLs</b><div>• <a href="${PATH_A}">${PATH_A}</a></div><div>• <a href="${PATH_B}">${PATH_B}</a></div></div><div class="box"><b>Program IDs</b><pre>localnet: ${PID_LOCAL}
-devnet : ${PID_DEV}
-mainnet: ${PID_MAIN}</pre></div><div class="box"><b>Workspace</b><div><code>${APP}</code></div><div><b>Webroot</b> <code>${WEBROOT}</code></div><div><b>Domain</b> <code>${DOMAIN}</code></div></div></body></html>
-EOF
-chown www-data:www-data "$WEBROOT/index.html" 2>/dev/null || true
-chmod 0644 "$WEBROOT/index.html" || true
-
-say "2) Write nginx include (routes)"
-ROUTES="### AQUILA_STACKING_ROUTES_BEGIN
-location = ${PATH_A%/} { return 301 ${PATH_A}; }
-location ^~ ${PATH_A} {
-  alias ${WEBROOT}/;
-  index index.html;
-  add_header Cache-Control \"no-store\" always;
-  try_files \$uri \$uri/ /index.html =404;
+location ^~ /${SLUG}/api/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+  proxy_set_header Connection "";
+  proxy_connect_timeout 5s;
+  proxy_send_timeout 60s;
+  proxy_read_timeout 60s;
+  proxy_pass http://127.0.0.1:${PORT}/api/;
 }
-location = ${PATH_B%/} { return 301 ${PATH_B}; }
-location ^~ ${PATH_B} {
-  alias ${WEBROOT}/;
-  index index.html;
-  add_header Cache-Control \"no-store\" always;
-  try_files \$uri \$uri/ /index.html =404;
+location ^~ /${SLUG}/exec/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+  proxy_set_header Connection "";
+  proxy_connect_timeout 5s;
+  proxy_send_timeout 60s;
+  proxy_read_timeout 60s;
+  proxy_pass http://127.0.0.1:${PORT}/exec/;
 }
-### AQUILA_STACKING_ROUTES_END"
-write_file "$INC" "$ROUTES"
+INCFILE
 
-say "3) Patch active nginx configs serving ${DOMAIN} (443) to include routes (idempotent)"
-nginx -T >"$BK/nginx_T.txt" 2>&1 || { cp -a /var/log/nginx/error.log "$BK/" 2>/dev/null || true; die "nginx -T failed"; }
+say "== 4) Inject include into vhost (idempotent) =="
+python3 - <<PY
+import re,sys,os
+vhost="${VHOST}"
+inc="include ${INC};"
+s=open(vhost,"r",encoding="utf-8",errors="ignore").read().splitlines(True)
+if any(inc in ln for ln in s):
+  print("OK include already present"); sys.exit(0)
 
-python3 - <<'PY'
-import re, os, sys, shutil, datetime
-BK=os.environ["BK"]
-DOMAIN=os.environ["DOMAIN"]
-INC=os.environ["INC"]
-T=open(os.path.join(BK,"nginx_T.txt"),"r",errors="ignore").read()
+# find server block containing fireinners.online
+# strategy: locate a line with "server_name" and fireinners.online, then walk backwards to nearest "server" line, then forward counting braces to end.
+idx_sn=None
+for i,ln in enumerate(s):
+  if "server_name" in ln and "fireinners.online" in ln:
+    idx_sn=i; break
+if idx_sn is None:
+  print("ERR cannot find server_name fireinners.online in vhost"); sys.exit(2)
 
-# collect files referenced in nginx -T output
-files=[]
-for m in re.finditer(r"^# configuration file (.+?):", T, flags=re.M):
-    p=m.group(1).strip()
-    if p.startswith("/"):
-        files.append(p)
-# prefer enabled vhosts + conf.d
-prio=[]
-def score(p):
-    s=0
-    if "/etc/nginx/sites-enabled/" in p: s+=50
-    if "/etc/nginx/conf.d/" in p: s+=40
-    if "fireinners" in p: s+=30
-    if "ssl" in p: s+=10
-    return -s
-files=sorted(set(files), key=score)
+# find start of server block
+start=None
+for j in range(idx_sn, -1, -1):
+  if re.match(r'^\s*server\s*\{', s[j]):
+    start=j; break
+if start is None:
+  print("ERR cannot find server { for that server_name"); sys.exit(3)
 
-def patch_file(path):
-    try:
-        txt=open(path,"r",errors="ignore").read()
-    except:
-        return False, "unreadable"
-    if "AQUILA_STACKING_ROUTES_BEGIN" in txt and INC in txt:
-        return True, "already"
-    # find server blocks containing server_name DOMAIN and listening 443 (or ssl)
-    # naive but deterministic insertion: add include inside that server block after the opening line
-    out=[]
-    i=0
-    n=len(txt)
-    changed=False
+brace=0
+end=None
+for k in range(start, len(s)):
+  brace += s[k].count("{")
+  brace -= s[k].count("}")
+  if brace==0 and k>start:
+    end=k; break
+if end is None:
+  print("ERR cannot find end of server block"); sys.exit(4)
 
-    # tokenize by characters to track braces; parse server blocks
-    pattern=re.compile(r"\bserver\s*\{", re.I)
-    for m in pattern.finditer(txt):
-        pass
-
-    # manual scan
-    idx=0
-    while True:
-        m=pattern.search(txt, idx)
-        if not m:
-            out.append(txt[idx:])
-            break
-        out.append(txt[idx:m.start()])
-        # find matching closing brace for this server block
-        start=m.start()
-        brace_pos=txt.find("{", m.end()-1)
-        if brace_pos==-1:
-            out.append(txt[m.start():])
-            break
-        depth=0
-        j=brace_pos
-        while j<n:
-            c=txt[j]
-            if c=="{": depth+=1
-            elif c=="}":
-                depth-=1
-                if depth==0:
-                    end=j+1
-                    break
-            j+=1
-        else:
-            out.append(txt[m.start():])
-            break
-        block=txt[start:end]
-        idx=end
-
-        # checks
-        if re.search(rf"\bserver_name\b[^;]*\b{re.escape(DOMAIN)}\b", block) and re.search(r"\blisten\b[^;]*\b443\b", block):
-            if INC not in block:
-                # insert include near top of server block (after first newline following '{')
-                k=block.find("{")
-                k2=block.find("\n", k)
-                if k2==-1: k2=k+1
-                insert=f"\n    include {INC};\n"
-                block=block[:k2+1]+insert+block[k2+1:]
-                changed=True
-        out.append(block)
-
-    newtxt="".join(out)
-    if changed:
-        b=os.path.join(BK, os.path.basename(path)+".bak")
-        shutil.copy2(path, b)
-        # try unlock immutability (best effort)
-        try:
-            os.system(f"chattr -i {path} 2>/dev/null || true")
-        except: pass
-        open(path,"w").write(newtxt)
-        return True, "patched"
-    return True, "no-match"
-
-patched=[]
-for p in files:
-    ok,st=patch_file(p)
-    if ok and st in ("patched","already"):
-        patched.append((p,st))
-
-# write report
-rep=os.path.join(BK,"patched_files.txt")
-with open(rep,"w") as f:
-    for p,st in patched:
-        f.write(f"{st}\t{p}\n")
-
-print("patched_count=",len(patched))
+insert_at=end
+pad="  "
+# try to match indentation of nearby lines
+m=re.match(r'^(\s*)\}', s[end])
+if m: pad=m.group(1)
+s.insert(insert_at, f"{pad}{inc}\n")
+open(vhost,"w",encoding="utf-8").write("".join(s))
+print("OK injected")
 PY
 
-say "4) nginx test + reload"
+say "== 5) Nginx test + reload =="
 nginx -t
 systemctl reload nginx
 
-say "5) Local HTTPS verify (no DNS dependency)"
-curl -k -sS --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}${PATH_B}" | head -n 3 || true
-curl -k -sS --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}${PATH_A}" | head -n 3 || true
+say "== 6) Smoke tests (local TLS) =="
+CODE1="$(curl -k -sS -o /dev/null -w '%{http_code}' "https://127.0.0.1/${SLUG}/" -H "Host: ${DOMAIN}" || true)"
+CODE2="$(curl -k -sS -o /dev/null -w '%{http_code}' "https://127.0.0.1/${SLUG}/api/health" -H "Host: ${DOMAIN}" || true)"
+say "HTTP /${SLUG}/ => ${CODE1}"
+say "HTTP /${SLUG}/api/health => ${CODE2}"
+if [ "$CODE1" = "404" ]; then
+  say "ERR still 404 on /${SLUG}/ (nginx route not active)"
+  exit 10
+fi
 
-say "DONE"
-say "Open: https://${DOMAIN}${PATH_B}"
-say "Open: https://${DOMAIN}${PATH_A}"
-say "INC: $INC"
-say "WEBROOT: $WEBROOT"
-say "BK: $BK"
+say "== 7) Freeze back (chattr +i) + verify =="
+chattr +i "$INC" 2>/dev/null || true
+chattr +i "$VHOST" 2>/dev/null || true
+say "lsattr vhost/inc:"
+lsattr "$VHOST" "$INC" 2>/dev/null || true
+
+say "== DONE =="
+say "Public: https://${DOMAIN}/${SLUG}/"
+say "API:    https://${DOMAIN}/${SLUG}/api/health"
 BASH
-chmod +x /root/MEGA_AQUILA_STACKING_WEBROUTE_FIX_V1.sh
-BK="/root/AQUILA_STACKING_WEBROUTE_FIX_BK_$(date +%Y%m%d_%H%M%S)" DOMAIN="fireinners.online" INC="/etc/nginx/includes/aquila_stacking_routes.inc" bash /root/MEGA_AQUILA_STACKING_WEBROUTE_FIX_V1.sh
+chmod +x /root/MEGA_IAQUILA_FIX_404.sh
+/root/MEGA_IAQUILA_FIX_404.sh
