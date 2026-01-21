@@ -1,137 +1,429 @@
 bash -lc 'set -euo pipefail
 DOMAIN="fireinners.online"
-URL="https://${DOMAIN}/bundler/"
-RESOLVE="--resolve ${DOMAIN}:443:127.0.0.1"
-TMP="$(mktemp)";trap "rm -f $TMP" EXIT
+PUBLIC_BASE="https://${DOMAIN}"
+DEFAULT_RPC="https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac"
+SVC="bundler-api.service"
+TS="$(date +%Y%m%d_%H%M%S)"
+BK="/root/BUNDLER_METADATA_ONCHAIN_${TS}"
+mkdir -p "$BK"
 
-echo "== fetch current /bundler/ html (origin localhost) =="
-curl -k -sS $RESOLVE "$URL" >"$TMP" || { echo "ERROR: curl failed"; exit 1; }
-H="$(sha256sum "$TMP" | awk "{print \$1}")"
-echo "HTML_SHA256=$H"
+say(){ printf "[%s] %s\n" "$(date +%H:%M:%S)" "$*"; }
 
-echo "== find matching index.html on disk =="
-MATCH=""
-while IFS= read -r f; do
-  sh="$(sha256sum "$f" 2>/dev/null | awk "{print \$1}")" || continue
-  if [ "$sh" = "$H" ]; then MATCH="$f"; break; fi
-done < <(find /var/www /opt -maxdepth 6 -type f \( -name index.html -o -name bundler.html \) 2>/dev/null)
+say "detect API_DIR from systemd: ${SVC}"
+systemctl is-enabled "$SVC" >/dev/null 2>&1 || true
+UNIT="$(systemctl show -p FragmentPath --value "$SVC" 2>/dev/null || true)"
+WORKDIR="$(systemctl show -p WorkingDirectory --value "$SVC" 2>/dev/null || true)"
+EXECLINE="$(systemctl show -p ExecStart --value "$SVC" 2>/dev/null || true)"
 
-if [ -z "$MATCH" ]; then
-  for f in /var/www/bundler/index.html /var/www/html/bundler/index.html /opt/fireinners/frontend-react/app/dist/bundler/index.html; do
-    if [ -f "$f" ]; then MATCH="$f"; break; fi
+API_DIR=""
+if [ -n "${WORKDIR:-}" ] && [ -d "$WORKDIR" ]; then API_DIR="$WORKDIR"; fi
+if [ -z "$API_DIR" ]; then
+  # parse node .../server.js
+  API_JS="$(printf "%s" "$EXECLINE" | sed -nE "s/.*\/usr\/bin\/node[[:space:]]+([^ ;]+).*/\1/p" | head -n1)"
+  if [ -n "${API_JS:-}" ] && [ -f "$API_JS" ]; then API_DIR="$(dirname "$API_JS")"; fi
+fi
+if [ -z "$API_DIR" ]; then
+  # common fallback
+  for d in /opt/bundler_api /opt/bundler-api /opt/bundler; do
+    [ -d "$d" ] && API_DIR="$d" && break
   done
 fi
+[ -n "$API_DIR" ] && [ -d "$API_DIR" ] || { say "ERROR: cannot detect API_DIR"; exit 1; }
+say "API_DIR=$API_DIR"
 
-test -n "$MATCH" || { echo "ERROR: cannot locate served bundler HTML on disk"; exit 1; }
-echo "UI_FILE=$MATCH"
+say "backup (api dir + nginx include/vhost if present)"
+cp -a "$API_DIR" "$BK/api_dir" 2>/dev/null || true
+for f in /etc/nginx/sites-available/fireinners.online-ssl /etc/nginx/nginx.conf /etc/nginx/includes/bundler_routes.inc; do
+  [ -f "$f" ] && cp -a "$f" "$BK/$(basename "$f")" || true
+done
+[ -n "${UNIT:-}" ] && [ -f "$UNIT" ] && cp -a "$UNIT" "$BK/$(basename "$UNIT")" || true
+say "BACKUP=$BK"
 
-echo "== backup =="
-BK="/root/BUNDLER_UI_META_PATCH_$(date +%Y%m%d_%H%M%S)"
-mkdir -p "$BK"
-cp -a "$MATCH" "$BK/$(basename "$MATCH")"
-echo "BACKUP=$BK"
+say "ensure api folders"
+mkdir -p "$API_DIR/public/assets"
 
-echo "== patch UI: add Token Name + Logo upload (idempotent) =="
-python3 - "$MATCH" <<'"'"'PY'"'"'
-import re,sys,os
-p=sys.argv[1]
-s=open(p,"r",encoding="utf-8",errors="ignore").read()
-
-if "id=\"tokenName\"" in s and "id=\"tokenLogo\"" in s:
-  print("SKIP: already patched")
-  sys.exit(0)
-
-# 1) Inject HTML block near the form (best-effort: before OWNER or before MINT_ADDRESS or before submit button)
-block = r"""
-<div style="display:flex;gap:12px;flex-wrap:wrap;margin:10px 0">
-  <div style="flex:1;min-width:240px">
-    <div style="font-size:12px;opacity:.85;margin:0 0 6px">Token Name (off-chain)</div>
-    <input id="tokenName" placeholder="Ex: FIREINNERS" style="width:100%;box-sizing:border-box;padding:10px;border-radius:10px;border:1px solid rgba(120,180,255,.35);background:rgba(0,0,0,.15);color:#d8ecff;outline:none">
-  </div>
-  <div style="flex:1;min-width:240px">
-    <div style="font-size:12px;opacity:.85;margin:0 0 6px">Logo (PNG/JPG)</div>
-    <input id="tokenLogo" type="file" accept="image/*" style="width:100%;box-sizing:border-box;padding:8px;border-radius:10px;border:1px solid rgba(120,180,255,.35);background:rgba(0,0,0,.15);color:#d8ecff;outline:none">
-    <div style="margin-top:8px;display:flex;align-items:center;gap:10px">
-      <img id="tokenLogoPreview" alt="" style="display:none;height:40px;width:40px;object-fit:cover;border-radius:10px;border:1px solid rgba(120,180,255,.35)">
-      <div id="tokenLogoInfo" style="display:none;font-size:12px;opacity:.85"></div>
-    </div>
-  </div>
-</div>
-""".strip("\n")
-
-# Heuristics for insertion point
-cands=[
-  (r'(OWNER\s*\(optionnel\)[\s\S]{0,200})', True),
-  (r'(MINT_ADDRESS\s*\(optionnel,\s*reuse\)[\s\S]{0,200})', True),
-  (r'(<button[^>]*>\s*Cr[ée]er\s+le\s+token\s*</button>)', False),
-  (r'(<button[^>]*id="createToken"[^>]*>[\s\S]*?</button>)', False),
-]
-inserted=False
-for pat, after in cands:
-  m=re.search(pat,s,re.IGNORECASE)
-  if m:
-    i=m.end(1) if after else m.start(1)
-    s=s[:i]+"\n"+block+"\n"+s[i:]
-    inserted=True
-    break
-if not inserted:
-  # fallback: before closing form if exists
-  m=re.search(r'(</form\s*>)',s,re.IGNORECASE)
-  if m:
-    s=s[:m.start(1)]+"\n"+block+"\n"+s[m.start(1):]
-    inserted=True
-if not inserted:
-  # last resort: before </body>
-  m=re.search(r'(</body\s*>)',s,re.IGNORECASE)
-  if m:
-    s=s[:m.start(1)]+"\n"+block+"\n"+s[m.start(1):]
-    inserted=True
-
-# 2) Inject JS to handle file -> dataURL + persist in localStorage (idempotent marker)
-marker="/*BUNDLER_TOKEN_META_UI_V1*/"
-if marker not in s:
-  js = r"""
-<script>/*BUNDLER_TOKEN_META_UI_V1*/(()=>{try{const $=id=>document.getElementById(id);const n=$("tokenName"),f=$("tokenLogo"),img=$("tokenLogoPreview"),info=$("tokenLogoInfo");const ls=window.localStorage;const keyN="BUNDLER_TOKEN_NAME",keyL="BUNDLER_TOKEN_LOGO_DATAURL";const setLogo=(u)=>{window.__BUNDLER_LOGO_DATAURL=u||"";if(u){if(img){img.src=u;img.style.display="block"}if(info){info.textContent=(u.split(",")[0]||"image")+" · loaded";info.style.display="block"}try{ls.setItem(keyL,u)}catch(e){}}else{if(img){img.style.display="none"}if(info){info.style.display="none"}try{ls.removeItem(keyL)}catch(e){}}};const setName=(v)=>{window.__BUNDLER_TOKEN_NAME=(v||"").trim();try{ls.setItem(keyN,window.__BUNDLER_TOKEN_NAME)}catch(e){}};try{const sn=ls.getItem(keyN)||"";if(n){n.value=sn;setName(sn)}const sl=ls.getItem(keyL)||"";if(sl){setLogo(sl)}}catch(e){};if(n){n.addEventListener("input",()=>setName(n.value))}if(f){f.addEventListener("change",()=>{const file=f.files&&f.files[0];if(!file){setLogo("");return}const r=new FileReader();r.onload=()=>setLogo(String(r.result||""));r.readAsDataURL(file);})}window.__BUNDLER_GET_META=()=>({tokenName:(window.__BUNDLER_TOKEN_NAME||""),logo:(window.__BUNDLER_LOGO_DATAURL||"")});}catch(e){console.error(e)}})();</script>
-""".strip("\n")
-  # place before </body> if possible
-  m=re.search(r'(</body\s*>)',s,re.IGNORECASE)
-  if m: s=s[:m.start(1)]+"\n"+js+"\n"+s[m.start(1):]
-  else: s=s+"\n"+js+"\n"
-
-# 3) Best-effort: if UI builds payload variable, attach tokenName/logo to request (non-breaking if backend ignores)
-if "/*BUNDLER_META_ATTACH_V1*/" not in s:
-  attach = r"""
-;(()=>{try{
-  const meta=()=>{try{return (window.__BUNDLER_GET_META&&window.__BUNDLER_GET_META())||{tokenName:"",logo:""}}catch(e){return {tokenName:"",logo:""}}};
-  const _fetch=window.fetch;
-  window.fetch=async function(input,init){
-    try{
-      const u=typeof input==="string"?input:(input&&input.url)||"";
-      if(u.includes("/bundler/api/create-token") && init && init.body && typeof init.body==="string" && init.headers){
-        try{
-          const j=JSON.parse(init.body);
-          const m=meta();
-          if(m.tokenName) j.tokenName=m.tokenName;
-          if(m.logo) j.logo=m.logo;
-          init.body=JSON.stringify(j);
-        }catch(e){}
-      }
-    }catch(e){}
-    return _fetch.apply(this,arguments);
-  };
-}catch(e){}})();/*BUNDLER_META_ATTACH_V1*/"""
-  m=re.search(r'(</script\s*>\s*</body\s*>)',s,re.IGNORECASE)
-  if m: s=s[:m.start(1)]+"\n<script>"+attach+"</script>\n"+s[m.start(1):]
+say "write .env (default RPC + public base) (non-destructive: append/replace keys)"
+ENVF="$API_DIR/.env"
+touch "$ENVF"
+python3 - "$ENVF" "$DEFAULT_RPC" "$PUBLIC_BASE" <<'"'"'PY'"'"'
+import sys,re
+p, rpc, base = sys.argv[1], sys.argv[2], sys.argv[3]
+s=open(p,"r",encoding="utf-8",errors="ignore").read().splitlines()
+kv={}
+out=[]
+def setk(k,v):
+  kv[k]=v
+for ln in s:
+  if not ln.strip() or ln.lstrip().startswith("#"):
+    out.append(ln); continue
+  m=re.match(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", ln)
+  if not m: out.append(ln); continue
+  k=m.group(1); v=m.group(2)
+  kv[k]=v
+for k,v in [("DEFAULT_RPC",rpc),("PUBLIC_BASE",base),("ASSETS_DIR","public/assets")]:
+  kv[k]=v
+# rebuild, preserving existing non-key lines, then ensure keys exist at end
+kept=set()
+new=[]
+for ln in out:
+  m=re.match(r"^([A-Za-z_][A-Za-z0-9_]*)=", ln or "")
+  if m and m.group(1) in kv:
+    k=m.group(1); new.append(f"{k}={kv[k]}"); kept.add(k)
   else:
-    m=re.search(r'(</body\s*>)',s,re.IGNORECASE)
-    if m: s=s[:m.start(1)]+"\n<script>"+attach+"</script>\n"+s[m.start(1):]
-    else: s=s+"\n<script>"+attach+"</script>\n"
-
-open(p,"w",encoding="utf-8").write(s)
-print("PATCHED:",p)
+    new.append(ln)
+for k in ["DEFAULT_RPC","PUBLIC_BASE","ASSETS_DIR"]:
+  if k not in kept:
+    new.append(f"{k}={kv[k]}")
+open(p,"w",encoding="utf-8").write("\n".join(new).rstrip()+"\n")
+print("OK .env updated:",p)
 PY
 
-echo "== smoke test (origin localhost) =="
-curl -k -sS $RESOLVE "$URL" | head -n 5 >/dev/null
-echo "OK: reloaded HTML; open $URL and you will see Token Name + Logo fields."
+say "ensure node deps (package.json + npm install in API_DIR)"
+cd "$API_DIR"
+if [ ! -f package.json ]; then
+  npm init -y >/dev/null 2>&1 || true
+fi
+# ensure deps
+npm i --silent express cors dotenv @solana/web3.js @solana/spl-token @metaplex-foundation/mpl-token-metadata >/dev/null 2>&1 || npm i express cors dotenv @solana/web3.js @solana/spl-token @metaplex-foundation/mpl-token-metadata
+
+say "write server.js (real create + on-chain metadata) with marker"
+cat > "$API_DIR/server.js" <<'"'"'JS'"'"'
+"use strict";
+const fs=require("fs");
+const path=require("path");
+const express=require("express");
+const cors=require("cors");
+require("dotenv").config({path:path.join(__dirname,".env")});
+const {Connection,Keypair,PublicKey,Transaction,SystemProgram}=require("@solana/web3.js");
+const spl=require("@solana/spl-token");
+const mpl=require("@metaplex-foundation/mpl-token-metadata");
+
+/*BUNDLER_SERVER_ONCHAIN_META_V1*/
+
+const APP=express();
+APP.use(cors({origin:"*",methods:["GET","POST","OPTIONS"],allowedHeaders:["Content-Type","X-API-Key"]}));
+APP.use(express.json({limit:"6mb"}));
+
+const API_KEY=(process.env.BUNDLER_API_KEY||process.env.API_KEY||"").trim();
+const DEFAULT_RPC=(process.env.DEFAULT_RPC||"").trim();
+const PUBLIC_BASE=(process.env.PUBLIC_BASE||"").trim()||"";
+const ASSETS_DIR=path.join(__dirname, (process.env.ASSETS_DIR||"public/assets").trim());
+const WALLET_PATH=process.env.WALLET_PATH ? process.env.WALLET_PATH.trim() : path.join(__dirname,"wallet.json");
+
+function now(){return new Date().toISOString();}
+function ok(res,obj){res.status(200).json(obj);}
+function bad(res,code,msg,extra){res.status(code).json(Object.assign({ok:false,error:String(msg||"ERROR")},extra||{}));}
+
+function loadPayer(){
+  if(!fs.existsSync(WALLET_PATH)) throw new Error("WALLET_MISSING:"+WALLET_PATH);
+  const raw=fs.readFileSync(WALLET_PATH,"utf8");
+  const sk=Uint8Array.from(JSON.parse(raw));
+  return Keypair.fromSecretKey(sk);
+}
+
+function trimName(n){n=String(n||"").trim(); if(!n) return ""; if(n.length>32) n=n.slice(0,32); return n;}
+function makeSymbolFromName(n){
+  n=String(n||"").trim().toUpperCase().replace(/[^A-Z0-9]/g,"");
+  if(!n) return "TOKEN";
+  if(n.length>10) n=n.slice(0,10);
+  return n;
+}
+function dataUrlToFile(dataUrl, outPath){
+  const m=String(dataUrl||"").match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
+  if(!m) throw new Error("LOGO_BAD_DATAURL");
+  const mime=m[1].toLowerCase();
+  const b64=m[2];
+  const buf=Buffer.from(b64,"base64");
+  if(buf.length>1024*1024*2) throw new Error("LOGO_TOO_LARGE");
+  let ext="png";
+  if(mime.includes("jpeg")||mime.includes("jpg")) ext="jpg";
+  else if(mime.includes("webp")) ext="webp";
+  else if(mime.includes("png")) ext="png";
+  else ext="img";
+  const file=outPath.endsWith("."+ext)?outPath:(outPath+"."+ext);
+  fs.mkdirSync(path.dirname(file),{recursive:true});
+  fs.writeFileSync(file,buf);
+  return {file,ext,mime,size:buf.length};
+}
+
+function requireApiKey(req,res){
+  if(!API_KEY) return true; // if no key configured, allow (dev)
+  const k=(req.headers["x-api-key"]||req.body?.apiKey||req.body?.key||"").toString().trim();
+  if(k!==API_KEY) { bad(res,401,"UNAUTHORIZED"); return false; }
+  return true;
+}
+
+APP.get("/health",(req,res)=>ok(res,{ok:true,ts:now(),host:"127.0.0.1"}));
+APP.get("/info",(req,res)=>ok(res,{ok:true,ts:now(),defaultRpc:DEFAULT_RPC||null,publicBase:PUBLIC_BASE||null,assetsDir:ASSETS_DIR,walletPath:WALLET_PATH,haveApiKey:!!API_KEY}));
+
+APP.post("/api/create-token", async (req,res)=>{
+  try{
+    if(!requireApiKey(req,res)) return;
+
+    const body=req.body||{};
+    const rpc=String(body.rpc||DEFAULT_RPC||"").trim();
+    if(!rpc) return bad(res,400,"RPC_MISSING");
+    const decimals=Number(body.decimals??6);
+    if(!Number.isFinite(decimals) || decimals<0 || decimals>9) return bad(res,400,"BAD_DECIMALS");
+    const supplyHuman=String(body.supply??body.amount??"0").trim();
+    if(!/^\d+$/.test(supplyHuman)) return bad(res,400,"BAD_SUPPLY");
+    const preflightOnly=!!body.preflightOnly;
+
+    const payer=loadPayer();
+    const ownerStr=String(body.owner||"").trim();
+    const owner=ownerStr? new PublicKey(ownerStr) : payer.publicKey;
+
+    // optional reuse mint
+    const reuseMintStr=String(body.mintAddress||body.mint||"").trim();
+    const reuseMint = reuseMintStr ? new PublicKey(reuseMintStr) : null;
+
+    const revokeMintAuth=!!body.revokeMintAuth;
+    const revokeFreezeAuth=!!body.revokeFreezeAuth;
+
+    // UI meta (name/logo)
+    const tokenName=trimName(body.tokenName||body.name||"");
+    const logoDataUrl=String(body.logo||"").trim();
+
+    const conn=new Connection(rpc,"confirmed");
+
+    // amount = supply * 10^decimals
+    const pow10 = BigInt("1" + "0".repeat(decimals));
+    const amount = BigInt(supplyHuman) * pow10;
+
+    // rent estimates (mint + ata + metadata, best-effort)
+    const mintRentLamports = await conn.getMinimumBalanceForRentExemption(spl.MINT_SIZE).catch(()=>0);
+    const ataRentLamports = await conn.getMinimumBalanceForRentExemption(spl.ACCOUNT_SIZE).catch(()=>0);
+    // metadata size is not exposed here; return 0 (program handles)
+    const est={mintRentLamports:Number(mintRentLamports)||0, mintRentSOL:(Number(mintRentLamports)||0)/1e9, ataRentLamports:Number(ataRentLamports)||0, ataRentSOL:(Number(ataRentLamports)||0)/1e9};
+
+    if(preflightOnly){
+      return ok(res,{ok:true,stub:false,result:{preflightOnly:true,rpc,payer:payer.publicKey.toBase58(),owner:owner.toBase58(),decimals,supplyHuman,amount:amount.toString(),reuseMint:reuseMint?reuseMint.toBase58():null,est,tokenName:tokenName||null,haveLogo:!!logoDataUrl,revokeMintAuth,revokeFreezeAuth}});
+    }
+
+    // REAL MODE (costs SOL)
+    let mintKp=null;
+    let mintPub=null;
+
+    if(reuseMint){
+      mintPub=reuseMint;
+    }else{
+      mintKp=Keypair.generate();
+      mintPub=mintKp.publicKey;
+      // create mint (payer as mintAuthority+freezeAuthority initially)
+      const lam=await conn.getMinimumBalanceForRentExemption(spl.MINT_SIZE);
+      const tx=new Transaction();
+      tx.add(SystemProgram.createAccount({fromPubkey:payer.publicKey,newAccountPubkey:mintPub,space:spl.MINT_SIZE,lamports:lam,programId:spl.TOKEN_PROGRAM_ID}));
+      tx.add(spl.createInitializeMintInstruction(mintPub,decimals,payer.publicKey,payer.publicKey,spl.TOKEN_PROGRAM_ID));
+      tx.feePayer=payer.publicKey;
+      tx.recentBlockhash=(await conn.getLatestBlockhash("confirmed")).blockhash;
+      tx.sign(payer,mintKp);
+      const sig=await conn.sendRawTransaction(tx.serialize(),{skipPreflight:false,maxRetries:5});
+      await conn.confirmTransaction(sig,"confirmed");
+    }
+
+    // ATA + mintTo
+    const ata = await spl.getOrCreateAssociatedTokenAccount(conn,payer,mintPub,owner,true,"confirmed");
+    const sigMintTo = await spl.mintTo(conn,payer,mintPub,ata.address,payer,amount,[],{commitment:"confirmed"});
+
+    // revoke authorities if requested
+    let sigRevokeMint=null, sigRevokeFreeze=null;
+    if(revokeMintAuth){
+      sigRevokeMint=await spl.setAuthority(conn,payer,mintPub,payer.publicKey,spl.AuthorityType.MintTokens,null,[],{commitment:"confirmed"});
+    }
+    if(revokeFreezeAuth){
+      sigRevokeFreeze=await spl.setAuthority(conn,payer,mintPub,payer.publicKey,spl.AuthorityType.FreezeAccount,null,[],{commitment:"confirmed"});
+    }
+
+    // on-chain metadata (URI points to our hosted JSON)
+    let metaSig=null, metadataPda=null, uri=null, imageUrl=null, jsonUrl=null, savedLogo=null;
+    if(tokenName){
+      fs.mkdirSync(ASSETS_DIR,{recursive:true});
+      const symbol=makeSymbolFromName(tokenName);
+
+      // save logo if provided
+      if(logoDataUrl){
+        const base=path.join(ASSETS_DIR, mintPub.toBase58());
+        const r=dataUrlToFile(logoDataUrl, base+"_logo");
+        savedLogo=path.basename(r.file);
+        imageUrl=(PUBLIC_BASE? (PUBLIC_BASE+"/bundler/assets/"+savedLogo) : ("/bundler/assets/"+savedLogo));
+      }
+
+      // write metadata json
+      const jsonName=mintPub.toBase58()+".json";
+      jsonUrl=(PUBLIC_BASE? (PUBLIC_BASE+"/bundler/assets/"+jsonName) : ("/bundler/assets/"+jsonName));
+      uri=jsonUrl;
+      const md={
+        name: tokenName,
+        symbol,
+        description: "Created via fireinners Bundler",
+        image: imageUrl || null,
+        external_url: PUBLIC_BASE? (PUBLIC_BASE+"/bundler/") : "/bundler/",
+        attributes:[]
+      };
+      fs.writeFileSync(path.join(ASSETS_DIR,jsonName), JSON.stringify(md,null,2));
+
+      const TOKEN_METADATA_PROGRAM_ID = mpl.PROGRAM_ID ? mpl.PROGRAM_ID : new PublicKey("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s");
+      const [pda] = PublicKey.findProgramAddressSync(
+        [Buffer.from("metadata"), TOKEN_METADATA_PROGRAM_ID.toBuffer(), mintPub.toBuffer()],
+        TOKEN_METADATA_PROGRAM_ID
+      );
+      metadataPda=pda.toBase58();
+
+      const ix = mpl.createCreateMetadataAccountV3Instruction(
+        {
+          metadata: pda,
+          mint: mintPub,
+          mintAuthority: payer.publicKey,
+          payer: payer.publicKey,
+          updateAuthority: payer.publicKey,
+          systemProgram: SystemProgram.programId,
+          rent: new PublicKey("SysvarRent111111111111111111111111111111111")
+        },
+        {
+          createMetadataAccountArgsV3: {
+            data: {
+              name: tokenName,
+              symbol: symbol,
+              uri: uri,
+              sellerFeeBasisPoints: 0,
+              creators: null,
+              collection: null,
+              uses: null
+            },
+            isMutable: true,
+            collectionDetails: null
+          }
+        }
+      );
+
+      const txm=new Transaction().add(ix);
+      txm.feePayer=payer.publicKey;
+      txm.recentBlockhash=(await conn.getLatestBlockhash("confirmed")).blockhash;
+      txm.sign(payer);
+      metaSig=await conn.sendRawTransaction(txm.serialize(),{skipPreflight:false,maxRetries:5});
+      await conn.confirmTransaction(metaSig,"confirmed");
+    }
+
+    return ok(res,{
+      ok:true,stub:false,
+      result:{
+        rpc,
+        payer:payer.publicKey.toBase58(),
+        owner:owner.toBase58(),
+        mint:mintPub.toBase58(),
+        ata:ata.address.toBase58(),
+        decimals,
+        supplyHuman,
+        amount:amount.toString(),
+        signatures:{mintTo:sigMintTo,revokeMint:sigRevokeMint,revokeFreeze:sigRevokeFreeze,metadata:metaSig},
+        metadata:{pda:metadataPda,uri,jsonUrl,imageUrl},
+        explorer:{
+          mint:"https://solscan.io/token/"+mintPub.toBase58(),
+          ata:"https://solscan.io/account/"+ata.address.toBase58()
+        }
+      }
+    });
+
+  }catch(e){
+    return bad(res,500,"SERVER_ERROR",{detail:String(e&&e.message||e)});
+  }
+});
+
+APP.use("/assets", express.static(path.join(__dirname,"public/assets")));
+
+const HOST=process.env.API_HOST||"127.0.0.1";
+const PORT=Number(process.env.API_PORT||9797);
+APP.listen(PORT,HOST,()=>console.log(JSON.stringify({ok:true,ts:now(),host:HOST,port:PORT,rpc:DEFAULT_RPC||null})));
+JS
+
+say "ensure nginx route for /bundler/assets/ (alias to API assets dir) + /bundler/api/ proxy"
+INC="/etc/nginx/includes/bundler_routes.inc"
+touch "$INC"
+python3 - "$INC" "$API_DIR" <<'"'"'PY'"'"'
+import sys,re
+inc=sys.argv[1]; api_dir=sys.argv[2]
+s=open(inc,"r",encoding="utf-8",errors="ignore").read()
+if "BUNDLER_ROUTES_META_V1" not in s:
+  block=f"""
+# BUNDLER_ROUTES_META_V1
+location ^~ /bundler/api/ {{
+  proxy_pass http://127.0.0.1:9797/;
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+}}
+location ^~ /bundler/assets/ {{
+  alias {api_dir}/public/assets/;
+  add_header Cache-Control "no-store";
+}}
+"""
+  s=(s.rstrip()+"\n\n"+block+"\n")
+open(inc,"w",encoding="utf-8").write(s)
+print("OK include:",inc)
+PY
+
+say "ensure vhost includes bundler_routes.inc (idempotent)"
+VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
+[ -f "$VHOST" ] || { say "ERROR: vhost not found: $VHOST"; exit 1; }
+grep -q "/etc/nginx/includes/bundler_routes.inc" "$VHOST" || {
+  # insert inside server { ... } after first server_name or listen line
+  python3 - "$VHOST" <<'"'"'PY'"'"'
+import sys,re
+p=sys.argv[1]
+s=open(p,"r",encoding="utf-8",errors="ignore").read().splitlines(True)
+out=[]
+in_server=False
+inserted=False
+depth=0
+for ln in s:
+  out.append(ln)
+  if re.search(r"^\s*server\s*\{", ln):
+    in_server=True
+    depth=1
+    continue
+  if in_server:
+    depth += ln.count("{")-ln.count("}")
+    if not inserted and re.search(r"^\s*(listen|server_name)\b", ln):
+      out.append("    include /etc/nginx/includes/bundler_routes.inc;\n")
+      inserted=True
+    if depth<=0:
+      in_server=False
+open(p,"w",encoding="utf-8").write("".join(out))
+print("OK injected include into",p)
+PY
+}
+
+say "systemd override to load env + keep workingdir"
+mkdir -p /etc/systemd/system/bundler-api.service.d
+cat > /etc/systemd/system/bundler-api.service.d/override.conf <<EOF
+[Service]
+WorkingDirectory=${API_DIR}
+EnvironmentFile=${API_DIR}/.env
+ExecStart=
+ExecStart=/usr/bin/node ${API_DIR}/server.js
+Restart=always
+RestartSec=2
+User=root
+EOF
+
+say "reload systemd + restart api"
+systemctl daemon-reload
+systemctl enable --now "$SVC" >/dev/null 2>&1 || true
+systemctl restart "$SVC"
+sleep 1
+systemctl --no-pager -l status "$SVC" | sed -n "1,25p" || true
+
+say "nginx test + reload"
+nginx -t
+systemctl reload nginx
+
+say "smoke tests (origin localhost)"
+curl -sS "http://127.0.0.1:9797/health" || true
+curl -k -sS --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/bundler/api/health" || true
+curl -k -sS --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/bundler/assets/" -I | sed -n "1,5p" || true
+
+say "DONE"
+say "BACKUP=$BK"
+say "NOTE: For on-chain metadata, fill Token Name + (optional) Logo, UNCHECK PREFLIGHT_ONLY, then Create. This will spend SOL from the server payer wallet."
 '
