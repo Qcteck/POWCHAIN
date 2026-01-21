@@ -1,447 +1,111 @@
-cat >/root/MEGA_WOLVERINE_VAULT_FINAL.sh <<'BASH'
+cat >/root/MEGA_AQUILA_STACKING_ROUTE_FIX_V1.sh<<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
-
+umask 027
 TS="$(date +%Y%m%d_%H%M%S)"
-BK="/root/MEGA_WOLVERINE_VAULT_BK_${TS}"
+say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
+die(){ say "ERR: $*"; exit 1; }
+need(){ command -v "$1" >/dev/null 2>&1 || die "missing: $1"; }
+
+[ "$(id -u)" -eq 0 ] || die "run as root"
+
+# FireInners VPS fixed
+VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
+INC="/etc/nginx/includes/aquila_stacking_routes.inc"
+WEBROOT="/var/www/aquila_stacking"
+HTML="${WEBROOT}/index.html"
+
+# Project (if installed)
+APP="/opt/aquila_stacking"
+KEYS="${APP}/keys"
+PROG="aquila_stacking"
+
+BK="/root/AQUILA_STAKING_ROUTE_FIX_BK_${TS}"
 mkdir -p "$BK"
+cp -a "$VHOST" "$BK/fireinners.online-ssl.bak" || true
+[ -f "$INC" ] && cp -a "$INC" "$BK/aquila_stacking_routes.inc.bak" || true
+[ -d "$WEBROOT" ] && cp -a "$WEBROOT" "$BK/webroot_aquila_stacking.bak" || true
 
-WEBROOT="/var/www/wolverine"
-INDEX="$WEBROOT/index.html"
-
-NGX_VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
-NGX_EN="/etc/nginx/sites-enabled"
-INC="/etc/nginx/includes/wolverine_routes.inc"
-
-VAULT_DIR="/opt/traderone-vault-api"
-VAULT_PORT="8787"
-VAULT_SVC="/etc/systemd/system/traderone-vault-api.service"
-VAULT_USER="vaultapi"
-KEYFILE="/etc/traderone-vault-api.key"
-ORIGIN="https://fireinners.online"
-
-say(){ printf "\n[%s] %s\n" "$(date +%H:%M:%S)" "$*"; }
-die(){ echo "FATAL: $*" >&2; exit 1; }
-
-restore_on_fail(){
-  set +e
-  say "ROLLBACK: restauration backups si présents"
-  [ -f "$BK/nginx_vhost.bak" ] && cp -a "$BK/nginx_vhost.bak" "$NGX_VHOST" || true
-  [ -f "$BK/wolverine_routes.inc.bak" ] && cp -a "$BK/wolverine_routes.inc.bak" "$INC" || true
-  [ -f "$BK/index.html.bak" ] && cp -a "$BK/index.html.bak" "$INDEX" || true
-  nginx -t >/dev/null 2>&1 && systemctl reload nginx || true
-  systemctl restart traderone-vault-api >/dev/null 2>&1 || true
-}
-trap 'restore_on_fail' ERR
-
-say "0) Savepoint (si disponible)"
-if [ -x /root/WOLVERINE_SAVEPOINT.sh ]; then /root/WOLVERINE_SAVEPOINT.sh || true; fi
-
-say "1) Préflight outils"
-export DEBIAN_FRONTEND=noninteractive
-command -v nginx >/dev/null 2>&1 || { apt-get update -y; apt-get install -y nginx; }
-command -v node >/dev/null 2>&1 || die "Node manquant. (Règle: pas apt npm). Installe Node via NodeSource/corepack puis relance."
-command -v curl >/dev/null 2>&1 || apt-get install -y curl
-command -v python3 >/dev/null 2>&1 || apt-get install -y python3
-
-say "2) Webroot Wolverine"
-mkdir -p "$WEBROOT"
-[ -f "$INDEX" ] || die "INDEX manquant: $INDEX"
-
-say "3) Backup fichiers clés"
-cp -a "$NGX_VHOST" "$BK/nginx_vhost.bak" || true
-[ -f "$INC" ] && cp -a "$INC" "$BK/wolverine_routes.inc.bak" || true
-cp -a "$INDEX" "$BK/index.html.bak" || true
-
-say "4) Fix conflit server_name (désactive vhosts en double, conserve fireinners.online-ssl)"
-# On ne touche qu'aux symlinks dans sites-enabled qui déclarent server_name fireinners.online et qui ne sont pas fireinners.online-ssl
-for f in "$NGX_EN"/*; do
-  [ -L "$f" ] || continue
-  bn="$(basename "$f")"
-  [ "$bn" = "fireinners.online-ssl" ] && continue
-  tgt="$(readlink -f "$f" || true)"
-  [ -n "$tgt" ] || continue
-  if grep -RqsE 'server_name\s+fireinners\.online(\s|;)' "$tgt"; then
-    say "   - disable duplicate: $bn -> $tgt"
-    cp -a "$f" "$BK/sites-enabled_${bn}.bak" || true
-    rm -f "$f"
-  fi
-done
-
-say "5) Nginx include routes Wolverine (RPC + Vault API sans 301/HTML/405)"
-cat >"$INC" <<INC
-# AUTO-GEN by MEGA_WOLVERINE_VAULT_FINAL.sh @ $TS
-
-# ---- Solana RPC proxy (JSON-RPC POST) ----
-location = /wolverine/solana-rpc {
-  proxy_http_version 1.1;
-  proxy_ssl_server_name on;
-  proxy_set_header Host lb.drpc.live;
-  proxy_set_header Connection "";
-  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto \$scheme;
-
-  # CORS (durci)
-  if (\$request_method = OPTIONS) {
-    add_header Access-Control-Allow-Origin "$ORIGIN" always;
-    add_header Access-Control-Allow-Methods "POST,OPTIONS" always;
-    add_header Access-Control-Allow-Headers "content-type" always;
-    add_header Access-Control-Max-Age 86400 always;
-    return 204;
-  }
-  add_header Access-Control-Allow-Origin "$ORIGIN" always;
-  add_header Content-Type "application/json" always;
-
-  proxy_pass https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac;
-}
-
-# ---- Vault API (canon) ----
-# Canon: /wolverine/traderone/vault/*
-location ^~ /wolverine/traderone/vault/ {
-  proxy_http_version 1.1;
-  proxy_set_header Host \$host;
-  proxy_set_header X-Real-IP \$remote_addr;
-  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto \$scheme;
-
-  # CORS (durci)
-  if (\$request_method = OPTIONS) {
-    add_header Access-Control-Allow-Origin "$ORIGIN" always;
-    add_header Access-Control-Allow-Methods "GET,POST,OPTIONS" always;
-    add_header Access-Control-Allow-Headers "content-type" always;
-    add_header Access-Control-Max-Age 86400 always;
-    return 204;
-  }
-  add_header Access-Control-Allow-Origin "$ORIGIN" always;
-
-  proxy_pass http://127.0.0.1:$VAULT_PORT/;
-}
-
-# ---- Aliases legacy (sans redirect 301) ----
-location ^~ /wolverine/vault-api/ { proxy_pass http://127.0.0.1:$VAULT_PORT/; }
-location ^~ /wolverine/vault/     { proxy_pass http://127.0.0.1:$VAULT_PORT/; }
-INC
-
-say "6) S'assure que le vhost inclut wolverine_routes.inc"
-grep -q "wolverine_routes.inc" "$NGX_VHOST" || {
-  # Ajoute l'include dans le premier server {} trouvé (minimal)
-  python3 - <<PY
-import re
-p="$NGX_VHOST"
-s=open(p,'r',encoding='utf-8',errors='ignore').read()
-if "include /etc/nginx/includes/wolverine_routes.inc;" in s:
-  print("OK already included")
-  raise SystemExit(0)
-m=re.search(r"server\s*{", s)
-if not m: raise SystemExit("No server block found")
-i=m.end()
-ins="\n    include /etc/nginx/includes/wolverine_routes.inc;\n"
-s=s[:i]+ins+s[i:]
-open(p,'w',encoding='utf-8').write(s)
-print("Injected include into first server{}")
-PY
-}
-
-say "7) Installer/repair Vault API backend (JSON only + signature Phantom + encryption + rate-limit)"
-mkdir -p "$VAULT_DIR"
-if ! id -u "$VAULT_USER" >/dev/null 2>&1; then useradd -r -s /usr/sbin/nologin "$VAULT_USER" || true; fi
-
-# Keyfile AES (root:vaultapi 640)
-if [ ! -f "$KEYFILE" ]; then
-  umask 077
-  head -c 32 /dev/urandom | base64 >"$KEYFILE"
-  chown root:"$VAULT_USER" "$KEYFILE"
-  chmod 640 "$KEYFILE"
+ASKLIB="/opt/fireinners/sentinel/lib/askorupdate.sh"
+if [ -f "$ASKLIB" ]; then
+  # shellcheck disable=SC1090
+  . "$ASKLIB" || true
 fi
 
-cat >"$VAULT_DIR/package.json" <<'PKG'
-{
-  "name": "traderone-vault-api",
-  "version": "1.0.0",
-  "private": true,
-  "type": "commonjs",
-  "main": "server.js",
-  "dependencies": {
-    "bs58": "^5.0.0",
-    "express": "^4.19.2",
-    "tweetnacl": "^1.0.3"
-  }
-}
-PKG
-
-cat >"$VAULT_DIR/server.js" <<'JS'
-const fs = require("fs");
-const path = require("path");
-const crypto = require("crypto");
-const express = require("express");
-const nacl = require("tweetnacl");
-const bs58 = require("bs58");
-
-const PORT = parseInt(process.env.PORT || "8787", 10);
-const ORIGIN = process.env.ORIGIN || "https://fireinners.online";
-const KEYFILE = process.env.KEYFILE || "/etc/traderone-vault-api.key";
-const STATE = process.env.STATE || path.join(__dirname, "state.json");
-
-function now(){ return Date.now(); }
-
-function readKey(){
-  const b64 = fs.readFileSync(KEYFILE, "utf8").trim();
-  const raw = Buffer.from(b64, "base64");
-  if (raw.length !== 32) throw new Error("Bad KEY length (need 32 bytes base64)");
-  return raw;
+write_file(){
+  local path="$1"
+  local tmp; tmp="$(mktemp)"
+  cat >"$tmp"
+  if declare -F askorupdate_file >/dev/null 2>&1; then
+    ASKORUPDATE_ASK=0 askorupdate_file "$path" "$tmp" "deploy aquila_stacking route" || { rm -f "$tmp"; die "askorupdate_file failed: $path"; }
+    rm -f "$tmp"
+  else
+    chattr -i "$path" 2>/dev/null || true
+    cp -a "$path" "$path.bak.$TS" 2>/dev/null || true
+    install -m 0644 "$tmp" "$path"
+    rm -f "$tmp"
+  fi
 }
 
-const KEY = readKey();
+need nginx
+need systemctl
 
-function enc(obj){
-  const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv("aes-256-gcm", KEY, iv);
-  const pt = Buffer.from(JSON.stringify(obj), "utf8");
-  const ct = Buffer.concat([cipher.update(pt), cipher.final()]);
-  const tag = cipher.getAuthTag();
-  return { iv: iv.toString("base64"), tag: tag.toString("base64"), data: ct.toString("base64") };
-}
+say "1) WEBROOT: $WEBROOT"
+mkdir -p "$WEBROOT"
+chmod 0755 "$WEBROOT"
 
-function dec(payload){
-  const iv = Buffer.from(payload.iv, "base64");
-  const tag = Buffer.from(payload.tag, "base64");
-  const data = Buffer.from(payload.data, "base64");
-  const decipher = crypto.createDecipheriv("aes-256-gcm", KEY, iv);
-  decipher.setAuthTag(tag);
-  const pt = Buffer.concat([decipher.update(data), decipher.final()]);
-  return JSON.parse(pt.toString("utf8"));
-}
+say "2) Program ID"
+PID="UNKNOWN"
+if command -v solana-keygen >/dev/null 2>&1 && [ -f "$KEYS/${PROG}-keypair.json" ]; then
+  PID="$(solana-keygen pubkey "$KEYS/${PROG}-keypair.json" 2>/dev/null || echo UNKNOWN)"
+fi
 
-function loadState(){
-  try{
-    const s = JSON.parse(fs.readFileSync(STATE,"utf8"));
-    if (!s || typeof s !== "object") return { vaults:{} };
-    if (!s.vaults) s.vaults = {};
-    return s;
-  } catch(e){
-    return { vaults:{} };
-  }
-}
-function saveState(st){
-  fs.writeFileSync(STATE, JSON.stringify(st,null,2));
-  try{ fs.chmodSync(STATE, 0o600); }catch(_){}
-}
+say "3) index.html"
+cat >"$HTML"<<EOF
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AquilaStacking</title><style>body{font-family:system-ui,Segoe UI,Arial;margin:24px;max-width:980px}code{background:#0b1020;color:#d7e3ff;padding:10px;border-radius:10px;display:block;overflow:auto}h1{margin:0 0 12px}small{opacity:.8}</style></head><body><h1>AquilaStacking</h1><p><b>Program ID:</b><code>${PID}</code></p><p><b>Workspace:</b><code>${APP}</code></p><p><b>URL:</b><code>/aquila_stacking/</code></p><p><small>Redirect: /aquilastacking/ → /aquila_stacking/</small></p></body></html>
+EOF
+chown -R www-data:www-data "$WEBROOT" 2>/dev/null || true
+chmod -R 0755 "$WEBROOT"
 
-const app = express();
-app.disable("x-powered-by");
-app.use(express.json({ limit: "64kb" }));
+say "4) nginx include: $INC"
+write_file "$INC" <<EOF
+location = /aquilastacking { return 301 /aquila_stacking/; }
+location ^~ /aquilastacking/ { return 301 /aquila_stacking/; }
+location ^~ /aquila_stacking/ { alias ${WEBROOT}/; index index.html; try_files \$uri \$uri/ /aquila_stacking/index.html; add_header Cache-Control "no-store" always; }
+EOF
 
-// CORS strict
-app.use((req,res,next)=>{
-  const o = req.headers.origin;
-  if (o === ORIGIN) res.setHeader("Access-Control-Allow-Origin", ORIGIN);
-  res.setHeader("Vary","Origin");
-  res.setHeader("Access-Control-Allow-Methods","GET,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers","content-type");
-  if (req.method === "OPTIONS") return res.status(204).end();
-  return next();
-});
+say "5) ensure vhost includes $INC"
+INC_LINE="include /etc/nginx/includes/aquila_stacking_routes.inc;"
+MARKER="# AQUILA_STAKING_INCLUDE"
 
-// Rate limit simple (IP)
-const RL_WIN_MS = 60_000;
-const RL_MAX = 20;
-const rl = new Map();
-function rateLimit(req,res,next){
-  const ip = (req.headers["x-forwarded-for"]||req.socket.remoteAddress||"").toString().split(",")[0].trim();
-  const t = now();
-  const v = rl.get(ip) || { t0:t, n:0 };
-  if (t - v.t0 > RL_WIN_MS){ v.t0 = t; v.n = 0; }
-  v.n++;
-  rl.set(ip,v);
-  if (v.n > RL_MAX) return res.status(429).json({ ok:false, error:"rate_limited" });
-  next();
-}
+chattr -i "$VHOST" 2>/dev/null || true
 
-function isB58(s){ return typeof s === "string" && s.length>=20 && s.length<=60; }
+if grep -qF "$INC_LINE" "$VHOST"; then
+  say "vhost already includes aquila_stacking"
+else
+  cp -a "$VHOST" "$BK/fireinners.online-ssl.preappend.$TS" || true
+  cat >>"$VHOST"<<EOF
 
-app.get("/health",(req,res)=> res.json({ ok:true, service:"vault-api", ts: new Date().toISOString() }));
+${MARKER}
+${INC_LINE}
+# END_${MARKER}
+EOF
+fi
 
-// POST /create : nécessite signature Phantom (anti-abus)
-app.post("/create", rateLimit, (req,res)=>{
-  try{
-    const { userPub, sig, ts } = req.body || {};
-    if (!isB58(userPub) || !isB58(sig) || typeof ts !== "number") return res.status(400).json({ ok:false, error:"bad_params" });
+say "6) nginx -t + reload (rollback if fail)"
+if ! nginx -t; then
+  say "nginx invalid -> rollback"
+  cp -a "$BK/fireinners.online-ssl.bak" "$VHOST" || true
+  [ -f "$BK/aquila_stacking_routes.inc.bak" ] && cp -a "$BK/aquila_stacking_routes.inc.bak" "$INC" || true
+  nginx -t || true
+  die "rolled back"
+fi
 
-    // anti-replay (±5 minutes)
-    const dt = Math.abs(now() - ts);
-    if (dt > 5*60*1000) return res.status(401).json({ ok:false, error:"stale_ts" });
-
-    const msg = `VAULT_CREATE:${userPub}:${ts}`;
-    const pub = bs58.decode(userPub);
-    const signature = bs58.decode(sig);
-    const ok = nacl.sign.detached.verify(Buffer.from(msg,"utf8"), signature, pub);
-    if (!ok) return res.status(401).json({ ok:false, error:"bad_signature" });
-
-    const st = loadState();
-    if (st.vaults[userPub]){
-      return res.json({ ok:true, userPub, vaultPub: st.vaults[userPub].vaultPub, existing:true });
-    }
-
-    const kp = nacl.sign.keyPair();
-    const vaultPub = bs58.encode(Buffer.from(kp.publicKey));
-    const vaultPriv = bs58.encode(Buffer.from(kp.secretKey));
-
-    // stocke chiffré
-    st.vaults[userPub] = {
-      vaultPub,
-      vaultEnc: enc({ vaultPriv }),
-      createdAt: new Date().toISOString()
-    };
-    saveState(st);
-
-    return res.json({ ok:true, userPub, vaultPub, existing:false });
-  } catch(e){
-    return res.status(500).json({ ok:false, error:"internal", detail: String(e && e.message || e) });
-  }
-});
-
-app.listen(PORT, "127.0.0.1", ()=> console.log(`vault-api listening on 127.0.0.1:${PORT}`));
-JS
-
-# deps install (idempotent)
-cd "$VAULT_DIR"
-if [ ! -d node_modules ]; then npm install --omit=dev; else npm install --omit=dev >/dev/null 2>&1 || true; fi
-
-chown -R "$VAULT_USER":"$VAULT_USER" "$VAULT_DIR"
-chmod 750 "$VAULT_DIR"
-chmod 640 "$VAULT_DIR/package.json" "$VAULT_DIR/server.js" || true
-
-say "8) Systemd service Vault API"
-cat >"$VAULT_SVC" <<SVC
-[Unit]
-Description=TraderOne Vault API (Wolverine)
-After=network.target
-
-[Service]
-Type=simple
-User=$VAULT_USER
-Group=$VAULT_USER
-WorkingDirectory=$VAULT_DIR
-Environment=PORT=$VAULT_PORT
-Environment=ORIGIN=$ORIGIN
-Environment=KEYFILE=$KEYFILE
-Environment=STATE=$VAULT_DIR/state.json
-ExecStart=/usr/bin/node $VAULT_DIR/server.js
-Restart=always
-RestartSec=1
-
-# Hardening (minimal compatible)
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=$VAULT_DIR
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectControlGroups=true
-
-[Install]
-WantedBy=multi-user.target
-SVC
-
-systemctl daemon-reload
-systemctl enable --now traderone-vault-api
-systemctl restart traderone-vault-api
-
-say "9) Patch frontend: endpoint canon + suppression duplication (non destructive)"
-# On ajoute un override JS en fin de fichier (sans sed global sur URLs)
-python3 - <<PY
-p="$INDEX"
-s=open(p,'r',encoding='utf-8',errors='ignore').read()
-marker="/*__VAULT_FINAL_OVERRIDE__*/"
-if marker in s:
-  print("Override déjà présent")
-  raise SystemExit(0)
-
-override = r'''
-<script>/*__VAULT_FINAL_OVERRIDE__*/(function(){try{
-  // Canon endpoint (sans redirects)
-  var VAULT_BASE="/wolverine/traderone/vault";
-  // 1) Dédup Vault UI: garde la première section seulement (safe: cible boutons exacts)
-  window.addEventListener("DOMContentLoaded",function(){
-    try{
-      var btns=[].slice.call(document.querySelectorAll("button"));
-      var targets=btns.filter(b=>((b.textContent||"").trim().toLowerCase().indexOf("créer vault")===0));
-      if(targets.length>1){
-        for(var i=1;i<targets.length;i++){
-          var b=targets[i];
-          var box=b.closest("div,section,article")||b.parentElement;
-          if(box){ box.remove(); }
-        }
-      }
-    }catch(e){}
-  });
-
-  // 2) Hook fetch: si l'UI appelle un ancien endpoint (/wolverine/vault-api ou /wolverine/vault), on reroute vers canon
-  var _fetch=window.fetch;
-  window.fetch=function(input,init){
-    try{
-      var url=(typeof input==="string")?input:(input&&input.url)||"";
-      if(url){
-        url=url.replace(/^https?:\/\/[^\/]+/,"");
-        url=url.replace(/^\/wolverine\/(vault-api|vault)\b/, VAULT_BASE);
-        url=url.replace(/^\/wolverine\/traderone\/vault-api\b/, VAULT_BASE);
-        if(typeof input==="string") input=url; else input=new Request(url,input);
-      }
-    }catch(e){}
-    return _fetch(input,init);
-  };
-
-  // 3) Helper global: create vault (utilisable même si l'UI n'est pas à jour)
-  window.__createVaultFinal = async function(pub, provider){
-    if(!provider||!provider.signMessage) throw new Error("Phantom signMessage missing");
-    var ts=Date.now();
-    var msg="VAULT_CREATE:"+pub+":"+ts;
-    var enc=new TextEncoder();
-    var signed=await provider.signMessage(enc.encode(msg), "utf8");
-    // signed.signature: Uint8Array
-    // bs58 local (si déjà chargé ailleurs) sinon mini encode
-    function b58enc(bytes){
-      if(window.bs58&&window.bs58.encode) return window.bs58.encode(bytes);
-      var ALPH="123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-      var d=[0];
-      for(var i=0;i<bytes.length;i++){
-        var c=bytes[i];
-        for(var j=0;j<d.length;j++){ c += d[j]<<8; d[j]=c%58; c=(c/58)|0; }
-        while(c){ d.push(c%58); c=(c/58)|0; }
-      }
-      var s="";
-      for(var k=0; bytes[k]===0 && k<bytes.length-1; k++) s+=ALPH[0];
-      for(var q=d.length-1;q>=0;q--) s+=ALPH[d[q]];
-      return s;
-    }
-    var sig=b58enc(signed.signature);
-    var r=await fetch(VAULT_BASE+"/create",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({userPub:pub,sig:sig,ts:ts})});
-    return await r.json();
-  };
-}catch(e){}})();</script>
-'''
-open(p,'w',encoding='utf-8').write(s+"\n"+override+"\n")
-print("Override ajouté")
-PY
-
-say "10) Nginx test + reload"
-nginx -t
 systemctl reload nginx
+chattr +i "$VHOST" 2>/dev/null || true
 
-say "11) Tests (local + public) -> doit être JSON"
-# local service must answer
-curl -fsS "http://127.0.0.1:$VAULT_PORT/health" | python3 -c 'import sys,json;json.load(sys.stdin);print("OK local health JSON")'
-
-# public through nginx (canon)
-curl -fsS "$ORIGIN/wolverine/traderone/vault/health" | python3 -c 'import sys,json;json.load(sys.stdin);print("OK public health JSON")'
-
-say "12) Résultat"
-echo "BACKUP=$BK"
-echo "Vault health: $ORIGIN/wolverine/traderone/vault/health"
-echo "UI: $ORIGIN/wolverine/"
-echo "DONE: Ctrl+F5 sur /wolverine, connect Phantom, puis clique 'Créer Vault + Déposer'."
+say "DONE: https://fireinners.online/aquila_stacking/"
+say "BK: $BK"
 BASH
-
-chmod +x /root/MEGA_WOLVERINE_VAULT_FINAL.sh
-bash /root/MEGA_WOLVERINE_VAULT_FINAL.sh
+chmod +x /root/MEGA_AQUILA_STACKING_ROUTE_FIX_V1.sh
+bash /root/MEGA_AQUILA_STACKING_ROUTE_FIX_V1.sh
