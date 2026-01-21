@@ -1,9 +1,9 @@
-cat >/root/MEGA_AQUILA_STACKING_ONLY_UNFREEZE_NGX.sh <<'BASH'
+cat >/root/MEGA_AQUILA_STACKING_DEDUP_FIX.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 umask 022
 TS="$(date +%Y%m%d_%H%M%S)"
-BK="/root/AQUILA_STACKING_ONLY_NGX_BK_${TS}"
+BK="/root/AQUILA_STACKING_DEDUP_BK_${TS}"
 mkdir -p "$BK"
 say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 die(){ echo "ERR: $*" >&2; exit 1; }
@@ -13,123 +13,104 @@ PATH_APP="/aquilastacking"
 WEBROOT="/var/www/aquilastacking"
 INC="/etc/nginx/includes/aquilastacking_routes.inc"
 VHOST_A="/etc/nginx/sites-available/fireinners.online-ssl"
-VHOST_E="/etc/nginx/sites-enabled/fireinners.online-ssl"
 NGX="/etc/nginx/nginx.conf"
 
 backup_one(){ local p="$1"; [ -e "$p" ] || return 0; mkdir -p "$BK/$(dirname "$p")"; cp -a "$p" "$BK/$p.bak" 2>/dev/null || true; }
-
 lsattr_safe(){ lsattr "$1" 2>/dev/null | awk '{print $1}' || echo ""; }
+unfreeze_one(){ local f="$1"; [ -e "$f" ] || return 0; local a; a="$(lsattr_safe "$f")"; if echo "$a" | grep -q 'i'; then say "UNFREEZE: chattr -i $f"; chattr -i "$f" 2>/dev/null || true; fi; }
+refreeze_one(){ local f="$1"; [ -e "$f" ] || return 0; say "REFREEZE: chattr +i $f"; chattr +i "$f" 2>/dev/null || true; }
 
-unfreeze_one(){
-  local f="$1"
-  [ -e "$f" ] || return 0
-  local a; a="$(lsattr_safe "$f")"
-  if echo "$a" | grep -q 'i'; then
-    say "UNFREEZE: chattr -i $f"
-    chattr -i "$f" 2>/dev/null || true
-  fi
+write_inc_clean(){
+  say "Rewrite include CLEAN: $INC"
+  backup_one "$INC"
+  mkdir -p "$(dirname "$INC")"
+  cat >"$INC" <<EOF
+## aquilastacking_routes (clean)
+location = ${PATH_APP} { return 301 ${PATH_APP}/; }
+location ${PATH_APP}/ {
+  alias ${WEBROOT}/;
+  index index.html;
+  try_files \$uri \$uri/ /index.html;
+  add_header Cache-Control "no-store" always;
 }
-
-refreeze_one(){
-  local f="$1"
-  [ -e "$f" ] || return 0
-  say "REFREEZE: chattr +i $f"
-  chattr +i "$f" 2>/dev/null || true
-}
-
-write_file(){
-  local path="$1"; shift
-  local tmp; tmp="$(mktemp)"
-  cat >"$tmp" <<EOF
-$*
+location = ${PATH_APP}/sw.js { add_header Cache-Control "no-store" always; return 404; }
+location = ${PATH_APP}/service-worker.js { add_header Cache-Control "no-store" always; return 404; }
+location = ${PATH_APP}/manifest.json { add_header Cache-Control "no-store" always; return 404; }
 EOF
-  mkdir -p "$(dirname "$path")"
-  backup_one "$path"
-  mv -f "$tmp" "$path"
 }
 
-patch_vhost_include(){
-  say "Patch vhost include: $VHOST_A"
+dedup_vhost_include(){
+  say "Dedup include line in vhost: $VHOST_A"
   [ -f "$VHOST_A" ] || die "missing $VHOST_A"
   backup_one "$VHOST_A"
   python3 - "$VHOST_A" "$INC" <<'PY'
 import sys,re
 p,inc=sys.argv[1],sys.argv[2]
 s=open(p,'r',encoding='utf-8',errors='ignore').read()
-needle=f"include {inc};"
-if needle in s:
+needle=re.escape(f"include {inc};")
+# remove duplicates: keep first occurrence only
+matches=list(re.finditer(needle,s))
+if len(matches)<=1:
   print("nochange"); sys.exit(0)
-m=re.search(r'\bserver\s*\{',s)
-if not m: raise SystemExit("ERR: no server { found")
-i=m.end(); depth=1
-while i<len(s) and depth:
-  if s[i]=='{': depth+=1
-  elif s[i]=='}': depth-=1
-  i+=1
-blk=s[m.start():i]; rest=s[i:]
-pos=blk.rfind('}')
-if pos==-1: raise SystemExit("ERR: server block brace not found")
-blk2=blk[:pos].rstrip()+ "\n  " + needle + "\n" + blk[pos:]
-open(p,'w',encoding='utf-8').write(s[:m.start()]+blk2+rest)
-print("patched")
+first=matches[0]
+# remove all subsequent occurrences
+out=[]; last=0; kept=False
+for m in matches:
+  if not kept:
+    kept=True
+    continue
+  # remove that line (and surrounding whitespace up to newline)
+  start=m.start()
+  # expand to full line
+  ls=s.rfind("\n",0,start)+1
+  le=s.find("\n",m.end())
+  if le==-1: le=len(s)
+  out.append(s[last:ls])
+  last=le+1 if le<len(s) else le
+out.append(s[last:])
+open(p,'w',encoding='utf-8').write("".join(out))
+print(f"dedup: removed {len(matches)-1}")
 PY
 }
 
-main(){
-  say "BEGIN STACKING-ONLY NGINX UNFREEZE/PATCH @ $TS"
-  say "BK: $BK"
-
-  # Detect /etc mount read-only (rare). If ro, stop early with clear output.
-  if mount | grep -E ' on /etc ' | grep -q '(\bro\b)'; then
-    die "/etc is mounted read-only (ro). Remount rw required."
-  fi
-
-  # Unfreeze nginx files
-  unfreeze_one "$NGX"
-  unfreeze_one "$VHOST_A"
-  unfreeze_one "$VHOST_E"
-  unfreeze_one "$INC"
-
-  # Ensure stacking webroot exists (no build here)
+ensure_webroot(){
   mkdir -p "$WEBROOT"
   if [ ! -f "$WEBROOT/index.html" ]; then
-    write_file "$WEBROOT/index.html" "<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>Aquila Stacking</title></head><body style='margin:0;font-family:system-ui;background:#0b0f14;color:#e6eef8'><div style='max-width:860px;margin:40px auto;padding:24px'><h1 style='margin:0 0 12px'>Aquila Stacking</h1><p>Placeholder (WEBROOT vide). Dépose ton build dans /var/www/aquilastacking ou relance avec un deploy build.</p></div></body></html>"
+    say "Create placeholder index.html (WEBROOT was empty)"
+    backup_one "$WEBROOT/index.html"
+    cat >"$WEBROOT/index.html" <<'EOF'
+<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Aquila Stacking</title>
+<body style="margin:0;font-family:system-ui;background:#0b0f14;color:#e6eef8">
+<div style="max-width:860px;margin:40px auto;padding:24px">
+<h1 style="margin:0 0 12px">Aquila Stacking</h1>
+<p>Placeholder (build non déployé). Dépose ton build dans <b>/var/www/aquilastacking</b>.</p>
+</div></body>
+EOF
   fi
   chown -R www-data:www-data "$WEBROOT" 2>/dev/null || true
   chmod -R a+rX "$WEBROOT" 2>/dev/null || true
-
-  # Write include
-  say "Write include: $INC"
-  write_file "$INC" "## aquilastacking_routes
-location = ${PATH_APP} { return 301 ${PATH_APP}/; }
-location ${PATH_APP}/ {
-  alias ${WEBROOT}/;
-  index index.html;
-  try_files \$uri \$uri/ /index.html;
-  add_header Cache-Control \"no-store\" always;
 }
-location = ${PATH_APP}/sw.js { add_header Cache-Control \"no-store\" always; return 404; }
-location = ${PATH_APP}/service-worker.js { add_header Cache-Control \"no-store\" always; return 404; }
-location = ${PATH_APP}/manifest.json { add_header Cache-Control \"no-store\" always; return 404; }
-"
 
-  # Patch vhost to include it
-  patch_vhost_include
+main(){
+  say "BEGIN STACKING DEDUP FIX @ $TS"
+  say "BK: $BK"
 
-  # Test + reload
+  unfreeze_one "$NGX"
+  unfreeze_one "$VHOST_A"
+  unfreeze_one "$INC"
+
+  ensure_webroot
+  write_inc_clean
+  dedup_vhost_include
+
   say "nginx -t"
   nginx -t
   say "reload nginx"
   systemctl reload nginx
 
-  # Local tests
-  say "Local test (must NOT be 404)"
-  echo "--- https://127.0.0.1${PATH_APP}/ ---"
-  curl -skI -H "Host: ${DOMAIN}" "https://127.0.0.1${PATH_APP}/" | head -n 20 || true
-  echo "--- include hit ---"
-  nginx -T 2>/dev/null | grep -n "aquilastacking_routes" -n | head -n 20 || true
+  say "Quick check"
+  curl -skI -H "Host: ${DOMAIN}" "https://127.0.0.1${PATH_APP}/" | head -n 12 || true
 
-  # Refreeze
   refreeze_one "$INC"
   refreeze_one "$VHOST_A"
   refreeze_one "$NGX"
@@ -137,8 +118,7 @@ location = ${PATH_APP}/manifest.json { add_header Cache-Control \"no-store\" alw
   say "DONE"
   say "Open: https://${DOMAIN}${PATH_APP}/"
 }
-
 main
 BASH
-chmod +x /root/MEGA_AQUILA_STACKING_ONLY_UNFREEZE_NGX.sh
-bash /root/MEGA_AQUILA_STACKING_ONLY_UNFREEZE_NGX.sh
+chmod +x /root/MEGA_AQUILA_STACKING_DEDUP_FIX.sh
+bash /root/MEGA_AQUILA_STACKING_DEDUP_FIX.sh
