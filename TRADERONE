@@ -1,12 +1,10 @@
-bash -lc 'cat >/root/MEGA_WOLVERINE_FIX_404.sh<<'"'"'BASH'"'"'
-#!/usr/bin/env bash
+bash -lc 'cat >/root/wv_fix.sh<<'"'"'BASH'"'"'
 set -euo pipefail
 umask 022
-
 TS="$(date +%Y%m%d_%H%M%S)"
 DOMAIN="fireinners.online"
 WEBROOT="/var/www/wolverine"
-NGX_CONF="/etc/nginx/nginx.conf"
+DIST="/opt/fireinners/frontend-react/app/dist/wolverine"
 SITES_AV="/etc/nginx/sites-available"
 SITES_EN="/etc/nginx/sites-enabled"
 VHOST_A="${SITES_AV}/fireinners.online-ssl"
@@ -14,105 +12,88 @@ VHOST_E="${SITES_EN}/fireinners.online-ssl"
 INC_DIR="/etc/nginx/includes"
 SNIP_DIR="/etc/nginx/snippets"
 INC_WV="${INC_DIR}/wolverine_static.inc"
-BK="/root/WV_BK_${TS}"
-IMM_LIST="${BK}/immut.list"
-
+BK="/root/WV_FIX_${TS}"
+IMM="${BK}/immut.list"
 say(){ printf "\n[%s] %s\n" "$(date +%H:%M:%S)" "$*"; }
+need_root(){ [ "$(id -u)" -eq 0 ] || { echo "RUN AS ROOT"; exit 1; }; }
 
-need_root(){
-  if [ "$(id -u)" -ne 0 ]; then echo "RUN AS ROOT"; exit 1; fi
-}
+mkdir -p "$BK"; :> "$IMM"
 
-mkdir -p "$BK"
-: >"$IMM_LIST"
+unfreeze_file(){ local f="$1"; [ -e "$f" ] || return 0; command -v lsattr >/dev/null 2>&1 || return 0; command -v chattr >/dev/null 2>&1 || return 0; if lsattr -d "$f" 2>/dev/null | awk "{print \$1}" | grep -q "i"; then echo "$f" >>"$IMM" || true; chattr -i "$f" 2>/dev/null || true; fi; }
+unfreeze_tree(){ local d="$1"; [ -d "$d" ] || return 0; while IFS= read -r -d "" f; do unfreeze_file "$f"; done < <(find "$d" -maxdepth 2 -type f -print0 2>/dev/null || true); }
+refreeze_all(){ [ -s "$IMM" ] || return 0; command -v chattr >/dev/null 2>&1 || return 0; while IFS= read -r f; do [ -e "$f" ] && chattr +i "$f" 2>/dev/null || true; done <"$IMM"; }
 
-unfreeze_file(){
-  local f="$1"
-  [ -e "$f" ] || return 0
-  if command -v lsattr >/dev/null 2>&1 && command -v chattr >/dev/null 2>&1; then
-    if lsattr -d "$f" 2>/dev/null | awk "{print \$1}" | grep -q "i"; then
-      echo "$f" >>"$IMM_LIST" || true
-      chattr -i "$f" 2>/dev/null || true
-    fi
-  fi
-}
-
-unfreeze_tree(){
-  local d="$1"
-  [ -d "$d" ] || return 0
-  while IFS= read -r -d "" f; do unfreeze_file "$f"; done < <(find "$d" -maxdepth 2 -type f -print0 2>/dev/null || true)
-}
-
-refreeze_all(){
-  [ -s "$IMM_LIST" ] || return 0
-  if command -v chattr >/dev/null 2>&1; then
-    while IFS= read -r f; do [ -e "$f" ] && chattr +i "$f" 2>/dev/null || true; done <"$IMM_LIST"
-  fi
-}
-
-backup_paths(){
-  say "Backup nginx + webroot -> $BK"
+backup_all(){
+  say "Backup -> $BK"
   cp -a /etc/nginx "$BK/nginx" 2>/dev/null || true
-  if [ -d "$WEBROOT" ]; then cp -a "$WEBROOT" "$BK/wolverine_webroot" 2>/dev/null || true; fi
-  if [ -x /root/WOLVERINE_SAVEPOINT.sh ]; then
-    say "Run /root/WOLVERINE_SAVEPOINT.sh (snapshot)"
-    /root/WOLVERINE_SAVEPOINT.sh || true
-  fi
+  [ -d "$WEBROOT" ] && cp -a "$WEBROOT" "$BK/webroot" 2>/dev/null || true
+  [ -x /root/WOLVERINE_SAVEPOINT.sh ] && /root/WOLVERINE_SAVEPOINT.sh || true
 }
 
-disable_aquila_location_include(){
+disable_aquila_bad_include(){
   local f="${INC_DIR}/aquila_stacking_routes.inc"
-  if [ -f "$f" ]; then
-    # If it contains location{} and is included globally somewhere, it can break nginx.
-    if grep -qE "^[[:space:]]*location[[:space:]]" "$f"; then
-      say "Disable aquila_stacking_routes.inc (contains location{})"
-      mv -f "$f" "${f}.disabled_${TS}" 2>/dev/null || true
-    fi
+  if [ -f "$f" ] && grep -qE "^[[:space:]]*location[[:space:]]" "$f"; then
+    say "Disable aquila_stacking_routes.inc (location{} outside server{})"
+    mv -f "$f" "${f}.disabled_${TS}" 2>/dev/null || true
   fi
-  # Comment any include lines referencing it (anywhere)
   while IFS= read -r file; do
     [ -f "$file" ] || continue
-    cp -a "$file" "$BK/$(basename "$file").bak.aquila" 2>/dev/null || true
-    sed -i -E "s|^([[:space:]]*include[[:space:]]+.*aquila_stacking_routes\.inc[^;]*;)|# DISABLED_BY_WV_FIX ${TS} :: \\1|g" "$file" || true
+    cp -a "$file" "$BK/$(echo "$file" | tr "/" "_" ).bak.aquila" 2>/dev/null || true
+    sed -i -E "s|^([[:space:]]*include[[:space:]]+.*aquila_stacking_routes\.inc[^;]*;)|# DISABLED_BY_WV_FIX_${TS} :: \\1|g" "$file" || true
   done < <(grep -RIl "aquila_stacking_routes\.inc" /etc/nginx 2>/dev/null || true)
 }
 
 comment_location_block(){
-  # comments the whole location block starting at first match (pattern) with brace tracking
-  local file="$1" pattern="$2"
+  local file="$1" pat="$2"
   [ -f "$file" ] || return 0
-  awk -v pat="$pattern" -v ts="$TS" '
-    function cmt(line){ return "# WV_FIX_"ts" "line }
+  awk -v pat="$pat" -v ts="$TS" '
+    function cmt(s){ return "# WV_FIX_"ts" "s }
     BEGIN{inblk=0;depth=0}
     {
-      if(inblk==0 && $0 ~ pat){
-        inblk=1
-      }
+      if(inblk==0 && $0 ~ pat){ inblk=1 }
       if(inblk==1){
-        # count braces on the ORIGINAL line
         n=gsub(/\{/,"{"); depth+=n
         n=gsub(/\}/,"}"); depth-=n
         print cmt($0)
         if(depth<=0){ inblk=0; depth=0 }
         next
       }
-      print $0
-    }
-  ' "$file" >"${file}.tmp" && mv -f "${file}.tmp" "$file"
+      print
+    }' "$file" >"${file}.tmp" && mv -f "${file}.tmp" "$file"
+}
+
+remove_other_wolverine_locations(){
+  say "Neutralize other location /wolverine/ (avoid duplicate location)"
+  local f bn
+  while IFS= read -r f; do
+    [ -f "$f" ] || continue
+    [ "$f" = "$INC_WV" ] && continue
+    bn="$(basename "$f")"
+    cp -a "$f" "$BK/$(echo "$f" | tr "/" "_" ).bak.wvloc" 2>/dev/null || true
+    if echo "$bn" | grep -qiE "wolverine.*(routes|location|static).*\.((inc|conf))$"; then
+      mv -f "$f" "${f}.disabled_${TS}" 2>/dev/null || true
+    else
+      comment_location_block "$f" "location[[:space:]]+\\^~[[:space:]]+/wolverine/|location[[:space:]]+/wolverine/"
+    fi
+  done < <(grep -RIlE "location[[:space:]]+\^~[[:space:]]+/wolverine/|location[[:space:]]+/wolverine/" /etc/nginx 2>/dev/null || true)
 }
 
 ensure_webroot(){
-  say "Ensure $WEBROOT has index.html"
+  say "Ensure WEBROOT: $WEBROOT"
   mkdir -p "$WEBROOT"
+  if [ -d "$DIST" ]; then
+    say "Sync dist -> webroot"
+    rsync -a --delete "$DIST"/ "$WEBROOT"/
+  fi
   if [ ! -f "$WEBROOT/index.html" ]; then
     cat >"$WEBROOT/index.html"<<EOF
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WOLVERINE</title></head><body style="font-family:system-ui;margin:40px"><h1>WOLVERINE</h1><p>Static webroot OK. Replace /var/www/wolverine contents with your exported UI.</p></body></html>
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WOLVERINE</title></head><body style="font-family:system-ui;margin:40px"><h1>WOLVERINE</h1><p>Webroot OK. Place your UI in /var/www/wolverine/</p></body></html>
 EOF
   fi
 }
 
-write_inc_wolverine(){
-  say "Write $INC_WV"
+write_include(){
+  say "Write include: $INC_WV"
   mkdir -p "$INC_DIR"
   cat >"$INC_WV"<<EOF
 # WV_STATIC_${TS}
@@ -125,42 +106,40 @@ EOF
 }
 
 ensure_vhost_enabled(){
-  say "Ensure vhost enabled: $VHOST_E"
-  if [ ! -f "$VHOST_A" ]; then
-    echo "MISSING: $VHOST_A" >&2
-    exit 1
-  fi
+  say "Ensure vhost enabled"
+  [ -f "$VHOST_A" ] || { echo "MISSING: $VHOST_A"; exit 1; }
   ln -sf "$VHOST_A" "$VHOST_E" || true
 }
 
-inject_include_into_ssl_server(){
-  say "Inject include into SSL server block (443) if missing"
+disable_duplicate_vhosts(){
+  say "Disable duplicate enabled vhosts with server_name ${DOMAIN} (keep fireinners.online-ssl)"
+  local f
+  while IFS= read -r f; do
+    [ -L "$f" ] || continue
+    [ "$f" = "$VHOST_E" ] && continue
+    if grep -qE "^[[:space:]]*server_name[[:space:]].*fireinners\.online" "$f" 2>/dev/null; then
+      mv -f "$f" "${f}.disabled_${TS}" 2>/dev/null || true
+    fi
+  done < <(find "$SITES_EN" -maxdepth 1 -type l 2>/dev/null || true)
+}
+
+inject_into_ssl_server(){
+  say "Inject include into 443 server{} (only once)"
   unfreeze_file "$VHOST_A"
   cp -a "$VHOST_A" "$BK/fireinners.online-ssl.bak" 2>/dev/null || true
-
-  # If already included, done.
-  if grep -qF "include ${INC_WV};" "$VHOST_A"; then
-    return 0
-  fi
-
-  # Inject into the first server{} that listens on 443 (brace tracking)
+  grep -qF "include ${INC_WV};" "$VHOST_A" && return 0
   awk -v inc="include ${INC_WV};" '
     BEGIN{in_srv=0;depth=0;is443=0;done=0}
     /^[[:space:]]*server[[:space:]]*\{/{
       in_srv=1; depth=1; is443=0
-      print
-      next
+      print; next
     }
     {
       if(in_srv){
         if($0 ~ /listen[[:space:]]+443/){ is443=1 }
-        # track braces
         n=gsub(/\{/,"{"); depth+=n
         n=gsub(/\}/,"}"); depth-=n
-
-        # inject right after we know we are in 443 server and before leaving the server (only once)
         if(is443 && !done && $0 !~ /^[[:space:]]*#/){
-          # inject immediately after first non-comment line after entering server block
           print "  "inc
           done=1
           is443=0
@@ -170,88 +149,54 @@ inject_include_into_ssl_server(){
         next
       }
       print
-    }
-  ' "$VHOST_A" >"$VHOST_A.tmp" && mv -f "$VHOST_A.tmp" "$VHOST_A"
-
-  # If injection failed (still missing), inject at top of file as last resort (safe include; nginx will error only if context invalid)
-  if ! grep -qF "include ${INC_WV};" "$VHOST_A"; then
-    printf "\n# WV_FIX_FALLBACK_%s\ninclude %s;\n" "$TS" "$INC_WV" >>"$VHOST_A"
-  fi
+    }' "$VHOST_A" >"$VHOST_A.tmp" && mv -f "$VHOST_A.tmp" "$VHOST_A"
+  grep -qF "include ${INC_WV};" "$VHOST_A" || printf "\n# WV_FIX_FALLBACK_%s\ninclude %s;\n" "$TS" "$INC_WV" >>"$VHOST_A"
 }
 
-disable_duplicate_fireinners_vhosts(){
-  say "Disable duplicate vhosts (server_name fireinners.online) except fireinners.online-ssl"
-  local f bn
-  while IFS= read -r f; do
-    bn="$(basename "$f")"
-    [ "$f" = "$VHOST_E" ] && continue
-    [ -L "$f" ] || continue
-    if grep -qE "^[[:space:]]*server_name[[:space:]].*fireinners\.online" "$f" 2>/dev/null; then
-      mv -f "$f" "${f}.disabled_${TS}" 2>/dev/null || true
-    fi
-  done < <(find "$SITES_EN" -maxdepth 1 -type l 2>/dev/null || true)
-}
-
-remove_other_wolverine_locations(){
-  say "Comment other location /wolverine/ blocks to avoid duplicate location errors"
-  local file
-  # find all files defining location /wolverine/ (except our include)
-  while IFS= read -r file; do
-    [ -f "$file" ] || continue
-    [ "$file" = "$INC_WV" ] && continue
-    cp -a "$file" "$BK/$(echo "$file" | tr "/" "_" ).bak.wvloc" 2>/dev/null || true
-    comment_location_block "$file" "location[[:space:]]+\\^~[[:space:]]+/wolverine/|location[[:space:]]+/wolverine/"
-  done < <(grep -RIlE "location[[:space:]]+\^~[[:space:]]+/wolverine/|location[[:space:]]+/wolverine/" /etc/nginx 2>/dev/null || true)
-}
-
-nginx_test_reload(){
+nginx_reload(){
   say "nginx -t"
   nginx -t
-  say "Reload nginx"
+  say "reload nginx"
   systemctl reload nginx || systemctl restart nginx
 }
 
 tests(){
-  say "Tests (local SNI -> 127.0.0.1)"
-  echo "== /wolverine/ (HEAD) =="
+  say "Tests (SNI -> 127.0.0.1)"
+  echo "== HTTPS /wolverine/ (HEAD) =="
   curl -skI --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/" | sed -n "1,12p" || true
   echo
-  echo "== /wolverine/ (GET first bytes) =="
+  echo "== HTTPS /wolverine/ (first bytes) =="
   curl -sk --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/" | head -c 200 || true
   echo; echo
+  echo "== ls webroot =="
+  ls -la "$WEBROOT" | sed -n "1,20p" || true
 }
 
 main(){
   need_root
   say "MEGA_WOLVERINE_FIX_404 :: start"
-  backup_paths
-
-  say "Unfreeze nginx trees (if chattr +i)"
+  backup_all
+  say "Unfreeze nginx trees (chattr -i)"
   unfreeze_tree "/etc/nginx/sites-available"
   unfreeze_tree "/etc/nginx/sites-enabled"
   unfreeze_tree "/etc/nginx/includes"
   unfreeze_tree "/etc/nginx/snippets"
-
-  disable_aquila_location_include
-  disable_duplicate_fireinners_vhosts
-  ensure_webroot
-  write_inc_wolverine
-  ensure_vhost_enabled
+  disable_aquila_bad_include
+  disable_duplicate_vhosts
   remove_other_wolverine_locations
-  inject_include_into_ssl_server
-
-  nginx_test_reload
+  ensure_webroot
+  write_include
+  ensure_vhost_enabled
+  inject_into_ssl_server
+  nginx_reload
   tests
-
-  say "Refreeze previously immutable files (best-effort)"
+  say "Refreeze (best-effort)"
   refreeze_all
-
   say "DONE"
   echo "Backups: $BK"
-  echo "Open: https://${DOMAIN}/wolverine/  (Ctrl+F5)"
+  echo "Open: https://${DOMAIN}/wolverine/ ثم Ctrl+F5"
 }
-
 main "$@"
 BASH
-chmod +x /root/MEGA_WOLVERINE_FIX_404.sh
-/root/MEGA_WOLVERINE_FIX_404.sh'
+sed -i "s/\r$//" /root/wv_fix.sh
+bash /root/wv_fix.sh'
