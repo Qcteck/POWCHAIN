@@ -1,12 +1,12 @@
-cat > /root/MEGA_BUNDLER_FIX_404_V2.sh <<'SH'
+cat > /root/MEGA_BUNDLER_STACK_V3_DEPS.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
-
 [ "$(id -u)" -eq 0 ] || { echo "RUN AS ROOT"; exit 1; }
 
 DOMAIN="${DOMAIN:-fireinners.online}"
 WEBROOT="/var/www/bundler"
 API_DIR="/opt/bundler_api"
+UI_DIR="/opt/bundler_ui"
 API_HOST="${API_HOST:-127.0.0.1}"
 API_PORT="${API_PORT:-9797}"
 
@@ -14,18 +14,38 @@ INC_DIR="/etc/nginx/includes"
 INC_FILE="${INC_DIR}/bundler_routes.inc"
 
 TS="$(date +%Y%m%d_%H%M%S)"
-BK="/root/BUNDLER_FIX404_V2_${TS}"
+BK="/root/BUNDLER_STACK_V3_${TS}"
 mkdir -p "$BK"
 
 say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
+
+ver_ge(){ python3 - "$1" "$2" <<'PY'
+import sys
+from packaging.version import Version
+print("1" if Version(sys.argv[1])>=Version(sys.argv[2]) else "0")
+PY
+}
 
 say "backup => $BK"
 cp -a /etc/nginx "$BK/nginx" 2>/dev/null || true
 cp -a /etc/systemd/system "$BK/systemd_system" 2>/dev/null || true
 mkdir -p "$BK/www" && cp -a "$WEBROOT" "$BK/www/bundler" 2>/dev/null || true
 mkdir -p "$BK/opt" && cp -a "$API_DIR" "$BK/opt/bundler_api" 2>/dev/null || true
+mkdir -p "$BK/opt" && cp -a "$UI_DIR" "$BK/opt/bundler_ui" 2>/dev/null || true
 
-say "detect active ssl vhost file for ${DOMAIN}"
+say "node: ensure >= 20.18.0 (solana codecs requirement)"
+CUR_NODE="$(node -v 2>/dev/null | sed 's/^v//' || true)"
+if [ -z "${CUR_NODE:-}" ] || [ "$(ver_ge "${CUR_NODE:-0.0.0}" "20.18.0")" != "1" ]; then
+  say "node: installing/upgrading via NodeSource 20.x"
+  apt-get update -y
+  apt-get install -y ca-certificates curl gnupg
+  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+  apt-get install -y nodejs
+  CUR_NODE="$(node -v | sed 's/^v//')"
+fi
+say "node=${CUR_NODE} npm=$(npm -v 2>/dev/null || true)"
+
+say "nginx: detect active ssl vhost file for ${DOMAIN}"
 NGT="$BK/nginx_T.txt"
 nginx -T >"$NGT" 2>&1 || { tail -n 200 "$NGT" || true; exit 1; }
 
@@ -64,11 +84,18 @@ for f,blk in servers:
 print("")
 PY
 )"
-
 [ -n "${ACTIVE_SSL_FILE:-}" ] || { say "FAIL: no SSL vhost found for ${DOMAIN}"; exit 1; }
 say "ACTIVE_SSL_FILE=$ACTIVE_SSL_FILE"
 
-say "write include file $INC_FILE"
+say "webroot: ensure ${WEBROOT}"
+mkdir -p "$WEBROOT"
+if [ ! -f "$WEBROOT/index.html" ]; then
+  cat >"$WEBROOT/index.html" <<'EOF'
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Bundler</title></head><body style="font-family:system-ui;margin:40px"><h1>Bundler</h1><p>Route OK. Remplacer ce placeholder par le build Vite/React.</p></body></html>
+EOF
+fi
+
+say "nginx: write include ${INC_FILE}"
 mkdir -p "$INC_DIR"
 cat >"$INC_FILE" <<EOF
 # AUTO bundler routes (${TS})
@@ -88,102 +115,99 @@ location ^~ /bundler/api/ {
 }
 EOF
 
-say "inject include into SSL vhost (safe)"
+say "nginx: inject include into active ssl vhost (idempotent)"
 python3 - "$ACTIVE_SSL_FILE" "$DOMAIN" "$INC_FILE" <<'PY'
 import re,sys,shutil
 path,dom,inc=sys.argv[1],sys.argv[2],sys.argv[3]
-bk=path+".bak_"+re.sub(r'[^0-9A-Za-z]+','_',inc)[-32:]
-shutil.copy2(path,bk)
-
+shutil.copy2(path, path+".bak_bundler_"+re.sub(r'[^0-9A-Za-z]+','_',inc)[-32:])
 lines=open(path,'r',errors='ignore').read().splitlines(True)
 inc_line=f"  include {inc};\n"
 domre=re.compile(r'\bserver_name\b[^;]*\b'+re.escape(dom)+r'\b',re.I)
 sslre=re.compile(r'\blisten\b[^;]*\b443\b[^;]*\bssl\b',re.I)
-
-out=[]
-depth=0
-in_srv=False
-srv=[]
+out=[]; depth=0; in_srv=False; srv=[]
 def d(s): return s.count('{')-s.count('}')
-
-def flush_server(srv_lines):
+def flush(srv_lines):
   blk="".join(srv_lines)
   if f"include {inc};" in blk: return srv_lines, False
   if domre.search(blk) and sslre.search(blk):
-    # insert include right after first server_name line if possible
-    new=[]
-    inserted=False
+    new=[]; inserted=False
     for ln in srv_lines:
       new.append(ln)
       if (not inserted) and re.search(r'\bserver_name\b', ln):
         new.append(inc_line); inserted=True
     if not inserted:
-      # fallback: insert before closing brace
       for i in range(len(new)-1,-1,-1):
         if new[i].strip()=="}":
           new.insert(i,inc_line); inserted=True; break
     return new, True
   return srv_lines, False
-
 i=0; changed=False
 while i<len(lines):
-  ln=lines[i]
-  s=ln.strip()
+  ln=lines[i]; s=ln.strip()
   if (not in_srv) and re.search(r'\bserver\s*\{', s):
     in_srv=True; srv=[ln]; depth=d(ln); i+=1; continue
   if in_srv:
     srv.append(ln); depth+=d(ln)
     if depth<=0:
-      srv2, did=flush_server(srv)
-      out.extend(srv2)
-      changed = changed or did
+      srv2,did=flush(srv); out.extend(srv2); changed=changed or did
       in_srv=False; srv=[]; depth=0
     i+=1; continue
   out.append(ln); i+=1
-
 open(path,'w').write("".join(out))
 print("CHANGED" if changed else "NOCHANGE")
 PY
 
-say "ensure webroot $WEBROOT"
-mkdir -p "$WEBROOT"
-if [ ! -f "$WEBROOT/index.html" ]; then
-  cat >"$WEBROOT/index.html" <<'EOF'
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Bundler</title></head><body style="font-family:system-ui;margin:40px"><h1>Bundler</h1><p>Route OK. Remplacer ce placeholder par le build Vite/React.</p></body></html>
-EOF
-fi
-
-say "write minimal stable API on ${API_HOST}:${API_PORT}"
+say "api: write package.json + install deps"
 mkdir -p "$API_DIR"
-cat >"$API_DIR/server.js" <<'EOF'
-const http=require("http");
-const host=process.env.API_HOST||"127.0.0.1";
-const port=parseInt(process.env.API_PORT||"9797",10);
-const key=process.env.BUNDLER_API_KEY||"";
-const send=(res,code,obj)=>{res.writeHead(code,{"content-type":"application/json"});res.end(JSON.stringify(obj));};
-http.createServer((req,res)=>{
-  const u=new URL(req.url,"http://x");
-  if(u.pathname==="/health") return send(res,200,{ok:true,ts:new Date().toISOString(),host,port});
-  if(u.pathname==="/create-token"){
-    if(req.method!=="POST") return send(res,405,{ok:false,error:"METHOD_NOT_ALLOWED"});
-    const got=(req.headers["x-api-key"]||"").toString();
-    if(key && got!==key) return send(res,401,{ok:false,error:"UNAUTHORIZED"});
-    let b=""; req.on("data",d=>b+=d); req.on("end",()=>send(res,200,{ok:true,stub:true,payload:(()=>{try{return b?JSON.parse(b):{};}catch(e){return {raw:b};}})()}));
-    return;
-  }
-  return send(res,404,{ok:false,error:"NOT_FOUND",path:u.pathname});
-}).listen(port,host,()=>console.log(JSON.stringify({ok:true,ts:new Date().toISOString(),host,port})));
-EOF
-
 API_KEY_FILE="${API_DIR}/.api_key"
 if [ ! -f "$API_KEY_FILE" ]; then tr -dc 'A-Za-z0-9' </dev/urandom | head -c 48 >"$API_KEY_FILE"; fi
 chmod 600 "$API_KEY_FILE" || true
 BUNDLER_API_KEY="$(cat "$API_KEY_FILE")"
 
-say "systemd: install/repair service"
+cat >"$API_DIR/package.json" <<'EOF'
+{"name":"bundler-api","private":true,"type":"commonjs","version":"1.0.0","main":"server.js","dependencies":{"express":"^4.19.2","cors":"^2.8.5","morgan":"^1.10.0","zod":"^3.23.8","bs58":"^5.0.0","tweetnacl":"^1.0.3","@solana/web3.js":"^1.98.0","@solana/spl-token":"^0.4.9"}}
+EOF
+
+( cd "$API_DIR" && npm i --omit=dev --no-audit --no-fund )
+
+say "api: write server.js (express, stable endpoints)"
+cat >"$API_DIR/server.js" <<'EOF'
+const express=require("express");
+const cors=require("cors");
+const morgan=require("morgan");
+const {z}=require("zod");
+
+const host=process.env.API_HOST||"127.0.0.1";
+const port=parseInt(process.env.API_PORT||"9797",10);
+const key=process.env.BUNDLER_API_KEY||"";
+
+const app=express();
+app.disable("x-powered-by");
+app.use(cors({origin:true,credentials:false}));
+app.use(morgan("combined"));
+app.use(express.json({limit:"2mb"}));
+
+app.get("/health",(req,res)=>res.json({ok:true,ts:new Date().toISOString(),host,port}));
+
+const CreateSchema=z.object({name:z.string().min(1).optional(),symbol:z.string().min(1).optional(),decimals:z.number().int().min(0).max(18).optional()}).passthrough();
+
+app.post("/create-token",(req,res)=>{
+  const got=(req.header("x-api-key")||"").toString();
+  if(key && got!==key) return res.status(401).json({ok:false,error:"UNAUTHORIZED"});
+  const parsed=CreateSchema.safeParse(req.body||{});
+  if(!parsed.success) return res.status(400).json({ok:false,error:"BAD_REQUEST",issues:parsed.error.issues});
+  return res.json({ok:true,stub:true,payload:parsed.data});
+});
+
+app.use((req,res)=>res.status(404).json({ok:false,error:"NOT_FOUND",path:req.path}));
+
+app.listen(port,host,()=>console.log(JSON.stringify({ok:true,ts:new Date().toISOString(),host,port})));
+EOF
+
+say "systemd: install/repair bundler-api.service"
 cat > /etc/systemd/system/bundler-api.service <<EOF
 [Unit]
-Description=Bundler API (stable minimal)
+Description=Bundler API (create token)
 After=network.target
 
 [Service]
@@ -213,7 +237,13 @@ say "diag: listeners"
 ss -lntp | grep -E "(:${API_PORT}\s)" || true
 
 say "tests: local api"
-curl -fsS "http://${API_HOST}:${API_PORT}/health" && echo " LOCAL_API_OK" || echo " LOCAL_API_FAIL"
+if ! curl -fsS "http://${API_HOST}:${API_PORT}/health" >/dev/null; then
+  say "LOCAL_API_FAIL: status + logs"
+  systemctl status --no-pager bundler-api.service || true
+  journalctl -u bundler-api.service -n 80 --no-pager || true
+else
+  echo "LOCAL_API_OK"
+fi
 
 say "tests: nginx on-box (force host) /bundler/ + /bundler/api/health"
 curl -k -sS -o /dev/null -D - --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/bundler/" | sed -n '1,12p'
@@ -221,6 +251,7 @@ curl -k -sS -o /dev/null -D - --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOM
 
 say "DONE"
 say "BACKUP=$BK"
+say "API_KEY_FILE=${API_KEY_FILE}"
 SH
-chmod +x /root/MEGA_BUNDLER_FIX_404_V2.sh
-/root/MEGA_BUNDLER_FIX_404_V2.sh
+chmod +x /root/MEGA_BUNDLER_STACK_V3_DEPS.sh
+/root/MEGA_BUNDLER_STACK_V3_DEPS.sh
