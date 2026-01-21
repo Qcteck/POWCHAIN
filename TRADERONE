@@ -1,4 +1,4 @@
-bash -lc 'cat >/root/MEGA_WOLVERINE_FIX_VAULT_FINAL.sh<<'"'"'BASH'"'"'
+cat >/root/MEGA_WOLVERINE_FIX_VAULT_FINAL.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -17,7 +17,7 @@ VAULT_SVC="/etc/systemd/system/traderone-vault-api.service"
 VAULT_DATA="$VAULT_DIR/data"
 
 have(){ command -v "$1" >/dev/null 2>&1; }
-mkbackup(){ local f="$1"; [ -f "$f" ] && cp -a "$f" "$f.bak.$TS" 2>/dev/null || true; }
+mkbackup(){ local f="$1"; [ -e "$f" ] && cp -a "$f" "$f.bak.$TS" 2>/dev/null || true; }
 unfreeze_one(){ local f="$1"; [ -e "$f" ] && chattr -i "$f" 2>/dev/null || true; }
 freeze_one(){ local f="$1"; [ -e "$f" ] && chattr +i "$f" 2>/dev/null || true; }
 
@@ -27,10 +27,8 @@ if [ -x /root/WOLVERINE_SAVEPOINT.sh ]; then /root/WOLVERINE_SAVEPOINT.sh || tru
 say "1) Preflight tools"
 if ! have nginx; then apt-get update -y && apt-get install -y nginx; fi
 if ! have curl; then apt-get update -y && apt-get install -y curl; fi
-if ! have node; then
-  say "ERROR: node is missing. Install Node (NodeSource/corepack) then rerun."
-  exit 1
-fi
+if ! have node; then say "ERROR: node is missing. Install Node (NodeSource/corepack) then rerun."; exit 1; fi
+if ! have npm; then say "ERROR: npm is missing. Install npm via NodeSource/corepack then rerun."; exit 1; fi
 
 say "2) Ensure webroot exists"
 mkdir -p "$WEBROOT"
@@ -42,7 +40,7 @@ unfreeze_one "$NGX_INC"
 unfreeze_one "$INDEX"
 for f in /etc/nginx/includes/wolverine*.inc /etc/nginx/includes/*.inc; do unfreeze_one "$f"; done
 
-say "4) Install/repair Vault API backend (stable JSON, no HTML, no redirects)"
+say "4) Install/repair Vault API backend (stable JSON only)"
 mkdir -p "$VAULT_DIR" "$VAULT_DATA"
 mkbackup "$VAULT_DIR/server.js"
 mkbackup "$VAULT_DIR/package.json"
@@ -74,16 +72,11 @@ const STATE_FILE = path.join(DATA_DIR, "state.json");
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
 function readState() {
-  try {
-    const raw = fs.readFileSync(STATE_FILE, "utf8");
-    const j = JSON.parse(raw);
-    if (j && typeof j === "object") return j;
-  } catch (_) {}
+  try { return JSON.parse(fs.readFileSync(STATE_FILE, "utf8")); } catch (_) {}
   return { byUser: {}, meta: { createdAt: new Date().toISOString() } };
 }
-function writeState(s) {
-  try { fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2)); } catch (_) {}
-}
+function writeState(s) { try { fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2)); } catch (_) {} }
+
 function sendJSON(res, code, obj) {
   const body = JSON.stringify(obj);
   res.writeHead(code, {
@@ -105,7 +98,7 @@ function readBody(req) {
   });
 }
 
-const server = http.createServer(async (req, res) => {
+http.createServer(async (req, res) => {
   try {
     if (req.method === "OPTIONS") return sendJSON(res, 200, { ok: true });
 
@@ -130,12 +123,11 @@ const server = http.createServer(async (req, res) => {
 
       const kp = Keypair.generate();
       const vaultPub = kp.publicKey.toBase58();
-      const secretKey = Array.from(kp.secretKey); // store only server-side
+      const secretKey = Array.from(kp.secretKey);
 
       if (userPub) st.byUser[userPub] = { vaultPub, secretKey, createdAt: new Date().toISOString() };
-      else {
-        st.byUser["_anon_" + vaultPub] = { vaultPub, secretKey, createdAt: new Date().toISOString() };
-      }
+      else st.byUser["_anon_" + vaultPub] = { vaultPub, secretKey, createdAt: new Date().toISOString() };
+
       st.meta.lastCreateAt = new Date().toISOString();
       writeState(st);
 
@@ -146,28 +138,14 @@ const server = http.createServer(async (req, res) => {
   } catch (e) {
     return sendJSON(res, 500, { ok: false, error: "internal_error", message: String(e && e.message ? e.message : e) });
   }
-});
-
-server.listen(PORT, "127.0.0.1", () => {
-  console.log(`[vault-api] listening on 127.0.0.1:${PORT}`);
-});
+}).listen(PORT, "127.0.0.1", () => console.log(`[vault-api] listening on 127.0.0.1:${PORT}`));
 JS
 
-say "4.1) Install node deps (idempotent)"
+say "4.1) npm install (idempotent)"
 cd "$VAULT_DIR"
-if [ ! -d node_modules ] || [ ! -f node_modules/.package-lock.json ]; then
-  if have npm; then
-    npm install --omit=dev
-  else
-    say "ERROR: npm missing. Install npm via NodeSource/corepack then rerun."
-    exit 1
-  fi
-else
-  # still ensure deps are correct
-  npm install --omit=dev >/dev/null 2>&1 || true
-fi
+npm install --omit=dev
 
-say "4.2) Create/repair systemd service for Vault API"
+say "4.2) systemd service"
 mkbackup "$VAULT_SVC"
 cat >"$VAULT_SVC"<<EOF
 [Unit]
@@ -193,16 +171,13 @@ systemctl daemon-reload
 systemctl enable --now traderone-vault-api.service
 systemctl restart traderone-vault-api.service
 
-say "5) Ensure nginx include exists with canonical Vault routes + legacy 307 (no 301/405)"
+say "5) Nginx include: canonical vault route + legacy aliases (NO 301, keep POST with 307)"
 mkbackup "$NGX_INC"
 cat >"$NGX_INC"<<'NGINX'
-# Wolverine routes include (canonical + legacy redirects)
-# - IMPORTANT: use 307 (keeps POST) not 301
-# - Vault API runs locally (127.0.0.1:8787)
-
-# Canonical Vault endpoints:
-#   GET  /wolverine/traderone/vault/health  -> /health
-#   POST /wolverine/traderone/vault/create  -> /create
+# Wolverine routes include - Vault API canonical + legacy aliases
+# Canonical:
+#  GET  /wolverine/traderone/vault/health  -> /health
+#  POST /wolverine/traderone/vault/create  -> /create
 location ^~ /wolverine/traderone/vault/ {
   proxy_http_version 1.1;
   proxy_set_header Host $host;
@@ -215,7 +190,7 @@ location ^~ /wolverine/traderone/vault/ {
   proxy_pass http://127.0.0.1:8787/;
 }
 
-# Legacy aliases (avoid 301 that breaks fetch/json and POST):
+# Legacy aliases (use 307 so POST remains POST)
 location = /wolverine/vault/health { return 307 /wolverine/traderone/vault/health; }
 location = /wolverine/vault/create { return 307 /wolverine/traderone/vault/create; }
 
@@ -225,72 +200,52 @@ location = /wolverine/vault-api/create { return 307 /wolverine/traderone/vault/c
 location = /wolverine/vault/api/health { return 307 /wolverine/traderone/vault/health; }
 location = /wolverine/vault/api/create { return 307 /wolverine/traderone/vault/create; }
 
-# Some accidental paths seen in logs (/wolverine/vault/api/create/...):
 location ^~ /wolverine/vault/api/create/ { return 307 /wolverine/traderone/vault/create; }
 NGINX
 
-say "6) Ensure vhost includes the wolverine routes include (idempotent)"
+say "6) Ensure vhost includes wolverine_routes.inc"
 if [ -f "$NGX_VHOST" ]; then
   if ! grep -qF "include $NGX_INC" "$NGX_VHOST"; then
     mkbackup "$NGX_VHOST"
-    # Insert include right after the first server_name line containing fireinners.online
-    perl -0777 -i -pe '
-      if ($ARGV && -f $ARGV) {
-        my $inc = "  include /etc/nginx/includes/wolverine_routes.inc;\n";
-        if ($_ !~ /include\s+\/etc\/nginx\/includes\/wolverine_routes\.inc;/) {
-          # try to insert after server_name ...fireinners.online...;
-          if ($_ =~ /(server_name[^\n;]*fireinners\.online[^\n;]*;\n)/) {
-            $_ =~ s/(server_name[^\n;]*fireinners\.online[^\n;]*;\n)/$1$inc/;
-          } else {
-            # fallback: append at end
-            $_ .= "\n# appended by MEGA_WOLVERINE_FIX_VAULT_FINAL\n$inc";
-          }
-        }
-      }
-    ' "$NGX_VHOST"
+    perl -0777 -i -pe 'my $inc="  include /etc/nginx/includes/wolverine_routes.inc;\n"; if($_ !~ /include\s+\/etc\/nginx\/includes\/wolverine_routes\.inc;/){ if($_ =~ /(server_name[^\n;]*fireinners\.online[^\n;]*;\n)/){ $_ =~ s/(server_name[^\n;]*fireinners\.online[^\n;]*;\n)/$1$inc/; } else { $_ .= "\n$inc"; } }' "$NGX_VHOST"
   fi
 else
-  say "WARN: nginx vhost not found at $NGX_VHOST (skipping vhost include step)"
+  say "WARN: vhost not found ($NGX_VHOST) - skipping"
 fi
 
-say "7) Patch frontend (remove duplicate Vault box at runtime + force canonical endpoint strings)"
+say "7) Frontend patch: force canonical strings + remove duplicate Vault box at runtime"
 if [ -f "$INDEX" ]; then
   mkbackup "$INDEX"
 
-  # Force canonical endpoint strings if they exist in raw HTML/JS
   sed -i \
     -e 's#/wolverine/vault-api#/wolverine/traderone/vault#g' \
     -e 's#/wolverine/vault/api#/wolverine/traderone/vault#g' \
     -e 's#/wolverine/vault#/wolverine/traderone/vault#g' \
     "$INDEX" || true
 
-  # Add runtime dedupe guard once (safe even if markup changes)
   if ! grep -q "WOLVERINE_VAULT_DEDUP_V1" "$INDEX"; then
-    perl -0777 -i -pe 's#</body>#<script>/*WOLVERINE_VAULT_DEDUP_V1*/(function(){function txt(n){return(n&&n.textContent||"").replace(/\\s+/g," ").trim()}function findBox(el){var x=el;for(var i=0;i<25&&x&&x!==document.body;i++){var t=txt(x);if(/Budget\\s*\\(SOL\\)/i.test(t)&&/Vault/i.test(t)&&x.querySelector&&x.querySelector("button"))return x;x=x.parentElement}return null}function dedup(){try{var btns=[].slice.call(document.querySelectorAll("button"));var target=btns.filter(function(b){return /Créer Vault \\+ Déposer/i.test(txt(b))});if(target.length>1){var keep=findBox(target[0])||target[0].parentElement;for(var i=1;i<target.length;i++){var box=findBox(target[i])||target[i].parentElement;if(box&&box!==keep&&box.parentNode)box.parentNode.removeChild(box)} } }catch(e){} }if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",dedup);else dedup();})();</script>\n</body>#s' "$INDEX"
+    perl -0777 -i -pe 's#</body>#<script>/*WOLVERINE_VAULT_DEDUP_V1*/(function(){function t(n){return(n&&n.textContent||"").replace(/\\s+/g," ").trim()}function box(el){var x=el;for(var i=0;i<30&&x&&x!==document.body;i++){var s=t(x);if(/Budget\\s*\\(SOL\\)/i.test(s)&&/Vault/i.test(s)&&x.querySelector&&x.querySelector("button"))return x;x=x.parentElement}return null}function run(){try{var b=[].slice.call(document.querySelectorAll("button")).filter(function(z){return /Créer Vault \\+ Déposer/i.test(t(z))});if(b.length>1){var keep=box(b[0])||b[0].parentElement;for(var i=1;i<b.length;i++){var rm=box(b[i])||b[i].parentElement;if(rm&&rm!==keep&&rm.parentNode)rm.parentNode.removeChild(rm)}}}catch(e){}}if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",run);else run();})();</script>\n</body>#s' "$INDEX"
   fi
 else
-  say "WARN: frontend index not found at $INDEX (skipping UI patch)"
+  say "WARN: $INDEX not found - skipping UI patch"
 fi
 
 say "8) Nginx test + reload"
 nginx -t
 systemctl reload nginx
 
-say "9) Tests (must be JSON)"
-say "== local vault health =="
-curl -sS "http://127.0.0.1:${VAULT_PORT}/health" || true; echo
-say "== local vault create =="
-curl -sS -X POST "http://127.0.0.1:${VAULT_PORT}/create" -H "content-type: application/json" -d "{\"userPub\":\"TEST_$TS\"}" || true; echo
+say "9) Tests (must be JSON, never HTML/301/405/502)"
+say "== local health =="; curl -sS "http://127.0.0.1:${VAULT_PORT}/health"; echo
+say "== local create =="; curl -sS -X POST "http://127.0.0.1:${VAULT_PORT}/create" -H "content-type: application/json" -d "{\"userPub\":\"TEST_$TS\"}"; echo
 
-say "== public canonical health =="
-curl -sS -i "https://fireinners.online/wolverine/traderone/vault/health" | head -n 25 || true
-say "== public canonical create (should be HTTP 200 JSON, not 301/405/502) =="
-curl -sS -i -X POST "https://fireinners.online/wolverine/traderone/vault/create" -H "content-type: application/json" -d "{\"userPub\":\"TEST_$TS\"}" | head -n 30 || true
+say "== public canonical health (headers) =="; curl -sS -i "https://fireinners.online/wolverine/traderone/vault/health" | head -n 25 || true
+say "== public canonical create (headers) =="; curl -sS -i -X POST "https://fireinners.online/wolverine/traderone/vault/create" -H "content-type: application/json" -d "{\"userPub\":\"TEST_$TS\"}" | head -n 30 || true
 
-say "10) Status"
-systemctl --no-pager status traderone-vault-api.service | sed -n "1,18p" || true
+say "10) Service status"
+systemctl --no-pager status traderone-vault-api.service | sed -n '1,18p' || true
 
-say "DONE. Ctrl+F5 https://fireinners.online/wolverine then click \"Créer Vault + Déposer\" once."
+say "DONE: Ctrl+F5 https://fireinners.online/wolverine puis clique \"Créer Vault + Déposer\" (1 fois)."
 BASH
+
 chmod +x /root/MEGA_WOLVERINE_FIX_VAULT_FINAL.sh
-/root/MEGA_WOLVERINE_FIX_VAULT_FINAL.sh'
+bash /root/MEGA_WOLVERINE_FIX_VAULT_FINAL.sh
