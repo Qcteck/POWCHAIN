@@ -1,33 +1,31 @@
-cat >/root/WV_SSL_ROUTE_FIX.sh <<'BASH'
+cat >/root/WV_DEDUP_WOLVERINE_LOCATIONS.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
 DOMAIN="fireinners.online"
-SITESEN="/etc/nginx/sites-enabled"
-INC="/etc/nginx/includes/wolverine_routes.inc"
+INCDIR="/etc/nginx/includes"
+CANON_INC="$INCDIR/wolverine_routes.inc"
 WEBROOT="/var/www/wolverine"
-BK="/root/BK_WV_SSL_ROUTE_FIX_$(date +%Y%m%d_%H%M%S)"
+BK="/root/BK_WV_DEDUP_$(date +%Y%m%d_%H%M%S)"
 
 say(){ echo "[$(date -u +"%F %T UTC")] $*"; }
 need_root(){ [ "${EUID:-$(id -u)}" -eq 0 ] || { echo "ERR: root only"; exit 1; }; }
 
-unfreeze(){
-  command -v chattr >/dev/null 2>&1 || return 0
-  chattr -i -R /etc/nginx 2>/dev/null || true
-}
-
-backup(){
+backup_all(){
   mkdir -p "$BK"
   cp -a /etc/nginx "$BK/nginx" 2>/dev/null || true
   [ -d "$WEBROOT" ] && cp -a "$WEBROOT" "$BK/webroot_wolverine" 2>/dev/null || true
   say "Backups: $BK"
 }
 
-ensure_inc(){
-  mkdir -p "$(dirname "$INC")"
-  if [ ! -f "$INC" ]; then
-    say "Create $INC"
-    cat >"$INC" <<'NGX'
+unfreeze(){
+  command -v chattr >/dev/null 2>&1 || return 0
+  chattr -i -R /etc/nginx 2>/dev/null || true
+}
+
+ensure_canon_inc(){
+  mkdir -p "$INCDIR"
+  cat >"$CANON_INC" <<'NGX'
 location = /wolverine { return 301 /wolverine/; }
 location ^~ /wolverine/ {
   alias /var/www/wolverine/;
@@ -52,149 +50,189 @@ location ^~ /wolverine/traderone/ {
   proxy_pass http://127.0.0.1:3000/;
 }
 NGX
-  fi
 }
 
 ensure_webroot(){
   mkdir -p "$WEBROOT"
   if [ ! -f "$WEBROOT/index.html" ]; then
-    say "Create minimal $WEBROOT/index.html (missing)"
     cat >"$WEBROOT/index.html" <<'HTML'
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WOLVERINE</title><style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;margin:0;background:#0b0f14;color:#e7eef7}main{max-width:900px;margin:0 auto;padding:22px}h1{margin:0 0 10px;font-size:22px}a{color:#7bd3ff}code{background:#111a24;padding:2px 6px;border-radius:6px}pre{background:#0e1520;padding:12px;border-radius:10px;overflow:auto}</style></head><body><main><h1>WOLVERINE — OK</h1><p>Si tu vois cette page, le routing <code>/wolverine/</code> fonctionne côté nginx (origin).</p><p>Tests:</p><ul><li><a href="/wolverine/vault-api/health">/wolverine/vault-api/health</a></li><li><a href="/wolverine/traderone/">/wolverine/traderone/</a></li></ul><pre>Next step: remettre TON index.html officiel ici:
-/var/www/wolverine/index.html</pre></main></body></html>
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WOLVERINE</title></head><body style="font-family:system-ui;background:#0b0f14;color:#e7eef7;margin:0"><div style="max-width:900px;margin:0 auto;padding:22px"><h1 style="margin:0 0 10px;font-size:22px">WOLVERINE — OK</h1><p>Routing nginx actif pour <code>/wolverine/</code>.</p><ul><li><a style="color:#7bd3ff" href="/wolverine/vault-api/health">/wolverine/vault-api/health</a></li><li><a style="color:#7bd3ff" href="/wolverine/traderone/">/wolverine/traderone/</a></li></ul></div></body></html>
 HTML
   fi
 }
 
-find_ssl_vhosts(){
-  local out="$BK/ssl_vhosts.txt"
-  : >"$out"
-  shopt -s nullglob
-  for f in "$SITESEN"/*; do
-    [ -e "$f" ] || continue
-    local real
-    real="$(readlink -f "$f" 2>/dev/null || true)"
-    [ -n "$real" ] || continue
-    if grep -qE "server_name[[:space:]].*\b${DOMAIN}\b" "$real" 2>/dev/null && grep -qE "listen[[:space:]]+443" "$real" 2>/dev/null; then
-      echo "$f -> $real" >>"$out"
-    fi
-  done
-  shopt -u nullglob
-  cat "$out"
+dedup_other_includes(){
+  say "Dedup: remove /wolverine* location blocks from other includes (keep only $CANON_INC)"
+  python3 - "$INCDIR" "$CANON_INC" <<'PY'
+import os,re,sys,glob,shutil
+incdir=sys.argv[1]
+canon=os.path.realpath(sys.argv[2])
+
+targets=[
+  re.compile(r'^\s*location\s*=\s*/wolverine\b'),
+  re.compile(r'^\s*location\s+\^~\s+/wolverine/\b'),
+  re.compile(r'^\s*location\s+/wolverine/\b'),
+  re.compile(r'^\s*location\s+\^~\s+/wolverine/vault-api/\b'),
+  re.compile(r'^\s*location\s+/wolverine/vault-api/\b'),
+  re.compile(r'^\s*location\s+\^~\s+/wolverine/traderone/\b'),
+  re.compile(r'^\s*location\s+/wolverine/traderone/\b'),
+]
+
+def is_target(line:str)->bool:
+  return any(p.search(line) for p in targets)
+
+def strip_blocks(lines):
+  out=[]
+  i=0
+  n=len(lines)
+  removed=0
+  while i<n:
+    line=lines[i]
+    if is_target(line):
+      removed+=1
+      # single-line block with {} on same line
+      if "{" in line and "}" in line and line.index("{") < line.rindex("}"):
+        i+=1
+        continue
+      # multi-line: skip until braces close
+      depth = line.count("{") - line.count("}")
+      i+=1
+      # if location line didn't open brace yet, keep skipping until we see '{'
+      while i<n and depth<=0:
+        depth += lines[i].count("{") - lines[i].count("}")
+        i+=1
+        if depth>0: break
+      while i<n and depth>0:
+        depth += lines[i].count("{") - lines[i].count("}")
+        i+=1
+      continue
+    out.append(line)
+    i+=1
+  return out,removed
+
+for path in sorted(glob.glob(os.path.join(incdir,"*.inc"))):
+  rp=os.path.realpath(path)
+  if rp==canon:
+    continue
+  try:
+    txt=open(path,'r',encoding='utf-8',errors='ignore').read().splitlines(True)
+  except Exception:
+    continue
+  new,removed=strip_blocks(txt)
+  if removed>0:
+    # keep file present but safe; write a header comment + remaining content
+    hdr=f"# AUTO: dedup removed {removed} /wolverine* location block(s). Canonical is {canon}\n"
+    content=hdr + "".join(new)
+    # ensure not empty (nginx ok with empty, but keep comment)
+    if content.strip()=="":
+      content=hdr
+    open(path,'w',encoding='utf-8').write(content)
+    print(f"DEDUP: {path} (removed {removed})")
+PY
 }
 
-choose_primary(){
-  local list="$BK/ssl_vhosts.txt"
-  [ -s "$list" ] || { say "ERR: no ssl vhost found for $DOMAIN in $SITESEN"; exit 1; }
-  local primary=""
-  # prefer fireinners.online-ssl if present
-  primary="$(grep -iE "fireinners\.online-ssl" "$list" | head -n1 | sed 's/ .*//')"
-  if [ -z "$primary" ]; then
-    primary="$(head -n1 "$list" | sed 's/ .*//')"
-  fi
-  echo "$primary"
-}
+ensure_vhost_has_canon_include(){
+  # inject include into the active SSL vhost for fireinners.online
+  say "Inject include into SSL vhost for $DOMAIN (idempotent)"
+  python3 - "$DOMAIN" "$CANON_INC" <<'PY'
+import glob,os,re,sys
+domain=sys.argv[1]
+inc=sys.argv[2]
+sites_enabled="/etc/nginx/sites-enabled"
 
-disable_duplicates(){
-  local primary="$1"
-  local list="$BK/ssl_vhosts.txt"
-  local dd="$BK/disabled_sitesenabled"
-  mkdir -p "$dd"
-  while IFS= read -r line; do
-    local link="${line%% *}"
-    [ -n "$link" ] || continue
-    if [ "$link" != "$primary" ]; then
-      say "Disable duplicate sites-enabled link: $link"
-      mv -f "$link" "$dd/" 2>/dev/null || true
-    fi
-  done <"$list"
-}
+# find ssl vhost symlink for domain
+cands=[]
+for link in glob.glob(sites_enabled+"/*"):
+  try:
+    real=os.path.realpath(link)
+  except Exception:
+    continue
+  if not os.path.isfile(real): 
+    continue
+  txt=open(real,'r',encoding='utf-8',errors='ignore').read()
+  if re.search(r'^\s*server_name\b.*\b'+re.escape(domain)+r'\b', txt, re.M) and re.search(r'^\s*listen\s+443\b', txt, re.M):
+    cands.append((link,real))
 
-inject_include_into_primary(){
-  local primary_link="$1"
-  local vhost
-  vhost="$(readlink -f "$primary_link")"
-  [ -f "$vhost" ] || { say "ERR: vhost file missing: $vhost"; exit 1; }
-  say "Primary SSL vhost: $primary_link -> $vhost"
+if not cands:
+  print("ERR: no ssl vhost found for domain in sites-enabled")
+  sys.exit(1)
 
-  python3 - "$vhost" "$DOMAIN" "$INC" <<'PY'
-import sys,re
-path,domain,inc=sys.argv[1],sys.argv[2],sys.argv[3]
-txt=open(path,'r',encoding='utf-8',errors='ignore').read().splitlines(True)
+# prefer *-ssl
+cands.sort(key=lambda x: (0 if "ssl" in os.path.basename(x[0]).lower() else 1, x[0]))
+link,real=cands[0]
+lines=open(real,'r',encoding='utf-8',errors='ignore').read().splitlines(True)
 
-def is_server_start(line): return re.match(r'^\s*server\s*\{', line) is not None
-def has_listen_443(block): return any(re.search(r'^\s*listen\s+443\b', l) for l in block)
-def has_server_name(block): return any(re.search(r'^\s*server_name\b.*\b'+re.escape(domain)+r'\b', l) for l in block)
-def has_inc(block): return any(re.search(r'^\s*include\s+'+re.escape(inc)+r'\s*;', l) for l in block)
+def is_server_start(l): return re.match(r'^\s*server\s*\{', l) is not None
 
-out=[]
-i=0
-n=len(txt)
-changed=False
-
-while i<n:
-  line=txt[i]
-  if not is_server_start(line):
-    out.append(line); i+=1; continue
-
-  # capture server block by brace depth
-  start=i
+def block_bounds(i):
   depth=0
   j=i
-  while j<n:
-    depth += txt[j].count('{') - txt[j].count('}')
+  while j<len(lines):
+    depth += lines[j].count("{") - lines[j].count("}")
     j+=1
     if depth<=0: break
-  block=txt[start:j]
+  return i,j
 
-  if has_listen_443(block) and has_server_name(block):
-    if not has_inc(block):
-      # insert include after first listen 443 line, else after server_name line, else after 'server {'
-      insert_at=None
-      for k,l in enumerate(block):
-        if re.search(r'^\s*listen\s+443\b', l):
-          insert_at=k+1; break
-      if insert_at is None:
-        for k,l in enumerate(block):
-          if re.search(r'^\s*server_name\b', l):
-            insert_at=k+1; break
-      if insert_at is None:
-        insert_at=1
-      block.insert(insert_at, f"    include {inc};\n")
-      changed=True
+def has_inc(block):
+  return any(re.search(r'^\s*include\s+'+re.escape(inc)+r'\s*;', l) for l in block)
 
-  out.extend(block)
-  i=j
+changed=False
+out=[]
+i=0
+while i<len(lines):
+  if not is_server_start(lines[i]):
+    out.append(lines[i]); i+=1; continue
+  a,b=block_bounds(i)
+  block=lines[a:b]
+  is_ssl = any(re.search(r'^\s*listen\s+443\b', l) for l in block)
+  is_dom = any(re.search(r'^\s*server_name\b.*\b'+re.escape(domain)+r'\b', l) for l in block)
+  if is_ssl and is_dom and not has_inc(block):
+    # insert after first listen 443
+    ins=1
+    for k,l in enumerate(block):
+      if re.search(r'^\s*listen\s+443\b', l):
+        ins=k+1; break
+    block.insert(ins, f"    include {inc};\n")
+    changed=True
+  # dedup multiple same include lines: keep first
+  seen=0
+  nb=[]
+  for l in block:
+    if re.search(r'^\s*include\s+'+re.escape(inc)+r'\s*;', l):
+      seen+=1
+      if seen==1: nb.append(l)
+      else: 
+        changed=True
+        continue
+    else:
+      nb.append(l)
+  out.extend(nb)
+  i=b
 
 if changed:
-  open(path,'w',encoding='utf-8').write(''.join(out))
-PY
-
-  # ensure include is not present multiple times
-  # (keep first)
-  python3 - "$vhost" "$INC" <<'PY'
-import sys,re
-path,inc=sys.argv[1],sys.argv[2]
-lines=open(path,'r',encoding='utf-8',errors='ignore').read().splitlines(True)
-out=[]
-seen=0
-pat=re.compile(r'^\s*include\s+'+re.escape(inc)+r'\s*;\s*$')
-for l in lines:
-  if pat.search(l):
-    seen+=1
-    if seen==1: out.append(l)
-    else: continue
-  else:
-    out.append(l)
-open(path,'w',encoding='utf-8').write(''.join(out))
+  open(real,'w',encoding='utf-8').write("".join(out))
+print(f"Primary SSL vhost: {link} -> {real} (updated={changed})")
 PY
 }
 
-nginx_reload(){
+nginx_test_reload(){
   say "nginx -t"
-  nginx -t
-  say "reload nginx"
-  systemctl reload nginx || systemctl restart nginx
+  if nginx -t; then
+    say "reload nginx"
+    systemctl reload nginx || systemctl restart nginx
+    return 0
+  fi
+  return 1
+}
+
+rollback(){
+  say "ROLLBACK /etc/nginx from backup"
+  [ -d "$BK/nginx" ] || { say "No backup nginx dir"; return 1; }
+  rm -rf /etc/nginx.broken 2>/dev/null || true
+  mv /etc/nginx /etc/nginx.broken 2>/dev/null || true
+  cp -a "$BK/nginx" /etc/nginx
+  nginx -t || true
+  systemctl restart nginx || true
 }
 
 tests(){
@@ -202,7 +240,7 @@ tests(){
   curl -skI --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/" | sed -n '1,15p' || true
   echo
   say "TEST LOCAL (bypass CF) first bytes"
-  curl -sk --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/" | head -c 200 || true
+  curl -sk --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/" | head -c 220 || true
   echo; echo
   say "TEST PUBLIC HEAD"
   curl -skI "https://${DOMAIN}/wolverine/" | sed -n '1,15p' || true
@@ -210,18 +248,17 @@ tests(){
 
 main(){
   need_root
-  backup
+  backup_all
   unfreeze
-  ensure_inc
+  ensure_canon_inc
   ensure_webroot
-  say "Scan ssl vhosts (server_name ${DOMAIN} + listen 443)"
-  find_ssl_vhosts | tee "$BK/ssl_vhosts.txt"
-  local primary
-  primary="$(choose_primary)"
-  say "Primary chosen: $primary"
-  disable_duplicates "$primary"
-  inject_include_into_primary "$primary"
-  nginx_reload
+  dedup_other_includes
+  ensure_vhost_has_canon_include
+  if ! nginx_test_reload; then
+    say "nginx -t failed after dedup; rolling back"
+    rollback
+    exit 1
+  fi
   tests
   say "DONE"
   echo "Backups: $BK"
@@ -229,5 +266,5 @@ main(){
 main "$@"
 BASH
 
-chmod +x /root/WV_SSL_ROUTE_FIX.sh
-bash /root/WV_SSL_ROUTE_FIX.sh
+chmod +x /root/WV_DEDUP_WOLVERINE_LOCATIONS.sh
+bash /root/WV_DEDUP_WOLVERINE_LOCATIONS.sh
