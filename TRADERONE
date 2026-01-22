@@ -1,262 +1,56 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-### ===== CONFIG =====
-APP="/var/www/fireinners.online/aiaquila"
-SITE="fireinners.online"
-USER="www-data"
-GROUP="www-data"
-BACK="/root/aiaquila_backup_$(date +%Y%m%d_%H%M%S)"
+echo "==============================================="
+echo " AIAQUILA PROXY — ROOT VERIFICATION BATCH"
+echo "==============================================="
 
-### ===== ROOT CHECK =====
-[ "$EUID" -ne 0 ] && echo "ROOT ONLY" && exit 1
+PROXY_URL="https://aiaquila-proxy.paycashnostory.workers.dev"
+LOG="/root/aiaquila_proxy_check_$(date +%Y%m%d_%H%M%S).log"
 
-echo "== BACKUP =="
-mkdir -p "$BACK"
-[ -d "$APP" ] && cp -a "$APP" "$BACK/"
+echo "Proxy URL : $PROXY_URL"
+echo "Log file  : $LOG"
+echo ""
 
-echo "== DEPENDENCIES =="
-apt-get update -y
-apt-get install -y nginx curl jq
+exec > >(tee -a "$LOG") 2>&1
 
-echo "== APP DIR =="
-mkdir -p "$APP"
+echo "==[1] BASIC CONNECTIVITY =="
+curl -s -I "$PROXY_URL/health" || echo "❌ Health endpoint unreachable"
+echo ""
 
-echo "== FRONTEND (AIAQUILA COMPLET) =="
-cat > "$APP/index.html" <<'HTML'
-<!doctype html>
-<html lang="fr">
-<meta charset="utf-8">
-<title>AIAQUILA • Journaliste Crypto Interactif</title>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<style>
-body{margin:0;background:#0b0f14;color:#e6edf3;font-family:system-ui}
-header{padding:14px;border-bottom:1px solid #1f2937}
-main{max-width:1000px;margin:auto;padding:20px}
-#stream p{margin:.55em 0}
-input,button{background:#111827;color:#e6edf3;border:1px solid #374151;padding:8px}
-button{cursor:pointer}
-hr{border:0;border-top:1px solid #1f2937;margin:14px 0}
-.small{opacity:.7;font-size:.9em}
-</style>
+echo "==[2] HEALTH CHECK =="
+curl -s "$PROXY_URL/health" | jq . || curl -s "$PROXY_URL/health"
+echo ""
 
-<body>
-<header>
-  <strong>AIAQUILA</strong> — Bulletin crypto & macro en continu
-</header>
+echo "==[3] RSS — ECONOMY =="
+curl -s "$PROXY_URL/rss?cat=economy" | head -n 40
+echo ""
 
-<main>
-  <div class="small">Token à analyser</div>
-  <input id="tokenInput" placeholder="Adresse ou symbole du token">
-  <button onclick="analyzeToken()">Analyser</button>
+echo "==[4] RSS — CRYPTO =="
+curl -s "$PROXY_URL/rss?cat=crypto" | head -n 40
+echo ""
 
-  <hr>
+echo "==[5] PRICE CHECK =="
+curl -s "$PROXY_URL/price?ids=bitcoin,solana,ethereum" | jq . || curl -s "$PROXY_URL/price?ids=bitcoin,solana,ethereum"
+echo ""
 
-  <div id="stream"></div>
+echo "==[6] ENTITY EXTRACTION TEST =="
+echo "Elon Musk and Michael Saylor commented on Bitcoin and Solana." | \
+curl -s -X POST "$PROXY_URL/entities" --data-binary @- | jq . || true
+echo ""
 
-  <input id="userInput" placeholder="Réponds ici…">
-</main>
+echo "==[7] TLS / DNS INFO =="
+echo | openssl s_client -connect aiaquila-proxy.paycashnostory.workers.dev:443 -servername aiaquila-proxy.paycashnostory.workers.dev 2>/dev/null | \
+grep -E "subject=|issuer=|Verify return code"
+echo ""
 
-<script>
-/* =========================
-   USER MEMORY
-========================= */
-const USER={
-  name:null,
-  preferences:{},
-  confidence:{}
-};
+echo "==[8] LATENCY TEST =="
+for i in {1..5}; do
+  curl -o /dev/null -s -w "Ping $i → %{time_total}s\n" "$PROXY_URL/health"
+done
+echo ""
 
-/* =========================
-   PERSON MEMORY
-========================= */
-const PERSONS={};
-
-/* =========================
-   VOICE
-========================= */
-let voiceReady=false;
-function unlockVoice(){
-  if(voiceReady) return;
-  voiceReady=true;
-  speechSynthesis.speak(new SpeechSynthesisUtterance(" "));
-}
-["click","keydown","touchstart","scroll"].forEach(e=>{
-  window.addEventListener(e,unlockVoice,{once:true});
-});
-
-function speak(text, importance=1){
-  const p=document.createElement("p");
-  p.textContent=text;
-  stream.appendChild(p);
-
-  if(voiceReady){
-    const u=new SpeechSynthesisUtterance(text);
-    u.lang="fr-CA";
-    u.rate = importance>1 ? 0.95 : 1;
-    speechSynthesis.speak(u);
-  }
-}
-
-/* =========================
-   USER INPUT HANDLING
-========================= */
-userInput.addEventListener("keydown",e=>{
-  if(e.key==="Enter"){
-    const v=userInput.value.trim();
-    userInput.value="";
-    if(!v) return;
-
-    if(!USER.preferences.crypto_favorite){
-      USER.preferences.crypto_favorite=v;
-      USER.confidence.crypto_favorite=0.9;
-      speak("Je note que tu t’intéresses surtout à "+v+".");
-      return;
-    }
-
-    speak("D’accord.");
-  }
-});
-
-/* =========================
-   PRICES
-========================= */
-async function fetchPrices(){
-  try{
-    const r=await fetch("/proxy-prices");
-    const d=await r.json();
-    speak(
-      "Bitcoin autour de "+d.BTC+
-      " dollars. Solana proche de "+d.SOL+
-      " dollars.", 2
-    );
-  }catch(e){}
-}
-
-/* =========================
-   TOKEN ANALYSIS
-========================= */
-async function analyzeToken(){
-  const q=tokenInput.value.trim();
-  if(!q) return;
-
-  const r=await fetch("/proxy-token?q="+encodeURIComponent(q));
-  const t=await r.json();
-
-  speak("Résumé du token "+t.name+". "+t.summary,2);
-  t.advice.forEach((a,i)=>{
-    speak("Conseil "+(i+1)+". "+a);
-  });
-}
-
-/* =========================
-   PERSONS / ARTICLES
-========================= */
-async function fetchPersons(){
-  try{
-    const r=await fetch("/proxy-persons");
-    const list=await r.json();
-
-    list.forEach(p=>{
-      if(!PERSONS[p.name]){
-        PERSONS[p.name]={count:0,last:p.date,context:p.context};
-      }
-      PERSONS[p.name].count++;
-      PERSONS[p.name].last=p.date;
-      PERSONS[p.name].context=p.context;
-
-      if(USER.preferences.crypto_favorite &&
-         p.context.includes(USER.preferences.crypto_favorite.toLowerCase())){
-        speak(
-          p.name+" revient dans l’actualité liée à "+
-          USER.preferences.crypto_favorite+
-          "."
-        );
-      }
-    });
-  }catch(e){}
-}
-
-/* =========================
-   LOOP
-========================= */
-setInterval(fetchPrices,15000);
-setInterval(fetchPersons,25000);
-</script>
-</body>
-</html>
-HTML
-
-echo "== NGINX ROUTES =="
-NGX="/etc/nginx/sites-available/${SITE}-ssl"
-
-if ! grep -q "proxy-persons" "$NGX"; then
-cat >> "$NGX" <<'NGXADD'
-
-# --- AIAQUILA PROXIES ---
-location /proxy-persons {
-  proxy_pass https://YOUR_WORKER_URL/persons;
-}
-location /proxy-prices {
-  proxy_pass https://YOUR_WORKER_URL/prices;
-}
-location /proxy-token {
-  proxy_pass https://YOUR_WORKER_URL/token;
-}
-NGXADD
-fi
-
-chown -R $USER:$GROUP "$APP"
-chmod -R 755 "$APP"
-
-nginx -t && systemctl reload nginx
-
-echo
-echo "========================================"
-echo "AIAQUILA DÉPLOYÉ SUR https://${SITE}/aiaquila"
-echo
-echo "⚠️ ACTION RESTANTE (OBLIGATOIRE) :"
-echo "1) Créer un Cloudflare Worker"
-echo "2) Coller le code ci-dessous"
-echo "3) Remplacer YOUR_WORKER_URL dans nginx"
-echo "========================================"
-
-cat <<'WORKER'
-/* ===== CLOUDFLARE WORKER — RSS / PERSONS / PRICES ===== */
-export default {
- async fetch(req){
-  const u=new URL(req.url);
-
-  if(u.pathname.endsWith("/prices")){
-    const r=await fetch("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,solana&vs_currencies=usd");
-    const j=await r.json();
-    return new Response(JSON.stringify({
-      BTC:j.bitcoin.usd,
-      SOL:j.solana.usd
-    }),{headers:{'content-type':'application/json','access-control-allow-origin':'*'}});
-  }
-
-  if(u.pathname.endsWith("/token")){
-    const q=u.searchParams.get("q")||"token";
-    return new Response(JSON.stringify({
-      name:q,
-      summary:"Token observé dans un contexte de marché actif.",
-      advice:[
-        "Vérifier la liquidité avant toute décision.",
-        "Comparer la performance avec Bitcoin.",
-        "Éviter les décisions impulsives sur pics de volume."
-      ]
-    }),{headers:{'content-type':'application/json','access-control-allow-origin':'*'}});
-  }
-
-  if(u.pathname.endsWith("/persons")){
-    return new Response(JSON.stringify([
-      {name:"Musk",context:"crypto",date:new Date().toISOString()},
-      {name:"Powell",context:"macro",date:new Date().toISOString()}
-    ]),{headers:{'content-type':'application/json','access-control-allow-origin':'*'}});
-  }
-
-  return new Response("OK");
- }
-}
-WORKER
+echo "==============================================="
+echo " ✅ AIAQUILA PROXY CHECK COMPLETED"
+echo " Log saved to: $LOG"
+echo "==============================================="
