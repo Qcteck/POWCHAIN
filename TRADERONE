@@ -1,81 +1,61 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "=== AIAQUILA RSS PROXY REPAIR (ONE-SHOT) ==="
+echo "=== AIAQUILA RSS FIX FINAL ==="
 
-# PATHS
 WEBROOT="/var/www/aiaquila"
 HTML="$WEBROOT/index.html"
-PROXY="$WEBROOT/rss-proxy.php"
-BACKUP="$WEBROOT/index.html.bak.$(date +%s)"
+BACKUP="$HTML.bak.$(date +%s)"
 
-# 1️⃣ Vérifications
-echo "[1/6] Vérification chemins..."
-test -d "$WEBROOT" || { echo "❌ $WEBROOT introuvable"; exit 1; }
-test -f "$HTML" || { echo "❌ index.html introuvable"; exit 1; }
+test -f "$HTML" || { echo "index.html introuvable"; exit 1; }
 
-# 2️⃣ Backup HTML
-echo "[2/6] Backup index.html → $BACKUP"
+echo "[1/5] Backup"
 cp "$HTML" "$BACKUP"
 
-# 3️⃣ Création proxy RSS local (CORS OK)
-echo "[3/6] Création proxy RSS local"
+echo "[2/5] Patch JS RSS logique"
 
-cat > "$PROXY" <<'PHP'
-<?php
-header("Access-Control-Allow-Origin: *");
-header("Access-Control-Allow-Methods: GET");
-header("Content-Type: text/xml; charset=utf-8");
+perl -0777 -i -pe '
+s|const RSS_FEEDS\s*=\s*\[[^\]]*\];|
+const RSS_FEEDS = [
+  "https://www.coindesk.com/arc/outboundfeeds/rss/",
+  "https://cointelegraph.com/rss",
+  "https://www.coingecko.com/rss/news"
+];
+|sg;
 
-if (!isset($_GET['url'])) {
-  http_response_code(400);
-  echo "Missing url";
-  exit;
+s|fetch\(([^)]+)\)|fetch("/aiaquila/rss-proxy.php?url=" + encodeURIComponent($1))|sg;
+
+s|response\.json\(\)|response.text()|sg;
+
+s|JSON\.parse\(|new DOMParser().parseFromString(|sg;
+' "$HTML"
+
+echo "[3/5] Injection parser RSS sûr"
+
+perl -0777 -i -pe '
+s|function parseRSS\([^)]*\)\s*\{.*?\}|
+function parseRSS(xmlText) {
+  const doc = new DOMParser().parseFromString(xmlText, "text/xml");
+  const items = [...doc.querySelectorAll("item")];
+  return items.map(item => ({
+    title: item.querySelector("title")?.textContent || "",
+    link: item.querySelector("link")?.textContent || "",
+    desc: item.querySelector("description")?.textContent || ""
+  }));
 }
+|sg;
+' "$HTML"
 
-$url = $_GET['url'];
-if (!preg_match('#^https?://#', $url)) {
-  http_response_code(400);
-  echo "Invalid url";
-  exit;
-}
+echo "[4/5] Permissions"
+chown www-data:www-data "$HTML"
+chmod 644 "$HTML"
 
-$ctx = stream_context_create([
-  "http" => [
-    "timeout" => 8,
-    "user_agent" => "AIAQUILA-RSS/1.0"
-  ]
-]);
-
-$data = @file_get_contents($url, false, $ctx);
-if ($data === false) {
-  http_response_code(502);
-  echo "RSS fetch failed";
-  exit;
-}
-
-echo $data;
-PHP
-
-chmod 644 "$PROXY"
-
-# 4️⃣ Patch JS inline → proxy local
-echo "[4/6] Patch JS inline (RSS proxy)"
-
-sed -i \
-  -e 's|https://aiaquila-proxy[^"]*|/aiaquila/rss-proxy.php?url=|g' \
-  "$HTML"
-
-# 5️⃣ Checksum
-echo "[5/6] Checksums"
-sha256sum "$HTML" "$PROXY"
-
-# 6️⃣ Reload nginx
-echo "[6/6] Reload nginx"
+echo "[5/5] Reload nginx"
 nginx -t && systemctl reload nginx
 
-echo "=========================================="
-echo "✅ AIAQUILA RSS PROXY RÉPARÉ"
+echo "======================================"
+echo "✅ RSS RÉPARÉ"
 echo "🌐 https://fireinners.online/aiaquila/"
-echo "📦 Backup : $BACKUP"
-echo "=========================================="
+echo "🧠 Articles DOIVENT apparaître"
+echo "📦 Backup: $BACKUP"
+echo "======================================"
