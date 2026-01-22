@@ -1,122 +1,276 @@
-cat >/root/AIAQUILA_SIMPLIFIED_UI.sh <<'EOF'
+cat >/root/WV_MEGA_FIX_WOLVERINE_404_V3.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
+cd /root
 
-APP_NAME="aiaquila"
-WEB_ROOT="/var/www/${APP_NAME}"
+TS="$(date +%Y%m%d_%H%M%S)"
+DOMAIN="fireinners.online"
+WEBROOT="/var/www/wolverine"
+INCDIR="/etc/nginx/includes"
+CANON_INC="${INCDIR}/wolverine_routes.inc"
+BK="/root/BK_WV_FIX404_V3_${TS}"
 
-mkdir -p "$WEB_ROOT"
+say(){ echo "[$(date -u +'%F %T UTC')] $*"; }
+need_root(){ [ "${EUID:-$(id -u)}" -eq 0 ] || { echo "ERR: root only"; exit 1; }; }
 
-cat >"${WEB_ROOT}/index.html"<<'HTML'
-<!DOCTYPE html><html lang="fr"><head>
-<meta charset="utf-8">
-<title>AIAQUILA • UI Simplifiée</title>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<style>
-html,body{margin:0;padding:0;background:#05070b;color:#e6ebff;font-family:system-ui}
-#app{display:grid;grid-template-columns:320px 1fr;height:100vh}
-aside{background:#0a0f1c;border-right:1px solid #1b2450;padding:14px}
-main{padding:14px}
-button,input{background:#0e1633;color:#e6ebff;border:1px solid #2b3cff;padding:6px;border-radius:4px}
-button{cursor:pointer}
-.ok{border-color:#3cff9e}.warn{border-color:#ff4d4d}
-.card{border:1px solid #1b2450;border-radius:6px;padding:10px;margin-bottom:10px;background:#070c18}
-.log{font-family:ui-monospace,monospace;font-size:12px;white-space:pre-wrap}
-</style>
-</head><body>
-
-<div id="app">
-<aside>
-<div class="card"><b>Wallet</b><div id="wallet">Déconnecté</div><button id="connect" class="ok">CONNECT PHANTOM</button></div>
-<div class="card"><b>Destination</b><input id="dest" placeholder="Adresse Solana"></div>
-<div class="card"><b>Montant</b><input id="amount" placeholder="0.001 SOL ou 1000000"></div>
-<div class="card"><button id="arm" class="ok">ARM</button><button id="disarm" class="warn">DISARM</button></div>
-<div class="card"><button id="propose">PROPOSE</button><button id="sign" class="ok">APPROUVER & SIGNER</button></div>
-</aside>
-
-<main>
-<div class="card"><b>Console</b><div id="log" class="log"></div></div>
-</main>
-</div>
-
-<script src="https://unpkg.com/@solana/web3.js@1.95.4/lib/index.iife.min.js"></script>
-<script>
-const { Connection, PublicKey, Transaction, SystemProgram } = solanaWeb3;
-const RPC="https://api.mainnet-beta.solana.com";
-const LAMPORTS_PER_SOL=1_000_000_000;
-const $=i=>document.getElementById(i);
-const log=t=>$("log").textContent+=t+"\\n";
-
-function toLamports(v){
- v=Number(v);
- if(!Number.isFinite(v)||v<=0)throw Error("Montant invalide");
- if(v<1)return Math.round(v*LAMPORTS_PER_SOL);
- if(Number.isInteger(v))return v;
- return Math.round(v*LAMPORTS_PER_SOL);
+backup_all(){
+  mkdir -p "$BK"
+  say "Backup -> $BK"
+  cp -a /etc/nginx "$BK/nginx" 2>/dev/null || true
+  [ -d "$WEBROOT" ] && cp -a "$WEBROOT" "$BK/webroot_wolverine" 2>/dev/null || true
 }
 
-let wallet=null,pub=null,armed=false,pending=null;
+unfreeze_nginx(){
+  command -v chattr >/dev/null 2>&1 || return 0
+  chattr -i /etc/nginx/nginx.conf 2>/dev/null || true
+  chattr -i -R /etc/nginx/sites-available /etc/nginx/sites-enabled /etc/nginx/includes /etc/nginx/conf.d 2>/dev/null || true
+}
 
-$("connect").onclick=async()=>{
- if(!window.solana)return alert("Phantom non détecté");
- wallet=window.solana;
- const r=await wallet.connect();
- pub=r.publicKey.toString();
- $("wallet").textContent=pub;
- log("Wallet connecté");
-};
+refreeze_best(){
+  command -v chattr >/dev/null 2>&1 || return 0
+  [ -f /etc/nginx/nginx.conf ] && chattr +i /etc/nginx/nginx.conf 2>/dev/null || true
+  [ -f "$VH" ] && chattr +i "$VH" 2>/dev/null || true
+  [ -f "$CANON_INC" ] && chattr +i "$CANON_INC" 2>/dev/null || true
+}
 
-$("arm").onclick=()=>{armed=true;log("ARM ON");};
-$("disarm").onclick=()=>{armed=false;log("ARM OFF");};
-
-$("propose").onclick=()=>{
- try{
-  if(!armed)throw Error("ARM requis");
-  const dest=$("dest").value.trim();
-  if(!dest)throw Error("Destination vide");
-  const lamports=toLamports($("amount").value);
-  pending={dest,lamports};
-  log("Proposition OK → "+lamports+" lamports");
- }catch(e){log("ERR "+e.message);}
-};
-
-$("sign").onclick=async()=>{
- try{
-  if(!pending||!wallet)throw Error("Rien à signer");
-  const conn=new Connection(RPC,"confirmed");
-  const tx=new Transaction().add(SystemProgram.transfer({
-   fromPubkey:new PublicKey(pub),
-   toPubkey:new PublicKey(pending.dest),
-   lamports:pending.lamports
-  }));
-  tx.feePayer=new PublicKey(pub);
-  tx.recentBlockhash=(await conn.getLatestBlockhash()).blockhash;
-  const signed=await wallet.signTransaction(tx);
-  const sig=await conn.sendRawTransaction(signed.serialize());
-  await conn.confirmTransaction(sig);
-  log("TX OK: "+sig);
-  pending=null;
- }catch(e){log("ERR "+e.message);}
-};
-</script>
-</body></html>
+ensure_webroot(){
+  mkdir -p "$WEBROOT"
+  if [ ! -f "$WEBROOT/index.html" ]; then
+    say "Create minimal $WEBROOT/index.html"
+    cat >"$WEBROOT/index.html" <<'HTML'
+<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>WOLVERINE</title><style>body{font-family:system-ui,Segoe UI,Roboto,Arial;margin:24px;color:#111}code{background:#f3f3f3;padding:2px 6px;border-radius:6px}a{color:#0b5}h1{margin:0 0 10px 0}</style></head><body><h1>WOLVERINE OK</h1><p>Static webroot: <code>/var/www/wolverine</code></p><p>Health: <a href="/wolverine/vault-api/health">/wolverine/vault-api/health</a></p><p>Legacy: <a href="/wolverine/traderone/vault/health">/wolverine/traderone/vault/health</a></p></body></html>
 HTML
+  else
+    say "Keep existing $WEBROOT/index.html"
+  fi
+}
 
-nginx -t && systemctl reload nginx
-echo "OK → https://fireinners.online/aiaquila/"
-EOF
+write_canon_include(){
+  mkdir -p "$INCDIR"
+  say "Write canonical include -> $CANON_INC"
+  cat >"$CANON_INC" <<NGX
+# AUTO: canonical Wolverine routes (WV_MEGA_FIX_WOLVERINE_404_V3)
+location = /wolverine { return 301 /wolverine/; }
 
+location ^~ /wolverine/ {
+  alias $WEBROOT/;
+  index index.html;
+  try_files \$uri \$uri/ /wolverine/index.html;
+  add_header Cache-Control "no-store" always;
+}
 
+location ^~ /wolverine/vault-api/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+  proxy_pass http://127.0.0.1:3000/;
+}
 
+location ^~ /wolverine/traderone/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+  proxy_pass http://127.0.0.1:3000/;
+}
+NGX
+}
 
+pick_ssl_vhost(){
+  python3 - <<PY
+import re,glob,os
+dom="${DOMAIN}"
+cands=[]
+# prefer enabled
+for p in glob.glob("/etc/nginx/sites-enabled/*"):
+  if os.path.islink(p):
+    try: p=os.path.realpath(p)
+    except: pass
+  cands.append(p)
+# then available
+cands += glob.glob("/etc/nginx/sites-available/*")
+seen=set()
+cands=[p for p in cands if not (p in seen or seen.add(p))]
+def file_has(p):
+  try:
+    t=open(p,"r",encoding="utf-8",errors="ignore").read()
+  except: return False
+  if re.search(r"^\s*server\s*\{",t,flags=re.M): 
+    pass
+  return (re.search(r"^\s*server_name\s+.*\b"+re.escape(dom)+r"\b",t,flags=re.M) and re.search(r"^\s*listen\s+443(\s|;)",t,flags=re.M))
+for p in cands:
+  if file_has(p):
+    print(p); break
+else:
+  print("/etc/nginx/sites-available/fireinners.online-ssl")
+PY
+}
 
+edit_nginx(){
+  python3 - <<PY
+import os,re,glob,shutil
+DOMAIN="${DOMAIN}"
+CANON="${CANON_INC}"
+BK="${BK}"
 
+def read(p):
+  try: return open(p,"r",encoding="utf-8",errors="ignore").read().splitlines(True)
+  except: return None
 
+def write(p,lines):
+  with open(p,"w",encoding="utf-8") as f: f.writelines(lines)
 
-chmod +x /root/AIAQUILA_SIMPLIFIED_UI.sh
-/root/AIAQUILA_SIMPLIFIED_UI.sh
+def backup(p):
+  try:
+    rel=p.lstrip("/")
+    dst=os.path.join(BK,"files",rel)
+    os.makedirs(os.path.dirname(dst),exist_ok=True)
+    shutil.copy2(p,dst)
+  except: pass
 
+def strip_block(lines, start_regex, keep_first=False):
+  sr=re.compile(start_regex)
+  out=[]; i=0; kept=0; n=len(lines)
+  while i<n:
+    if sr.search(lines[i]):
+      if keep_first and kept==0:
+        kept=1
+        out.append(lines[i]); i+=1
+        continue
+      depth=0; seen_open=False
+      while i<n:
+        l=lines[i]
+        if "{" in l: 
+          depth += l.count("{"); seen_open=True
+        if "}" in l and seen_open:
+          depth -= l.count("}")
+        i+=1
+        if seen_open and depth<=0:
+          break
+      continue
+    out.append(lines[i]); i+=1
+  return out
 
+# 1) dedup /bundler/api/ in bundler_routes.inc (keep first)
+bundler="/etc/nginx/includes/bundler_routes.inc"
+bl=read(bundler)
+if bl is not None:
+  bl2=strip_block(bl, r"^\s*location\s+\^~\s+/bundler/api/\s*", keep_first=True)
+  if bl2!=bl:
+    backup(bundler); write(bundler,bl2)
 
+# 2) remove ALL Wolverine blocks everywhere except CANON include
+targets=set(glob.glob("/etc/nginx/**/*.conf", recursive=True)+glob.glob("/etc/nginx/sites-available/*")+glob.glob("/etc/nginx/sites-enabled/*")+glob.glob("/etc/nginx/includes/*"))
+patterns=[
+  r"^\s*location\s*=\s*/wolverine\s*\{",
+  r"^\s*location\s+\^~\s+/wolverine/\s*",
+  r"^\s*location\s+\^~\s+/wolverine/vault-api/\s*",
+  r"^\s*location\s+\^~\s+/wolverine/traderone/\s*",
+]
+for p in sorted(targets):
+  if not os.path.isfile(p): 
+    continue
+  if os.path.abspath(p)==os.path.abspath(CANON):
+    continue
+  lines=read(p)
+  if lines is None: 
+    continue
+  orig=lines
+  for pat in patterns:
+    lines=strip_block(lines, pat, keep_first=False)
+  if lines!=orig:
+    backup(p); write(p,lines)
 
+# 3) ensure CANON include exists exactly once in SSL vhost server block
+vhost="${VH}"
+vl=read(vhost)
+if vl is None:
+  raise SystemExit(0)
+inc_line=f"  include {CANON};\n"
+inc_re=re.compile(r"^\s*include\s+"+re.escape(CANON)+r"\s*;")
+new=[]; seen=0
+for l in vl:
+  if inc_re.search(l):
+    seen += 1
+    if seen>1: 
+      continue
+  new.append(l)
+vl=new
+if any(inc_re.search(l) for l in vl):
+  backup(vhost); write(vhost,vl); raise SystemExit(0)
 
+out=[]
+in_server=False
+depth=0
+has_dom=False
+has_443=False
+injected=False
+for l in vl:
+  if (not in_server) and re.search(r"^\s*server\s*\{", l):
+    in_server=True; depth=0; has_dom=False; has_443=False
+  if in_server:
+    if re.search(r"^\s*server_name\s+.*\b"+re.escape(DOMAIN)+r"\b", l): has_dom=True
+    if re.search(r"^\s*listen\s+443(\s|;)", l) or re.search(r"^\s*listen\s+\[::\]:443(\s|;)", l): has_443=True
+    depth += l.count("{"); depth -= l.count("}")
+    if (not injected) and has_dom and has_443 and re.match(r"^\s*\}\s*$", l):
+      out.append(inc_line); injected=True
+  out.append(l)
+  if in_server and depth<=0 and re.match(r"^\s*\}\s*$", l):
+    in_server=False
+
+if not injected:
+  out.append("\n"+inc_line)
+
+backup(vhost); write(vhost,out)
+PY
+}
+
+nginx_test_reload(){
+  say "nginx -t"
+  nginx -t
+  say "reload nginx"
+  systemctl reload nginx || systemctl restart nginx
+}
+
+tests(){
+  echo
+  say "LOCAL (bypass CF) HEAD /wolverine/"
+  curl -sSIk --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/" | sed -n "1,12p" || true
+  echo
+  say "PUBLIC HEAD /wolverine/"
+  curl -sSIk "https://${DOMAIN}/wolverine/" | sed -n "1,12p" || true
+  echo
+  say "PROOF locations:"
+  nginx -T 2>/dev/null | grep -nE "include ${CANON_INC}|location[[:space:]]*=[[:space:]]*/wolverine|location[[:space:]]+\\^~[[:space:]]+/wolverine/" | head -n 120 || true
+}
+
+main(){
+  need_root
+  say "WV_MEGA_FIX_WOLVERINE_404_V3 :: start"
+  backup_all
+  unfreeze_nginx
+
+  VH="$(pick_ssl_vhost)"
+  say "Chosen vhost: $VH"
+
+  ensure_webroot
+  write_canon_include
+  edit_nginx
+  nginx_test_reload
+
+  refreeze_best
+  tests
+
+  say "DONE"
+  echo "Backups: $BK"
+  echo "Open: https://${DOMAIN}/wolverine/ (Ctrl+F5)"
+}
+
+main
+SH
+
+chmod +x /root/WV_MEGA_FIX_WOLVERINE_404_V3.sh
+bash /root/WV_MEGA_FIX_WOLVERINE_404_V3.sh
