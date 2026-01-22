@@ -1,106 +1,129 @@
+cat >/root/MEGA_WV_INJECT_FIX.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
+set +H 2>/dev/null || true
+TS="$(date +%Y%m%d_%H%M%S)"
+BK="/root/BK_WV_INJECT_FIX_$TS"
+INC="/etc/nginx/includes/wolverine_routes.inc"
+DOMAIN="fireinners.online"
 
-BASE="/var/www/aiaquila"
-HTML="$BASE/index.html"
-JS="$BASE/aiaquila-rss.js"
-BACKUP="$BASE/index.backup_$(date +%Y%m%d_%H%M%S).html"
+say(){ echo "[$(date -u +%F\ %T\ UTC)] $*"; }
 
-echo "== AIAQUILA RSS PATCH SAFE =="
+say "BACKUP -> $BK"
+mkdir -p "$BK"
+cp -a /etc/nginx "$BK/nginx" 2>/dev/null || true
+[ -f "$INC" ] && cp -a "$INC" "$BK/$(basename "$INC")" 2>/dev/null || true
 
-# 1) Vérif
-[ -f "$HTML" ] || { echo "index.html introuvable"; exit 1; }
+if command -v chattr >/dev/null 2>&1; then
+  say "UNFREEZE chattr -i (best effort)"
+  for f in /etc/nginx/nginx.conf /etc/nginx/sites-available/* /etc/nginx/sites-enabled/* /etc/nginx/conf.d/* /etc/nginx/includes/*; do
+    [ -e "$f" ] || continue
+    chattr -i "$f" 2>/dev/null || true
+  done
+fi
 
-# 2) Backup
-cp "$HTML" "$BACKUP"
-echo "Backup: $BACKUP"
+say "ENSURE include file $INC"
+mkdir -p /etc/nginx/includes
+cat >"$INC"<<'EOF'
+# wolverine routes (managed)
+location = /wolverine { return 301 /wolverine/; }
+location ^~ /wolverine/ { root /var/www; try_files $uri $uri/ /wolverine/index.html; add_header Cache-Control "no-store" always; }
 
-# 3) Supprimer anciens scripts AIAQUILA inline
-perl -0777 -i -pe '
-s/<script[^>]*>[\s\S]*?AIAQUILA[\s\S]*?<\/script>//gi
-' "$HTML"
-
-# 4) Injecter balise JS externe avant </body>
-perl -0777 -i -pe '
-s|</body>|<script src="/aiaquila/aiaquila-rss.js"></script>\n</body>|i
-' "$HTML"
-
-# 5) Écrire le JS FIX FINAL (parser + voix + sendUser)
-cat > "$JS" <<'EOF'
-/* ===== AIAQUILA RSS FIX FINAL ===== */
-
-const FEEDS=[
- "https://www.coindesk.com/arc/outboundfeeds/rss/",
- "https://cointelegraph.com/rss",
- "https://news.bitcoin.com/feed/",
- "https://www.newsbtc.com/feed/"
-];
-
-const PROXY="/aiaquila/rss-proxy.php?url=";
-let ARTICLES=[];
-
-function log(m){
- const l=document.getElementById("logs");
- if(l){l.textContent+=m+"\n";l.scrollTop=l.scrollHeight;}
+# backend 3000
+location ^~ /wolverine/vault-api/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  proxy_pass http://127.0.0.1:3000/;
 }
 
-function speak(t){
- if(!t) return;
- const u=new SpeechSynthesisUtterance(t);
- u.lang="fr-FR";
- speechSynthesis.cancel();
- speechSynthesis.speak(u);
+# vault routes
+location ^~ /wolverine/traderone/vault/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  proxy_pass http://127.0.0.1:3000/;
 }
 
-function parseXML(txt){
- const p=new DOMParser().parseFromString(txt,"text/xml");
- let items=[...p.querySelectorAll("item")];
- if(!items.length){
-  items=[...p.querySelectorAll("entry")];
- }
- return items.map(it=>({
-  title:(it.querySelector("title")||{}).textContent||"",
-  desc:(it.querySelector("description")||it.querySelector("summary")||{}).textContent||""
- })).filter(a=>a.title);
+# api routes
+location ^~ /wolverine/traderone/api/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  proxy_pass http://127.0.0.1:3000/;
 }
-
-async function loadRSS(){
- ARTICLES=[];
- log("Chargement RSS...");
- for(const f of FEEDS){
-  try{
-   const r=await fetch(PROXY+encodeURIComponent(f));
-   const t=await r.text();
-   const a=parseXML(t);
-   log("Flux reçu: "+f+" ("+t.length+" chars)");
-   log("Titres extraits: "+a.length);
-   ARTICLES.push(...a);
-  }catch(e){
-   log("ERREUR flux "+f);
-  }
- }
- log("TOTAL articles: "+ARTICLES.length);
- if(ARTICLES.length){
-  speak("Premier article. "+ARTICLES[0].title);
- }
-}
-
-function sendUser(){
- const i=document.querySelector("#chatInput");
- if(i && i.value){
-  speak(i.value);
-  i.value="";
- }
-}
-
-document.addEventListener("DOMContentLoaded",()=>{
- const b=document.querySelector("button");
- if(b) b.onclick=loadRSS;
-});
 EOF
 
-# 6) Permissions
-chown www-data:www-data "$HTML" "$JS"
-chmod 644 "$HTML" "$JS"
+say "FIND nginx vhosts containing server_name $DOMAIN"
+mapfile -t VHOSTS < <(grep -Rsl --include="*.conf" -E "\bserver_name\b.*${DOMAIN//./\\.}" /etc/nginx/sites-enabled /etc/nginx/sites-available /etc/nginx/conf.d 2>/dev/null | sort -u || true)
+printf "%s\n" "${VHOSTS[@]:-}" >"$BK/vhosts_found.txt" || true
+if [ "${#VHOSTS[@]:-0}" -eq 0 ]; then
+  say "ERR: no vhost found for $DOMAIN"
+  exit 1
+fi
+say "VHOSTS count=${#VHOSTS[@]}"
 
-echo "PATCH OK — recharge la page avec Ctrl+F5"
+say "INJECT include into each vhost server block (idempotent)"
+python3 - <<PY
+import re, pathlib, sys
+domain = "${DOMAIN}"
+inc_line = "  include /etc/nginx/includes/wolverine_routes.inc;"
+files = ${VHOSTS!r}
+patched=0
+for fp in files:
+    p = pathlib.Path(fp)
+    try:
+        s = p.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        continue
+    if "include /etc/nginx/includes/wolverine_routes.inc;" in s:
+        continue
+    # insert right after the server_name line containing domain, within same server block
+    lines = s.splitlines(True)
+    out=[]
+    inserted=False
+    for line in lines:
+        out.append(line)
+        if (not inserted) and re.search(r"\\bserver_name\\b.*"+re.escape(domain), line):
+            out.append(inc_line+"\n")
+            inserted=True
+    if inserted:
+        p.write_text("".join(out), encoding="utf-8")
+        patched += 1
+print("patched_vhosts=", patched)
+PY
+
+say "NGINX TEST"
+nginx -t
+
+say "RELOAD nginx"
+systemctl reload nginx 2>/dev/null || systemctl restart nginx
+
+if command -v chattr >/dev/null 2>&1; then
+  say "REFREEZE chattr +i (best effort)"
+  chattr +i /etc/nginx/nginx.conf 2>/dev/null || true
+  chattr +i "$INC" 2>/dev/null || true
+  for f in "${VHOSTS[@]}"; do chattr +i "$f" 2>/dev/null || true; done
+fi
+
+say "TEST LOCAL (bypass CF) /wolverine/ (first bytes)"
+curl -sk --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/wolverine/" | head -c 160 || true; echo
+say "TEST LOCAL (bypass CF) /wolverine/vault-api/health"
+curl -sk --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/wolverine/vault-api/health" || true; echo
+say "TEST LOCAL (bypass CF) /wolverine/traderone/vault/health"
+curl -sk --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/wolverine/traderone/vault/health" || true; echo
+say "TEST LOCAL (bypass CF) /wolverine/traderone/api/health"
+curl -sk --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/wolverine/traderone/api/health" || true; echo
+
+say "DONE"
+say "Backups: $BK"
+echo "Open: https://$DOMAIN/wolverine/ (Ctrl+F5)"
+BASH
+chmod +x /root/MEGA_WV_INJECT_FIX.sh
+/root/MEGA_WV_INJECT_FIX.sh
