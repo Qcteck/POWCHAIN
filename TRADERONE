@@ -1,226 +1,182 @@
-cat >/root/MEGA_AQUILA_STACKING_ONLY.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+
 TS="$(date +%Y%m%d_%H%M%S)"
-BK="/root/AQUILA_STACKING_ONLY_BK_${TS}"
-mkdir -p "$BK"
-say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
-die(){ echo "ERR: $*" >&2; exit 1; }
-needroot(){ [ "$(id -u)" -eq 0 ] || die "run as root"; }
-needroot
-umask 022
+WORK="/opt/orion"
+SRC="$WORK/src"
+WWW="/var/www/orion"
+NGX_VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
+NGX_INC_DIR="/etc/nginx/includes"
+NGX_INC_FILE="$NGX_INC_DIR/orion_routes.inc"
 
-DOMAIN="fireinners.online"
-PATH_APP="/aquilastacking"
-WEBROOT="/var/www/aquilastacking"
-INC="/etc/nginx/includes/aquilastacking_routes.inc"
-VHOST_A="/etc/nginx/sites-available/fireinners.online-ssl"
-VHOST_E="/etc/nginx/sites-enabled/fireinners.online-ssl"
+# Cherche aussi orion_patched.zip
+ZIP_CANDIDATES=(
+  "${ORION_ZIP_PATH:-}"
+  "/root/orion_patched.zip"
+  "/root/orion.zip"
+  "/opt/orion_patched.zip"
+  "/opt/orion.zip"
+  "/tmp/orion_patched.zip"
+  "/tmp/orion.zip"
+)
 
-backup_one(){ local p="$1"; [ -e "$p" ] || return 0; mkdir -p "$BK/$(dirname "$p")"; cp -a "$p" "$BK/$p.bak" 2>/dev/null || true; }
-unfreeze_one(){ local f="$1"; [ -e "$f" ] || return 0; chattr -i "$f" 2>/dev/null || true; }
-refreeze_one(){ local f="$1"; [ -e "$f" ] || return 0; chattr +i "$f" 2>/dev/null || true; }
+log(){ printf "\n[%s] %s\n" "$(date -u +'%F %T UTC')" "$*"; }
+die(){ echo "ERROR: $*" >&2; exit 1; }
 
-ensure_pkgs(){
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update -y >/dev/null || true
-  for p in nginx curl rsync; do dpkg -s "$p" >/dev/null 2>&1 || apt-get install -y "$p"; done
+ASKLIB="/opt/fireinners/sentinel/lib/askorupdate.sh"
+if [[ -f "$ASKLIB" ]]; then
+  # shellcheck disable=SC1090
+  source "$ASKLIB"
+else
+  askorupdate_file(){ local src="$1" dst="$2" mode="${3:-0644}"; mkdir -p "$(dirname "$dst")"; [[ -f "$dst" ]] && cp -a "$dst" "$dst.bak.$TS"; install -m "$mode" "$src" "$dst"; }
+fi
+
+require_root(){ [[ "$(id -u)" == "0" ]] || die "Lance ce script en root."; }
+ensure_cmd(){ command -v "$1" >/dev/null 2>&1 || die "Commande manquante: $1"; }
+backup_path(){ local p="$1"; [[ -e "$p" ]] && cp -a "$p" "$p.bak.$TS" || true; }
+chattr_unlock(){ command -v chattr >/dev/null 2>&1 && [[ -e "$1" ]] && chattr -i "$1" 2>/dev/null || true; }
+chattr_lock(){ command -v chattr >/dev/null 2>&1 && [[ -e "$1" ]] && chattr +i "$1" 2>/dev/null || true; }
+
+apt_install_deps(){
+  log "APT deps"
+  apt-get update -y
+  apt-get install -y --no-install-recommends \
+    ca-certificates curl gnupg unzip rsync git nginx \
+    build-essential python3-minimal jq
 }
 
-write_inc_clean(){
-  say "Write include CLEAN: $INC"
-  backup_one "$INC"
-  mkdir -p "$(dirname "$INC")"
-  cat >"$INC" <<EOF
-# aquilastacking_routes.inc (single source of truth)
-location = ${PATH_APP} { return 301 ${PATH_APP}/; }
-location ^~ ${PATH_APP}/ {
-  alias ${WEBROOT}/;
-  index index.html;
-  add_header Cache-Control "no-store" always;
-  try_files \$uri \$uri/ ${PATH_APP}/index.html;
-}
-EOF
-}
-
-patch_vhost_include_once(){
-  [ -f "$VHOST_A" ] || die "missing vhost: $VHOST_A"
-  say "Patch vhost include (once): $VHOST_A"
-  backup_one "$VHOST_A"
-  python3 - "$VHOST_A" "$INC" <<'PY'
-import sys,re
-p,inc=sys.argv[1],sys.argv[2]
-s=open(p,'r',encoding='utf-8',errors='ignore').read().splitlines(True)
-inc_line=f"include {inc};\n"
-# remove duplicate include lines anywhere
-s=[ln for ln in s if ln.strip()!=f"include {inc};"]
-txt="".join(s)
-# find a server block containing server_name fireinners.online (best effort)
-# insert include before the closing brace of that server block
-def insert_in_server(txt):
-  m=re.search(r"server\s*\{",txt)
-  if not m: return None
-  # scan all server blocks, choose the one that mentions fireinners.online
-  i=0
-  while True:
-    m=re.search(r"server\s*\{",txt[i:])
-    if not m: break
-    a=i+m.start()
-    # find matching brace
-    depth=0
-    j=a
-    while j<len(txt):
-      if txt[j]=="{": depth+=1
-      elif txt[j]=="}":
-        depth-=1
-        if depth==0:
-          block=txt[a:j+1]
-          if "server_name" in block and "fireinners.online" in block:
-            # insert before last }
-            return txt[:j] + "  " + inc_line + txt[j:]
-          break
-      j+=1
-    i=j+1
-  return None
-
-out=insert_in_server(txt)
-if out is None:
-  # fallback: append include near end of file
-  out=txt + ("\n" if not txt.endswith("\n") else "") + inc_line
-open(p,'w',encoding='utf-8').write(out)
-PY
-}
-
-deploy_webroot(){
-  say "Deploy webroot: $WEBROOT"
-  mkdir -p "$WEBROOT"
-  # If a built app exists, prefer it
-  if [ -d "/opt/aquila_stacking_react" ]; then
-    if [ -d "/opt/aquila_stacking_react/dist" ]; then
-      say "Found /opt/aquila_stacking_react/dist -> rsync"
-      rsync -a --delete "/opt/aquila_stacking_react/dist/" "$WEBROOT/"
-      return 0
-    fi
-    if [ -d "/opt/aquila_stacking_react/build" ]; then
-      say "Found /opt/aquila_stacking_react/build -> rsync"
-      rsync -a --delete "/opt/aquila_stacking_react/build/" "$WEBROOT/"
-      return 0
-    fi
+install_node20(){
+  if command -v node >/dev/null 2>&1 && node -v | grep -Eq '^v20\.'; then
+    log "Node OK: $(node -v)"
+    return 0
   fi
-
-  # Fallback: stable frontend (no simulation, wallet+balances only)
-  say "No build found -> writing stable index.html (wallet+balances)"
-  cat >"$WEBROOT/index.html" <<'HTML'
-<!doctype html><html lang="fr"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Aquila Stacking</title><style>html,body{margin:0;height:100%;background:#071125;color:#d7e7ff;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial}#w{display:flex;height:100%}#l{width:360px;max-width:92vw;border-right:1px solid rgba(255,255,255,.08);padding:14px;box-sizing:border-box}#r{flex:1;padding:14px;box-sizing:border-box}button,input{border-radius:10px;border:1px solid rgba(255,255,255,.14);background:rgba(10,20,40,.7);color:#d7e7ff;padding:10px 12px;font-weight:700}button{cursor:pointer}button:disabled{opacity:.45;cursor:not-allowed}input{width:100%;margin:6px 0 10px}h1{margin:0 0 10px;font-size:18px}small{opacity:.75}#log{white-space:pre-wrap;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:12px;line-height:1.35;background:rgba(0,0,0,.35);border:1px solid rgba(255,255,255,.10);border-radius:12px;padding:12px;height:calc(100% - 42px);overflow:auto}a{color:#9bd0ff}</style><div id="w"><div id="l"><h1>Aquila Stacking</h1><small>Route: /aquilastacking (stable)</small><div style="height:10px"></div><button id="btnConnect">CONNECT PHANTOM</button><div style="height:10px"></div><div><small>Wallet</small><input id="pub" readonly value=""></div><div><small>SOL</small><input id="sol" readonly value=""></div><div><small>USDC</small><input id="usdc" readonly value=""></div><div style="display:flex;gap:10px"><button id="btnRefresh">REFRESH</button><button id="btnDisc">DISCONNECT</button></div><div style="height:10px"></div><div><small>Staking TX</small><div style="display:flex;gap:10px"><button disabled id="btnStake">STAKE</button><button disabled id="btnUnstake">UNSTAKE</button></div><small style="display:block;margin-top:8px;opacity:.7">Les actions STAKE/UNSTAKE s’activent quand un build/IDL est déployé.</small></div></div><div id="r"><div style="display:flex;gap:10px;align-items:center;height:28px"><b>Console</b><small id="net" style="margin-left:auto;opacity:.8"></small></div><div id="log"></div></div></div><script>(function(){try{if(typeof globalThis==="undefined")window.globalThis=window;globalThis.global=globalThis;globalThis.process=globalThis.process||{env:{}};if(!globalThis.Buffer){function B(a){return new Uint8Array(a)}B.from=function(x){if(x instanceof Uint8Array)return x;if(Array.isArray(x))return new Uint8Array(x);if(typeof x==="string"){var e=new TextEncoder();return e.encode(x)}return new Uint8Array(x)};B.alloc=function(n){return new Uint8Array(n)};B.isBuffer=function(x){return x instanceof Uint8Array};globalThis.Buffer=B}}catch(e){}})();</script><script src="https://unpkg.com/@solana/web3.js@1.95.3/lib/index.iife.min.js"></script><script>(()=>{const logEl=document.getElementById("log");const pubEl=document.getElementById("pub");const solEl=document.getElementById("sol");const usdcEl=document.getElementById("usdc");const netEl=document.getElementById("net");const USDC_MINT="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1";const RPC="https://api.mainnet-beta.solana.com";let provider=null,conn=null;const log=(m)=>{logEl.textContent+=m+"\n";logEl.scrollTop=logEl.scrollHeight};const setNet=()=>{netEl.textContent="RPC: "+RPC};setNet();function getProvider(){const w=window;return (w.solana&&w.solana.isPhantom)?w.solana:null}async function connect(){provider=getProvider();if(!provider){log("Phantom introuvable.");return}try{const r=await provider.connect({onlyIfTrusted:false});const pk=(r.publicKey||provider.publicKey);pubEl.value=pk?pk.toString():"";log("wallet connectée: "+pubEl.value);await refresh()}catch(e){log("connect err: "+(e&&e.message||e))}}async function disconnect(){try{if(provider&&provider.disconnect)await provider.disconnect()}catch(_){}provider=null;pubEl.value="";solEl.value="";usdcEl.value="";log("disconnected")}async function refresh(){try{provider=getProvider();if(!provider||!provider.publicKey){log("pas connecté");return}if(!conn)conn=new solanaWeb3.Connection(RPC,"confirmed");const pk=provider.publicKey;const lam=await conn.getBalance(pk,"confirmed");solEl.value=(lam/1e9).toFixed(6);let usdc=0;try{const res=await conn.getParsedTokenAccountsByOwner(pk,{mint:new solanaWeb3.PublicKey(USDC_MINT)},"confirmed");for(const a of (res&&res.value)||[]){const info=a.account.data.parsed.info;const amt=info.tokenAmount.uiAmount||0;usdc+=amt}}catch(e){log("USDC read err: "+(e&&e.message||e))}usdcEl.value=usdc.toFixed(6);log("refresh ok")}catch(e){log("refresh err: "+(e&&e.message||e))}}document.getElementById("btnConnect").onclick=connect;document.getElementById("btnDisc").onclick=disconnect;document.getElementById("btnRefresh").onclick=refresh;window.addEventListener("focus",()=>setTimeout(()=>{if(getProvider()&&getProvider().publicKey)refresh()},250));})();</script></html>
-HTML
-  chmod 0644 "$WEBROOT/index.html"
+  log "Install/Upgrade Node 20 (NodeSource)"
+  ensure_cmd curl; ensure_cmd gpg
+  install -d -m 0755 /etc/apt/keyrings
+  curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
+  local codename; codename="$(. /etc/os-release && echo "${VERSION_CODENAME:-noble}")"
+  printf "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x %s main\n" "$codename" > /etc/apt/sources.list.d/nodesource.list
+  apt-get update -y
+  apt-get install -y nodejs
+  node -v | grep -Eq '^v20\.' || die "Node 20 non installé correctement."
+  log "Node: $(node -v) | npm: $(npm -v || true)"
 }
 
-dedupe_other_locations(){
-  say "Dedupe other /aquilastacking locations (keep only $INC)"
-  local T; T="$(mktemp)"
-  nginx -T >"$T" 2>/dev/null || true
-  python3 - "$T" "$INC" "$BK" <<'PY'
-import sys,re,os,shutil
-t,keep,bk=sys.argv[1],sys.argv[2],sys.argv[3]
-s=open(t,'r',encoding='utf-8',errors='ignore').read().splitlines()
-# nginx -T includes markers: "# configuration file /path:"
-cur=None
-occ=[]
-for i,ln in enumerate(s):
-    m=re.match(r"#\s*configuration file\s+(\S+):",ln)
-    if m: cur=m.group(1)
-    if cur and "location" in ln and "aquilastacking" in ln:
-        occ.append((cur,i,ln))
-# keep occurrences in keep file only
-targets=[o for o in occ if os.path.realpath(o[0])!=os.path.realpath(keep)]
-# group by file
-by={}
-for f,i,ln in targets:
-    by.setdefault(f,[]).append((i,ln))
-def remove_block(txt, start_idx):
-    # remove from line containing 'location' until matching brace close
-    lines=txt.splitlines(True)
-    # find start line by scanning for the exact location line substring 'aquilastacking'
-    # we will remove the first block that matches '/aquilastacking'
-    for si,l in enumerate(lines):
-        if "location" in l and "aquilastacking" in l:
-            start=si; break
-    else:
-        return txt, False
-    # brace match (count { and } from start)
-    depth=0
-    end=start
-    for j in range(start,len(lines)):
-        depth += lines[j].count("{")
-        depth -= lines[j].count("}")
-        end=j
-        if depth<=0 and j>start and "}" in lines[j]:
-            break
-    # delete block lines
-    new = "".join(lines[:start] + lines[end+1:])
-    return new, True
+find_zip(){
+  for p in "${ZIP_CANDIDATES[@]}"; do
+    [[ -n "${p:-}" ]] || continue
+    [[ -f "$p" && -s "$p" ]] && { echo "$p"; return 0; }
+  done
+  if [[ -n "${ORION_ZIP_URL:-}" ]]; then
+    local out="/root/orion_patched.zip"
+    log "Téléchargement ORION_ZIP_URL -> $out"
+    curl -fL --retry 3 --retry-delay 2 -o "$out" "$ORION_ZIP_URL"
+    [[ -s "$out" ]] || die "Zip téléchargé vide."
+    echo "$out"; return 0
+  fi
+  die "ZIP introuvable. Mets /root/orion_patched.zip (ou /root/orion.zip) OU ORION_ZIP_URL=..."
+}
 
-for f in sorted(by.keys()):
-    if not f.startswith("/etc/nginx/"): 
-        continue
-    if not os.path.exists(f): 
-        continue
-    if os.path.realpath(f)==os.path.realpath(keep):
-        continue
-    # backup
-    dest=os.path.join(bk, f.lstrip("/")) + ".dedupe.bak"
-    os.makedirs(os.path.dirname(dest), exist_ok=True)
-    try:
-        shutil.copy2(f, dest)
-    except Exception:
-        pass
-    txt=open(f,'r',encoding='utf-8',errors='ignore').read()
-    changed=False
-    # remove all blocks that reference aquilastacking
-    while True:
-        txt2, ok = remove_block(txt, 0)
-        if not ok: break
-        txt=txt2; changed=True
-    if changed:
-        open(f,'w',encoding='utf-8').write(txt)
-PY
+write_nginx_include(){
+  mkdir -p "$NGX_INC_DIR"
+  local tmp; tmp="$(mktemp)"
+  cat >"$tmp" <<'NGX'
+# AUTOGENERATED: orion_routes.inc
+location ^~ /orion/ {
+  alias /var/www/orion/;
+  try_files $uri $uri/ /orion/index.html;
+  add_header Cache-Control "no-store";
+}
+NGX
+  chattr_unlock "$NGX_INC_FILE"
+  backup_path "$NGX_INC_FILE"
+  askorupdate_file "$tmp" "$NGX_INC_FILE" 0644
+  rm -f "$tmp"
+  chattr_lock "$NGX_INC_FILE"
+  log "Nginx include: $NGX_INC_FILE"
+}
+
+ensure_include_in_vhost(){
+  ensure_cmd nginx
+  [[ -f "$NGX_VHOST" ]] || die "Vhost introuvable: $NGX_VHOST"
+  local inc_line="include $NGX_INC_FILE;"
+  if grep -Fq "$inc_line" "$NGX_VHOST"; then
+    log "Vhost: include déjà présent."
+    nginx -t && systemctl reload nginx
+    return 0
+  fi
+  log "Vhost: insertion include orion"
+  chattr_unlock "$NGX_VHOST"
+  backup_path "$NGX_VHOST"
+  local tmp; tmp="$(mktemp)"
+  awk -v ins="$inc_line" 'BEGIN{done=0}{if(!done && $0~/^[[:space:]]*location[[:space:]]/){print "  " ins; done=1} print $0}' "$NGX_VHOST" > "$tmp"
+  if ! grep -Fq "$inc_line" "$tmp"; then
+    awk -v ins="$inc_line" '{l[NR]=$0}END{for(i=1;i<=NR;i++){if(i==NR && l[i]~/^[[:space:]]*}[[:space:]]*$/){print "  " ins} print l[i]}}' "$NGX_VHOST" > "$tmp"
+  fi
+  install -m 0644 "$tmp" "$NGX_VHOST"
+  rm -f "$tmp"
+  nginx -t
+  systemctl reload nginx
+  chattr_lock "$NGX_VHOST"
+  log "Nginx reload OK"
+}
+
+build_and_deploy(){
+  ensure_cmd unzip; ensure_cmd rsync
+  mkdir -p "$SRC" "$WWW"
+  rm -rf "$SRC"/*
+  local zip; zip="$(find_zip)"
+  log "Zip utilisé: $zip"
+  unzip -q -o "$zip" -d "$SRC"
+
+  local rootdir="$SRC"
+  if [[ -f "$SRC/package.json" ]]; then
+    rootdir="$SRC"
+  else
+    local pj; pj="$(find "$SRC" -maxdepth 4 -type f -name package.json | head -n1 || true)"
+    [[ -n "$pj" ]] || die "package.json introuvable après unzip."
+    rootdir="$(dirname "$pj")"
+  fi
+  log "Root projet: $rootdir"
+  cd "$rootdir"
+
+  npm config set fund false >/dev/null 2>&1 || true
+  npm config set audit false >/dev/null 2>&1 || true
+  npm config set fetch-retries 3 >/dev/null 2>&1 || true
+  npm config set fetch-retry-mintimeout 20000 >/dev/null 2>&1 || true
+  npm config set fetch-retry-maxtimeout 120000 >/dev/null 2>&1 || true
+
+  log "npm ci"
+  npm ci --no-audit --no-fund
+  log "npm run build"
+  npm run build
+  [[ -d "$rootdir/dist" ]] || die "dist/ introuvable après build."
+
+  log "Deploy dist/ -> $WWW"
+  backup_path "$WWW"
+  rsync -a --delete "$rootdir/dist/" "$WWW/"
+  chown -R www-data:www-data "$WWW" 2>/dev/null || true
+  find "$WWW" -type d -exec chmod 0755 {} \; 2>/dev/null || true
+  find "$WWW" -type f -exec chmod 0644 {} \; 2>/dev/null || true
+}
+
+healthcheck(){
+  ensure_cmd curl
+  local code; code="$(curl -k -s -o /dev/null -w "%{http_code}" "https://fireinners.online/orion/" || true)"
+  log "Healthcheck https://fireinners.online/orion/ => HTTP $code"
 }
 
 main(){
-  say "BEGIN AQUILA STACKING ONLY @ $TS"
-  ensure_pkgs
-
-  # Unfreeze targets
-  for f in "$INC" "$VHOST_A" "$VHOST_E" /etc/nginx/nginx.conf; do unfreeze_one "$f"; done
-
-  # Write include + ensure vhost includes it once
-  write_inc_clean
-  patch_vhost_include_once
-
-  # Try to remove other duplicate location blocks
-  dedupe_other_locations
-
-  # Deploy webroot
-  deploy_webroot
-
-  # Test + reload
-  say "nginx -t"
-  if nginx -t; then
-    say "reload nginx"
-    systemctl reload nginx || nginx -s reload || true
-  else
-    say "nginx -t FAILED. Showing aquilastacking occurrences:"
-    nginx -T 2>/dev/null | grep -n "aquilastacking" | head -n 200 || true
-    exit 1
-  fi
-
-  # Refreeze vhost/include (best-effort)
-  for f in "$INC" "$VHOST_A" /etc/nginx/nginx.conf; do refreeze_one "$f"; done
-
-  say "OK: https://${DOMAIN}${PATH_APP}/"
+  require_root
+  log "=== ORION DEPLOY (patched zip aware) START ==="
+  apt_install_deps
+  install_node20
+  build_and_deploy
+  write_nginx_include
+  ensure_include_in_vhost
+  healthcheck
+  log "=== ORION DEPLOY DONE ==="
 }
+
 main "$@"
-SH
-chmod +x /root/MEGA_AQUILA_STACKING_ONLY.sh
-bash /root/MEGA_AQUILA_STACKING_ONLY.sh
