@@ -1,226 +1,439 @@
-bash -lc 'set -euo pipefail
-cd /root
+cat >/root/MEGA_AIAQUILA_DEPLOY_V2_100.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
 
 TS="$(date +%Y%m%d_%H%M%S)"
-BK="/root/BK_WV_FIX_404_${TS}"
+BK="/root/AIAQUILA_BK_$TS"
+mkdir -p "$BK"
+say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
+die(){ say "ERR: $*"; exit 1; }
+[ "$(id -u)" -eq 0 ] || die "run as root"
+command -v nginx >/dev/null 2>&1 || die "nginx missing"
+command -v curl  >/dev/null 2>&1 || die "curl missing"
+command -v sha256sum >/dev/null 2>&1 || die "sha256sum missing"
+command -v systemctl >/dev/null 2>&1 || die "systemctl missing"
+
 DOMAIN="fireinners.online"
-WEBROOT="/var/www/wolverine"
-INCDIR="/etc/nginx/includes"
-CANINC="${INCDIR}/wolverine_routes.inc"
+SLUG="aiaquila"
+WEB="/var/www/${SLUG}"
+VENDOR="${WEB}/vendor"
+INC="/etc/nginx/includes/${SLUG}_routes.inc"
+MARK="AIAQUILA_AUTOINC"
 
-say(){ echo "[$(date -u +'%F %T UTC')] $*"; }
-need_root(){ [ "${EUID:-$(id -u)}" -eq 0 ] || { echo "ERR: root only"; exit 1; }; }
+VHOST=""
+if [ -f /etc/nginx/conf.d/000-fireinners.online-ssl.conf ]; then
+  VHOST="/etc/nginx/conf.d/000-fireinners.online-ssl.conf"
+elif [ -f /etc/nginx/sites-available/fireinners.online-ssl ]; then
+  VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
+else
+  VHOST="$(nginx -T 2>/dev/null | awk '/# configuration file /{f=$4} /server_name/ && $0 ~ /fireinners\.online/{print f; exit}')"
+fi
+[ -n "${VHOST:-}" ] && [ -f "$VHOST" ] || die "cannot find vhost for ${DOMAIN}"
 
-pick_vhost_443(){
-  # choose first server block (file) that contains server_name fireinners.online AND listen 443
-  local f
-  f="$(nginx -T 2>/dev/null | awk -v dom="$DOMAIN" '
-    $0 ~ /# configuration file / {file=$4; gsub(/:$/,"",file)}
-    $0 ~ /^[[:space:]]*server_name[[:space:]]/ && $0 ~ dom {sn=1}
-    $0 ~ /^[[:space:]]*listen[[:space:]]+443/ {l443=1}
-    sn && l443 {print file; exit}
-  ' || true)"
-  [ -n "${f:-}" ] && echo "$f" || echo "/etc/nginx/sites-available/fireinners.online-ssl"
-}
+backup(){ local p="$1"; [ -e "$p" ] || return 0; mkdir -p "$BK/$(dirname "$p")"; cp -a "$p" "$BK/$p.bak" 2>/dev/null || true; }
+unfreeze(){ chattr -i /etc/nginx/nginx.conf 2>/dev/null || true; chattr -i "$VHOST" 2>/dev/null || true; chattr -i "$INC" 2>/dev/null || true; }
+freeze(){ chattr +i /etc/nginx/nginx.conf 2>/dev/null || true; chattr +i "$VHOST" 2>/dev/null || true; chattr +i "$INC" 2>/dev/null || true; }
 
-unfreeze_best(){
-  command -v chattr >/dev/null 2>&1 || return 0
-  for f in /etc/nginx/nginx.conf /etc/nginx/sites-available/* /etc/nginx/sites-enabled/* /etc/nginx/conf.d/* /etc/nginx/includes/*; do
-    [ -e "$f" ] || continue
-    chattr -i "$f" 2>/dev/null || true
-  done
-}
+say "== 0) backup + unfreeze =="
+backup "$VHOST"; backup "$INC"; backup "$WEB/index.html"
+unfreeze
 
-refreeze_best(){
-  command -v chattr >/dev/null 2>&1 || return 0
-  for f in /etc/nginx/nginx.conf "$VH" "$CANINC"; do
-    [ -e "$f" ] || continue
-    chattr +i "$f" 2>/dev/null || true
-  done
-}
+say "== 1) web dirs =="
+mkdir -p "$VENDOR"
+chmod 0755 "$WEB" "$VENDOR" || true
+chown -R www-data:www-data "$WEB" 2>/dev/null || true
 
-backup_all(){
-  mkdir -p "$BK"
-  say "Backup -> $BK"
-  cp -a /etc/nginx "$BK/nginx" 2>/dev/null || true
-  [ -d "$WEBROOT" ] && cp -a "$WEBROOT" "$BK/webroot_wolverine" 2>/dev/null || true
-  say "Backups ready: $BK"
-}
+say "== 2) vendor (PIN local) =="
+SOLANA_VER="1.95.3"
+curl -fsSL "https://unpkg.com/@solana/web3.js@${SOLANA_VER}/lib/index.iife.min.js" -o "$VENDOR/solana-web3.iife.min.js"
+curl -fsSL "https://cdn.jsdelivr.net/npm/process@0.11.10/browser.js" -o "$VENDOR/process.min.js"
+curl -fsSL "https://cdn.jsdelivr.net/npm/buffer@6.0.3/index.min.js" -o "$VENDOR/buffer.min.js"
+SOL_SHA="$(sha256sum "$VENDOR/solana-web3.iife.min.js" | awk '{print $1}')"
+PROC_SHA="$(sha256sum "$VENDOR/process.min.js" | awk '{print $1}')"
+BUF_SHA="$(sha256sum "$VENDOR/buffer.min.js" | awk '{print $1}')"
+cat >"$VENDOR/SHA256SUMS.txt" <<EOF
+solana-web3.iife.min.js  ${SOL_SHA}
+process.min.js            ${PROC_SHA}
+buffer.min.js             ${BUF_SHA}
+EOF
 
-ensure_webroot(){
-  mkdir -p "$WEBROOT"
-  if [ ! -f "$WEBROOT/index.html" ]; then
-    say "Create minimal $WEBROOT/index.html (missing)"
-    cat >"$WEBROOT/index.html" <<'"'"'HTML'"'"'
-<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>WOLVERINE</title><style>body{font-family:system-ui,Segoe UI,Roboto,Arial;margin:24px;color:#111}code{background:#f3f3f3;padding:2px 6px;border-radius:6px}a{color:#0b5}h1{margin:0 0 10px 0}</style></head><body><h1>WOLVERINE OK</h1><p>Static webroot: <code>/var/www/wolverine</code></p><p>Health: <a href="/wolverine/vault-api/health">/wolverine/vault-api/health</a></p><p>Legacy: <a href="/wolverine/traderone/vault/health">/wolverine/traderone/vault/health</a></p></body></html>
+say "== 3) index.html (Phantom + finalized + idempotence + allowlist/quota) =="
+cat >"$WEB/index.html" <<'HTML'
+<!doctype html><html lang="fr"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/><title>AIAQUILA • Execution Réel (Phantom) • Policy</title><style>
+:root{--bg:#05070b;--p:#0b1020;--b:#1b2450;--t:#e6ebff;--mut:rgba(230,235,255,.75);--ok:#3cff9e;--bad:#ff4d4d;}
+html,body{margin:0;padding:0;background:var(--bg);color:var(--t);font-family:system-ui}
+#top{padding:14px;border-bottom:1px solid var(--b);display:flex;gap:10px;align-items:center;justify-content:space-between;background:var(--p)}
+#grid{display:grid;grid-template-columns:420px 1fr;gap:12px;padding:12px}
+@media(max-width:980px){#grid{grid-template-columns:1fr}}
+.box{border:1px solid var(--b);border-radius:10px;padding:12px;background:rgba(7,12,24,.85)}
+.hd{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;white-space:pre-wrap;word-break:break-word;line-height:1.35}
+input,textarea,button{background:#0e1633;color:var(--t);border:1px solid #2b3cff;padding:10px;border-radius:10px;font-size:14px}
+textarea{width:100%;min-height:120px}
+button{cursor:pointer}
+.ok{border-color:var(--ok)}
+.bad{border-color:var(--bad)}
+.chip{display:inline-flex;gap:6px;align-items:center;border:1px solid var(--b);border-radius:999px;padding:6px 10px;font-size:12px;color:var(--mut);background:rgba(0,0,0,.18)}
+.small{font-size:12px;color:var(--mut)}
+hr{border:0;border-top:1px solid var(--b);margin:10px 0}
+</style></head><body>
+<div id="top">
+  <div><b>AIAQUILA</b> <span class="small">• Execution réelle Phantom • Policy (allowlist/quota) • finalized • idempotent</span></div>
+  <div class="row">
+    <span class="chip" id="chipNET">NET: -</span>
+    <span class="chip" id="chipRPC">RPC: -</span>
+    <span class="chip" id="chipW">WALLET: -</span>
+    <span class="chip" id="chipARM">ARM: OFF</span>
+  </div>
+</div>
+
+<div id="grid">
+  <div class="box">
+    <div class="hd"><b>Wallet + Policy</b><span class="chip" id="chipPOL">POLICY: -</span></div>
+    <div class="row" style="margin-bottom:10px">
+      <button class="ok" id="btnConnect">CONNECT PHANTOM</button>
+      <button class="bad" id="btnDisconnect">DISCONNECT</button>
+    </div>
+    <div class="row" style="margin-bottom:10px">
+      <button class="ok" id="btnARM">ARM</button>
+      <button class="bad" id="btnDISARM">DISARM</button>
+      <span class="small" id="cooldown"></span>
+    </div>
+
+    <div class="row" style="margin-bottom:10px">
+      <input id="dest" placeholder="DEST (pubkey allowlist)" style="flex:1;min-width:260px"/>
+      <input id="lam" placeholder="Lamports" value="1000" style="width:140px"/>
+    </div>
+
+    <div class="row" style="margin-bottom:14px">
+      <button id="btnPropose">PROPOSE (PENDING)</button>
+      <button class="ok" id="btnApprove">APPROUVER & SIGNER</button>
+      <button class="bad" id="btnReject">REJETER</button>
+      <button class="bad" id="btnReset">RESET PENDING</button>
+    </div>
+
+    <div class="small">Allowlist JSON (dest→maxLamportsPerDay). Quota consommé uniquement après <b>finalized</b>.</div>
+    <textarea id="policy"></textarea>
+    <div class="row" style="margin-top:10px">
+      <button id="btnSavePolicy">SAVE POLICY</button>
+      <button id="btnLoadPolicy">RELOAD</button>
+    </div>
+  </div>
+
+  <div class="box">
+    <div class="hd"><b>Console</b><span class="chip" id="chipST">STATE: -</span></div>
+    <div class="mono" id="log"></div>
+    <hr/>
+    <div class="small">Pending</div>
+    <div class="mono" id="pending"></div>
+  </div>
+</div>
+
+<script src="/aiaquila/vendor/process.min.js"></script>
+<script src="/aiaquila/vendor/buffer.min.js"></script>
+<script src="/aiaquila/vendor/solana-web3.iife.min.js"></script>
+<script>
+(function(){
+  try{ if(typeof globalThis.process==='undefined' && typeof process!=='undefined') globalThis.process=process; }catch(e){}
+  try{ if(typeof globalThis.Buffer==='undefined' && typeof buffer!=='undefined' && buffer.Buffer) globalThis.Buffer=buffer.Buffer; }catch(e){}
+
+  const {Connection,PublicKey,Transaction,SystemProgram,clusterApiUrl}=solanaWeb3;
+  const KEY='AIAQUILA_DB_V1';
+  const now=()=>Date.now();
+  const dayKey=()=>new Date().toISOString().slice(0,10);
+  const $=id=>document.getElementById(id);
+
+  const DEFAULT_POLICY={allowDests:{"11111111111111111111111111111111":5000},maxLamportsPerTx:10000,cooldownMsAfterFinalized:15000};
+
+  function load(){ try{ return JSON.parse(localStorage.getItem(KEY)||'null'); }catch(e){ return null; } }
+  function save(db){ localStorage.setItem(KEY, JSON.stringify(db)); }
+
+  let DB=load()||{arm:false,wallet:null,policy:DEFAULT_POLICY,usage:{},pending:null,lastFinalizedAt:0,logs:[]};
+  save(DB);
+
+  function log(s){
+    DB.logs.push('['+new Date().toISOString()+'] '+s);
+    if(DB.logs.length>400) DB.logs=DB.logs.slice(-300);
+    save(DB); render();
+  }
+  function setState(s){ $('chipST').textContent='STATE: '+s; }
+
+  const RPCS=["https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac",clusterApiUrl('mainnet-beta')];
+  let RPC_IDX=0;
+  function conn(commitment){ return new Connection(RPCS[RPC_IDX], commitment||'confirmed'); }
+  function rotateRPC(){ RPC_IDX=(RPC_IDX+1)%RPCS.length; $('chipRPC').textContent='RPC: '+RPC_IDX; }
+
+  async function withRetry(fn,label){
+    let wait=400;
+    for(let i=0;i<5;i++){
+      try{ return await fn(); }
+      catch(e){
+        const m=(e&&e.message)||String(e);
+        log(label+' fail '+(i+1)+'/5: '+m);
+        if(/429|rate|timeout|fetch|network/i.test(m)) rotateRPC();
+        await new Promise(r=>setTimeout(r,wait));
+        wait=Math.min(2500,Math.floor(wait*1.8));
+      }
+    }
+    throw new Error(label+' failed after retries');
+  }
+
+  function policyText(){ return JSON.stringify(DB.policy,null,2); }
+  function parsePolicy(txt){
+    const p=JSON.parse(txt);
+    if(!p||typeof p!=='object') throw new Error('bad policy');
+    if(!p.allowDests||typeof p.allowDests!=='object') throw new Error('allowDests required');
+    p.maxLamportsPerTx=Number(p.maxLamportsPerTx||DEFAULT_POLICY.maxLamportsPerTx);
+    p.cooldownMsAfterFinalized=Number(p.cooldownMsAfterFinalized||DEFAULT_POLICY.cooldownMsAfterFinalized);
+    return p;
+  }
+
+  function usedToday(dest){
+    const d=dayKey();
+    const day=DB.usage[d]||{};
+    return Number(day[dest]||0);
+  }
+  function addUsageFinalized(dest,lamports){
+    const d=dayKey();
+    DB.usage[d]=DB.usage[d]||{};
+    DB.usage[d][dest]=Number(DB.usage[d][dest]||0)+Number(lamports||0);
+    save(DB);
+  }
+  function inCooldown(){ return now() < (DB.lastFinalizedAt + Number(DB.policy.cooldownMsAfterFinalized||0)); }
+
+  async function sha256Hex(str){
+    const enc=new TextEncoder().encode(str);
+    const buf=await crypto.subtle.digest('SHA-256',enc);
+    return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,'0')).join('');
+  }
+
+  let provider=null;
+
+  async function connectWallet(){
+    if(!window.solana) throw new Error('Phantom requis (iPhone: ouvrir dans le navigateur Phantom)');
+    provider=window.solana;
+    const r=await provider.connect();
+    DB.wallet=r.publicKey.toString();
+    save(DB);
+    log('Wallet connecté: '+DB.wallet);
+  }
+
+  async function disconnectWallet(){
+    try{ if(provider && provider.disconnect) await provider.disconnect(); }catch(e){}
+    DB.wallet=null; save(DB);
+    log('Wallet déconnecté');
+  }
+
+  function validatePropose(destStr,lamStr){
+    if(!DB.arm) throw new Error('ARM requis');
+    if(!DB.wallet) throw new Error('Wallet requis');
+    if(inCooldown()) throw new Error('Cooldown actif');
+    const lam=Number(lamStr||0);
+    if(!Number.isFinite(lam)||lam<=0) throw new Error('Lamports invalid');
+    if(lam>Number(DB.policy.maxLamportsPerTx||0)) throw new Error('Depasse maxLamportsPerTx');
+    const dest=destStr.trim();
+    if(!dest) throw new Error('DEST requis');
+    if(!DB.policy.allowDests[dest]) throw new Error('DEST pas dans allowlist');
+    const maxDay=Number(DB.policy.allowDests[dest]);
+    const used=usedToday(dest);
+    if(used+lam>maxDay) throw new Error('Quota depasse (today '+used+'/'+maxDay+')');
+    return {dest,lam};
+  }
+
+  async function propose(){
+    const {dest,lam}=validatePropose($('dest').value,$('lam').value);
+    const id=await sha256Hex(DB.wallet+'|'+dest+'|'+lam+'|'+dayKey()+'|'+now());
+    DB.pending={id,status:'PROPOSED',dest,lamports:lam,createdAt:now(),signedB64:null,sig:null,blockhash:null,lastValidBlockHeight:null,err:null};
+    save(DB);
+    log('Proposed pending id='+id+' dest='+dest+' lamports='+lam);
+  }
+
+  function reject(){ if(DB.pending){ DB.pending.status='REJECTED'; DB.pending.err='user_reject'; save(DB); log('Pending rejeté'); } }
+  function resetPending(){ DB.pending=null; save(DB); log('Pending reset'); }
+
+  async function approveAndSend(){
+    if(!DB.pending) throw new Error('No pending');
+    if(DB.pending.status==='FINALIZED') throw new Error('Already finalized');
+    if(!DB.arm) throw new Error('ARM requis');
+    if(!DB.wallet) throw new Error('Wallet requis');
+    if(inCooldown()) throw new Error('Cooldown actif');
+
+    const dest=DB.pending.dest, lam=Number(DB.pending.lamports);
+
+    if(DB.pending.signedB64){
+      setState('SENDING');
+      const signedBytes=Uint8Array.from(atob(DB.pending.signedB64),c=>c.charCodeAt(0));
+      const c=conn('confirmed');
+      const sig=await withRetry(()=>c.sendRawTransaction(signedBytes,{skipPreflight:false,maxRetries:3}),'sendRawTransaction');
+      DB.pending.sig=sig; DB.pending.status='SENT'; save(DB);
+      log('TX resent (idempotent) sig='+sig);
+      await confirmFinalized();
+      return;
+    }
+
+    setState('PREPARE');
+    const c=conn('confirmed');
+    const from=new PublicKey(DB.wallet);
+    const to=new PublicKey(dest);
+
+    const latest=await withRetry(()=>c.getLatestBlockhash('confirmed'),'getLatestBlockhash');
+    const tx=new Transaction().add(SystemProgram.transfer({fromPubkey:from,toPubkey:to,lamports:lam}));
+    tx.feePayer=from;
+    tx.recentBlockhash=latest.blockhash;
+
+    DB.pending.blockhash=latest.blockhash;
+    DB.pending.lastValidBlockHeight=latest.lastValidBlockHeight;
+    DB.pending.status='SIGNING';
+    save(DB);
+    log('Signing...');
+
+    let signed;
+    try{ signed=await provider.signTransaction(tx); }
+    catch(e){ DB.pending.status='REJECTED'; DB.pending.err='sign_reject'; save(DB); throw e; }
+
+    const bytes=signed.serialize();
+    DB.pending.signedB64=btoa(String.fromCharCode.apply(null,Array.from(bytes)));
+    DB.pending.status='SIGNED';
+    save(DB);
+    log('Signed OK (stored signed tx for replay-safe)');
+
+    setState('SENDING');
+    const sig=await withRetry(()=>c.sendRawTransaction(bytes,{skipPreflight:false,maxRetries:3}),'sendRawTransaction');
+    DB.pending.sig=sig;
+    DB.pending.status='SENT';
+    save(DB);
+    log('Sent sig='+sig);
+
+    await confirmFinalized();
+  }
+
+  async function confirmFinalized(){
+    if(!DB.pending||!DB.pending.sig) throw new Error('No sig to confirm');
+    setState('CONFIRMING_FINALIZED');
+    const c=conn('finalized');
+    const sig=DB.pending.sig;
+    const bh=DB.pending.blockhash;
+    const lvh=DB.pending.lastValidBlockHeight;
+
+    await withRetry(async()=>{ await c.confirmTransaction({signature:sig,blockhash:bh,lastValidBlockHeight:lvh},'finalized'); return true; },'confirmTransaction(finalized)');
+
+    DB.pending.status='FINALIZED';
+    DB.lastFinalizedAt=now();
+    addUsageFinalized(DB.pending.dest,DB.pending.lamports);
+    save(DB);
+    log('FINALIZED ✅ sig='+sig+' (quota consumed)');
+    setState('FINALIZED');
+  }
+
+  function render(){
+    $('chipARM').textContent='ARM: '+(DB.arm?'ON':'OFF');
+    $('chipW').textContent='WALLET: '+(DB.wallet?DB.wallet.slice(0,4)+'…'+DB.wallet.slice(-4):'-');
+    $('chipNET').textContent='NET: mainnet';
+    $('chipRPC').textContent='RPC: '+RPC_IDX;
+    $('policy').value=policyText();
+    $('chipPOL').textContent='POLICY: '+Object.keys(DB.policy.allowDests||{}).length+' dest(s)';
+    $('log').textContent=(DB.logs||[]).slice(-120).join('\n');
+    $('pending').textContent=DB.pending?JSON.stringify(DB.pending,null,2):'-';
+    const cd=inCooldown()?Math.max(0,Math.ceil((DB.lastFinalizedAt+Number(DB.policy.cooldownMsAfterFinalized||0)-now())/1000)):0;
+    $('cooldown').textContent=cd?('cooldown '+cd+'s'):'';
+  }
+  render();
+  setState('IDLE');
+
+  (async()=>{ try{ if(DB.pending && (DB.pending.status==='SENT'||DB.pending.status==='SIGNED') && DB.pending.sig){ log('Resume pending confirm...'); await confirmFinalized(); } }catch(e){ log('Resume failed: '+((e&&e.message)||String(e))); } })();
+
+  $('btnConnect').onclick=async()=>{ try{ setState('CONNECT'); await connectWallet(); setState('READY'); }catch(e){ log('Connect err: '+((e&&e.message)||String(e))); setState('ERR'); } };
+  $('btnDisconnect').onclick=async()=>{ try{ await disconnectWallet(); setState('IDLE'); }catch(e){ log('Disconnect err: '+((e&&e.message)||String(e))); } };
+
+  $('btnARM').onclick=()=>{ DB.arm=true; save(DB); log('ARM ON'); render(); };
+  $('btnDISARM').onclick=()=>{ DB.arm=false; save(DB); log('ARM OFF'); render(); };
+
+  $('btnPropose').onclick=async()=>{ try{ setState('PROPOSE'); await propose(); setState('PROPOSED'); }catch(e){ log('Propose err: '+((e&&e.message)||String(e))); setState('ERR'); } };
+  $('btnApprove').onclick=async()=>{ try{ await approveAndSend(); }catch(e){ if(DB.pending){ DB.pending.status='FAILED'; DB.pending.err=((e&&e.message)||String(e)); save(DB); } log('Approve/send err: '+((e&&e.message)||String(e))); setState('FAILED'); } };
+  $('btnReject').onclick=()=>{ try{ reject(); setState('REJECTED'); }catch(e){} };
+  $('btnReset').onclick=()=>{ resetPending(); setState('IDLE'); };
+
+  $('btnSavePolicy').onclick=()=>{ try{ DB.policy=parsePolicy($('policy').value); save(DB); log('Policy saved'); render(); }catch(e){ log('Policy parse err: '+((e&&e.message)||String(e))); } };
+  $('btnLoadPolicy').onclick=()=>{ render(); log('Policy reloaded'); };
+})();
+</script>
+</body></html>
 HTML
-  else
-    say "Keep existing $WEBROOT/index.html (present)"
-  fi
-}
+chown -R www-data:www-data "$WEB" 2>/dev/null || true
+chmod -R a+rX "$WEB" 2>/dev/null || true
 
-write_canonical_include(){
-  mkdir -p "$INCDIR"
-  say "Write canonical include -> $CANINC"
-  cat >"$CANINC" <<NGX
-# AUTO: canonical Wolverine routes (managed by WV_FIX_WOLVERINE_404_V1)
-location = /wolverine { return 301 /wolverine/; }
-
-location ^~ /wolverine/ {
-  alias $WEBROOT/;
-  index index.html;
-  try_files \$uri \$uri/ /wolverine/index.html;
+say "== 4) nginx include routes =="
+mkdir -p "$(dirname "$INC")"
+cat >"$INC" <<INC
+# ${SLUG} routes (AUTO)
+location = /${SLUG} { return 301 /${SLUG}/; }
+location ^~ /${SLUG}/ {
+  alias ${WEB}/;
+  try_files \$uri \$uri/ /${SLUG}/index.html;
   add_header Cache-Control "no-store" always;
 }
+INC
 
-# Vault API (Node behind nginx)
-location ^~ /wolverine/vault-api/ {
-  proxy_http_version 1.1;
-  proxy_set_header Host \$host;
-  proxy_set_header X-Real-IP \$remote_addr;
-  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto \$scheme;
-  proxy_pass http://127.0.0.1:3000/;
-}
+say "== 5) inject include into vhost (idempotent) =="
+if ! grep -qF "$INC" "$VHOST"; then
+python3 - "$VHOST" "$DOMAIN" "$INC" "$MARK" <<'PY'
+import re,sys
+p,dom,inc,mark=sys.argv[1],sys.argv[2],sys.argv[3],sys.argv[4]
+s=open(p,'r',encoding='utf-8',errors='ignore').read()
+def patch(block):
+  if inc in block: return block, False
+  if not re.search(r'\blisten\b[^;]*\b443\b', block): return block, False
+  if not re.search(r'\bserver_name\b[^;]*\b'+re.escape(dom)+r'\b', block): return block, False
+  lines=block.splitlines()
+  ins=None
+  for i,l in enumerate(lines):
+    if re.search(r'\bserver_name\b', l):
+      ins=i+1; break
+  if ins is None: ins=1
+  lines.insert(ins, f"    # {mark}")
+  lines.insert(ins+1, f"    include {inc};")
+  return "\n".join(lines), True
+out=[]; changed=False; pos=0
+for m in re.finditer(r'server\s*\{', s):
+  start=m.start(); out.append(s[pos:start])
+  i=start; depth=0
+  while i < len(s):
+    c=s[i]
+    if c=='{': depth+=1
+    elif c=='}':
+      depth-=1
+      if depth==0:
+        end=i+1; b=s[start:end]
+        nb,ch=patch(b); out.append(nb); changed=changed or ch; pos=end
+        break
+    i+=1
+new="".join(out)+s[pos:]
+if changed: open(p,'w',encoding='utf-8').write(new)
+PY
+fi
 
-# Optional compat/legacy path (safe even if backend absent)
-location ^~ /wolverine/traderone/ {
-  proxy_http_version 1.1;
-  proxy_set_header Host \$host;
-  proxy_set_header X-Real-IP \$remote_addr;
-  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto \$scheme;
-  proxy_pass http://127.0.0.1:3000/;
-}
-NGX
-}
+say "== 6) nginx test + reload =="
+nginx -t
+systemctl reload nginx
 
-strip_location_blocks_from_file(){
-  # remove specific location blocks from a file (keeps file, avoids nginx include missing)
-  # $1=file, $2=regex for location start
-  local f="$1" re="$2" tmp="${1}.tmp.${TS}"
-  [ -f "$f" ] || return 0
-  grep -Eq "$re" "$f" || return 0
-  cp -a "$f" "$BK/$(echo "$f" | sed "s#^/##;s#/#__#g")" 2>/dev/null || true
-  awk -v re="$re" '
-    function countc(s,c,  i,n){n=0;for(i=1;i<=length(s);i++)if(substr(s,i,1)==c)n++;return n}
-    BEGIN{skip=0;depth=0;seen_open=0}
-    {
-      if(skip==0 && $0 ~ re){
-        skip=1;depth=0;seen_open=0;next
-      }
-      if(skip==1){
-        o=countc($0,"{"); c=countc($0,"}")
-        if(o>0){depth+=o;seen_open=1}
-        if(c>0){depth-=c}
-        if(seen_open && depth<=0){skip=0}
-        next
-      }
-      print
-    }
-  ' "$f" >"$tmp"
-  mv -f "$tmp" "$f"
-}
+say "== 7) smoke tests (local TLS) =="
+echo "--- /${SLUG}/ ---"
+curl -skI -H "Host: ${DOMAIN}" "https://127.0.0.1/${SLUG}/" | head -n 20 || true
+echo "--- vendor solana-web3 ---"
+curl -skI -H "Host: ${DOMAIN}" "https://127.0.0.1/${SLUG}/vendor/solana-web3.iife.min.js" | head -n 15 || true
+echo "--- nginx has include ---"
+nginx -T 2>/dev/null | grep -n "${SLUG}_routes.inc" | head -n 20 || true
 
-dedup_wolverine_locations_everywhere(){
-  say "Dedup: remove duplicate Wolverine location blocks outside canonical include"
-  local f
-  while IFS= read -r f; do
-    [ -n "$f" ] || continue
-    [ "$f" = "$CANINC" ] && continue
-    strip_location_blocks_from_file "$f" "^[[:space:]]*location[[:space:]]+\\^~[[:space:]]+/wolverine/vault-api/"
-    strip_location_blocks_from_file "$f" "^[[:space:]]*location[[:space:]]+\\^~[[:space:]]+/wolverine/"
-    strip_location_blocks_from_file "$f" "^[[:space:]]*location[[:space:]]*=[[:space:]]*/wolverine[[:space:]]*\\{"
-    strip_location_blocks_from_file "$f" "^[[:space:]]*location[[:space:]]+\\^~[[:space:]]+/wolverine/traderone/"
-  done < <(grep -RIl -- "/wolverine" /etc/nginx 2>/dev/null || true)
-}
+say "== 8) freeze nginx files =="
+freeze
 
-ensure_include_once_in_vhost(){
-  say "Ensure include present once in vhost: $VH"
-  [ -f "$VH" ] || { say "ERR: vhost not found: $VH"; exit 1; }
-  cp -a "$VH" "$BK/$(basename "$VH")" 2>/dev/null || true
-
-  # remove duplicate include lines of canonical include, keep first
-  awk -v inc="$CANINC" '
-    BEGIN{n=0}
-    {
-      if($0 ~ "include[[:space:]]+"inc";"){
-        n++
-        if(n>1) next
-      }
-      print
-    }
-  ' "$VH" >"$VH.tmp.${TS}" && mv -f "$VH.tmp.${TS}" "$VH"
-
-  # inject include near end of first 443 server block if not present anywhere
-  if ! grep -qE "include[[:space:]]+${CANINC};" "$VH"; then
-    awk -v inc="$CANINC" '
-      function pr(s){print s}
-      BEGIN{inserver=0;lvl=0;done=0}
-      {
-        line=$0
-        if(done==0 && line ~ /^[[:space:]]*server[[:space:]]*\{/){inserver=1;lvl=0}
-        if(inserver==1){
-          # update level
-          for(i=1;i<=length(line);i++){
-            ch=substr(line,i,1)
-            if(ch=="{") lvl++
-            else if(ch=="}") lvl--
-          }
-          # before closing brace of server block, inject include once
-          if(done==0 && lvl==0 && line ~ /^[[:space:]]*\}[[:space:]]*$/){
-            pr("  include " inc ";")
-            done=1
-          }
-        }
-        pr(line)
-        if(inserver==1 && done==1 && line ~ /^[[:space:]]*\}[[:space:]]*$/){inserver=0}
-      }
-    ' "$VH" >"$VH.tmp.${TS}" && mv -f "$VH.tmp.${TS}" "$VH"
-  fi
-}
-
-nginx_test_reload(){
-  say "nginx -t"
-  nginx -t
-  say "reload nginx"
-  systemctl reload nginx || systemctl restart nginx
-}
-
-tests(){
-  say "TEST local (bypass CF) HEAD /wolverine/"
-  curl -sSIk --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/" | sed -n "1,12p" || true
-  echo
-  say "TEST public HEAD /wolverine/"
-  curl -sSIk "https://${DOMAIN}/wolverine/" | sed -n "1,12p" || true
-  echo
-  say "PROOF (nginx -T) show /wolverine locations"
-  nginx -T 2>/dev/null | grep -nE "location[[:space:]]+\\^~[[:space:]]+/wolverine/|location[[:space:]]*=[[:space:]]*/wolverine" | head -n 60 || true
-}
-
-main(){
-  need_root
-  say "WV_FIX_WOLVERINE_404_V1 :: start"
-  backup_all
-  unfreeze_best
-
-  VH="$(pick_vhost_443)"
-  say "Chosen vhost: $VH"
-
-  ensure_webroot
-  write_canonical_include
-
-  dedup_wolverine_locations_everywhere
-  ensure_include_once_in_vhost
-
-  nginx_test_reload
-  refreeze_best
-  tests
-
-  say "DONE"
-  echo "Backups: $BK"
-  echo "Open: https://${DOMAIN}/wolverine/ (Ctrl+F5)"
-}
-
-main
-'"
+say "DONE"
+say "URL: https://${DOMAIN}/${SLUG}/"
+say "FS:  ${WEB}/index.html"
+say "INC: ${INC}"
+say "VHOST:${VHOST}"
+say "BK:  ${BK}"
+BASH
+chmod 755 /root/MEGA_AIAQUILA_DEPLOY_V2_100.sh
+bash /root/MEGA_AIAQUILA_DEPLOY_V2_100.sh
