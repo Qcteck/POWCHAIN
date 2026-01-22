@@ -1,6 +1,6 @@
 bash -lc 'set -euo pipefail
 TS="$(date +%Y%m%d_%H%M%S)"
-BK="/root/BK_WV_PATCHALL_$TS"
+BK="/root/BK_WV_PATCHALL_FIX_$TS"
 INC="/etc/nginx/includes/wolverine_routes.inc"
 DOMAIN="fireinners.online"
 mkdir -p "$BK"
@@ -18,25 +18,32 @@ if command -v chattr >/dev/null 2>&1; then
   done
 fi
 
-say "ENSURE $INC"
+say "ENSURE include $INC"
 mkdir -p /etc/nginx/includes
 if [ ! -f "$INC" ]; then
   cat >"$INC"<<'"'"'EOF'"'"'
 # wolverine routes (managed)
 location = /wolverine { return 301 /wolverine/; }
 location ^~ /wolverine/ { root /var/www; try_files $uri $uri/ /wolverine/index.html; add_header Cache-Control "no-store" always; }
-location ^~ /wolverine/vault-api/ { proxy_http_version 1.1; proxy_set_header Host $host; proxy_set_header X-Real-IP $remote_addr; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Proto $scheme; proxy_pass http://127.0.0.1:3000/; }
+location ^~ /wolverine/vault-api/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  proxy_pass http://127.0.0.1:3000/;
+}
 EOF
 fi
 
-say "PATCH include: add traderone/vault + traderone/api if missing"
-python3 - <<PY
+say "PATCH include: ensure traderone/vault + traderone/api"
+python3 - <<'"'"'PY'"'"'
 import re, pathlib
-p=pathlib.Path("$INC")
+p=pathlib.Path("/etc/nginx/includes/wolverine_routes.inc")
 s=p.read_text(encoding="utf-8", errors="ignore")
 
-def has(loc):
-  return re.search(r"location\\s+\\^~\\s+%s\\s*\\{"%re.escape(loc), s) is not None
+def has(loc:str)->bool:
+  return re.search(r"location\s+\^~\s+%s\s*\{"%re.escape(loc), s) is not None
 
 tpl = """location ^~ {loc} {{
   proxy_http_version 1.1;
@@ -51,41 +58,33 @@ add=[]
 if not has("/wolverine/traderone/vault/"): add.append(tpl.format(loc="/wolverine/traderone/vault/"))
 if not has("/wolverine/traderone/api/"): add.append(tpl.format(loc="/wolverine/traderone/api/"))
 if add:
-  s = s.rstrip() + "\\n\\n# added by WV_PATCHALL\\n" + "\\n".join(add) + "\\n"
+  s = s.rstrip() + "\n\n# added by WV_PATCHALL_FIX\n" + "\n".join(add) + "\n"
   p.write_text(s, encoding="utf-8")
-print("OK include updated; added_blocks=", len(add))
+print("OK include; added_blocks=", len(add))
 PY
 
-say "FIND all vhosts referencing server_name fireinners.online"
-mapfile -t VHOSTS < <(grep -Rsl --include="*.conf" -E "\\bserver_name\\b.*fireinners\\.online" /etc/nginx/sites-enabled /etc/nginx/sites-available /etc/nginx/conf.d 2>/dev/null | sort -u)
-if [ "${#VHOSTS[@]}" -eq 0 ]; then
-  say "ERR no vhosts found"
-  exit 1
-fi
+say "FIND all vhosts for server_name fireinners.online"
+mapfile -t VHOSTS < <(grep -Rsl --include="*.conf" -E "\bserver_name\b.*fireinners\.online" /etc/nginx/sites-enabled /etc/nginx/sites-available /etc/nginx/conf.d 2>/dev/null | sort -u)
+if [ "${#VHOSTS[@]}" -eq 0 ]; then say "ERR no vhosts found"; exit 1; fi
 printf "%s\n" "${VHOSTS[@]}" >"$BK/vhosts_list.txt"
-say "VHOSTS count=${#VHOSTS[@]} (saved $BK/vhosts_list.txt)"
+say "VHOSTS count=${#VHOSTS[@]}"
 
-say "INJECT include into ALL matching vhosts (after server_name line if possible)"
-python3 - <<PY
+say "INJECT include into ALL matching vhosts (if missing)"
+python3 - <<'"'"'PY'"'"'
 import re, pathlib
-inc_line = "include /etc/nginx/includes/wolverine_routes.inc;\\n"
-paths = pathlib.Path("$BK/vhosts_list.txt").read_text().splitlines()
+inc_line="include /etc/nginx/includes/wolverine_routes.inc;\n"
+paths=pathlib.Path("'$BK'/vhosts_list.txt").read_text().splitlines()
 patched=[]
 for path in paths:
   fp=pathlib.Path(path)
-  try:
-    txt=fp.read_text(encoding="utf-8", errors="ignore").splitlines(True)
-  except Exception:
-    continue
+  txt=fp.read_text(encoding="utf-8", errors="ignore").splitlines(True)
   if any("includes/wolverine_routes.inc" in l for l in txt):
     continue
-  out=[]
-  inserted=False
+  out=[]; inserted=False
   for line in txt:
     out.append(line)
-    if (not inserted) and re.search(r"\\bserver_name\\b.*fireinners\\.online", line):
-      out.append(inc_line)
-      inserted=True
+    if (not inserted) and re.search(r"\bserver_name\b.*fireinners\.online", line):
+      out.append(inc_line); inserted=True
   if not inserted:
     out=[inc_line]+txt
   fp.write_text("".join(out), encoding="utf-8")
@@ -107,16 +106,12 @@ if command -v chattr >/dev/null 2>&1; then
   for f in "${VHOSTS[@]}"; do chattr +i "$f" 2>/dev/null || true; done
 fi
 
-say "SHOW effective locations for /wolverine in nginx -T (first matches)"
-nginx -T 2>/dev/null | awk "/server_name[[:space:]].*fireinners\\.online/{in=1} in&&/location[[:space:]]/&&/wolverine/{print} /}/{if(in&&++c>80)exit}" | sed -n "1,120p" || true
-
-say "TEST LOCAL (bypass CF) /wolverine/ first bytes"
+say "TEST LOCAL (bypass CF) /wolverine/ (first bytes)"
 curl -sk --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/wolverine/" | head -c 160 || true; echo
 say "TEST LOCAL (bypass CF) /wolverine/vault-api/health"
 curl -sk --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/wolverine/vault-api/health" || true; echo
 say "TEST LOCAL (bypass CF) /wolverine/traderone/vault/health"
 curl -sk --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/wolverine/traderone/vault/health" || true; echo
-
 say "TEST PUBLIC HEAD /wolverine/traderone/vault/health"
 curl -skI "https://$DOMAIN/wolverine/traderone/vault/health" | sed -n "1,20p" || true
 
