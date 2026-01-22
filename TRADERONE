@@ -1,98 +1,216 @@
 bash -lc 'set -euo pipefail
-TS="$(date +%Y%m%d_%H%M%S)"; BK="/root/AIAQUILA_BK_$TS"; mkdir -p "$BK"
-say(){ printf "[%s] %s\n" "$(date +%H:%M:%S)" "$*"; }
-die(){ say "ERR: $*"; exit 1; }
-[ "$(id -u)" -eq 0 ] || die "run as root"
+F="/root/WV_FIX_WOLVERINE_404_V4.sh"
+cat >"$F"<<'"'"'SH'"'"'
+#!/usr/bin/env bash
+set -euo pipefail
 
-WEB="/var/www/aiaquila"
-VENDOR="$WEB/vendor"
-IDX="$WEB/index.html"
+DOMAIN="fireinners.online"
+WEBROOT="/var/www/wolverine"
+INCDIR="/etc/nginx/includes"
+INC_WOLV="$INCDIR/wolverine_routes.inc"
+TS="$(date +%Y%m%d_%H%M%S)"
+BK="/root/BK_WV_WOLV404_V4_${TS}"
 
-say "1) checks"
-[ -d "$WEB" ] || die "missing $WEB"
-[ -f "$IDX" ] || die "missing $IDX"
-mkdir -p "$VENDOR"
+say(){ echo "[$(date -u "+%F %T UTC")] $*"; }
+need_root(){ [ "$(id -u)" -eq 0 ] || { echo "ERR: root only"; exit 1; }; }
 
-say "2) backup"
-cp -a "$IDX" "$BK/index.html.bak"
+backup_all(){
+  mkdir -p "$BK"
+  cp -a /etc/nginx "$BK/nginx" 2>/dev/null || true
+  if [ -d "$WEBROOT" ]; then cp -a "$WEBROOT" "$BK/webroot_wolverine" 2>/dev/null || true; fi
+  say "Backup -> $BK"
+}
 
-say "3) ensure vendor (pinned files, no CDN at runtime)"
-# If you already have these files, we keep them. If missing, download.
-need_dl=0
-[ -f "$VENDOR/solana-web3.iife.min.js" ] || need_dl=1
-[ -f "$VENDOR/buffer.min.js" ] || need_dl=1
-[ -f "$VENDOR/process.min.js" ] || need_dl=1
+rollback(){
+  say "ROLLBACK nginx from backup"
+  [ -d "$BK/nginx" ] || { say "No backup dir"; return 0; }
+  mv /etc/nginx "/etc/nginx.broken_${TS}" 2>/dev/null || true
+  cp -a "$BK/nginx" /etc/nginx 2>/dev/null || true
+  nginx -t || true
+  systemctl reload nginx || systemctl restart nginx || true
+}
 
-if [ "$need_dl" -eq 1 ]; then
-  say "   downloading vendor files..."
-  # Pinned versions (stable) — adjust only if you want.
-  curl -fsSL "https://unpkg.com/@solana/web3.js@1.95.4/lib/index.iife.min.js" -o "$VENDOR/solana-web3.iife.min.js"
-  curl -fsSL "https://unpkg.com/buffer@6.0.3/index.min.js" -o "$VENDOR/buffer.min.js"
-  curl -fsSL "https://unpkg.com/process@0.11.10/browser.js" -o "$VENDOR/process.min.js"
-  (cd "$VENDOR" && sha256sum solana-web3.iife.min.js buffer.min.js process.min.js > SHA256SUMS.txt)
-else
-  say "   vendor already present (skip download)"
-fi
+unfreeze(){
+  command -v chattr >/dev/null 2>&1 || return 0
+  chattr -i /etc/nginx/nginx.conf 2>/dev/null || true
+  chattr -i -R /etc/nginx/sites-available /etc/nginx/sites-enabled /etc/nginx/includes 2>/dev/null || true
+}
 
-say "4) patch index.html (inject global Buffer polyfill BEFORE any JS)"
-python3 - "$IDX" <<'"'"'PY'"'"'
-import re,sys
-p=sys.argv[1]
-s=open(p,"r",encoding="utf-8",errors="ignore").read()
+refreeze_best(){
+  command -v chattr >/dev/null 2>&1 || return 0
+  chattr +i /etc/nginx/nginx.conf 2>/dev/null || true
+}
 
-MARK="AIAQUILA_BUFFER_POLYFILL_V1"
-if MARK in s:
-    print("already patched")
-    sys.exit(0)
+pick_primary_ssl_vhost(){
+  local p=""
+  if [ -e "/etc/nginx/sites-enabled/fireinners.online-ssl" ]; then
+    p="/etc/nginx/sites-enabled/fireinners.online-ssl"
+    echo "$p"; return 0
+  fi
+  local cands
+  mapfile -t cands < <(grep -RIl --include="*" -e "server_name[[:space:]].*\\b${DOMAIN}\\b" /etc/nginx/sites-enabled 2>/dev/null | sort -u || true)
+  for f in "${cands[@]}"; do
+    if grep -Eq "listen[[:space:]]+443" "$f" 2>/dev/null; then
+      echo "$f"; return 0
+    fi
+  done
+  for f in "${cands[@]}"; do echo "$f"; return 0; done
+  echo ""
+}
 
-poly = r'''
-<!-- AIAQUILA_BUFFER_POLYFILL_V1 -->
-<script src="/aiaquila/vendor/process.min.js"></script>
-<script src="/aiaquila/vendor/buffer.min.js"></script>
-<script>
-/* Buffer/process globals required by solana-web3 + hashing */
-(function(){
-  try{
-    if(!window.globalThis) window.globalThis=window;
-    window.global = window;
-    window.process = window.process || (window.process && window.process.browser ? window.process : {env:{},browser:true});
-    var B = (window.buffer && window.buffer.Buffer) ? window.buffer.Buffer : (window.Buffer||null);
-    if(B){
-      window.Buffer = B;
-      window.globalThis.Buffer = B;
-    }
-  }catch(e){}
-})();
-</script>
-<!-- /AIAQUILA_BUFFER_POLYFILL_V1 -->
-'''.strip()+"\n"
+disable_duplicate_ssl_vhosts(){
+  local primary="$1"
+  local keep_real
+  keep_real="$(readlink -f "$primary" 2>/dev/null || echo "$primary")"
+  mkdir -p "$BK/disabled_sitesenabled"
+  shopt -s nullglob
+  for f in /etc/nginx/sites-enabled/*; do
+    [ -f "$f" ] || continue
+    local real
+    real="$(readlink -f "$f" 2>/dev/null || echo "$f")"
+    if grep -Eq "server_name[[:space:]].*\\b${DOMAIN}\\b" "$f" 2>/dev/null && grep -Eq "listen[[:space:]]+443" "$f" 2>/dev/null; then
+      if [ "$real" != "$keep_real" ]; then
+        cp -a "$f" "$BK/disabled_sitesenabled/$(basename "$f")" 2>/dev/null || true
+        rm -f "$f" || true
+        say "Disabled dup ssl vhost: $f"
+      fi
+    fi
+  done
+  shopt -u nullglob
+}
 
-# Inject right before first <script ...solana-web3...> if present, else before </head>
-m=re.search(r'<script[^>]+src=[\"\']/aiaquila/vendor/solana-web3\.iife\.min\.js[\"\'][^>]*>\s*</script>', s, re.I)
-if m:
-    s = s[:m.start()] + poly + s[m.start():]
-else:
-    # try before </head>
-    m2=re.search(r'</head\s*>', s, re.I)
-    if m2:
-        s = s[:m2.start()] + poly + s[m2.start():]
-    else:
-        # fallback: prepend
-        s = poly + s
+ensure_enabled_symlink(){
+  if [ -e /etc/nginx/sites-available/fireinners.online-ssl ]; then
+    ln -sf /etc/nginx/sites-available/fireinners.online-ssl /etc/nginx/sites-enabled/fireinners.online-ssl
+    say "Ensured symlink: sites-enabled/fireinners.online-ssl"
+  fi
+}
 
-open(p,"w",encoding="utf-8").write(s)
-print("patched")
-PY
+ensure_webroot(){
+  mkdir -p "$WEBROOT"
+  if [ ! -f "$WEBROOT/index.html" ]; then
+    cat >"$WEBROOT/index.html"<<HTML
+<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WOLVERINE</title><style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;margin:24px;color:#111}code{background:#f3f3f3;padding:2px 6px;border-radius:6px}</style><h1>WOLVERINE OK</h1><p>Static webroot: <code>$WEBROOT</code></p><p><a href="/wolverine/">/wolverine/</a> · <a href="/wolverine/vault-api/health">/wolverine/vault-api/health</a> · <a href="/wolverine/traderone/api">/wolverine/traderone/api</a></p>
+HTML
+    say "Created $WEBROOT/index.html"
+  fi
+}
 
-say "5) verify (marker + vendor paths)"
-grep -q "AIAQUILA_BUFFER_POLYFILL_V1" "$IDX" || die "patch failed (marker missing)"
-ls -la "$VENDOR/solana-web3.iife.min.js" "$VENDOR/buffer.min.js" "$VENDOR/process.min.js" >/dev/null 2>&1 || die "vendor missing"
+disable_wolverine_duplicate_includes(){
+  mkdir -p "$BK/disabled_includes"
+  shopt -s nullglob
+  for f in "$INCDIR"/*.inc "$INCDIR"/*.conf "$INCDIR"/*.nginx; do
+    [ -f "$f" ] || continue
+    [ "$f" = "$INC_WOLV" ] && continue
+    if grep -Eq "location[[:space:]]+\\^~[[:space:]]+/wolverine/|location[[:space:]]+=[[:space:]]+/wolverine" "$f" 2>/dev/null; then
+      cp -a "$f" "$BK/disabled_includes/$(basename "$f")" 2>/dev/null || true
+      mv -f "$f" "$f.disabled_${TS}" 2>/dev/null || true
+      say "Disabled include with wolverine locations: $f"
+    fi
+  done
+  shopt -u nullglob
+}
 
-say "6) quick local fetch tests"
-curl -fsS "http://127.0.0.1/aiaquila/vendor/buffer.min.js" >/dev/null 2>&1 || true
-curl -fsS "http://127.0.0.1/aiaquila/" | head -n 2 || true
+write_wolverine_include(){
+  mkdir -p "$INCDIR"
+  cat >"$INC_WOLV"<<NGX
+location = /wolverine { return 301 /wolverine/; }
+location ^~ /wolverine/ {
+  alias $WEBROOT/;
+  index index.html;
+  try_files \$uri \$uri/ /wolverine/index.html;
+  add_header Cache-Control "no-store" always;
+}
+location ^~ /wolverine/vault-api/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+  proxy_pass http://127.0.0.1:3000/;
+}
+location ^~ /wolverine/traderone/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+  proxy_pass http://127.0.0.1:8484/;
+}
+NGX
+  say "Wrote $INC_WOLV"
+}
 
-say "DONE"
-say "Backup: $BK"
-say "Open: https://fireinners.online/aiaquila/"
+ensure_include_once_in_vhost(){
+  local vh="$1"
+  [ -n "$vh" ] || { say "ERR: no vhost found"; exit 1; }
+  local real
+  real="$(readlink -f "$vh" 2>/dev/null || echo "$vh")"
+  cp -a "$real" "$BK/$(basename "$real").bak" 2>/dev/null || true
+  if grep -Eq "include[[:space:]]+$INC_WOLV;" "$real" 2>/dev/null; then
+    say "Include already present in: $real"
+  else
+    awk -v inc="    include '"$INC_WOLV"';" '"'"'
+      BEGIN{inserver=0;added=0}
+      /^[[:space:]]*server[[:space:]]*\{/ {inserver=1}
+      inserver==1 && /^[[:space:]]*\}/ && added==0 {print inc; added=1; inserver=0}
+      {print}
+    '"'"' "$real" >"$real.tmp"
+    mv -f "$real.tmp" "$real"
+    say "Injected include into: $real"
+  fi
+  # remove duplicate include lines if multiple
+  awk -v pat="include '"$INC_WOLV"';" '"'"'
+    { if(index($0,pat)){c++; if(c>1) next} print }
+  '"'"' "$real" >"$real.tmp2"
+  mv -f "$real.tmp2" "$real"
+}
+
+nginx_test_reload(){
+  nginx -t
+  systemctl reload nginx || systemctl restart nginx
+}
+
+tests(){
+  say "TEST LOCAL (bypass CF) HEAD /wolverine/"
+  curl -skI --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/" | sed -n "1,12p" || true
+  say "TEST LOCAL (bypass CF) GET first bytes"
+  curl -sk --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/" | head -c 220 || true; echo
+  say "TEST PUBLIC HEAD /wolverine/"
+  curl -skI "https://${DOMAIN}/wolverine/" | sed -n "1,12p" || true
+  say "SHOW nginx -T (server_name ${DOMAIN} listen 443) file markers"
+  nginx -T 2>/dev/null | awk '"'"'/^# configuration file /{file=$4} /server_name[[:space:]]+.*'"$DOMAIN"'/ {sn=1} sn&&/listen[[:space:]]+443/ {print "FILE:",file; sn=0}'"'"' | head -n 20 || true
+}
+
+main(){
+  need_root
+  say "WV_FIX_WOLVERINE_404_V4 start"
+  backup_all
+  unfreeze
+  ensure_webroot
+  disable_wolverine_duplicate_includes
+  write_wolverine_include
+  ensure_enabled_symlink
+  local primary
+  primary="$(pick_primary_ssl_vhost)"
+  say "Primary SSL vhost: ${primary:-NONE}"
+  disable_duplicate_ssl_vhosts "${primary:-}"
+  ensure_include_once_in_vhost "$primary"
+  if ! nginx_test_reload; then
+    say "nginx reload failed -> rollback"
+    rollback
+    exit 1
+  fi
+  refreeze_best
+  tests
+  say "DONE"
+  echo "Backups: $BK"
+  echo "Open: https://${DOMAIN}/wolverine/ (Ctrl+F5)"
+}
+
+main "$@"
+SH
+sed -i "s/\r$//" "$F" || true
+chmod +x "$F"
+"$F"
 '
