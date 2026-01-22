@@ -1,128 +1,99 @@
-python3 - <<'PY'
-s=r'''#!/usr/bin/env bash
+cat >/root/MEGA_DEDUP_BUNDLER_API.sh <<'BASH'
+#!/usr/bin/env bash
 set -euo pipefail
-DOMAIN="fireinners.online"
-WEBROOT="/var/www/wolverine"
-VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
-SITESEN="/etc/nginx/sites-enabled"
-INCDIR="/etc/nginx/includes"
-INC="$INCDIR/wolverine_routes.inc"
-BK="/root/WV_FIX404_$(date +%Y%m%d_%H%M%S)"
+
+INC="/etc/nginx/includes/bundler_routes.inc"
+BK="/root/BK_DEDUP_BUNDLER_API_$(date +%Y%m%d_%H%M%S)"
 
 say(){ echo "[$(date -u +"%F %T UTC")] $*"; }
 need_root(){ [ "${EUID:-$(id -u)}" -eq 0 ] || { echo "ERR: root only"; exit 1; }; }
 
-backup(){ mkdir -p "$BK"; cp -a /etc/nginx "$BK/nginx" 2>/dev/null || true; [ -d "$WEBROOT" ] && cp -a "$WEBROOT" "$BK/webroot" 2>/dev/null || true; [ -f "$VHOST" ] && cp -a "$VHOST" "$BK/$(basename "$VHOST").bak" 2>/dev/null || true; }
-unfreeze(){ command -v chattr >/dev/null 2>&1 || return 0; chattr -i -R /etc/nginx 2>/dev/null || true; chattr -i -R "$WEBROOT" 2>/dev/null || true; }
-refreeze(){ command -v chattr >/dev/null 2>&1 || return 0; chattr +i /etc/nginx/nginx.conf 2>/dev/null || true; chattr +i "$VHOST" 2>/dev/null || true; chattr +i "$INC" 2>/dev/null || true; }
-
-write_html(){
-  mkdir -p "$WEBROOT"
-  cat >"$WEBROOT/index.html"<<'HTML'
-<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WOLVERINE</title><style>body{margin:0;background:#0b0f14;color:#e6eef7;font-family:system-ui;padding:20px}a{color:#7dd3fc}code{background:#05070b;padding:2px 6px;border-radius:8px;border:1px solid rgba(148,163,184,.2)}</style><h1>WOLVERINE OK</h1><p>Si tu vois cette page, <code>/wolverine/</code> sert bien le webroot.</p><p><a href="/wolverine/vault-api/health">/wolverine/vault-api/health</a> · <a href="/wolverine/traderone/vault/health">/wolverine/traderone/vault/health</a></p>
-HTML
+backup(){
+  mkdir -p "$BK"
+  cp -a /etc/nginx "$BK/nginx" 2>/dev/null || true
+  [ -f "$INC" ] && cp -a "$INC" "$BK/$(basename "$INC").bak" 2>/dev/null || true
+  say "Backups: $BK"
 }
 
-write_include(){
-  mkdir -p "$INCDIR"
-  cat >"$INC"<<'NGX'
-location = /wolverine { return 301 /wolverine/; }
-location ^~ /wolverine/ {
-  alias /var/www/wolverine/;
-  index index.html;
-  try_files $uri $uri/ /wolverine/index.html;
-  add_header Cache-Control "no-store" always;
-}
-location ^~ /wolverine/vault-api/ {
-  proxy_http_version 1.1;
-  proxy_set_header Host $host;
-  proxy_set_header X-Real-IP $remote_addr;
-  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto $scheme;
-  proxy_pass http://127.0.0.1:3000/;
-}
-location ^~ /wolverine/traderone/ {
-  proxy_http_version 1.1;
-  proxy_set_header Host $host;
-  proxy_set_header X-Real-IP $remote_addr;
-  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto $scheme;
-  proxy_pass http://127.0.0.1:3000/;
-}
-NGX
+unfreeze(){
+  command -v chattr >/dev/null 2>&1 || return 0
+  chattr -i -R /etc/nginx 2>/dev/null || true
 }
 
-disable_dup(){
-  mkdir -p "$BK/disabled_sitesenabled"
-  shopt -s nullglob
-  for f in "$SITESEN"/*; do
-    [ -e "$f" ] || continue
-    if grep -qE "server_name[[:space:]]+.*\\b${DOMAIN}\\b" "$f" 2>/dev/null; then
-      if [ "$(readlink -f "$f" 2>/dev/null || echo "$f")" != "$VHOST" ]; then
-        cp -a "$f" "$BK/disabled_sitesenabled/" 2>/dev/null || true
-        rm -f "$f" || true
-      fi
-    fi
-  done
-  shopt -u nullglob
+refreeze_best(){
+  command -v chattr >/dev/null 2>&1 || return 0
+  chattr +i /etc/nginx/nginx.conf 2>/dev/null || true
+  chattr +i /etc/nginx/sites-available/fireinners.online-ssl 2>/dev/null || true
+  [ -f "$INC" ] && chattr +i "$INC" 2>/dev/null || true
 }
 
-ensure_enabled(){ [ -f "$VHOST" ] || { say "ERR missing $VHOST"; exit 1; }; ln -sf "$VHOST" "$SITESEN/$(basename "$VHOST")"; }
+dedup(){
+  [ -f "$INC" ] || { say "ERR missing $INC"; exit 1; }
+  say "Dedup: keep FIRST location for /bundler/api/ ; remove duplicates (only this path)"
 
-inject_once(){
-  local tmp="$BK/vhost.tmp" inc="include $INC;"
-  awk -v dom="$DOMAIN" -v inc="$inc" '
-  BEGIN{insrv=0;depth=0;ssl=0;domok=0;has=0;ins=0}
-  function br(s,n){n=gsub(/\{/,"{",s);depth+=n;n=gsub(/\}/,"}",s);depth-=n}
+  local tmp="$BK/bundler_routes.inc.tmp"
+  awk '
+  BEGIN{seen=0;skip=0;depth=0}
+  function bump(s,  o,c){ o=gsub(/\{/,"{",s); c=gsub(/\}/,"}",s); depth+=o-c }
   {
     L=$0
-    if(L ~ /^[[:space:]]*server[[:space:]]*\{/){insrv=1;depth=0;ssl=0;domok=0;has=0;br(L);print;next}
-    if(insrv){
-      if(L ~ /listen[[:space:]]+443/){ssl=1}
-      if(L ~ /server_name/ && L ~ dom){domok=1}
-      if(index(L,inc)>0){has=1}
-      if(depth==0 && L ~ /^[[:space:]]*\}/){
-        if(ssl && domok && !has && !ins){print "  "inc; ins=1}
-        print L; insrv=0; next
-      }
-      br(L); print; next
+    if(skip){
+      bump(L)
+      if(depth<=0){ skip=0; depth=0 }
+      next
     }
-    print
-  }' "$VHOST" >"$tmp"
-  cp -a "$tmp" "$VHOST"
+
+    # detect location line that targets /bundler/api/
+    if(L ~ /^[[:space:]]*location[[:space:]]+/ && L ~ /\/bundler\/api\//){
+      if(seen==0){
+        seen=1
+        print L
+        bump(L)
+        next
+      } else {
+        # skip duplicate block entirely
+        skip=1
+        depth=0
+        bump(L)
+        next
+      }
+    }
+
+    print L
+  }' "$INC" >"$tmp"
+
+  cp -a "$tmp" "$INC"
 }
 
-reload_nginx(){ nginx -t; systemctl reload nginx || systemctl restart nginx; }
+test_reload(){
+  say "nginx -t"
+  nginx -t
+  say "reload nginx"
+  systemctl reload nginx || systemctl restart nginx
+}
 
-tests(){
-  say "LOCAL (bypass CF) HEAD:"
-  curl -skI --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/" | sed -n "1,12p" || true
-  say "PUBLIC HEAD:"
-  curl -skI "https://${DOMAIN}/wolverine/" | sed -n "1,12p" || true
+run_wv_fix_if_present(){
+  if [ -x /root/WV_FIX404_ONE.sh ]; then
+    say "Run WV_FIX404_ONE.sh (present)"
+    /root/WV_FIX404_ONE.sh || true
+  else
+    say "WV_FIX404_ONE.sh not found, skip"
+  fi
 }
 
 main(){
   need_root
-  say "WV_FIX404 start"
   backup
   unfreeze
-  write_html
-  write_include
-  disable_dup
-  ensure_enabled
-  inject_once
-  reload_nginx
-  tests
-  refreeze
+  dedup
+  test_reload
+  run_wv_fix_if_present
+  refreeze_best
   say "DONE"
   echo "Backups: $BK"
-  echo "Open: https://${DOMAIN}/wolverine/ (Ctrl+F5)"
 }
 main "$@"
-'''
-p="/root/WV_FIX404_ONE.sh"
-open(p,"w",newline="\n").write(s)
-print("WROTE",p,len(s),"bytes")
-PY
-chmod +x /root/WV_FIX404_ONE.sh
-bash /root/WV_FIX404_ONE.sh
+BASH
+
+chmod +x /root/MEGA_DEDUP_BUNDLER_API.sh
+bash /root/MEGA_DEDUP_BUNDLER_API.sh
