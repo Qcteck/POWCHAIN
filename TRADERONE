@@ -1,292 +1,125 @@
-python3 - <<'PY'
-import os,stat,textwrap
-p="/root/WV_MEGA_FIX_WOLVERINE_404_V2.sh"
-s=r'''#!/usr/bin/env bash
+#!/usr/bin/env bash
 set -euo pipefail
-cd /root
 
-TS="$(date +%Y%m%d_%H%M%S)"
-DOMAIN="fireinners.online"
-WEBROOT="/var/www/wolverine"
-INCDIR="/etc/nginx/includes"
-WVINCLUDE="${INCDIR}/wolverine_routes.inc"
-BK="/root/BK_WV_FIX_404_${TS}"
+### CONFIG
+APP_NAME="aiaquila"
+WEB_ROOT="/var/www/${APP_NAME}"
+NGINX_SITE="/etc/nginx/sites-available/fireinners.online-ssl"
 
-say(){ echo "[$(date -u +'%F %T UTC')] $*"; }
-need_root(){ [ "${EUID:-$(id -u)}" -eq 0 ] || { echo "ERR: root only"; exit 1; }; }
+echo "=== AQUILA PATCH | SOL → LAMPORTS AUTO ==="
 
-unfreeze_best(){
-  command -v chattr >/dev/null 2>&1 || return 0
-  for f in /etc/nginx/nginx.conf /etc/nginx/sites-available/* /etc/nginx/sites-enabled/* /etc/nginx/conf.d/* /etc/nginx/includes/*; do
-    [ -e "$f" ] || continue
-    chattr -i "$f" 2>/dev/null || true
-  done
+### 1. Vérifications
+[ "$(id -u)" -eq 0 ] || { echo "ERREUR: root requis"; exit 1; }
+command -v nginx >/dev/null || { echo "ERREUR: nginx absent"; exit 1; }
+
+### 2. Préparer dossier
+mkdir -p "$WEB_ROOT"
+chmod 755 "$WEB_ROOT"
+
+### 3. Déployer HTML corrigé
+cat > "${WEB_ROOT}/index.html" <<'HTML'
+<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8"><title>AIAQUILA • SOL→Lamports Auto</title><meta name="viewport" content="width=device-width,initial-scale=1"><style>
+html,body{margin:0;padding:0;background:#05070b;color:#e6ebff;font-family:system-ui}
+#app{display:grid;grid-template-columns:340px 1fr;height:100vh}
+aside{background:#0a0f1c;border-right:1px solid #1b2450;padding:14px}
+main{padding:14px}
+button,input,textarea{background:#0e1633;color:#e6ebff;border:1px solid #2b3cff;padding:6px;border-radius:4px}
+button{cursor:pointer}
+.ok{border-color:#3cff9e}.warn{border-color:#ff4d4d}
+.card{border:1px solid #1b2450;border-radius:6px;padding:10px;margin-bottom:10px;background:#070c18}
+.log{font-family:ui-monospace,monospace;font-size:12px;white-space:pre-wrap}
+</style></head><body>
+<div id="app">
+<aside>
+<div class="card"><b>Wallet</b><div id="wallet">Déconnecté</div><button id="connect" class="ok">CONNECT PHANTOM</button></div>
+<div class="card"><b>Destination</b><input id="dest"></div>
+<div class="card"><b>Montant</b><input id="amount" placeholder="SOL (0.001) ou lamports (1000000)"></div>
+<div class="card"><button id="arm" class="ok">ARM</button><button id="disarm" class="warn">DISARM</button></div>
+<div class="card"><button id="propose">PROPOSE</button><button id="sign" class="ok">APPROUVER & SIGNER</button></div>
+<div class="card"><b>Policy JSON</b><textarea id="policy" rows="6"></textarea><br><button id="save">SAVE POLICY</button><button id="reload">RELOAD</button></div>
+</aside>
+<main>
+<div class="card"><b>Console</b><div id="log" class="log"></div></div>
+</main>
+</div>
+
+<script type="module">
+import{Connection,PublicKey,Transaction,SystemProgram}from"https://unpkg.com/@solana/web3.js@latest/lib/index.iife.min.js";
+const RPC="https://api.mainnet-beta.solana.com";
+const LAMPORTS_PER_SOL=1_000_000_000;
+const $=i=>document.getElementById(i);
+const log=t=>$("log").textContent+=t+"\\n";
+
+/* ===== amount parser ===== */
+function parseAmountToLamports(v){
+ v=Number(v);
+ if(!Number.isFinite(v)||v<=0)throw Error("Montant invalide");
+ if(v<1)return Math.round(v*LAMPORTS_PER_SOL);
+ if(Number.isInteger(v))return v;
+ return Math.round(v*LAMPORTS_PER_SOL);
 }
 
-refreeze_best(){
-  command -v chattr >/dev/null 2>&1 || return 0
-  for f in /etc/nginx/nginx.conf "$VH" "$WVINCLUDE"; do
-    [ -e "$f" ] || continue
-    chattr +i "$f" 2>/dev/null || true
-  done
-}
+/* ===== state ===== */
+let wallet=null,pub=null,armed=false,pending=null;
+$("policy").value=JSON.stringify({
+ allowDests:{},
+ maxLamportsPerTx:1000000,
+ cooldownMsAfterFinalized:15000
+},null,2);
 
-backup_all(){
-  mkdir -p "$BK"
-  say "Backup -> $BK"
-  cp -a /etc/nginx "$BK/nginx" 2>/dev/null || true
-  [ -d "$WEBROOT" ] && cp -a "$WEBROOT" "$BK/webroot_wolverine" 2>/dev/null || true
-}
+/* ===== wallet ===== */
+$("connect").onclick=async()=>{
+ if(!window.solana)return alert("Phantom requis");
+ wallet=window.solana;
+ const r=await wallet.connect();
+ pub=r.publicKey.toString();
+ $("wallet").textContent=pub;
+ log("Wallet connecté");
+};
 
-ensure_webroot(){
-  mkdir -p "$WEBROOT"
-  if [ ! -f "$WEBROOT/index.html" ]; then
-    say "Create minimal $WEBROOT/index.html"
-    cat >"$WEBROOT/index.html" <<'HTML'
-<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>WOLVERINE</title><style>body{font-family:system-ui,Segoe UI,Roboto,Arial;margin:24px;color:#111}code{background:#f3f3f3;padding:2px 6px;border-radius:6px}a{color:#0b5}h1{margin:0 0 10px 0}</style></head><body><h1>WOLVERINE OK</h1><p>Static webroot: <code>/var/www/wolverine</code></p><p>Health: <a href="/wolverine/vault-api/health">/wolverine/vault-api/health</a></p><p>Legacy: <a href="/wolverine/traderone/vault/health">/wolverine/traderone/vault/health</a></p></body></html>
+/* ===== controls ===== */
+$("arm").onclick=()=>{armed=true;log("ARM ON");};
+$("disarm").onclick=()=>{armed=false;log("ARM OFF");};
+
+$("save").onclick=()=>{localStorage.setItem("AIAQ_POLICY",$("policy").value);log("Policy saved");};
+$("reload").onclick=()=>{const p=localStorage.getItem("AIAQ_POLICY");if(p)$("policy").value=p;log("Policy reloaded");};
+
+$("propose").onclick=()=>{
+ if(!armed)return log("ERR: ARM requis");
+ const policy=JSON.parse($("policy").value);
+ const dest=$("dest").value.trim();
+ const lamports=parseAmountToLamports($("amount").value);
+ if(!policy.allowDests[dest])return log("ERR: DEST pas dans allowlist");
+ if(lamports>policy.maxLamportsPerTx)return log("ERR: dépasse maxLamportsPerTx");
+ pending={dest,lamports};
+ log("Proposition OK: "+lamports+" lamports");
+};
+
+$("sign").onclick=async()=>{
+ if(!pending||!wallet)return log("ERR: rien à signer");
+ const conn=new Connection(RPC,"confirmed");
+ const tx=new Transaction().add(SystemProgram.transfer({
+  fromPubkey:new PublicKey(pub),
+  toPubkey:new PublicKey(pending.dest),
+  lamports:pending.lamports
+ }));
+ tx.feePayer=new PublicKey(pub);
+ tx.recentBlockhash=(await conn.getLatestBlockhash()).blockhash;
+ const signed=await wallet.signTransaction(tx);
+ const sig=await conn.sendRawTransaction(signed.serialize());
+ await conn.confirmTransaction(sig);
+ log("TX envoyée: "+sig);
+ pending=null;
+};
+</script>
+</body></html>
 HTML
-  else
-    say "Keep existing $WEBROOT/index.html"
-  fi
-}
 
-write_wolverine_include(){
-  mkdir -p "$INCDIR"
-  say "Write canonical include -> $WVINCLUDE"
-  cat >"$WVINCLUDE" <<NGX
-# AUTO: canonical Wolverine routes (WV_MEGA_FIX_WOLVERINE_404_V2)
-location = /wolverine { return 301 /wolverine/; }
+chmod 644 "${WEB_ROOT}/index.html"
 
-location ^~ /wolverine/ {
-  alias $WEBROOT/;
-  index index.html;
-  try_files \$uri \$uri/ /wolverine/index.html;
-  add_header Cache-Control "no-store" always;
-}
+### 4. Reload nginx
+nginx -t
+systemctl reload nginx
 
-location ^~ /wolverine/vault-api/ {
-  proxy_http_version 1.1;
-  proxy_set_header Host \$host;
-  proxy_set_header X-Real-IP \$remote_addr;
-  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto \$scheme;
-  proxy_pass http://127.0.0.1:3000/;
-}
-
-location ^~ /wolverine/traderone/ {
-  proxy_http_version 1.1;
-  proxy_set_header Host \$host;
-  proxy_set_header X-Real-IP \$remote_addr;
-  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto \$scheme;
-  proxy_pass http://127.0.0.1:3000/;
-}
-NGX
-}
-
-pick_vhost_443(){
-  python3 - <<PY
-import re,subprocess
-dom="${DOMAIN}"
-try:
-  out=subprocess.check_output(["nginx","-T"],stderr=subprocess.STDOUT,text=True)
-except Exception:
-  print("/etc/nginx/sites-available/fireinners.online-ssl"); raise SystemExit
-file=None
-cur=None
-sn=False
-l443=False
-for line in out.splitlines():
-  m=re.match(r"^# configuration file (.+?):\d+", line)
-  if m:
-    cur=m.group(1); sn=False; l443=False
-    continue
-  if cur is None: 
-    continue
-  if re.search(r"^\s*server_name\s+.*\b"+re.escape(dom)+r"\b", line):
-    sn=True
-  if re.search(r"^\s*listen\s+443(\s|;)", line) or re.search(r"^\s*listen\s+\[::\]:443(\s|;)", line):
-    l443=True
-  if sn and l443:
-    file=cur
-    break
-print(file or "/etc/nginx/sites-available/fireinners.online-ssl")
-PY
-}
-
-fix_nginx_text(){
-  say "Fix duplicates + ensure include (python editor)"
-  python3 - <<PY
-import os,re,glob,io
-DOMAIN="${DOMAIN}"
-WVINCLUDE="${WVINCLUDE}"
-WEBROOT="${WEBROOT}"
-
-def read(p):
-  try:
-    with open(p,"r",encoding="utf-8",errors="ignore") as f: return f.read().splitlines(True)
-  except: return None
-
-def write(p,lines):
-  with open(p,"w",encoding="utf-8") as f: f.writelines(lines)
-
-def strip_location_blocks(lines, start_re, keep_first=True):
-  out=[]
-  i=0
-  kept=0
-  n=len(lines)
-  sr=re.compile(start_re)
-  while i<n:
-    line=lines[i]
-    if sr.search(line):
-      if keep_first and kept==0:
-        kept=1
-        out.append(line); i+=1
-        continue
-      # remove whole block: from this line until matching braces close
-      depth=0
-      seen_open=False
-      while i<n:
-        l=lines[i]
-        depth += l.count("{")
-        if l.count("{")>0: seen_open=True
-        depth -= l.count("}")
-        i+=1
-        if seen_open and depth<=0:
-          break
-      continue
-    out.append(line); i+=1
-  return out
-
-def ensure_include_once_in_vhost(vhost_path, include_path, domain):
-  lines=read(vhost_path)
-  if lines is None: 
-    return
-  inc_line=f"  include {include_path};\n"
-  # remove duplicate include lines
-  new=[]
-  seen=0
-  inc_re=re.compile(r"^\s*include\s+"+re.escape(include_path)+r"\s*;")
-  for l in lines:
-    if inc_re.search(l):
-      seen += 1
-      if seen>1: 
-        continue
-    new.append(l)
-  lines=new
-  if any(inc_re.search(l) for l in lines):
-    write(vhost_path,lines); 
-    return
-  # inject before closing brace of the *first* server block that has server_name domain and listen 443
-  out=[]
-  in_server=False
-  depth=0
-  has_dom=False
-  has_443=False
-  injected=False
-  for l in lines:
-    if (not in_server) and re.search(r"^\s*server\s*\{", l):
-      in_server=True; depth=0; has_dom=False; has_443=False
-    if in_server:
-      if re.search(r"^\s*server_name\s+.*\b"+re.escape(domain)+r"\b", l): has_dom=True
-      if re.search(r"^\s*listen\s+443(\s|;)", l) or re.search(r"^\s*listen\s+\[::\]:443(\s|;)", l): has_443=True
-      depth += l.count("{"); depth -= l.count("}")
-      if (not injected) and has_dom and has_443 and re.match(r"^\s*\}\s*$", l):
-        out.append(inc_line)
-        injected=True
-    out.append(l)
-    if in_server and depth<=0 and re.match(r"^\s*\}\s*$", l):
-      in_server=False
-  if not injected:
-    # fallback: append include at end of file
-    out.append("\n"+inc_line)
-  write(vhost_path,out)
-
-# 1) Dedup /bundler/api/ INSIDE bundler_routes.inc if present (keep first)
-bundler="/etc/nginx/includes/bundler_routes.inc"
-if os.path.isfile(bundler):
-  bl=read(bundler)
-  if bl is not None:
-    bl2=strip_location_blocks(bl, r"^\s*location\s+\^~\s+/bundler/api/\s*", keep_first=True)
-    if bl2!=bl: write(bundler, bl2)
-
-# 2) Remove ALL wolverine blocks from every nginx file except WVINCLUDE (so only canonical include defines them)
-targets=set(glob.glob("/etc/nginx/**/*.conf", recursive=True)+glob.glob("/etc/nginx/sites-available/*")+glob.glob("/etc/nginx/sites-enabled/*")+glob.glob("/etc/nginx/includes/*"))
-patterns=[
-  r"^\s*location\s*=\s*/wolverine\s*\{",
-  r"^\s*location\s+\^~\s+/wolverine/vault-api/\s*",
-  r"^\s*location\s+\^~\s+/wolverine/traderone/\s*",
-  r"^\s*location\s+\^~\s+/wolverine/\s*",
-]
-for p in sorted(targets):
-  if not os.path.isfile(p): 
-    continue
-  if os.path.abspath(p)==os.path.abspath(WVINCLUDE):
-    continue
-  lines=read(p)
-  if lines is None: 
-    continue
-  orig=lines
-  for pat in patterns:
-    # remove ALL occurrences (keep_first=False)
-    lines=strip_location_blocks(lines, pat, keep_first=False)
-  if lines!=orig:
-    write(p,lines)
-
-# 3) Ensure vhost includes WVINCLUDE once
-vhost="${VH}"
-ensure_include_once_in_vhost(vhost, WVINCLUDE, DOMAIN)
-PY
-}
-
-nginx_test_reload(){
-  say "nginx -t"
-  nginx -t
-  say "reload nginx"
-  systemctl reload nginx || systemctl restart nginx
-}
-
-tests(){
-  echo
-  say "LOCAL (bypass CF) HEAD /wolverine/"
-  curl -sSIk --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/" | sed -n "1,12p" || true
-  echo
-  say "PUBLIC HEAD /wolverine/"
-  curl -sSIk "https://${DOMAIN}/wolverine/" | sed -n "1,12p" || true
-  echo
-  say "PROOF: effective locations (nginx -T)"
-  nginx -T 2>/dev/null | grep -nE "location[[:space:]]+\\^~[[:space:]]+/wolverine/|location[[:space:]]*=[[:space:]]*/wolverine" | head -n 80 || true
-}
-
-main(){
-  need_root
-  say "WV_MEGA_FIX_WOLVERINE_404_V2 :: start"
-  backup_all
-  unfreeze_best
-
-  VH="$(pick_vhost_443)"
-  say "Chosen vhost: $VH"
-
-  ensure_webroot
-  write_wolverine_include
-
-  fix_nginx_text
-  nginx_test_reload
-
-  refreeze_best
-  tests
-
-  say "DONE"
-  echo "Backups: $BK"
-  echo "Open: https://${DOMAIN}/wolverine/ (Ctrl+F5)"
-}
-
-main
-'''
-os.makedirs(os.path.dirname(p), exist_ok=True)
-with open(p,"w",encoding="utf-8") as f: f.write(s)
-os.chmod(p, os.stat(p).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-print(p)
-PY
-
-bash /root/WV_MEGA_FIX_WOLVERINE_404_V2.sh
+echo "=== OK ==="
+echo "AIAQUILA prêt : https://fireinners.online/${APP_NAME}/"
