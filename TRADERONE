@@ -1,93 +1,57 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_DIR="/var/www/aiaquila"
-HTML="$APP_DIR/index.html"
+PROXY="/var/www/aiaquila/rss-proxy.php"
 TS="$(date +%Y%m%d_%H%M%S)"
-BACKUP="$APP_DIR/index.backup_$TS.html"
 
-echo "=== AIAQUILA RSS + TTS JS PATCH (SAFE) ==="
+echo "=== FIX RSS PROXY (AIAQUILA) ==="
 
-# 1) CHECK
-[ -f "$HTML" ] || { echo "index.html introuvable"; exit 1; }
+# Backup
+cp "$PROXY" "$PROXY.backup_$TS"
+echo "Backup: $PROXY.backup_$TS"
 
-# 2) BACKUP
-cp "$HTML" "$BACKUP"
-echo "Backup créé: $BACKUP"
+# Rewrite proxy
+cat <<'PHP' > "$PROXY"
+<?php
+header("Access-Control-Allow-Origin: *");
+header("Content-Type: application/xml; charset=UTF-8");
 
-# 3) SUPPRESSION ancien script AIAQUILA RSS
-sed -i '/AIAQUILA RSS/,+200d' "$HTML"
-echo "Ancien JS RSS supprimé"
-
-# 4) AJOUT DU NOUVEAU JS (SAFE HEREDOC)
-cat <<'JS' >> "$HTML"
-
-<!-- ===== AIAQUILA RSS + TTS – PATCH FINAL ===== -->
-<script>
-const FEEDS = [
-  "https://www.coindesk.com/arc/outboundfeeds/rss/",
-  "https://cointelegraph.com/rss",
-  "https://www.coingecko.com/rss/news"
-];
-
-const PROXY = "/aiaquila/rss-proxy.php?url=";
-let articles = [];
-
-function log(m){
-  const l = document.getElementById("logs");
-  if(l){
-    l.textContent += m + "\n";
-    l.scrollTop = l.scrollHeight;
-  }
+if (!isset($_GET['url'])) {
+  http_response_code(400);
+  echo "Missing url";
+  exit;
 }
 
-function parseRSS(xml){
-  const p = new DOMParser();
-  const d = p.parseFromString(xml, "text/xml");
-  return [...d.querySelectorAll("item")].map(i => ({
-    title: i.querySelector("title")?.textContent || "",
-    desc: i.querySelector("description")?.textContent || ""
-  }));
+$url = $_GET['url'];
+
+$ch = curl_init();
+curl_setopt_array($ch, [
+  CURLOPT_URL => $url,
+  CURLOPT_RETURNTRANSFER => true,
+  CURLOPT_FOLLOWLOCATION => true,
+  CURLOPT_TIMEOUT => 15,
+  CURLOPT_USERAGENT => "Mozilla/5.0 (AIAQUILA RSS)",
+  CURLOPT_HTTPHEADER => [
+    "Accept: application/rss+xml, application/xml;q=0.9, */*;q=0.8"
+  ]
+]);
+
+$data = curl_exec($ch);
+$err  = curl_error($ch);
+curl_close($ch);
+
+if (!$data) {
+  http_response_code(502);
+  echo "RSS fetch failed: $err";
+  exit;
 }
 
-async function loadRSS(){
-  log("AIAQUILA RSS prêt");
-  articles = [];
-  for(const f of FEEDS){
-    try{
-      const r = await fetch(PROXY + encodeURIComponent(f));
-      const t = await r.text();
-      articles.push(...parseRSS(t));
-    }catch(e){
-      log("RSS erreur: " + f);
-    }
-  }
-  log("Articles chargés: " + articles.length);
-  if(articles.length) speak();
-}
+echo $data;
+PHP
 
-function speak(){
-  const txt = articles.slice(0,3).map(a => a.title).join(". ");
-  if(!txt) return;
-  const u = new SpeechSynthesisUtterance(txt);
-  u.lang = "fr-FR";
-  speechSynthesis.cancel();
-  speechSynthesis.speak(u);
-  log("TTS lancé");
-}
+# Permissions
+chown www-data:www-data "$PROXY"
+chmod 644 "$PROXY"
 
-document.addEventListener("DOMContentLoaded", () => {
-  document.getElementById("loadRSS")?.addEventListener("click", loadRSS);
-});
-</script>
-<!-- ===== FIN PATCH ===== -->
-
-JS
-
-# 5) PERMISSIONS
-chown www-data:www-data "$HTML"
-chmod 644 "$HTML"
-
-echo "=== PATCH TERMINÉ ==="
+echo "=== PROXY RSS CORRIGÉ ==="
 echo "Recharge la page (Ctrl+F5) puis clique 'Charger les articles'"
-echo "URL: https://fireinners.online/aiaquila/"
