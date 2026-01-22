@@ -1,237 +1,230 @@
-cat >/root/MEGA_WOLVERINE_FIX_404_V9.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
+umask 022
 
-DOMAIN="fireinners.online"
-WEBROOT="/var/www/wolverine"
-INC_DIR="/etc/nginx/includes"
-INC_FILE="$INC_DIR/wolverine_static.inc"
 TS="$(date +%Y%m%d_%H%M%S)"
 BK="/root/BK_WOLV404_FIX_${TS}"
+DOMAIN="fireinners.online"
+WEBROOT="/var/www/wolverine"
+INCDIR="/etc/nginx/includes"
+INC_CANON="${INCDIR}/wolverine_routes.inc"
 
-say(){ echo "[$(date -u '+%F %T UTC')] $*"; }
+say(){ echo "[$(date -u +'%F %T UTC')] $*"; }
 need_root(){ [ "${EUID:-$(id -u)}" -eq 0 ] || { echo "ERR: root only"; exit 1; }; }
 
-unfreeze(){
-  command -v chattr >/dev/null 2>&1 || return 0
+need_root
+mkdir -p "$BK"
+
+say "== BACKUP =="
+cp -a /etc/nginx "$BK/nginx" 2>/dev/null || true
+[ -d "$WEBROOT" ] && cp -a "$WEBROOT" "$BK/webroot_wolverine" 2>/dev/null || true
+(lsattr -R /etc/nginx 2>/dev/null || true) >"$BK/lsattr_nginx.txt" || true
+
+say "== UNFREEZE nginx files (best effort) =="
+if command -v chattr >/dev/null 2>&1; then
   chattr -i /etc/nginx/nginx.conf 2>/dev/null || true
-  chattr -i -R /etc/nginx/sites-enabled /etc/nginx/sites-available /etc/nginx/conf.d /etc/nginx/includes 2>/dev/null || true
-}
-refreeze_one(){
-  command -v chattr >/dev/null 2>&1 || return 0
-  local f="$1"
-  [ -e "$f" ] && chattr +i "$f" 2>/dev/null || true
-}
+  find /etc/nginx -maxdepth 3 -type f \( -name "*.conf" -o -name "*.inc" \) -print0 2>/dev/null \
+    | xargs -0 -I{} sh -lc 'chattr -i "{}" 2>/dev/null || true' || true
+fi
 
-backup_all(){
-  mkdir -p "$BK"
-  cp -a /etc/nginx "$BK/nginx" 2>/dev/null || true
-  if [ -d "$WEBROOT" ]; then cp -a "$WEBROOT" "$BK/webroot_wolverine" 2>/dev/null || true; fi
-  say "Backups: $BK"
-}
-
-ensure_webroot(){
-  mkdir -p "$WEBROOT"
-  if [ ! -f "$WEBROOT/index.html" ]; then
-    say "Create minimal $WEBROOT/index.html (placeholder)"
-    cat >"$WEBROOT/index.html" <<HTML
-<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>WOLVERINE OK</title><style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;margin:24px}code{background:#f3f3f3;padding:2px 6px;border-radius:6px}</style></head><body><h1>WOLVERINE OK</h1><p>Static route <code>/wolverine/</code> is served.</p><p>Path: <code>/var/www/wolverine/index.html</code></p></body></html>
+say "== ENSURE WEBROOT + index.html =="
+mkdir -p "$WEBROOT"
+if [ ! -f "$WEBROOT/index.html" ]; then
+  cat >"$WEBROOT/index.html" <<'HTML'
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WOLVERINE</title><style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;margin:24px}code{background:#f3f3f3;padding:2px 6px;border-radius:6px}</style></head><body><h1>WOLVERINE</h1><p>Placeholder <code>/var/www/wolverine/index.html</code> (remplace par ton build Next export).</p><p><a href="/wolverine/">/wolverine/</a></p></body></html>
 HTML
-  fi
-}
+fi
 
-write_include(){
-  mkdir -p "$INC_DIR"
-  cat >"$INC_FILE" <<'NGX'
+say "== WRITE CANONICAL INCLUDE: $INC_CANON =="
+mkdir -p "$INCDIR"
+cat >"$INC_CANON" <<'NGX'
+# --- WOLVERINE canonical routes (single source of truth) ---
 location = /wolverine { return 301 /wolverine/; }
+
+# IMPORTANT: use root /var/www (NOT alias) to make try_files correct.
 location ^~ /wolverine/ {
-  alias /var/www/wolverine/;
+  root /var/www;
   index index.html;
   try_files $uri $uri/ /wolverine/index.html;
-  add_header Cache-Control "no-store" always;
-  add_header Pragma "no-cache" always;
-  expires -1;
+  add_header Cache-Control "no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0" always;
+}
+
+# Vault API (backend)
+location ^~ /wolverine/vault-api/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  proxy_set_header Upgrade $http_upgrade;
+  proxy_set_header Connection "upgrade";
+  proxy_pass http://127.0.0.1:3000/;
+}
+
+# TraderOne (backend)
+location ^~ /wolverine/traderone/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  proxy_set_header Upgrade $http_upgrade;
+  proxy_set_header Connection "upgrade";
+  proxy_pass http://127.0.0.1:3000/;
 }
 NGX
-}
 
-detect_vhosts(){
-  nginx -T 2>/dev/null | python3 - <<'PY'
-import re,sys
-txt=sys.stdin.read().splitlines()
-cur=None
-out=[]
-for line in txt:
-    m=re.match(r'# configuration file (.*):$', line.strip())
-    if m: cur=m.group(1); continue
-    if cur and 'server_name' in line and 'fireinners.online' in line:
-        out.append(cur)
-seen=[]
-for f in out:
-    if f not in seen: seen.append(f)
-print("\n".join(seen))
-PY
-}
-
-pick_primary_ssl_vhost(){
-  nginx -T 2>/dev/null | python3 - <<'PY'
-import re,sys
-domain="fireinners.online"
-lines=sys.stdin.read().splitlines()
-cur=None
-servers=[]
-i=0
-while i < len(lines):
-    line=lines[i]
-    m=re.match(r'# configuration file (.*):$', line.strip())
-    if m: cur=m.group(1); i+=1; continue
-    if cur and re.search(r'^\s*server\s*\{', line):
-        depth=0
-        has_domain=False
-        has_443=False
-        j=i
-        while j < len(lines):
-            l=lines[j]
-            depth += l.count('{') - l.count('}')
-            if re.search(r'\bserver_name\b', l) and domain in l: has_domain=True
-            if re.search(r'\blisten\b', l) and re.search(r'\b443\b', l): has_443=True
-            if depth<=0: break
-            j+=1
-        if has_domain and has_443:
-            servers.append(cur)
-        i=j+1
-        continue
-    i+=1
-seen=[]
-for f in servers:
-    if f not in seen: seen.append(f)
-print(seen[0] if seen else "")
-PY
-}
-
-disable_other_ssl_conflicts(){
-  local primary="$1"
-  say "Scan other SSL vhosts for $DOMAIN (disable conflicts, keep primary)"
-  local all; all="$(detect_vhosts || true)"
-  [ -n "$all" ] || return 0
-  while IFS= read -r f; do
-    [ -n "$f" ] || continue
-    [ "$f" = "$primary" ] && continue
-    if [ -L "$f" ]; then
-      say "Disable symlink: $f"
-      mv -f "$f" "$BK/disabled_$(basename "$f")" 2>/dev/null || true
-    elif [ -f "$f" ]; then
-      if [[ "$f" == /etc/nginx/conf.d/* ]]; then
-        say "Disable conf.d file: $f"
-        mv -f "$f" "$BK/disabled_$(basename "$f")" 2>/dev/null || true
-      else
-        say "Leave file (not safe to auto-disable): $f"
-      fi
-    fi
-  done <<<"$all"
-}
-
-inject_include_into_primary(){
-  local primary="$1"
-  [ -n "$primary" ] || { say "ERR: primary SSL vhost not found"; exit 1; }
-  [ -f "$primary" ] || { say "ERR: primary file missing: $primary"; exit 1; }
-
-  say "Primary SSL vhost: $primary"
-  cp -a "$primary" "$BK/primary_vhost.bak" 2>/dev/null || true
-
-  python3 - <<PY
-import re
-p="$primary"
-inc='$INC_FILE'
-needle=f'include {inc};'
-s=open(p,'r',encoding='utf-8',errors='ignore').read().splitlines(True)
-
-# If already present anywhere, keep single instance (first) and remove the rest
-found=[]
-for i,l in enumerate(s):
-    if needle in l and not l.lstrip().startswith('#'):
-        found.append(i)
-if found:
-    keep=found[0]
-    for idx in reversed(found[1:]):
-        s.pop(idx)
-else:
-    # Insert into the first server block that mentions server_name fireinners.online
+say "== REMOVE /wolverine location blocks from other include files (dedup) =="
+python3 - <<'PY'
+import glob,os,re
+incdir="/etc/nginx/includes"
+canon=os.path.join(incdir,"wolverine_routes.inc")
+paths=sorted(glob.glob(os.path.join(incdir,"*.inc")))
+def strip_wolverine_blocks(txt:str)->str:
+    lines=txt.splitlines(True)
     out=[]
+    i=0
+    while i<len(lines):
+        line=lines[i]
+        if re.search(r'^\s*location\b.*\/wolverine', line):
+            # remove this whole location { ... } block by brace counting
+            depth=0
+            # count braces starting from this line
+            while i<len(lines):
+                depth += lines[i].count('{')
+                depth -= lines[i].count('}')
+                i+=1
+                if depth<=0:
+                    break
+            continue
+        out.append(line); i+=1
+    return "".join(out)
+for p in paths:
+    if os.path.abspath(p)==os.path.abspath(canon): 
+        continue
+    try:
+        with open(p,"r",encoding="utf-8",errors="ignore") as f: src=f.read()
+        dst=strip_wolverine_blocks(src)
+        if dst!=src:
+            bak=p+".bak_wolv404"
+            if not os.path.exists(bak):
+                with open(bak,"w",encoding="utf-8") as f: f.write(src)
+            with open(p,"w",encoding="utf-8") as f: f.write(dst)
+            print("STRIPPED:",p)
+    except Exception as e:
+        print("SKIP:",p,"ERR:",e)
+PY
+
+say "== FIND & PATCH PRIMARY SSL VHOST (server_name ${DOMAIN} listen 443) =="
+python3 - <<'PY'
+import glob,os,re,sys
+targets=[]
+cands=glob.glob("/etc/nginx/sites-enabled/*")+glob.glob("/etc/nginx/conf.d/*.conf")
+for f in sorted(set(cands)):
+    try:
+        s=open(f,"r",encoding="utf-8",errors="ignore").read()
+    except: 
+        continue
+    if re.search(r'\bserver_name\b[^;]*\bfireinners\.online\b', s) and re.search(r'\blisten\b[^;]*\b443\b', s):
+        targets.append(f)
+
+if not targets:
+    print("ERR: no vhost found with server_name fireinners.online + listen 443"); sys.exit(2)
+
+vf=targets[0]
+src=open(vf,"r",encoding="utf-8",errors="ignore").read().splitlines(True)
+
+def patch_server_block(lines):
+    out=[]
+    i=0
     in_server=False
     depth=0
-    inserted=False
-    server_has_domain=False
-    for i,l in enumerate(s):
-        if re.search(r'^\s*server\s*\{', l):
+    saw_name=False
+    saw_443=False
+    include_line="include /etc/nginx/includes/wolverine_routes.inc;"
+    include_present=False
+
+    # include files to disable if they usually carry wolverine blocks (avoid duplicates)
+    bad_include_re=re.compile(r'^\s*include\s+.*(wolverine_routes\.inc|wv_vault_api\.inc|wv_.*wolv.*\.inc)\s*;')
+
+    while i<len(lines):
+        line=lines[i]
+        # enter server
+        if not in_server and re.search(r'^\s*server\s*\{', line):
             in_server=True
-            depth=0
-            server_has_domain=False
-        if in_server:
-            depth += l.count('{') - l.count('}')
-            if ('server_name' in l) and ('fireinners.online' in l):
-                server_has_domain=True
-            # Insert right after server_name line if possible, else before end of server
-            if server_has_domain and (not inserted) and ('server_name' in l):
-                out.append(l)
-                out.append(f'  {needle}\n')
-                inserted=True
-                continue
-            if in_server and depth<=0:
-                in_server=False
-        out.append(l)
-    s=out
+            depth=line.count('{')-line.count('}')
+            blk=[line]
+            i+=1
+            saw_name=saw_443=include_present=False
+            while i<len(lines) and depth>0:
+                l=lines[i]
+                if re.search(r'\bserver_name\b[^;]*\bfireinners\.online\b', l): saw_name=True
+                if re.search(r'\blisten\b[^;]*\b443\b', l): saw_443=True
+                if l.strip()==include_line: include_present=True
 
-open(p,'w',encoding='utf-8').write(''.join(s))
+                # comment duplicate/bad includes inside this server block only
+                if bad_include_re.search(l):
+                    blk.append("# " + l if not l.lstrip().startswith("#") else l)
+                else:
+                    blk.append(l)
+
+                depth += l.count('{')-l.count('}')
+                i+=1
+
+            # if this is the target server block, ensure include exists once
+            if saw_name and saw_443:
+                # remove extra duplicates of include_line inside block
+                newblk=[]
+                seen=False
+                for l in blk:
+                    if l.strip()==include_line:
+                        if seen: 
+                            newblk.append("# " + l)
+                        else:
+                            newblk.append(l); seen=True
+                    else:
+                        newblk.append(l)
+                blk=newblk
+                if not seen:
+                    # insert include before last closing brace of this server block
+                    # find last line that contains only "}" at end of server
+                    for j in range(len(blk)-1,-1,-1):
+                        if re.match(r'^\s*\}\s*$', blk[j]):
+                            blk.insert(j, "  "+include_line+"\n")
+                            break
+            out.extend(blk)
+            in_server=False
+            continue
+
+        out.append(line); i+=1
+    return out, vf
+
+patched, vf = patch_server_block(src)
+bak=vf+".bak_wolv404"
+if not os.path.exists(bak):
+    open(bak,"w",encoding="utf-8").write("".join(src))
+open(vf,"w",encoding="utf-8").write("".join(patched))
+print("PATCHED_VHOST:",vf)
 PY
-}
 
-nginx_reload(){
-  say "nginx -t"
-  nginx -t
-  say "reload nginx"
-  systemctl reload nginx 2>/dev/null || systemctl restart nginx
-}
+say "== NGINX TEST =="
+nginx -t
 
-tests(){
-  say "TEST LOCAL (bypass CF) GET /wolverine/ (first bytes + code)"
-  curl -sk --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/" -D /tmp/wolv_hdr.txt -o /tmp/wolv_body.txt || true
-  head -n 20 /tmp/wolv_hdr.txt || true
-  head -c 240 /tmp/wolv_body.txt 2>/dev/null | sed 's/[[:cntrl:]]/./g' || true
-  echo
-  say "TEST PUBLIC HEAD /wolverine/"
-  curl -skI "https://${DOMAIN}/wolverine/" | sed -n '1,20p' || true
-}
+say "== RELOAD NGINX =="
+systemctl reload nginx 2>/dev/null || systemctl restart nginx
 
-main(){
-  need_root
-  say "MEGA_WOLVERINE_FIX_404_V9 start"
-  backup_all
-  unfreeze
-  ensure_webroot
-  write_include
+say "== TEST LOCAL (bypass CF) /wolverine/ =="
+curl -skI --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/" | sed -n '1,12p' || true
+say "== TEST LOCAL (body first bytes) =="
+curl -sk --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/" | head -c 240 | sed -e 's/[[:cntrl:]]/ /g' || true
+echo
 
-  local primary; primary="$(pick_primary_ssl_vhost || true)"
-  [ -n "$primary" ] || primary="/etc/nginx/sites-enabled/fireinners.online-ssl"
-  [ -f "$primary" ] || primary="/etc/nginx/sites-enabled/fireinners.online-ssl.conf"
-  [ -f "$primary" ] || primary="/etc/nginx/conf.d/000-fireinners.online-ssl.conf"
+say "== TEST PUBLIC HEAD /wolverine/ =="
+curl -skI "https://${DOMAIN}/wolverine/" | sed -n '1,12p' || true
 
-  disable_other_ssl_conflicts "$primary"
-  inject_include_into_primary "$primary"
+say "== SHOW WHAT NGINX LOADED FOR fireinners.online:443 (nginx -T grep) =="
+nginx -T 2>/dev/null | awk '/server_name[[:space:]].*fireinners\.online/{flag=1} flag&&/listen[[:space:]].*443/{print "---- TARGET SERVER (snippet) ----"} flag&&/wolverine_routes\.inc|location[[:space:]].*\/wolverine/{print}'
 
-  nginx_reload
-  tests
-
-  refreeze_one /etc/nginx/nginx.conf
-  refreeze_one "$primary"
-  refreeze_one "$INC_FILE"
-
-  say "DONE"
-  say "Backups: $BK"
-  echo "Open: https://${DOMAIN}/wolverine/ (Ctrl+F5)"
-}
-
-main "$@"
-SH
-chmod +x /root/MEGA_WOLVERINE_FIX_404_V9.sh
-bash /root/MEGA_WOLVERINE_FIX_404_V9.sh
+say "== DONE =="
+say "Backups: $BK"
+say "Open: https://${DOMAIN}/wolverine/ (Ctrl+F5)"
