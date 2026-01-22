@@ -1,275 +1,98 @@
-#!/usr/bin/env bash
-set -euo pipefail
+bash -lc 'set -euo pipefail
+TS="$(date +%Y%m%d_%H%M%S)"; BK="/root/AIAQUILA_BK_$TS"; mkdir -p "$BK"
+say(){ printf "[%s] %s\n" "$(date +%H:%M:%S)" "$*"; }
+die(){ say "ERR: $*"; exit 1; }
+[ "$(id -u)" -eq 0 ] || die "run as root"
 
-# MEGA_ORION_DEPLOY_V3_DEPS.sh
-# Déploie Orion (Vite/React) sur https://fireinners.online/orion/
-# + Installe toutes les dépendances système nécessaires (node20, build tools, unzip, nginx, curl, rsync, git)
-#
-# Usage:
-#   bash MEGA_ORION_DEPLOY_V3_DEPS.sh
-#   ORION_ZIP_URL="https://.../orion.zip" bash MEGA_ORION_DEPLOY_V3_DEPS.sh
-#   ORION_ZIP_PATH="/chemin/orion.zip"   bash MEGA_ORION_DEPLOY_V3_DEPS.sh
+WEB="/var/www/aiaquila"
+VENDOR="$WEB/vendor"
+IDX="$WEB/index.html"
 
-export DEBIAN_FRONTEND=noninteractive
+say "1) checks"
+[ -d "$WEB" ] || die "missing $WEB"
+[ -f "$IDX" ] || die "missing $IDX"
+mkdir -p "$VENDOR"
 
-TS="$(date +%Y%m%d_%H%M%S)"
-WORK="/opt/orion"
-SRC="$WORK/src"
-WWW="/var/www/orion"
+say "2) backup"
+cp -a "$IDX" "$BK/index.html.bak"
 
-NGX_VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
-NGX_INC_DIR="/etc/nginx/includes"
-NGX_INC_FILE="$NGX_INC_DIR/orion_routes.inc"
+say "3) ensure vendor (pinned files, no CDN at runtime)"
+# If you already have these files, we keep them. If missing, download.
+need_dl=0
+[ -f "$VENDOR/solana-web3.iife.min.js" ] || need_dl=1
+[ -f "$VENDOR/buffer.min.js" ] || need_dl=1
+[ -f "$VENDOR/process.min.js" ] || need_dl=1
 
-ZIP_CANDIDATES=(
-  "${ORION_ZIP_PATH:-}"
-  "/root/orion.zip"
-  "/root/orion/orion.zip"
-  "/opt/orion.zip"
-  "/opt/orion/orion.zip"
-  "/var/www/orion.zip"
-  "/tmp/orion.zip"
-)
-
-log(){ printf "\n[%s] %s\n" "$(date -u +'%F %T UTC')" "$*"; }
-die(){ echo "ERROR: $*" >&2; exit 1; }
-
-ASKLIB="/opt/fireinners/sentinel/lib/askorupdate.sh"
-if [[ -f "$ASKLIB" ]]; then
-  # shellcheck disable=SC1090
-  source "$ASKLIB"
+if [ "$need_dl" -eq 1 ]; then
+  say "   downloading vendor files..."
+  # Pinned versions (stable) — adjust only if you want.
+  curl -fsSL "https://unpkg.com/@solana/web3.js@1.95.4/lib/index.iife.min.js" -o "$VENDOR/solana-web3.iife.min.js"
+  curl -fsSL "https://unpkg.com/buffer@6.0.3/index.min.js" -o "$VENDOR/buffer.min.js"
+  curl -fsSL "https://unpkg.com/process@0.11.10/browser.js" -o "$VENDOR/process.min.js"
+  (cd "$VENDOR" && sha256sum solana-web3.iife.min.js buffer.min.js process.min.js > SHA256SUMS.txt)
 else
-  askorupdate_file(){
-    local src="$1" dst="$2" mode="${3:-0644}"
-    mkdir -p "$(dirname "$dst")"
-    [[ -f "$dst" ]] && cp -a "$dst" "$dst.bak.$TS"
-    install -m "$mode" "$src" "$dst"
-  }
+  say "   vendor already present (skip download)"
 fi
 
-require_root(){ [[ "$(id -u)" == "0" ]] || die "Lance ce script en root."; }
-ensure_cmd(){ command -v "$1" >/dev/null 2>&1 || die "Commande manquante: $1"; }
+say "4) patch index.html (inject global Buffer polyfill BEFORE any JS)"
+python3 - "$IDX" <<'"'"'PY'"'"'
+import re,sys
+p=sys.argv[1]
+s=open(p,"r",encoding="utf-8",errors="ignore").read()
 
-backup_path(){ local p="$1"; [[ -e "$p" ]] && cp -a "$p" "$p.bak.$TS" || true; }
-chattr_unlock(){ command -v chattr >/dev/null 2>&1 && [[ -e "$1" ]] && chattr -i "$1" 2>/dev/null || true; }
-chattr_lock(){ command -v chattr >/dev/null 2>&1 && [[ -e "$1" ]] && chattr +i "$1" 2>/dev/null || true; }
+MARK="AIAQUILA_BUFFER_POLYFILL_V1"
+if MARK in s:
+    print("already patched")
+    sys.exit(0)
 
-apt_install_deps(){
-  log "APT deps (curl, unzip, rsync, git, nginx, build-essential, python3-minimal, ca-certificates, gnupg)"
-  apt-get update -y
-  apt-get install -y --no-install-recommends \
-    ca-certificates curl gnupg \
-    unzip rsync git \
-    nginx \
-    build-essential python3-minimal \
-    jq
-}
-
-install_node20(){
-  # Respect règle: ne pas installer npm via apt. NodeSource fournit node + npm.
-  if command -v node >/dev/null 2>&1 && node -v | grep -Eq '^v20\.'; then
-    log "Node OK: $(node -v)"
-    return 0
-  fi
-  log "Install/Upgrade Node 20 (NodeSource)"
-  ensure_cmd curl
-  ensure_cmd gpg
-
-  install -d -m 0755 /etc/apt/keyrings
-  curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
-  local codename; codename="$(. /etc/os-release && echo "${VERSION_CODENAME:-noble}")"
-  printf "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x %s main\n" "$codename" > /etc/apt/sources.list.d/nodesource.list
-  apt-get update -y
-  apt-get install -y nodejs
-  node -v | grep -Eq '^v20\.' || die "Node 20 non installé correctement."
-  log "Node installé: $(node -v)"
-  log "npm: $(npm -v || true)"
-}
-
-find_orion_zip(){
-  for p in "${ZIP_CANDIDATES[@]}"; do
-    [[ -n "${p:-}" ]] || continue
-    if [[ -f "$p" && -s "$p" ]]; then
-      echo "$p"
-      return 0
-    fi
-  done
-
-  if [[ -n "${ORION_ZIP_URL:-}" ]]; then
-    ensure_cmd curl
-    local out="/root/orion.zip"
-    log "Téléchargement: ORION_ZIP_URL -> $out"
-    curl -fL --retry 3 --retry-delay 2 -o "$out" "$ORION_ZIP_URL"
-    [[ -s "$out" ]] || die "Zip téléchargé vide."
-    echo "$out"
-    return 0
-  fi
-  return 1
-}
-
-hint_upload_commands(){
-  cat >&2 <<'TXT'
-
-ZIP introuvable sur le VPS.
-
-Option A (1 commande depuis ton PC):
-  scp orion.zip root@72.61.79.12:/root/orion.zip
-
-Option B (si tu as une URL directe du zip):
-  ORION_ZIP_URL="https://TON-LIEN/orion.zip" bash /root/MEGA_ORION_DEPLOY_V3_DEPS.sh
-
-Option C (si le zip est déjà sur le VPS mais ailleurs):
-  ORION_ZIP_PATH="/chemin/vers/orion.zip" bash /root/MEGA_ORION_DEPLOY_V3_DEPS.sh
-
-TXT
-}
-
-unpack_and_build(){
-  ensure_cmd unzip
-  ensure_cmd rsync
-
-  mkdir -p "$SRC" "$WWW"
-  rm -rf "$SRC"/*
-
-  local zip
-  if ! zip="$(find_orion_zip)"; then
-    hint_upload_commands
-    exit 2
-  fi
-
-  log "Zip utilisé: $zip"
-  log "Décompression -> $SRC"
-  unzip -q -o "$zip" -d "$SRC"
-
-  local rootdir="$SRC"
-  if [[ -f "$SRC/package.json" ]]; then
-    rootdir="$SRC"
-  else
-    local pj
-    pj="$(find "$SRC" -maxdepth 4 -type f -name package.json | head -n1 || true)"
-    [[ -n "$pj" ]] || die "package.json introuvable après unzip."
-    rootdir="$(dirname "$pj")"
-  fi
-  log "Root projet: $rootdir"
-
-  cd "$rootdir"
-
-  # Durcissement npm: cache local, pas d'audit, timeouts corrects
-  npm config set fund false >/dev/null 2>&1 || true
-  npm config set audit false >/dev/null 2>&1 || true
-  npm config set fetch-retries 3 >/dev/null 2>&1 || true
-  npm config set fetch-retry-mintimeout 20000 >/dev/null 2>&1 || true
-  npm config set fetch-retry-maxtimeout 120000 >/dev/null 2>&1 || true
-
-  log "npm ci"
-  npm ci --no-audit --no-fund
-
-  log "npm run build"
-  npm run build
-
-  [[ -d "$rootdir/dist" ]] || die "dist/ introuvable après build."
-
-  log "Déploiement dist/ -> $WWW"
-  backup_path "$WWW"
-  mkdir -p "$WWW"
-  rsync -a --delete "$rootdir/dist/" "$WWW/"
-
-  chown -R www-data:www-data "$WWW" 2>/dev/null || true
-  find "$WWW" -type d -exec chmod 0755 {} \; 2>/dev/null || true
-  find "$WWW" -type f -exec chmod 0644 {} \; 2>/dev/null || true
-}
-
-write_nginx_include(){
-  mkdir -p "$NGX_INC_DIR"
-  local tmp; tmp="$(mktemp)"
-  cat >"$tmp" <<'NGX'
-# AUTOGENERATED: orion_routes.inc
-location ^~ /orion/ {
-  alias /var/www/orion/;
-  try_files $uri $uri/ /orion/index.html;
-  add_header Cache-Control "no-store";
-}
-NGX
-
-  chattr_unlock "$NGX_INC_FILE"
-  backup_path "$NGX_INC_FILE"
-  askorupdate_file "$tmp" "$NGX_INC_FILE" 0644
-  rm -f "$tmp"
-  chattr_lock "$NGX_INC_FILE"
-  log "Nginx include: $NGX_INC_FILE"
-}
-
-ensure_include_in_vhost(){
-  ensure_cmd nginx
-  [[ -f "$NGX_VHOST" ]] || die "Vhost introuvable: $NGX_VHOST"
-
-  local inc_line="include $NGX_INC_FILE;"
-  if grep -Fq "$inc_line" "$NGX_VHOST"; then
-    log "Vhost: include déjà présent."
-    return 0
-  fi
-
-  log "Vhost: insertion include orion"
-  chattr_unlock "$NGX_VHOST"
-  backup_path "$NGX_VHOST"
-
-  local tmp; tmp="$(mktemp)"
-  awk -v ins="$inc_line" '
-    BEGIN{done=0}
-    {
-      if(!done && $0 ~ /^[[:space:]]*location[[:space:]]/){
-        print "  " ins
-        done=1
-      }
-      print $0
+poly = r'''
+<!-- AIAQUILA_BUFFER_POLYFILL_V1 -->
+<script src="/aiaquila/vendor/process.min.js"></script>
+<script src="/aiaquila/vendor/buffer.min.js"></script>
+<script>
+/* Buffer/process globals required by solana-web3 + hashing */
+(function(){
+  try{
+    if(!window.globalThis) window.globalThis=window;
+    window.global = window;
+    window.process = window.process || (window.process && window.process.browser ? window.process : {env:{},browser:true});
+    var B = (window.buffer && window.buffer.Buffer) ? window.buffer.Buffer : (window.Buffer||null);
+    if(B){
+      window.Buffer = B;
+      window.globalThis.Buffer = B;
     }
-  ' "$NGX_VHOST" > "$tmp"
+  }catch(e){}
+})();
+</script>
+<!-- /AIAQUILA_BUFFER_POLYFILL_V1 -->
+'''.strip()+"\n"
 
-  if ! grep -Fq "$inc_line" "$tmp"; then
-    awk -v ins="$inc_line" '
-      {lines[NR]=$0}
-      END{
-        for(i=1;i<=NR;i++){
-          if(i==NR && lines[i] ~ /^[[:space:]]*}[[:space:]]*$/){
-            print "  " ins
-          }
-          print lines[i]
-        }
-      }
-    ' "$NGX_VHOST" > "$tmp"
-  fi
+# Inject right before first <script ...solana-web3...> if present, else before </head>
+m=re.search(r'<script[^>]+src=[\"\']/aiaquila/vendor/solana-web3\.iife\.min\.js[\"\'][^>]*>\s*</script>', s, re.I)
+if m:
+    s = s[:m.start()] + poly + s[m.start():]
+else:
+    # try before </head>
+    m2=re.search(r'</head\s*>', s, re.I)
+    if m2:
+        s = s[:m2.start()] + poly + s[m2.start():]
+    else:
+        # fallback: prepend
+        s = poly + s
 
-  install -m 0644 "$tmp" "$NGX_VHOST"
-  rm -f "$tmp"
+open(p,"w",encoding="utf-8").write(s)
+print("patched")
+PY
 
-  nginx -t
-  systemctl reload nginx
-  chattr_lock "$NGX_VHOST"
-  log "Nginx reload OK"
-}
+say "5) verify (marker + vendor paths)"
+grep -q "AIAQUILA_BUFFER_POLYFILL_V1" "$IDX" || die "patch failed (marker missing)"
+ls -la "$VENDOR/solana-web3.iife.min.js" "$VENDOR/buffer.min.js" "$VENDOR/process.min.js" >/dev/null 2>&1 || die "vendor missing"
 
-healthcheck(){
-  ensure_cmd curl
-  local code
-  code="$(curl -k -s -o /dev/null -w "%{http_code}" "https://fireinners.online/orion/" || true)"
-  log "Healthcheck https://fireinners.online/orion/ => HTTP $code"
-}
+say "6) quick local fetch tests"
+curl -fsS "http://127.0.0.1/aiaquila/vendor/buffer.min.js" >/dev/null 2>&1 || true
+curl -fsS "http://127.0.0.1/aiaquila/" | head -n 2 || true
 
-main(){
-  require_root
-  ensure_cmd bash
-  ensure_cmd awk
-  ensure_cmd sed
-
-  log "=== ORION DEPLOY V3 (DEPS) START ==="
-  apt_install_deps
-  install_node20
-  unpack_and_build
-  write_nginx_include
-  ensure_include_in_vhost
-  healthcheck
-  log "=== ORION DEPLOY V3 (DEPS) DONE ==="
-  log "URL: https://fireinners.online/orion/"
-}
-
-main "$@"
+say "DONE"
+say "Backup: $BK"
+say "Open: https://fireinners.online/aiaquila/"
+'
