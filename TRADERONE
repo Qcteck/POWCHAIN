@@ -1,57 +1,36 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PROXY="/var/www/aiaquila/rss-proxy.php"
-TS="$(date +%Y%m%d_%H%M%S)"
+echo "=== AIAQUILA PHP FIX ==="
 
-echo "=== FIX RSS PROXY (AIAQUILA) ==="
+# 1. Installer PHP-FPM si absent
+apt update
+apt install -y php php-fpm php-curl
 
-# Backup
-cp "$PROXY" "$PROXY.backup_$TS"
-echo "Backup: $PROXY.backup_$TS"
+PHP_SOCK=$(ls /run/php/php*-fpm.sock | head -n1)
 
-# Rewrite proxy
-cat <<'PHP' > "$PROXY"
-<?php
-header("Access-Control-Allow-Origin: *");
-header("Content-Type: application/xml; charset=UTF-8");
+echo "PHP socket: $PHP_SOCK"
 
-if (!isset($_GET['url'])) {
-  http_response_code(400);
-  echo "Missing url";
-  exit;
-}
+# 2. Patch vhost nginx fireinners
+VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
 
-$url = $_GET['url'];
+cp "$VHOST" "$VHOST.backup_$(date +%Y%m%d_%H%M%S)"
 
-$ch = curl_init();
-curl_setopt_array($ch, [
-  CURLOPT_URL => $url,
-  CURLOPT_RETURNTRANSFER => true,
-  CURLOPT_FOLLOWLOCATION => true,
-  CURLOPT_TIMEOUT => 15,
-  CURLOPT_USERAGENT => "Mozilla/5.0 (AIAQUILA RSS)",
-  CURLOPT_HTTPHEADER => [
-    "Accept: application/rss+xml, application/xml;q=0.9, */*;q=0.8"
-  ]
-]);
+# Inject PHP handler if missing
+if ! grep -q "fastcgi_pass.*php" "$VHOST"; then
+  sed -i '/location \//a \
+    location ~ \\.php$ {\
+        include snippets/fastcgi-php.conf;\
+        fastcgi_pass unix:'"$PHP_SOCK"';\
+    }\
+' "$VHOST"
+fi
 
-$data = curl_exec($ch);
-$err  = curl_error($ch);
-curl_close($ch);
+# 3. Reload services
+systemctl restart php*-fpm
+nginx -t
+systemctl reload nginx
 
-if (!$data) {
-  http_response_code(502);
-  echo "RSS fetch failed: $err";
-  exit;
-}
-
-echo $data;
-PHP
-
-# Permissions
-chown www-data:www-data "$PROXY"
-chmod 644 "$PROXY"
-
-echo "=== PROXY RSS CORRIGÉ ==="
-echo "Recharge la page (Ctrl+F5) puis clique 'Charger les articles'"
+echo "=== PHP ACTIVÉ POUR AIAQUILA ==="
+echo "Teste maintenant :"
+echo "https://fireinners.online/aiaquila/rss-proxy.php?url=https://www.coindesk.com/arc/outboundfeeds/rss/"
