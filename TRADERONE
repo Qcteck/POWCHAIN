@@ -1,110 +1,247 @@
-cat >/root/AIAQUILA_FIX_SEND.sh <<'EOF'
+cat >/root/MEGA_AQUILA_STACKING_ONLY.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
+TS="$(date +%Y%m%d_%H%M%S)"
+BK="/root/AQUILA_STACKING_ONLY_BK_$TS"
+mkdir -p "$BK"
+umask 022
 
-WEB_ROOT="/var/www/aiaquila"
-mkdir -p "$WEB_ROOT"
+say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
+die(){ echo "ERR: $*" >&2; exit 1; }
+have(){ command -v "$1" >/dev/null 2>&1; }
 
-cat >"$WEB_ROOT/index.html"<<'HTML'
-<!DOCTYPE html><html lang="fr"><head>
-<meta charset="utf-8">
-<title>AIAQUILA • SEND FIX</title>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<style>
-html,body{margin:0;padding:0;background:#05070b;color:#e6ebff;font-family:system-ui}
-#app{display:grid;grid-template-columns:320px 1fr;height:100vh}
-aside{background:#0a0f1c;border-right:1px solid #1b2450;padding:14px}
-main{padding:14px}
-button,input{background:#0e1633;color:#e6ebff;border:1px solid #2b3cff;padding:6px;border-radius:4px}
-button{cursor:pointer}
-.ok{border-color:#3cff9e}.warn{border-color:#ff4d4d}
-.card{border:1px solid #1b2450;border-radius:6px;padding:10px;margin-bottom:10px;background:#070c18}
-.log{font-family:ui-monospace,monospace;font-size:12px;white-space:pre-wrap}
-</style>
-</head><body>
+DOMAIN="fireinners.online"
+PATH_APP="/aquilastacking"
+WEBROOT="/var/www/aquilastacking"
+INC="/etc/nginx/includes/aquilastacking_routes.inc"
 
-<script src="https://unpkg.com/@solana/web3.js@1.95.4/lib/index.iife.min.js"></script>
+VHOST_A="/etc/nginx/sites-available/fireinners.online-ssl"
+VHOST_E="/etc/nginx/sites-enabled/fireinners.online-ssl"
+NGINX_MAIN="/etc/nginx/nginx.conf"
 
-<div id="app">
-<aside>
-<div class="card"><b>Wallet</b><div id="wallet">Déconnecté</div><button id="connect" class="ok">CONNECT PHANTOM</button></div>
-<div class="card"><b>Destination</b><input id="dest"></div>
-<div class="card"><b>Montant</b><input id="amount" placeholder="0.001 SOL ou 1000000"></div>
-<div class="card"><button id="arm" class="ok">ARM</button><button id="disarm" class="warn">DISARM</button></div>
-<div class="card"><button id="propose">PROPOSE</button><button id="sign" class="ok">APPROUVER & SIGNER</button></div>
-</aside>
-<main>
-<div class="card"><b>Console</b><div id="log" class="log"></div></div>
-</main>
-</div>
+backup_one(){ local p="$1"; [ -e "$p" ] || return 0; mkdir -p "$BK$(dirname "$p")"; cp -a "$p" "$BK$p.bak" 2>/dev/null || true; }
+lsattr_safe(){ lsattr "$1" 2>/dev/null | awk '{print $1}' || echo ""; }
+unfreeze_one(){ local f="$1"; [ -e "$f" ] || return 0; local a; a="$(lsattr_safe "$f")"; if echo "$a" | grep -q 'i'; then say "UNFREEZE: chattr -i $f"; chattr -i "$f" 2>/dev/null || true; fi; }
+refreeze_one(){ local f="$1"; [ -e "$f" ] || return 0; say "REFREEZE: chattr +i $f"; chattr +i "$f" 2>/dev/null || true; }
 
-<script>
-const {Connection,PublicKey,Transaction,SystemProgram}=solanaWeb3;
-const RPC="https://api.mainnet-beta.solana.com";
-const LAMPORTS_PER_SOL=1_000_000_000;
-const $=i=>document.getElementById(i);
-const log=t=>$("log").textContent+=t+"\\n";
-
-function toLamports(v){
- v=Number(v);
- if(!Number.isFinite(v)||v<=0)throw Error("Montant invalide");
- if(v<1)return Math.round(v*LAMPORTS_PER_SOL);
- if(Number.isInteger(v))return v;
- return Math.round(v*LAMPORTS_PER_SOL);
+ensure_packages(){
+  say "Packages (curl/unzip/nginx if missing)"
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y >/dev/null || true
+  local pkgs=(curl unzip nginx)
+  for p in "${pkgs[@]}"; do dpkg -s "$p" >/dev/null 2>&1 || apt-get install -y "$p" >/dev/null; done
 }
 
-let wallet=null,pub=null,armed=false,pending=null;
+write_file(){
+  local path="$1"; shift
+  local tmp; tmp="$(mktemp)"
+  cat >"$tmp" <<'EOF'
+EOF
+  # shellcheck disable=SC2059
+  printf "%s" "$*" >"$tmp"
+  mkdir -p "$(dirname "$path")"
+  backup_one "$path"
+  mv -f "$tmp" "$path"
+}
 
-$("connect").onclick=async()=>{
- wallet=window.solana;
- if(!wallet)return alert("Phantom requis");
- const r=await wallet.connect();
- pub=r.publicKey.toString();
- $("wallet").textContent=pub;
- log("Wallet connecté");
+write_include(){
+  say "Write include: $INC"
+  mkdir -p "$(dirname "$INC")"
+  backup_one "$INC"
+  cat >"$INC" <<EOF
+# AQUILA_STACKING_ONLY (managed) - $TS
+# Route: ${PATH_APP} -> ${WEBROOT}
+location = ${PATH_APP} { return 301 ${PATH_APP}/; }
+location ^~ ${PATH_APP}/ {
+  alias ${WEBROOT}/;
+  index index.html;
+  try_files \$uri \$uri/ ${PATH_APP}/index.html;
+  add_header Cache-Control "no-store" always;
+}
+location = ${PATH_APP}/sw.js { add_header Cache-Control "no-store" always; return 404; }
+location = ${PATH_APP}/service-worker.js { add_header Cache-Control "no-store" always; return 404; }
+location = ${PATH_APP}/manifest.json { add_header Cache-Control "no-store" always; return 404; }
+EOF
+}
+
+patch_vhost_include(){
+  [ -f "$VHOST_A" ] || die "Missing vhost: $VHOST_A"
+  say "Patch vhost (dedupe include): $VHOST_A"
+  backup_one "$VHOST_A"
+
+  python3 - "$VHOST_A" "$INC" <<'PY'
+import re,sys
+p=sys.argv[1]; inc=sys.argv[2]
+s=open(p,'r',encoding='utf-8',errors='ignore').read()
+
+# remove any existing aquilastacking include lines (keep nothing, we re-add clean)
+lines=s.splitlines(True)
+lines=[ln for ln in lines if not re.search(r'^\s*include\s+.*aquilastacking_routes\.inc\s*;\s*$', ln)]
+s=''.join(lines)
+
+# find first "server { ... }" block and insert include just before its closing brace
+# simple brace matching ignoring comments/strings is good enough for nginx files
+m=re.search(r'\bserver\s*\{', s)
+if not m:
+  raise SystemExit("No server{ block found in vhost")
+start=m.start()
+i=m.end()
+depth=1
+while i < len(s) and depth>0:
+  ch=s[i]
+  if ch=='#':  # comment to end of line
+    j=s.find('\n', i)
+    i = len(s) if j==-1 else j+1
+    continue
+  if ch=='{': depth+=1
+  elif ch=='}': depth-=1
+  i+=1
+end=i  # position after matching }
+server_block=s[start:end]
+before=s[:start]
+after=s[end:]
+
+# inject include before final "}" of this server block
+insert=f"\n  include {inc};\n"
+server_block=re.sub(r'\}\s*$', insert+"}\n", server_block, count=1)
+
+out=before+server_block+after
+open(p,'w',encoding='utf-8').write(out)
+PY
+}
+
+ensure_webroot(){
+  say "Ensure webroot: $WEBROOT"
+  mkdir -p "$WEBROOT"
+  backup_one "$WEBROOT/index.html" || true
+
+  cat >"$WEBROOT/index.html" <<'HTML'
+<!doctype html><html lang="fr"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Aquila Stacking</title><style>html,body{height:100%;margin:0;background:#070b14;color:#cfe8ff;font-family:ui-sans-serif,system-ui,Segoe UI,Roboto,Arial}a{color:#8bd3ff}#w{display:flex;gap:12px;padding:14px}#l{width:340px;border:1px solid rgba(130,200,255,.35);border-radius:12px;padding:12px;background:rgba(15,25,45,.65)}#r{flex:1;border:1px solid rgba(130,200,255,.35);border-radius:12px;padding:12px;background:rgba(15,25,45,.35);min-height:70vh}button,input{font:inherit;border-radius:10px;border:1px solid rgba(130,200,255,.35);background:rgba(10,18,35,.9);color:#cfe8ff;padding:10px}button{cursor:pointer}button:hover{filter:brightness(1.15)}.row{display:flex;gap:10px;align-items:center;margin:10px 0}.k{opacity:.8;font-size:12px;margin-top:8px}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;word-break:break-all}#log{white-space:pre-wrap;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;line-height:1.35}</style></head><body><div id="w"><div id="l"><div class="k">Wallet</div><div class="row"><button id="btnConnect">CONNECT PHANTOM</button><button id="btnDisconnect">DISCONNECT</button></div><div class="k">Pubkey</div><div id="pub" class="mono">—</div><div class="k">RPC</div><input id="rpc" value="https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac" style="width:100%"/><div class="row"><button id="btnRefresh">REFRESH BALANCES</button></div><div class="k">SOL (lamports)</div><div id="sol" class="mono">—</div><div class="k">USDC (approx)</div><div id="usdc" class="mono">—</div><hr style="border:0;border-top:1px solid rgba(130,200,255,.25);margin:12px 0"/><div class="k">Stacking (frontend)</div><div class="row"><input id="amt" placeholder="Montant" value="0.01" style="flex:1"/><button id="btnPrepare">PRÉPARER</button></div><div class="k">Préparation = payload clair (aucune signature sans programme staking).</div><div class="k">Si tu veux la signature réelle staking, il faut: ProgramID + comptes + méthode (Anchor/IDL).</div></div><div id="r"><div class="k">Console</div><div id="log"></div></div></div><script>
+const $=s=>document.querySelector(s);
+const log=(m)=>{$('#log').textContent+=(m+(m.endsWith('\n')?'':'\n'));};
+let wallet=null, pubkey=null;
+
+async function rpcCall(method, params){
+  const url=$('#rpc').value.trim();
+  const r=await fetch(url,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({jsonrpc:'2.0',id:1,method,params})});
+  const j=await r.json().catch(()=>null);
+  if(!j) throw new Error('RPC invalid JSON');
+  if(j.error) throw new Error('RPC '+JSON.stringify(j.error));
+  return j.result;
+}
+
+async function refreshBalances(){
+  if(!pubkey) return log('No wallet connected');
+  try{
+    const bal=await rpcCall('getBalance',[pubkey,{commitment:'confirmed'}]);
+    $('#sol').textContent=String(bal?.value??'—');
+  }catch(e){ log('SOL error: '+e.message); }
+  try{
+    // USDC mint mainnet: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1
+    const mint="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1";
+    const res=await rpcCall('getTokenAccountsByOwner',[pubkey,{mint},{encoding:'jsonParsed'}]);
+    let sum=0;
+    for(const a of (res?.value||[])){
+      const ui=a?.account?.data?.parsed?.info?.tokenAmount?.uiAmount;
+      if(typeof ui==='number') sum+=ui;
+    }
+    $('#usdc').textContent=String(sum);
+  }catch(e){ log('USDC error: '+e.message); }
+}
+
+$('#btnConnect').onclick=async()=>{
+  try{
+    wallet=window.solana;
+    if(!wallet || !wallet.isPhantom) return log('Phantom non détecté');
+    const r=await wallet.connect();
+    pubkey=(r?.publicKey?.toString?.()||wallet.publicKey?.toString?.()||null);
+    $('#pub').textContent=pubkey||'—';
+    log('Wallet connectée: '+pubkey);
+    await refreshBalances();
+  }catch(e){ log('Connect error: '+(e?.message||e)); }
+};
+$('#btnDisconnect').onclick=async()=>{
+  try{ if(wallet?.disconnect) await wallet.disconnect(); }catch{}
+  wallet=null; pubkey=null; $('#pub').textContent='—'; $('#sol').textContent='—'; $('#usdc').textContent='—';
+  log('Disconnected');
+};
+$('#btnRefresh').onclick=refreshBalances;
+
+$('#btnPrepare').onclick=()=>{
+  if(!pubkey) return log('Connecte Phantom avant.');
+  const amt=parseFloat($('#amt').value||'0');
+  if(!(amt>0)) return log('Montant invalide');
+  const payload={type:'STACKING_PREPARE',owner:pubkey,amount:amt,unit:'SOL',ts:Date.now(),note:'Pour exécution réelle: fournir ProgramID + comptes + méthode.'};
+  log('PREPARED:\n'+JSON.stringify(payload,null,2));
 };
 
-$("arm").onclick=()=>{armed=true;log("ARM ON");};
-$("disarm").onclick=()=>{armed=false;log("ARM OFF");};
-
-$("propose").onclick=()=>{
- try{
-  if(!armed)throw Error("ARM requis");
-  pending={dest:$("dest").value.trim(),lamports:toLamports($("amount").value)};
-  log("Proposition OK → "+pending.lamports+" lamports");
- }catch(e){log("ERR "+e.message);}
-};
-
-$("sign").onclick=async()=>{
- try{
-  if(!pending)throw Error("Rien à signer");
-  const conn=new Connection(RPC,"confirmed");
-  const tx=new Transaction().add(SystemProgram.transfer({
-   fromPubkey:new PublicKey(pub),
-   toPubkey:new PublicKey(pending.dest),
-   lamports:pending.lamports
-  }));
-  tx.feePayer=new PublicKey(pub);
-  tx.recentBlockhash=(await conn.getLatestBlockhash()).blockhash;
-
-  // ✅ FIX : Phantom envoie lui-même
-  const res = await wallet.signAndSendTransaction(tx);
-  await conn.confirmTransaction(res.signature);
-
-  log("TX OK: "+res.signature);
-  pending=null;
- }catch(e){log("ERR "+e.message);}
-};
-</script>
-</body></html>
+log('Aquila Stacking chargé. Route: /aquilastacking/');
+</script></body></html>
 HTML
 
-nginx -t && systemctl reload nginx
-echo "OK → https://fireinners.online/aiaquila/"
-EOF
+  chmod 644 "$WEBROOT/index.html"
+}
 
+dedupe_by_nginxT(){
+  # If nginx still reports duplicate location, we try to find offenders.
+  say "Check duplicates (nginx -T scan)"
+  if ! nginx -t >/dev/null 2>&1; then
+    nginx -T 2>/dev/null | grep -n "location .*aquilastacking" | head -n 200 || true
+    nginx -T 2>/dev/null | grep -n "include .*aquilastacking_routes\.inc" | head -n 200 || true
+    return 1
+  fi
+  return 0
+}
 
+main(){
+  say "BEGIN AQUILA STACKING ONLY @ $TS"
+  say "BK: $BK"
 
-chmod +x /root/AIAQUILA_FIX_SEND.sh
-/root/AIAQUILA_FIX_SEND.sh
+  ensure_packages
 
+  # unfreeze common immutable nginx files (safe even if not immutable)
+  unfreeze_one "$NGINX_MAIN"
+  unfreeze_one "$VHOST_A"
+  unfreeze_one "$INC"
+
+  # backups
+  backup_one "$NGINX_MAIN"
+  backup_one "$VHOST_A"
+  backup_one "$VHOST_E"
+  backup_one "$INC"
+
+  ensure_webroot
+  write_include
+  patch_vhost_include
+
+  # if vhost enabled symlink missing, keep existing structure but ensure it exists
+  if [ -f "$VHOST_A" ] && [ ! -e "$VHOST_E" ]; then
+    say "Enable vhost symlink: $VHOST_E"
+    ln -s "$VHOST_A" "$VHOST_E" 2>/dev/null || true
+  fi
+
+  # test + fix duplicates if any
+  if ! dedupe_by_nginxT; then
+    say "NGINX TEST FAIL (duplicate or syntax). Showing include occurrences:"
+    grep -RIn --include='*.conf' --include='*.inc' --include='*ssl*' "aquilastacking" /etc/nginx 2>/dev/null | head -n 300 || true
+    die "nginx -t failed (see lines above). Restorable backups in $BK"
+  fi
+
+  say "nginx -t OK"
+  systemctl reload nginx || service nginx reload || true
+
+  # re-freeze (optional but consistent with your setup)
+  refreeze_one "$NGINX_MAIN"
+  refreeze_one "$VHOST_A"
+  refreeze_one "$INC"
+
+  say "HTTP CHECK"
+  curl -sS -I "https://${DOMAIN}${PATH_APP}/" | head -n 20 || true
+  say "OPEN: https://${DOMAIN}${PATH_APP}/ (Ctrl+F5)"
+  say "DONE"
+}
+
+main "$@"
+SH
+chmod +x /root/MEGA_AQUILA_STACKING_ONLY.sh
+bash /root/MEGA_AQUILA_STACKING_ONLY.sh
