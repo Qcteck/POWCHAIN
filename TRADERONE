@@ -1,278 +1,128 @@
-#!/usr/bin/env bash
+python3 - <<'PY'
+s=r'''#!/usr/bin/env bash
 set -euo pipefail
+DOMAIN="fireinners.online"
+WEBROOT="/var/www/wolverine"
+VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
+SITESEN="/etc/nginx/sites-enabled"
+INCDIR="/etc/nginx/includes"
+INC="$INCDIR/wolverine_routes.inc"
+BK="/root/WV_FIX404_$(date +%Y%m%d_%H%M%S)"
 
-# MEGA_ORION_DEPLOY_ROOT.sh
-# Déploie Orion (Vite/React) sur https://fireinners.online/orion
-# Prérequis minimal: disposer du zip projet sur le VPS:
-#   - soit /root/orion.zip
-#   - soit définir ORION_ZIP_URL=https://.../orion.zip (téléchargement auto)
-#
-# Exécution:
-#   bash MEGA_ORION_DEPLOY_ROOT.sh
+say(){ echo "[$(date -u +"%F %T UTC")] $*"; }
+need_root(){ [ "${EUID:-$(id -u)}" -eq 0 ] || { echo "ERR: root only"; exit 1; }; }
 
-export DEBIAN_FRONTEND=noninteractive
+backup(){ mkdir -p "$BK"; cp -a /etc/nginx "$BK/nginx" 2>/dev/null || true; [ -d "$WEBROOT" ] && cp -a "$WEBROOT" "$BK/webroot" 2>/dev/null || true; [ -f "$VHOST" ] && cp -a "$VHOST" "$BK/$(basename "$VHOST").bak" 2>/dev/null || true; }
+unfreeze(){ command -v chattr >/dev/null 2>&1 || return 0; chattr -i -R /etc/nginx 2>/dev/null || true; chattr -i -R "$WEBROOT" 2>/dev/null || true; }
+refreeze(){ command -v chattr >/dev/null 2>&1 || return 0; chattr +i /etc/nginx/nginx.conf 2>/dev/null || true; chattr +i "$VHOST" 2>/dev/null || true; chattr +i "$INC" 2>/dev/null || true; }
 
-TS="$(date +%Y%m%d_%H%M%S)"
-WORK="/opt/orion"
-SRC="$WORK/src"
-BUILD="$WORK/build"
-WWW="/var/www/orion"
-NGX_VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
-NGX_INC_DIR="/etc/nginx/includes"
-NGX_INC_FILE="$NGX_INC_DIR/orion_routes.inc"
-ZIP_LOCAL_DEFAULT="/root/orion.zip"
-
-log(){ printf "\n[%s] %s\n" "$(date -u +'%F %T UTC')" "$*"; }
-die(){ echo "ERROR: $*" >&2; exit 1; }
-
-# --- askorupdate helpers (si présent sur VPS) ---
-ASKLIB="/opt/fireinners/sentinel/lib/askorupdate.sh"
-if [[ -f "$ASKLIB" ]]; then
-  # shellcheck disable=SC1090
-  source "$ASKLIB"
-else
-  askorupdate_file(){
-    local src="$1" dst="$2" mode="${3:-0644}"
-    mkdir -p "$(dirname "$dst")"
-    if [[ -f "$dst" ]]; then cp -a "$dst" "$dst.bak.$TS"; fi
-    install -m "$mode" "$src" "$dst"
-  }
-  askorupdate_yesno(){ return 0; }
-fi
-
-require_root(){
-  [[ "$(id -u)" == "0" ]] || die "Lance ce script en root."
+write_html(){
+  mkdir -p "$WEBROOT"
+  cat >"$WEBROOT/index.html"<<'HTML'
+<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WOLVERINE</title><style>body{margin:0;background:#0b0f14;color:#e6eef7;font-family:system-ui;padding:20px}a{color:#7dd3fc}code{background:#05070b;padding:2px 6px;border-radius:8px;border:1px solid rgba(148,163,184,.2)}</style><h1>WOLVERINE OK</h1><p>Si tu vois cette page, <code>/wolverine/</code> sert bien le webroot.</p><p><a href="/wolverine/vault-api/health">/wolverine/vault-api/health</a> · <a href="/wolverine/traderone/vault/health">/wolverine/traderone/vault/health</a></p>
+HTML
 }
 
-ensure_cmd(){
-  command -v "$1" >/dev/null 2>&1 || die "Commande manquante: $1"
+write_include(){
+  mkdir -p "$INCDIR"
+  cat >"$INC"<<'NGX'
+location = /wolverine { return 301 /wolverine/; }
+location ^~ /wolverine/ {
+  alias /var/www/wolverine/;
+  index index.html;
+  try_files $uri $uri/ /wolverine/index.html;
+  add_header Cache-Control "no-store" always;
 }
-
-backup_path(){
-  local p="$1"
-  if [[ -e "$p" ]]; then
-    cp -a "$p" "$p.bak.$TS"
-  fi
+location ^~ /wolverine/vault-api/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  proxy_pass http://127.0.0.1:3000/;
 }
-
-chattr_unlock_if_possible(){
-  local p="$1"
-  if command -v chattr >/dev/null 2>&1 && [[ -e "$p" ]]; then
-    chattr -i "$p" 2>/dev/null || true
-  fi
-}
-chattr_lock_if_possible(){
-  local p="$1"
-  if command -v chattr >/dev/null 2>&1 && [[ -e "$p" ]]; then
-    chattr +i "$p" 2>/dev/null || true
-  fi
-}
-
-install_node20_if_needed(){
-  if command -v node >/dev/null 2>&1; then
-    local v; v="$(node -v || true)"
-    if [[ "$v" =~ ^v20\. ]]; then
-      log "Node OK: $v"
-      return 0
-    fi
-    log "Node détecté mais pas v20: $v (upgrade vers Node 20)"
-  else
-    log "Node absent (install Node 20)"
-  fi
-
-  ensure_cmd curl
-  ensure_cmd bash
-  apt-get update -y
-  apt-get install -y ca-certificates curl gnupg
-  install -d -m 0755 /etc/apt/keyrings
-  curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
-  local codename; codename="$(. /etc/os-release && echo "${VERSION_CODENAME:-noble}")"
-  printf "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x %s main\n" "$codename" > /etc/apt/sources.list.d/nodesource.list
-  apt-get update -y
-  apt-get install -y nodejs
-  node -v | grep -E '^v20\.' >/dev/null || die "Node 20 non installé correctement."
-  log "Node installé: $(node -v)"
-}
-
-get_zip(){
-  local zip_path="$ZIP_LOCAL_DEFAULT"
-  if [[ -f "$zip_path" ]]; then
-    log "Zip trouvé: $zip_path"
-    echo "$zip_path"
-    return 0
-  fi
-
-  if [[ -n "${ORION_ZIP_URL:-}" ]]; then
-    ensure_cmd curl
-    mkdir -p /root
-    log "Téléchargement zip depuis ORION_ZIP_URL..."
-    curl -fL --retry 3 --retry-delay 2 -o "$zip_path" "$ORION_ZIP_URL"
-    [[ -s "$zip_path" ]] || die "Zip téléchargé vide."
-    log "Zip téléchargé: $zip_path"
-    echo "$zip_path"
-    return 0
-  fi
-
-  die "Zip introuvable. Place le projet en /root/orion.zip OU exporte ORION_ZIP_URL=https://.../orion.zip puis relance."
-}
-
-unpack_build(){
-  ensure_cmd unzip
-  ensure_cmd rsync
-
-  mkdir -p "$SRC" "$BUILD" "$WWW"
-  rm -rf "$SRC"/*
-  rm -rf "$BUILD"/*
-
-  local zip; zip="$(get_zip)"
-
-  log "Décompression vers $SRC ..."
-  unzip -q -o "$zip" -d "$SRC"
-
-  # Normalisation: le zip peut contenir un dossier racine
-  local rootdir="$SRC"
-  if [[ -d "$SRC" ]]; then
-    local first
-    first="$(find "$SRC" -mindepth 1 -maxdepth 1 -type d | head -n1 || true)"
-    if [[ -n "$first" ]] && [[ -f "$first/package.json" ]]; then
-      rootdir="$first"
-    elif [[ -f "$SRC/package.json" ]]; then
-      rootdir="$SRC"
-    else
-      # tenter deeper
-      local pj
-      pj="$(find "$SRC" -maxdepth 3 -type f -name package.json | head -n1 || true)"
-      [[ -n "$pj" ]] || die "package.json introuvable dans le zip."
-      rootdir="$(dirname "$pj")"
-    fi
-  fi
-
-  log "Root projet détecté: $rootdir"
-
-  cd "$rootdir"
-
-  log "Install deps (npm ci) ..."
-  npm ci --no-audit --no-fund
-
-  log "Build (npm run build) ..."
-  npm run build
-
-  [[ -d "$rootdir/dist" ]] || die "Build terminé mais dist/ introuvable."
-  log "Déploiement dist/ -> $WWW (atomic via rsync) ..."
-  backup_path "$WWW"
-  mkdir -p "$WWW"
-  rsync -a --delete "$rootdir/dist/" "$WWW/"
-
-  # Permissions
-  chown -R www-data:www-data "$WWW" || true
-  find "$WWW" -type d -exec chmod 0755 {} \; || true
-  find "$WWW" -type f -exec chmod 0644 {} \; || true
-
-  log "OK: fichiers servis dans $WWW"
-}
-
-render_nginx_include(){
-  mkdir -p "$NGX_INC_DIR"
-  local tmp; tmp="$(mktemp)"
-
-  cat >"$tmp" <<'NGX'
-# AUTOGENERATED: orion_routes.inc
-# Route: https://fireinners.online/orion
-location ^~ /orion/ {
-  alias /var/www/orion/;
-  try_files $uri $uri/ /orion/index.html;
-  add_header Cache-Control "no-store";
+location ^~ /wolverine/traderone/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  proxy_pass http://127.0.0.1:3000/;
 }
 NGX
-
-  chattr_unlock_if_possible "$NGX_INC_FILE"
-  backup_path "$NGX_INC_FILE"
-  askorupdate_file "$tmp" "$NGX_INC_FILE" 0644
-  rm -f "$tmp"
-  chattr_lock_if_possible "$NGX_INC_FILE"
-
-  log "OK: nginx include -> $NGX_INC_FILE"
 }
 
-ensure_include_in_vhost(){
-  [[ -f "$NGX_VHOST" ]] || die "Vhost introuvable: $NGX_VHOST"
-  ensure_cmd nginx
-
-  local inc_line="include $NGX_INC_FILE;"
-  if grep -Fq "$inc_line" "$NGX_VHOST"; then
-    log "Vhost: include déjà présent."
-    return 0
-  fi
-
-  log "Vhost: insertion include orion..."
-  chattr_unlock_if_possible "$NGX_VHOST"
-  backup_path "$NGX_VHOST"
-
-  # Insertion: juste avant la première ligne "location" du server block (fallback: avant la dernière "}")
-  local tmp; tmp="$(mktemp)"
-  awk -v ins="$inc_line" '
-    BEGIN{done=0}
-    {
-      if(!done && $0 ~ /^[[:space:]]*location[[:space:]]/){
-        print "  " ins
-        done=1
-      }
-      print $0
-    }
-    END{
-      # si jamais pas de location trouvée, on ne modifie pas ici (géré après)
-    }
-  ' "$NGX_VHOST" > "$tmp"
-
-  if diff -q "$NGX_VHOST" "$tmp" >/dev/null 2>&1; then
-    # aucun location trouvé; insertion avant la dernière } du fichier
-    awk -v ins="$inc_line" '
-      {lines[NR]=$0}
-      END{
-        for(i=1;i<=NR;i++){
-          if(i==NR && lines[i] ~ /^[[:space:]]*}[[:space:]]*$/){
-            print "  " ins
-          }
-          print lines[i]
-        }
-      }
-    ' "$NGX_VHOST" > "$tmp"
-  fi
-
-  install -m 0644 "$tmp" "$NGX_VHOST"
-  rm -f "$tmp"
-
-  nginx -t
-  systemctl reload nginx
-
-  chattr_lock_if_possible "$NGX_VHOST"
-  log "OK: vhost mis à jour + nginx reload"
+disable_dup(){
+  mkdir -p "$BK/disabled_sitesenabled"
+  shopt -s nullglob
+  for f in "$SITESEN"/*; do
+    [ -e "$f" ] || continue
+    if grep -qE "server_name[[:space:]]+.*\\b${DOMAIN}\\b" "$f" 2>/dev/null; then
+      if [ "$(readlink -f "$f" 2>/dev/null || echo "$f")" != "$VHOST" ]; then
+        cp -a "$f" "$BK/disabled_sitesenabled/" 2>/dev/null || true
+        rm -f "$f" || true
+      fi
+    fi
+  done
+  shopt -u nullglob
 }
 
-healthcheck(){
-  ensure_cmd curl
-  local code
-  code="$(curl -s -o /dev/null -w "%{http_code}" "https://fireinners.online/orion/" || true)"
-  log "HTTP status https://fireinners.online/orion/ => $code"
-  if [[ "$code" != "200" ]]; then
-    log "Note: si 404/5xx, vérifie que fireinners.online pointe bien sur ce VPS et que le vhost actif est fireinners.online-ssl."
-  fi
+ensure_enabled(){ [ -f "$VHOST" ] || { say "ERR missing $VHOST"; exit 1; }; ln -sf "$VHOST" "$SITESEN/$(basename "$VHOST")"; }
+
+inject_once(){
+  local tmp="$BK/vhost.tmp" inc="include $INC;"
+  awk -v dom="$DOMAIN" -v inc="$inc" '
+  BEGIN{insrv=0;depth=0;ssl=0;domok=0;has=0;ins=0}
+  function br(s,n){n=gsub(/\{/,"{",s);depth+=n;n=gsub(/\}/,"}",s);depth-=n}
+  {
+    L=$0
+    if(L ~ /^[[:space:]]*server[[:space:]]*\{/){insrv=1;depth=0;ssl=0;domok=0;has=0;br(L);print;next}
+    if(insrv){
+      if(L ~ /listen[[:space:]]+443/){ssl=1}
+      if(L ~ /server_name/ && L ~ dom){domok=1}
+      if(index(L,inc)>0){has=1}
+      if(depth==0 && L ~ /^[[:space:]]*\}/){
+        if(ssl && domok && !has && !ins){print "  "inc; ins=1}
+        print L; insrv=0; next
+      }
+      br(L); print; next
+    }
+    print
+  }' "$VHOST" >"$tmp"
+  cp -a "$tmp" "$VHOST"
+}
+
+reload_nginx(){ nginx -t; systemctl reload nginx || systemctl restart nginx; }
+
+tests(){
+  say "LOCAL (bypass CF) HEAD:"
+  curl -skI --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/" | sed -n "1,12p" || true
+  say "PUBLIC HEAD:"
+  curl -skI "https://${DOMAIN}/wolverine/" | sed -n "1,12p" || true
 }
 
 main(){
-  require_root
-  ensure_cmd bash
-  ensure_cmd sed
-  ensure_cmd awk
-
-  log "=== ORION DEPLOY START ==="
-  install_node20_if_needed
-  unpack_build
-  render_nginx_include
-  ensure_include_in_vhost
-  healthcheck
-  log "=== ORION DEPLOY DONE ==="
-  log "URL: https://fireinners.online/orion/"
+  need_root
+  say "WV_FIX404 start"
+  backup
+  unfreeze
+  write_html
+  write_include
+  disable_dup
+  ensure_enabled
+  inject_once
+  reload_nginx
+  tests
+  refreeze
+  say "DONE"
+  echo "Backups: $BK"
+  echo "Open: https://${DOMAIN}/wolverine/ (Ctrl+F5)"
 }
-
 main "$@"
+'''
+p="/root/WV_FIX404_ONE.sh"
+open(p,"w",newline="\n").write(s)
+print("WROTE",p,len(s),"bytes")
+PY
+chmod +x /root/WV_FIX404_ONE.sh
+bash /root/WV_FIX404_ONE.sh
