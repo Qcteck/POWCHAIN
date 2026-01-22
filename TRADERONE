@@ -1,63 +1,103 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PHP="/var/www/aiaquila/rss-proxy.php"
-BACKUP="$PHP.backup_$(date +%Y%m%d_%H%M%S)"
+BASE="/var/www/aiaquila"
+HTML="$BASE/index.html"
+BACKUP="$BASE/index.backup_$(date +%Y%m%d_%H%M%S).html"
 
-echo "=== FIX RSS PROXY – AIAQUILA ==="
-cp "$PHP" "$BACKUP"
-echo "Backup: $BACKUP"
+echo "== AIAQUILA RSS PATCH =="
 
-cat > "$PHP" <<'PHP'
-<?php
-header("Access-Control-Allow-Origin: *");
-header("Content-Type: application/xml; charset=UTF-8");
+# 1) Vérification
+[ -f "$HTML" ] || { echo "ERREUR: index.html introuvable"; exit 1; }
 
-if(!isset($_GET['url'])){
- http_response_code(400);
- echo "Missing url";
- exit;
+# 2) Backup
+cp "$HTML" "$BACKUP"
+echo "Backup créé: $BACKUP"
+
+# 3) Suppression anciens scripts RSS cassés
+perl -0777 -i -pe '
+s/<script[^>]*>[\s\S]*?AIAQUILA[\s\S]*?<\/script>//gi
+' "$HTML"
+
+# 4) Injection JS FIX FINAL (parser + voix + sendUser)
+perl -0777 -i -pe '
+s|</body>|<script>
+/* ===== AIAQUILA RSS FIX FINAL ===== */
+
+const FEEDS=[
+ "https://www.coindesk.com/arc/outboundfeeds/rss/",
+ "https://cointelegraph.com/rss",
+ "https://news.bitcoin.com/feed/",
+ "https://www.newsbtc.com/feed/"
+];
+const PROXY="/aiaquila/rss-proxy.php?url=";
+let ARTICLES=[];
+
+function log(m){
+ const l=document.getElementById("logs");
+ if(l){l.textContent+=m+"\\n";l.scrollTop=l.scrollHeight;}
 }
 
-$url=$_GET['url'];
-
-$ch=curl_init();
-curl_setopt_array($ch,[
- CURLOPT_URL=>$url,
- CURLOPT_RETURNTRANSFER=>true,
- CURLOPT_FOLLOWLOCATION=>true,
- CURLOPT_TIMEOUT=>20,
- CURLOPT_CONNECTTIMEOUT=>10,
- CURLOPT_ENCODING=>"", // 🔑 force gzip/br/deflate
- CURLOPT_USERAGENT=>"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
- CURLOPT_HTTPHEADER=>[
-  "Accept: application/rss+xml, application/atom+xml, application/xml, text/xml;q=0.9, */*;q=0.8"
- ]
-]);
-
-$data=curl_exec($ch);
-$err=curl_error($ch);
-$code=curl_getinfo($ch,CURLINFO_HTTP_CODE);
-$type=curl_getinfo($ch,CURLINFO_CONTENT_TYPE);
-curl_close($ch);
-
-if(!$data || $code>=400){
- http_response_code(502);
- echo "Proxy error ($code): $err";
- exit;
+function speak(t){
+ if(!t)return;
+ const u=new SpeechSynthesisUtterance(t);
+ u.lang="fr-FR";
+ speechSynthesis.cancel();
+ speechSynthesis.speak(u);
 }
 
-// Sécurité : vérifier qu’on a bien du XML
-if(stripos($type,"xml")===false && stripos($data,"<rss")===false && stripos($data,"<feed")===false){
- http_response_code(502);
- echo "Invalid XML content";
- exit;
+function parseXML(txt){
+ const p=new DOMParser().parseFromString(txt,"text/xml");
+ let items=[...p.querySelectorAll("item")];
+ if(!items.length){
+  items=[...p.querySelectorAll("entry")];
+ }
+ return items.map(it=>({
+  title:(it.querySelector("title")||{}).textContent||"",
+  desc:(it.querySelector("description")||it.querySelector("summary")||{}).textContent||""
+ })).filter(a=>a.title);
 }
 
-echo $data;
-PHP
+async function loadRSS(){
+ ARTICLES=[];
+ log("Chargement RSS...");
+ for(const f of FEEDS){
+  try{
+   const r=await fetch(PROXY+encodeURIComponent(f));
+   const t=await r.text();
+   const a=parseXML(t);
+   log("Flux reçu: "+f+" ("+t.length+" chars)");
+   log("Titres extraits: "+a.length);
+   ARTICLES.push(...a);
+  }catch(e){
+   log("ERREUR flux "+f);
+  }
+ }
+ log("TOTAL articles: "+ARTICLES.length);
+ if(ARTICLES.length){
+  speak("Premier article. "+ARTICLES[0].title);
+ }
+}
 
-chmod 644 "$PHP"
+function sendUser(){
+ const i=document.querySelector("#chatInput");
+ if(i && i.value){
+  speak(i.value);
+  i.value="";
+ }
+}
 
-echo "=== PROXY RSS CORRIGÉ ==="
-echo "➡ Recharge la page (Ctrl+F5) puis clique « Charger les articles »"
+/* auto bind */
+document.addEventListener("DOMContentLoaded",()=>{
+ const b=document.querySelector("button");
+ if(b) b.onclick=loadRSS;
+});
+
+</script></body>|si
+' "$HTML"
+
+# 5) Permissions
+chown www-data:www-data "$HTML"
+chmod 644 "$HTML"
+
+echo "PATCH APPLIQUÉ — Recharge la page (Ctrl+F5)"
