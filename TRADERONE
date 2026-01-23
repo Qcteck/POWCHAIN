@@ -1,245 +1,90 @@
-cat >/root/MEGA_AQUILA_STACKING_NGINX_FIX_V1.sh <<'SH'
-#!/usr/bin/env bash
+bash <<'EOF'
 set -euo pipefail
-export DEBIAN_FRONTEND=noninteractive
 
-TS="$(date +%Y%m%d_%H%M%S)"
-BK="/root/AQUILA_STACKING_NGINX_FIX_BK_${TS}"
-mkdir -p "$BK"
+echo "=== AIAQUILA FULL ROOT FIX (VPS PROXY MODE) ==="
 
-DOMAIN="fireinners.online"
-PATH_APP="/aquilastacking"
-WEBROOT="/var/www/aquilastacking"
-INC="/etc/nginx/includes/aquilastacking_routes.inc"
+SITE_ROOT="/var/www/fireinners.online/aiaquila"
+INDEX="$SITE_ROOT/index.html"
+BACKUP="$SITE_ROOT/index.backup.$(date +%Y%m%d_%H%M%S).html"
+NGX_SITE="/etc/nginx/sites-available/fireinners.online-ssl"
+API_LOC="/etc/nginx/snippets/aiaquila_rss_proxy.conf"
+WORKER="https://aiaquila-proxy.paycashnostory.workers.dev/rss"
 
-log(){ printf "\n[%s] %s\n" "$(date -u +'%F %T UTC')" "$*"; }
-die(){ echo "ERROR: $*" >&2; exit 1; }
+command -v nginx >/dev/null
+command -v curl >/dev/null
 
-backup_one(){
-  local p="$1"
-  [ -e "$p" ] || return 0
-  local d="$BK$(dirname "$p")"
-  mkdir -p "$d"
-  cp -a "$p" "$d/$(basename "$p")" 2>/dev/null || true
+echo "[1/7] Vérif Worker depuis VPS..."
+curl -fsS "$WORKER?url=https://news.bitcoin.com/feed/" >/tmp/aiaquila.json
+jq . /tmp/aiaquila.json >/dev/null
+echo "OK Worker VPS"
+
+echo "[2/7] Backup frontend..."
+cp -a "$INDEX" "$BACKUP"
+echo "Backup -> $BACKUP"
+
+echo "[3/7] Création snippet nginx proxy..."
+cat > "$API_LOC" <<NGX
+location /aiaquila/api/rss {
+    proxy_pass $WORKER;
+    proxy_set_header Host aiaquila-proxy.paycashnostory.workers.dev;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_ssl_server_name on;
+    proxy_connect_timeout 10s;
+    proxy_read_timeout 30s;
 }
+NGX
 
-unfreeze(){
-  local p="$1"
-  [ -e "$p" ] || return 0
-  chattr -i "$p" 2>/dev/null || true
+echo "[4/7] Injection snippet dans nginx si absent..."
+if ! grep -q "aiaquila_rss_proxy" "$NGX_SITE"; then
+  sed -i '/server_name fireinners.online;/a \    include /etc/nginx/snippets/aiaquila_rss_proxy.conf;' "$NGX_SITE"
+fi
+
+echo "[5/7] Réécriture frontend (appel LOCAL uniquement)..."
+cat > "$INDEX" <<'HTML'
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<title>AIAQUILA — RSS réel (VPS)</title>
+<style>
+body{margin:0;padding:20px;background:#0b1b3a;color:#fff;font-family:system-ui}
+button{padding:10px 14px;font-size:15px;cursor:pointer}
+pre{white-space:pre-wrap;margin-top:15px;font-size:14px;color:#cfe}
+</style>
+</head>
+<body>
+<h2>🦅 AIAQUILA — RSS réel (VPS)</h2>
+<button onclick="load()">Lire les articles</button>
+<pre id="out">En attente…</pre>
+<script>
+async function load(){
+ const o=document.getElementById("out");
+ o.textContent="Chargement…";
+ try{
+  const r=await fetch("/aiaquila/api/rss?url="+encodeURIComponent("https://news.bitcoin.com/feed/"),{cache:"no-store"});
+  if(!r.ok) throw r.status;
+  const j=await r.json();
+  o.textContent=j.items.map(x=>"• "+x.title+"\n"+x.link).join("\n\n");
+ }catch(e){
+  o.textContent="ERREUR: "+e;
+ }
 }
+</script>
+</body>
+</html>
+HTML
 
-refreeze(){
-  local p="$1"
-  [ -e "$p" ] || return 0
-  chattr +i "$p" 2>/dev/null || true
-}
+echo "[6/7] Permissions + reload nginx..."
+chown www-data:www-data "$INDEX"
+chmod 644 "$INDEX"
+nginx -t
+systemctl reload nginx
 
-write_inc_clean(){
-  log "1) Écrit include CLEAN: $INC"
-  backup_one "$INC"
-  mkdir -p "$(dirname "$INC")"
+echo "[7/7] TEST final local..."
+curl -fsS "https://fireinners.online/aiaquila/api/rss?url=https://news.bitcoin.com/feed/" | jq '.items[0].title'
 
-  cat >"$INC" <<EOF
-# AQUILA STACKING routes (managed) - $TS
-location = ${PATH_APP} { return 301 ${PATH_APP}/; }
-location ^~ ${PATH_APP}/ {
-  alias ${WEBROOT}/;
-  index index.html;
-  try_files \$uri \$uri/ ${PATH_APP}/index.html;
-  add_header Cache-Control "no-store" always;
-}
-# Optionnel: éviter 404 SW/manifest bruyants
-location = ${PATH_APP}/sw.js { add_header Cache-Control "no-store" always; return 404; }
-location = ${PATH_APP}/service-worker.js { add_header Cache-Control "no-store" always; return 404; }
-location = ${PATH_APP}/manifest.json { add_header Cache-Control "no-store" always; return 404; }
+echo "=== ✅ AIAQUILA RÉPARÉ DÉFINITIVEMENT ==="
+echo "Site   : https://fireinners.online/aiaquila/"
+echo "Backup : $BACKUP"
 EOF
-
-  chmod 644 "$INC" || true
-}
-
-ensure_webroot(){
-  log "2) Vérifie WEBROOT: $WEBROOT"
-  mkdir -p "$WEBROOT"
-  if [ ! -f "$WEBROOT/index.html" ]; then
-    log "   index.html absent -> placeholder minimal"
-    cat >"$WEBROOT/index.html" <<EOF
-<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Aquila Stacking</title>
-<style>body{font-family:system-ui,Segoe UI,Roboto,Arial;margin:24px}code{background:#f2f2f2;padding:2px 6px;border-radius:6px}</style>
-<h1>Aquila Stacking</h1>
-<p>Route OK: <code>${PATH_APP}/</code> (Nginx). Remplace ce fichier par ton build/export réel.</p>
-EOF
-    chmod 644 "$WEBROOT/index.html" || true
-  fi
-}
-
-ensure_pkgs(){
-  log "3) Paquets (curl/nginx/python3) si manquants"
-  apt-get update -y >/dev/null || true
-  for p in curl nginx python3; do
-    dpkg -s "$p" >/dev/null 2>&1 || apt-get install -y "$p" >/dev/null
-  done
-}
-
-nginx_dump(){
-  nginx -T 2>/tmp/nginxT.txt >/dev/null || return 1
-  echo "/tmp/nginxT.txt"
-}
-
-detect_domain_server_files(){
-  # Retourne une liste de fichiers de conf qui contiennent server_name DOMAIN
-  python3 - <<PY
-import re,sys,glob,os
-domain="${DOMAIN}"
-cand=set()
-paths=[]
-paths += glob.glob("/etc/nginx/sites-available/*")
-paths += glob.glob("/etc/nginx/sites-enabled/*")
-paths += glob.glob("/etc/nginx/conf.d/*.conf")
-paths += ["/etc/nginx/nginx.conf"]
-for p in paths:
-    try:
-        if os.path.islink(p):
-            rp=os.path.realpath(p)
-        else:
-            rp=p
-        with open(rp,"r",encoding="utf-8",errors="ignore") as f:
-            s=f.read()
-        if re.search(r"\\bserver_name\\b[^;]*\\b"+re.escape(domain)+r"\\b", s):
-            cand.add(rp)
-    except Exception:
-        pass
-for p in sorted(cand):
-    print(p)
-PY
-}
-
-dedupe_and_inject_include_in_file(){
-  local f="$1"
-  [ -f "$f" ] || return 0
-
-  log "   Patch vhost: $f"
-  backup_one "$f"
-  unfreeze "$f"
-
-  python3 - "$f" "$DOMAIN" "$INC" <<'PY'
-import sys,re
-path,domain,inc = sys.argv[1], sys.argv[2], sys.argv[3]
-s=open(path,"r",encoding="utf-8",errors="ignore").read()
-
-# Supprime toutes les lignes qui incluent déjà le fichier INC (doublons)
-s=re.sub(r'^[ \t]*include[ \t]+'+re.escape(inc)+r'[ \t]*;[ \t]*\r?\n','',s,flags=re.M)
-
-lines=s.splitlines(True)
-
-# Parse simple: repérer blocs server { ... } et y injecter include si server_name contient le domain
-out=[]
-i=0
-while i < len(lines):
-    line=lines[i]
-    if re.search(r'^\s*server\s*\{', line):
-        # capturer le bloc server avec comptage d'accolades
-        blk=[line]
-        depth=line.count('{')-line.count('}')
-        i+=1
-        while i < len(lines) and depth>0:
-            blk.append(lines[i])
-            depth += lines[i].count('{')-lines[i].count('}')
-            i+=1
-        b=''.join(blk)
-        if re.search(r'\bserver_name\b[^;]*\b'+re.escape(domain)+r'\b', b):
-            # injecter include juste avant le dernier "}" du bloc server
-            m=re.search(r'\}\s*$', b, flags=re.S)
-            if m:
-                b=b[:m.start()] + f"\n    include {inc};\n" + b[m.start():]
-        out.append(b)
-        continue
-    out.append(line)
-    i+=1
-
-open(path,"w",encoding="utf-8").write(''.join(out))
-PY
-}
-
-patch_all_domain_vhosts(){
-  log "4) Détecte et patch les vhosts qui servent ${DOMAIN}"
-  local files
-  files="$(detect_domain_server_files || true)"
-  if [ -z "${files:-}" ]; then
-    die "Aucun fichier de conf trouvé avec server_name ${DOMAIN}. (À ce stade, c’est anormal.)"
-  fi
-
-  echo "$files" | while read -r f; do
-    [ -n "$f" ] || continue
-    # On ne touche pas aux fichiers inexistants
-    [ -f "$f" ] || continue
-    # Déverrouille aussi le symlink source (si applicable)
-    unfreeze "$f"
-    dedupe_and_inject_include_in_file "$f"
-  done
-}
-
-show_where_aquilastacking_is_defined(){
-  log "5) Scan (nginx -T) des occurrences 'location /aquilastacking'"
-  local t
-  t="$(nginx_dump || true)"
-  [ -f "$t" ] || { echo "   (nginx -T a échoué)"; return 0; }
-  grep -n "location .*${PATH_APP}" "$t" | head -n 80 || true
-  grep -n "include .*aquilastacking_routes\.inc" "$t" | head -n 80 || true
-}
-
-nginx_test_reload(){
-  log "6) nginx -t && reload"
-  nginx -t
-  systemctl reload nginx
-}
-
-http_checks(){
-  log "7) HTTP CHECK (bypass Cloudflare -> 127.0.0.1)"
-  curl -skI --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}${PATH_APP}/" | sed -n '1,20p' || true
-
-  log "8) PUBLIC CHECK (Cloudflare)"
-  curl -skI -H "Cache-Control: no-cache" "https://${DOMAIN}${PATH_APP}/?ts=${TS}" | sed -n '1,25p' || true
-}
-
-refreeze_targets(){
-  log "9) Refreeze (chattr +i) fichiers clés si présents"
-  for p in /etc/nginx/nginx.conf \
-           /etc/nginx/sites-available/*fireinners* \
-           /etc/nginx/sites-enabled/*fireinners* \
-           "$INC"
-  do
-    [ -e "$p" ] || continue
-    refreeze "$p"
-  done
-}
-
-main(){
-  log "BEGIN MEGA_AQUILA_STACKING_NGINX_FIX_V1 @ $TS"
-  ensure_pkgs
-
-  # Déverrouille ce qu’on va modifier (si immutable)
-  unfreeze /etc/nginx/nginx.conf || true
-  for p in /etc/nginx/sites-available/* /etc/nginx/sites-enabled/* /etc/nginx/includes/*.inc; do
-    [ -e "$p" ] || continue
-    # on ne déverrouille pas tout en masse, uniquement si lié à fireinners/aquila
-    if echo "$p" | grep -qiE 'fireinners|aquila|aquilastacking'; then unfreeze "$p"; fi
-  done
-
-  ensure_webroot
-  write_inc_clean
-  patch_all_domain_vhosts
-
-  show_where_aquilastacking_is_defined
-  nginx_test_reload
-  http_checks
-  refreeze_targets
-
-  log "DONE. Backup: $BK"
-  log "OPEN: https://${DOMAIN}${PATH_APP}/ (Ctrl+F5)"
-}
-
-main "$@"
-SH
-bash /root/MEGA_AQUILA_STACKING_NGINX_FIX_V1.sh
