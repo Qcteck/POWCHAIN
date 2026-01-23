@@ -1,1 +1,228 @@
-curl https://paycashnostory.workers.dev/rss
+cat >/root/MEGA_AQUILA_STACKING_ONLY_FIX.sh <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+
+TS="$(date +%Y%m%d_%H%M%S)"
+BK="/root/AQUILA_STACKING_ONLY_BK_${TS}"
+mkdir -p "$BK"
+
+DOMAIN="fireinners.online"
+PATH_APP="/aquilastacking"
+WEBROOT="/var/www/aquilastacking"
+INC="/etc/nginx/includes/aquilastacking_routes.inc"
+NGX_MAIN="/etc/nginx/nginx.conf"
+
+log(){ printf "\n[%s] %s\n" "$(date -u +'%F %T UTC')" "$*"; }
+die(){ echo "ERROR: $*" >&2; exit 1; }
+
+need(){ command -v "$1" >/dev/null 2>&1; }
+
+backup_file(){
+  local f="$1"
+  [ -e "$f" ] || return 0
+  local rp
+  rp="$(readlink -f "$f" 2>/dev/null || echo "$f")"
+  mkdir -p "$BK/$(dirname "$rp")"
+  cp -a "$rp" "$BK/$rp" 2>/dev/null || true
+}
+
+unfreeze(){
+  local f="$1"
+  [ -e "$f" ] || return 0
+  chattr -i "$f" 2>/dev/null || true
+}
+refreeze(){
+  local f="$1"
+  [ -e "$f" ] || return 0
+  chattr +i "$f" 2>/dev/null || true
+}
+
+log "1) Packages (curl/nginx/python3) si manquants"
+apt-get update -y >/dev/null || true
+for p in curl nginx python3; do
+  dpkg -s "$p" >/dev/null 2>&1 || apt-get install -y "$p" >/dev/null
+done
+
+log "2) Prépare WEBROOT: $WEBROOT"
+mkdir -p "$WEBROOT"
+if [ ! -f "$WEBROOT/index.html" ]; then
+  cat >"$WEBROOT/index.html" <<HTML
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Aquila Stacking</title></head><body style="font-family:system-ui,Segoe UI,Roboto,Arial;padding:18px">
+<h2 style="margin:0 0 10px">Aquila Stacking</h2>
+<p>Déployé sur <code>$DOMAIN$PATH_APP/</code>.</p>
+<p>Placeholder statique (build React/Vite à déposer dans <code>$WEBROOT</code> si nécessaire).</p>
+</body></html>
+HTML
+  chmod 644 "$WEBROOT/index.html" || true
+fi
+
+log "3) Réécrit l'include Nginx (CLEAN) : $INC"
+backup_file "$INC"
+unfreeze "$NGX_MAIN"
+unfreeze "$INC"
+mkdir -p "$(dirname "$INC")"
+cat >"$INC" <<EOF
+# AQUILA_STACKING_ONLY_MANAGED ${TS}
+# Route: ${PATH_APP}/  -> alias ${WEBROOT}/
+location = ${PATH_APP} { return 301 ${PATH_APP}/; }
+location ^~ ${PATH_APP}/ {
+  alias ${WEBROOT}/;
+  index index.html;
+  try_files \$uri \$uri/ /index.html;
+  add_header Cache-Control "no-store" always;
+}
+EOF
+chmod 644 "$INC" || true
+
+log "4) Détecte et patch TOUS les vhosts qui servent ${DOMAIN} (sites-enabled/available)"
+mapfile -t CAND < <(
+  { grep -RIl --include='*' -E '^\s*server_name\s+.*\bfireinners\.online\b' /etc/nginx/sites-enabled /etc/nginx/sites-available 2>/dev/null || true; } \
+  | while read -r f; do readlink -f "$f" 2>/dev/null || echo "$f"; done \
+  | awk 'NF' | sort -u
+)
+
+[ "${#CAND[@]}" -gt 0 ] || die "Aucun vhost trouvé contenant server_name fireinners.online dans /etc/nginx/sites-enabled|sites-available"
+
+log "   Vhosts candidats:"
+for f in "${CAND[@]}"; do echo "   - $f"; done
+
+# Backup + unfreeze de tout ce qu'on va toucher
+backup_file "$NGX_MAIN"
+unfreeze "$NGX_MAIN"
+for f in "${CAND[@]}"; do
+  backup_file "$f"
+  unfreeze "$f"
+done
+
+log "5) Patch vhosts: (a) retire anciens location /aquilastacking, (b) retire include doublons, (c) injecte include 1x par server block cible"
+python3 - <<'PY'
+import re,sys,os
+DOMAIN="fireinners.online"
+INC="/etc/nginx/includes/aquilastacking_routes.inc"
+PATH_APP="/aquilastacking"
+
+files=sys.argv[1:]
+if not files:
+  print("No files", file=sys.stderr); sys.exit(2)
+
+rx_server_name=re.compile(r'^\s*server_name\s+(.+?);')
+rx_include=re.compile(r'^\s*include\s+([^;]+);')
+rx_loc=re.compile(r'^\s*location\b.*\b/aquilastacking\b')
+
+def strip_loc_blocks(lines):
+  out=[]
+  i=0
+  while i<len(lines):
+    line=lines[i]
+    if rx_loc.search(line):
+      # remove balanced block starting on this line
+      bc=line.count('{')-line.count('}')
+      i+=1
+      while i<len(lines) and bc>0:
+        bc += lines[i].count('{')-lines[i].count('}')
+        i+=1
+      continue
+    out.append(line); i+=1
+  return out
+
+def process_one(path):
+  txt=open(path,'r',encoding='utf-8',errors='ignore').read().splitlines(True)
+
+  # parse server blocks (brace-based)
+  out=[]
+  i=0
+  n=len(txt)
+  while i<n:
+    line=txt[i]
+    if re.match(r'^\s*server\s*\{', line):
+      # capture block
+      block=[line]; i+=1
+      bc=line.count('{')-line.count('}')
+      while i<n and bc>0:
+        block.append(txt[i])
+        bc += txt[i].count('{')-txt[i].count('}')
+        i+=1
+
+      # decide if this server block targets fireinners.online
+      joined=''.join(block)
+      if re.search(r'^\s*server_name\s+.*\bfireinners\.online\b', joined, flags=re.M):
+        # remove old include lines pointing to our INC
+        new_block=[]
+        for ln in block:
+          m=rx_include.match(ln)
+          if m and os.path.normpath(m.group(1).strip())==os.path.normpath(INC):
+            continue
+          new_block.append(ln)
+        block=new_block
+
+        # remove any inline location /aquilastacking blocks in the vhost itself
+        block=strip_loc_blocks(block)
+
+        # inject include once near top inside server { ... }
+        injected=False
+        new_block=[]
+        for idx,ln in enumerate(block):
+          new_block.append(ln)
+          if (not injected) and rx_server_name.match(ln):
+            # insert right after server_name line (simple + stable)
+            new_block.append(f"  include {INC};\n")
+            injected=True
+        if not injected:
+          # fallback: after opening line
+          new_block.insert(1, f"  include {INC};\n")
+        block=new_block
+
+      out.extend(block)
+    else:
+      out.append(line); i+=1
+
+  new=''.join(out)
+  open(path,'w',encoding='utf-8').write(new)
+
+for p in files:
+  process_one(p)
+PY "${CAND[@]}"
+
+log "6) Vérif doublons: nginx -T scan 'location /aquilastacking' (doit être 1 occurrence par server)"
+# nginx -T peut être très long; on filtre juste les lignes pertinentes
+(nginx -T 2>/dev/null | grep -nE 'location\b.*\/aquilastacking\b' || true) | head -n 200 || true
+
+log "7) nginx -t (si fail => rollback)"
+if ! nginx -t; then
+  echo
+  echo "== ROLLBACK (nginx -t FAIL) ==" >&2
+  # restaure chaque fichier backup si présent
+  for f in "$INC" "$NGX_MAIN" "${CAND[@]}"; do
+    rp="$(readlink -f "$f" 2>/dev/null || echo "$f")"
+    if [ -f "$BK/$rp" ]; then
+      cp -a "$BK/$rp" "$rp" 2>/dev/null || true
+    fi
+  done
+  nginx -t || true
+  die "nginx config invalide, rollback appliqué: $BK"
+fi
+
+log "8) Reload nginx"
+systemctl reload nginx || nginx -s reload || true
+
+log "9) Checks HTTP (origin local + public CF)"
+set +e
+echo "-- ORIGIN (bypass CF via --resolve => 127.0.0.1) --"
+curl -kIsS --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}${PATH_APP}/" | head -n 20
+echo
+echo "-- PUBLIC (Cloudflare) --"
+curl -IsS "https://${DOMAIN}${PATH_APP}/" | head -n 20
+set -e
+
+log "10) Refreeze (chattr +i) sur fichiers touchés"
+refreeze "$INC"
+refreeze "$NGX_MAIN"
+for f in "${CAND[@]}"; do refreeze "$f"; done
+
+log "DONE. Ouvre: https://${DOMAIN}${PATH_APP}/ (Ctrl+F5)"
+echo "BK: $BK"
+SH
+chmod +x /root/MEGA_AQUILA_STACKING_ONLY_FIX.sh
+bash /root/MEGA_AQUILA_STACKING_ONLY_FIX.sh
