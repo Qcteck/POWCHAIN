@@ -1,8 +1,8 @@
-cat >/root/MEGA_AQUILA_STACKING_ROUTEFIX_V2.sh <<'SH'
+cat >/root/MEGA_AQUILA_STACKING_FORCE_VHOST_V1.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 TS="$(date +%Y%m%d_%H%M%S)"
-BK="/root/AQUILA_STACKING_ROUTEFIX_V2_BK_$TS"
+BK="/root/AQUILA_STACKING_FORCE_VHOST_V1_BK_$TS"
 mkdir -p "$BK"
 umask 022
 
@@ -13,6 +13,8 @@ DOMAIN="fireinners.online"
 PATH_APP="/aquilastacking"
 WEBROOT="/var/www/aquilastacking"
 INC="/etc/nginx/includes/aquilastacking_routes.inc"
+VHOST_A="/etc/nginx/sites-available/fireinners.online-ssl"
+VHOST_E="/etc/nginx/sites-enabled/fireinners.online-ssl"
 NGINX_MAIN="/etc/nginx/nginx.conf"
 
 backup_one(){ local p="$1"; [ -e "$p" ] || return 0; mkdir -p "$BK$(dirname "$p")"; cp -a "$p" "$BK$p.bak" 2>/dev/null || true; }
@@ -58,124 +60,85 @@ EOF
   chmod 644 "$INC" || true
 }
 
-# stdout ONLY = list of files, one per line
-find_server_files(){
-  nginx -T 2>/dev/null | python3 - "$DOMAIN" <<'PY'
-import sys,re
-dom=sys.argv[1].strip()
-txt=sys.stdin.read().splitlines()
+patch_vhost(){
+  [ -f "$VHOST_A" ] || die "Missing vhost: $VHOST_A"
+  log "Patch vhost: $VHOST_A (dedupe + inject include)"
+  backup_one "$VHOST_A"
 
-cur_file=None
-files=[]
-i=0
-while i<len(txt):
-  line=txt[i]
-  m=re.match(r'#\s*configuration file\s+(\S+):\d+', line)
-  if m: cur_file=m.group(1)
-  if re.search(r'\bserver\s*\{', line):
-    start=i
-    depth=0
-    j=i
-    block=[]
-    while j<len(txt):
-      l=txt[j]
-      if '{' in l: depth += l.count('{')
-      if '}' in l: depth -= l.count('}')
-      block.append(l)
-      if depth<=0 and j>start:
-        break
-      j+=1
-    b="\n".join(block)
-    if cur_file and re.search(r'^\s*server_name\s+[^;]*\b'+re.escape(dom)+r'\b', b, re.M):
-      if cur_file not in files: files.append(cur_file)
-    i=j
-  i+=1
-print("\n".join(files))
-PY
-}
-
-patch_server_file(){
-  local f="$1"
-  [ -f "$f" ] || die "Missing server file: $f"
-  log "Patch server file: $f"
-  backup_one "$f"
-  python3 - "$f" "$INC" "$DOMAIN" <<'PY'
+  python3 - "$VHOST_A" "$INC" "$DOMAIN" <<'PY'
 import sys,re
 p,inc,dom=sys.argv[1],sys.argv[2],sys.argv[3]
 s=open(p,'r',encoding='utf-8',errors='ignore').read()
 
-# remove any existing include lines for aquilastacking_routes.inc anywhere (clean duplicates)
+# Remove any existing aquilastacking include lines (anywhere in file)
 s=re.sub(r'^\s*include\s+.*aquilastacking_routes\.inc\s*;\s*\n','',s,flags=re.M)
 
-def inject_into_server(block:str)->str:
-  # only inject if server_name matches dom
-  if not re.search(r'^\s*server_name\s+[^;]*\b'+re.escape(dom)+r'\b', block, re.M):
-    return block
-  ins=f"\n  include {inc};\n"
-  # inject before last }
-  return re.sub(r'\}\s*$', ins+"}\n", block, count=1)
+def split_server_blocks(text):
+  # returns list of (pre, block, post...) but simplest rebuild
+  out=[]
+  i=0
+  while True:
+    m=re.search(r'\bserver\s*\{', text[i:])
+    if not m:
+      out.append(text[i:])
+      break
+    a=i+m.start()
+    b=i+m.end()
+    out.append(text[i:a])
+    j=b
+    depth=1
+    while j<len(text) and depth>0:
+      ch=text[j]
+      if ch=='#':  # skip comments to endline
+        k=text.find('\n', j)
+        j=len(text) if k==-1 else k+1
+        continue
+      if ch=='{': depth+=1
+      elif ch=='}': depth-=1
+      j+=1
+    block=text[a:j]
+    out.append(("__SERVER_BLOCK__", block))
+    i=j
+  return out
 
-# split & rebuild by scanning server { ... } blocks with brace depth
-out=[]
-i=0
-while True:
-  m=re.search(r'\bserver\s*\{', s[i:])
-  if not m:
-    out.append(s[i:])
-    break
-  a=i+m.start()
-  b=i+m.end()
-  out.append(s[i:a])
-  j=b
-  depth=1
-  while j<len(s) and depth>0:
-    ch=s[j]
-    if ch=='#':
-      k=s.find('\n', j)
-      j = len(s) if k==-1 else k+1
-      continue
-    if ch=='{': depth+=1
-    elif ch=='}': depth-=1
-    j+=1
-  block=s[a:j]
-  out.append(inject_into_server(block))
-  i=j
+parts=split_server_blocks(s)
+new=[]
+for part in parts:
+  if isinstance(part, tuple) and part[0]=="__SERVER_BLOCK__":
+    block=part[1]
+    # only touch blocks that contain server_name with dom
+    if re.search(r'^\s*server_name\s+[^;]*\b'+re.escape(dom)+r'\b', block, re.M):
+      if re.search(r'^\s*include\s+'+re.escape(inc)+r'\s*;\s*$', block, re.M):
+        new.append(block)
+      else:
+        # inject include near end of block, before final }
+        ins=f"\n  include {inc};\n"
+        block=re.sub(r'\}\s*$', ins+"}\n", block, count=1)
+        new.append(block)
+    else:
+      new.append(block)
+  else:
+    new.append(part)
 
-open(p,'w',encoding='utf-8').write(''.join(out))
+open(p,'w',encoding='utf-8').write(''.join(x if isinstance(x,str) else x[1] for x in new))
 PY
 }
 
 main(){
-  log "BEGIN AQUILA STACKING ROUTEFIX V2 @ $TS"
+  log "BEGIN AQUILA STACKING FORCE VHOST V1 @ $TS"
   log "BK: $BK"
 
   ensure_packages
 
-  # unfreeze core files + include
+  # Unfreeze only what we touch
   unfreeze_one "$NGINX_MAIN"
+  unfreeze_one "$VHOST_A"
+  unfreeze_one "$VHOST_E"
   unfreeze_one "$INC"
-
-  # unfreeze any file that might contain the server block for this domain
-  for f in /etc/nginx/sites-available/* /etc/nginx/sites-enabled/* /etc/nginx/conf.d/* /etc/nginx/includes/*; do
-    [ -e "$f" ] || continue
-    unfreeze_one "$f"
-  done
 
   ensure_webroot
   write_include
-
-  log "Detect active server file(s) for ${DOMAIN} via nginx -T"
-  files="$(find_server_files || true)"
-  if [ -z "${files//$'\n'/}" ]; then
-    log "No server files detected. Showing nginx -T matches:"
-    nginx -T 2>/dev/null | grep -n "server_name.*${DOMAIN}" | head -n 50 || true
-    die "Cannot locate active server block for ${DOMAIN}"
-  fi
-
-  while IFS= read -r f; do
-    [ -n "$f" ] || continue
-    patch_server_file "$f"
-  done <<<"$files"
+  patch_vhost
 
   log "nginx -t"
   nginx -t
@@ -183,10 +146,10 @@ main(){
   log "reload nginx"
   systemctl reload nginx || service nginx reload || true
 
-  # refreeze core + server files
-  refreeze_one "$NGINX_MAIN"
+  # Refreeze back
   refreeze_one "$INC"
-  while IFS= read -r f; do [ -n "$f" ] || continue; refreeze_one "$f"; done <<<"$files"
+  refreeze_one "$VHOST_A"
+  refreeze_one "$NGINX_MAIN"
 
   log "ORIGIN CHECK (bypass Cloudflare via --resolve -> 127.0.0.1)"
   curl -k -sS -I --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}${PATH_APP}/" | head -n 30 || true
@@ -200,5 +163,5 @@ main(){
 
 main "$@"
 SH
-chmod +x /root/MEGA_AQUILA_STACKING_ROUTEFIX_V2.sh
-bash /root/MEGA_AQUILA_STACKING_ROUTEFIX_V2.sh
+chmod +x /root/MEGA_AQUILA_STACKING_FORCE_VHOST_V1.sh
+bash /root/MEGA_AQUILA_STACKING_FORCE_VHOST_V1.sh
