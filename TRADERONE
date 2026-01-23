@@ -1,18 +1,20 @@
 bash <<'EOF'
 set -e
 
-echo "=== AIAQUILA RSS FIX FINAL ==="
+echo "=== AIAQUILA RSS HARD FIX ==="
 
-# 1. Dossiers
 ROOT="/var/www/aiaquila"
+NGCONF="/etc/nginx/sites-available/fireinners.online-ssl"
+
+# 1. Dépendances
+apt update -y
+apt install -y php php-fpm php-curl php-xml
+
+# 2. Dossier
 mkdir -p "$ROOT"
 cd "$ROOT"
 
-# 2. Dépendances
-apt update -y
-apt install -y php php-curl php-xml
-
-# 3. Backend RSS -> JSON (PROPRE)
+# 3. Backend RSS PHP (JSON GARANTI)
 cat > rss.php <<'PHP'
 <?php
 header("Access-Control-Allow-Origin: *");
@@ -30,8 +32,8 @@ $ch = curl_init($url);
 curl_setopt_array($ch, [
   CURLOPT_RETURNTRANSFER => true,
   CURLOPT_FOLLOWLOCATION => true,
-  CURLOPT_TIMEOUT => 10,
-  CURLOPT_USERAGENT => "AIAQUILA-RSS"
+  CURLOPT_TIMEOUT => 15,
+  CURLOPT_USERAGENT => "Mozilla/5.0 AIAQUILA"
 ]);
 
 $data = curl_exec($ch);
@@ -51,40 +53,27 @@ if (!$xml) {
   exit;
 }
 
-$items = [];
-if (isset($xml->channel->item)) {
-  foreach ($xml->channel->item as $i) {
-    $items[] = [
-      "title" => (string)$i->title,
-      "link" => (string)$i->link,
-      "date" => (string)$i->pubDate,
-      "desc" => strip_tags((string)$i->description)
-    ];
-  }
+$out = [];
+foreach ($xml->channel->item ?? [] as $i) {
+  $out[] = [
+    "title" => (string)$i->title,
+    "link"  => (string)$i->link,
+    "date"  => (string)$i->pubDate
+  ];
 }
 
-echo json_encode($items);
+echo json_encode($out);
 PHP
 
-# 4. Frontend HTML + JS (fonctionnel)
+# 4. Frontend (affiche erreurs réelles)
 cat > index.html <<'HTML'
 <!DOCTYPE html>
-<html lang="fr">
-<head>
-<meta charset="utf-8">
-<title>AIAQUILA — RSS réel</title>
-<style>
-body{background:#0b1a33;color:#fff;font-family:Arial;padding:20px}
-button{padding:10px;font-size:16px}
-.article{margin:10px 0;padding:10px;border-bottom:1px solid #444}
-</style>
-</head>
-<body>
-
+<html>
+<head><meta charset="utf-8"><title>AIAQUILA RSS</title></head>
+<body style="background:#0b1a33;color:white;font-family:Arial">
 <h1>🦅 AIAQUILA — RSS réel</h1>
-<button onclick="loadRSS()">Lire les articles</button>
-<div id="out"></div>
-
+<button onclick="load()">Lire les articles</button>
+<pre id="log"></pre>
 <script>
 const FEEDS=[
 "https://www.coindesk.com/arc/outboundfeeds/rss/",
@@ -92,32 +81,24 @@ const FEEDS=[
 "https://news.bitcoin.com/feed/"
 ];
 
-async function loadRSS(){
-  const out=document.getElementById("out");
-  out.innerHTML="Chargement...";
+async function load(){
+  const log=document.getElementById("log");
+  log.textContent="";
   let total=0;
-
   for(const f of FEEDS){
     try{
       const r=await fetch("rss.php?url="+encodeURIComponent(f));
-      const j=await r.json();
-      j.forEach(a=>{
-        total++;
-        out.innerHTML+=`
-          <div class="article">
-            <b>${a.title}</b><br>
-            <a href="${a.link}" target="_blank">${a.link}</a>
-          </div>`;
-      });
+      const t=await r.text();
+      const j=JSON.parse(t);
+      log.textContent+=f+" -> "+j.length+" articles\n";
+      total+=j.length;
     }catch(e){
-      out.innerHTML+=`<div>Erreur flux ${f}</div>`;
+      log.textContent+=f+" -> ERREUR "+e+"\n";
     }
   }
-
-  out.innerHTML=`<h3>${total} articles</h3>`+out.innerHTML;
+  log.textContent+="TOTAL: "+total;
 }
 </script>
-
 </body>
 </html>
 HTML
@@ -126,10 +107,21 @@ HTML
 chown -R www-data:www-data "$ROOT"
 chmod -R 755 "$ROOT"
 
-# 6. Vérification
-echo "=== TEST LOCAL ==="
-php -r 'echo file_get_contents("http://localhost/aiaquila/rss.php?url=https://www.coindesk.com/arc/outboundfeeds/rss/");' || true
+# 6. NGINX : s'assurer que PHP est ACTIF
+if ! grep -q "fastcgi_pass" "$NGCONF"; then
+  echo "❌ PHP non activé dans nginx — ABORT"
+  exit 1
+fi
 
-echo "=== OK ==="
-echo "Ouvre : https://fireinners.online/aiaquila/"
+# 7. Reload nginx + php
+systemctl restart php8.3-fpm || systemctl restart php8.2-fpm || true
+nginx -t
+systemctl reload nginx
+
+# 8. TEST CLI
+php rss.php url=https://www.coindesk.com/arc/outboundfeeds/rss/ | head -c 200
+
+echo
+echo "=== OUVRE ==="
+echo "https://fireinners.online/aiaquila/"
 EOF
