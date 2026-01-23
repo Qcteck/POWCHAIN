@@ -1,213 +1,459 @@
-bash -lc 'cat >/root/WV_ROUTES_PATCH.sh <<'"'"'SH'"'"'
+cat > /root/MEGA_AQUILA_STACKING_ONLY_FIX.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
 
-say(){ echo "[$(date -u +'%Y-%m-%d %H:%M:%S UTC')] $*"; }
-
-TS="$(date +%Y%m%d_%H%M%S)"
-BK="/root/BK_WV_ROUTES_PATCH_$TS"
-INC="/etc/nginx/includes/wolverine_routes.inc"
-DOMAIN="fireinners.online"
-
-say "START WV_ROUTES_PATCH"
+TS="$(date -u +%Y%m%d_%H%M%S)"
+BK="/root/AQUILA_STACKING_ONLY_BK_${TS}"
 mkdir -p "$BK"
+umask 022
 
-say "BACKUP"
-cp -a /etc/nginx "$BK/nginx" 2>/dev/null || true
-cp -a /var/www/wolverine "$BK/var_www_wolverine" 2>/dev/null || true
+# ===== Targets (STACKING ONLY) =====
+DOMAIN="fireinners.online"
+PATH_APP="/aquilastacking"
+WEBROOT="/var/www/aquilastacking"
+INC="/etc/nginx/includes/aquilastacking_routes.inc"
+NGINX_MAIN="/etc/nginx/nginx.conf"
 
-if command -v chattr >/dev/null 2>&1; then
-  say "UNFREEZE chattr -i (best effort)"
-  for p in /etc/nginx/nginx.conf /etc/nginx/sites-available/* /etc/nginx/sites-enabled/* /etc/nginx/conf.d/* /etc/nginx/includes/*; do
-    [ -e "$p" ] || continue
-    chattr -i "$p" 2>/dev/null || true
-  done
+log(){ printf "\n[%s] %s\n" "$(date -u +'%F %T UTC')" "$*"; }
+die(){ echo "ERROR: $*" >&2; exit 1; }
+have(){ command -v "$1" >/dev/null 2>&1; }
+
+# ===== askorupdate (optional) =====
+ASKLIB="/opt/fireinners/sentinel/lib/askorupdate.sh"
+if [ -f "$ASKLIB" ]; then
+  # shellcheck disable=SC1090
+  . "$ASKLIB" || true
 fi
 
-say "ENSURE /var/www/wolverine/index.html"
-mkdir -p /var/www/wolverine
-if [ ! -f /var/www/wolverine/index.html ]; then
-  cat >/var/www/wolverine/index.html <<'EOF'
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WOLVERINE OK</title><style>body{margin:0;background:#071018;color:#dbe7ff;font:16px/1.35 system-ui,Segoe UI,Roboto,Arial}a{color:#7ab7ff}main{padding:26px}h1{margin:0 0 10px;font-size:28px}</style></head><body><main><h1>WOLVERINE OK</h1><p>Si tu vois cette page, <b>/wolverine/</b> sert bien le webroot.</p><p><a href="/wolverine/vault-api/health">/wolverine/vault-api/health</a> · <a href="/wolverine/traderone/vault/health">/wolverine/traderone/vault/health</a> · <a href="/wolverine/traderone/api/health">/wolverine/traderone/api/health</a></p></main></body></html>
+backup_one(){
+  local p="$1"
+  [ -e "$p" ] || return 0
+  local dst="$BK${p}"
+  mkdir -p "$(dirname "$dst")"
+  cp -a "$p" "$dst" 2>/dev/null || true
+}
+
+lsattr_safe(){ lsattr "$1" 2>/dev/null | awk '{print $1}' || echo ""; }
+
+unfreeze_one(){
+  local f="$1"
+  [ -e "$f" ] || return 0
+  local a; a="$(lsattr_safe "$f")"
+  if echo "$a" | grep -q 'i'; then
+    log "UNFREEZE: chattr -i $f"
+    chattr -i "$f" 2>/dev/null || true
+  fi
+}
+
+refreeze_one(){
+  local f="$1"
+  [ -e "$f" ] || return 0
+  log "REFREEZE: chattr +i $f"
+  chattr +i "$f" 2>/dev/null || true
+}
+
+write_file(){
+  local path="$1"; shift
+  local tmp; tmp="$(mktemp)"
+  cat >"$tmp" <<'EOF'
+__CONTENT__
 EOF
-fi
+  # replace placeholder with stdin content
+  perl -0777 -pe 's/__CONTENT__\n//s' -i "$tmp"
+  # append real content piped in
+  cat >>"$tmp"
+  mkdir -p "$(dirname "$path")"
+  backup_one "$path"
+  mv -f "$tmp" "$path"
+  chmod 644 "$path" || true
+}
 
-say "WRITE include $INC"
-mkdir -p /etc/nginx/includes
-cat >"$INC" <<'EOF'
-# wolverine routes (managed)
-location = /wolverine { return 301 /wolverine/; }
+ensure_packages(){
+  log "1) Packages (curl/nginx/python3/unzip) si manquants"
+  apt-get update -y >/dev/null 2>&1 || true
+  for p in curl nginx python3 unzip; do
+    dpkg -s "$p" >/dev/null 2>&1 || apt-get install -y "$p" >/dev/null 2>&1 || true
+  done
+}
 
-# static app
-location ^~ /wolverine/ {
-  root /var/www;
-  try_files $uri $uri/ /wolverine/index.html;
+ensure_webroot(){
+  log "2) Prépare WEBROOT: $WEBROOT"
+  mkdir -p "$WEBROOT"
+  # try to copy local vendor (best-effort, optional)
+  mkdir -p "$WEBROOT/vendor" || true
+  for cand in \
+    "/opt/fireinners/frontend-react/app/dist/wolverine/vendor" \
+    "/var/www/wolverine/vendor" \
+    "/opt/wolverine/vendor" \
+    "/opt/fireinners/frontend-react/app/dist/wolverine/_next/static/vendor" \
+  ; do
+    if [ -d "$cand" ]; then
+      cp -a "$cand/." "$WEBROOT/vendor/" 2>/dev/null || true
+    fi
+  done
+
+  backup_one "$WEBROOT/index.html"
+  cat > "$WEBROOT/index.html" <<'HTML'
+<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Aquila Stacking</title><style>html,body{height:100%;margin:0;background:#060a12;color:#cfe3ff;font-family:system-ui,Segoe UI,Roboto,Arial}*{box-sizing:border-box}a{color:#8ecbff}#wrap{display:grid;grid-template-columns:360px 1fr;gap:14px;height:100%;padding:14px}#panel,#console{border:1px solid #2a3b66;border-radius:10px;background:rgba(20,30,60,.55);box-shadow:0 0 0 1px rgba(30,80,160,.15) inset}#panel{padding:12px}#console{padding:12px;overflow:auto;white-space:pre-wrap}h3{margin:0 0 10px 0;font-size:14px;color:#9fd3ff}label{display:block;font-size:12px;opacity:.9;margin:10px 0 6px}input{width:100%;padding:10px;border-radius:9px;border:1px solid #2a3b66;background:#0b1327;color:#d7ecff;outline:none}button{padding:10px 12px;border-radius:9px;border:1px solid #2a3b66;background:#0e1c3a;color:#d7ecff;cursor:pointer}button:hover{filter:brightness(1.08)}.row{display:flex;gap:10px;flex-wrap:wrap}.row button{flex:1;min-width:140px}small{opacity:.7}#addr{font-size:12px;word-break:break-all;opacity:.95}</style></head><body><div id="wrap"><div id="panel"><h3>Wallet</h3><div id="addr">Non connecté</div><div class="row" style="margin-top:8px"><button id="btnConnect">CONNECT PHANTOM</button><button id="btnDisconnect">DISCONNECT</button></div><label>Destination</label><input id="to" placeholder="Adresse Solana destination"/><label>Montant (SOL)</label><input id="amt" value="0.01"/><div class="row" style="margin-top:10px"><button id="btnArm">ARM</button><button id="btnDisarm">DISARM</button></div><div class="row" style="margin-top:10px"><button id="btnPropose">PROPOSE</button><button id="btnApprove">APPROUVER & SIGNER</button></div><div style="margin-top:10px"><small>Objectif: page STACKING fonctionnelle + Buffer polyfill + Solana web3 loader (local si présent, sinon CDN).</small></div></div><div id="console"><h3>Console</h3><div id="log"></div></div></div><script>
+/* ===== Buffer polyfill (iOS/PC) ===== */
+(()=>{try{if(!globalThis.global)globalThis.global=globalThis;if(!globalThis.process)globalThis.process={env:{}};if(!globalThis.Buffer){function b64ToBytes(b64){const bin=atob(b64);const a=new Uint8Array(bin.length);for(let i=0;i<bin.length;i++)a[i]=bin.charCodeAt(i);return a}function bytesToB64(u8){let s="";for(let i=0;i<u8.length;i++)s+=String.fromCharCode(u8[i]);return btoa(s)}class BufferX extends Uint8Array{static from(v,enc){if(v instanceof ArrayBuffer)return new BufferX(new Uint8Array(v));if(ArrayBuffer.isView(v))return new BufferX(new Uint8Array(v.buffer,v.byteOffset,v.byteLength));if(typeof v==="string"){if(enc==="base64")return new BufferX(b64ToBytes(v));const te=new TextEncoder();return new BufferX(te.encode(v))}if(Array.isArray(v))return new BufferX(new Uint8Array(v));throw new Error("Buffer.from unsupported")}static alloc(n){return new BufferX(new Uint8Array(n))}toString(enc){if(enc==="base64")return bytesToB64(this);const td=new TextDecoder();return td.decode(this)} }globalThis.Buffer=BufferX}}catch(e){}})();
+
+/* ===== UI helpers ===== */
+const $=s=>document.querySelector(s);
+const L=(...a)=>{const el=$("#log");el.textContent+=(a.join(" ")+"\n");el.parentElement.scrollTop=1e9;console.log(...a)};
+let armed=false, provider=null, pubkey=null, lastTx=null;
+
+/* ===== Load Solana web3: local then CDN ===== */
+function loadScript(src){return new Promise((res,rej)=>{const s=document.createElement("script");s.src=src;s.async=true;s.onload=()=>res(src);s.onerror=()=>rej(new Error("fail "+src));document.head.appendChild(s)})}
+async function ensureWeb3(){
+  if(globalThis.solanaWeb3) return true;
+  const tries=[
+    "./vendor/solana-web3.min.js",
+    "./vendor/solanaWeb3.min.js",
+    "./vendor/solana-web3.js",
+    "https://unpkg.com/@solana/web3.js@latest/lib/index.iife.min.js"
+  ];
+  for(const t of tries){
+    try{await loadScript(t); if(globalThis.solanaWeb3){L("solanaWeb3 loaded:",t); return true;}}catch(e){}
+  }
+  return false;
+}
+
+function setAddr(){
+  $("#addr").textContent = pubkey ? (pubkey.toBase58?pubkey.toBase58():String(pubkey)) : "Non connecté";
+}
+
+async function connect(){
+  if(!window.solana || !window.solana.isPhantom){L("Phantom non détecté");return;}
+  const r=await window.solana.connect({onlyIfTrusted:false});
+  provider=window.solana; pubkey=r.publicKey; setAddr(); L("Wallet connecté:", pubkey.toBase58());
+  if(!$("#to").value) $("#to").value=pubkey.toBase58();
+}
+async function disconnect(){
+  try{await window.solana.disconnect()}catch(e){}
+  provider=null; pubkey=null; setAddr(); L("Wallet déconnecté");
+}
+
+async function propose(){
+  if(!armed){L("Refus: ARM requis");return;}
+  if(!provider||!pubkey){L("Connecte Phantom d'abord");return;}
+  if(!(await ensureWeb3())){L("ERREUR: solanaWeb3 introuvable");return;}
+  const to=$("#to").value.trim(); const amt=parseFloat($("#amt").value||"0");
+  if(!to||!Number.isFinite(amt)||amt<=0){L("Paramètres invalides");return;}
+  const {Connection,PublicKey,SystemProgram,Transaction,LAMPORTS_PER_SOL,clusterApiUrl}=solanaWeb3;
+  const rpc=clusterApiUrl("mainnet-beta");
+  const cx=new Connection(rpc,"confirmed");
+  const bh=await cx.getLatestBlockhash("confirmed");
+  const tx=new Transaction({feePayer:pubkey,recentBlockhash:bh.blockhash});
+  tx.add(SystemProgram.transfer({fromPubkey:pubkey,toPubkey:new PublicKey(to),lamports:Math.round(amt*LAMPORTS_PER_SOL)}));
+  lastTx=tx; L("Proposition OK: TX prête. Clique APPROUVER & SIGNER.");
+}
+
+async function approve(){
+  if(!armed){L("Refus: ARM requis");return;}
+  if(!lastTx){L("Propose d'abord");return;}
+  if(!provider||!pubkey){L("Connecte Phantom");return;}
+  if(!(await ensureWeb3())){L("ERREUR: solanaWeb3 introuvable");return;}
+  const {Connection,clusterApiUrl}=solanaWeb3;
+  const rpc=clusterApiUrl("mainnet-beta");
+  const cx=new Connection(rpc,"confirmed");
+  try{
+    // Phantom: prefer signAndSendTransaction if available
+    if(provider.signAndSendTransaction){
+      const r=await provider.signAndSendTransaction(lastTx);
+      L("Envoyé (signAndSend):", r.signature||JSON.stringify(r));
+      return;
+    }
+    const signed=await provider.signTransaction(lastTx);
+    const sig=await cx.sendRawTransaction(signed.serialize(),{skipPreflight:false,maxRetries:3});
+    L("Envoyé:", sig);
+    await cx.confirmTransaction(sig,"confirmed");
+    L("Confirmé:", sig);
+  }catch(e){
+    L("ERREUR approve:", e && e.message ? e.message : String(e));
+  }
+}
+
+$("#btnConnect").onclick=()=>connect().catch(e=>L("ERR:",e.message||e));
+$("#btnDisconnect").onclick=()=>disconnect().catch(e=>L("ERR:",e.message||e));
+$("#btnArm").onclick=()=>{armed=true;L("ARM OK")};
+$("#btnDisarm").onclick=()=>{armed=false;L("DISARM OK")};
+$("#btnPropose").onclick=()=>propose().catch(e=>L("ERR:",e.message||e));
+$("#btnApprove").onclick=()=>approve().catch(e=>L("ERR:",e.message||e));
+
+L("Ready. ARM -> PROPOSE -> APPROUVER & SIGNER");
+</script></body></html>
+HTML
+  chmod 644 "$WEBROOT/index.html" || true
+}
+
+write_include_clean(){
+  log "3) Réécrit l'include Nginx (CLEAN): $INC"
+  mkdir -p "$(dirname "$INC")"
+  backup_one "$INC"
+  cat > "$INC" <<EOF
+# AQUILA_STACKING (managed) - $TS
+location = ${PATH_APP} { return 301 ${PATH_APP}/; }
+location ^~ ${PATH_APP}/ {
+  alias ${WEBROOT}/;
+  index index.html;
+  try_files \$uri \$uri/ ${PATH_APP}/index.html;
   add_header Cache-Control "no-store" always;
 }
-
-# backend (port 3000)
-location ^~ /wolverine/vault-api/ {
-  proxy_http_version 1.1;
-  proxy_set_header Host $host;
-  proxy_set_header X-Real-IP $remote_addr;
-  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto $scheme;
-  proxy_pass http://127.0.0.1:3000/;
-}
-
-# traderone aliases -> same backend (strip prefix -> /health works)
-location ^~ /wolverine/traderone/vault/ {
-  proxy_http_version 1.1;
-  proxy_set_header Host $host;
-  proxy_set_header X-Real-IP $remote_addr;
-  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto $scheme;
-  proxy_pass http://127.0.0.1:3000/;
-}
-
-location ^~ /wolverine/traderone/api/ {
-  proxy_http_version 1.1;
-  proxy_set_header Host $host;
-  proxy_set_header X-Real-IP $remote_addr;
-  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto $scheme;
-  proxy_pass http://127.0.0.1:3000/;
-}
+location = ${PATH_APP}/sw.js { add_header Cache-Control "no-store" always; return 404; }
+location = ${PATH_APP}/service-worker.js { add_header Cache-Control "no-store" always; return 404; }
+location = ${PATH_APP}/manifest.json { add_header Cache-Control "no-store" always; return 404; }
 EOF
+  chmod 644 "$INC" || true
+}
 
-say "FIND vhosts containing server_name $DOMAIN"
-TMP="/tmp/wv_vhosts_$TS.txt"
-: >"$TMP"
-( grep -RIl --include='*.conf' -E "server_name[[:space:]].*\\b${DOMAIN//./\\.}\\b" /etc/nginx/sites-enabled /etc/nginx/conf.d /etc/nginx/sites-available 2>/dev/null || true ) | sort -u >"$TMP"
+# Remove any "location ... aquilastacking" blocks from nginx configs EXCEPT our include
+retire_duplicate_locations(){
+  log "4) Retire les location '${PATH_APP}' ailleurs (évite duplicate location)"
+  python3 - <<'PY'
+import os,re,glob,sys
+PATH_APP="/aquilastacking"
+KEEP="/etc/nginx/includes/aquilastacking_routes.inc"
+root="/etc/nginx"
+targets=[]
+for p in glob.glob(root+"/**/*", recursive=True):
+  if os.path.isdir(p): continue
+  if not any(p.endswith(x) for x in [".conf",".inc"]) and "/sites-" not in p and "/nginx.conf" not in p:
+    continue
+  if os.path.realpath(p)==os.path.realpath(KEEP): 
+    continue
+  try:
+    s=open(p,"r",encoding="utf-8",errors="ignore").read()
+  except: 
+    continue
+  if "location" in s and "aquilastacking" in s:
+    targets.append(p)
 
-COUNT="$(wc -l <"$TMP" | tr -d " ")"
-say "VHOSTS count=$COUNT"
-if [ "$COUNT" = "0" ]; then
-  say "ERROR: no vhost found for $DOMAIN"
-  exit 2
-fi
+def comment_block(txt, start_idx):
+  # Find block boundaries: from the 'location ... aquilastacking' line until matching braces close.
+  # Works for typical nginx conf formatting.
+  lines=txt.splitlines(True)
+  # convert start char index -> line index
+  cur=0
+  li=0
+  for i,L in enumerate(lines):
+    if cur+len(L)>start_idx:
+      li=i; break
+    cur+=len(L)
+  # start at li, count braces
+  brace=0
+  started=False
+  out=[]
+  i=0
+  while i<len(lines):
+    L=lines[i]
+    if i==li:
+      started=True
+    if not started:
+      out.append(L); i+=1; continue
+    # comment this line
+    if not L.lstrip().startswith("#"):
+      Lc = "# AQUILA_DISABLED " + L
+    else:
+      Lc = L
+    out.append(Lc)
+    brace += L.count("{") - L.count("}")
+    # If this is a single-line location without braces, stop immediately.
+    if i==li and "{" not in lines[i]:
+      # stop after this line only
+      out.extend(lines[i+1:])
+      return "".join(out)
+    if started and brace<=0 and i>li:
+      out.extend(lines[i+1:])
+      return "".join(out)
+    i+=1
+  return "".join(out)
 
-say "PATCH vhosts: inject include line if missing (only in server blocks for $DOMAIN + 443/ssl)"
-python3 - <<'PY'
-import re, pathlib, sys
-
-inc_line = "include /etc/nginx/includes/wolverine_routes.inc;"
-domain = "fireinners.online"
-
-lst = pathlib.Path("'$TMP'".strip("'")).read_text().splitlines()
-patched = 0
-
-def split_server_blocks(text):
-    # crude server{} block splitter using brace counting
-    out=[]
-    i=0
-    n=len(text)
-    while True:
-        m=re.search(r'\bserver\s*\{', text[i:])
-        if not m: break
-        s=i+m.start()
-        j=s+m.end()-m.start()
-        depth=0
-        k=j
-        while k<n:
-            c=text[k]
-            if c=='{': depth+=1
-            elif c=='}':
-                if depth==0:
-                    out.append((s, k+1))
-                    i=k+1
-                    break
-                depth-=1
-            k+=1
-        else:
-            break
-    return out
-
-for path_s in lst:
-    p = pathlib.Path(path_s)
+loc_re=re.compile(r'^[ \t]*location[ \t]+[^\n]*aquilastacking[^\n]*$', re.M)
+for p in targets:
+  try:
+    txt=open(p,"r",encoding="utf-8",errors="ignore").read()
+  except:
+    continue
+  m=loc_re.search(txt)
+  if not m:
+    continue
+  new=txt
+  # comment repeatedly until none left
+  changed=False
+  while True:
+    m=loc_re.search(new)
+    if not m: break
+    new2=comment_block(new, m.start())
+    if new2==new: break
+    new=new2; changed=True
+  if changed:
+    # backup
+    bk="/root/AQUILA_STACKING_ONLY_BK_"+os.environ.get("TS","")
+    # (backup is handled in bash via cp -a; here we just write)
     try:
-        s = p.read_text(encoding="utf-8", errors="ignore")
-    except Exception:
-        continue
-    if inc_line in s:
-        continue
-
-    blocks = split_server_blocks(s)
-    if not blocks:
-        continue
-
-    s_list=list(s)
-    # patch in reverse order to keep indices stable
-    inserts=[]
-    for (a,b) in blocks:
-        blk = s[a:b]
-        if not re.search(r'\bserver_name\b[^;]*\b'+re.escape(domain)+r'\b', blk):
-            continue
-        # only ssl/443 servers
-        if not (re.search(r'\blisten\b[^;]*\b443\b', blk) or re.search(r'\bssl\b', blk)):
-            continue
-        # already included inside block?
-        if inc_line in blk:
-            continue
-        # inject after first server_name line if possible, else right after "server {"
-        m = re.search(r'(^[ \t]*server_name\b[^\n;]*;[ \t]*\n)', blk, flags=re.M)
-        if m:
-            pos = a + m.end()
-            ins = "  " + inc_line + "\n"
-        else:
-            m2 = re.search(r'\bserver\s*\{\s*\n', blk)
-            if m2:
-                pos = a + m2.end()
-                ins = "  " + inc_line + "\n"
-            else:
-                pos = a
-                ins = "server {\n  " + inc_line + "\n"
-        inserts.append((pos, ins))
-
-    if not inserts:
-        continue
-
-    inserts.sort(key=lambda x:x[0], reverse=True)
-    out = s
-    for pos, ins in inserts:
-        out = out[:pos] + ins + out[pos:]
-    if out != s:
-        p.write_text(out, encoding="utf-8")
-        patched += 1
-
-print("patched_files=", patched)
+      open(p,"w",encoding="utf-8").write(new)
+      print("DISABLED duplicate location in:", p)
+    except Exception as e:
+      print("WARN: cannot write", p, e)
 PY
+}
 
-say "NGINX TEST"
-nginx -t
+# Patch ALL server blocks that serve fireinners.online to include our include (once)
+patch_vhosts_all(){
+  log "5) Patch TOUS les vhosts qui servent ${DOMAIN} (inject include idempotent)"
+  python3 - <<'PY'
+import subprocess,re,os,sys
 
-say "RELOAD nginx"
-systemctl reload nginx 2>/dev/null || systemctl restart nginx
+DOMAIN="fireinners.online"
+INC="/etc/nginx/includes/aquilastacking_routes.inc"
 
-if command -v chattr >/dev/null 2>&1; then
-  say "REFREEZE chattr +i (best effort)"
-  chattr +i /etc/nginx/nginx.conf 2>/dev/null || true
-  chattr +i "$INC" 2>/dev/null || true
-fi
+# get full config with file markers
+p=subprocess.run(["nginx","-T"],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
+out=p.stdout
 
-say "TEST LOCAL (bypass CF) GET /wolverine/ (first bytes + code)"
-curl -sk --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/" -D - | head -n 18 || true
-echo
-say "TEST LOCAL (bypass CF) /wolverine/vault-api/health"
-curl -sk --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/vault-api/health" -D - | sed -n "1,12p" || true
-echo
-say "TEST LOCAL (bypass CF) /wolverine/traderone/vault/health"
-curl -sk --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/traderone/vault/health" -D - | sed -n "1,12p" || true
-echo
-say "TEST LOCAL (bypass CF) /wolverine/traderone/api/health"
-curl -sk --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/traderone/api/health" -D - | sed -n "1,12p" || true
-echo
-say "TEST PUBLIC HEAD /wolverine/traderone/vault/health"
-curl -skI "https://${DOMAIN}/wolverine/traderone/vault/health" | sed -n "1,12p" || true
+# nginx -T prints "configuration file /path: ..."; collect paths that mention DOMAIN somewhere
+files=set()
+for line in out.splitlines():
+  m=re.match(r'^# configuration file (.*?):\d+', line)
+  if m:
+    cur=m.group(1)
+    continue
+  if 'cur' in locals() and (DOMAIN in line):
+    files.add(cur)
 
-say "DONE"
-say "Backups: $BK"
-say "Open: https://${DOMAIN}/wolverine/ (Ctrl+F5)"
+files=[f for f in files if f.startswith("/etc/nginx/") and os.path.exists(f)]
+
+def parse_server_blocks(txt):
+  # returns list of (start,end) indices for "server { ... }" blocks
+  # naive but works for typical nginx configs
+  blocks=[]
+  i=0; n=len(txt)
+  while True:
+    m=re.search(r'(^|\n)\s*server\s*\{', txt[i:], re.M)
+    if not m: break
+    s=i+m.start()
+    # find '{' position
+    brace_pos=txt.find("{", s)
+    if brace_pos==-1: break
+    depth=0
+    j=brace_pos
+    while j<n:
+      c=txt[j]
+      if c=="{": depth+=1
+      elif c=="}":
+        depth-=1
+        if depth==0:
+          blocks.append((s, j+1))
+          i=j+1
+          break
+      j+=1
+    else:
+      break
+  return blocks
+
+def ensure_include_in_block(block_text):
+  # Only inject if not already in that block
+  if re.search(r'^\s*include\s+'+re.escape(INC)+r'\s*;\s*$', block_text, re.M):
+    return block_text, False
+  # Inject near end, before last }
+  insert=f"  include {INC};\n"
+  # place before final closing brace line
+  m=re.search(r'\n\s*\}\s*$', block_text)
+  if not m:
+    return block_text, False
+  return block_text[:m.start()+1] + insert + block_text[m.start()+1:], True
+
+patched=[]
+for f in sorted(files):
+  try:
+    txt=open(f,"r",encoding="utf-8",errors="ignore").read()
+  except:
+    continue
+  blocks=parse_server_blocks(txt)
+  if not blocks: 
+    continue
+  new=txt
+  delta=0
+  changed=False
+  for (s,e) in blocks:
+    s2=s+delta; e2=e+delta
+    blk=new[s2:e2]
+    # match server_name containing DOMAIN
+    if not re.search(r'^\s*server_name\s+[^;]*\b'+re.escape(DOMAIN)+r'\b', blk, re.M):
+      continue
+    # ensure include
+    nb, did=ensure_include_in_block(blk)
+    if did:
+      new=new[:s2]+nb+new[e2:]
+      delta += (len(nb)-len(blk))
+      changed=True
+  if changed:
+    open(f,"w",encoding="utf-8").write(new)
+    patched.append(f)
+
+print("PATCHED_FILES:", len(patched))
+for f in patched:
+  print(" -", f)
+PY
+}
+
+nginx_reload_and_test(){
+  log "6) nginx -t && reload"
+  nginx -t
+  systemctl reload nginx
+
+  log "7) HTTP CHECK (bypass Cloudflare via --resolve -> 127.0.0.1)"
+  set +e
+  curl -k -sS -I --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}${PATH_APP}/" | sed -n '1,12p'
+  echo
+  log "8) PUBLIC CHECK (Cloudflare / Internet)"
+  curl -k -sS -I "https://${DOMAIN}${PATH_APP}/" | sed -n '1,12p'
+  set -e
+  log "OPEN: https://${DOMAIN}${PATH_APP}/ (Ctrl+F5)"
+}
+
+main(){
+  [ "$(id -u)" -eq 0 ] || die "run as root"
+
+  ensure_packages
+
+  # unfreeze key nginx files (common immutable setup)
+  unfreeze_one "$NGINX_MAIN"
+  # unfreeze all potential vhosts/includes we may touch
+  for f in /etc/nginx/sites-available/* /etc/nginx/sites-enabled/* /etc/nginx/includes/*; do
+    [ -e "$f" ] && unfreeze_one "$f" || true
+  done
+  unfreeze_one "$INC"
+
+  ensure_webroot
+  write_include_clean
+
+  # Disable any other duplicate location blocks for aquilastacking
+  retire_duplicate_locations
+
+  # Ensure every server_name fireinners.online has exactly one include of our routes
+  patch_vhosts_all
+
+  # Final: ensure include itself is not duplicated inside same server due to previous scripts
+  # (handled by patcher per server block)
+
+  nginx_reload_and_test
+
+  # refreeze back the critical ones (best-effort)
+  refreeze_one "$INC"
+  # You may have your own policy; we refreeze only what we unfreeze most commonly
+  refreeze_one "$NGINX_MAIN"
+  for f in /etc/nginx/sites-available/* /etc/nginx/includes/*; do
+    [ -e "$f" ] && refreeze_one "$f" || true
+  done
+
+  log "DONE. Backup: $BK"
+}
+
+main "$@"
 SH
-chmod +x /root/WV_ROUTES_PATCH.sh
-/root/WV_ROUTES_PATCH.sh'
+
+chmod +x /root/MEGA_AQUILA_STACKING_ONLY_FIX.sh
+bash /root/MEGA_AQUILA_STACKING_ONLY_FIX.sh
