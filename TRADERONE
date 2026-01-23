@@ -1,86 +1,53 @@
 bash <<'EOF'
-set -e
+set -euo pipefail
 
-echo "=== AIAQUILA — DIAGNOSTIC RÉEL NGINX ==="
+### CONFIG
+APP_DIR="/var/www/fireinners.online/aiaquila"
+INDEX="$APP_DIR/index.html"
+BACKUP="$APP_DIR/index.backup.$(date +%Y%m%d_%H%M%S).html"
+WORKER_BASE="https://aiquila-proxy.workers.dev"   # ⚠️ NE PAS CHANGER
+RSS_ENDPOINT="/rss"
 
-### 1. Trouver le vhost réellement utilisé
-echo
-echo "== VHOST ACTIF =="
-nginx -T | sed -n '/server_name fireinners.online/,/}/p' | sed -n '1,200p'
+echo "== AIAQUILA RSS HARD FIX =="
 
-### 2. Trouver TOUS les root / alias / locations possibles
-echo
-echo "== ROOT / ALIAS / LOCATION aiaq =="
-nginx -T | grep -E "root |alias |location /aiaquila" -n
+### 1. Vérifs
+[ -d "$APP_DIR" ] || { echo "❌ Dossier absent $APP_DIR"; exit 1; }
+[ -f "$INDEX" ] && cp "$INDEX" "$BACKUP"
 
-### 3. Lister tous les index.html possibles
-echo
-echo "== INDEX.HTML CANDIDATS =="
-find /var/www /opt /usr/share/nginx -type f -name index.html 2>/dev/null | grep -i aiaquila || true
-
-### 4. Vérifier lequel est réellement servi
-echo
-echo "== CONTENU SERVI PAR NGINX (SHA) =="
-TMP=$(mktemp)
-curl -s https://fireinners.online/aiaquila/ > "$TMP"
-sha256sum "$TMP"
-echo
-echo "== PREMIÈRES LIGNES SERVIES =="
-sed -n '1,30p' "$TMP"
-
-### 5. Identifier le fichier correspondant
-echo
-echo "== MATCH SHA SUR DISQUE =="
-FOUND=""
-while read -r f; do
-  if [ "$(sha256sum "$f" | awk '{print $1}')" = "$(sha256sum "$TMP" | awk '{print $1}')" ]; then
-    echo ">>> FICHIER SERVI RÉEL : $f"
-    FOUND="$f"
-  fi
-done < <(find /var/www /opt /usr/share/nginx -type f -name index.html 2>/dev/null)
-
-if [ -z "$FOUND" ]; then
-  echo "❌ AUCUN FICHIER LOCAL NE CORRESPOND → cache proxy / include nginx"
-  exit 1
-fi
-
-### 6. BACKUP + REMPLACEMENT DU FICHIER SERVI
-echo
-echo "== PATCH DU FICHIER SERVI =="
-cp "$FOUND" "$FOUND.backup.$(date +%s)"
-
-cat > "$FOUND" <<'HTML'
+### 2. Écriture HTML FINAL (JSON ONLY)
+cat > "$INDEX" <<'HTML'
 <!DOCTYPE html>
 <html lang="fr">
 <head>
 <meta charset="utf-8">
 <title>AIAQUILA — RSS réel</title>
 <style>
-body{margin:0;background:#0b1b3a;color:#fff;font-family:system-ui}
-#wrap{padding:20px}
+body{margin:0;padding:20px;font-family:system-ui;background:#0b1b3a;color:#fff}
 button{padding:10px 14px;font-size:15px;cursor:pointer}
-pre{white-space:pre-wrap;margin-top:15px;font-size:13px}
+pre{white-space:pre-wrap;margin-top:15px;font-size:14px}
 </style>
 </head>
 <body>
-<div id="wrap">
-<h2>🦅 AIAQUILA — RSS réel (FORCÉ)</h2>
+<h2>🦅 AIAQUILA — RSS réel</h2>
 <button onclick="load()">Lire les articles</button>
 <pre id="out">En attente…</pre>
-</div>
 
 <script>
-const RSS="https://aiaquila-proxy.workers.dev/rss?url=https://news.bitcoin.com/feed/";
+const API = "https://aiquila-proxy.workers.dev/rss";
+
 async function load(){
   const out=document.getElementById("out");
-  out.textContent="FETCH → "+RSS+"\\n\\n";
+  out.textContent="Chargement…\n";
   try{
-    const r=await fetch(RSS,{cache:"no-store"});
+    const r=await fetch(API,{cache:"no-store"});
+    if(!r.ok) throw new Error("HTTP "+r.status);
     const j=await r.json();
-    out.textContent="Articles: "+j.length+"\\n\\n";
-    j.slice(0,20).forEach((a,i)=>{
-      out.textContent+=(i+1)+". "+a.title+"\\n"+a.link+"\\n\\n";
+    if(!Array.isArray(j)) throw new Error("JSON invalide");
+    let txt="";
+    j.forEach((a,i)=>{
+      txt+=`${i+1}. ${a.title}\n${a.link}\n\n`;
     });
+    out.textContent=txt||"Aucun article";
   }catch(e){
     out.textContent="ERREUR: "+e.message;
   }
@@ -90,15 +57,17 @@ async function load(){
 </html>
 HTML
 
-chown www-data:www-data "$FOUND"
-chmod 644 "$FOUND"
+### 3. Reload nginx
+nginx -t && systemctl reload nginx
 
-### 7. Reload nginx
-nginx -t
-systemctl reload nginx
-
+### 4. Tests Worker
+echo "== TEST WORKER =="
+curl -s "$WORKER_BASE/health" || true
 echo
-echo "✅ PATCH APPLIQUÉ SUR LE FICHIER EFFECTIVEMENT SERVI"
-echo "➡️ https://fireinners.online/aiaquila/"
-echo "➡️ CTRL + SHIFT + R"
+curl -s "$WORKER_BASE/rss" | head -c 300 || true
+echo
+
+echo "== OK =="
+echo "Backup: $BACKUP"
+echo "URL: https://fireinners.online/aiaquila/"
 EOF
