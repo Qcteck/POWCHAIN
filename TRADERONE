@@ -1,67 +1,213 @@
+bash -lc 'cat >/root/WV_ROUTES_PATCH.sh <<'"'"'SH'"'"'
 #!/usr/bin/env bash
 set -euo pipefail
 
-SITE_DIR="/var/www/fireinners.online/aiaquila"
-INDEX="$SITE_DIR/index.html"
-BACKUP="$SITE_DIR/index.backup.$(date +%Y%m%d_%H%M%S).html"
+say(){ echo "[$(date -u +'%Y-%m-%d %H:%M:%S UTC')] $*"; }
 
-WORKER_BASE="https://aiaquila-proxy.paycashnostory.workers.dev"
-WORKER_RSS="$WORKER_BASE/rss"
+TS="$(date +%Y%m%d_%H%M%S)"
+BK="/root/BK_WV_ROUTES_PATCH_$TS"
+INC="/etc/nginx/includes/wolverine_routes.inc"
+DOMAIN="fireinners.online"
 
-echo "=== AIAQUILA • FINAL FIX ==="
+say "START WV_ROUTES_PATCH"
+mkdir -p "$BK"
 
-echo "[1/6] Test WORKER /rss (SEUL endpoint valide)..."
-curl -fsSL "$WORKER_RSS" | head -n 3 || {
-  echo "❌ Worker RSS inaccessible"
-  exit 1
+say "BACKUP"
+cp -a /etc/nginx "$BK/nginx" 2>/dev/null || true
+cp -a /var/www/wolverine "$BK/var_www_wolverine" 2>/dev/null || true
+
+if command -v chattr >/dev/null 2>&1; then
+  say "UNFREEZE chattr -i (best effort)"
+  for p in /etc/nginx/nginx.conf /etc/nginx/sites-available/* /etc/nginx/sites-enabled/* /etc/nginx/conf.d/* /etc/nginx/includes/*; do
+    [ -e "$p" ] || continue
+    chattr -i "$p" 2>/dev/null || true
+  done
+fi
+
+say "ENSURE /var/www/wolverine/index.html"
+mkdir -p /var/www/wolverine
+if [ ! -f /var/www/wolverine/index.html ]; then
+  cat >/var/www/wolverine/index.html <<'EOF'
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WOLVERINE OK</title><style>body{margin:0;background:#071018;color:#dbe7ff;font:16px/1.35 system-ui,Segoe UI,Roboto,Arial}a{color:#7ab7ff}main{padding:26px}h1{margin:0 0 10px;font-size:28px}</style></head><body><main><h1>WOLVERINE OK</h1><p>Si tu vois cette page, <b>/wolverine/</b> sert bien le webroot.</p><p><a href="/wolverine/vault-api/health">/wolverine/vault-api/health</a> · <a href="/wolverine/traderone/vault/health">/wolverine/traderone/vault/health</a> · <a href="/wolverine/traderone/api/health">/wolverine/traderone/api/health</a></p></main></body></html>
+EOF
+fi
+
+say "WRITE include $INC"
+mkdir -p /etc/nginx/includes
+cat >"$INC" <<'EOF'
+# wolverine routes (managed)
+location = /wolverine { return 301 /wolverine/; }
+
+# static app
+location ^~ /wolverine/ {
+  root /var/www;
+  try_files $uri $uri/ /wolverine/index.html;
+  add_header Cache-Control "no-store" always;
 }
-echo "✅ Worker RSS OK"
 
-echo "[2/6] Backup frontend..."
-cp -a "$INDEX" "$BACKUP"
-echo "Backup -> $BACKUP"
-
-echo "[3/6] Écriture frontend (WORKER ONLY)..."
-cat > "$INDEX" <<EOF
-<!doctype html><html lang="fr"><head>
-<meta charset="utf-8">
-<title>AIAQUILA — RSS réel</title>
-<style>
-body{margin:0;padding:20px;font-family:system-ui;background:#0b1b3a;color:#fff}
-button{padding:10px 14px;font-size:15px;cursor:pointer}
-pre{white-space:pre-wrap;margin-top:15px;font-size:14px}
-</style>
-</head><body>
-<h2>🦅 AIAQUILA — RSS réel</h2>
-<button onclick="load()">Lire les articles</button>
-<pre id="out">En attente…</pre>
-<script>
-const API="$WORKER_RSS";
-async function load(){
- const out=document.getElementById("out");
- out.textContent="Chargement…\\n";
- try{
-  const r=await fetch(API,{cache:"no-store"});
-  if(!r.ok) throw new Error("HTTP "+r.status);
-  const j=await r.json();
-  if(!Array.isArray(j)) throw new Error("JSON invalide");
-  out.textContent=j.map((a,i)=>\`\${i+1}. \${a.title}\\n\${a.link}\\n\`).join("\\n");
- }catch(e){
-  out.textContent="ERREUR: "+e.message;
- }
+# backend (port 3000)
+location ^~ /wolverine/vault-api/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  proxy_pass http://127.0.0.1:3000/;
 }
-</script>
-</body></html>
+
+# traderone aliases -> same backend (strip prefix -> /health works)
+location ^~ /wolverine/traderone/vault/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  proxy_pass http://127.0.0.1:3000/;
+}
+
+location ^~ /wolverine/traderone/api/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  proxy_pass http://127.0.0.1:3000/;
+}
 EOF
 
-echo "[4/6] Permissions..."
-chown -R www-data:www-data "$SITE_DIR"
-chmod 644 "$INDEX"
+say "FIND vhosts containing server_name $DOMAIN"
+TMP="/tmp/wv_vhosts_$TS.txt"
+: >"$TMP"
+( grep -RIl --include='*.conf' -E "server_name[[:space:]].*\\b${DOMAIN//./\\.}\\b" /etc/nginx/sites-enabled /etc/nginx/conf.d /etc/nginx/sites-available 2>/dev/null || true ) | sort -u >"$TMP"
 
-echo "[5/6] Reload nginx..."
+COUNT="$(wc -l <"$TMP" | tr -d " ")"
+say "VHOSTS count=$COUNT"
+if [ "$COUNT" = "0" ]; then
+  say "ERROR: no vhost found for $DOMAIN"
+  exit 2
+fi
+
+say "PATCH vhosts: inject include line if missing (only in server blocks for $DOMAIN + 443/ssl)"
+python3 - <<'PY'
+import re, pathlib, sys
+
+inc_line = "include /etc/nginx/includes/wolverine_routes.inc;"
+domain = "fireinners.online"
+
+lst = pathlib.Path("'$TMP'".strip("'")).read_text().splitlines()
+patched = 0
+
+def split_server_blocks(text):
+    # crude server{} block splitter using brace counting
+    out=[]
+    i=0
+    n=len(text)
+    while True:
+        m=re.search(r'\bserver\s*\{', text[i:])
+        if not m: break
+        s=i+m.start()
+        j=s+m.end()-m.start()
+        depth=0
+        k=j
+        while k<n:
+            c=text[k]
+            if c=='{': depth+=1
+            elif c=='}':
+                if depth==0:
+                    out.append((s, k+1))
+                    i=k+1
+                    break
+                depth-=1
+            k+=1
+        else:
+            break
+    return out
+
+for path_s in lst:
+    p = pathlib.Path(path_s)
+    try:
+        s = p.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        continue
+    if inc_line in s:
+        continue
+
+    blocks = split_server_blocks(s)
+    if not blocks:
+        continue
+
+    s_list=list(s)
+    # patch in reverse order to keep indices stable
+    inserts=[]
+    for (a,b) in blocks:
+        blk = s[a:b]
+        if not re.search(r'\bserver_name\b[^;]*\b'+re.escape(domain)+r'\b', blk):
+            continue
+        # only ssl/443 servers
+        if not (re.search(r'\blisten\b[^;]*\b443\b', blk) or re.search(r'\bssl\b', blk)):
+            continue
+        # already included inside block?
+        if inc_line in blk:
+            continue
+        # inject after first server_name line if possible, else right after "server {"
+        m = re.search(r'(^[ \t]*server_name\b[^\n;]*;[ \t]*\n)', blk, flags=re.M)
+        if m:
+            pos = a + m.end()
+            ins = "  " + inc_line + "\n"
+        else:
+            m2 = re.search(r'\bserver\s*\{\s*\n', blk)
+            if m2:
+                pos = a + m2.end()
+                ins = "  " + inc_line + "\n"
+            else:
+                pos = a
+                ins = "server {\n  " + inc_line + "\n"
+        inserts.append((pos, ins))
+
+    if not inserts:
+        continue
+
+    inserts.sort(key=lambda x:x[0], reverse=True)
+    out = s
+    for pos, ins in inserts:
+        out = out[:pos] + ins + out[pos:]
+    if out != s:
+        p.write_text(out, encoding="utf-8")
+        patched += 1
+
+print("patched_files=", patched)
+PY
+
+say "NGINX TEST"
 nginx -t
-systemctl reload nginx
 
-echo "[6/6] OK"
-echo "URL SITE   : https://fireinners.online/aiaquila/"
-echo "WORKER RSS : $WORKER_RSS"
+say "RELOAD nginx"
+systemctl reload nginx 2>/dev/null || systemctl restart nginx
+
+if command -v chattr >/dev/null 2>&1; then
+  say "REFREEZE chattr +i (best effort)"
+  chattr +i /etc/nginx/nginx.conf 2>/dev/null || true
+  chattr +i "$INC" 2>/dev/null || true
+fi
+
+say "TEST LOCAL (bypass CF) GET /wolverine/ (first bytes + code)"
+curl -sk --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/" -D - | head -n 18 || true
+echo
+say "TEST LOCAL (bypass CF) /wolverine/vault-api/health"
+curl -sk --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/vault-api/health" -D - | sed -n "1,12p" || true
+echo
+say "TEST LOCAL (bypass CF) /wolverine/traderone/vault/health"
+curl -sk --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/traderone/vault/health" -D - | sed -n "1,12p" || true
+echo
+say "TEST LOCAL (bypass CF) /wolverine/traderone/api/health"
+curl -sk --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/traderone/api/health" -D - | sed -n "1,12p" || true
+echo
+say "TEST PUBLIC HEAD /wolverine/traderone/vault/health"
+curl -skI "https://${DOMAIN}/wolverine/traderone/vault/health" | sed -n "1,12p" || true
+
+say "DONE"
+say "Backups: $BK"
+say "Open: https://${DOMAIN}/wolverine/ (Ctrl+F5)"
+SH
+chmod +x /root/WV_ROUTES_PATCH.sh
+/root/WV_ROUTES_PATCH.sh'
