@@ -1,127 +1,49 @@
 bash <<'EOF'
 set -e
 
-echo "=== AIAQUILA RSS HARD FIX ==="
+echo "=== AIAQUILA PHP EXECUTION FIX ==="
 
-ROOT="/var/www/aiaquila"
 NGCONF="/etc/nginx/sites-available/fireinners.online-ssl"
+ROOT="/var/www/aiaquila"
 
-# 1. Dépendances
-apt update -y
-apt install -y php php-fpm php-curl php-xml
-
-# 2. Dossier
-mkdir -p "$ROOT"
-cd "$ROOT"
-
-# 3. Backend RSS PHP (JSON GARANTI)
-cat > rss.php <<'PHP'
-<?php
-header("Access-Control-Allow-Origin: *");
-header("Content-Type: application/json; charset=UTF-8");
-
-if (!isset($_GET["url"])) {
-  http_response_code(400);
-  echo json_encode(["error"=>"missing url"]);
-  exit;
-}
-
-$url = $_GET["url"];
-
-$ch = curl_init($url);
-curl_setopt_array($ch, [
-  CURLOPT_RETURNTRANSFER => true,
-  CURLOPT_FOLLOWLOCATION => true,
-  CURLOPT_TIMEOUT => 15,
-  CURLOPT_USERAGENT => "Mozilla/5.0 AIAQUILA"
-]);
-
-$data = curl_exec($ch);
-curl_close($ch);
-
-if (!$data) {
-  http_response_code(502);
-  echo json_encode(["error"=>"fetch failed"]);
-  exit;
-}
-
-libxml_use_internal_errors(true);
-$xml = simplexml_load_string($data, "SimpleXMLElement", LIBXML_NOCDATA);
-if (!$xml) {
-  http_response_code(500);
-  echo json_encode(["error"=>"xml parse failed"]);
-  exit;
-}
-
-$out = [];
-foreach ($xml->channel->item ?? [] as $i) {
-  $out[] = [
-    "title" => (string)$i->title,
-    "link"  => (string)$i->link,
-    "date"  => (string)$i->pubDate
-  ];
-}
-
-echo json_encode($out);
-PHP
-
-# 4. Frontend (affiche erreurs réelles)
-cat > index.html <<'HTML'
-<!DOCTYPE html>
-<html>
-<head><meta charset="utf-8"><title>AIAQUILA RSS</title></head>
-<body style="background:#0b1a33;color:white;font-family:Arial">
-<h1>🦅 AIAQUILA — RSS réel</h1>
-<button onclick="load()">Lire les articles</button>
-<pre id="log"></pre>
-<script>
-const FEEDS=[
-"https://www.coindesk.com/arc/outboundfeeds/rss/",
-"https://cointelegraph.com/rss",
-"https://news.bitcoin.com/feed/"
-];
-
-async function load(){
-  const log=document.getElementById("log");
-  log.textContent="";
-  let total=0;
-  for(const f of FEEDS){
-    try{
-      const r=await fetch("rss.php?url="+encodeURIComponent(f));
-      const t=await r.text();
-      const j=JSON.parse(t);
-      log.textContent+=f+" -> "+j.length+" articles\n";
-      total+=j.length;
-    }catch(e){
-      log.textContent+=f+" -> ERREUR "+e+"\n";
-    }
-  }
-  log.textContent+="TOTAL: "+total;
-}
-</script>
-</body>
-</html>
-HTML
-
-# 5. Permissions
-chown -R www-data:www-data "$ROOT"
-chmod -R 755 "$ROOT"
-
-# 6. NGINX : s'assurer que PHP est ACTIF
-if ! grep -q "fastcgi_pass" "$NGCONF"; then
-  echo "❌ PHP non activé dans nginx — ABORT"
+# 1. Vérifs
+if [ ! -f "$NGCONF" ]; then
+  echo "❌ VHOST introuvable"
   exit 1
 fi
 
-# 7. Reload nginx + php
-systemctl restart php8.3-fpm || systemctl restart php8.2-fpm || true
+# 2. Sauvegarde
+cp "$NGCONF" "$NGCONF.bak.$(date +%s)"
+
+# 3. Forcer root correct
+sed -i 's|root .*;|root /var/www;|g' "$NGCONF"
+
+# 4. Injecter bloc PHP CORRECT
+if ! grep -q "location ~ \\\\.php" "$NGCONF"; then
+cat >> "$NGCONF" <<'NGINX'
+
+location ~ \.php$ {
+    include snippets/fastcgi-php.conf;
+    fastcgi_pass unix:/run/php/php8.3-fpm.sock;
+    fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+    include fastcgi_params;
+}
+NGINX
+fi
+
+# 5. Permissions
+chown -R www-data:www-data /var/www
+chmod -R 755 /var/www
+
+# 6. Restart services
+systemctl restart php8.3-fpm || systemctl restart php8.2-fpm
 nginx -t
 systemctl reload nginx
 
-# 8. TEST CLI
-php rss.php url=https://www.coindesk.com/arc/outboundfeeds/rss/ | head -c 200
-
+# 7. TEST HTTP (CRUCIAL)
 echo
-echo "=== OUVRE ==="
-echo "https://fireinners.online/aiaquila/"
+echo "=== TEST HTTP rss.php ==="
+curl -s "https://fireinners.online/aiaquila/rss.php?url=https://news.bitcoin.com/feed/" | head -c 200
+echo
+echo "=== FIN ==="
 EOF
