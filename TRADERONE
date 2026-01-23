@@ -1,1 +1,111 @@
-ls -la /root/orion.zip || true
+cat >/root/AIAQUILA_FIX_FINAL.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+SITE="fireinners.online"
+WEBROOT="/var/www/fireinners.online/aiaquila"
+INDEX="$WEBROOT/index.html"
+TS="$(date +%Y%m%d_%H%M%S)"
+
+NGX_SNIP="/etc/nginx/snippets/aiaquila_rss.conf"
+NGX_SITE="/etc/nginx/sites-available/$SITE"
+
+echo "=== AIAQUILA FINAL FIX (DIRECT RSS / SAFE) ==="
+
+### 1) Backup frontend
+echo "[1/6] Backup frontend"
+cp -a "$INDEX" "$INDEX.backup.$TS"
+
+### 2) Write nginx snippet (ONLY location blocks)
+echo "[2/6] Write nginx snippet"
+cat >"$NGX_SNIP" <<'NGX'
+location /aiaquila/api/rss {
+    resolver 1.1.1.1 8.8.8.8 valid=300s;
+    resolver_timeout 5s;
+
+    proxy_pass https://news.bitcoin.com/feed/;
+    proxy_set_header Host news.bitcoin.com;
+    proxy_set_header User-Agent "AIAQUILA-RSS";
+    proxy_ssl_server_name on;
+
+    proxy_connect_timeout 10s;
+    proxy_read_timeout 30s;
+}
+
+location /aiaquila/health {
+    default_type text/plain;
+    return 200 "OK AIAQUILA\n";
+}
+NGX
+
+### 3) Inject snippet include SAFELY (no sed rename bug)
+echo "[3/6] Ensure include in nginx site"
+if ! grep -q "aiaquila_rss.conf" "$NGX_SITE"; then
+  awk '
+  /server_name/ && !done {
+    print;
+    print "    include /etc/nginx/snippets/aiaquila_rss.conf;";
+    done=1; next
+  }
+  {print}
+  ' "$NGX_SITE" >"/tmp/$SITE.$TS"
+  cp "/tmp/$SITE.$TS" "$NGX_SITE"
+fi
+
+### 4) Rewrite frontend (LOCAL API ONLY)
+echo "[4/6] Rewrite frontend index.html"
+cat >"$INDEX" <<'HTML'
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<title>AIAQUILA — RSS réel (FORCÉ)</title>
+<style>
+body{margin:0;padding:20px;background:#0b1b3a;color:#fff;font-family:system-ui}
+button{padding:10px 14px;font-size:15px;cursor:pointer}
+pre{white-space:pre-wrap;margin-top:15px;font-size:14px;color:#cfe}
+</style>
+</head>
+<body>
+<h2>🦅 AIAQUILA — RSS réel (FORCÉ)</h2>
+<button onclick="load()">Lire les articles</button>
+<pre id="out">En attente…</pre>
+<script>
+async function load(){
+  const o=document.getElementById("out");
+  o.textContent="Chargement…";
+  try{
+    const r=await fetch("/aiaquila/api/rss",{cache:"no-store"});
+    if(!r.ok) throw r.status;
+    const t=await r.text();
+    const x=new DOMParser().parseFromString(t,"text/xml");
+    const items=[...x.querySelectorAll("item")].slice(0,20);
+    o.textContent=items.map(i=>
+      (i.querySelector("title")?.textContent||"")+"\n"+
+      (i.querySelector("link")?.textContent||"")
+    ).join("\n\n");
+  }catch(e){
+    o.textContent="ERREUR: "+e;
+  }
+}
+</script>
+</body>
+</html>
+HTML
+
+### 5) Test nginx
+echo "[5/6] nginx test"
+nginx -t
+
+### 6) Reload nginx
+echo "[6/6] reload nginx"
+systemctl reload nginx
+
+echo "=== DONE ==="
+echo "Health: https://$SITE/aiaquila/health"
+echo "RSS   : https://$SITE/aiaquila/api/rss"
+echo "UI    : https://$SITE/aiaquila/"
+BASH
+
+chmod +x /root/AIAQUILA_FIX_FINAL.sh
+/root/AIAQUILA_FIX_FINAL.sh
