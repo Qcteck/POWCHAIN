@@ -1,69 +1,14 @@
-bash -lc 'set -euo pipefail;TS="$(date +%Y%m%d_%H%M%S)";CANON="/etc/nginx/sites-available/fireinners.online-ssl";BK="/root/NGINX_CONFLICT_FIX_$TS";log(){ printf "\n[%s] %s\n" "$(date -u +%F\ %T\ UTC)" "$*"; };die(){ echo "ERROR: $*" >&2; exit 1; };[[ "$(id -u)" == "0" ]]||die "Lance en root.";command -v nginx >/dev/null||die "nginx manquant.";mkdir -p "$BK";unlock(){ command -v chattr >/dev/null&&[[ -e "$1" ]]&&chattr -i "$1" 2>/dev/null||true; };lock(){ command -v chattr >/dev/null&&[[ -e "$1" ]]&&chattr +i "$1" 2>/dev/null||true; };backup(){ [[ -e "$1" ]]&&cp -a "$1" "$BK/$(basename "$1").bak"||true; };backupdir(){ [[ -d "$1" ]]&&cp -a "$1" "$BK/$(basename "$1")"||true; };log "Backup dirs";backupdir /etc/nginx/sites-available;backupdir /etc/nginx/sites-enabled;backupdir /etc/nginx/conf.d;log "Collecte nginx -T";nginx -T >"$BK/nginx_T.txt" 2>&1||true;log "Occurrences server_name fireinners.online + listen 443 (fichiers sources)";python3 - <<PY
-import re
-canon="$CANON"
-txt=open("$BK/nginx_T.txt","r",errors="ignore").read().splitlines()
-cur=None
-hits=[]
-for i,l in enumerate(txt):
-    m=re.match(r"^# configuration file (.+):$", l)
-    if m: cur=m.group(1).strip()
-    if cur and re.search(r"\\bserver_name\\b", l) and "fireinners.online" in l:
-        # scan forward within same file region for listen 443 and server block context
-        j=i
-        listen=False
-        for k in range(i, min(i+120, len(txt))):
-            if re.match(r"^# configuration file ", txt[k]): break
-            if re.search(r"\\blisten\\b", txt[k]) and re.search(r"\\b443\\b", txt[k]): listen=True
-            if re.search(r"\\bserver\\s*\\{\\s*$", txt[k]): pass
-        if listen:
-            hits.append((cur,i+1,l.strip()))
-# de-dup
-seen=set(); out=[]
-for h in hits:
-    key=(h[0],h[2])
-    if key in seen: continue
-    seen.add(key); out.append(h)
-print("CANON:", canon)
-if not out:
-    print("Aucun doublon détecté via nginx -T (ou pas de listen 443 à proximité).")
-else:
-    for f,ln,line in out:
-        print(f"- {f}:{ln}: {line}")
-PY
-log "Désactivation des doublons (garde CANON)";# 1) sites-enabled symlinks pointant vers des vhosts contenant server_name fireinners.online
-if [[ -d /etc/nginx/sites-enabled ]]; then
-  while IFS= read -r -d "" p; do
-    tgt="$(readlink -f "$p" || true)"
-    [[ -n "$tgt" ]]||continue
-    [[ "$tgt" == "$CANON" ]]&&continue
-    if grep -Eq "\\bserver_name\\b.*\\bfireinners\\.online\\b" "$tgt" 2>/dev/null && grep -Eq "\\blisten\\b.*\\b443\\b" "$tgt" 2>/dev/null; then
-      log "Disable sites-enabled: $p -> $tgt"
-      unlock "$p"; backup "$p"
-      rm -f "$p"
-    fi
-  done < <(find /etc/nginx/sites-enabled -maxdepth 1 -type l -print0)
-fi
-# 2) conf.d/*.conf qui contiennent server_name fireinners.online + listen 443
-if [[ -d /etc/nginx/conf.d ]]; then
-  while IFS= read -r -d "" f; do
-    [[ "$f" == "/etc/nginx/conf.d/aiaquila_rss.conf" ]]&&true
-    if grep -Eq "\\bserver_name\\b.*\\bfireinners\\.online\\b" "$f" 2>/dev/null && grep -Eq "\\blisten\\b.*\\b443\\b" "$f" 2>/dev/null; then
-      log "Disable conf.d file: $f"
-      unlock "$f"; backup "$f"
-      mv -f "$f" "$f.disabled_$TS"
-      lock "$f.disabled_$TS"
-    fi
-  done < <(find /etc/nginx/conf.d -maxdepth 1 -type f -name "*.conf" -print0)
-fi
-log "Vérif que CANON est bien enabled";if [[ -f "$CANON" ]]; then
-  # assure un symlink simple si absent
-  if ! find /etc/nginx/sites-enabled -maxdepth 1 -type l -lname "$CANON" -print -quit | grep -q .; then
-    name="$(basename "$CANON")"
-    ln -sf "$CANON" "/etc/nginx/sites-enabled/$name"
-    log "Symlink ajouté: /etc/nginx/sites-enabled/$name -> $CANON"
-  fi
-else die "CANON introuvable: $CANON"; fi
-log "nginx -t";nginx -t
-log "reload";systemctl reload nginx
-log "OK. Backup: $BK"
-log "Si tu vois encore le warning, envoie: grep -R \"server_name.*fireinners\\.online\" -n /etc/nginx | head -n 200"'
+set -euo pipefail
+echo "=== nginx -t ==="
+nginx -t || true
+echo "=== status nginx ==="
+systemctl status nginx --no-pager -l | sed -n "1,120p" || true
+echo "=== conflits fireinners.online (si encore) ==="
+nginx -T 2>&1 | grep -n "conflicting server name\|server_name.*fireinners\.online\|listen.*443" | head -n 200 || true
+echo "=== vhost actif (443) ==="
+grep -RIn --include="*.conf" "server_name[[:space:]].*fireinners\.online" /etc/nginx | head -n 200 || true
+echo "=== test route /orion (headers) ==="
+curl -skI https://fireinners.online/orion/ | sed -n "1,30p" || true
+echo "=== contenu /orion (si statique) ==="
+ls -la /var/www/orion 2>/dev/null | sed -n "1,120p" || true
+ls -la /var/www/fireinners/orion 2>/dev/null | sed -n "1,120p" || true
