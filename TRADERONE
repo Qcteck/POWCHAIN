@@ -1,17 +1,51 @@
-bash <<'EOF'
-set -e
+cat >/root/AIAQUILA_FIX_FINAL.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
 
-INDEX="/var/www/fireinners.online/aiaquila/index.html"
-BACKUP="$INDEX.bak.$(date +%Y%m%d_%H%M%S)"
+echo "=== AIAQUILA FINAL FIX (ROOT / VPS PROXY MODE) ==="
 
+SITE="fireinners.online"
+ROOT_DIR="/var/www/fireinners.online/aiaquila"
+INDEX="$ROOT_DIR/index.html"
+BACKUP="$ROOT_DIR/index.backup.$(date +%Y%m%d_%H%M%S).html"
+
+WORKER="https://aiaquila-proxy.paycashnostory.workers.dev/rss"
+
+NGX_SNIPPET="/etc/nginx/snippets/aiaquila_rss_proxy.conf"
+NGX_SITE="/etc/nginx/sites-available/$SITE"
+
+### 1. Backup frontend
+echo "[1/6] Backup frontend"
 cp -a "$INDEX" "$BACKUP"
+echo "Backup -> $BACKUP"
 
-cat > "$INDEX" <<'HTML'
+### 2. NGINX proxy snippet (VPS -> Worker)
+echo "[2/6] Writing nginx proxy snippet"
+cat >"$NGX_SNIPPET" <<NGX
+location /aiaquila/api/rss {
+    proxy_pass $WORKER;
+    proxy_set_header Host aiaquila-proxy.paycashnostory.workers.dev;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_ssl_server_name on;
+    proxy_connect_timeout 10s;
+    proxy_read_timeout 30s;
+}
+NGX
+
+### 3. Inject snippet if absent
+echo "[3/6] Injecting snippet in nginx site"
+grep -q "aiaquila_rss_proxy" "$NGX_SITE" || \
+sed -i "/server_name $SITE;/a \    include /etc/nginx/snippets/aiaquila_rss_proxy.conf;" "$NGX_SITE"
+
+### 4. Rewrite frontend (VPS LOCAL ONLY)
+echo "[4/6] Rewriting frontend (LOCAL API ONLY)"
+cat >"$INDEX" <<'HTML'
 <!doctype html>
 <html lang="fr">
 <head>
 <meta charset="utf-8">
-<title>AIAQUILA — RSS réel (XML)</title>
+<title>AIAQUILA — RSS réel (VPS)</title>
 <style>
 body{margin:0;padding:20px;background:#0b1b3a;color:#fff;font-family:system-ui}
 button{padding:10px 14px;font-size:15px;cursor:pointer}
@@ -19,7 +53,7 @@ pre{white-space:pre-wrap;margin-top:15px;font-size:14px;color:#cfe}
 </style>
 </head>
 <body>
-<h2>🦅 AIAQUILA — RSS réel (XML direct)</h2>
+<h2>🦅 AIAQUILA — RSS réel (VPS)</h2>
 <button onclick="load()">Lire les articles</button>
 <pre id="out">En attente…</pre>
 
@@ -30,13 +64,13 @@ async function load(){
  try{
   const r=await fetch("/aiaquila/api/rss?url="+encodeURIComponent("https://news.bitcoin.com/feed/"),{cache:"no-store"});
   if(!r.ok) throw r.status;
-  const txt=await r.text();
-  const xml=new DOMParser().parseFromString(txt,"text/xml");
+  const t=await r.text();
+  const xml=new DOMParser().parseFromString(t,"text/xml");
   const items=[...xml.querySelectorAll("item")].slice(0,20);
   o.textContent=items.map(i=>{
-    const t=i.querySelector("title")?.textContent||"";
-    const l=i.querySelector("link")?.textContent||"";
-    return "• "+t+"\n"+l;
+    const title=i.querySelector("title")?.textContent||"";
+    const link=i.querySelector("link")?.textContent||"";
+    return "• "+title+"\n"+link;
   }).join("\n\n");
  }catch(e){
   o.textContent="ERREUR: "+e;
@@ -47,12 +81,21 @@ async function load(){
 </html>
 HTML
 
-chown www-data:www-data "$INDEX"
+### 5. Permissions + reload nginx
+echo "[5/6] Reload nginx"
 chmod 644 "$INDEX"
-
+nginx -t
 systemctl reload nginx
 
-echo "=== ✅ AIAQUILA OK (XML MODE) ==="
-echo "Backup: $BACKUP"
-echo "URL: https://fireinners.online/aiaquila/"
-EOF
+### 6. Test VPS endpoint
+echo "[6/6] Test VPS endpoint"
+curl -fsS "https://$SITE/aiaquila/api/rss?url=https://news.bitcoin.com/feed/" | head -n 5 >/dev/null
+echo "OK : endpoint VPS fonctionnel"
+
+echo "=== AIAQUILA RÉPARÉ DÉFINITIVEMENT ==="
+echo "URL : https://$SITE/aiaquila/"
+echo "Backup : $BACKUP"
+BASH
+
+chmod +x /root/AIAQUILA_FIX_FINAL.sh
+/root/AIAQUILA_FIX_FINAL.sh
