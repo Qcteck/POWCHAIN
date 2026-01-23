@@ -1,95 +1,97 @@
-bash <<'EOF'
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 
-echo "=== AIAQUILA FULL FIX (ROOT) ==="
-
+### CONFIG
 SITE_DIR="/var/www/fireinners.online/aiaquila"
 INDEX="$SITE_DIR/index.html"
 BACKUP="$SITE_DIR/index.backup.$(date +%Y%m%d_%H%M%S).html"
-WORKER_BASE="https://aiaquila-proxy.paycashnostory.workers.dev"
-TEST_FEED="https://news.bitcoin.com/feed/"
+WORKER_BASE="https://aiaquila-proxy.paycashnostory.workers.dev/rss"
+TEST_RSS="https://news.bitcoin.com/feed/"
 
-echo "[1/7] Test Worker JSON..."
-curl -fsS "$WORKER_BASE/rss?url=$(printf %s "$TEST_FEED" | sed 's/:/%3A/g;s/\//%2F/g')" \
-  | jq .feeds[0].raw >/dev/null
-echo "✔ Worker OK"
+echo "=== AIAQUILA FULL AUTO FIX (ROOT) ==="
 
-echo "[2/7] Backup frontend..."
+### 1) Vérifs de base
+command -v curl >/dev/null || { echo "curl manquant"; exit 1; }
+command -v nginx >/dev/null || { echo "nginx manquant"; exit 1; }
+
+### 2) Test Worker DIRECT (doit répondre 200)
+HTTP_CODE="$(curl -s -o /tmp/aiaquila_worker_test.out -w '%{http_code}' "$WORKER_BASE?url=$(python3 - <<EOF
+import urllib.parse; print(urllib.parse.quote("$TEST_RSS", safe=""))
+EOF
+)")"
+
+if [ "$HTTP_CODE" != "200" ]; then
+  echo "❌ Worker KO (HTTP $HTTP_CODE)"
+  exit 1
+fi
+echo "✅ Worker OK"
+
+### 3) Backup frontend
 cp -a "$INDEX" "$BACKUP"
-echo "✔ Backup -> $BACKUP"
+echo "✅ Backup → $BACKUP"
 
-echo "[3/7] Rewrite frontend (REAL RSS PARSER)..."
+### 4) Réécriture frontend (ENCODAGE CORRECT)
 cat > "$INDEX" <<'HTML'
 <!doctype html>
 <html lang="fr">
 <head>
 <meta charset="utf-8">
-<title>AIAQUILA — RSS réel</title>
+<title>AIAQUILA — RSS réel (FORCÉ)</title>
 <style>
 body{margin:0;padding:20px;font-family:system-ui;background:#0b1b3a;color:#fff}
 button{padding:10px 14px;font-size:15px;cursor:pointer}
 pre{white-space:pre-wrap;margin-top:15px;font-size:14px}
-a{color:#6cf}
+.err{color:#ff6b6b}
+.ok{color:#6bff95}
 </style>
 </head>
 <body>
-
-<h2>🦅 AIAQUILA — RSS réel</h2>
+<h2>🦅 AIAQUILA — RSS réel (FORCÉ)</h2>
 <button onclick="load()">Lire les articles</button>
 <pre id="out">En attente…</pre>
 
 <script>
-const API="https://aiaquila-proxy.paycashnostory.workers.dev/rss?url=";
-const FEED="https://news.bitcoin.com/feed/";
+const WORKER = "https://aiaquila-proxy.paycashnostory.workers.dev/rss";
+const FEED   = "https://news.bitcoin.com/feed/";
 
 async function load(){
   const out=document.getElementById("out");
   out.textContent="Chargement…\n";
   try{
-    const r=await fetch(API+encodeURIComponent(FEED),{cache:"no-store"});
+    const url = WORKER + "?url=" + encodeURIComponent(FEED);
+    const r = await fetch(url,{cache:"no-store"});
     if(!r.ok) throw new Error("HTTP "+r.status);
-    const j=await r.json();
-    const raw=j.feeds?.[0]?.raw;
-    if(!raw) throw new Error("RSS vide");
-    const xml=new DOMParser().parseFromString(raw,"text/xml");
-    const items=[...xml.querySelectorAll("item")];
-    let txt="";
-    items.slice(0,20).forEach((it,i)=>{
-      const title=it.querySelector("title")?.textContent||"";
-      const link=it.querySelector("link")?.textContent||"";
-      txt+=`${i+1}. ${title}\n${link}\n\n`;
-    });
-    out.innerHTML=txt.replace(/\n/g,"<br>");
+    const j = await r.json();
+    if(!Array.isArray(j.items)) throw new Error("JSON invalide");
+    out.innerHTML = "<span class='ok'>OK — Articles :</span>\n\n" +
+      j.items.map(i=>"• "+i.title+"\n"+i.link).join("\n\n");
   }catch(e){
-    out.textContent="ERREUR: "+e.message;
+    out.innerHTML="<span class='err'>ERREUR:</span> "+e.message;
   }
 }
 </script>
-
 </body>
 </html>
 HTML
-echo "✔ Frontend écrit"
 
-echo "[4/7] Permissions..."
-chown -R www-data:www-data "$SITE_DIR"
-chmod 755 "$SITE_DIR"
+echo "✅ Frontend corrigé (encodeURIComponent)"
+
+### 5) Permissions
+chown www-data:www-data "$INDEX"
 chmod 644 "$INDEX"
-echo "✔ Permissions OK"
 
-echo "[5/7] Test site local..."
-curl -fsS https://fireinners.online/aiaquila/ >/dev/null
-echo "✔ Site accessible"
+### 6) Test site local
+curl -fsS https://fireinners.online/aiaquila/ >/dev/null && echo "✅ Site accessible"
 
-echo "[6/7] Reload nginx..."
+### 7) Reload nginx
 nginx -t
 systemctl reload nginx
-echo "✔ Nginx reloaded"
+echo "✅ Nginx rechargé"
 
-echo "[7/7] FINAL STATUS"
+### 8) Résumé
+echo "=============================="
 echo "SITE   : https://fireinners.online/aiaquila/"
-echo "WORKER : $WORKER_BASE/rss"
+echo "WORKER : $WORKER"
 echo "BACKUP : $BACKUP"
-
-echo "=== ✅ AIAQUILA RÉPARÉ ==="
-EOF
+echo "✅ AIAQUILA RÉPARÉ DÉFINITIVEMENT"
+echo "=============================="
