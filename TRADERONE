@@ -1,86 +1,204 @@
-bash <<'EOF'
-set -e
+cat >/root/MEGA_AQUILA_STACKING_ROUTEFIX_V2.sh <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+TS="$(date +%Y%m%d_%H%M%S)"
+BK="/root/AQUILA_STACKING_ROUTEFIX_V2_BK_$TS"
+mkdir -p "$BK"
+umask 022
 
-### CONFIG
-AIA_DIR="/var/www/fireinners.online/aiaquila"
-INDEX="$AIA_DIR/index.html"
-BACKUP="$INDEX.backup.$(date +%Y%m%d_%H%M%S)"
-WORKER_BASE="https://aiaquila-proxy.workers.dev"
+log(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
+die(){ echo "ERR: $*" >&2; exit 1; }
 
-echo "=== AIAQUILA FINAL FIX (WORKER RSS ONLY) ==="
+DOMAIN="fireinners.online"
+PATH_APP="/aquilastacking"
+WEBROOT="/var/www/aquilastacking"
+INC="/etc/nginx/includes/aquilastacking_routes.inc"
+NGINX_MAIN="/etc/nginx/nginx.conf"
 
-### CHECK DIR
-if [ ! -d "$AIA_DIR" ]; then
-  echo "❌ Dossier introuvable: $AIA_DIR"
-  exit 1
-fi
+backup_one(){ local p="$1"; [ -e "$p" ] || return 0; mkdir -p "$BK$(dirname "$p")"; cp -a "$p" "$BK$p.bak" 2>/dev/null || true; }
+lsattr_safe(){ lsattr "$1" 2>/dev/null | awk '{print $1}' || echo ""; }
+unfreeze_one(){ local f="$1"; [ -e "$f" ] || return 0; local a; a="$(lsattr_safe "$f")"; if echo "$a" | grep -q 'i'; then log "UNFREEZE: chattr -i $f"; chattr -i "$f" 2>/dev/null || true; fi; }
+refreeze_one(){ local f="$1"; [ -e "$f" ] || return 0; log "REFREEZE: chattr +i $f"; chattr +i "$f" 2>/dev/null || true; }
 
-### BACKUP
-cp "$INDEX" "$BACKUP"
-echo "✔ Backup: $BACKUP"
-
-### WRITE CLEAN FRONTEND (WORKER /rss ONLY)
-cat > "$INDEX" <<HTML
-<!DOCTYPE html>
-<html lang="fr">
-<head>
-<meta charset="utf-8">
-<title>AIAQUILA — RSS réel</title>
-<style>
-body{margin:0;font-family:system-ui;background:#0b1b3a;color:#fff}
-#wrap{padding:20px}
-button{padding:10px 14px;font-size:15px;cursor:pointer}
-pre{white-space:pre-wrap;margin-top:15px;font-size:13px}
-</style>
-</head>
-<body>
-<div id="wrap">
-<h2>🦅 AIAQUILA — RSS réel (Cloudflare Worker)</h2>
-<button onclick="load()">Lire les articles</button>
-<pre id="out">En attente…</pre>
-</div>
-
-<script>
-const WORKER_RSS = "${WORKER_BASE}/rss";
-
-async function load(){
-  const out=document.getElementById("out");
-  out.textContent="FETCH → "+WORKER_RSS+"\\n\\n";
-  try{
-    const r=await fetch(WORKER_RSS+"?url=https://news.bitcoin.com/feed/");
-    if(!r.ok) throw new Error("HTTP "+r.status);
-    const j=await r.json();
-    out.textContent="Articles reçus: "+j.length+"\\n\\n";
-    j.slice(0,20).forEach((a,i)=>{
-      out.textContent+=
-        (i+1)+". "+a.title+"\\n"+
-        a.date+"\\n"+
-        a.link+"\\n\\n";
-    });
-  }catch(e){
-    out.textContent+="ERREUR: "+e.message;
-  }
+ensure_packages(){
+  log "Packages (curl/unzip/nginx/python3 if missing)"
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y >/dev/null || true
+  for p in curl unzip nginx python3; do dpkg -s "$p" >/dev/null 2>&1 || apt-get install -y "$p" >/dev/null; done
 }
-</script>
-</body>
-</html>
+
+ensure_webroot(){
+  log "Ensure webroot: $WEBROOT"
+  mkdir -p "$WEBROOT"
+  if [ ! -f "$WEBROOT/index.html" ]; then
+    cat >"$WEBROOT/index.html" <<'HTML'
+<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Aquila Stacking</title></head><body style="margin:0;background:#071022;color:#d7f0ff;font-family:system-ui,Segoe UI,Roboto,Arial"><div style="padding:18px"><h2 style="margin:0 0 10px">Aquila Stacking</h2><div>OK — route /aquilastacking/ servie.</div></div></body></html>
 HTML
+    chmod 644 "$WEBROOT/index.html" || true
+  fi
+}
 
-### PERMS
-chown www-data:www-data "$INDEX"
-chmod 644 "$INDEX"
-
-### TEST WORKER DIRECT
-echo
-echo "=== TEST WORKER DIRECT ==="
-curl -s "$WORKER_BASE/rss?url=https://news.bitcoin.com/feed/" | head -c 400
-echo
-echo
-
-### TEST FRONTEND
-echo "=== FRONTEND URL ==="
-echo "https://fireinners.online/aiaquila/"
-
-echo
-echo "✅ AIAQUILA CORRIGÉ — WORKER RSS RÉEL — AUCUN PHP — AUCUN CORS"
+write_include(){
+  log "Write include: $INC"
+  mkdir -p "$(dirname "$INC")"
+  backup_one "$INC"
+  cat >"$INC" <<EOF
+# AQUILA_STACKING (managed) - $TS
+location = ${PATH_APP} { return 301 ${PATH_APP}/; }
+location ^~ ${PATH_APP}/ {
+  alias ${WEBROOT}/;
+  index index.html;
+  try_files \$uri \$uri/ ${PATH_APP}/index.html;
+  add_header Cache-Control "no-store" always;
+}
+location = ${PATH_APP}/sw.js { add_header Cache-Control "no-store" always; return 404; }
+location = ${PATH_APP}/service-worker.js { add_header Cache-Control "no-store" always; return 404; }
+location = ${PATH_APP}/manifest.json { add_header Cache-Control "no-store" always; return 404; }
 EOF
+  chmod 644 "$INC" || true
+}
+
+# stdout ONLY = list of files, one per line
+find_server_files(){
+  nginx -T 2>/dev/null | python3 - "$DOMAIN" <<'PY'
+import sys,re
+dom=sys.argv[1].strip()
+txt=sys.stdin.read().splitlines()
+
+cur_file=None
+files=[]
+i=0
+while i<len(txt):
+  line=txt[i]
+  m=re.match(r'#\s*configuration file\s+(\S+):\d+', line)
+  if m: cur_file=m.group(1)
+  if re.search(r'\bserver\s*\{', line):
+    start=i
+    depth=0
+    j=i
+    block=[]
+    while j<len(txt):
+      l=txt[j]
+      if '{' in l: depth += l.count('{')
+      if '}' in l: depth -= l.count('}')
+      block.append(l)
+      if depth<=0 and j>start:
+        break
+      j+=1
+    b="\n".join(block)
+    if cur_file and re.search(r'^\s*server_name\s+[^;]*\b'+re.escape(dom)+r'\b', b, re.M):
+      if cur_file not in files: files.append(cur_file)
+    i=j
+  i+=1
+print("\n".join(files))
+PY
+}
+
+patch_server_file(){
+  local f="$1"
+  [ -f "$f" ] || die "Missing server file: $f"
+  log "Patch server file: $f"
+  backup_one "$f"
+  python3 - "$f" "$INC" "$DOMAIN" <<'PY'
+import sys,re
+p,inc,dom=sys.argv[1],sys.argv[2],sys.argv[3]
+s=open(p,'r',encoding='utf-8',errors='ignore').read()
+
+# remove any existing include lines for aquilastacking_routes.inc anywhere (clean duplicates)
+s=re.sub(r'^\s*include\s+.*aquilastacking_routes\.inc\s*;\s*\n','',s,flags=re.M)
+
+def inject_into_server(block:str)->str:
+  # only inject if server_name matches dom
+  if not re.search(r'^\s*server_name\s+[^;]*\b'+re.escape(dom)+r'\b', block, re.M):
+    return block
+  ins=f"\n  include {inc};\n"
+  # inject before last }
+  return re.sub(r'\}\s*$', ins+"}\n", block, count=1)
+
+# split & rebuild by scanning server { ... } blocks with brace depth
+out=[]
+i=0
+while True:
+  m=re.search(r'\bserver\s*\{', s[i:])
+  if not m:
+    out.append(s[i:])
+    break
+  a=i+m.start()
+  b=i+m.end()
+  out.append(s[i:a])
+  j=b
+  depth=1
+  while j<len(s) and depth>0:
+    ch=s[j]
+    if ch=='#':
+      k=s.find('\n', j)
+      j = len(s) if k==-1 else k+1
+      continue
+    if ch=='{': depth+=1
+    elif ch=='}': depth-=1
+    j+=1
+  block=s[a:j]
+  out.append(inject_into_server(block))
+  i=j
+
+open(p,'w',encoding='utf-8').write(''.join(out))
+PY
+}
+
+main(){
+  log "BEGIN AQUILA STACKING ROUTEFIX V2 @ $TS"
+  log "BK: $BK"
+
+  ensure_packages
+
+  # unfreeze core files + include
+  unfreeze_one "$NGINX_MAIN"
+  unfreeze_one "$INC"
+
+  # unfreeze any file that might contain the server block for this domain
+  for f in /etc/nginx/sites-available/* /etc/nginx/sites-enabled/* /etc/nginx/conf.d/* /etc/nginx/includes/*; do
+    [ -e "$f" ] || continue
+    unfreeze_one "$f"
+  done
+
+  ensure_webroot
+  write_include
+
+  log "Detect active server file(s) for ${DOMAIN} via nginx -T"
+  files="$(find_server_files || true)"
+  if [ -z "${files//$'\n'/}" ]; then
+    log "No server files detected. Showing nginx -T matches:"
+    nginx -T 2>/dev/null | grep -n "server_name.*${DOMAIN}" | head -n 50 || true
+    die "Cannot locate active server block for ${DOMAIN}"
+  fi
+
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    patch_server_file "$f"
+  done <<<"$files"
+
+  log "nginx -t"
+  nginx -t
+
+  log "reload nginx"
+  systemctl reload nginx || service nginx reload || true
+
+  # refreeze core + server files
+  refreeze_one "$NGINX_MAIN"
+  refreeze_one "$INC"
+  while IFS= read -r f; do [ -n "$f" ] || continue; refreeze_one "$f"; done <<<"$files"
+
+  log "ORIGIN CHECK (bypass Cloudflare via --resolve -> 127.0.0.1)"
+  curl -k -sS -I --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}${PATH_APP}/" | head -n 30 || true
+
+  log "PUBLIC CHECK"
+  curl -sS -I "https://${DOMAIN}${PATH_APP}/" | head -n 30 || true
+
+  log "OPEN: https://${DOMAIN}${PATH_APP}/ (Ctrl+F5)"
+  log "DONE"
+}
+
+main "$@"
+SH
+chmod +x /root/MEGA_AQUILA_STACKING_ROUTEFIX_V2.sh
+bash /root/MEGA_AQUILA_STACKING_ROUTEFIX_V2.sh
