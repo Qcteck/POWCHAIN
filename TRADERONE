@@ -1,61 +1,95 @@
-cat >/root/AIAQUILA_FIX_ROOT.sh <<'EOF'
-#!/usr/bin/env bash
+bash -lc 'python3 - <<'"'"'PY'"'"'
+s=r"""#!/usr/bin/env bash
 set -euo pipefail
+TS="$(date +%Y%m%d_%H%M%S)"
+BK="/root/BK_WV_TRADERONE_ROUTES_$TS"
+INC="/etc/nginx/includes/wolverine_routes.inc"
+DOMAIN="fireinners.online"
+say(){ echo "[$(date -u +'%Y-%m-%d %H:%M:%S UTC')] $*"; }
 
-SITE_DIR="/var/www/fireinners.online/aiaquila"
-INDEX="$SITE_DIR/index.html"
-BACKUP="$SITE_DIR/index.backup.$(date +%Y%m%d_%H%M%S).html"
-WORKER="https://aiaquila-proxy.paycashnostory.workers.dev/rss"
-FEED="https://news.bitcoin.com/feed/"
+say "START WV_TRADERONE_ROUTES_FIX"
+mkdir -p "$BK"
+cp -a "$INC" "$BK/wolverine_routes.inc.bak" 2>/dev/null || true
+cp -a /etc/nginx "$BK/nginx" 2>/dev/null || true
 
-echo "=== AIAQUILA ROOT FIX ==="
+if command -v chattr >/dev/null 2>&1; then
+  say "UNFREEZE chattr -i (best effort)"
+  for p in /etc/nginx/nginx.conf /etc/nginx/sites-available/* /etc/nginx/sites-enabled/* /etc/nginx/conf.d/* /etc/nginx/includes/*; do
+    [ -e "$p" ] || continue
+    chattr -i "$p" 2>/dev/null || true
+  done
+fi
 
-command -v curl >/dev/null || exit 1
-command -v nginx >/dev/null || exit 1
+say "WRITE include $INC (add traderone/vault + traderone/api)"
+mkdir -p /etc/nginx/includes
+cat >"$INC" <<'EOF'
+# wolverine routes (managed)
+location = /wolverine { return 301 /wolverine/; }
 
-ENC_FEED=$(python3 - <<PY
-import urllib.parse;print(urllib.parse.quote("$FEED",safe=""))
-PY
-)
-
-HTTP=$(curl -s -o /tmp/aq.json -w "%{http_code}" "$WORKER?url=$ENC_FEED")
-[ "$HTTP" = "200" ] || { echo "Worker KO"; exit 1; }
-jq . /tmp/aq.json >/dev/null
-
-cp -a "$INDEX" "$BACKUP"
-
-cat >"$INDEX"<<'HTML'
-<!doctype html><html lang="fr"><meta charset="utf-8">
-<title>AIAQUILA — RSS réel</title>
-<style>body{background:#0b1b3a;color:#fff;font-family:system-ui;padding:20px}button{padding:10px}</style>
-<h2>🦅 AIAQUILA — RSS réel</h2>
-<button onclick="go()">Lire les articles</button>
-<pre id=o>En attente…</pre>
-<script>
-const W="https://aiaquila-proxy.paycashnostory.workers.dev/rss";
-const F="https://news.bitcoin.com/feed/";
-async function go(){
-o.textContent="Chargement…";
-try{
-const r=await fetch(W+"?url="+encodeURIComponent(F),{cache:"no-store"});
-if(!r.ok)throw r.status;
-const j=await r.json();
-o.textContent=j.items.map(x=>"• "+x.title+"\n"+x.link).join("\n\n");
-}catch(e){o.textContent="ERREUR "+e;}
+# static app
+location ^~ /wolverine/ {
+  root /var/www;
+  try_files $uri $uri/ /wolverine/index.html;
+  add_header Cache-Control "no-store" always;
 }
-</script>
-HTML
 
-chown www-data:www-data "$INDEX"
-chmod 644 "$INDEX"
+# backend 3000 (existing)
+location ^~ /wolverine/vault-api/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  proxy_pass http://127.0.0.1:3000/;
+}
 
-nginx -t
-systemctl reload nginx
+# NEW: traderone/vault -> backend 3000 (strip prefix)
+location ^~ /wolverine/traderone/vault/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  proxy_pass http://127.0.0.1:3000/;
+}
 
-curl -fsS https://fireinners.online/aiaquila/ >/dev/null
-
-echo "OK — AIAQUILA RÉPARÉ"
-echo "Backup: $BACKUP"
+# NEW: traderone/api -> backend 3000 (strip prefix)
+location ^~ /wolverine/traderone/api/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  proxy_pass http://127.0.0.1:3000/;
+}
 EOF
-chmod +x /root/AIAQUILA_FIX_ROOT.sh
-/root/AIAQUILA_FIX_ROOT.sh
+
+say "NGINX TEST"
+nginx -t
+
+say "RELOAD nginx"
+systemctl reload nginx 2>/dev/null || systemctl restart nginx
+
+if command -v chattr >/dev/null 2>&1; then
+  say "REFREEZE chattr +i (best effort)"
+  chattr +i /etc/nginx/nginx.conf 2>/dev/null || true
+  chattr +i "$INC" 2>/dev/null || true
+fi
+
+say "TEST LOCAL (bypass CF) vault-api/health"
+curl -sk --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/vault-api/health" -D - | sed -n "1,12p" || true
+echo
+say "TEST LOCAL (bypass CF) traderone/vault/health"
+curl -sk --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/traderone/vault/health" -D - | sed -n "1,12p" || true
+echo
+say "TEST LOCAL (bypass CF) traderone/api/health"
+curl -sk --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/traderone/api/health" -D - | sed -n "1,12p" || true
+echo
+say "DONE"
+say "Backups: $BK"
+say "Open: https://${DOMAIN}/wolverine/ (Ctrl+F5)"
+"""
+open("/root/WV_TRADERONE_ROUTES_FIX.sh","w",encoding="utf-8").write(s)
+PY
+chmod +x /root/WV_TRADERONE_ROUTES_FIX.sh
+bash /root/WV_TRADERONE_ROUTES_FIX.sh'
