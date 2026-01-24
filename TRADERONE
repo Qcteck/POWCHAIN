@@ -1,24 +1,146 @@
-bash -lc 'set -euo pipefail;cd /root;python3 - <<'"'"'PY'"'"'
-import os,glob,shutil,sys
-cand=[]
-for p in glob.glob("/root/*"):
-  b=os.path.basename(p)
-  if "MEGA_DEMELE" in b or "DEMELE" in b and b.endswith(".sh"):
-    cand.append(p)
-print("CANDIDATES:")
-for p in cand: print(" -",repr(os.path.basename(p)))
-# pick best match
-best=None
-for p in cand:
-  if os.path.basename(p).startswith("MEGA_DEMELE_WOLV_AQ") and p.endswith(".sh"):
-    best=p;break
-if not best and cand: best=cand[0]
-if not best:
-  print("ERROR: aucun script DEMELE trouvé dans /root"); sys.exit(1)
-dst="/root/DW.sh"
-print("USING:",repr(os.path.basename(best)),"->",dst)
-shutil.copy2(best,dst)
-PY
-sed -i '"'"'s/\r$//'"'"' /root/DW.sh || true
-chmod +x /root/DW.sh
-bash /root/DW.sh'
+bash -lc 'set -euo pipefail;cat >/root/DW_FIX.sh <<'"'"'SH'"'"'
+#!/usr/bin/env bash
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+TS="$(date +%Y%m%d_%H%M%S)"
+DOMAIN="fireinners.online"
+NGX="/etc/nginx"
+VHOST="$NGX/sites-available/fireinners.online-ssl"
+INC_DIR="$NGX/includes"
+WOLV_INC="$INC_DIR/wolverine_routes.inc"
+BK="/root/BK_NGX_DEMELE_${TS}"
+say(){ echo "[$(date -u +'%F %T UTC')] $*"; }
+
+say "BACKUP -> $BK"
+mkdir -p "$BK"
+cp -a "$NGX" "$BK/nginx" 2>/dev/null || true
+
+say "UNFREEZE chattr -i (best effort)"
+if command -v chattr >/dev/null 2>&1; then
+  chattr -i "$NGX/nginx.conf" 2>/dev/null || true
+  chattr -i "$VHOST" 2>/dev/null || true
+  chattr -i "$INC_DIR" 2>/dev/null || true
+  chattr -i "$NGX/snippets" 2>/dev/null || true
+  find "$NGX" -maxdepth 2 -type f -name "*.conf" -o -name "*.inc" 2>/dev/null | while IFS= read -r f; do chattr -i "$f" 2>/dev/null || true; done
+fi
+
+if [ ! -f "$VHOST" ]; then
+  say "ERROR: vhost introuvable: $VHOST"
+  ls -la "$NGX/sites-available" | sed -n "1,200p" || true
+  exit 1
+fi
+
+say "STEP 1) DISABLE AIAQUILA (snippets + includes) + remove accidental includes"
+# 1) disable files
+for f in "$NGX/snippets"/aiaquila*.conf "$INC_DIR"/aiaquila*.inc "$INC_DIR"/aiaquila*.conf; do
+  [ -e "$f" ] || continue
+  if [[ "$f" != *.disabled ]]; then
+    mv -f "$f" "$f.disabled_${TS}" || true
+    say "DISABLED -> $f.disabled_${TS}"
+  fi
+done
+
+# 2) remove includes referencing aiaquila everywhere (comment out include lines)
+for cfg in "$NGX/nginx.conf" "$NGX/conf.d/"*.conf "$NGX/sites-available/"* "$NGX/sites-enabled/"* "$INC_DIR/"*.inc "$INC_DIR/"*.conf "$NGX/snippets/"*.conf; do
+  [ -e "$cfg" ] || continue
+  # comment any include line that references aiaquila
+  sed -i -E 's@^([[:space:]]*include[[:space:]]+[^;]*aiaquila[^;]*;)@# DISABLED_BY_DW_FIX \1@g' "$cfg" || true
+done
+
+say "STEP 2) ENSURE /var/www/wolverine/index.html"
+mkdir -p /var/www/wolverine
+if [ ! -f /var/www/wolverine/index.html ]; then
+  cat >/var/www/wolverine/index.html <<'HTML'
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WOLVERINE OK</title><style>body{font-family:system-ui,Segoe UI,Roboto,Arial;background:#0b0f14;color:#e6eef8}main{padding:26px}a{color:#7ab7ff;text-decoration:none}</style></head><body><main><h1>WOLVERINE OK</h1><p>Si tu vois cette page, <b>/wolverine/</b> sert bien le webroot.</p><p><a href="/wolverine/">/wolverine/</a> · <a href="/wolverine/traderone/api/health">/wolverine/traderone/api/health</a> · <a href="/wolverine/traderone/vault/health">/wolverine/traderone/vault/health</a> · <a href="/wolverine/vault-api/health">/wolverine/vault-api/health</a></p></main></body></html>
+HTML
+fi
+
+say "STEP 3) WRITE Wolverine include (locations) -> $WOLV_INC"
+mkdir -p "$INC_DIR"
+cat >"$WOLV_INC" <<'EOF'
+# wolverine routes (managed)
+location = /wolverine { return 301 /wolverine/; }
+
+# static app (served from /var/www/wolverine)
+location ^~ /wolverine/ {
+  root /var/www;
+  try_files $uri $uri/ /wolverine/index.html;
+  add_header Cache-Control "no-store" always;
+}
+
+# backend 3000 (traderone api)
+location ^~ /wolverine/traderone/api/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  proxy_pass http://127.0.0.1:3000/;
+}
+
+# backend 3000 (vault api)
+location ^~ /wolverine/traderone/vault/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  proxy_pass http://127.0.0.1:3000/;
+}
+
+# optional alias endpoint (if you expose vault-api separately on 3000)
+location ^~ /wolverine/vault-api/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  proxy_pass http://127.0.0.1:3000/;
+}
+EOF
+
+say "STEP 4) ENSURE include is INSIDE server{} of $VHOST"
+# add include once, right after first 'server {' if not present
+if ! grep -qF "include $WOLV_INC;" "$VHOST"; then
+  tmp="$(mktemp)"
+  awk -v inc="  include '"$WOLV_INC"';" '
+    BEGIN{done=0}
+    {print}
+    !done && $0 ~ /^[[:space:]]*server[[:space:]]*\{/ {print inc; done=1}
+  ' "$VHOST" >"$tmp"
+  mv -f "$tmp" "$VHOST"
+  say "INCLUDE inserted in vhost"
+else
+  say "INCLUDE already present"
+fi
+
+say "STEP 5) nginx -t"
+if ! nginx -t; then
+  say "NGINX TEST FAILED. Showing relevant lines:"
+  nginx -T 2>/dev/null | egrep -n "aiaquila|wolverine|include|server_name" | tail -n 120 || true
+  exit 1
+fi
+
+say "RELOAD nginx"
+systemctl reload nginx
+
+say "REFREEZE chattr +i (best effort)"
+if command -v chattr >/dev/null 2>&1; then
+  chattr +i "$NGX/nginx.conf" 2>/dev/null || true
+  chattr +i "$VHOST" 2>/dev/null || true
+fi
+
+say "TEST URLS"
+echo "OPEN: https://${DOMAIN}/wolverine/"
+echo "OPEN: https://${DOMAIN}/wolverine/traderone/api/health"
+echo "OPEN: https://${DOMAIN}/wolverine/traderone/vault/health"
+echo "OPEN: https://${DOMAIN}/wolverine/vault-api/health"
+curl -kI "https://${DOMAIN}/wolverine/" | head -n 8 || true
+curl -kI "https://${DOMAIN}/wolverine/traderone/api/health" | head -n 8 || true
+curl -kI "https://${DOMAIN}/wolverine/traderone/vault/health" | head -n 8 || true
+curl -kI "https://${DOMAIN}/wolverine/vault-api/health" | head -n 8 || true
+
+say "DONE. Backup: $BK"
+SH
+chmod +x /root/DW_FIX.sh
+bash /root/DW_FIX.sh'
