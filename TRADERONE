@@ -1,65 +1,195 @@
-cat >/root/AQ_FIX.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
 DOMAIN="fireinners.online"
+INC="/etc/nginx/includes/wolverine_routes.inc"
 VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
-SNIP="/etc/nginx/snippets/aiaquila_proxy.conf"
-TS="$(date +%Y%m%d_%H%M%S)"
+TS="$(date -u +%Y%m%d_%H%M%S)"
+BK="/root/BK_WOLV_ROUTES_FIX_${TS}"
 
-echo "=== AIAQUILA FINAL FIX ==="
+echo "== WOLVERINE ROUTES FIX =="
+echo "Backup: $BK"
+mkdir -p "$BK"
 
-### 1) Backup
-echo "[1/6] Backup vhost"
-cp -a "$VHOST" "$VHOST.bak.$TS"
+# --- backup
+cp -a /etc/nginx "$BK/nginx" 2>/dev/null || true
+[ -f "$VHOST" ] && cp -a "$VHOST" "$BK/$(basename "$VHOST").bak" || true
+[ -f "$INC" ] && cp -a "$INC" "$BK/$(basename "$INC").bak" || true
 
-### 2) Unlock
-echo "[2/6] Unlock vhost"
-chattr -i "$VHOST" 2>/dev/null || true
+# --- unfreeze (best effort)
+if command -v chattr >/dev/null 2>&1; then
+  echo "UNFREEZE chattr -i (best effort)"
+  for f in /etc/nginx/nginx.conf /etc/nginx/sites-available/* /etc/nginx/sites-enabled/* /etc/nginx/conf.d/* /etc/nginx/includes/*; do
+    [ -e "$f" ] || continue
+    chattr -i "$f" 2>/dev/null || true
+  done
+fi
 
-### 3) Write proxy snippet (NO location)
-echo "[3/6] Write proxy snippet"
-cat >"$SNIP" <<'NGX'
-resolver 1.1.1.1 8.8.8.8 valid=300s;
-resolver_timeout 5s;
+# --- ensure webroot + index
+echo "ENSURE /var/www/wolverine/index.html"
+mkdir -p /var/www/wolverine
+cat >/var/www/wolverine/index.html <<'EOF'
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WOLVERINE OK</title><style>body{margin:0;background:#0b1020;color:#e7ecff;font:16px system-ui,Segoe UI,Roboto,Arial}main{padding:26px}a{color:#7ab7ff}h1{margin:0 0 10px;font-size:28px}</style></head><body><main><h1>WOLVERINE OK</h1><p>Si tu vois cette page, <code>/wolverine/</code> sert bien le webroot.</p><p><a href="/wolverine/vault-api/health">/wolverine/vault-api/health</a> · <a href="/wolverine/traderone/vault/health">/wolverine/traderone/vault/health</a> · <a href="/wolverine/traderone/api/health">/wolverine/traderone/api/health</a></p></main></body></html>
+EOF
 
-proxy_pass https://news.bitcoin.com/feed/;
-proxy_set_header Host news.bitcoin.com;
-proxy_set_header User-Agent "AIAQUILA-RSS";
-proxy_ssl_server_name on;
+# --- write include (NO variable expansion inside, use quoted heredoc)
+echo "WRITE $INC"
+mkdir -p /etc/nginx/includes
+cat >"$INC" <<'EOF'
+# wolverine routes (managed)
+location = /wolverine { return 301 /wolverine/; }
 
-proxy_connect_timeout 10s;
-proxy_read_timeout 30s;
-NGX
+# static app
+location ^~ /wolverine/ {
+  root /var/www;
+  try_files $uri $uri/ /wolverine/index.html;
+  add_header Cache-Control "no-store" always;
+}
 
-### 4) Inject locations into SERVER BLOCK
-echo "[4/6] Inject locations if missing"
-grep -q "location /aiaquila/api/rss" "$VHOST" || sed -i '/server_name fireinners.online;/a\
-\
-    location /aiaquila/api/rss {\
-        include /etc/nginx/snippets/aiaquila_proxy.conf;\
-    }\
-\
-    location /aiaquila/health {\
-        default_type text/plain;\
-        return 200 "OK AIAQUILA\\n";\
-    }\
-' "$VHOST"
+# backend (node) base health via vault-api prefix
+location ^~ /wolverine/vault-api/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  proxy_pass http://127.0.0.1:3000/;
+}
 
-### 5) Test + reload
-echo "[5/6] nginx test"
+# explicit health aliases (map to backend /health)
+location = /wolverine/traderone/vault/health {
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  proxy_pass http://127.0.0.1:3000/health;
+}
+location = /wolverine/traderone/api/health {
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  proxy_pass http://127.0.0.1:3000/health;
+}
+
+# traderone vault/api prefixes (keep them for real endpoints)
+location ^~ /wolverine/traderone/vault/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  proxy_pass http://127.0.0.1:3000/vault/;
+}
+location ^~ /wolverine/traderone/api/ {
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  proxy_pass http://127.0.0.1:3000/api/;
+}
+EOF
+
+# --- inject include into fireinners.online ssl vhost (deterministic, once)
+if [ ! -f "$VHOST" ]; then
+  echo "ERROR: vhost missing: $VHOST"
+  echo "Backup: $BK"
+  exit 1
+fi
+
+echo "PATCH vhost: ensure include inside server{} ($VHOST)"
+python3 - <<'PY'
+import re, pathlib, sys
+vhost=pathlib.Path("/etc/nginx/sites-available/fireinners.online-ssl")
+inc_line="include /etc/nginx/includes/wolverine_routes.inc;"
+s=vhost.read_text(encoding="utf-8", errors="ignore")
+if inc_line in s:
+    print("OK: include already present")
+    sys.exit(0)
+
+# find server block that contains server_name fireinners.online
+m=re.search(r'server\s*\{', s)
+if not m:
+    print("ERROR: no server { found")
+    sys.exit(2)
+
+# iterate server blocks
+blocks=[]
+i=0
+while True:
+    ms=re.search(r'\bserver\s*\{', s[i:])
+    if not ms: break
+    start=i+ms.start()
+    # naive brace matching
+    depth=0
+    j=start
+    while j < len(s):
+        if s[j]=='{': depth+=1
+        elif s[j]=='}':
+            depth-=1
+            if depth==0:
+                end=j+1
+                blocks.append((start,end,s[start:end]))
+                i=end
+                break
+        j+=1
+    else:
+        break
+
+target=None
+for (a,b,blk) in blocks:
+    if re.search(r'\bserver_name\b[^;]*\bfireinners\.online\b', blk):
+        target=(a,b,blk); break
+
+if not target:
+    # fallback: first server block
+    target=blocks[0]
+
+a,b,blk=target
+# insert include near top of server block (after opening line)
+lines=blk.splitlines(True)
+out=[]
+inserted=False
+for idx,line in enumerate(lines):
+    out.append(line)
+    if not inserted and re.search(r'\bserver\s*\{', line):
+        out.append("  "+inc_line+"\n")
+        inserted=True
+new_blk="".join(out)
+s2=s[:a]+new_blk+s[b:]
+vhost.write_text(s2, encoding="utf-8")
+print("OK: include inserted")
+PY
+
+echo "NGINX TEST"
 nginx -t
 
-echo "[6/6] reload nginx"
-systemctl reload nginx
+echo "RELOAD NGINX"
+systemctl reload nginx 2>/dev/null || systemctl restart nginx
 
-### 6) Relock
-chattr +i "$VHOST" 2>/dev/null || true
+# --- refreeze (best effort)
+if command -v chattr >/dev/null 2>&1; then
+  echo "REFREEZE chattr +i (best effort)"
+  chattr +i /etc/nginx/nginx.conf 2>/dev/null || true
+  chattr +i "$VHOST" 2>/dev/null || true
+  chattr +i "$INC" 2>/dev/null || true
+fi
+
+echo "== TESTS (LOCAL BYPASS + PUBLIC) =="
+echo "-- local bypass (hits origin nginx directly)"
+curl -sk --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/" | head -c 200 || true; echo
+curl -sk --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/vault-api/health" || true; echo
+curl -sk --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/traderone/vault/health" || true; echo
+curl -sk --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/traderone/api/health" || true; echo
+
+echo "-- public (through Cloudflare)"
+curl -skI "https://${DOMAIN}/wolverine/" | sed -n '1,12p' || true
+curl -sk "https://${DOMAIN}/wolverine/traderone/vault/health" || true; echo
+curl -sk "https://${DOMAIN}/wolverine/traderone/api/health" || true; echo
 
 echo "DONE"
-echo "Health : https://$DOMAIN/aiaquila/health"
-echo "RSS    : https://$DOMAIN/aiaquila/api/rss"
-BASH
-
-chmod +x /root/AQ_FIX.sh
-/root/AQ_FIX.sh
+echo "Backup saved: $BK"
+echo "Open: https://${DOMAIN}/wolverine/ (Ctrl+F5)"
