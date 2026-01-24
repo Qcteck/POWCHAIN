@@ -1,69 +1,124 @@
-cat >/root/NGX_DISABLE_BROKEN_SSL_CONFD.sh <<'SH'
+cat >/root/MEGA_FIX_WOLVERINE_STATIC.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 TS="$(date +%Y%m%d_%H%M%S)"
 NGX="/etc/nginx"
-CONFD="$NGX/conf.d"
-DIS="$NGX/disabled-conf.d"
-BK="/root/BK_NGX_CONFD_${TS}"
+VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
+INC_DIR="/etc/nginx/includes"
+INC_FILE="$INC_DIR/wolverine_static.inc"
+WWW="/var/www/wolverine"
+BK="/root/BK_WOLV_STATIC_${TS}"
 
 say(){ echo "[$(date -u +'%Y-%m-%d %H:%M:%S UTC')] $*"; }
 
-mkdir -p "$BK" "$DIS"
+mkdir -p "$BK" "$INC_DIR" "$WWW"
 
-say "BACKUP -> $BK/nginx.tgz"
+say "BACKUP nginx -> $BK/nginx.tgz"
 tar -czf "$BK/nginx.tgz" "$NGX" 2>/dev/null || tar -czf "$BK/nginx.tgz" "$NGX"
+
+say "BACKUP webroot -> $BK/wolverine.tgz"
+tar -czf "$BK/wolverine.tgz" "$WWW" 2>/dev/null || true
 
 say "UNFREEZE chattr -i (best effort)"
 if command -v chattr >/dev/null 2>&1; then
   chattr -i "$NGX/nginx.conf" 2>/dev/null || true
+  chattr -i "$VHOST" 2>/dev/null || true
   find "$NGX" -maxdepth 2 -type f \( -name "*.conf" -o -name "*.inc" \) -print0 2>/dev/null | while IFS= read -r -d '' f; do chattr -i "$f" 2>/dev/null || true; done
 fi
 
-disable_one(){
-  local f="$1"
-  [ -f "$f" ] || return 0
-  local base="$(basename "$f")"
-  local dst="$DIS/${base}.disabled_${TS}"
-  say "DISABLE -> $dst"
-  mv -f "$f" "$dst"
+say "ENSURE /var/www/wolverine/index.html exists"
+if [ ! -s "$WWW/index.html" ]; then
+  cat >"$WWW/index.html" <<'HTML'
+<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>WOLVERINE</title></head><body style="margin:0;font-family:system-ui;background:#0b1220;color:#e6eef8"><main style="padding:26px"><h1 style="margin:0 0 12px;font-size:34px">WOLVERINE OK</h1><p>Index manquant: placeholder installé. Déploie ensuite ton export Next ici: <code>/var/www/wolverine</code>.</p></main></body></html>
+HTML
+fi
+
+say "WRITE include -> $INC_FILE"
+cat >"$INC_FILE" <<EOF
+# managed by MEGA_FIX_WOLVERINE_STATIC.sh ($TS)
+# Serve static Next export (or any static site) under /wolverine from /var/www/wolverine
+
+location = /wolverine { return 301 /wolverine/; }
+
+# Next static chunks if present
+location ^~ /wolverine/_next/ {
+  root /var/www;
+  try_files \$uri =404;
+  access_log off;
+  expires 7d;
 }
 
-# 1) Disable the exact culprit if present
-disable_one "$CONFD/aiaquila_server.conf"
+# Static assets (optional)
+location ^~ /wolverine/assets/ {
+  root /var/www;
+  try_files \$uri =404;
+  access_log off;
+  expires 7d;
+}
 
-# 2) Disable any other conf.d/*.conf that has listen ssl but no ssl_certificate
-if [ -d "$CONFD" ]; then
-  while IFS= read -r -d '' f; do
-    # active listen ssl?
-    if grep -Eq '^[[:space:]]*listen[[:space:]].*\bssl\b' "$f"; then
-      # missing active ssl_certificate?
-      if ! grep -Eq '^[[:space:]]*ssl_certificate[[:space:]]+' "$f"; then
-        say "FOUND broken ssl (no ssl_certificate) in: $f"
-        disable_one "$f"
-      fi
-    fi
-  done < <(find "$CONFD" -maxdepth 1 -type f -name "*.conf" -print0 2>/dev/null)
-fi
+# Main app
+location ^~ /wolverine/ {
+  root /var/www;
+  index index.html;
+  try_files \$uri \$uri/ /wolverine/index.html;
+}
+EOF
+
+say "PATCH vhost include (ensure included once)"
+python3 - <<'PY'
+import re,sys,os
+vhost="/etc/nginx/sites-available/fireinners.online-ssl"
+inc="/etc/nginx/includes/wolverine_static.inc"
+s=open(vhost,"r",encoding="utf-8",errors="ignore").read()
+
+# remove duplicate include lines for this file
+s2=re.sub(r'^\s*include\s+'+re.escape(inc)+r'\s*;\s*\n','',s,flags=re.M)
+
+if s2==s:
+  s=s2
+else:
+  s=s2
+
+# if already present anywhere (after cleanup), add only if missing
+if re.search(r'^\s*include\s+'+re.escape(inc)+r'\s*;\s*$', s, flags=re.M):
+  open(vhost,"w",encoding="utf-8").write(s)
+  sys.exit(0)
+
+# insert include inside the first "server { ... }" block (near top, after server_name if possible)
+m=re.search(r'(server\s*\{)', s)
+if not m:
+  raise SystemExit("No server { found in vhost")
+
+# try to place after server_name line if exists
+m2=re.search(r'(^\s*server_name\s+[^;]+;\s*$)', s, flags=re.M)
+if m2:
+  pos=m2.end()
+  ins="\n    include "+inc+";\n"
+  s=s[:pos]+ins+s[pos:]
+else:
+  # fallback: just after server {
+  pos=m.end()
+  ins="\n    include "+inc+";\n"
+  s=s[:pos]+ins+s[pos:]
+
+open(vhost,"w",encoding="utf-8").write(s)
+PY
 
 say "NGINX TEST"
-if nginx -t; then
-  say "RELOAD nginx"
-  systemctl reload nginx
-else
-  say "ERROR: nginx -t failed. Showing top related lines:"
-  nginx -T 2>/dev/null | grep -nE 'conf\.d/|aiaquila|listen.*ssl|ssl_certificate|ssl_certificate_key' | head -n 260 || true
-  exit 1
-fi
+nginx -t
+
+say "RELOAD nginx"
+systemctl reload nginx
 
 say "REFREEZE chattr +i (best effort)"
 if command -v chattr >/dev/null 2>&1; then
   chattr +i "$NGX/nginx.conf" 2>/dev/null || true
+  chattr +i "$VHOST" 2>/dev/null || true
 fi
 
-say "DONE. Backup: $BK/nginx.tgz"
-echo "OPEN: https://fireinners.online/"
+say "DONE. Backup: $BK"
 echo "OPEN: https://fireinners.online/wolverine/"
+echo "CHECK: curl -kI https://fireinners.online/wolverine/ | head -n 20"
 SH
-chmod +x /root/NGX_DISABLE_BROKEN_SSL_CONFD.sh
-bash /root/NGX_DISABLE_BROKEN_SSL_CONFD.sh
+chmod +x /root/MEGA_FIX_WOLVERINE_STATIC.sh
+bash /root/MEGA_FIX_WOLVERINE_STATIC.sh
