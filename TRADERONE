@@ -1,38 +1,28 @@
-cat >/root/WOLV_ONLY_FIX.sh <<'SH'
+cat >/root/WOLV_DEDUP.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 TS="$(date +%Y%m%d_%H%M%S)"
 NGX="/etc/nginx"
 INC_DIR="$NGX/includes"
 SNIP_DIR="$NGX/snippets"
-WWW="/var/www/wolverine"
 DOMAIN="fireinners.online"
+VHOST="$NGX/sites-available/fireinners.online-ssl"
 
 say(){ echo "[$(date -u +'%Y-%m-%d %H:%M:%S UTC')] $*"; }
 
-need(){ command -v "$1" >/dev/null 2>&1 || { echo "Missing: $1"; exit 1; }; }
-need nginx
-need python3
-need tar
-need sed
-need grep
+command -v nginx >/dev/null 2>&1 || { echo "Missing nginx"; exit 1; }
+command -v python3 >/dev/null 2>&1 || { echo "Missing python3"; exit 1; }
+command -v tar >/dev/null 2>&1 || { echo "Missing tar"; exit 1; }
 
-# --- find vhost serving fireinners.online (prefer known path)
-VHOST="$NGX/sites-available/fireinners.online-ssl"
 if [ ! -f "$VHOST" ]; then
   VHOST="$(grep -RIl --include='*' -E 'server_name[[:space:]].*fireinners\.online' "$NGX/sites-available" 2>/dev/null | head -n 1 || true)"
 fi
-if [ -z "${VHOST:-}" ] || [ ! -f "$VHOST" ]; then
-  say "ERROR: cannot find vhost containing server_name fireinners.online in $NGX/sites-available"
-  ls -la "$NGX/sites-available" | sed -n '1,200p' || true
-  exit 1
-fi
+[ -f "$VHOST" ] || { say "ERROR: vhost fireinners.online introuvable"; ls -la "$NGX/sites-available" | sed -n '1,200p' || true; exit 1; }
 
-BK="/root/BK_WOLV_ONLY_${TS}"
+BK="/root/BK_WOLV_DEDUP_${TS}"
 mkdir -p "$BK"
-say "BACKUP -> $BK/nginx+wolverine.tgz"
-tar -czf "$BK/nginx+wolverine.tgz" "$NGX" 2>/dev/null || tar -czf "$BK/nginx+wolverine.tgz" "$NGX"
-if [ -d "$WWW" ]; then tar -rzf "$BK/nginx+wolverine.tgz" "$WWW" 2>/dev/null || true; fi
+say "BACKUP -> $BK/nginx.tgz"
+tar -czf "$BK/nginx.tgz" "$NGX" 2>/dev/null || tar -czf "$BK/nginx.tgz" "$NGX"
 
 say "UNFREEZE chattr -i (best effort)"
 if command -v chattr >/dev/null 2>&1; then
@@ -41,208 +31,148 @@ if command -v chattr >/dev/null 2>&1; then
   find "$NGX" -maxdepth 2 -type f \( -name "*.conf" -o -name "*.inc" \) -print0 2>/dev/null | while IFS= read -r -d '' f; do chattr -i "$f" 2>/dev/null || true; done
 fi
 
-mkdir -p "$INC_DIR" "$SNIP_DIR" "$NGX/disabled-snippets" "$NGX/disabled-includes" "$NGX/disabled-sites"
+mkdir -p "$INC_DIR"
 
-# --- Disable any aiaquila snippet/include files by moving them out of the way
-say "DISABLE AIAQUILA files (move to disabled-*)"
-for f in "$SNIP_DIR"/aiaquila*.conf "$INC_DIR"/aiaquila*.inc "$INC_DIR"/aiaquila*.conf "$SNIP_DIR"/aiaquila*.inc; do
-  [ -e "$f" ] || continue
-  base="$(basename "$f")"
-  if [[ "$f" == $SNIP_DIR/* ]]; then
-    mv -f "$f" "$NGX/disabled-snippets/${base}.disabled_${TS}" || true
-    say "DISABLED -> $NGX/disabled-snippets/${base}.disabled_${TS}"
-  else
-    mv -f "$f" "$NGX/disabled-includes/${base}.disabled_${TS}" || true
-    say "DISABLED -> $NGX/disabled-includes/${base}.disabled_${TS}"
-  fi
-done
-
-# --- Comment out any include lines referencing aiaquila anywhere (nginx.conf, conf.d, sites-available/enabled, includes)
-say "COMMENT OUT include lines referencing 'aiaquila' everywhere"
-python3 - <<PY
+say "STEP A) Comment out ALL includes of wolverine_routes everywhere (except the managed include file itself)"
+python3 - <<'PY'
 import os,re,glob
+NGX="/etc/nginx"
+INC="/etc/nginx/includes/wolverine_routes.inc"
+rx=re.compile(r'^\s*include\s+[^;]*(wolverine_routes\.inc|wolverine_routes\.conf|wolverine_routes\.inc;)[^;]*;\s*$',re.I)
 paths=set()
-for pat in [
-  "$NGX/nginx.conf",
-  "$NGX/conf.d/*.conf",
-  "$NGX/sites-available/*",
-  "$NGX/sites-enabled/*",
-  "$INC_DIR/*.inc",
-  "$INC_DIR/*.conf",
-  "$SNIP_DIR/*.conf",
-  "$SNIP_DIR/*.inc",
-]:
+for pat in [f"{NGX}/nginx.conf",f"{NGX}/conf.d/*.conf",f"{NGX}/sites-available/*",f"{NGX}/sites-enabled/*",f"{NGX}/includes/*.inc",f"{NGX}/includes/*.conf",f"{NGX}/snippets/*.conf",f"{NGX}/snippets/*.inc"]:
   for p in glob.glob(pat):
-    if os.path.isfile(p):
-      paths.add(p)
-
-rx=re.compile(r'^\s*include\s+[^;]*aiaquila[^;]*;\s*$', re.I)
+    if os.path.isfile(p): paths.add(p)
 for p in sorted(paths):
-  try:
-    with open(p,'r',encoding='utf-8',errors='ignore') as f: lines=f.read().splitlines(True)
-  except Exception:
+  if os.path.abspath(p)==os.path.abspath(INC): 
     continue
-  changed=False
-  out=[]
-  for line in lines:
-    if rx.search(line) and not line.lstrip().startswith("#"):
-      out.append("# DISABLED_BY_WOLV_ONLY_FIX "+line)
-      changed=True
-    else:
-      out.append(line)
-  if changed:
-    try:
-      b=p+".bak_"+os.environ.get("TS","") 
-    except Exception:
-      b=p+".bak"
-    try:
-      if not os.path.exists(b):
-        with open(b,'w',encoding='utf-8',errors='ignore') as fb: fb.writelines(lines)
-    except Exception:
-      pass
-    with open(p,'w',encoding='utf-8',errors='ignore') as fw: fw.writelines(out)
-PY
-
-# --- Also ensure wolverine include is NOT accidentally included in nginx.conf/global contexts
-say "COMMENT OUT any include of wolverine_routes outside vhost (safety)"
-python3 - <<PY
-import os,re,glob
-targets=["$NGX/nginx.conf"]+glob.glob("$NGX/conf.d/*.conf")
-rx=re.compile(r'^\s*include\s+[^;]*(wolverine_routes\.inc|wolverine_routes\.conf)[^;]*;\s*$', re.I)
-for p in targets:
-  if not os.path.isfile(p): 
+  try: lines=open(p,'r',encoding='utf-8',errors='ignore').read().splitlines(True)
+  except: 
     continue
-  with open(p,'r',encoding='utf-8',errors='ignore') as f: lines=f.read().splitlines(True)
   out=[]; changed=False
   for line in lines:
     if rx.search(line) and not line.lstrip().startswith("#"):
-      out.append("# DISABLED_BY_WOLV_ONLY_FIX "+line); changed=True
+      out.append("# DISABLED_BY_WOLV_DEDUP "+line); changed=True
     else:
       out.append(line)
   if changed:
-    bak=p+".bak_wolvonly"
+    bak=p+f".bak_wolv_dedup"
     if not os.path.exists(bak):
-      with open(bak,'w',encoding='utf-8',errors='ignore') as fb: fb.writelines(lines)
-    with open(p,'w',encoding='utf-8',errors='ignore') as fw: fw.writelines(out)
+      try: open(bak,'w',encoding='utf-8',errors='ignore').writelines(lines)
+      except: pass
+    open(p,'w',encoding='utf-8',errors='ignore').writelines(out)
 PY
 
-# --- Ensure webroot + index
-say "ENSURE $WWW/index.html"
-mkdir -p "$WWW"
-cat >"$WWW/index.html" <<'HTML'
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WOLVERINE OK</title><style>body{font-family:system-ui,Segoe UI,Roboto,Arial;margin:0;background:#0b0f14;color:#e6eef8}main{padding:24px}a{color:#7ab7ff}</style></head><body><main><h1>WOLVERINE OK</h1><p>Si tu vois cette page, <b>/wolverine/</b> sert bien le webroot.</p><p><a href="/wolverine/traderone/api/health">/wolverine/traderone/api/health</a> • <a href="/wolverine/traderone/vault/health">/wolverine/traderone/vault/health</a> • <a href="/wolverine/vault-api/health">/wolverine/vault-api/health</a></p></main></body></html>
-HTML
+say "STEP B) Comment out ALL location blocks that target /wolverine (everywhere except managed include)"
+python3 - <<'PY'
+import os,re,glob
+NGX="/etc/nginx"
+MANAGED="/etc/nginx/includes/wolverine_routes.inc"
+# start of a location line containing /wolverine (any variant)
+loc_start=re.compile(r'^\s*location\b.*\b/wolverine\b',re.I)
+paths=set()
+for pat in [f"{NGX}/conf.d/*.conf",f"{NGX}/sites-available/*",f"{NGX}/sites-enabled/*",f"{NGX}/includes/*.inc",f"{NGX}/includes/*.conf",f"{NGX}/snippets/*.conf",f"{NGX}/snippets/*.inc"]:
+  for p in glob.glob(pat):
+    if os.path.isfile(p): paths.add(p)
 
-# --- Write clean wolverine routes include (server-level include only)
-say "WRITE $INC_DIR/wolverine_routes.inc"
+def comment_block(lines, start_i):
+  # comment from start_i until brace depth returns to the level before the block
+  out=[]
+  depth=0
+  # determine initial depth before start_i (rough)
+  for j in range(0,start_i):
+    depth += lines[j].count("{")-lines[j].count("}")
+  target_depth=depth
+  i=start_i
+  while i<len(lines):
+    line=lines[i]
+    out.append("# DISABLED_BY_WOLV_DEDUP "+line if not line.lstrip().startswith("#") else line)
+    depth += line.count("{")-line.count("}")
+    i+=1
+    if depth<=target_depth:
+      break
+  return out,i
+
+for p in sorted(paths):
+  if os.path.abspath(p)==os.path.abspath(MANAGED):
+    continue
+  try: lines=open(p,'r',encoding='utf-8',errors='ignore').read().splitlines(True)
+  except: 
+    continue
+  changed=False
+  out=[]
+  i=0
+  while i<len(lines):
+    if loc_start.search(lines[i]) and not lines[i].lstrip().startswith("#"):
+      block,ni=comment_block(lines,i)
+      out.extend(block)
+      i=ni
+      changed=True
+    else:
+      out.append(lines[i]); i+=1
+  if changed:
+    bak=p+".bak_loc_wolv"
+    if not os.path.exists(bak):
+      try: open(bak,'w',encoding='utf-8',errors='ignore').writelines(lines)
+      except: pass
+    open(p,'w',encoding='utf-8',errors='ignore').writelines(out)
+PY
+
+say "STEP C) Write managed include with SINGLE location block (no duplicates possible inside include)"
 cat >"$INC_DIR/wolverine_routes.inc" <<'EOF'
-# wolverine routes (managed)
-location = /wolverine { return 301 /wolverine/; }
-location ^~ /wolverine/ {
+# wolverine routes (managed by WOLV_DEDUP)
+location ^~ /wolverine {
+  if ($request_uri = /wolverine) { return 301 /wolverine/; }
   root /var/www;
   try_files $uri $uri/ /wolverine/index.html;
 }
 EOF
 
-# --- Inject include into correct server{} for fireinners.online inside $VHOST
-say "PATCH vhost: ensure include inside correct server{} ($VHOST)"
+say "STEP D) Ensure include appears ONCE inside the correct vhost ($VHOST)"
 python3 - <<PY
-import re,sys
+import re,os
 path="$VHOST"
-inc="include /etc/nginx/includes/wolverine_routes.inc;"
-with open(path,'r',encoding='utf-8',errors='ignore') as f:
-    src=f.read().splitlines(True)
+inc_line="include /etc/nginx/includes/wolverine_routes.inc;"
+src=open(path,'r',encoding='utf-8',errors='ignore').read().splitlines(True)
 
-# parse server blocks by brace depth
+# Remove any existing active include lines (leave commented)
 out=[]
-i=0
-depth=0
-in_server=False
-server_depth=None
-has_fireinners=False
-server_has_inc=False
-inserted=False
-
-def line_depth_delta(line):
-    # crude but works for nginx configs (ignore braces inside quotes rarely used)
-    return line.count("{")-line.count("}")
-
-# First pass: rewrite with injection
-depth=0; in_server=False; server_depth=None; has_fireinners=False; server_has_inc=False
-for idx,line in enumerate(src):
-    stripped=line.strip()
-    # detect entering server block
-    if re.match(r'^\s*server\s*\{', line):
-        in_server=True
-        server_depth=depth+1
-        has_fireinners=False
-        server_has_inc=False
-
-    if in_server and "server_name" in line and re.search(r'\bfireinners\.online\b', line):
-        has_fireinners=True
-
-    if in_server and "wolverine_routes.inc" in line and not line.lstrip().startswith("#"):
-        server_has_inc=True
-
+for line in src:
+  if ("wolverine_routes.inc" in line) and (not line.lstrip().startswith("#")):
+    out.append("# DISABLED_BY_WOLV_DEDUP "+line)
+  else:
     out.append(line)
 
-    # insert after server_name line (first one that contains fireinners.online) if needed
-    if in_server and has_fireinners and (not server_has_inc):
-        if re.search(r'^\s*server_name\b', line) and re.search(r'\bfireinners\.online\b', line):
-            out.append("  "+inc+"\n")
-            server_has_inc=True
+# Insert once after the first server_name line containing fireinners.online (within file)
+inserted=False
+final=[]
+for line in out:
+  final.append(line)
+  if (not inserted) and re.search(r'^\s*server_name\b.*\bfireinners\.online\b', line):
+    final.append("  "+inc_line+"\n")
+    inserted=True
 
-    depth += line_depth_delta(line)
-
-    # leaving server block
-    if in_server and depth < server_depth:
-        in_server=False
-        server_depth=None
-        has_fireinners=False
-        server_has_inc=False
-
-# If never inserted but server exists and already has server_name, ensure it exists somewhere inside server:
-txt="".join(out)
-if "wolverine_routes.inc" not in txt:
-    # fallback: insert right after first 'server_name ... fireinners.online'
-    out2=[]
-    done=False
-    for line in out:
-        out2.append(line)
-        if (not done) and re.search(r'^\s*server_name\b.*\bfireinners\.online\b', line) and ("wolverine_routes.inc" not in txt):
-            out2.append("  "+inc+"\n"); done=True
-    out=out2
-
-with open(path,'w',encoding='utf-8',errors='ignore') as f:
-    f.write("".join(out))
+open(path,'w',encoding='utf-8',errors='ignore').writelines(final)
 PY
 
-# --- nginx test/reload
-say "NGINX TEST"
+say "STEP E) nginx test"
 if nginx -t; then
   say "RELOAD nginx"
   systemctl reload nginx
 else
-  say "ERROR: nginx -t failed. Showing relevant lines:"
-  nginx -T 2>/dev/null | grep -nE 'aiaquila|wolverine_routes|/wolverine' | head -n 200 || true
+  say "ERROR: nginx -t failed (show wolverine-related lines)"
+  nginx -T 2>/dev/null | grep -nE 'wolverine|wolverine_routes' | head -n 250 || true
   exit 1
 fi
 
-# --- refreeze best effort (only nginx.conf + vhost)
 say "REFREEZE chattr +i (best effort)"
 if command -v chattr >/dev/null 2>&1; then
   chattr +i "$NGX/nginx.conf" 2>/dev/null || true
   chattr +i "$VHOST" 2>/dev/null || true
 fi
 
-say "TEST URLs"
+say "DONE. Backup: $BK/nginx.tgz"
 echo "OPEN: https://${DOMAIN}/wolverine/"
-echo "OPEN: https://${DOMAIN}/wolverine/traderone/api/health"
-echo "OPEN: https://${DOMAIN}/wolverine/traderone/vault/health"
-echo "OPEN: https://${DOMAIN}/wolverine/vault-api/health"
-curl -kI "https://${DOMAIN}/wolverine/" | head -n 8 || true
-
-say "DONE. Backup: $BK/nginx+wolverine.tgz"
 SH
-chmod +x /root/WOLV_ONLY_FIX.sh
-bash /root/WOLV_ONLY_FIX.sh
+chmod +x /root/WOLV_DEDUP.sh
+bash /root/WOLV_DEDUP.sh
