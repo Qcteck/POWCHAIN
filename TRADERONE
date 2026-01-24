@@ -1,590 +1,67 @@
-bash -lc 'set -euo pipefail
-cat >/root/MEGA_AIAQUILA_FIX_APPROVE.sh <<'"'"'BASH'"'"'
+cat >/root/AIAQUILA_LOCATION_FIX.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
 TS="$(date +%Y%m%d_%H%M%S)"
-BK="/root/AIAQUILA_BK_${TS}"
-DOMAIN="fireinners.online"
-SLUG="/aiaquila"
-WEB="/var/www/aiaquila"
-VENDOR="${WEB}/vendor"
-INC="/etc/nginx/includes/aiaquila_routes.inc"
-ASKLIB="/opt/fireinners/sentinel/lib/askorupdate.sh"
+VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
+SNIP="/etc/nginx/snippets/aiaquila_proxy.conf"
 
-say(){ printf "[%s] %s\n" "$(date +%H:%M:%S)" "$*"; }
-die(){ say "ERR: $*"; exit 1; }
-need(){ command -v "$1" >/dev/null 2>&1 || die "missing: $1"; }
+echo "=== AIAQUILA LOCATION FIX ==="
 
-[ "$(id -u)" -eq 0 ] || die "run as root"
+### 1) Backup vhost
+echo "[1/7] Backup vhost"
+cp -a "$VHOST" "$VHOST.backup.$TS"
 
-need bash
-need curl
-need sha256sum
-need python3
-need nginx
-need systemctl
+### 2) Remove immutable
+echo "[2/7] Remove immutable flag"
+chattr -i "$VHOST"
 
-# Optional askorupdate (preferred)
-if [ -f "$ASKLIB" ]; then
-  # shellcheck disable=SC1090
-  . "$ASKLIB" || true
-fi
+### 3) Write CLEAN snippet (NO location)
+echo "[3/7] Write clean proxy snippet"
+cat >"$SNIP" <<'NGX'
+resolver 1.1.1.1 8.8.8.8 valid=300s;
+resolver_timeout 5s;
 
-backup_path(){
-  local p="$1"
-  [ -e "$p" ] || return 0
-  mkdir -p "$BK/$(dirname "$p")"
-  cp -a "$p" "$BK/$p.bak" 2>/dev/null || true
-}
+proxy_pass https://news.bitcoin.com/feed/;
+proxy_set_header Host news.bitcoin.com;
+proxy_set_header User-Agent "AIAQUILA-RSS";
+proxy_ssl_server_name on;
 
-write_file(){
-  local path="$1"; shift
-  local tmp; tmp="$(mktemp)"
-  cat >"$tmp" <<EOF
-$*
-EOF
-  mkdir -p "$(dirname "$path")"
-  chattr -i "$path" 2>/dev/null || true
-  backup_path "$path"
-  if declare -F askorupdate_file >/dev/null 2>&1; then
-    ASKORUPDATE_ASK=0 askorupdate_file "$path" "$tmp" "aiaquila" || { rm -f "$tmp"; die "askorupdate_file failed: $path"; }
-  else
-    install -m 0644 "$tmp" "$path"
-  fi
-  rm -f "$tmp"
-}
+proxy_connect_timeout 10s;
+proxy_read_timeout 30s;
+NGX
 
-download(){
-  local url="$1" out="$2"
-  mkdir -p "$(dirname "$out")"
-  if [ -s "$out" ]; then
-    say "vendor ok: $out"
-    return 0
-  fi
-  say "download: $url -> $out"
-  curl -fsSL "$url" -o "$out"
-}
+### 4) Ensure locations exist in SERVER BLOCK
+echo "[4/7] Inject locations in server block if missing"
 
-# Detect active vhost for fireinners.online:443
-detect_vhost(){
-  local cand=""
-  if [ -f /etc/nginx/conf.d/000-fireinners.online-ssl.conf ]; then
-    cand="/etc/nginx/conf.d/000-fireinners.online-ssl.conf"
-    echo "$cand"; return 0
-  fi
-  if [ -f /etc/nginx/sites-available/fireinners.online-ssl ]; then
-    cand="/etc/nginx/sites-available/fireinners.online-ssl"
-    echo "$cand"; return 0
-  fi
-  # Fallback: parse nginx -T with python
-  python3 - <<PY
-import re,subprocess,sys
-dom="${DOMAIN}"
-txt=subprocess.check_output(["nginx","-T"],stderr=subprocess.STDOUT).decode("utf-8","ignore")
-# nginx -T includes "configuration file /path:" lines
-current=None
-files=set()
-for line in txt.splitlines():
-    m=re.search(r"configuration file (.*?):", line)
-    if m: current=m.group(1).strip()
-    if current and ("server_name" in line) and re.search(r"\\b"+re.escape(dom)+r"\\b", line):
-        files.add(current)
-# Prefer conf.d then sites-available
-prefs=[f for f in files if "/etc/nginx/conf.d/" in f] + [f for f in files if "/etc/nginx/sites-available/" in f] + list(files)
-print(prefs[0] if prefs else "")
-PY
-}
+grep -q "location /aiaquila/api/rss" "$VHOST" || sed -i '/server_name fireinners.online;/a\
+\
+    location /aiaquila/api/rss {\
+        include /etc/nginx/snippets/aiaquila_proxy.conf;\
+    }\
+\
+    location /aiaquila/health {\
+        default_type text/plain;\
+        return 200 "OK AIAQUILA\\n";\
+    }\
+' "$VHOST"
 
-inject_include_into_vhost(){
-  local vhost="$1"
-  [ -n "$vhost" ] || die "cannot detect vhost for $DOMAIN"
-  [ -f "$vhost" ] || die "vhost not found: $vhost"
+### 5) Restore immutable
+echo "[5/7] Restore immutable flag"
+chattr +i "$VHOST"
 
-  say "inject include -> $vhost"
-  chattr -i "$vhost" 2>/dev/null || true
-  backup_path "$vhost"
+### 6) nginx test
+echo "[6/7] nginx test"
+nginx -t
 
-  # Idempotent inject: only inside TLS server block for fireinners.online
-  python3 - "$vhost" "$DOMAIN" "$INC" <<'"'"'PY'"'"'
-import re,sys
-p,dom,inc=sys.argv[1],sys.argv[2],sys.argv[3]
-s=open(p,'r',encoding='utf-8',errors='ignore').read()
+### 7) reload
+echo "[7/7] reload nginx"
+systemctl reload nginx
 
-def patch_server_block(block:str):
-    if inc in block:
-        return block, False
-    if not re.search(r'\blisten\b[^;]*\b443\b', block):
-        return block, False
-    if not re.search(r'\bserver_name\b[^;]*\b'+re.escape(dom)+r'\b', block):
-        return block, False
-    lines=block.splitlines()
-    ins=None
-    for i,l in enumerate(lines):
-        if re.search(r'\bserver_name\b', l):
-            ins=i+1; break
-    if ins is None: ins=1
-    lines.insert(ins, "    include %s;"%inc)
-    return "\n".join(lines), True
-
-out=[]
-changed=False
-pos=0
-for m in re.finditer(r'\bserver\s*\{', s):
-    start=m.start()
-    out.append(s[pos:start])
-    i=start; depth=0
-    while i < len(s):
-        c=s[i]
-        if c=="{": depth+=1
-        elif c=="}":
-            depth-=1
-            if depth==0:
-                end=i+1
-                blk=s[start:end]
-                nblk,ch=patch_server_block(blk)
-                out.append(nblk)
-                changed = changed or ch
-                pos=end
-                break
-        i+=1
-out.append(s[pos:])
-ns="".join(out)
-if changed:
-    open(p,'w',encoding='utf-8').write(ns)
-print("changed" if changed else "nochange")
-PY
-
-  grep -qF "$INC" "$vhost" || die "include injection failed"
-}
-
-main(){
-  say "== 0) backup dir =="
-  mkdir -p "$BK"
-
-  say "== 1) unfreeze nginx (best-effort) =="
-  chattr -i /etc/nginx/nginx.conf 2>/dev/null || true
-  [ -f /etc/nginx/conf.d/000-fireinners.online-ssl.conf ] && chattr -i /etc/nginx/conf.d/000-fireinners.online-ssl.conf 2>/dev/null || true
-  [ -f /etc/nginx/sites-available/fireinners.online-ssl ] && chattr -i /etc/nginx/sites-available/fireinners.online-ssl 2>/dev/null || true
-  chattr -i "$INC" 2>/dev/null || true
-
-  say "== 2) ensure dirs =="
-  mkdir -p "$VENDOR"
-  chmod 0755 "$WEB" "$VENDOR" || true
-  chown -R www-data:www-data "$WEB" 2>/dev/null || true
-
-  say "== 3) vendor (PIN local, no CDN at runtime) =="
-  # Pinned versions
-  WEB3_VER="1.95.4"
-  # web3 iife
-  download "https://unpkg.com/@solana/web3.js@${WEB3_VER}/lib/index.iife.min.js" "${VENDOR}/solana-web3.iife.min.js"
-  # process polyfill
-  download "https://unpkg.com/process@0.11.10/browser.js" "${VENDOR}/process.min.js"
-  # buffer polyfill (UMD-ish)
-  download "https://unpkg.com/buffer@6.0.3/index.min.js" "${VENDOR}/buffer.min.js"
-
-  say "== 4) write index.html (Buffer BEFORE web3; policy+idempotence+finalized) =="
-  write_file "${WEB}/index.html" "<!doctype html>
-<html lang=\"fr\"><head><meta charset=\"utf-8\"/>
-<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"/>
-<title>AIAQUILA • Execution Réelle (Phantom) • Policy</title>
-<style>
-:root{--bg:#05070b;--panel:#0a0f1c;--line:#1b2450;--txt:#e6ebff;--ok:#3cff9e;--bad:#ff4d4d;--mut:#9fb0ff}
-html,body{margin:0;padding:0;background:var(--bg);color:var(--txt);font-family:system-ui}
-#app{display:grid;grid-template-columns:320px 1fr;min-height:100vh}
-aside{background:var(--panel);border-right:1px solid var(--line);padding:14px}
-main{padding:14px}
-.box{border:1px solid var(--line);border-radius:10px;background:rgba(7,12,24,.75);padding:12px;margin-bottom:12px}
-.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-.mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;white-space:pre-wrap;word-break:break-word;line-height:1.35}
-.small{font-size:12px;color:var(--mut)}
-input,button{background:#0e1633;color:var(--txt);border:1px solid #2b3cff;padding:8px 10px;border-radius:8px}
-button{cursor:pointer}
-.ok{border-color:var(--ok)}
-.bad{border-color:var(--bad)}
-.chip{display:inline-block;padding:3px 8px;border-radius:999px;border:1px solid var(--line);font-size:12px}
-.warn{color:#ffd2d2}
-</style></head>
-<body>
-<div id=\"app\">
-<aside>
-  <div class=\"box\">
-    <div style=\"font-weight:800\">AIAQUILA</div>
-    <div class=\"small\">Frontend-only • Signature réelle Phantom • Policy (allowlist/quota/idempotence/finalized)</div>
-    <div style=\"margin-top:10px\" class=\"row\">
-      <span class=\"chip\" id=\"chipNET\">NET:?</span>
-      <span class=\"chip\" id=\"chipRPC\">RPC:?</span>
-      <span class=\"chip\" id=\"chipWAL\">WALLET:OFF</span>
-      <span class=\"chip\" id=\"chipARM\">ARM:OFF</span>
-    </div>
-  </div>
-
-  <div class=\"box\">
-    <div style=\"font-weight:700;margin-bottom:8px\">Wallet</div>
-    <div class=\"row\" style=\"margin-bottom:10px\">
-      <button class=\"ok\" id=\"btnConnect\">CONNECT PHANTOM</button>
-      <button class=\"bad\" id=\"btnDisconnect\">DISCONNECT</button>
-    </div>
-    <div class=\"mono\" id=\"walletLine\">Déconnecté</div>
-  </div>
-
-  <div class=\"box\">
-    <div style=\"font-weight:700;margin-bottom:8px\">Action</div>
-    <div class=\"small\">Destination (pubkey allowlist)</div>
-    <input id=\"dest\" style=\"width:100%\" placeholder=\"DEST (pubkey)\"/>
-    <div class=\"row\" style=\"margin-top:10px\">
-      <div style=\"flex:1\">
-        <div class=\"small\">Lamports</div>
-        <input id=\"lam\" style=\"width:100%\" type=\"number\" min=\"1\" step=\"1\"/>
-      </div>
-      <div style=\"flex:1\">
-        <div class=\"small\">Cooldown (sec)</div>
-        <input id=\"cool\" style=\"width:100%\" type=\"number\" min=\"0\" step=\"1\"/>
-      </div>
-    </div>
-    <div class=\"row\" style=\"margin-top:10px\">
-      <button class=\"ok\" id=\"btnARM\">ARM</button>
-      <button class=\"bad\" id=\"btnDISARM\">DISARM</button>
-    </div>
-    <div class=\"row\" style=\"margin-top:10px\">
-      <button id=\"btnPropose\">PROPOSE (PENDING)</button>
-      <button class=\"ok\" id=\"btnApprove\">APPROUVER & SIGNER</button>
-      <button class=\"bad\" id=\"btnReject\">REJETER</button>
-    </div>
-  </div>
-
-  <div class=\"box\">
-    <div class=\"row\" style=\"justify-content:space-between\">
-      <div style=\"font-weight:700\">Policy</div>
-      <span class=\"chip\" id=\"chipPOL\">POLICY:?</span>
-    </div>
-    <div class=\"small\" style=\"margin-top:6px\">Allowlist destinations (1 par ligne)</div>
-    <textarea id=\"allow\" style=\"width:100%;height:96px;background:#0e1633;color:#e6ebff;border:1px solid #2b3cff;border-radius:8px;padding:8px\"></textarea>
-    <div class=\"row\" style=\"margin-top:8px\">
-      <button id=\"btnSavePolicy\">SAVE</button>
-      <button id=\"btnLoadPolicy\">LOAD</button>
-    </div>
-    <div class=\"small\" style=\"margin-top:8px\">
-      Quota: <span id=\"quotaLine\"></span><br/>
-      Kill-switch: <span id=\"killLine\"></span>
-    </div>
-    <div class=\"row\" style=\"margin-top:8px\">
-      <button class=\"bad\" id=\"btnKill\">KILL-SWITCH ON</button>
-      <button class=\"ok\" id=\"btnUnkill\">KILL-SWITCH OFF</button>
-    </div>
-  </div>
-</aside>
-
-<main>
-  <div class=\"box\">
-    <div class=\"row\" style=\"justify-content:space-between\">
-      <div style=\"font-weight:700\">Console</div>
-      <span class=\"chip\" id=\"chipST\">STATE:?</span>
-    </div>
-    <div class=\"mono\" id=\"log\"></div>
-    <div class=\"row\" style=\"margin-top:10px\">
-      <button id=\"btnRefresh\">REFRESH</button>
-      <button id=\"btnClear\">CLEAR LOG</button>
-    </div>
-  </div>
-</main>
-</div>
-
-<!-- ===== Polyfills MUST be before web3 ===== -->
-<script src=\"${SLUG}/vendor/process.min.js\"></script>
-<script src=\"${SLUG}/vendor/buffer.min.js\"></script>
-<script>
-/* AIAQUILA_BUFFER_POLYFILL_V1 */
-(function(){
-  try{
-    if(!globalThis.global) globalThis.global=globalThis;
-    // process
-    if(!globalThis.process){
-      if(typeof process!=\"undefined\") globalThis.process=process;
-      else globalThis.process={env:{}};
-    } else if(!globalThis.process.env){ globalThis.process.env={}; }
-    // Buffer
-    if(!globalThis.Buffer){
-      if(globalThis.buffer && globalThis.buffer.Buffer) globalThis.Buffer=globalThis.buffer.Buffer;
-    }
-  }catch(e){}
-})();
-</script>
-<script src=\"${SLUG}/vendor/solana-web3.iife.min.js\"></script>
-
-<script>
-/* ===== Config ===== */
-const RPC=\"https://api.mainnet-beta.solana.com\";
-const DBK=\"AIAQUILA_DB_V2\";
-
-/* ===== DB ===== */
-const now=()=>Date.now();
-const load=()=>{try{return JSON.parse(localStorage.getItem(DBK)||\"null\")}catch(e){return null}};
-const save=(d)=>localStorage.setItem(DBK,JSON.stringify(d));
-
-let DB=load()||{
-  arm:false,
-  kill:false,
-  cooldownSec:10,
-  lastActionAt:0,
-  pending:null,        // {id, dest, lamports, createdAt}
-  sentLog:[],          // [{t,sig,dest,lamports,slot,finalized}]
-  quota:{windowMs:10*60*1000,maxTx:3}, // 3 tx / 10 minutes
-  allowlist:[],
-  logs:[]
-};
-save(DB);
-
-/* ===== UI ===== */
-const \$=id=>document.getElementById(id);
-function log(msg,type){
-  const line=`[${new Date().toISOString()}] ${type||\"INFO\"} ${msg}`;
-  DB.logs.push(line);
-  if(DB.logs.length>200) DB.logs=DB.logs.slice(-200);
-  save(DB);
-  render();
-}
-function render(){
-  \$(\"chipRPC\").textContent=\"RPC:mainnet\";
-  \$(\"chipARM\").textContent=\"ARM:\"+(DB.arm?\"ON\":\"OFF\");
-  \$(\"chipPOL\").textContent=\"POLICY:\"+(DB.kill?\"KILL\":\"OK\");
-  \$(\"chipST\").textContent=\"STATE:\"+(DB.pending?\"PENDING\":\"IDLE\");
-  \$(\"log\").textContent=DB.logs.slice(-120).join(\"\\n\");
-  \$(\"lam\").value=String((DB.pending&&DB.pending.lamports)||1000000);
-  \$(\"cool\").value=String(DB.cooldownSec||0);
-  \$(\"allow\").value=(DB.allowlist||[]).join(\"\\n\");
-  \$(\"quotaLine\").textContent=`${DB.quota.maxTx} tx / ${(DB.quota.windowMs/60000)|0} min`;
-  \$(\"killLine\").textContent=DB.kill?\"ON\":\"OFF\";
-}
-render();
-
-/* ===== Phantom / web3 ===== */
-let provider=null;
-let pubkey=null;
-
-function providerOk(){
-  if(!window.solana || !window.solana.isPhantom) return false;
-  return true;
-}
-
-async function connect(){
-  if(!providerOk()) throw new Error(\"Phantom requis\");
-  provider=window.solana;
-  const r=await provider.connect();
-  pubkey=r.publicKey.toString();
-  \$(\"chipWAL\").textContent=\"WALLET:ON\";
-  \$(\"walletLine\").textContent=pubkey;
-  log(\"Wallet connecté: \"+pubkey);
-}
-
-async function disconnect(){
-  try{ if(provider && provider.disconnect) await provider.disconnect(); }catch(e){}
-  provider=null; pubkey=null;
-  \$(\"chipWAL\").textContent=\"WALLET:OFF\";
-  \$(\"walletLine\").textContent=\"Déconnecté\";
-  log(\"Wallet déconnecté\");
-}
-
-/* ===== Policy ===== */
-function parseAllowlist(txt){
-  return txt.split(/\\r?\\n/).map(s=>s.trim()).filter(Boolean);
-}
-function inAllowlist(dest){
-  const a=(DB.allowlist||[]).map(s=>s.trim());
-  return a.includes(dest.trim());
-}
-function quotaCount(){
-  const w=DB.quota.windowMs;
-  const t0=now()-w;
-  return (DB.sentLog||[]).filter(x=>x.t>=t0).length;
-}
-function cooldownOk(){
-  const cd=(DB.cooldownSec||0)*1000;
-  return (now()- (DB.lastActionAt||0)) >= cd;
-}
-
-/* ===== Buttons ===== */
-\$(\"btnConnect\").onclick=async()=>{ try{ await connect(); }catch(e){ log(e.message||String(e),\"ERR\"); alert(e.message||String(e)); } };
-\$(\"btnDisconnect\").onclick=async()=>{ await disconnect(); };
-
-\$(\"btnARM\").onclick=()=>{ DB.arm=true; save(DB); log(\"ARM ON\"); render(); };
-\$(\"btnDISARM\").onclick=()=>{ DB.arm=false; save(DB); log(\"ARM OFF\"); render(); };
-
-\$(\"btnKill\").onclick=()=>{ DB.kill=true; save(DB); log(\"KILL-SWITCH ON\",\"WARN\"); render(); };
-\$(\"btnUnkill\").onclick=()=>{ DB.kill=false; save(DB); log(\"KILL-SWITCH OFF\"); render(); };
-
-\$(\"btnSavePolicy\").onclick=()=>{
-  DB.allowlist=parseAllowlist(\$(\"allow\").value);
-  save(DB);
-  log(\"Policy sauvegardée: allowlist=\"+DB.allowlist.length);
-};
-\$(\"btnLoadPolicy\").onclick=()=>{ render(); log(\"Policy rechargée\"); };
-
-\$(\"btnRefresh\").onclick=()=>{ render(); log(\"Refresh\"); };
-\$(\"btnClear\").onclick=()=>{ DB.logs=[]; save(DB); render(); };
-
-\$(\"btnPropose\").onclick=()=>{
-  try{
-    if(DB.kill) throw new Error(\"KILL-SWITCH actif\");
-    if(!DB.arm) throw new Error(\"ARM requis\");
-    if(!provider||!pubkey) throw new Error(\"Wallet requis\");
-    if(DB.pending) throw new Error(\"Déjà PENDING (rejeter ou signer)\");
-    DB.cooldownSec=parseInt(\$(\"cool\").value||\"0\",10)||0;
-
-    const dest=(\$(\"dest\").value||\"\").trim();
-    const lamports=parseInt(\$(\"lam\").value||\"0\",10);
-    if(!dest) throw new Error(\"Destination requise\");
-    if(!Number.isFinite(lamports) || lamports<=0) throw new Error(\"Lamports invalides\");
-    if(!inAllowlist(dest)) throw new Error(\"Destination hors allowlist\");
-    if(quotaCount()>=DB.quota.maxTx) throw new Error(\"Quota dépassé\");
-    if(!cooldownOk()) throw new Error(\"Cooldown actif\");
-    // Validate pubkeys (throws if invalid)
-    new solanaWeb3.PublicKey(dest);
-    new solanaWeb3.PublicKey(pubkey);
-
-    const pid=\"p_\"+Math.random().toString(16).slice(2)+\"_\"+Date.now();
-    DB.pending={id:pid,dest,lamports,createdAt:now()};
-    save(DB);
-    log(`Proposition OK -> ${dest} + ${lamports} lamports (id ${pid})`);
-  }catch(e){
-    log(e.message||String(e),\"ERR\");
-    alert(e.message||String(e));
-  }
-};
-
-\$(\"btnReject\").onclick=()=>{
-  if(DB.pending){ log(\"Proposition rejetée: \"+DB.pending.id,\"WARN\"); DB.pending=null; save(DB); render(); }
-  else log(\"Aucune proposition à rejeter\",\"WARN\");
-};
-
-let busy=false;
-
-\$(\"btnApprove\").onclick=async()=>{
-  if(busy) return;
-  busy=true;
-  try{
-    if(DB.kill) throw new Error(\"KILL-SWITCH actif\");
-    if(!DB.arm) throw new Error(\"ARM requis\");
-    if(!provider||!pubkey) throw new Error(\"Wallet requis\");
-    if(!DB.pending) throw new Error(\"Aucune proposition (PROPOSE d\\x27abord)\");
-    if(!cooldownOk()) throw new Error(\"Cooldown actif\");
-    if(quotaCount()>=DB.quota.maxTx) throw new Error(\"Quota dépassé\");
-    if(!inAllowlist(DB.pending.dest)) throw new Error(\"Destination hors allowlist\");
-
-    const conn=new solanaWeb3.Connection(RPC,{commitment:\"confirmed\"});
-    const from=new solanaWeb3.PublicKey(pubkey);
-    const to=new solanaWeb3.PublicKey(DB.pending.dest);
-
-    // Blockhash
-    const bh=await conn.getLatestBlockhash(\"confirmed\");
-
-    const tx=new solanaWeb3.Transaction({
-      feePayer: from,
-      recentBlockhash: bh.blockhash
-    }).add(
-      solanaWeb3.SystemProgram.transfer({
-        fromPubkey: from,
-        toPubkey: to,
-        lamports: DB.pending.lamports
-      })
-    );
-
-    log(\"Signature demandée à Phantom…\");
-    let signed;
-    try{
-      signed=await provider.signTransaction(tx);
-    }catch(e){
-      throw new Error(\"User reject / signTransaction failed\");
-    }
-
-    log(\"Envoi TX…\");
-    let sig;
-    try{
-      sig=await conn.sendRawTransaction(signed.serialize(),{skipPreflight:false,maxRetries:3});
-    }catch(e){
-      throw new Error(\"sendRawTransaction failed (RPC/down/rate-limit)\");
-    }
-
-    log(\"Confirmations… (finalized)\");
-    const conf=await conn.confirmTransaction({signature:sig,blockhash:bh.blockhash,lastValidBlockHeight:bh.lastValidBlockHeight},\"finalized\");
-    if(conf && conf.value && conf.value.err) throw new Error(\"finalized err: \"+JSON.stringify(conf.value.err));
-
-    DB.lastActionAt=now();
-    DB.sentLog.push({t:now(),sig,dest:DB.pending.dest,lamports:DB.pending.lamports,finalized:true});
-    if(DB.sentLog.length>50) DB.sentLog=DB.sentLog.slice(-50);
-
-    log(\"TX FINALIZED: \"+sig);
-    DB.pending=null;
-    save(DB);
-    render();
-  }catch(e){
-    log(e.message||String(e),\"ERR\");
-    alert(e.message||String(e));
-  }finally{
-    busy=false;
-  }
-};
-
-/* ===== Init ===== */
-(function init(){
-  \$(\"chipNET\").textContent=\"NET:mainnet\";
-  \$(\"dest\").value=(DB.allowlist && DB.allowlist[0])?DB.allowlist[0]:\"\";
-  // sane defaults if empty allowlist
-  if(!(DB.allowlist||[]).length){
-    DB.allowlist=[\"11111111111111111111111111111111\"];
-    save(DB);
-  }
-  render();
-  log(\"UI prête. (Si Approve échoue: vérifier allowlist + Buffer polyfill OK)\");
-})();
-</script>
-</body></html>"
-
-  say "== 5) nginx include routes (/aiaquila + /aiaquila/api/health) =="
-  write_file "$INC" "# AIAQUILA routes
-location = ${SLUG} { return 301 ${SLUG}/; }
-location ^~ ${SLUG}/vendor/ { root /var/www; try_files \$uri =404; add_header Cache-Control \"public, max-age=31536000, immutable\" always; }
-location ^~ ${SLUG}/ {
-  root /var/www;
-  try_files \$uri \$uri/ ${SLUG}/index.html;
-  add_header Cache-Control \"no-store\" always;
-}
-location = ${SLUG}/api/health {
-  default_type application/json;
-  add_header Cache-Control \"no-store\" always;
-  return 200 '{\"ok\":true,\"svc\":\"aiaquila\"}';
-}
-"
-
-  say "== 6) inject include into active vhost =="
-  VHOST="$(detect_vhost)"
-  [ -n "$VHOST" ] || die "no vhost found for $DOMAIN"
-  inject_include_into_vhost "$VHOST"
-
-  say "== 7) nginx test + reload =="
-  nginx -t
-  systemctl reload nginx
-
-  say "== 8) freeze (best-effort) =="
-  chattr +i /etc/nginx/nginx.conf 2>/dev/null || true
-  chattr +i "$VHOST" 2>/dev/null || true
-  chattr +i "$INC" 2>/dev/null || true
-
-  say "== 9) smoke tests (must NOT be 404) =="
-  echo "--- HEAD https://127.0.0.1${SLUG}/ (Host:${DOMAIN}) ---"
-  curl -skI -H "Host: ${DOMAIN}" "https://127.0.0.1${SLUG}/" | head -n 12 || true
-  echo "--- GET  https://127.0.0.1${SLUG}/api/health (Host:${DOMAIN}) ---"
-  curl -sk -H "Host: ${DOMAIN}" "https://127.0.0.1${SLUG}/api/health" || true
-  echo
-
-  say "DONE"
-  say "URL: https://${DOMAIN}${SLUG}/"
-  say "Health: https://${DOMAIN}${SLUG}/api/health"
-  say "Backup: $BK"
-}
-
-main
+echo "DONE"
+echo "Health : https://fireinners.online/aiaquila/health"
+echo "RSS    : https://fireinners.online/aiaquila/api/rss"
 BASH
-chmod 755 /root/MEGA_AIAQUILA_FIX_APPROVE.sh
-/root/MEGA_AIAQUILA_FIX_APPROVE.sh
-' 
+
+chmod +x /root/AIAQUILA_LOCATION_FIX.sh
+/root/AIAQUILA_LOCATION_FIX.sh
