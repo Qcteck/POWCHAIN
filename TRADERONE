@@ -1,151 +1,65 @@
-bash -lc 'set -euo pipefail
-cd /root
-cat >/root/aia_ng.sh <<'"'"'BASH'"'"'
+cat >/root/AQ_FIX.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
-umask 022
-say(){ printf "[%s] %s\n" "$(date +%H:%M:%S)" "$*"; }
-die(){ say "ERR: $*"; exit 1; }
-[ "$(id -u)" -eq 0 ] || die "run as root"
-command -v nginx >/dev/null 2>&1 || die "nginx missing"
-command -v python3 >/dev/null 2>&1 || die "python3 missing"
-command -v curl >/dev/null 2>&1 || die "curl missing"
-command -v systemctl >/dev/null 2>&1 || die "systemctl missing"
-
-TS="$(date +%Y%m%d_%H%M%S)"
-BK="/root/BK_AIA_NGX_$TS"
-mkdir -p "$BK"
 
 DOMAIN="fireinners.online"
-SLUG="/iaaquila"
-INC_DIR="/etc/nginx/includes"
-INC_FILE="$INC_DIR/iaaquila_routes.inc"
+VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
+SNIP="/etc/nginx/snippets/aiaquila_proxy.conf"
+TS="$(date +%Y%m%d_%H%M%S)"
 
-unfreeze(){ chattr -i "$1" 2>/dev/null || true; }
-freeze(){ chattr +i "$1" 2>/dev/null || true; }
-backup(){ local p="$1"; [ -e "$p" ] || return 0; mkdir -p "$BK/$(dirname "$p")"; cp -a "$p" "$BK/$p.bak" 2>/dev/null || true; }
+echo "=== AIAQUILA FINAL FIX ==="
 
-detect_vhost(){
-  local cand=""
-  if [ -f /etc/nginx/conf.d/000-fireinners.online-ssl.conf ]; then cand="/etc/nginx/conf.d/000-fireinners.online-ssl.conf"
-  elif [ -f /etc/nginx/sites-available/fireinners.online-ssl ]; then cand="/etc/nginx/sites-available/fireinners.online-ssl"
-  else cand="$(nginx -T 2>/dev/null | awk '"'"'/# configuration file/ {f=$4} /server_name/ && /fireinners\.online/ {print f; exit}'"'"' || true)"
-  fi
-  echo "$cand"
-}
+### 1) Backup
+echo "[1/6] Backup vhost"
+cp -a "$VHOST" "$VHOST.bak.$TS"
 
-write_routes_include(){
-  say "1) write routes include (server-context)"
-  mkdir -p "$INC_DIR"
-  backup "$INC_FILE"
-  unfreeze "$INC_FILE"
-  cat >"$INC_FILE"<<EOF
-# iaaquila routes (must be included INSIDE server{})
-location = ${SLUG} { return 301 ${SLUG}/; }
-location ^~ ${SLUG}/ {
-  root /var/www;
-  try_files \$uri \$uri/ ${SLUG}/index.html;
-  add_header Cache-Control "no-store" always;
-}
-EOF
-  chmod 0644 "$INC_FILE" || true
-}
+### 2) Unlock
+echo "[2/6] Unlock vhost"
+chattr -i "$VHOST" 2>/dev/null || true
 
-comment_bad_includes(){
-  say "2) comment any iaaquila_routes includes found in wrong places"
-  mapfile -t hits < <(grep -RIn --include="*.conf" --include="*.inc" "iaaquila_routes\.inc" /etc/nginx 2>/dev/null || true)
-  if [ "${#hits[@]}" -eq 0 ]; then say "no existing includes found"; return 0; fi
-  printf "%s\n" "${hits[@]}" >"$BK/grep_hits.txt" || true
-  for h in "${hits[@]}"; do
-    f="${h%%:*}"
-    [ -f "$f" ] || continue
-    backup "$f"
-    unfreeze "$f"
-    python3 - "$f" <<'"'"'PY'"'"'
-import sys,re
-p=sys.argv[1]
-s=open(p,"r",encoding="utf-8",errors="ignore").read().splitlines(True)
-out=[]
-for line in s:
-  if re.search(r"\binclude\b.*iaaquila_routes\.inc\b", line) and not line.lstrip().startswith("#"):
-    out.append("# AIAQUILA_DISABLED_WRONG_CONTEXT " + line)
-  else:
-    out.append(line)
-open(p,"w",encoding="utf-8").write("".join(out))
-PY
-  done
-}
+### 3) Write proxy snippet (NO location)
+echo "[3/6] Write proxy snippet"
+cat >"$SNIP" <<'NGX'
+resolver 1.1.1.1 8.8.8.8 valid=300s;
+resolver_timeout 5s;
 
-inject_good_include_into_vhost(){
-  local VH="$1"
-  [ -n "$VH" ] || die "no vhost detected"
-  [ -f "$VH" ] || die "vhost not found: $VH"
-  say "3) inject include into vhost server{}: $VH"
-  backup "$VH"
-  unfreeze "$VH"
-  python3 - "$VH" "$DOMAIN" "$INC_FILE" <<'"'"'PY'"'"'
-import re,sys
-p,dom,inc=sys.argv[1],sys.argv[2],sys.argv[3]
-s=open(p,"r",encoding="utf-8",errors="ignore").read()
-if inc in s: sys.exit(0)
-def patch(block):
-  if inc in block: return block, False
-  if not re.search(r"\blisten\b[^;]*\b443\b", block): return block, False
-  if not re.search(r"\bserver_name\b[^;]*\b"+re.escape(dom)+r"\b", block): return block, False
-  lines=block.splitlines()
-  ins=None
-  for i,l in enumerate(lines):
-    if re.search(r"\bserver_name\b", l): ins=i+1; break
-  if ins is None: ins=1
-  lines.insert(ins,"    include %s;"%inc)
-  return "\n".join(lines), True
-out=[]; changed=False; pos=0
-for m in re.finditer(r"server\s*\{", s):
-  start=m.start(); out.append(s[pos:start])
-  i=start; depth=0
-  while i<len(s):
-    c=s[i]
-    if c=="{": depth+=1
-    elif c=="}":
-      depth-=1
-      if depth==0:
-        end=i+1
-        b=s[start:end]
-        nb,ch=patch(b)
-        out.append(nb); changed=changed or ch
-        pos=end
-        break
-    i+=1
-new="".join(out)+s[pos:]
-if changed: open(p,"w",encoding="utf-8").write(new)
-PY
-}
+proxy_pass https://news.bitcoin.com/feed/;
+proxy_set_header Host news.bitcoin.com;
+proxy_set_header User-Agent "AIAQUILA-RSS";
+proxy_ssl_server_name on;
 
-test_reload(){
-  say "4) nginx -t"
-  nginx -t
-  say "5) reload"
-  systemctl reload nginx
-}
+proxy_connect_timeout 10s;
+proxy_read_timeout 30s;
+NGX
 
-smoke(){
-  say "6) show includes now"
-  grep -RIn --include="*.conf" --include="*.inc" "iaaquila_routes\.inc" /etc/nginx 2>/dev/null || true
-  say "7) smoke curl"
-  curl -skI -H "Host: $DOMAIN" "https://127.0.0.1${SLUG}/" | head -n 12 || true
-}
+### 4) Inject locations into SERVER BLOCK
+echo "[4/6] Inject locations if missing"
+grep -q "location /aiaquila/api/rss" "$VHOST" || sed -i '/server_name fireinners.online;/a\
+\
+    location /aiaquila/api/rss {\
+        include /etc/nginx/snippets/aiaquila_proxy.conf;\
+    }\
+\
+    location /aiaquila/health {\
+        default_type text/plain;\
+        return 200 "OK AIAQUILA\\n";\
+    }\
+' "$VHOST"
 
-main(){
-  say "BEGIN AIAQUILA NGINX FIX @ $TS"
-  write_routes_include
-  comment_bad_includes
-  VH="$(detect_vhost)"
-  inject_good_include_into_vhost "$VH"
-  test_reload
-  smoke
-  say "DONE (BK=$BK)"
-}
-main
+### 5) Test + reload
+echo "[5/6] nginx test"
+nginx -t
+
+echo "[6/6] reload nginx"
+systemctl reload nginx
+
+### 6) Relock
+chattr +i "$VHOST" 2>/dev/null || true
+
+echo "DONE"
+echo "Health : https://$DOMAIN/aiaquila/health"
+echo "RSS    : https://$DOMAIN/aiaquila/api/rss"
 BASH
-chmod 755 /root/aia_ng.sh
-/root/aia_ng.sh'
+
+chmod +x /root/AQ_FIX.sh
+/root/AQ_FIX.sh
