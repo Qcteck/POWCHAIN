@@ -1,47 +1,69 @@
-bash -lc 'set -euo pipefail; TS="$(date +%Y%m%d_%H%M%S)"; F="/root/MEGA_DEMELE_NGINX_WOLV_AQ_${TS}.sh"; cat >"$F"<<'"'"'EOF'"'"'
 #!/usr/bin/env bash
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
-say(){ printf "%s\n" "$*"; }
-
+TS="$(date +%Y%m%d_%H%M%S)"
+DOMAIN="fireinners.online"
+BK="/root/BK_NGX_DEMELE_${TS}"
 NGX="/etc/nginx"
-NGXCONF="$NGX/nginx.conf"
-VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
-INC_DIR="$NGX/includes"
-SNIP_DIR="$NGX/snippets"
+VHOST_DEFAULT="/etc/nginx/sites-available/fireinners.online-ssl"
+WOLV_WWW="/var/www/wolverine"
+WOLV_INDEX="${WOLV_WWW}/index.html"
+WOLV_INC_DIR="${NGX}/includes"
+WOLV_INC="${WOLV_INC_DIR}/wolverine_routes.inc"
+SNIP_DIR="${NGX}/snippets"
+LOG="/root/MEGA_DEMELE_WOLV_AQ_${TS}.log"
+say(){ echo "[$(date -u +'%F %T UTC')] $*" | tee -a "$LOG"; }
 
-WOLV_INC="$INC_DIR/wolverine_routes.inc"
-AQ_INC="$INC_DIR/aiaquila_routes.inc"
-
-WOLV_SNIP1="$SNIP_DIR/wolverine_routes.conf"
-WOLV_SNIP2="$SNIP_DIR/wolverine_routes.inc"
-AQ_SNIP="$SNIP_DIR/aiaquila_locations.conf"
-
-BK="/root/BK_DEMELE_WOLV_AQ_${TS}"
+say "== MEGA DEMELE WOLVERINE / AIAQUILA (NGINX) =="
 say "BACKUP -> $BK"
 mkdir -p "$BK"
 cp -a "$NGX" "$BK/nginx" 2>/dev/null || true
 
+# --- best-effort unlock immutable bits
 if command -v chattr >/dev/null 2>&1; then
   say "UNFREEZE chattr -i (best effort)"
-  for f in "$NGXCONF" "$VHOST" "$INC_DIR"/* "$SNIP_DIR"/* "$NGX"/conf.d/* "$NGX"/sites-available/* "$NGX"/sites-enabled/*; do
-    [ -e "$f" ] || continue
+  for f in "$NGX/nginx.conf" "$VHOST_DEFAULT" "$WOLV_INC" "$SNIP_DIR/aiaquila_locations.conf"; do
+    [ -e "$f" ] && chattr -i "$f" 2>/dev/null || true
+  done
+  chattr -i "$NGX/nginx.conf" 2>/dev/null || true
+  find "$NGX" -maxdepth 3 -type f \( -name "*.conf" -o -name "*.inc" \) -print0 2>/dev/null | while IFS= read -r -d '' f; do
     chattr -i "$f" 2>/dev/null || true
   done
 fi
 
-say "ENSURE dirs"
-mkdir -p "$INC_DIR" "$SNIP_DIR" /var/www/wolverine
+# --- find vhost actually serving fireinners.online
+VHOST="$VHOST_DEFAULT"
+if [ ! -f "$VHOST" ]; then
+  say "VHOST default missing, searching..."
+  VHOST="$(grep -RIl --include="*.conf" --include="*" "server_name[[:space:]].*fireinners\.online" "$NGX/sites-available" "$NGX/conf.d" 2>/dev/null | head -n1 || true)"
+fi
+if [ -z "${VHOST:-}" ] || [ ! -f "$VHOST" ]; then
+  say "ERROR: cannot find vhost containing server_name fireinners.online"
+  exit 1
+fi
+say "VHOST = $VHOST"
+cp -a "$VHOST" "$BK/$(basename "$VHOST").bak" 2>/dev/null || true
 
-say "1) CANONICAL includes (server-level include only, locations only)"
-cat >"$WOLV_INC"<<'INC'
-# WOLVERINE routes (server-level include only)
+# --- ensure webroot + index
+say "ENSURE $WOLV_INDEX"
+mkdir -p "$WOLV_WWW"
+cat >"$WOLV_INDEX" <<'HTML'
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WOLVERINE OK</title><style>body{font-family:system-ui,Segoe UI,Roboto,Arial;margin:0;padding:0;background:#0b0f14;color:#e6eef8}main{padding:26px}a{color:#7ab7ff;text-decoration:none}a:hover{text-decoration:underline}.p{opacity:.9}</style></head><body><main><h1>WOLVERINE OK</h1><p class="p">Si tu vois cette page, <b>/wolverine/</b> sert bien le webroot.</p><p><a href="/wolverine/vault-api/health">/wolverine/vault-api/health</a> · <a href="/wolverine/traderone/vault/health">/wolverine/traderone/vault/health</a> · <a href="/wolverine/traderone/api/health">/wolverine/traderone/api/health</a></p></main></body></html>
+HTML
+
+# --- write wolverine include (locations-only, must be included INSIDE server{})
+say "WRITE $WOLV_INC"
+mkdir -p "$WOLV_INC_DIR"
+cp -a "$WOLV_INC" "$BK/wolverine_routes.inc.bak" 2>/dev/null || true
+cat >"$WOLV_INC" <<'NGX'
+# wolverine routes (managed) - locations-only include (put inside server{})
 location = /wolverine { return 301 /wolverine/; }
 location ^~ /wolverine/ {
   root /var/www;
   try_files $uri $uri/ /wolverine/index.html;
   add_header Cache-Control "no-store" always;
 }
+# backend 3000 (existing)
 location ^~ /wolverine/vault-api/ {
   proxy_http_version 1.1;
   proxy_set_header Host $host;
@@ -50,6 +72,7 @@ location ^~ /wolverine/vault-api/ {
   proxy_set_header X-Forwarded-Proto $scheme;
   proxy_pass http://127.0.0.1:3000/;
 }
+# traderone vault/api -> backend 3000
 location ^~ /wolverine/traderone/vault/ {
   proxy_http_version 1.1;
   proxy_set_header Host $host;
@@ -66,183 +89,106 @@ location ^~ /wolverine/traderone/api/ {
   proxy_set_header X-Forwarded-Proto $scheme;
   proxy_pass http://127.0.0.1:3000/;
 }
-INC
+NGX
 
-cat >"$AQ_INC"<<'INC'
-# AIAQUILA routes (server-level include only)
-location ^~ /aiaquila/api/rss {
-  proxy_http_version 1.1;
-  proxy_set_header Host $host;
-  proxy_set_header X-Real-IP $remote_addr;
-  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto $scheme;
-  proxy_pass http://127.0.0.1:3000;
-}
-INC
-
-say "2) NEUTRALIZE snippets (NO locations here)"
-for s in "$WOLV_SNIP1" "$WOLV_SNIP2" "$AQ_SNIP"; do
-  [ -e "$s" ] && cp -a "$s" "$BK/" 2>/dev/null || true
-  cat >"$s"<<TXT
-# neutralized (DO NOT put location{} here)
-# canonical:
-#   $WOLV_INC
-#   $AQ_INC
+# --- HARD DEMELE: disable AIAQUILA snippets that are breaking nginx (duplicate locations / wrong include context)
+say "DEMELE: disable aiaquila snippets that break nginx"
+shopt -s nullglob
+for f in "$SNIP_DIR"/*aiaquila*.conf "$NGX/includes"/*aiaquila*.inc; do
+  [ -f "$f" ] || continue
+  cp -a "$f" "$BK/$(basename "$f").bak" 2>/dev/null || true
+  mv -f "$f" "$f.disabled_${TS}" 2>/dev/null || true
+  cat >"$f" <<'TXT'
+# DISABLED by MEGA_DEMELE_WOLV_AQ (kept placeholder so includes won't crash)
+# Reason: aiaquila locations were interfering with nginx (duplicate/invalid location context)
 TXT
+  say "DISABLED -> $f (saved as $f.disabled_${TS})"
 done
+shopt -u nullglob
 
-say "3) REMOVE any GLOBAL includes of these snippets/includes from nginx.conf (prevents: location not allowed here)"
-if [ -f "$NGXCONF" ]; then
-  cp -a "$NGXCONF" "$BK/" 2>/dev/null || true
-  python3 - <<'PY'
-import pathlib,re
+# --- remove any accidental include of wolverine/aiaquila snippets in nginx.conf (global/http context)
+say "CLEAN nginx.conf: remove accidental includes (wolverine/aiaquila) outside vhost"
+python3 - <<'PY'
+import re, pathlib
 p=pathlib.Path("/etc/nginx/nginx.conf")
-s=p.read_text(encoding="utf-8", errors="ignore").splitlines(True)
-bad=[r"/etc/nginx/snippets/aiaquila_locations\.conf", r"/etc/nginx/snippets/wolverine_routes\.(conf|inc)", r"/etc/nginx/includes/wolverine_routes\.inc", r"/etc/nginx/includes/aiaquila_routes\.inc"]
-rx=re.compile(r"^\s*include\s+.*("+"|".join(bad)+r").*;\s*$")
-out=[]
-for line in s:
-  if rx.search(line) and not line.lstrip().startswith("#"):
-    out.append("# DISABLED_BY_DEMELE "+line)
-  else:
-    out.append(line)
-p.write_text("".join(out), encoding="utf-8")
-print("OK nginx.conf cleaned")
-PY
-fi
-
-say "4) PURGE duplicate location blocks across nginx tree (keep only in canonical includes)"
-python3 - <<'PY'
-import glob, pathlib, re
-KEEP=set([
-  "/etc/nginx/includes/wolverine_routes.inc",
-  "/etc/nginx/includes/aiaquila_routes.inc",
-])
-TARGETS=[
-  (r"^\s*location\b.*\b/wolverine\b.*\{", "/wolverine"),
-  (r"^\s*location\b.*\b/aiaquila/api/rss\b.*\{", "/aiaquila/api/rss"),
-]
-paths=set()
-paths.add("/etc/nginx/nginx.conf")
-paths |= set(glob.glob("/etc/nginx/conf.d/*.conf"))
-paths |= set(glob.glob("/etc/nginx/sites-available/*"))
-paths |= set(glob.glob("/etc/nginx/sites-enabled/*"))
-paths |= set(glob.glob("/etc/nginx/snippets/*"))
-paths |= set(glob.glob("/etc/nginx/includes/*"))
-
-def strip_blocks(text, start_rx):
-  lines=text.splitlines(True); out=[]; i=0; n=len(lines)
-  rx=re.compile(start_rx, re.I)
-  while i<n:
-    if rx.search(lines[i]):
-      brace = lines[i].count("{")-lines[i].count("}")
-      j=i+1
-      while j<n and brace>0:
-        brace += lines[j].count("{")-lines[j].count("}")
-        j+=1
-      out.append("# (removed duplicate) "+lines[i].lstrip())
-      i=j
+if p.exists():
+  s=p.read_text(encoding="utf-8", errors="ignore").splitlines(True)
+  out=[]
+  changed=False
+  for line in s:
+    if re.search(r'include\s+.*(wolverine_routes|aiaquila).*;', line):
+      out.append("# DEMELE_REMOVED "+line)
+      changed=True
     else:
-      out.append(lines[i]); i+=1
-  return "".join(out)
-
-patched=0
-for fp in sorted(paths):
-  if fp in KEEP: 
-    continue
-  p=pathlib.Path(fp)
-  if (not p.exists()) or (not p.is_file()):
-    continue
-  t=p.read_text(encoding="utf-8", errors="ignore")
-  nt=t
-  for sr,_name in TARGETS:
-    nt=strip_blocks(nt, sr)
-  if nt!=t:
-    p.write_text(nt, encoding="utf-8")
-    patched+=1
-print("OK patched_files", patched)
+      out.append(line)
+  if changed:
+    p.write_text("".join(out), encoding="utf-8")
 PY
 
-say "5) ENSURE vhost includes BOTH canonical includes INSIDE the correct server{}"
+# --- ensure vhost has exactly one include line INSIDE the correct server{} for fireinners.online
+say "PATCH vhost: ensure include inside server{} for $DOMAIN"
 python3 - <<'PY'
-import pathlib,re
-V="/etc/nginx/sites-available/fireinners.online-ssl"
-p=pathlib.Path(V)
-s=p.read_text(encoding="utf-8", errors="ignore")
+import re, pathlib
+vhost=pathlib.Path(r"""'"$VHOST"'''""")
+inc=r"""include /etc/nginx/includes/wolverine_routes.inc;"""
+txt=vhost.read_text(encoding="utf-8", errors="ignore")
 
-need=[
-  "include /etc/nginx/includes/wolverine_routes.inc;",
-  "include /etc/nginx/includes/aiaquila_routes.inc;",
-]
+# remove duplicate include lines anywhere first
+lines=txt.splitlines(True)
+new=[]
+seen=0
+for ln in lines:
+  if re.search(r'include\s+/etc/nginx/includes/wolverine_routes\.inc\s*;', ln):
+    seen+=1
+    if seen==1:
+      new.append(ln)
+    else:
+      new.append("# DEMELE_DUP_REMOVED "+ln)
+  else:
+    new.append(ln)
+txt="".join(new)
 
-def ensure_server_includes(block):
-  # remove any existing include lines (anywhere in block), then insert once after server{
-  for line in need:
-    block=re.sub(r"^\s*"+re.escape(line)+r"\s*$\n?", "", block, flags=re.M)
-  ins="\n  "+"\n  ".join(need)+"\n"
-  block=re.sub(r"(\bserver\s*\{\s*)", r"\1"+ins, block, count=1, flags=re.S)
-  return block
-
-parts=[]; i=0
-while True:
-  m=re.search(r"\bserver\s*\{", s[i:])
-  if not m: parts.append(s[i:]); break
-  start=i+m.start()
-  if start>i: parts.append(s[i:start])
-  j=start; brace=0
-  while j<len(s):
-    if s[j]=="{": brace+=1
-    elif s[j]=="}":
-      brace-=1
-      if brace==0: j+=1; break
-    j+=1
-  parts.append(s[start:j]); i=j
-
-out=[]
-for part in parts:
-  if re.match(r"^\s*server\s*\{", part) and re.search(r"\bserver_name\b[^;]*\bfireinners\.online\b", part):
-    part=ensure_server_includes(part)
-  out.append(part)
-
-p.write_text("".join(out), encoding="utf-8")
-print("OK vhost ensured includes")
+# if include missing, insert near end of server block that contains server_name fireinners.online
+if "include /etc/nginx/includes/wolverine_routes.inc;" not in txt:
+  # naive server-block insertion: find server{...} containing server_name fireinners.online
+  m=re.search(r'(server\s*\{)(.*?server_name\s+[^;]*\bfireinners\.online\b[^;]*;)(.*?\n\})', txt, flags=re.S)
+  if m:
+    block=m.group(0)
+    if inc not in block:
+      # insert before last closing brace in that server block
+      block2=re.sub(r'\n\}\s*$', "\n  "+inc+"\n}\n", block)
+      txt=txt.replace(block, block2, 1)
+  else:
+    # fallback: append include at end (commented) if no match
+    txt += "\n# DEMELE_NOTE: could not find server block for fireinners.online to inject wolverine include\n"
+vhost.write_text(txt, encoding="utf-8")
 PY
 
-say "6) ENSURE /var/www/wolverine/index.html exists (for try_files fallback)"
-if [ ! -f /var/www/wolverine/index.html ]; then
-  cat >/var/www/wolverine/index.html <<'HTML'
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WOLVERINE OK</title><style>body{font-family:system-ui,Segoe UI,Roboto,Arial;margin:0;padding:22px}a{color:#2b7cff}</style></head><body><h1>WOLVERINE OK</h1><p>Si tu vois cette page, <b>/wolverine</b> sert bien le webroot.</p><p><a href="/wolverine/vault-api/health">/wolverine/vault-api/health</a></p><p><a href="/wolverine/traderone/vault/health">/wolverine/traderone/vault/health</a></p><p><a href="/wolverine/traderone/api/health">/wolverine/traderone/api/health</a></p></body></html>
-HTML
-fi
+# --- nginx test + reload
+say "NGINX TEST"
+nginx -t 2>&1 | tee -a "$LOG"
 
-say "7) NGINX TEST"
-if ! nginx -t; then
-  say "NGINX TEST FAILED -> RESTORE BACKUP"
-  rm -rf /etc/nginx
-  cp -a "$BK/nginx" /etc/nginx
-  nginx -t
-  systemctl restart nginx || true
-  exit 1
-fi
-
-say "8) RELOAD nginx"
+say "RELOAD nginx"
 systemctl reload nginx 2>/dev/null || systemctl restart nginx
 
+# --- local tests (bypass CF)
+say "TEST LOCAL (bypass CF) /wolverine/ first bytes"
+curl -sk --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/" | head -c 180 || true; echo
+say "TEST LOCAL /wolverine/vault-api/health"
+curl -sk --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/vault-api/health" || true; echo
+say "TEST LOCAL /wolverine/traderone/vault/health"
+curl -sk --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/traderone/vault/health" || true; echo
+say "TEST LOCAL /wolverine/traderone/api/health"
+curl -sk --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/traderone/api/health" || true; echo
+
+# --- best-effort refreeze
 if command -v chattr >/dev/null 2>&1; then
   say "REFREEZE chattr +i (best effort)"
-  for f in "$NGXCONF" "$VHOST" "$WOLV_INC" "$AQ_INC" "$AQ_SNIP" "$WOLV_SNIP1" "$WOLV_SNIP2"; do
-    [ -e "$f" ] || continue
-    chattr +i "$f" 2>/dev/null || true
-  done
+  chattr +i "$NGX/nginx.conf" 2>/dev/null || true
+  chattr +i "$VHOST" 2>/dev/null || true
+  chattr +i "$WOLV_INC" 2>/dev/null || true
 fi
 
 say "DONE"
-say "Backup: $BK"
-echo "TEST:"
-echo "  https://fireinners.online/wolverine/"
-echo "  https://fireinners.online/aiaquila/api/rss"
-EOF
-chmod +x "$F"
-bash "$F"
-echo "OK: $F"
-'
+say "Backups: $BK"
+say "Open: https://${DOMAIN}/wolverine/ (Ctrl+F5)"
