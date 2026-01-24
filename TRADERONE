@@ -1,10 +1,8 @@
-cat >/root/WOLV_DEDUP.sh <<'SH'
+cat >/root/NGX_FIX_SSL_FIREINNERS.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 TS="$(date +%Y%m%d_%H%M%S)"
 NGX="/etc/nginx"
-INC_DIR="$NGX/includes"
-SNIP_DIR="$NGX/snippets"
 DOMAIN="fireinners.online"
 VHOST="$NGX/sites-available/fireinners.online-ssl"
 
@@ -14,12 +12,13 @@ command -v nginx >/dev/null 2>&1 || { echo "Missing nginx"; exit 1; }
 command -v python3 >/dev/null 2>&1 || { echo "Missing python3"; exit 1; }
 command -v tar >/dev/null 2>&1 || { echo "Missing tar"; exit 1; }
 
+# find vhost if default path missing
 if [ ! -f "$VHOST" ]; then
   VHOST="$(grep -RIl --include='*' -E 'server_name[[:space:]].*fireinners\.online' "$NGX/sites-available" 2>/dev/null | head -n 1 || true)"
 fi
 [ -f "$VHOST" ] || { say "ERROR: vhost fireinners.online introuvable"; ls -la "$NGX/sites-available" | sed -n '1,200p' || true; exit 1; }
 
-BK="/root/BK_WOLV_DEDUP_${TS}"
+BK="/root/BK_NGX_SSL_${TS}"
 mkdir -p "$BK"
 say "BACKUP -> $BK/nginx.tgz"
 tar -czf "$BK/nginx.tgz" "$NGX" 2>/dev/null || tar -czf "$BK/nginx.tgz" "$NGX"
@@ -31,137 +30,81 @@ if command -v chattr >/dev/null 2>&1; then
   find "$NGX" -maxdepth 2 -type f \( -name "*.conf" -o -name "*.inc" \) -print0 2>/dev/null | while IFS= read -r -d '' f; do chattr -i "$f" 2>/dev/null || true; done
 fi
 
-mkdir -p "$INC_DIR"
+say "Detect cert files in /etc/letsencrypt/live"
+CERT_DIR=""
+if [ -d /etc/letsencrypt/live ]; then
+  CERT_DIR="$(ls -1d /etc/letsencrypt/live/${DOMAIN}* 2>/dev/null | head -n 1 || true)"
+fi
+if [ -z "$CERT_DIR" ] || [ ! -f "$CERT_DIR/fullchain.pem" ] || [ ! -f "$CERT_DIR/privkey.pem" ]; then
+  say "ERROR: cert introuvable. Contenu /etc/letsencrypt/live:"
+  ls -la /etc/letsencrypt/live 2>/dev/null || true
+  find /etc/letsencrypt/live -maxdepth 2 -type f -name fullchain.pem -o -name privkey.pem 2>/dev/null | sed -n '1,200p' || true
+  exit 1
+fi
 
-say "STEP A) Comment out ALL includes of wolverine_routes everywhere (except the managed include file itself)"
-python3 - <<'PY'
-import os,re,glob
-NGX="/etc/nginx"
-INC="/etc/nginx/includes/wolverine_routes.inc"
-rx=re.compile(r'^\s*include\s+[^;]*(wolverine_routes\.inc|wolverine_routes\.conf|wolverine_routes\.inc;)[^;]*;\s*$',re.I)
-paths=set()
-for pat in [f"{NGX}/nginx.conf",f"{NGX}/conf.d/*.conf",f"{NGX}/sites-available/*",f"{NGX}/sites-enabled/*",f"{NGX}/includes/*.inc",f"{NGX}/includes/*.conf",f"{NGX}/snippets/*.conf",f"{NGX}/snippets/*.inc"]:
-  for p in glob.glob(pat):
-    if os.path.isfile(p): paths.add(p)
-for p in sorted(paths):
-  if os.path.abspath(p)==os.path.abspath(INC): 
-    continue
-  try: lines=open(p,'r',encoding='utf-8',errors='ignore').read().splitlines(True)
-  except: 
-    continue
-  out=[]; changed=False
-  for line in lines:
-    if rx.search(line) and not line.lstrip().startswith("#"):
-      out.append("# DISABLED_BY_WOLV_DEDUP "+line); changed=True
-    else:
-      out.append(line)
-  if changed:
-    bak=p+f".bak_wolv_dedup"
-    if not os.path.exists(bak):
-      try: open(bak,'w',encoding='utf-8',errors='ignore').writelines(lines)
-      except: pass
-    open(p,'w',encoding='utf-8',errors='ignore').writelines(out)
-PY
+FULLCHAIN="$CERT_DIR/fullchain.pem"
+PRIVKEY="$CERT_DIR/privkey.pem"
+say "Using: $FULLCHAIN"
+say "Using: $PRIVKEY"
+say "VHOST: $VHOST"
 
-say "STEP B) Comment out ALL location blocks that target /wolverine (everywhere except managed include)"
-python3 - <<'PY'
-import os,re,glob
-NGX="/etc/nginx"
-MANAGED="/etc/nginx/includes/wolverine_routes.inc"
-# start of a location line containing /wolverine (any variant)
-loc_start=re.compile(r'^\s*location\b.*\b/wolverine\b',re.I)
-paths=set()
-for pat in [f"{NGX}/conf.d/*.conf",f"{NGX}/sites-available/*",f"{NGX}/sites-enabled/*",f"{NGX}/includes/*.inc",f"{NGX}/includes/*.conf",f"{NGX}/snippets/*.conf",f"{NGX}/snippets/*.inc"]:
-  for p in glob.glob(pat):
-    if os.path.isfile(p): paths.add(p)
-
-def comment_block(lines, start_i):
-  # comment from start_i until brace depth returns to the level before the block
-  out=[]
-  depth=0
-  # determine initial depth before start_i (rough)
-  for j in range(0,start_i):
-    depth += lines[j].count("{")-lines[j].count("}")
-  target_depth=depth
-  i=start_i
-  while i<len(lines):
-    line=lines[i]
-    out.append("# DISABLED_BY_WOLV_DEDUP "+line if not line.lstrip().startswith("#") else line)
-    depth += line.count("{")-line.count("}")
-    i+=1
-    if depth<=target_depth:
-      break
-  return out,i
-
-for p in sorted(paths):
-  if os.path.abspath(p)==os.path.abspath(MANAGED):
-    continue
-  try: lines=open(p,'r',encoding='utf-8',errors='ignore').read().splitlines(True)
-  except: 
-    continue
-  changed=False
-  out=[]
-  i=0
-  while i<len(lines):
-    if loc_start.search(lines[i]) and not lines[i].lstrip().startswith("#"):
-      block,ni=comment_block(lines,i)
-      out.extend(block)
-      i=ni
-      changed=True
-    else:
-      out.append(lines[i]); i+=1
-  if changed:
-    bak=p+".bak_loc_wolv"
-    if not os.path.exists(bak):
-      try: open(bak,'w',encoding='utf-8',errors='ignore').writelines(lines)
-      except: pass
-    open(p,'w',encoding='utf-8',errors='ignore').writelines(out)
-PY
-
-say "STEP C) Write managed include with SINGLE location block (no duplicates possible inside include)"
-cat >"$INC_DIR/wolverine_routes.inc" <<'EOF'
-# wolverine routes (managed by WOLV_DEDUP)
-location ^~ /wolverine {
-  if ($request_uri = /wolverine) { return 301 /wolverine/; }
-  root /var/www;
-  try_files $uri $uri/ /wolverine/index.html;
-}
-EOF
-
-say "STEP D) Ensure include appears ONCE inside the correct vhost ($VHOST)"
+say "Patch vhost: ensure ssl_certificate + ssl_certificate_key exist in the server{} that listens 443 ssl"
 python3 - <<PY
-import re,os
-path="$VHOST"
-inc_line="include /etc/nginx/includes/wolverine_routes.inc;"
+import re
+path=r"$VHOST"
+fullchain=r"$FULLCHAIN"
+privkey=r"$PRIVKEY"
+
 src=open(path,'r',encoding='utf-8',errors='ignore').read().splitlines(True)
 
-# Remove any existing active include lines (leave commented)
+# quick test: if file contains listen 443 ssl anywhere
+has_listen_ssl=any(re.search(r'^\s*listen\s+[^;]*\b443\b[^;]*\bssl\b',l) for l in src)
+
+if not has_listen_ssl:
+    # nothing to do (but keep file unchanged)
+    open(path,'w',encoding='utf-8',errors='ignore').writelines(src)
+    raise SystemExit(0)
+
+# We will inject only if ssl_certificate is missing in file or commented out only.
+has_cert=any(re.search(r'^\s*ssl_certificate\s+',l) and not l.lstrip().startswith("#") for l in src)
+has_key =any(re.search(r'^\s*ssl_certificate_key\s+',l) and not l.lstrip().startswith("#") for l in src)
+
+# Also ensure common includes (optional but safe)
+has_opts =any("/etc/letsencrypt/options-ssl-nginx.conf" in l and not l.lstrip().startswith("#") for l in src)
+has_dh   =any("ssl-dhparams.pem" in l and not l.lstrip().startswith("#") for l in src)
+
 out=[]
-for line in src:
-  if ("wolverine_routes.inc" in line) and (not line.lstrip().startswith("#")):
-    out.append("# DISABLED_BY_WOLV_DEDUP "+line)
-  else:
-    out.append(line)
-
-# Insert once after the first server_name line containing fireinners.online (within file)
 inserted=False
-final=[]
-for line in out:
-  final.append(line)
-  if (not inserted) and re.search(r'^\s*server_name\b.*\bfireinners\.online\b', line):
-    final.append("  "+inc_line+"\n")
-    inserted=True
 
-open(path,'w',encoding='utf-8',errors='ignore').writelines(final)
+for i,l in enumerate(src):
+    out.append(l)
+    # Insert right after the first active "listen ... 443 ... ssl" line
+    if (not inserted) and re.search(r'^\s*listen\s+[^;]*\b443\b[^;]*\bssl\b',l) and (not l.lstrip().startswith("#")):
+        if not has_cert:
+            out.append(f"  ssl_certificate {fullchain};\n")
+        if not has_key:
+            out.append(f"  ssl_certificate_key {privkey};\n")
+        if not has_opts and ("/etc/letsencrypt/options-ssl-nginx.conf" in open("/etc/nginx/snippets/ssl-params.conf",'r',errors='ignore').read() if __import__("os").path.exists("/etc/nginx/snippets/ssl-params.conf") else ""):
+            pass
+        if not has_opts:
+            out.append("  include /etc/letsencrypt/options-ssl-nginx.conf;\n")
+        if not has_dh and __import__("os").path.exists("/etc/letsencrypt/ssl-dhparams.pem"):
+            out.append("  ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;\n")
+        inserted=True
+
+# backup once
+bak=path+f".bak_ssl_{__import__('time').strftime('%Y%m%d_%H%M%S')}"
+open(bak,'w',encoding='utf-8',errors='ignore').writelines(src)
+open(path,'w',encoding='utf-8',errors='ignore').writelines(out)
 PY
 
-say "STEP E) nginx test"
+say "nginx test"
 if nginx -t; then
   say "RELOAD nginx"
   systemctl reload nginx
 else
-  say "ERROR: nginx -t failed (show wolverine-related lines)"
-  nginx -T 2>/dev/null | grep -nE 'wolverine|wolverine_routes' | head -n 250 || true
+  say "ERROR: nginx -t failed (show ssl-related lines)"
+  nginx -T 2>/dev/null | grep -nE 'listen.*443.*ssl|ssl_certificate|ssl_certificate_key|server_name.*fireinners|fireinners\.online-ssl' | head -n 260 || true
   exit 1
 fi
 
@@ -172,7 +115,8 @@ if command -v chattr >/dev/null 2>&1; then
 fi
 
 say "DONE. Backup: $BK/nginx.tgz"
+echo "OPEN: https://${DOMAIN}/"
 echo "OPEN: https://${DOMAIN}/wolverine/"
 SH
-chmod +x /root/WOLV_DEDUP.sh
-bash /root/WOLV_DEDUP.sh
+chmod +x /root/NGX_FIX_SSL_FIREINNERS.sh
+bash /root/NGX_FIX_SSL_FIREINNERS.sh
