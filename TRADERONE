@@ -1,195 +1,211 @@
+bash -lc 'set -euo pipefail; TS="$(date +%Y%m%d_%H%M%S)"; F="/root/MEGA_WOLVERINE_NGINX_FIX_${TS}.sh"; cat >"$F"<<'"'"'EOF'"'"'
 #!/usr/bin/env bash
 set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
 
 DOMAIN="fireinners.online"
-INC="/etc/nginx/includes/wolverine_routes.inc"
 VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
-TS="$(date -u +%Y%m%d_%H%M%S)"
-BK="/root/BK_WOLV_ROUTES_FIX_${TS}"
+NGXCONF="/etc/nginx/nginx.conf"
 
-echo "== WOLVERINE ROUTES FIX =="
-echo "Backup: $BK"
+WWW="/var/www/wolverine"
+INDEX="$WWW/index.html"
+
+SNIP_DIR="/etc/nginx/snippets"
+SNIP="$SNIP_DIR/wolverine_routes.conf"
+INC_LINE="include $SNIP;"
+
+BACKEND="http://127.0.0.1:3000"
+
+say(){ printf "%s\n" "$*"; }
+
+TS="$(date +%Y%m%d_%H%M%S)"
+BK="/root/BK_WOLV_NGX_FIX_${TS}"
 mkdir -p "$BK"
 
-# --- backup
+say "BACKUP -> $BK"
 cp -a /etc/nginx "$BK/nginx" 2>/dev/null || true
-[ -f "$VHOST" ] && cp -a "$VHOST" "$BK/$(basename "$VHOST").bak" || true
-[ -f "$INC" ] && cp -a "$INC" "$BK/$(basename "$INC").bak" || true
+cp -a "$WWW" "$BK/wolverine" 2>/dev/null || true
 
-# --- unfreeze (best effort)
 if command -v chattr >/dev/null 2>&1; then
-  echo "UNFREEZE chattr -i (best effort)"
-  for f in /etc/nginx/nginx.conf /etc/nginx/sites-available/* /etc/nginx/sites-enabled/* /etc/nginx/conf.d/* /etc/nginx/includes/*; do
+  say "UNFREEZE chattr -i (best effort)"
+  for f in "$NGXCONF" "$VHOST" "$SNIP" /etc/nginx/sites-available/* /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*; do
     [ -e "$f" ] || continue
     chattr -i "$f" 2>/dev/null || true
   done
 fi
 
-# --- ensure webroot + index
-echo "ENSURE /var/www/wolverine/index.html"
-mkdir -p /var/www/wolverine
-cat >/var/www/wolverine/index.html <<'EOF'
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WOLVERINE OK</title><style>body{margin:0;background:#0b1020;color:#e7ecff;font:16px system-ui,Segoe UI,Roboto,Arial}main{padding:26px}a{color:#7ab7ff}h1{margin:0 0 10px;font-size:28px}</style></head><body><main><h1>WOLVERINE OK</h1><p>Si tu vois cette page, <code>/wolverine/</code> sert bien le webroot.</p><p><a href="/wolverine/vault-api/health">/wolverine/vault-api/health</a> · <a href="/wolverine/traderone/vault/health">/wolverine/traderone/vault/health</a> · <a href="/wolverine/traderone/api/health">/wolverine/traderone/api/health</a></p></main></body></html>
-EOF
+say "ENSURE webroot + index"
+mkdir -p "$WWW"
+cat >"$INDEX"<<'HTML'
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WOLVERINE OK</title><style>body{margin:0;font:16px system-ui,Segoe UI,Roboto,Arial;background:#0b0f14;color:#e6eef8}main{padding:26px}h1{margin:0 0 12px;font-size:34px}a{color:#7ab7ff;text-decoration:none}a:hover{text-decoration:underline}.p{opacity:.85;margin:0 0 14px}</style></head><body><main><h1>WOLVERINE OK</h1><p class="p">Si tu vois cette page, <b>/wolverine/</b> sert bien le webroot.</p><p><a href="/wolverine/vault-api/health">/wolverine/vault-api/health</a> · <a href="/wolverine/traderone/vault/health">/wolverine/traderone/vault/health</a> · <a href="/wolverine/traderone/api/health">/wolverine/traderone/api/health</a></p></main></body></html>
+HTML
 
-# --- write include (NO variable expansion inside, use quoted heredoc)
-echo "WRITE $INC"
-mkdir -p /etc/nginx/includes
-cat >"$INC" <<'EOF'
-# wolverine routes (managed)
+say "WRITE snippet $SNIP (locations only)"
+mkdir -p "$SNIP_DIR"
+cat >"$SNIP"<<EOF_SNIP
+# WOLVERINE routes (server-level include only)
+
+# normalize
 location = /wolverine { return 301 /wolverine/; }
 
 # static app
 location ^~ /wolverine/ {
   root /var/www;
-  try_files $uri $uri/ /wolverine/index.html;
+  try_files \$uri \$uri/ /wolverine/index.html;
   add_header Cache-Control "no-store" always;
 }
 
-# backend (node) base health via vault-api prefix
+# existing backend (kept)
 location ^~ /wolverine/vault-api/ {
   proxy_http_version 1.1;
-  proxy_set_header Host $host;
-  proxy_set_header X-Real-IP $remote_addr;
-  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto $scheme;
-  proxy_pass http://127.0.0.1:3000/;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+  proxy_pass $BACKEND/;
 }
 
-# explicit health aliases (map to backend /health)
+# TraderOne Vault: map /wolverine/traderone/vault/* to backend /health (stable) + /vault/* (optional)
 location = /wolverine/traderone/vault/health {
   proxy_http_version 1.1;
-  proxy_set_header Host $host;
-  proxy_set_header X-Real-IP $remote_addr;
-  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto $scheme;
-  proxy_pass http://127.0.0.1:3000/health;
-}
-location = /wolverine/traderone/api/health {
-  proxy_http_version 1.1;
-  proxy_set_header Host $host;
-  proxy_set_header X-Real-IP $remote_addr;
-  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto $scheme;
-  proxy_pass http://127.0.0.1:3000/health;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+  proxy_pass $BACKEND/health;
 }
 
-# traderone vault/api prefixes (keep them for real endpoints)
 location ^~ /wolverine/traderone/vault/ {
   proxy_http_version 1.1;
-  proxy_set_header Host $host;
-  proxy_set_header X-Real-IP $remote_addr;
-  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto $scheme;
-  proxy_pass http://127.0.0.1:3000/vault/;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+  proxy_pass $BACKEND/vault/;
 }
+
+# TraderOne API: map /wolverine/traderone/api/* to backend /api/*
+location = /wolverine/traderone/api/health {
+  proxy_http_version 1.1;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+  proxy_pass $BACKEND/health;
+}
+
 location ^~ /wolverine/traderone/api/ {
   proxy_http_version 1.1;
-  proxy_set_header Host $host;
-  proxy_set_header X-Real-IP $remote_addr;
-  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto $scheme;
-  proxy_pass http://127.0.0.1:3000/api/;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+  proxy_pass $BACKEND/api/;
 }
-EOF
+EOF_SNIP
 
-# --- inject include into fireinners.online ssl vhost (deterministic, once)
-if [ ! -f "$VHOST" ]; then
-  echo "ERROR: vhost missing: $VHOST"
-  echo "Backup: $BK"
-  exit 1
-fi
-
-echo "PATCH vhost: ensure include inside server{} ($VHOST)"
-python3 - <<'PY'
-import re, pathlib, sys
-vhost=pathlib.Path("/etc/nginx/sites-available/fireinners.online-ssl")
-inc_line="include /etc/nginx/includes/wolverine_routes.inc;"
-s=vhost.read_text(encoding="utf-8", errors="ignore")
-if inc_line in s:
-    print("OK: include already present")
-    sys.exit(0)
-
-# find server block that contains server_name fireinners.online
-m=re.search(r'server\s*\{', s)
-if not m:
-    print("ERROR: no server { found")
-    sys.exit(2)
-
-# iterate server blocks
-blocks=[]
-i=0
-while True:
-    ms=re.search(r'\bserver\s*\{', s[i:])
-    if not ms: break
-    start=i+ms.start()
-    # naive brace matching
-    depth=0
-    j=start
-    while j < len(s):
-        if s[j]=='{': depth+=1
-        elif s[j]=='}':
-            depth-=1
-            if depth==0:
-                end=j+1
-                blocks.append((start,end,s[start:end]))
-                i=end
-                break
-        j+=1
-    else:
-        break
-
-target=None
-for (a,b,blk) in blocks:
-    if re.search(r'\bserver_name\b[^;]*\bfireinners\.online\b', blk):
-        target=(a,b,blk); break
-
-if not target:
-    # fallback: first server block
-    target=blocks[0]
-
-a,b,blk=target
-# insert include near top of server block (after opening line)
-lines=blk.splitlines(True)
-out=[]
-inserted=False
-for idx,line in enumerate(lines):
-    out.append(line)
-    if not inserted and re.search(r'\bserver\s*\{', line):
-        out.append("  "+inc_line+"\n")
-        inserted=True
-new_blk="".join(out)
-s2=s[:a]+new_blk+s[b:]
-vhost.write_text(s2, encoding="utf-8")
-print("OK: include inserted")
+say "CLEAN: remove any accidental wolverine_routes include in nginx.conf (global context)"
+python3 - <<PY
+import re, pathlib
+p=pathlib.Path("$NGXCONF")
+s=p.read_text(encoding="utf-8", errors="ignore")
+s2=re.sub(r"^.*wolverine_routes\.conf.*\n","",s,flags=re.M)
+if s2!=s:
+  p.write_text(s2,encoding="utf-8")
+  print("OK: cleaned nginx.conf")
+else:
+  print("OK: nginx.conf had no wolverine_routes")
 PY
 
-echo "NGINX TEST"
+say "PATCH vhost: ensure snippet include is inside correct server{} for $DOMAIN"
+python3 - <<PY
+import re, pathlib
+v=pathlib.Path("$VHOST")
+txt=v.read_text(encoding="utf-8", errors="ignore").splitlines(True)
+
+# remove duplicates of include line (anywhere)
+inc_line="$INC_LINE"
+txt=[ln for ln in txt if inc_line not in ln]
+
+out=[]
+i=0
+patched=False
+n=len(txt)
+
+# naive brace parser for server blocks
+while i<n:
+  ln=txt[i]
+  # detect "server" block start
+  if re.match(r"^\s*server\s*\{", ln):
+    # capture block
+    start=i
+    brace=0
+    j=i
+    block=[]
+    while j<n:
+      l=txt[j]
+      brace += l.count("{") - l.count("}")
+      block.append(l)
+      j+=1
+      if brace<=0:
+        break
+    block_txt="".join(block)
+
+    # check this server contains server_name with DOMAIN
+    if re.search(r"^\s*server_name\s+.*\b"+re.escape("$DOMAIN")+r"\b", block_txt, flags=re.M):
+      # insert include near top of server block (after server { line)
+      new_block=[]
+      inserted=False
+      for k,l in enumerate(block):
+        new_block.append(l)
+        if (not inserted) and k==0:
+          new_block.append("  "+inc_line+"\n")
+          inserted=True
+      block=new_block
+      patched=True
+
+    out.extend(block)
+    i=j
+    continue
+
+  out.append(ln)
+  i+=1
+
+if not patched:
+  raise SystemExit("FATAL: server block for DOMAIN not found in vhost: "+str(v))
+
+v.write_text("".join(out), encoding="utf-8")
+print("OK: include inserted into correct server{}")
+PY
+
+say "NGINX TEST"
 nginx -t
 
-echo "RELOAD NGINX"
+say "RELOAD nginx"
 systemctl reload nginx 2>/dev/null || systemctl restart nginx
 
-# --- refreeze (best effort)
 if command -v chattr >/dev/null 2>&1; then
-  echo "REFREEZE chattr +i (best effort)"
-  chattr +i /etc/nginx/nginx.conf 2>/dev/null || true
+  say "REFREEZE chattr +i (best effort)"
+  chattr +i "$NGXCONF" 2>/dev/null || true
   chattr +i "$VHOST" 2>/dev/null || true
-  chattr +i "$INC" 2>/dev/null || true
+  chattr +i "$SNIP" 2>/dev/null || true
 fi
 
-echo "== TESTS (LOCAL BYPASS + PUBLIC) =="
-echo "-- local bypass (hits origin nginx directly)"
-curl -sk --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/" | head -c 200 || true; echo
-curl -sk --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/vault-api/health" || true; echo
-curl -sk --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/traderone/vault/health" || true; echo
-curl -sk --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/wolverine/traderone/api/health" || true; echo
+say "TEST LOCAL (bypass CF via --resolve)"
+curl -sk --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/wolverine/" | head -c 120 || true; echo
+curl -sk --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/wolverine/vault-api/health" || true; echo
+curl -sk --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/wolverine/traderone/vault/health" || true; echo
+curl -sk --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/wolverine/traderone/api/health" || true; echo
 
-echo "-- public (through Cloudflare)"
-curl -skI "https://${DOMAIN}/wolverine/" | sed -n '1,12p' || true
-curl -sk "https://${DOMAIN}/wolverine/traderone/vault/health" || true; echo
-curl -sk "https://${DOMAIN}/wolverine/traderone/api/health" || true; echo
+say "TEST PUBLIC"
+curl -sk "https://$DOMAIN/wolverine/vault-api/health" || true; echo
+curl -sk "https://$DOMAIN/wolverine/traderone/vault/health" || true; echo
+curl -sk "https://$DOMAIN/wolverine/traderone/api/health" || true; echo
 
-echo "DONE"
-echo "Backup saved: $BK"
-echo "Open: https://${DOMAIN}/wolverine/ (Ctrl+F5)"
+say "DONE"
+say "Backup: $BK"
+EOF
+chmod +x "$F"
+bash "$F"
+echo "OK: ran $F"
+'
