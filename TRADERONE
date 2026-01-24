@@ -1,122 +1,69 @@
-cat >/root/NGX_FIX_SSL_FIREINNERS.sh <<'SH'
+cat >/root/NGX_DISABLE_BROKEN_SSL_CONFD.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 TS="$(date +%Y%m%d_%H%M%S)"
 NGX="/etc/nginx"
-DOMAIN="fireinners.online"
-VHOST="$NGX/sites-available/fireinners.online-ssl"
+CONFD="$NGX/conf.d"
+DIS="$NGX/disabled-conf.d"
+BK="/root/BK_NGX_CONFD_${TS}"
 
 say(){ echo "[$(date -u +'%Y-%m-%d %H:%M:%S UTC')] $*"; }
 
-command -v nginx >/dev/null 2>&1 || { echo "Missing nginx"; exit 1; }
-command -v python3 >/dev/null 2>&1 || { echo "Missing python3"; exit 1; }
-command -v tar >/dev/null 2>&1 || { echo "Missing tar"; exit 1; }
+mkdir -p "$BK" "$DIS"
 
-# find vhost if default path missing
-if [ ! -f "$VHOST" ]; then
-  VHOST="$(grep -RIl --include='*' -E 'server_name[[:space:]].*fireinners\.online' "$NGX/sites-available" 2>/dev/null | head -n 1 || true)"
-fi
-[ -f "$VHOST" ] || { say "ERROR: vhost fireinners.online introuvable"; ls -la "$NGX/sites-available" | sed -n '1,200p' || true; exit 1; }
-
-BK="/root/BK_NGX_SSL_${TS}"
-mkdir -p "$BK"
 say "BACKUP -> $BK/nginx.tgz"
 tar -czf "$BK/nginx.tgz" "$NGX" 2>/dev/null || tar -czf "$BK/nginx.tgz" "$NGX"
 
 say "UNFREEZE chattr -i (best effort)"
 if command -v chattr >/dev/null 2>&1; then
   chattr -i "$NGX/nginx.conf" 2>/dev/null || true
-  chattr -i "$VHOST" 2>/dev/null || true
   find "$NGX" -maxdepth 2 -type f \( -name "*.conf" -o -name "*.inc" \) -print0 2>/dev/null | while IFS= read -r -d '' f; do chattr -i "$f" 2>/dev/null || true; done
 fi
 
-say "Detect cert files in /etc/letsencrypt/live"
-CERT_DIR=""
-if [ -d /etc/letsencrypt/live ]; then
-  CERT_DIR="$(ls -1d /etc/letsencrypt/live/${DOMAIN}* 2>/dev/null | head -n 1 || true)"
+disable_one(){
+  local f="$1"
+  [ -f "$f" ] || return 0
+  local base="$(basename "$f")"
+  local dst="$DIS/${base}.disabled_${TS}"
+  say "DISABLE -> $dst"
+  mv -f "$f" "$dst"
+}
+
+# 1) Disable the exact culprit if present
+disable_one "$CONFD/aiaquila_server.conf"
+
+# 2) Disable any other conf.d/*.conf that has listen ssl but no ssl_certificate
+if [ -d "$CONFD" ]; then
+  while IFS= read -r -d '' f; do
+    # active listen ssl?
+    if grep -Eq '^[[:space:]]*listen[[:space:]].*\bssl\b' "$f"; then
+      # missing active ssl_certificate?
+      if ! grep -Eq '^[[:space:]]*ssl_certificate[[:space:]]+' "$f"; then
+        say "FOUND broken ssl (no ssl_certificate) in: $f"
+        disable_one "$f"
+      fi
+    fi
+  done < <(find "$CONFD" -maxdepth 1 -type f -name "*.conf" -print0 2>/dev/null)
 fi
-if [ -z "$CERT_DIR" ] || [ ! -f "$CERT_DIR/fullchain.pem" ] || [ ! -f "$CERT_DIR/privkey.pem" ]; then
-  say "ERROR: cert introuvable. Contenu /etc/letsencrypt/live:"
-  ls -la /etc/letsencrypt/live 2>/dev/null || true
-  find /etc/letsencrypt/live -maxdepth 2 -type f -name fullchain.pem -o -name privkey.pem 2>/dev/null | sed -n '1,200p' || true
-  exit 1
-fi
 
-FULLCHAIN="$CERT_DIR/fullchain.pem"
-PRIVKEY="$CERT_DIR/privkey.pem"
-say "Using: $FULLCHAIN"
-say "Using: $PRIVKEY"
-say "VHOST: $VHOST"
-
-say "Patch vhost: ensure ssl_certificate + ssl_certificate_key exist in the server{} that listens 443 ssl"
-python3 - <<PY
-import re
-path=r"$VHOST"
-fullchain=r"$FULLCHAIN"
-privkey=r"$PRIVKEY"
-
-src=open(path,'r',encoding='utf-8',errors='ignore').read().splitlines(True)
-
-# quick test: if file contains listen 443 ssl anywhere
-has_listen_ssl=any(re.search(r'^\s*listen\s+[^;]*\b443\b[^;]*\bssl\b',l) for l in src)
-
-if not has_listen_ssl:
-    # nothing to do (but keep file unchanged)
-    open(path,'w',encoding='utf-8',errors='ignore').writelines(src)
-    raise SystemExit(0)
-
-# We will inject only if ssl_certificate is missing in file or commented out only.
-has_cert=any(re.search(r'^\s*ssl_certificate\s+',l) and not l.lstrip().startswith("#") for l in src)
-has_key =any(re.search(r'^\s*ssl_certificate_key\s+',l) and not l.lstrip().startswith("#") for l in src)
-
-# Also ensure common includes (optional but safe)
-has_opts =any("/etc/letsencrypt/options-ssl-nginx.conf" in l and not l.lstrip().startswith("#") for l in src)
-has_dh   =any("ssl-dhparams.pem" in l and not l.lstrip().startswith("#") for l in src)
-
-out=[]
-inserted=False
-
-for i,l in enumerate(src):
-    out.append(l)
-    # Insert right after the first active "listen ... 443 ... ssl" line
-    if (not inserted) and re.search(r'^\s*listen\s+[^;]*\b443\b[^;]*\bssl\b',l) and (not l.lstrip().startswith("#")):
-        if not has_cert:
-            out.append(f"  ssl_certificate {fullchain};\n")
-        if not has_key:
-            out.append(f"  ssl_certificate_key {privkey};\n")
-        if not has_opts and ("/etc/letsencrypt/options-ssl-nginx.conf" in open("/etc/nginx/snippets/ssl-params.conf",'r',errors='ignore').read() if __import__("os").path.exists("/etc/nginx/snippets/ssl-params.conf") else ""):
-            pass
-        if not has_opts:
-            out.append("  include /etc/letsencrypt/options-ssl-nginx.conf;\n")
-        if not has_dh and __import__("os").path.exists("/etc/letsencrypt/ssl-dhparams.pem"):
-            out.append("  ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;\n")
-        inserted=True
-
-# backup once
-bak=path+f".bak_ssl_{__import__('time').strftime('%Y%m%d_%H%M%S')}"
-open(bak,'w',encoding='utf-8',errors='ignore').writelines(src)
-open(path,'w',encoding='utf-8',errors='ignore').writelines(out)
-PY
-
-say "nginx test"
+say "NGINX TEST"
 if nginx -t; then
   say "RELOAD nginx"
   systemctl reload nginx
 else
-  say "ERROR: nginx -t failed (show ssl-related lines)"
-  nginx -T 2>/dev/null | grep -nE 'listen.*443.*ssl|ssl_certificate|ssl_certificate_key|server_name.*fireinners|fireinners\.online-ssl' | head -n 260 || true
+  say "ERROR: nginx -t failed. Showing top related lines:"
+  nginx -T 2>/dev/null | grep -nE 'conf\.d/|aiaquila|listen.*ssl|ssl_certificate|ssl_certificate_key' | head -n 260 || true
   exit 1
 fi
 
 say "REFREEZE chattr +i (best effort)"
 if command -v chattr >/dev/null 2>&1; then
   chattr +i "$NGX/nginx.conf" 2>/dev/null || true
-  chattr +i "$VHOST" 2>/dev/null || true
 fi
 
 say "DONE. Backup: $BK/nginx.tgz"
-echo "OPEN: https://${DOMAIN}/"
-echo "OPEN: https://${DOMAIN}/wolverine/"
+echo "OPEN: https://fireinners.online/"
+echo "OPEN: https://fireinners.online/wolverine/"
 SH
-chmod +x /root/NGX_FIX_SSL_FIREINNERS.sh
-bash /root/NGX_FIX_SSL_FIREINNERS.sh
+chmod +x /root/NGX_DISABLE_BROKEN_SSL_CONFD.sh
+bash /root/NGX_DISABLE_BROKEN_SSL_CONFD.sh
