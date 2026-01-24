@@ -1,42 +1,519 @@
-// ... suite manquante
-document.getElementById('temp').textContent = temp.toFixed(1);
-document.getElementById('ressenti').textContent = ressenti.toFixed(1);
-document.getElementById('vent').textContent = Math.round(vent);
-document.getElementById('rafales').textContent = Math.round(rafales);
-document.getElementById('neige').textContent = Math.max(0, neige).toFixed(0);
-document.getElementById('kp').textContent = kp.toFixed(1);
-document.getElementById('aurores').textContent = (kp > 5 ? 80 : kp > 4.5 ? 50 : 20);
-document.getElementById('ionisation').textContent = Math.round(80 + kp * 5);
-document.getElementById('maree').textContent = Math.round(50 + Math.sin(d.getMinutes()/10) * 20);
-document.getElementById('visibilite').textContent = neige > 10 ? 2.5 : 20;
-document.getElementById('verglas').textContent = temp > -5 && neige > 10 ? 15 : 0;
+bash -lc 'set -euo pipefail
+cd /root
+cat >/root/aia_fix.sh <<'"'"'BASH'"'"'
+#!/usr/bin/env bash
+set -euo pipefail
+umask 022
 
-// Sensor géomagnétique
-const gamma = 0.8 + Math.random() * 0.6;
-document.getElementById('geomag').textContent = gamma.toFixed(1);
-document.getElementById('vibration').textContent = (7.83 + Math.random() * 0.1).toFixed(2);
-document.getElementById('phase').textContent = 'veille';
-document.getElementById('charge').textContent = 'Montréal, Québec';
+say(){ printf "[%s] %s\n" "$(date +%H:%M:%S)" "$*"; }
+die(){ say "ERR: $*"; exit 1; }
 
-// Lune
-document.getElementById('lune').textContent = getPhaseLune();
-document.getElementById('maree_lune').textContent = 'haute';
+[ "$(id -u)" -eq 0 ] || die "run as root"
+command -v nginx >/dev/null 2>&1 || die "nginx missing"
+command -v curl  >/dev/null 2>&1 || die "curl missing"
+command -v python3 >/dev/null 2>&1 || die "python3 missing"
+command -v systemctl >/dev/null 2>&1 || die "systemctl missing"
 
-// Alertes
-let alerte = [];
-if (ressenti < -35) alerte.push('Froid –37 °C 🧊');
-if (gamma > 1.5) alerte.push('Charge verte 💚');
-document.getElementById('alertText').textContent = alerte.join('. ') || 'Aucune alerte.';
+TS="$(date +%Y%m%d_%H%M%S)"
+BK="/root/AIAQUILA_BK_$TS"
+mkdir -p "$BK"
+
+DOMAIN="fireinners.online"
+SLUG="/iaaquila"
+WWW="/var/www/iaaquila"
+VENDOR="$WWW/vendor"
+NGX_INC_DIR="/etc/nginx/includes"
+NGX_INC="$NGX_INC_DIR/iaaquila_routes.inc"
+
+# PIN versions (no @latest)
+WEB3_VER="1.95.4"
+PROCESS_VER="0.11.10"
+BUFFER_VER="6.0.3"
+
+# Best-effort unfreeze targets
+unfreeze(){ chattr -i "$1" 2>/dev/null || true; }
+freeze(){ chattr +i "$1" 2>/dev/null || true; }
+
+backup_path(){
+  local p="$1"
+  [ -e "$p" ] || return 0
+  mkdir -p "$BK/$(dirname "$p")"
+  cp -a "$p" "$BK/$p.bak" 2>/dev/null || true
 }
 
-// Auto mise à jour
-function toggleAuto() {
-  if (autoInterval) {
-    clearInterval(autoInterval);
-    document.getElementById('autoStatus').textContent = 'OFF';
-  } else {
-    rapport();
-    autoInterval = setInterval(rapport, 15*60*1000);
-    document.getElementById('autoStatus').textContent = 'ON';
+detect_vhost(){
+  local cand=""
+  if [ -f /etc/nginx/conf.d/000-fireinners.online-ssl.conf ]; then
+    cand="/etc/nginx/conf.d/000-fireinners.online-ssl.conf"
+  elif [ -f /etc/nginx/sites-available/fireinners.online-ssl ]; then
+    cand="/etc/nginx/sites-available/fireinners.online-ssl"
+  else
+    cand="$(nginx -T 2>/dev/null | awk '"'"'/# configuration file/ {f=$4} /server_name/ && /fireinners\.online/ {print f; exit}'"'"' || true)"
+  fi
+  echo "$cand"
+}
+
+write_nginx_include(){
+  say "1) write nginx include $NGX_INC"
+  mkdir -p "$NGX_INC_DIR"
+  backup_path "$NGX_INC"
+  unfreeze "$NGX_INC"
+  cat >"$NGX_INC" <<EOF
+# iaaquila routes (static)
+location = ${SLUG} { return 301 ${SLUG}/; }
+location ^~ ${SLUG}/ {
+  root /var/www;
+  try_files \$uri \$uri/ ${SLUG}/index.html;
+  add_header Cache-Control "no-store" always;
+}
+EOF
+  chmod 0644 "$NGX_INC" || true
+}
+
+inject_include_into_vhost(){
+  local VH="$1"
+  [ -n "$VH" ] || { say "WARN: no vhost detected, skip inject"; return 0; }
+  [ -f "$VH" ] || { say "WARN: vhost not a file ($VH), skip inject"; return 0; }
+
+  say "2) inject include into vhost: $VH"
+  backup_path "$VH"
+  unfreeze "$VH"
+
+  python3 - "$VH" "$DOMAIN" "$NGX_INC" <<'"'"'PY'"'"'
+import re,sys
+p,dom,inc=sys.argv[1],sys.argv[2],sys.argv[3]
+s=open(p,"r",encoding="utf-8",errors="ignore").read()
+if inc in s:
+  sys.exit(0)
+
+def patch(block):
+  if inc in block: return block, False
+  if not re.search(r"\blisten\b[^;]*\b443\b", block): return block, False
+  if not re.search(r"\bserver_name\b[^;]*\b"+re.escape(dom)+r"\b", block): return block, False
+  lines=block.splitlines()
+  ins=None
+  for i,l in enumerate(lines):
+    if re.search(r"\bserver_name\b", l):
+      ins=i+1; break
+  if ins is None: ins=1
+  lines.insert(ins, "    include %s;"%inc)
+  return "\n".join(lines), True
+
+out=[]; changed=False; pos=0
+for m in re.finditer(r"server\s*\{", s):
+  start=m.start(); out.append(s[pos:start])
+  i=start; depth=0
+  while i < len(s):
+    c=s[i]
+    if c=="{": depth+=1
+    elif c=="}":
+      depth-=1
+      if depth==0:
+        end=i+1
+        b=s[start:end]
+        nb,ch=patch(b)
+        out.append(nb)
+        changed=changed or ch
+        pos=end
+        break
+    i+=1
+new="".join(out)+s[pos:]
+if changed:
+  open(p,"w",encoding="utf-8").write(new)
+PY
+}
+
+write_vendor(){
+  say "3) vendor pinned libs (process/buffer/web3) -> $VENDOR"
+  mkdir -p "$VENDOR"
+  chmod 0755 "$WWW" "$VENDOR" || true
+
+  # process polyfill
+  curl -fsSL "https://unpkg.com/process@${PROCESS_VER}/browser.js" -o "$VENDOR/process.min.js"
+
+  # buffer polyfill (browser build)
+  curl -fsSL "https://unpkg.com/buffer@${BUFFER_VER}/index.min.js" -o "$VENDOR/buffer.min.js"
+
+  # solana web3 iife pinned
+  curl -fsSL "https://unpkg.com/@solana/web3.js@${WEB3_VER}/lib/index.iife.min.js" -o "$VENDOR/solana-web3.iife.min.js"
+
+  chmod 0644 "$VENDOR/"*.js || true
+}
+
+write_policy(){
+  say "4) write policy.json (allowlist/quota/kill-switch defaults)"
+  backup_path "$WWW/policy.json"
+  cat >"$WWW/policy.json"<<'"'"'EOF'"'"'
+{
+  "enabled": true,
+  "network": "mainnet-beta",
+  "rpc": "https://api.mainnet-beta.solana.com",
+  "allowDestinations": [
+    "2uHqvSM6vrm7Ye7ntMFUA1RHiqAinGjeCx1XXXXXXXXXXXXXXX"
+  ],
+  "maxLamportsPerTx": 2000000,
+  "maxTxPerMinute": 2,
+  "cooldownMs": 15000,
+  "requireArm": true,
+  "confirmCommitment": "finalized"
+}
+EOF
+  chmod 0644 "$WWW/policy.json" || true
+}
+
+write_index(){
+  say "5) write index.html (Buffer/process polyfill BEFORE web3, idempotence, retry/backoff, finalized)"
+  backup_path "$WWW/index.html"
+  cat >"$WWW/index.html"<<'"'"'HTML'"'"'
+<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>AIAQUILA • Execution Réel (Phantom)</title><style>:root{--bg:#050a16;--panel:#0b1634;--line:#274a9b;--txt:#d7e3ff;--mut:#9fb7ff;--bad:#ff6a6a;--ok:#63ffb8}*{box-sizing:border-box}html,body{height:100%;margin:0;background:radial-gradient(1200px 700px at 70% 20%,rgba(37,99,235,.15),rgba(0,0,0,1));color:var(--txt);font:14px/1.35 system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue",Arial}#app{display:flex;gap:16px;padding:16px;max-width:1280px;margin:0 auto}#left{width:360px;min-width:320px}#right{flex:1}h1{margin:0 0 10px 0;font-size:18px;letter-spacing:.08em}h2{margin:0 0 8px 0;font-size:14px;color:var(--mut)}.box{background:rgba(11,22,52,.72);border:1px solid rgba(39,74,155,.65);border-radius:12px;padding:12px;box-shadow:0 18px 60px rgba(0,0,0,.35)}.row{display:flex;gap:10px;align-items:center;margin:10px 0}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre-wrap;word-break:break-word;background:rgba(0,0,0,.25);border:1px solid rgba(39,74,155,.35);border-radius:10px;padding:10px;min-height:260px;max-height:520px;overflow:auto}.chip{display:inline-flex;gap:6px;align-items:center;padding:4px 8px;border-radius:999px;border:1px solid rgba(39,74,155,.65);background:rgba(0,0,0,.18);font-size:12px}.ok{color:var(--ok)}.bad{color:var(--bad)}input{flex:1;min-width:0;background:rgba(0,0,0,.25);border:1px solid rgba(39,74,155,.55);border-radius:10px;padding:10px;color:var(--txt);outline:none}button{cursor:pointer;border:1px solid rgba(39,74,155,.65);background:rgba(0,0,0,.18);color:var(--txt);padding:10px 12px;border-radius:10px;font-weight:700;letter-spacing:.05em}button.primary{background:rgba(37,99,235,.25)}button.danger{background:rgba(255,106,106,.12)}button:disabled{opacity:.45;cursor:not-allowed}</style>
+<script src="./vendor/process.min.js"></script>
+<script src="./vendor/buffer.min.js"></script>
+<script>
+/* AIAQUILA_POLYFILL_V2: must be BEFORE solana-web3 */
+(function(){
+  var g=globalThis;
+  g.global=g;
+  if(!g.process && typeof process!=="undefined") g.process=process;
+  if(!g.process) g.process={env:{},browser:true,nextTick:function(fn){Promise.resolve().then(fn)}};
+  // buffer@6 exposes "buffer" global with Buffer inside on browsers
+  try{
+    if(!g.Buffer){
+      if(g.buffer && g.buffer.Buffer) g.Buffer=g.buffer.Buffer;
+      else if(typeof Buffer!=="undefined") g.Buffer=Buffer;
+    }
+  }catch(e){}
+})();
+</script>
+<script src="./vendor/solana-web3.iife.min.js"></script>
+</head><body><div id="app">
+  <div id="left">
+    <div class="box">
+      <h1>AIAQUILA • Execution Réel (Phantom)</h1>
+      <div class="row"><span class="chip" id="chipNET">NET:—</span><span class="chip" id="chipRPC">RPC:—</span><span class="chip" id="chipARM">ARM:OFF</span></div>
+      <div class="row"><span class="chip" id="chipWAL">WALLET:—</span></div>
+      <div class="row"><button class="primary" id="btnConnect">CONNECT PHANTOM</button><button class="danger" id="btnDisconnect">DISCONNECT</button></div>
+      <h2>Destination</h2>
+      <div class="row"><input id="dest" placeholder="DEST (pubkey allowlist)"></div>
+      <h2>Montant</h2>
+      <div class="row"><input id="sol" placeholder="SOL (ex: 0.001)" value="0.001"></div>
+      <div class="row"><button id="btnARM" class="primary">ARM</button><button id="btnDISARM" class="danger">DISARM</button></div>
+      <div class="row"><button id="btnPropose">PROPOSE</button><button id="btnApprove" class="primary">APPROUVER & SIGNER</button></div>
+      <div class="row"><button id="btnClear">CLEAR PENDING</button><button id="btnReloadPolicy">RELOAD POLICY</button></div>
+      <div class="row"><span class="chip" id="chipPOL">POLICY:—</span></div>
+    </div>
+  </div>
+  <div id="right">
+    <div class="box">
+      <h2>Console</h2>
+      <div class="mono" id="log"></div>
+    </div>
+  </div>
+</div>
+<script>
+(()=>{"use strict";
+const $=id=>document.getElementById(id);
+const logEl=$("log");
+const chipNET=$("chipNET"),chipRPC=$("chipRPC"),chipARM=$("chipARM"),chipWAL=$("chipWAL"),chipPOL=$("chipPOL");
+const btnConnect=$("btnConnect"),btnDisconnect=$("btnDisconnect"),btnARM=$("btnARM"),btnDISARM=$("btnDISARM"),btnPropose=$("btnPropose"),btnApprove=$("btnApprove"),btnClear=$("btnClear"),btnReloadPolicy=$("btnReloadPolicy");
+const inpDest=$("dest"),inpSol=$("sol");
+
+function now(){return new Date().toLocaleTimeString("fr-CA",{hour:"2-digit",minute:"2-digit",second:"2-digit"});}
+function p(s,cls){const d=document.createElement("div");d.textContent=`[${now()}] ${s}`;if(cls)d.className=cls;logEl.appendChild(d);logEl.scrollTop=1e9;}
+function fmtErr(e){try{if(!e)return"Unknown";if(typeof e==="string")return e;return (e.message||String(e))+(e.code?` (code ${e.code})`:"");}catch(_){return"Error";}}
+
+let web3=null, solana=null, wallet=null, arm=false;
+let policy={enabled:true,network:"mainnet-beta",rpc:"https://api.mainnet-beta.solana.com",allowDestinations:[],maxLamportsPerTx:2_000_000,maxTxPerMinute:2,cooldownMs:15000,requireArm:true,confirmCommitment:"finalized"};
+let conn=null;
+let pending=null; // {id,from,to,lamports,createdAt,blockhash,lastValidBlockHeight,signature,stage,lastAttemptAt,attempts}
+
+function setChip(el,txt,ok){el.textContent=txt;el.style.borderColor=ok?"rgba(99,255,184,.65)":"rgba(255,106,106,.55)";}
+function refreshChips(){
+  chipNET.textContent=`NET:${policy.network||"—"}`;
+  chipRPC.textContent=`RPC:${(policy.rpc||"—").replace(/^https?:\/\//,"")}`;
+  chipARM.textContent=`ARM:${arm?"ON":"OFF"}`;
+  chipARM.className="chip "+(arm?"ok":"bad");
+  chipWAL.textContent=`WALLET:${wallet?wallet.slice(0,4)+"…"+wallet.slice(-4):"—"}`;
+  chipPOL.textContent=`POLICY:${policy.enabled?"ON":"OFF"}`;
+  chipPOL.className="chip "+(policy.enabled?"ok":"bad");
+}
+
+function lsGet(k){try{return localStorage.getItem(k);}catch(_){return null;}}
+function lsSet(k,v){try{localStorage.setItem(k,v);}catch(_){return;}}
+function lsDel(k){try{localStorage.removeItem(k);}catch(_){return;}}
+const KEY_POL="AIAQ_POLICY_V1";
+const KEY_PEND="AIAQ_PENDING_V1";
+const KEY_RATE="AIAQ_RATE_V1";
+
+async function sha256Hex(s){
+  const b=new TextEncoder().encode(s);
+  const h=await crypto.subtle.digest("SHA-256",b);
+  return Array.from(new Uint8Array(h)).map(x=>x.toString(16).padStart(2,"0")).join("");
+}
+
+function rateOk(){
+  const t=Date.now();
+  let r={t0:t, n:0, last:t};
+  const raw=lsGet(KEY_RATE);
+  if(raw){try{r=JSON.parse(raw)||r;}catch(_){r=r;}}
+  if(t-r.t0>60_000){r={t0:t,n:0,last:t};}
+  if(t-r.last < (policy.cooldownMs||0)) return {ok:false, why:`cooldown ${policy.cooldownMs}ms`};
+  if(r.n >= (policy.maxTxPerMinute||999)) return {ok:false, why:`rate maxTxPerMinute=${policy.maxTxPerMinute}`};
+  r.n++; r.last=t; lsSet(KEY_RATE,JSON.stringify(r));
+  return {ok:true};
+}
+
+function policyCheck(to,lamports){
+  if(!policy.enabled) return {ok:true};
+  if(policy.requireArm && !arm) return {ok:false, why:"ARM required"};
+  if(!to) return {ok:false, why:"destination missing"};
+  if(!Number.isFinite(lamports) || lamports<=0) return {ok:false, why:"lamports invalid"};
+  if(lamports > (policy.maxLamportsPerTx||0)) return {ok:false, why:`over maxLamportsPerTx=${policy.maxLamportsPerTx}`};
+  const allow=(policy.allowDestinations||[]).map(x=>String(x||"").trim()).filter(Boolean);
+  if(allow.length && !allow.includes(to)) return {ok:false, why:"destination not allowlisted"};
+  return {ok:true};
+}
+
+async function loadPolicy(){
+  // merge localStorage -> policy.json -> defaults
+  let base=policy;
+  const ls=lsGet(KEY_POL);
+  if(ls){try{base=Object.assign({},base,JSON.parse(ls)||{});}catch(_){/*ignore*/}}
+  try{
+    const r=await fetch("./policy.json?ts="+Date.now(),{cache:"no-store"});
+    if(r.ok){
+      const j=await r.json();
+      base=Object.assign({},base,j||{});
+      p("Policy loaded from ./policy.json","ok");
+    }else{
+      p("Policy fetch not ok (using local/default)","bad");
+    }
+  }catch(e){
+    p("Policy fetch failed (using local/default): "+fmtErr(e),"bad");
   }
+  policy=base;
+  lsSet(KEY_POL,JSON.stringify(policy));
+  conn=new solanaWeb3.Connection(policy.rpc,{commitment:"confirmed"});
+  refreshChips();
 }
+
+function loadPending(){
+  const raw=lsGet(KEY_PEND);
+  if(!raw) return;
+  try{pending=JSON.parse(raw)||null;}catch(_){pending=null;}
+  if(pending) p("Pending restored: "+pending.id,"ok");
+}
+
+function savePending(){
+  if(pending) lsSet(KEY_PEND,JSON.stringify(pending)); else lsDel(KEY_PEND);
+}
+
+function clearPending(){
+  pending=null; savePending();
+  p("Pending cleared","ok");
+}
+
+async function connect(){
+  solana=window.solana;
+  if(!solana || !solana.isPhantom) throw new Error("Phantom not detected");
+  const r=await solana.connect({onlyIfTrusted:false});
+  wallet=(r && r.publicKey)? r.publicKey.toString() : (solana.publicKey?solana.publicKey.toString():null);
+  if(!wallet) throw new Error("wallet missing after connect");
+  p("Wallet connecté: "+wallet,"ok");
+  refreshChips();
+}
+
+function disconnect(){
+  try{ if(window.solana && window.solana.isPhantom) window.solana.disconnect(); }catch(_){}
+  wallet=null;
+  p("Disconnected","bad");
+  refreshChips();
+}
+
+function solToLamports(sol){
+  const x=Number(sol);
+  if(!Number.isFinite(x) || x<=0) return NaN;
+  return Math.round(x*1e9);
+}
+
+async function propose(){
+  if(!window.solanaWeb3) throw new Error("solanaWeb3 missing (web3 not loaded)");
+  if(!wallet) throw new Error("wallet not connected");
+  if(pending && pending.stage && pending.stage!=="done") throw new Error("pending already exists (clear or approve)");
+
+  const to=String(inpDest.value||"").trim();
+  const lamports=solToLamports(inpSol.value);
+  const chk=policyCheck(to,lamports);
+  if(!chk.ok) throw new Error("policy: "+chk.why);
+
+  const rid=await sha256Hex(JSON.stringify({from:wallet,to,lamports,ts:Date.now()}));
+  pending={id:rid,from:wallet,to,lamports,createdAt:Date.now(),signature:null,stage:"proposed",attempts:0,lastAttemptAt:0};
+  savePending();
+  p(`Proposition OK -> ${lamports} lamports (id ${rid.slice(0,10)}…)`,"ok");
+}
+
+async function sendWithRetry(tx){
+  // retry on transient errors
+  let lastErr=null;
+  for(let i=0;i<3;i++){
+    try{
+      const sig=await conn.sendRawTransaction(tx.serialize(),{skipPreflight:false,preflightCommitment:"confirmed",maxRetries:0});
+      return sig;
+    }catch(e){
+      lastErr=e;
+      const msg=fmtErr(e);
+      p("sendRawTransaction failed: "+msg,"bad");
+      // blockhash not found / expired -> let caller rebuild
+      await new Promise(r=>setTimeout(r, 600*(2**i)));
+    }
+  }
+  throw lastErr||new Error("send failed");
+}
+
+async function confirmFinalized(sig, bh, lvh){
+  // confirm in finalized with backoff
+  let lastErr=null;
+  for(let i=0;i<6;i++){
+    try{
+      const res=await conn.confirmTransaction({signature:sig,blockhash:bh,lastValidBlockHeight:lvh}, policy.confirmCommitment||"finalized");
+      if(res && res.value && res.value.err) throw new Error("tx err: "+JSON.stringify(res.value.err));
+      return true;
+    }catch(e){
+      lastErr=e;
+      p("confirm failed: "+fmtErr(e),"bad");
+      await new Promise(r=>setTimeout(r, 800*(2**i)));
+    }
+  }
+  throw lastErr||new Error("confirm failed");
+}
+
+async function approve(){
+  if(!wallet) throw new Error("wallet not connected");
+  if(!pending || pending.stage!=="proposed") throw new Error("no pending proposal");
+  const to=pending.to, lamports=pending.lamports;
+
+  const chk=policyCheck(to,lamports);
+  if(!chk.ok) throw new Error("policy: "+chk.why);
+
+  const rate=rateOk();
+  if(!rate.ok) throw new Error("rate: "+rate.why);
+
+  pending.stage="building"; pending.attempts=(pending.attempts||0)+1; pending.lastAttemptAt=Date.now(); savePending();
+  p("Building tx…","ok");
+
+  // always get a fresh blockhash right before signing
+  const bh=await conn.getLatestBlockhash("confirmed");
+  pending.blockhash=bh.blockhash;
+  pending.lastValidBlockHeight=bh.lastValidBlockHeight;
+
+  const tx=new solanaWeb3.Transaction({feePayer:new solanaWeb3.PublicKey(wallet),recentBlockhash:bh.blockhash});
+  tx.add(solanaWeb3.SystemProgram.transfer({
+    fromPubkey:new solanaWeb3.PublicKey(wallet),
+    toPubkey:new solanaWeb3.PublicKey(to),
+    lamports
+  }));
+
+  pending.stage="signing"; savePending();
+  p("Request signature Phantom…","ok");
+
+  let signed;
+  try{
+    signed=await window.solana.signTransaction(tx);
+  }catch(e){
+    // user reject
+    pending.stage="proposed"; savePending();
+    throw new Error("user rejected: "+fmtErr(e));
+  }
+
+  pending.stage="sending"; savePending();
+  p("Sending tx…","ok");
+
+  let sig=null;
+  try{
+    sig=await sendWithRetry(signed);
+  }catch(e){
+    // blockhash expired etc -> fallback one rebuild attempt
+    const msg=fmtErr(e);
+    p("Send failed, retry rebuild once… ("+msg+")","bad");
+    const bh2=await conn.getLatestBlockhash("confirmed");
+    pending.blockhash=bh2.blockhash; pending.lastValidBlockHeight=bh2.lastValidBlockHeight;
+    const tx2=new solanaWeb3.Transaction({feePayer:new solanaWeb3.PublicKey(wallet),recentBlockhash:bh2.blockhash});
+    tx2.add(solanaWeb3.SystemProgram.transfer({fromPubkey:new solanaWeb3.PublicKey(wallet),toPubkey:new solanaWeb3.PublicKey(to),lamports}));
+    const signed2=await window.solana.signTransaction(tx2);
+    sig=await sendWithRetry(signed2);
+  }
+
+  pending.signature=sig;
+  pending.stage="confirming"; savePending();
+  p("Sent: "+sig+" (confirming "+(policy.confirmCommitment||"finalized")+")","ok");
+
+  await confirmFinalized(sig, pending.blockhash, pending.lastValidBlockHeight);
+
+  pending.stage="done"; savePending();
+  p("FINALIZED OK: "+sig,"ok");
+}
+
+function bootChecks(){
+  if(!window.solanaWeb3) p("WARN: solanaWeb3 missing","bad");
+  if(!globalThis.Buffer) p("WARN: Buffer missing (polyfill not loaded)","bad");
+  else p("Buffer OK","ok");
+}
+
+btnConnect.onclick=async()=>{try{await connect();}catch(e){p(fmtErr(e),"bad");}};
+btnDisconnect.onclick=()=>disconnect();
+btnARM.onclick=()=>{arm=true;refreshChips();p("ARM ON","ok");};
+btnDISARM.onclick=()=>{arm=false;refreshChips();p("ARM OFF","bad");};
+btnPropose.onclick=async()=>{try{await propose();}catch(e){p(fmtErr(e),"bad");}};
+btnApprove.onclick=async()=>{try{await approve();}catch(e){p(fmtErr(e),"bad");}};
+btnClear.onclick=()=>clearPending();
+btnReloadPolicy.onclick=async()=>{await loadPolicy();};
+
+(async()=>{
+  p("Boot…","ok");
+  await loadPolicy();
+  loadPending();
+  refreshChips();
+  bootChecks();
+})();
+})();
+</script></body></html>
+HTML
+  chmod 0644 "$WWW/index.html" || true
+  chown -R www-data:www-data "$WWW" 2>/dev/null || true
+}
+
+smoke(){
+  say "6) nginx -t + reload"
+  nginx -t
+  systemctl reload nginx
+
+  say "7) smoke tests"
+  echo "--- HEAD ${SLUG}/ ---"
+  curl -skI -H "Host: $DOMAIN" "https://127.0.0.1${SLUG}/" | head -n 12 || true
+  echo "--- GET ${SLUG}/policy.json ---"
+  curl -sk -H "Host: $DOMAIN" "https://127.0.0.1${SLUG}/policy.json" | head -n 5 || true
+  echo "--- nginx include visible ---"
+  nginx -T 2>/dev/null | grep -n "iaaquila_routes" | head -n 20 || true
+}
+
+main(){
+  say "BEGIN AIAQUILA FIX @ $TS"
+  mkdir -p "$WWW"
+  backup_path "$WWW"
+  write_nginx_include
+  VH="$(detect_vhost)"
+  [ -n "$VH" ] && inject_include_into_vhost "$VH" || true
+  write_vendor
+  write_policy
+  write_index
+  smoke
+  # Optional freeze (best-effort): don’t brick if you need future edits
+  # freeze "$NGX_INC" || true
+  # [ -n "${VH:-}" ] && freeze "$VH" || true
+  say "DONE"
+  say "BK: $BK"
+  say "Open: https://$DOMAIN${SLUG}/"
+}
+main
+BASH
+chmod 755 /root/aia_fix.sh
+/root/aia_fix.sh'
