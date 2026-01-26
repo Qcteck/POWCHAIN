@@ -1,1 +1,240 @@
-ARM=ON CAP_USDC=20 MAX_BUY_USDC=20 bash MEGA_MICROCAP_HUNT_AUTO_INSTALL_V1.sh
+bash -lc 'set -euo pipefail;umask 077;cd /root;cat > /root/MEGA_MICROCAP_HUNT_AUTO_INSTALL_V1.sh <<'"'"'BASH'"'"'
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+say(){ printf "[%s] %s\n" "$(date +%H:%M:%S)" "$*"; }
+die(){ say "ERROR: $*"; exit 1; }
+[ "$(id -u)" -eq 0 ] || die "Run as root."
+APP="/opt/microcap_hunt_auto"
+LOGDIR="$APP/logs"
+ENVF="$APP/.env"
+STATEF="$APP/state.json"
+UNIT="/etc/systemd/system/microcap-hunt-auto.service"
+WALLET_FILE_DEFAULT="/root/traderone_wallet_backup.txt"
+RPC_DEFAULT="https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac"
+USDC_MINT_DEFAULT="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1"
+JUP_QUOTE_DEFAULT="https://quote-api.jup.ag/v6/quote"
+JUP_SWAP_DEFAULT="https://quote-api.jup.ag/v6/swap"
+DS_PROFILES_DEFAULT="https://api.dexscreener.com/token-profiles/latest/v1"
+DS_TOKEN_DEFAULT="https://api.dexscreener.com/latest/dex/tokens"
+ARM="${ARM:-OFF}"
+MODE="${MODE:-MICROCAPS}"
+RPC="${RPC:-$RPC_DEFAULT}"
+WALLET_FILE="${WALLET_FILE:-$WALLET_FILE_DEFAULT}"
+USDC_MINT="${USDC_MINT:-$USDC_MINT_DEFAULT}"
+JUP_QUOTE="${JUP_QUOTE:-$JUP_QUOTE_DEFAULT}"
+JUP_SWAP="${JUP_SWAP:-$JUP_SWAP_DEFAULT}"
+DS_PROFILES="${DS_PROFILES:-$DS_PROFILES_DEFAULT}"
+DS_TOKEN="${DS_TOKEN:-$DS_TOKEN_DEFAULT}"
+SCAN_MS="${SCAN_MS:-15000}"
+TOP_MINTS="${TOP_MINTS:-90}"
+PICK_TOP="${PICK_TOP:-12}"
+CAP_USDC="${CAP_USDC:-20}"
+MAX_BUY_USDC="${MAX_BUY_USDC:-20}"
+SL_PCT="${SL_PCT:-7.5}"
+TP1_PCT="${TP1_PCT:-12}"
+TP2_PCT="${TP2_PCT:-25}"
+SLIPPAGE_BPS="${SLIPPAGE_BPS:-200}"
+LMIN="${LMIN:-25000}"
+VMIN5="${VMIN5:-5000}"
+TXMIN5="${TXMIN5:-10}"
+RTH_TICK="${RTH_TICK:-0.35}"
+SMIN="${SMIN:-25}"
+BBUF="${BBUF:-0.60}"
+SCORE_MIN="${SCORE_MIN:-55}"
+say "== PRECHECK =="
+command -v node >/dev/null 2>&1 || die "node not found (need Node 20+)."
+command -v npm  >/dev/null 2>&1 || die "npm not found."
+node -v
+[ -f "$WALLET_FILE" ] || die "Missing wallet secret: $WALLET_FILE"
+[ -n "$RPC" ] || die "RPC empty"
+say "== PREP DIRS =="
+mkdir -p "$APP" "$LOGDIR"
+chmod 700 "$APP" "$LOGDIR"
+say "== WRITE package.json =="
+cat >"$APP/package.json" <<'JSON'
+{"name":"microcap-hunt-auto","version":"1.0.0","type":"module","private":true,"dependencies":{"@solana/web3.js":"^1.95.5","bs58":"^5.0.0"}}
+JSON
+say "== WRITE bot.mjs =="
+cat >"$APP/bot.mjs" <<'JS'
+import fs from "fs";import path from "path";import bs58 from "bs58";
+import {Connection,Keypair,PublicKey,VersionedTransaction} from "@solana/web3.js";
+const APP=path.resolve("/opt/microcap_hunt_auto"),ENV=path.join(APP,".env"),LOGDIR=path.join(APP,"logs"),STATEF=path.join(APP,"state.json");
+function ts(){return new Date().toISOString()}function now(){return Date.now()}function sleep(ms){return new Promise(r=>setTimeout(r,ms))}
+function clamp(x,a,b){return Math.max(a,Math.min(b,x))}function fmt(n,d=2){return Number.isFinite(n)?n.toLocaleString("en-US",{maximumFractionDigits:d}):"—"}
+function log(line){const s=`${ts()} ${line}\n`;process.stdout.write(s);try{fs.appendFileSync(path.join(LOGDIR,"bot.ndjson"),JSON.stringify({t:ts(),msg:line})+"\n")}catch{}}
+function loadEnv(){const o={};if(!fs.existsSync(ENV)) return o;const txt=fs.readFileSync(ENV,"utf8");
+for(const ln of txt.split(/\r?\n/)){const m=ln.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*)\s*$/);if(!m) continue;let v=m[2];if(v.startsWith("\"")&&v.endsWith("\"")) v=v.slice(1,-1);o[m[1]]=v;}return o;}
+const E=loadEnv();const CFG={RPC:E.RPC||"",WALLET_FILE:E.WALLET_FILE||"/root/traderone_wallet_backup.txt",USDC_MINT:E.USDC_MINT||"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1",
+JUP_QUOTE:E.JUP_QUOTE||"https://quote-api.jup.ag/v6/quote",JUP_SWAP:E.JUP_SWAP||"https://quote-api.jup.ag/v6/swap",
+DS_PROFILES:E.DS_PROFILES||"https://api.dexscreener.com/token-profiles/latest/v1",DS_TOKEN:E.DS_TOKEN||"https://api.dexscreener.com/latest/dex/tokens",
+ARM:(E.ARM||"OFF").toUpperCase(),SCAN_MS:parseInt(E.SCAN_MS||"15000",10),TOP_MINTS:parseInt(E.TOP_MINTS||"90",10),PICK_TOP:parseInt(E.PICK_TOP||"12",10),
+CAP_USDC:parseFloat(E.CAP_USDC||"20"),MAX_BUY_USDC:parseFloat(E.MAX_BUY_USDC||"20"),SL_PCT:parseFloat(E.SL_PCT||"7.5")/100,
+TP1_PCT:parseFloat(E.TP1_PCT||"12")/100,TP2_PCT:parseFloat(E.TP2_PCT||"25")/100,SLIPPAGE_BPS:parseInt(E.SLIPPAGE_BPS||"200",10),
+LMIN:parseFloat(E.LMIN||"25000"),VMIN5:parseFloat(E.VMIN5||"5000"),TXMIN5:parseFloat(E.TXMIN5||"10"),
+RTH_TICK:parseFloat(E.RTH_TICK||"0.35"),SMIN:parseInt(E.SMIN||"25",10),BBUF:parseFloat(E.BBUF||"0.60")/100,SCORE_MIN:parseFloat(E.SCORE_MIN||"55"),EPS:-0.01533};
+function loadState(){try{if(!fs.existsSync(STATEF)) return {mem:{},pos:null};const s=JSON.parse(fs.readFileSync(STATEF,"utf8"));return {mem:s.mem||{},pos:s.pos||null};}catch{return {mem:{},pos:null}}}
+function saveState(st){try{fs.writeFileSync(STATEF,JSON.stringify(st,null,2))}catch{}}
+function parseSecretWallet(file){const raw=fs.readFileSync(file,"utf8").trim();
+if(raw.startsWith("[")&&raw.endsWith("]")){const arr=JSON.parse(raw);return Keypair.fromSecretKey(Uint8Array.from(arr));}
+const m=raw.match(/([1-9A-HJ-NP-Za-km-z]{20,})/);if(!m) throw new Error("Cannot parse wallet secret");
+const b=bs58.decode(m[1]);if(b.length===64) return Keypair.fromSecretKey(Uint8Array.from(b));if(b.length===32) return Keypair.fromSeed(Uint8Array.from(b));
+throw new Error("Unexpected secret length: "+b.length);}
+async function jget(url,ms=15000){const ac=new AbortController();const t=setTimeout(()=>ac.abort(),ms);try{const r=await fetch(url,{signal:ac.signal,cache:"no-store"});if(!r.ok) throw new Error("HTTP "+r.status);return await r.json();}finally{clearTimeout(t)}}
+async function jpost(url,body,ms=20000){const ac=new AbortController();const t=setTimeout(()=>ac.abort(),ms);try{const r=await fetch(url,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body),signal:ac.signal});
+if(!r.ok){const txt=await r.text().catch(()=> "");throw new Error("HTTP "+r.status+" "+txt.slice(0,200));}return await r.json();}finally{clearTimeout(t)}}
+async function getSolanaMints(){const js=await jget(CFG.DS_PROFILES);return (js||[]).filter(x=>String(x.chainId).toLowerCase()==="solana").map(x=>x.tokenAddress).filter(Boolean);}
+function pickBestPair(pairs){let best=null,bs=-1;for(const p of pairs||[]){const liq=p?.liquidity?.usd??0,v5=p?.volume?.m5??0,tx5=(p?.txns?.m5?.buys??0)+(p?.txns?.m5?.sells??0);
+const price=parseFloat(p?.priceUsd??"0");if(!Number.isFinite(price)||price<=0) continue;
+const s=(Math.log10(1+liq)*3)+(Math.log10(1+v5)*2)+(Math.log10(1+tx5));if(s>bs){bs=s;best=p;}}return best;}
+async function getTokenMetaForMint(mint){const js=await jget(`${CFG.DS_TOKEN}/${mint}`);const pair=pickBestPair(js?.pairs||[]);if(!pair) return null;
+const price=parseFloat(pair?.priceUsd||"NaN");const tx5=(pair?.txns?.m5?.buys??0)+(pair?.txns?.m5?.sells??0);
+return {mint,sym:(pair?.baseToken?.symbol||"").slice(0,12),name:(pair?.baseToken?.name||"").slice(0,18),url:pair?.url||"",price,liq:pair?.liquidity?.usd??0,vol5:pair?.volume?.m5??0,tx5,r5:pair?.priceChange?.m5??0};}
+function updateSeries(mem,price){const t=now();mem.series=mem.series||[];mem.series.push([t,price]);const cut=t-40*60*1000;while(mem.series.length&&mem.series[0][0]<cut) mem.series.shift();}
+function rangeFromSeries(mem,winMs){const t=now(),cut=t-winMs;const arr=(mem.series||[]).filter(x=>x[0]>=cut);if(arr.length<10) return null;
+let hi=-Infinity,lo=Infinity;for(const a of arr){const p=a[1];if(p>hi)hi=p;if(p<lo)lo=p;}if(!Number.isFinite(hi)||!Number.isFinite(lo)) return null;return {hi,lo,n:arr.length};}
+function porte(m){if(!(m.liq>=CFG.LMIN)) return "PORTE_LIQ";if(!(m.vol5>=CFG.VMIN5)) return "PORTE_VOL";if(!(m.tx5>=CFG.TXMIN5)) return "PORTE_TX";if(!Number.isFinite(m.price)||m.price<=0) return "PORTE_PRICE";return "";}
+function tickSilence(st,m){const mem=st.mem[m.mint]||{};const last=Number.isFinite(mem.lastPrice)?mem.lastPrice:NaN;
+const r=(Number.isFinite(last)&&Number.isFinite(m.price)&&last>0)?((m.price-last)/last*100):(m.r5??0);const silent=Math.abs(r)<=CFG.RTH_TICK;
+mem.S=silent?clamp((mem.S||0)+1,0,999999):0;mem.lastPrice=Number.isFinite(m.price)?m.price:last;mem.lastTs=now();updateSeries(mem,mem.lastPrice);st.mem[m.mint]=mem;return {mem,S:mem.S,r};}
+function calcP(liq,vol5){if(!(liq>0)||!(vol5>=0)) return 0;return clamp(Math.sqrt(liq)*Math.sqrt(1+vol5),1,1e12);}
+function scoreRow(row){const cold=clamp((row.M-1.6)/(3.2-1.6)*100,0,100);const trad=clamp((Math.log10(1+row.liq)-3.8)/(6.2-3.8)*100,0,100);
+const clean=clamp((50-Math.abs(row.r))*2,0,100);let pen=0;if(row.state!=="OK") pen+=70;if(row.liq<CFG.LMIN*1.5) pen+=10;if(row.vol5<CFG.VMIN5*1.5) pen+=10;
+return clamp(0.45*cold+0.35*trad+0.20*clean-pen,0,100);}
+async function getDecimals(connection,mintStr){const info=await connection.getParsedAccountInfo(new PublicKey(mintStr));const dec=info?.value?.data?.parsed?.info?.decimals;if(!Number.isFinite(dec)) throw new Error("decimals not found for "+mintStr);return dec;}
+async function getUsdcAmount(connection,owner){const mint=new PublicKey(CFG.USDC_MINT);const accts=await connection.getParsedTokenAccountsByOwner(owner,{mint});let sum=0;
+for(const a of accts.value){const ui=a.account?.data?.parsed?.info?.tokenAmount?.uiAmount;if(Number.isFinite(ui)) sum+=ui;}return sum;}
+async function getTokenAmount(connection,owner,mintStr){const mint=new PublicKey(mintStr);const accts=await connection.getParsedTokenAccountsByOwner(owner,{mint});let sum=0;
+for(const a of accts.value){const ui=a.account?.data?.parsed?.info?.tokenAmount?.uiAmount;if(Number.isFinite(ui)) sum+=ui;}return sum;}
+async function jupSwap(connection,kp,inputMint,outputMint,amountInUi){const owner=kp.publicKey;const inDec=await getDecimals(connection,inputMint);
+const amt=Math.floor(amountInUi*Math.pow(10,inDec));if(!(amt>0)) throw new Error("amountIn too small");
+const q=new URL(CFG.JUP_QUOTE);q.searchParams.set("inputMint",inputMint);q.searchParams.set("outputMint",outputMint);q.searchParams.set("amount",String(amt));
+q.searchParams.set("slippageBps",String(CFG.SLIPPAGE_BPS));q.searchParams.set("onlyDirectRoutes","false");const quote=await jget(q.toString());if(!quote?.outAmount) throw new Error("no quote");
+const swap=await jpost(CFG.JUP_SWAP,{quoteResponse:quote,userPublicKey:owner.toBase58(),wrapAndUnwrapSol:true,dynamicComputeUnitLimit:true,prioritizationFeeLamports:"auto"});
+const b64=swap?.swapTransaction;if(!b64) throw new Error("no swapTransaction");
+const tx=VersionedTransaction.deserialize(Buffer.from(b64,"base64"));tx.sign([kp]);
+const sig=await connection.sendRawTransaction(tx.serialize(),{skipPreflight:false,maxRetries:3});await connection.confirmTransaction(sig,"confirmed");return sig;}
+function decideBuySize(usdcBal,maxBuy){const maxSpend=Math.min(maxBuy,Math.max(0,usdcBal-0.5));return clamp(maxSpend,0,maxBuy);}
+async function main(){
+fs.mkdirSync(LOGDIR,{recursive:true});
+const kp=parseSecretWallet(CFG.WALLET_FILE);const owner=kp.publicKey;const connection=new Connection(CFG.RPC,{commitment:"confirmed"});
+log(`boot ok | pubkey=${owner.toBase58()}`);log(`ARM=${CFG.ARM} | MAX_BUY_USDC=${CFG.MAX_BUY_USDC} | SL=${CFG.SL_PCT*100}% TP1=${CFG.TP1_PCT*100}% TP2=${CFG.TP2_PCT*100}%`);
+let st=loadState();let lastScan=0;
+while(true){
+const t=now();if(t-lastScan<CFG.SCAN_MS){await sleep(250);continue;}lastScan=t;
+try{
+const mints=(await getSolanaMints()).slice(0,CFG.TOP_MINTS);
+const rows=[];
+for(const mint of mints){
+let meta=null;try{meta=await getTokenMetaForMint(mint);}catch{}if(!meta) continue;
+const pr=porte(meta);const {mem,S,r}=tickSilence(st,meta);const state=pr||"OK";const P=calcP(meta.liq,meta.vol5);
+const T=(state==="OK"&&P>0)?(-(S*S)/P+CFG.EPS):NaN;const M=(Number.isFinite(T)&&T!==0)?Math.log10(Math.abs(T)):NaN;
+const rng=rangeFromSeries(mem,20*60*1000);const breakout=rng?(rng.hi*(1+CFG.BBUF)):NaN;
+const row={mint:meta.mint,sym:meta.sym,name:meta.name,url:meta.url,price:meta.price,liq:meta.liq,vol5:meta.vol5,tx5:meta.tx5,S,r,P,T,M,state,breakout,rng};row.score=scoreRow(row);rows.push(row);
+}
+rows.sort((a,b)=>b.score-a.score);const top=rows.slice(0,CFG.PICK_TOP);
+if(st.pos&&st.pos.mint){
+let cur=top.find(x=>x.mint===st.pos.mint);
+if(!cur){const meta=await getTokenMetaForMint(st.pos.mint);if(meta){const pr=porte(meta);const {mem,S,r}=tickSilence(st,meta);const state=pr||"OK";
+const P=calcP(meta.liq,meta.vol5);const T=(state==="OK"&&P>0)?(-(S*S)/P+CFG.EPS):NaN;const M=(Number.isFinite(T)&&T!==0)?Math.log10(Math.abs(T)):NaN;
+cur={mint:meta.mint,sym:meta.sym,name:meta.name,url:meta.url,price:meta.price,liq:meta.liq,vol5:meta.vol5,tx5:meta.tx5,S,r,P,T,M,state,score:scoreRow({liq:meta.liq,vol5:meta.vol5,r,state,M})};}}
+if(cur&&Number.isFinite(cur.price)&&cur.price>0){
+const e=st.pos.entryPrice,tp1=e*(1+CFG.TP1_PCT),tp2=e*(1+CFG.TP2_PCT),sl=e*(1-CFG.SL_PCT);
+if(cur.price<=sl){
+log(`STOP | ${cur.sym} price=${fmt(cur.price,10)} <= SL=${fmt(sl,10)} | SELL ALL`);
+if(CFG.ARM==="ON"){const tokBal=await getTokenAmount(connection,owner,st.pos.mint);if(tokBal>0){const sig=await jupSwap(connection,kp,st.pos.mint,CFG.USDC_MINT,tokBal);log(`SELL(stop) sig=${sig}`);}}
+st.pos=null;saveState(st);
+}else if(!st.pos.tp1done&&cur.price>=tp1){
+log(`TP1 | ${cur.sym} price=${fmt(cur.price,10)} >= TP1=${fmt(tp1,10)} | SELL 50%`);
+if(CFG.ARM==="ON"){const tokBal=await getTokenAmount(connection,owner,st.pos.mint);const sell=tokBal*0.50;if(sell>0){const sig=await jupSwap(connection,kp,st.pos.mint,CFG.USDC_MINT,sell);log(`SELL(tp1) sig=${sig}`);}}
+st.pos.tp1done=true;saveState(st);
+}else if(st.pos.tp1done&&!st.pos.tp2done&&cur.price>=tp2){
+log(`TP2 | ${cur.sym} price=${fmt(cur.price,10)} >= TP2=${fmt(tp2,10)} | SELL 40% (keep runner)`);
+if(CFG.ARM==="ON"){const tokBal=await getTokenAmount(connection,owner,st.pos.mint);const sell=tokBal*0.40;if(sell>0){const sig=await jupSwap(connection,kp,st.pos.mint,CFG.USDC_MINT,sell);log(`SELL(tp2) sig=${sig}`);}}
+st.pos.tp2done=true;saveState(st);
+}else{
+log(`HOLD | ${st.pos.sym} price=${fmt(cur.price,10)} entry=${fmt(e,10)} S=${cur.S}`);
+}
+}else log(`WARN | position price unavailable`);
+}else{
+const best=top.find(x=>x.state==="OK"&&x.score>=CFG.SCORE_MIN&&x.rng&&x.S>=CFG.SMIN&&Number.isFinite(x.breakout)&&x.price>x.breakout&&x.r>0);
+if(best){
+const usdcBal=await getUsdcAmount(connection,owner);const spend=decideBuySize(usdcBal,CFG.MAX_BUY_USDC);
+log(`SIGNAL BUY | ${best.sym} score=${fmt(best.score,1)} S=${best.S} price=${fmt(best.price,10)} > breakout=${fmt(best.breakout,10)} | spend=$${fmt(spend,2)} | bal=$${fmt(usdcBal,2)}`);
+if(CFG.ARM==="ON"&&spend>=1){const sig=await jupSwap(connection,kp,CFG.USDC_MINT,best.mint,spend);log(`BUY sig=${sig}`);st.pos={mint:best.mint,sym:best.sym,entryPrice:best.price,tp1done:false,tp2done:false};saveState(st);}else log(`ARM OFF (dry-run)`);
+}else{const h=top[0];if(h) log(`SCAN | top=${h.sym} score=${fmt(h.score,1)} S=${h.S} state=${h.state} r=${fmt(h.r,3)}%`);else log(`SCAN | no candidates`);}
+}
+saveState(st);
+}catch(e){log(`ERR | ${e?.message||String(e)}`);}
+await sleep(50);
+}}
+main().catch(e=>{log("FATAL "+(e?.stack||e?.message||String(e)));process.exit(1);});
+JS
+say "== WRITE .env =="
+cat >"$ENVF" <<EOF
+ARM=$ARM
+MODE=$MODE
+RPC=$RPC
+WALLET_FILE=$WALLET_FILE
+USDC_MINT=$USDC_MINT
+JUP_QUOTE=$JUP_QUOTE
+JUP_SWAP=$JUP_SWAP
+DS_PROFILES=$DS_PROFILES
+DS_TOKEN=$DS_TOKEN
+SCAN_MS=$SCAN_MS
+TOP_MINTS=$TOP_MINTS
+PICK_TOP=$PICK_TOP
+CAP_USDC=$CAP_USDC
+MAX_BUY_USDC=$MAX_BUY_USDC
+SL_PCT=$SL_PCT
+TP1_PCT=$TP1_PCT
+TP2_PCT=$TP2_PCT
+SLIPPAGE_BPS=$SLIPPAGE_BPS
+LMIN=$LMIN
+VMIN5=$VMIN5
+TXMIN5=$TXMIN5
+RTH_TICK=$RTH_TICK
+SMIN=$SMIN
+BBUF=$BBUF
+SCORE_MIN=$SCORE_MIN
+EOF
+chmod 600 "$ENVF"
+say "== INSTALL DEPS =="
+cd "$APP"
+npm install --omit=dev >/dev/null 2>&1 || npm install --omit=dev
+say "== WRITE systemd unit =="
+cat >"$UNIT" <<EOF
+[Unit]
+Description=Microcap Hunt Auto (Jupiter swaps)
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=simple
+User=root
+WorkingDirectory=$APP
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/node $APP/bot.mjs
+Restart=always
+RestartSec=3
+Nice=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=false
+ReadWritePaths=$APP $LOGDIR $STATEF
+LimitNOFILE=65535
+[Install]
+WantedBy=multi-user.target
+EOF
+say "== ENABLE + START =="
+systemctl daemon-reload
+systemctl enable --now microcap-hunt-auto.service
+say "== STATUS =="
+systemctl --no-pager status microcap-hunt-auto.service | sed -n "1,80p" || true
+say "== LAST LOG =="
+journalctl -u microcap-hunt-auto.service -n 30 --no-pager || true
+say "== DONE =="
+say "TAIL: journalctl -u microcap-hunt-auto.service -f"
+BASH
+chmod 700 /root/MEGA_MICROCAP_HUNT_AUTO_INSTALL_V1.sh
+ARM=ON CAP_USDC=20 MAX_BUY_USDC=20 bash /root/MEGA_MICROCAP_HUNT_AUTO_INSTALL_V1.sh'
