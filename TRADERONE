@@ -1,221 +1,239 @@
-cat >/root/MEGA_AQUILATRADER_FIX_V2.sh <<'BASH'
+cat >/root/MEGA_AQUILATRADER_FIX_V3.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 umask 022
 
-# -----------------------------
-# Self-log wrapper (no manual tee needed)
-# -----------------------------
-LOG="/root/MEGA_AQUILATRADER_FIX_V2.log"
-if [ -z "${_TEE_LOGGED:-}" ]; then
-  export _TEE_LOGGED=1
-  bash "$0" |& tee "$LOG"
-  exit ${PIPESTATUS[0]}
-fi
-
-say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
-hr(){ echo "----------------------------------------------------------------"; }
-die(){ say "ERROR: $*"; exit 1; }
-
 DOMAIN="fireinners.online"
+VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
+INC_WOLV="/etc/nginx/includes/wolverine_static.inc"
+INC_AQ="/etc/nginx/includes/aquilatrader_routes.inc"
+
 WWW="/var/www/aquilatrader"
 INDEX="$WWW/index.html"
 
-VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
-INC="/etc/nginx/includes/wolverine_static.inc"
-
 TS="$(date +%Y%m%d_%H%M%S)"
-BK="/root/BK_AQUILATRADER_FIX_V2_${TS}"
-mkdir -p "$BK"
+BK="/root/BK_AQUILATRADER_FIX_V3_${TS}"
+LOG="/root/MEGA_AQUILATRADER_FIX_V3.log"
 
-say "MEGA_AQUILATRADER_FIX_V2"
-say "Goal: https://${DOMAIN}/aquilatrader/ serves ${INDEX} (no manual edits)"
+say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
+die(){ say "ERROR: $*"; exit 1; }
+hr(){ echo "----------------------------------------------------------------"; }
+
+need(){ command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"; }
+need nginx; need python3; need curl; need awk; need sed; need grep; need stat || true
+
+is_immutable(){
+  local f="$1"
+  command -v lsattr >/dev/null 2>&1 || return 1
+  lsattr -d "$f" 2>/dev/null | awk '{print $1}' | grep -q 'i' && return 0 || return 1
+}
+
+unlock(){
+  local f="$1"
+  if [ -e "$f" ] && is_immutable "$f"; then
+    say "chattr -i $f"
+    chattr -i "$f" 2>/dev/null || true
+    echo "$f" >>"$BK/IMMUTABLE_WAS_ON.txt"
+  fi
+}
+
+relock(){
+  local f="$1"
+  if [ -f "$BK/IMMUTABLE_WAS_ON.txt" ] && grep -Fxq "$f" "$BK/IMMUTABLE_WAS_ON.txt"; then
+    say "chattr +i $f"
+    chattr +i "$f" 2>/dev/null || true
+  fi
+}
+
+rollback(){
+  say "ROLLBACK: restoring backups from $BK"
+  [ -f "$BK/$(basename "$VHOST").bak" ] && cp -a "$BK/$(basename "$VHOST").bak" "$VHOST" || true
+  [ -f "$BK/$(basename "$INC_WOLV").bak" ] && cp -a "$BK/$(basename "$INC_WOLV").bak" "$INC_WOLV" || true
+  [ -f "$BK/$(basename "$INC_AQ").bak" ] && cp -a "$BK/$(basename "$INC_AQ").bak" "$INC_AQ" || true
+  nginx -t || true
+  systemctl reload nginx || true
+}
+
+say "MEGA_AQUILATRADER_FIX_V3"
+say "Goal: https://${DOMAIN}/aquilatrader/ serves ${INDEX} (no duplicates, no manual edits)"
 say "Log:  ${LOG}"
 say "BK:   ${BK}"
 hr
 
-# -----------------------------
-# 0) Preconditions + backups
-# -----------------------------
-[ -f "$VHOST" ] || die "Missing vhost: $VHOST"
-[ -f "$INC" ]   || die "Missing include: $INC (expected by Wolverine vhost)"
+mkdir -p "$BK"
 
+# 0) Preconditions
+[ -f "$VHOST" ] || die "Missing vhost: $VHOST"
+[ -f "$INC_WOLV" ] || die "Missing include: $INC_WOLV"
+
+# 1) Backups
 say "0) Backup nginx files"
-cp -a "$VHOST" "$BK/$(basename "$VHOST").bak"
-cp -a "$INC"   "$BK/$(basename "$INC").bak"
+cp -a "$VHOST" "$BK/$(basename "$VHOST").bak" || true
+cp -a "$INC_WOLV" "$BK/$(basename "$INC_WOLV").bak" || true
+[ -f "$INC_AQ" ] && cp -a "$INC_AQ" "$BK/$(basename "$INC_AQ").bak" || true
 nginx -t >/dev/null 2>&1 || true
 hr
 
-# -----------------------------
-# 1) Ensure webroot + index
-# -----------------------------
+# 2) Ensure webroot + index
 say "1) Ensure ${WWW} + index.html"
 mkdir -p "$WWW"
 if [ ! -f "$INDEX" ]; then
   cat >"$INDEX" <<'HTML'
-<!doctype html>
-<html lang="fr">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>AquilaTrader</title>
-  <style>
-    body{font-family:system-ui,Segoe UI,Roboto,Arial;margin:0;background:#0b0f14;color:#e6eef8}
-    main{max-width:980px;margin:0 auto;padding:24px}
-    a{color:#7ab7ff}
-    .card{background:#0f1620;border:1px solid rgba(255,255,255,.08);border-radius:14px;padding:16px;margin-top:14px}
-    .muted{opacity:.75}
-    code{background:rgba(255,255,255,.06);padding:2px 6px;border-radius:8px}
-  </style>
-</head>
-<body>
-  <main>
-    <h1>AquilaTrader</h1>
-    <p class="muted">Webroot OK. Cette page sert juste à confirmer la route Nginx.</p>
-
-    <div class="card">
-      <div>Endpoints utiles :</div>
-      <ul>
-        <li><a href="/wolverine/traderone/api/health">/wolverine/traderone/api/health</a></li>
-        <li><a href="/wolverine/traderone/vault/health">/wolverine/traderone/vault/health</a></li>
-        <li><a href="/wolverine/vault-api/health">/wolverine/vault-api/health</a></li>
-      </ul>
-      <div class="muted">Chemin: <code>/aquilatrader/</code></div>
-    </div>
-  </main>
-</body>
-</html>
+<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>AquilaTrader</title><style>body{font-family:system-ui,Segoe UI,Roboto,Arial;margin:0;background:#0b1020;color:#eef}main{max-width:900px;margin:28px auto;padding:18px}a{color:#7ab7ff}</style></head><body><main><h1>AquilaTrader</h1><p>OK — route <b>/aquilatrader/</b> est servie.</p><p><a href="/wolverine/">Wolverine</a> • <a href="/wolverine/traderone/api/health">TraderOne API</a> • <a href="/wolverine/traderone/vault/health">Vault</a></p></main></body></html>
 HTML
-  chmod 0644 "$INDEX"
-else
-  say "index exists: $INDEX (no-op)"
 fi
 hr
 
-# -----------------------------
-# 2) Patch include: remove duplicates then add ONE managed block
-# -----------------------------
-say "2) Patch include (dedupe any /aquilatrader blocks) -> $INC"
-
-python3 - <<'PY'
-import re, sys, pathlib
-
-inc_path = pathlib.Path("/etc/nginx/includes/wolverine_static.inc")
-txt = inc_path.read_text(encoding="utf-8", errors="replace").splitlines(True)
-
-def drop_managed_markers(lines):
-  out=[]
-  skip=False
-  for ln in lines:
-    if re.search(r'^\s*#\s*BEGIN\s+AQUILATRADER_MANAGED\b', ln):
-      skip=True
-      continue
-    if re.search(r'^\s*#\s*END\s+AQUILATRADER_MANAGED\b', ln):
-      skip=False
-      continue
-    if not skip:
-      out.append(ln)
-  return out
-
-def drop_location_aquilatrader(lines):
-  """
-  Remove any nginx 'location ... /aquilatrader' blocks (manual or partial),
-  including location = /aquilatrader and location ^~ /aquilatrader/
-  """
-  out=[]
-  i=0
-  n=len(lines)
-
-  # match location headers that mention /aquilatrader
-  loc_re = re.compile(r'^\s*location\s+(.+?)\s*\{\s*$')
-
-  def header_is_aquilatrader(h):
-    # normalize multiple spaces
-    h = " ".join(h.strip().split())
-    # examples:
-    # location = /aquilatrader {
-    # location ^~ /aquilatrader/ {
-    # location /aquilatrader {
-    return "/aquilatrader" in h
-
-  while i<n:
-    ln=lines[i]
-    m=loc_re.match(ln)
-    if m and header_is_aquilatrader(ln):
-      # skip this whole block by brace depth
-      depth=0
-      # consume header line
-      # count braces in header line
-      depth += ln.count("{") - ln.count("}")
-      i += 1
-      while i<n and depth>0:
-        depth += lines[i].count("{") - lines[i].count("}")
-        i += 1
-      continue
-    else:
-      out.append(ln)
-      i += 1
-  return out
-
-clean = drop_managed_markers(txt)
-clean = drop_location_aquilatrader(clean)
-
-managed = r'''
+# 3) Build AquilaTrader include (single source of truth)
+say "2) Write include ${INC_AQ}"
+unlock "$INC_AQ"
+cat >"$INC_AQ" <<'NGX'
 # BEGIN AQUILATRADER_MANAGED
+# Serve static AquilaTrader UI at /aquilatrader/
 location = /aquilatrader { return 301 /aquilatrader/; }
-
 location ^~ /aquilatrader/ {
   alias /var/www/aquilatrader/;
   try_files $uri $uri/ /aquilatrader/index.html;
   add_header Cache-Control "no-store" always;
 }
 # END AQUILATRADER_MANAGED
-'''.lstrip("\n")
-
-# ensure file ends with newline
-if clean and not clean[-1].endswith("\n"):
-  clean[-1] += "\n"
-
-# append managed block
-if clean and not clean[-1].endswith("\n"):
-  clean.append("\n")
-clean.append("\n" + managed.strip("\n") + "\n")
-
-inc_path.write_text("".join(clean), encoding="utf-8")
-print("OK: cleaned + wrote single /aquilatrader managed block ->", str(inc_path))
-PY
-
+NGX
+relock "$INC_AQ"
 hr
 
-# -----------------------------
-# 3) nginx -t then reload (rollback on failure)
-# -----------------------------
-say "3) nginx -t then reload"
+# 4) Purge any aquilatrader location blocks from wolverine_static.inc (this is where your duplicate is)
+say "3) Deduplicate: remove ANY 'location ... /aquilatrader' blocks from ${INC_WOLV}"
+unlock "$INC_WOLV"
+python3 - <<'PY'
+import re,sys
+p = "/etc/nginx/includes/wolverine_static.inc"
+lines = open(p,"r",encoding="utf-8",errors="replace").read().splitlines(True)
+
+out=[]
+i=0
+removed=0
+
+def has_aq_location(line):
+  # catch: location /aquilatrader , location ^~ /aquilatrader/ , with any spacing/tabs
+  return bool(re.search(r'^\s*location\b.*\b/aquilatrader\b', line))
+
+while i < len(lines):
+  line = lines[i]
+  if has_aq_location(line):
+    removed += 1
+    # skip whole block using brace depth
+    depth = 0
+    started = False
+    # process current line then subsequent lines until block closes
+    while i < len(lines):
+      l = lines[i]
+      # detect start of block (first "{")
+      if "{" in l:
+        started = True
+        depth += l.count("{")
+      if "}" in l and started:
+        depth -= l.count("}")
+        if depth <= 0:
+          i += 1
+          break
+      i += 1
+    continue
+  out.append(line)
+  i += 1
+
+# ensure newline at end
+if out and not out[-1].endswith("\n"):
+  out[-1] += "\n"
+open(p,"w",encoding="utf-8").write("".join(out))
+print(f"OK: removed {removed} aquilatrader location block(s) from {p}")
+PY
+relock "$INC_WOLV"
+hr
+
+# 5) Ensure vhost includes aquilatrader include exactly once
+say "4) Ensure vhost includes ${INC_AQ} exactly once"
+unlock "$VHOST"
+python3 - <<'PY'
+import re,sys
+v="/etc/nginx/sites-available/fireinners.online-ssl"
+inc="/etc/nginx/includes/aquilatrader_routes.inc"
+txt=open(v,"r",encoding="utf-8",errors="replace").read().splitlines(True)
+
+# remove any previous managed blocks
+out=[]
+skip=False
+for line in txt:
+  if re.search(r'BEGIN\s+AQUILATRADER', line):
+    skip=True
+    continue
+  if skip:
+    if re.search(r'END\s+AQUILATRADER', line):
+      skip=False
+    continue
+  out.append(line)
+
+txt=out
+
+# if include already present, keep only first occurrence
+include_line=f"  include {inc};\n"
+seen=0
+out=[]
+for line in txt:
+  if line.strip()==f"include {inc};":
+    seen += 1
+    if seen==1:
+      out.append(include_line)
+    continue
+  out.append(line)
+txt=out
+
+# if not present at all, insert right after wolverine_static include (best place)
+if seen==0:
+  inserted=False
+  out=[]
+  for line in txt:
+    out.append(line)
+    if (not inserted) and re.search(r'include\s+/etc/nginx/includes/wolverine_static\.inc\s*;', line):
+      out.append(include_line)
+      inserted=True
+  txt=out
+  if not inserted:
+    # fallback: append near top (still valid)
+    txt.insert(0, include_line)
+
+# add small comment wrapper (not required, but useful)
+final=[]
+final.append("# BEGIN AQUILATRADER (managed include)\n")
+final.extend(txt)
+final.append("# END AQUILATRADER (managed include)\n")
+
+open(v,"w",encoding="utf-8").write("".join(final))
+print("OK: vhost updated")
+PY
+relock "$VHOST"
+hr
+
+# 6) nginx test + reload with rollback
+say "5) nginx -t then reload (rollback if fails)"
 set +e
 nginx -t
 RC=$?
 set -e
 if [ "$RC" -ne 0 ]; then
-  say "nginx -t FAILED -> rollback backups"
-  cp -a "$BK/$(basename "$VHOST").bak" "$VHOST" || true
-  cp -a "$BK/$(basename "$INC").bak"   "$INC"   || true
-  nginx -t || true
-  die "Rollback done. Fix not applied. Check: $BK and $LOG"
+  say "nginx -t FAILED"
+  rollback
+  die "Fix not applied (rolled back). Check: $BK and $LOG"
 fi
-
 systemctl reload nginx
 hr
 
-# -----------------------------
-# 4) Quick checks
-# -----------------------------
-say "4) Quick local checks (Host header)"
-curl -sk "https://127.0.0.1/aquilatrader/" -H "Host: ${DOMAIN}" | head -n 20 || true
+# 7) Quick checks
+say "6) Quick checks"
+curl -sk "https://127.0.0.1/aquilatrader/" -H "Host: ${DOMAIN}" | head -n 12 || true
+curl -sk "https://127.0.0.1/wolverine/" -H "Host: ${DOMAIN}" | head -n 8 || true
 hr
 say "DONE. Open: https://${DOMAIN}/aquilatrader/"
-say "Log:  ${LOG}"
-say "BK:   ${BK}"
+say "Backup: $BK"
 BASH
 
-chmod +x /root/MEGA_AQUILATRADER_FIX_V2.sh
-bash /root/MEGA_AQUILATRADER_FIX_V2.sh
+bash /root/MEGA_AQUILATRADER_FIX_V3.sh |& tee /root/MEGA_AQUILATRADER_FIX_V3.log
