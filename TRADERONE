@@ -1,4 +1,4 @@
-cat >/root/MEGA_AQUILATRADER_FIX_404_V1.sh <<'BASH'
+cat >/root/MEGA_AQUILATRADER_DEDUP_FIX_NGINX_V1.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 umask 022
@@ -10,246 +10,190 @@ die(){ say "ERROR: $*"; exit 1; }
 
 [ "$(id -u)" -eq 0 ] || die "Run as root"
 command -v nginx >/dev/null 2>&1 || die "nginx not found"
+command -v python3 >/dev/null 2>&1 || die "python3 not found"
 
 TS="$(date +%Y%m%d_%H%M%S)"
-BK="/root/AQUILATRADER_FIX_${TS}"
+BK="/root/AQUILATRADER_DEDUP_${TS}"
 mkdir -p "$BK"
-
-WWW="/var/www/aquilatrader"
-INDEX="$WWW/index.html"
 
 NGX_VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
 NGX_CONF="/etc/nginx/nginx.conf"
-INC_DIR="/etc/nginx/includes"
-WOLV_STATIC="$INC_DIR/wolverine_static.inc"
-WOLV_ROUTES="$INC_DIR/wolverine_routes.inc"
 
-say "MEGA_AQUILATRADER_FIX_404_V1"
-say "Goal: make https://fireinners.online/aquilatrader/ work (no manual edits)"
+say "MEGA_AQUILATRADER_DEDUP_FIX_NGINX_V1"
+say "Goal: fix nginx duplicate location /aquilatrader (keep exactly one block)"
 hr
 
-say "0) Snapshot current nginx + includes"
+say "0) Backup nginx core + includes + sites-available"
 cp -a "$NGX_VHOST" "$BK/fireinners.online-ssl.bak" 2>/dev/null || true
 cp -a "$NGX_CONF" "$BK/nginx.conf.bak" 2>/dev/null || true
-[ -d "$INC_DIR" ] && cp -a "$INC_DIR" "$BK/includes.bak" 2>/dev/null || true
+[ -d /etc/nginx/includes ] && cp -a /etc/nginx/includes "$BK/includes.bak" 2>/dev/null || true
+[ -d /etc/nginx/snippets ] && cp -a /etc/nginx/snippets "$BK/snippets.bak" 2>/dev/null || true
+[ -d /etc/nginx/sites-available ] && cp -a /etc/nginx/sites-available "$BK/sites-available.bak" 2>/dev/null || true
 
 hr
-say "1) Ensure AquilaTrader webroot exists"
-mkdir -p "$WWW"
-
-if [ ! -f "$INDEX" ]; then
-  say "Writing $INDEX"
-  cat >"$INDEX" <<'HTML'
-<!doctype html>
-<html lang="fr">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>AquilaTrader</title>
-  <style>
-    :root{--bg:#060b16;--panel:#0b1020;--txt:#eaf0ff;--mut:#9fb1d8;--btn:#e9eefb;--btnTxt:#0b1020;}
-    html,body{height:100%}
-    body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;background:linear-gradient(180deg,#050816,#070b18 40%,#050816);color:var(--txt)}
-    .wrap{max-width:980px;margin:0 auto;padding:28px 18px}
-    h1{margin:0 0 14px;font-size:46px}
-    .row{display:flex;gap:14px;flex-wrap:wrap;align-items:center}
-    .card{background:rgba(11,16,32,.9);border:1px solid rgba(255,255,255,.06);border-radius:14px;padding:16px}
-    .wallet{color:var(--mut);margin:10px 0 14px;font-size:18px}
-    input{width:min(760px,100%);height:56px;border-radius:14px;border:1px solid rgba(255,255,255,.10);background:rgba(0,0,0,.25);color:var(--txt);padding:0 16px;font-size:18px;outline:none}
-    button{height:52px;min-width:150px;border-radius:16px;border:0;background:var(--btn);color:var(--btnTxt);font-size:20px;cursor:pointer}
-    button.secondary{background:rgba(233,238,251,.85)}
-    .log{margin-top:16px;white-space:pre-wrap;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;color:#cfe0ff}
-    a{color:#7ab7ff}
-    .hint{color:var(--mut);font-size:14px;margin-top:10px}
-    .sep{height:1px;background:rgba(255,255,255,.06);margin:16px 0}
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <h1>AquilaTrader</h1>
-
-    <div class="card">
-      <div class="row" style="justify-content:space-between">
-        <div>
-          <div class="wallet">Wallet: <span id="addr">-</span></div>
-          <div class="hint">Endpoints: <code>/wolverine/traderone/api/*</code></div>
-        </div>
-        <div class="row">
-          <button id="connect" class="secondary">Connect Wallet</button>
-          <button id="health" class="secondary">Health</button>
-        </div>
-      </div>
-
-      <div class="sep"></div>
-
-      <input id="amount" type="number" min="0" step="any" value="1" />
-
-      <div class="row" style="margin-top:14px">
-        <button id="start">Start</button>
-        <button id="stop" class="secondary">Stop</button>
-        <button id="cash" class="secondary">Cash-out</button>
-      </div>
-
-      <div id="log" class="log"></div>
-      <div class="hint">
-        Phantom requis seulement pour récupérer l’adresse. Health/Start/Stop/Cash-out peuvent être testés sans wallet.
-      </div>
-    </div>
-
-    <div class="hint" style="margin-top:14px">
-      Liens: <a href="/wolverine/traderone/api/health">/wolverine/traderone/api/health</a> •
-      <a href="/wolverine/traderone/vault/health">/wolverine/traderone/vault/health</a>
-    </div>
-  </div>
-
-<script>
-(function(){
-  const $ = (s)=>document.querySelector(s);
-  const logEl = $("#log");
-  const addrEl = $("#addr");
-  let pub = "";
-
-  function log(msg){
-    const t = new Date().toLocaleTimeString('fr-CA',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
-    logEl.textContent = `[${t}] ${msg}\n` + logEl.textContent;
-  }
-
-  async function post(url, body){
-    const r = await fetch(url, {
-      method:"POST",
-      headers:{ "content-type":"application/json" },
-      body: JSON.stringify(body || {})
-    });
-    const txt = await r.text();
-    let data = txt;
-    try { data = JSON.parse(txt); } catch(_){}
-    if(!r.ok) throw new Error(`HTTP ${r.status}: ${typeof data==="string"?data:JSON.stringify(data)}`);
-    return data;
-  }
-
-  async function get(url){
-    const r = await fetch(url, { method:"GET" });
-    const txt = await r.text();
-    let data = txt;
-    try { data = JSON.parse(txt); } catch(_){}
-    if(!r.ok) throw new Error(`HTTP ${r.status}: ${txt}`);
-    return data;
-  }
-
-  $("#connect").onclick = async ()=>{
-    try{
-      if(!window.solana || !window.solana.isPhantom){
-        log("Phantom non détecté.");
-        return;
-      }
-      const res = await window.solana.connect({ onlyIfTrusted:false });
-      pub = (res && res.publicKey) ? res.publicKey.toString() : (window.solana.publicKey ? window.solana.publicKey.toString() : "");
-      if(pub){ addrEl.textContent = pub; log("Wallet connecté: " + pub); }
-      else { log("Connect ok mais pubkey introuvable."); }
-    }catch(e){ log("Connect error: " + (e && e.message ? e.message : String(e))); }
-  };
-
-  $("#health").onclick = async ()=>{
-    try{ const d = await get("/wolverine/traderone/api/health"); log("health: " + (typeof d==="string"?d:JSON.stringify(d))); }
-    catch(e){ log("health error: " + (e && e.message ? e.message : String(e))); }
-  };
-
-  $("#start").onclick = async ()=>{
-    try{
-      const amount = Number($("#amount").value || 0);
-      const d = await post("/wolverine/traderone/api/start", { amount, userPub: pub || "" });
-      log("started: " + (typeof d==="string"?d:JSON.stringify(d)));
-    }catch(e){ log("start error: " + (e && e.message ? e.message : String(e))); }
-  };
-
-  $("#stop").onclick = async ()=>{
-    try{ const d = await post("/wolverine/traderone/api/stop", { userPub: pub || "" }); log("stopped: " + (typeof d==="string"?d:JSON.stringify(d))); }
-    catch(e){ log("stop error: " + (e && e.message ? e.message : String(e))); }
-  };
-
-  $("#cash").onclick = async ()=>{
-    try{ const d = await post("/wolverine/traderone/api/cashout", { userPub: pub || "" }); log("cashout: " + (typeof d==="string"?d:JSON.stringify(d))); }
-    catch(e){ log("cashout error: " + (e && e.message ? e.message : String(e))); }
-  };
-
-  log("AquilaTrader ready.");
-})();
-</script>
-</body>
-</html>
-HTML
-fi
-
-chown -R root:root "$WWW"
-find "$WWW" -type d -exec chmod 0755 {} \;
-find "$WWW" -type f -exec chmod 0644 {} \;
+say "1) Detect aquilatrader location occurrences (report only)"
+# report (best-effort)
+grep -RIn --exclude-dir='sites-enabled' --exclude='*.bak' -E 'location\s+(\^~\s+)?/aquilatrader|location\s*=\s*/aquilatrader|AQUILATRADER' /etc/nginx \
+  >"$BK/aquilatrader_grep.txt" || true
+say "Saved report: $BK/aquilatrader_grep.txt"
+sed -n '1,120p' "$BK/aquilatrader_grep.txt" || true
 
 hr
-say "2) Patch nginx route in the include that is already used by Wolverine"
-mkdir -p "$INC_DIR"
+say "2) Dedup ONLY marked blocks (# --- AQUILATRADER ... # --- /AQUILATRADER ---)"
+say "   If unmarked duplicate locations exist, script will STOP (safety)."
 
-ROUTE_BLOCK=$(cat <<'CONF'
+# temporarily unlock immutability (best-effort)
+chattr -i "$NGX_CONF" 2>/dev/null || true
+chattr -i "$NGX_VHOST" 2>/dev/null || true
+find /etc/nginx -maxdepth 3 -type f -name '*.inc' -print0 2>/dev/null | xargs -0 -r chattr -i 2>/dev/null || true
 
-# --- AQUILATRADER (managed) ---
-location = /aquilatrader { return 301 /aquilatrader/; }
-location ^~ /aquilatrader/ {
-  alias /var/www/aquilatrader/;
-  index index.html;
-  try_files $uri $uri/ /aquilatrader/index.html;
-  add_header Cache-Control "no-store" always;
-}
-# --- /AQUILATRADER ---
-CONF
-)
+python3 - <<'PY'
+import os, re, glob, shutil, time, sys
 
-target=""
-if [ -f "$WOLV_STATIC" ]; then
-  target="$WOLV_STATIC"
-elif [ -f "$WOLV_ROUTES" ]; then
-  target="$WOLV_ROUTES"
-else
-  die "Cannot find $WOLV_STATIC or $WOLV_ROUTES. Nginx includes folder exists but Wolverine include files missing."
+TS = os.environ.get("TS","")
+BK = os.environ.get("BK","/root/AQUILATRADER_DEDUP")
+root = "/etc/nginx"
+
+MARK_START = re.compile(r'^\s*#\s*---\s*AQUILATRADER\s*\(managed\)\s*---\s*$')
+MARK_END   = re.compile(r'^\s*#\s*---\s*/AQUILATRADER\s*---\s*$')
+
+# detect all files that contain either markers or aquilatrader locations
+candidates=set()
+for base, dirs, files in os.walk(root):
+    for fn in files:
+        if fn.endswith((".conf",".inc")):
+            candidates.add(os.path.join(base, fn))
+
+def read(p):
+    with open(p,"r",encoding="utf-8",errors="replace") as f:
+        return f.read().splitlines(True)
+
+def write(p, lines):
+    tmp = p + ".tmp_aquilatrader"
+    with open(tmp,"w",encoding="utf-8") as f:
+        f.writelines(lines)
+    os.replace(tmp, p)
+
+def find_marked_blocks(lines):
+    blocks=[]
+    i=0
+    while i < len(lines):
+        if MARK_START.match(lines[i]):
+            j=i+1
+            while j < len(lines) and not MARK_END.match(lines[j]):
+                j+=1
+            if j < len(lines) and MARK_END.match(lines[j]):
+                blocks.append((i,j))
+                i=j+1
+                continue
+        i+=1
+    return blocks
+
+def has_unmarked_locations(lines):
+    # any aquilatrader location line not within marked block
+    loc_re = re.compile(r'^\s*location\s+(\^~\s+)?/aquilatrader/|^\s*location\s*=\s*/aquilatrader')
+    blocks = find_marked_blocks(lines)
+    covered=[False]*len(lines)
+    for a,b in blocks:
+        for k in range(a,b+1):
+            covered[k]=True
+    hits=[]
+    for idx,ln in enumerate(lines):
+        if loc_re.search(ln) and not covered[idx]:
+            hits.append(idx+1)
+    return hits
+
+changed=[]
+safety_stop=[]
+
+for p in sorted(candidates):
+    try:
+        lines=read(p)
+    except Exception:
+        continue
+
+    blocks=find_marked_blocks(lines)
+    if not blocks and ("aquilatrader" not in "".join(lines).lower()):
+        continue
+
+    # safety: if unmarked location lines exist, stop (too risky)
+    unmarked = has_unmarked_locations(lines)
+    if unmarked:
+        safety_stop.append((p, unmarked))
+        continue
+
+    if len(blocks) <= 1:
+        continue
+
+    # keep first block, disable the rest by commenting with a prefix
+    keep = blocks[0]
+    new_lines = lines[:]
+    prefix = f"# DISABLED_DUP_AQUILATRADER_{time.strftime('%Y%m%d_%H%M%S')} "
+
+    # process from last to first to preserve indices
+    for (a,b) in blocks[1:][::-1]:
+        for i in range(a,b+1):
+            ln=new_lines[i]
+            if ln.strip()=="":
+                continue
+            if ln.lstrip().startswith("#"):
+                # already comment, but still mark
+                new_lines[i]=prefix + ln
+            else:
+                new_lines[i]=prefix + ln
+
+    # backup file before writing
+    rel = p.replace("/","_").lstrip("_")
+    bkpath = os.path.join(BK, f"bak__{rel}")
+    os.makedirs(BK, exist_ok=True)
+    shutil.copy2(p, bkpath)
+
+    write(p, new_lines)
+    changed.append((p, len(blocks)))
+
+if safety_stop:
+    print("SAFETY_STOP: Found unmarked /aquilatrader location lines (will not modify).")
+    for p, lines in safety_stop[:20]:
+        print(" -", p, "lines:", ",".join(map(str,lines[:30])))
+    sys.exit(3)
+
+print("CHANGED_FILES:", len(changed))
+for p,n in changed:
+    print(" -", p, f"(had {n} marked blocks; kept 1, disabled {n-1})")
+PY
+
+RC=$?
+if [ "$RC" -eq 3 ]; then
+  hr
+  say "SAFETY STOP: There are unmarked /aquilatrader location lines somewhere."
+  say "Open report: $BK/aquilatrader_grep.txt"
+  say "Paste me the first ~60 lines around the duplicates, and I’ll give a safe batch tailored to the exact file."
+  exit 1
 fi
-
-say "Target include: $target"
-cp -a "$target" "$BK/$(basename "$target").bak"
-
-if grep -qE 'location\s+\^~\s+/aquilatrader/' "$target"; then
-  say "Route already present in $target (no-op)"
-else
-  say "Appending route block to $target"
-  printf "%s\n" "$ROUTE_BLOCK" >>"$target"
-fi
-
-chmod 0644 "$target"
-chown root:root "$target"
 
 hr
 say "3) nginx -t then reload"
-# unlock immutability if present (best-effort)
-chattr -i "$NGX_CONF" 2>/dev/null || true
-chattr -i "$NGX_VHOST" 2>/dev/null || true
-chattr -i "$target" 2>/dev/null || true
-
 nginx -t
 systemctl reload nginx
 
 # re-lock best-effort
 chattr +i "$NGX_CONF" 2>/dev/null || true
 chattr +i "$NGX_VHOST" 2>/dev/null || true
-chattr +i "$target" 2>/dev/null || true
+find /etc/nginx -maxdepth 3 -type f -name '*.inc' -print0 2>/dev/null | xargs -0 -r chattr +i 2>/dev/null || true
 
 hr
-say "4) Local checks (HTTPS loopback with Host header)"
+say "4) Test AquilaTrader route (HTTPS loopback with Host header)"
 set +e
-curl -k -sS -D "$BK/curl_aquilatrader_headers.txt" "https://127.0.0.1/aquilatrader/" -H "Host: fireinners.online" | head -n 30 >"$BK/aquilatrader_head.html"
-RC=$?
+curl -k -sS -D "$BK/curl_headers.txt" "https://127.0.0.1/aquilatrader/" -H "Host: fireinners.online" | head -n 40 >"$BK/aquilatrader_head.html"
+CURL_RC=$?
 set -e
-say "curl rc=$RC"
+say "curl rc=$CURL_RC"
+say "Saved: $BK/curl_headers.txt"
 say "Saved: $BK/aquilatrader_head.html"
-say "Now open: https://fireinners.online/aquilatrader/"
+
 hr
-say "DONE (backup: $BK)"
+say "DONE. Now open: https://fireinners.online/aquilatrader/"
+say "Backup folder: $BK"
 BASH
 
-bash /root/MEGA_AQUILATRADER_FIX_404_V1.sh
+TS="$(date +%Y%m%d_%H%M%S)" BK="/root/AQUILATRADER_DEDUP_$(date +%Y%m%d_%H%M%S)" bash /root/MEGA_AQUILATRADER_DEDUP_FIX_NGINX_V1.sh
