@@ -1,97 +1,269 @@
-cat >/root/MEGA_WOLVERINE_UI_PUBLISH_DIST_TO_WWW.sh <<'BASH'
+cat >/root/MEGA_AQUILATRADER_DEPLOY_V1.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 umask 022
+export DEBIAN_FRONTEND=noninteractive
+
+# MEGA_AQUILATRADER_DEPLOY_V1.sh
+# One-shot root deploy:
+# - Publie AquilaTrader sur https://fireinners.online/aquilatrader/
+# - Réutilise (copie + adaptation) les routes nginx de /wolverine pour garder les mêmes upstreams backend
+# - Déploie le frontend depuis /opt/fireinners/frontend-react/app/dist/wolverine si présent
+# - Backups systématiques + nginx -t + reload + checks
+
+TS="$(date +%Y%m%d_%H%M%S)"
+BK="/root/BK_AQUILATRADER_${TS}"
+mkdir -p "$BK"
 
 say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
-hr(){ echo "----------------------------------------------------------------"; }
 die(){ say "ERROR: $*"; exit 1; }
+hr(){ echo "----------------------------------------------------------------"; }
 
-# What this does (one-shot):
-# - Backup current /var/www/wolverine
-# - Publish (rsync) the real built UI from: /opt/fireinners/frontend-react/app/dist/wolverine
-#   to the live webroot: /var/www/wolverine
-# - Test nginx config and reload nginx
-# - Run health checks through nginx routes
-
-SRC="/opt/fireinners/frontend-react/app/dist/wolverine"
-DST="/var/www/wolverine"
+# Canonical paths
+SRC_DIST="/opt/fireinners/frontend-react/app/dist/wolverine"
+WWW="/var/www/aquilatrader"
 VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
-TS="$(date +%Y%m%d_%H%M%S)"
-BK="/root/BK_WOLVERINE_UI_${TS}"
+INC_DIR="/etc/nginx/includes"
+WOLV_INC="${INC_DIR}/wolverine_routes.inc"
+AQ_INC="${INC_DIR}/aquilatrader_routes.inc"
 
+# Optional shared lib (read-only / safe update style)
 ASKLIB="/opt/fireinners/sentinel/lib/askorupdate.sh"
-if [ -f "$ASKLIB" ]; then
+if [[ -f "$ASKLIB" ]]; then
   # shellcheck disable=SC1090
-  . "$ASKLIB"
+  source "$ASKLIB" || true
 fi
 
-say "MEGA_WOLVERINE_UI_PUBLISH_DIST_TO_WWW (backup -> publish -> nginx reload -> checks)"
+hr
+say "MEGA_AQUILATRADER_DEPLOY_V1 (root, idempotent)"
+say "Backup dir: $BK"
 
 hr
-say "0) Preconditions"
-[ -d "$SRC" ] || die "Missing source dist folder: $SRC"
-[ -d "$DST" ] || die "Missing destination webroot: $DST"
-[ -f "$VHOST" ] || die "Missing nginx vhost: $VHOST"
-command -v rsync >/dev/null 2>&1 || die "rsync not found"
-command -v nginx >/dev/null 2>&1 || die "nginx not found"
+say "0) Sanity: required paths"
+[[ -f "$VHOST" ]] || die "Missing vhost: $VHOST"
+[[ -d "$INC_DIR" ]] || mkdir -p "$INC_DIR"
 
 hr
-say "1) Snapshot backup"
-mkdir -p "$BK"
-# Backup current live webroot (fast + readable)
-if command -v tar >/dev/null 2>&1; then
-  say "Creating tar backup: $BK/wolverine_www.tar.gz"
-  tar -C "$DST" -czf "$BK/wolverine_www.tar.gz" . || die "tar backup failed"
+say "1) Snapshot current state"
+cp -a "$VHOST" "$BK/$(basename "$VHOST").bak" || true
+[[ -f "$WOLV_INC" ]] && cp -a "$WOLV_INC" "$BK/$(basename "$WOLV_INC").bak" || true
+[[ -f "$AQ_INC" ]] && cp -a "$AQ_INC" "$BK/$(basename "$AQ_INC").bak" || true
+[[ -d "$WWW" ]] && cp -a "$WWW" "$BK/www_aquilatrader.bak" || true
+
+hr
+say "2) Deploy frontend to $WWW"
+mkdir -p "$WWW"
+if [[ -d "$SRC_DIST" && -f "$SRC_DIST/index.html" ]]; then
+  say "Using dist: $SRC_DIST -> $WWW (rsync --delete)"
+  command -v rsync >/dev/null 2>&1 || (apt-get update -y && apt-get install -y rsync)
+  rsync -a --delete "$SRC_DIST"/ "$WWW"/
 else
-  say "tar not available, doing cp -a backup"
-  cp -a "$DST" "$BK/wolverine_www_copy" || die "cp backup failed"
+  say "WARN: dist not found at $SRC_DIST. Generating minimal AquilaTrader index.html."
+  cat >"$WWW/index.html" <<'HTML'
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>AquilaTrader</title>
+  <style>
+    :root{color-scheme:dark}
+    body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;background:#0b1020;color:#eaf0ff}
+    .wrap{max-width:920px;margin:0 auto;padding:36px 18px}
+    h1{margin:0 0 14px 0;font-size:56px;letter-spacing:.5px}
+    .muted{opacity:.75}
+    .card{margin-top:22px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.08);border-radius:18px;padding:18px}
+    input{width:100%;font-size:20px;padding:18px 16px;border-radius:16px;border:1px solid rgba(255,255,255,.14);background:rgba(0,0,0,.18);color:#fff;outline:none}
+    .row{display:flex;gap:14px;flex-wrap:wrap;margin-top:14px}
+    button{font-size:18px;padding:14px 22px;border-radius:16px;border:1px solid rgba(255,255,255,.14);background:rgba(255,255,255,.92);cursor:pointer}
+    button.secondary{background:rgba(255,255,255,.12);color:#cfe1ff}
+    pre{white-space:pre-wrap;word-break:break-word;background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.08);padding:12px;border-radius:12px;margin-top:12px}
+    a{color:#a8c8ff}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>AquilaTrader</h1>
+    <div class="muted">Wallet: <span id="addr">-</span></div>
+
+    <div class="card">
+      <input id="amount" value="1" inputmode="decimal" />
+      <div class="row">
+        <button id="start">Start</button>
+        <button id="stop" class="secondary">Stop</button>
+        <button id="cash" class="secondary">Cash-out</button>
+        <button id="connect" class="secondary">Connect Phantom</button>
+      </div>
+      <pre id="log">Ready.</pre>
+      <div class="muted" style="margin-top:10px">
+        Health:
+        <a href="/aquilatrader/traderone/api/health">api</a> ·
+        <a href="/aquilatrader/traderone/vault/health">vault</a> ·
+        <a href="/aquilatrader/vault-api/health">vault-api</a>
+      </div>
+    </div>
+  </div>
+
+<script>
+(function(){
+  const $ = s => document.querySelector(s);
+  const log = (m)=>{$("#log").textContent = (typeof m==="string"?m:JSON.stringify(m,null,2));};
+
+  let pub = "";
+  async function post(url, body){
+    const r = await fetch(url, {
+      method:"POST",
+      headers: {"content-type":"application/json"},
+      body: JSON.stringify(body||{})
+    });
+    const t = await r.text();
+    try { return JSON.parse(t); } catch { return { ok:r.ok, status:r.status, text:t }; }
+  }
+
+  async function connect(){
+    if (!window.solana || !window.solana.isPhantom) {
+      log("Phantom non détecté.");
+      return;
+    }
+    const res = await window.solana.connect();
+    pub = (res && res.publicKey) ? res.publicKey.toString() : (window.solana.publicKey ? window.solana.publicKey.toString() : "");
+    $("#addr").textContent = pub || "-";
+    log(pub ? ("Connected: " + pub) : "Connect failed.");
+  }
+
+  $("#connect").onclick = connect;
+
+  $("#start").onclick = async () => {
+    const amt = String($("#amount").value||"").trim();
+    const r = await post("/aquilatrader/traderone/api/start", { amount: amt, userPub: pub });
+    log(r);
+  };
+  $("#stop").onclick = async () => {
+    const r = await post("/aquilatrader/traderone/api/stop", { userPub: pub });
+    log(r);
+  };
+  $("#cash").onclick = async () => {
+    const r = await post("/aquilatrader/traderone/api/cashout", { userPub: pub });
+    log(r);
+  };
+
+})();
+</script>
+</body>
+</html>
+HTML
 fi
 
 hr
-say "2) Publish dist -> /var/www/wolverine (rsync --delete)"
-say "SRC=$SRC"
-say "DST=$DST"
-rsync -a --delete --info=NAME,STATS2 "$SRC"/ "$DST"/
+say "3) Build nginx include for /aquilatrader routes"
+if [[ -f "$WOLV_INC" ]]; then
+  say "Found $WOLV_INC, generating $AQ_INC by prefix+path rewrite"
+  # Replace:
+  #  - route prefix /wolverine -> /aquilatrader
+  #  - static path /var/www/wolverine -> /var/www/aquilatrader
+  sed \
+    -e 's#/wolverine#\/aquilatrader#g' \
+    -e 's#/var/www/wolverine#\/var\/www\/aquilatrader#g' \
+    "$WOLV_INC" > "$AQ_INC.tmp"
+  mv -f "$AQ_INC.tmp" "$AQ_INC"
+else
+  say "WARN: Missing $WOLV_INC. Creating minimal static include + best-effort proxy hints."
+  cat >"$AQ_INC" <<EOF
+# aquilatrader_routes.inc (fallback)
+# NOTE: wolverine_routes.inc not found; adjust proxy_pass if needed.
+
+location = /aquilatrader { return 302 /aquilatrader/; }
+location ^~ /aquilatrader/ {
+  alias $WWW/;
+  try_files \$uri \$uri/ /aquilatrader/index.html;
+}
+
+# Best-effort defaults (may need alignment with your upstreams):
+location ^~ /aquilatrader/traderone/api/ { proxy_pass http://127.0.0.1:3000/; }
+location ^~ /aquilatrader/traderone/vault/ { proxy_pass http://127.0.0.1:3005/; }
+location ^~ /aquilatrader/vault-api/ { proxy_pass http://127.0.0.1:3005/; }
+EOF
+fi
 
 hr
-say "3) Permissions sanity"
-chown -R root:root "$DST" >/dev/null 2>&1 || true
-find "$DST" -type d -exec chmod 0755 {} \; >/dev/null 2>&1 || true
-find "$DST" -type f -exec chmod 0644 {} \; >/dev/null 2>&1 || true
+say "4) Ensure vhost includes aquilatrader routes (no duplicate)"
+# Handle immutable attribute (best-effort)
+unlock_file(){
+  local f="$1"
+  if command -v lsattr >/dev/null 2>&1 && command -v chattr >/dev/null 2>&1; then
+    if lsattr "$f" 2>/dev/null | grep -q ' i '; then
+      say "chattr -i $f"
+      chattr -i "$f" || true
+    fi
+  fi
+}
+lock_file(){
+  local f="$1"
+  if command -v chattr >/dev/null 2>&1; then
+    say "chattr +i $f"
+    chattr +i "$f" || true
+  fi
+}
+
+unlock_file "$VHOST"
+
+if ! grep -qF "include $AQ_INC;" "$VHOST"; then
+  say "Inject include into $VHOST"
+  # Prefer insertion after existing wolverine includes if present, else add near top of server block
+  python3 - "$VHOST" "$AQ_INC" <<'PY'
+import sys,re
+path=sys.argv[1]
+inc=sys.argv[2]
+s=open(path,'r',encoding='utf-8',errors='ignore').read().splitlines(True)
+
+needle=f"include {inc};\n"
+if any(line.strip()==needle.strip() for line in s):
+    sys.exit(0)
+
+out=[]
+inserted=False
+for i,line in enumerate(s):
+    out.append(line)
+    if (not inserted) and ("include /etc/nginx/includes/wolverine_routes.inc" in line or "include /etc/nginx/includes/wolverine_static.inc" in line):
+        # insert right after first wolverine include
+        out.append("  " + needle)
+        inserted=True
+
+if not inserted:
+    # insert after first "server {" line
+    out2=[]
+    for line in out:
+        out2.append(line)
+        if (not inserted) and re.search(r'^\s*server\s*\{', line):
+            out2.append("  " + needle)
+            inserted=True
+    out=out2
+
+open(path,'w',encoding='utf-8').write(''.join(out))
+PY
+else
+  say "OK: include already present"
+fi
 
 hr
-say "4) Nginx config test + reload"
+say "5) nginx test + reload"
 nginx -t
 systemctl reload nginx
 
-hr
-say "5) Quick content check: /var/www/wolverine/index.html (first 40 lines)"
-sed -n '1,40p' "$DST/index.html" || true
+lock_file "$VHOST"
 
 hr
-say "6) Health checks via nginx routes (localhost HTTPS with Host header)"
-# Use -k because cert may be valid; but localhost SNI sometimes differs. Host header forces vhost routing.
-# If your cert/SNI is strict, these still usually work with -k.
-for path in \
-  "/wolverine/" \
-  "/wolverine/traderone/api/health" \
-  "/wolverine/traderone/vault/health" \
-  "/wolverine/vault-api/health"
-do
-  say "GET https://127.0.0.1${path} (Host: fireinners.online)"
-  code="$(curl -k -sS -o /tmp/wolv_resp.txt -w "%{http_code}" -H "Host: fireinners.online" "https://127.0.0.1${path}" || true)"
-  say "HTTP $code"
-  head -n 5 /tmp/wolv_resp.txt | sed 's/\r$//' || true
-  hr
-done
+say "6) Quick local checks (HTTPS via Host header)"
+curl -skI "https://127.0.0.1/aquilatrader/" -H "Host: fireinners.online" | head -n 12 || true
+curl -sk "https://127.0.0.1/aquilatrader/traderone/api/health" -H "Host: fireinners.online" | head -n 30 || true
+curl -sk "https://127.0.0.1/aquilatrader/traderone/vault/health" -H "Host: fireinners.online" | head -n 30 || true
+curl -sk "https://127.0.0.1/aquilatrader/vault-api/health" -H "Host: fireinners.online" | head -n 30 || true
 
 hr
-say "7) Grep for frontend expected libs (solana web3 / walletconnect / lifi keywords) in live index"
-grep -iE 'solana|web3|walletconnect|lifi|phantom' -n "$DST/index.html" | head -n 60 || true
+say "DONE"
+say "Backup saved: $BK"
+say "URL: https://fireinners.online/aquilatrader/"
 
-hr
-say "DONE. Backup at: $BK"
 BASH
 
-bash /root/MEGA_WOLVERINE_UI_PUBLISH_DIST_TO_WWW.sh
+bash /root/MEGA_AQUILATRADER_DEPLOY_V1.sh
