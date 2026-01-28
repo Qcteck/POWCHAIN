@@ -1,600 +1,222 @@
+cat >/root/MEGA_DIAG_CRYPTO_ENGINES_VPS.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 umask 077
 export DEBIAN_FRONTEND=noninteractive
 
-# ============================================================
-# MEGA_CRYPTOENGINE_PRIVATE_VPS_HOTWALLET_AUTOTRADE.sh
-# - Installe un service Node.js "cryptoengine-private" (hot wallet sur VPS)
-# - Stocke la clé privée CHIFFRÉE (jamais en clair dans .env)
-# - Expose API locale + route Nginx protégée en Basic Auth
-# - Prêt pour autopilot via Jupiter (quote/swap) + Solana RPC
-# ============================================================
-
-APP_NAME="cryptoengine-private"
-BASE_DIR="/opt/${APP_NAME}"
-VAULT_DIR="${BASE_DIR}/vault"
-ETC_DIR="/etc/${APP_NAME}"
-LOG_DIR="/var/log/${APP_NAME}"
-SVC="/etc/systemd/system/${APP_NAME}.service"
-
-NGX_VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
-NGX_INC_DIR="/etc/nginx/includes"
-NGX_INC_FILE="${NGX_INC_DIR}/${APP_NAME}.inc"
-
-# Service écoute en localhost uniquement (Nginx proxy + BasicAuth)
-PORT="9797"
-HOST="127.0.0.1"
-
-# RPC Solana (par défaut = ton drpc live mémorisé)
-DEFAULT_SOL_RPC="https://lb.drpc.live/solana/Ah_pmhKMs0qntHMrHyHMTvqg8lcNcRkR8LWNEklbR4ac"
-
-# Jupiter API (quote + swap)
-DEFAULT_JUP_QUOTE="https://quote-api.jup.ag/v6/quote"
-DEFAULT_JUP_SWAP="https://quote-api.jup.ag/v6/swap"
+TS="$(date +%Y%m%d_%H%M%S)"
+OUT_DIR="/root/DIAG_CRYPTO_ENGINES_${TS}"
+REPORT="${OUT_DIR}/report.txt"
+JSON="${OUT_DIR}/services.json"
+PORTS="${OUT_DIR}/ports.txt"
+NGX="${OUT_DIR}/nginx_extract.txt"
+FILES="${OUT_DIR}/suspect_files.txt"
+CODEHITS="${OUT_DIR}/code_hits.txt"
 
 say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 die(){ say "ERROR: $*"; exit 1; }
 
-need_root(){
-  [[ "$(id -u)" == "0" ]] || die "Lance en root."
-}
+need_root(){ [[ "$(id -u)" == "0" ]] || die "Run as root."; }
 
-rand_hex(){ openssl rand -hex 24; }
+cmd_exists(){ command -v "$1" >/dev/null 2>&1; }
 
-ensure_pkgs(){
-  say "== deps =="
-  apt-get update -y
-  apt-get install -y ca-certificates curl gnupg openssl nginx apache2-utils jq
-}
-
-ensure_node20(){
-  if command -v node >/dev/null 2>&1; then
-    say "node present: $(node -v)"
-    return
+safe_stat_line(){
+  local f="$1"
+  # Do NOT print file contents. Only metadata + sha256.
+  local perm owner group size mtime
+  perm="$(stat -c '%a' "$f" 2>/dev/null || echo '?')"
+  owner="$(stat -c '%U' "$f" 2>/dev/null || echo '?')"
+  group="$(stat -c '%G' "$f" 2>/dev/null || echo '?')"
+  size="$(stat -c '%s' "$f" 2>/dev/null || echo '?')"
+  mtime="$(stat -c '%y' "$f" 2>/dev/null | cut -d. -f1 || echo '?')"
+  local sha="(sha256 n/a)"
+  if cmd_exists sha256sum; then
+    sha="$(sha256sum "$f" 2>/dev/null | awk '{print $1}' || true)"
+    [[ -n "$sha" ]] || sha="(sha256 err)"
   fi
-  say "== install Node.js 20 via NodeSource (no apt npm mix) =="
-  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-  apt-get install -y nodejs
-  say "node: $(node -v) | npm: $(npm -v)"
+  printf '%s | perm=%s owner=%s:%s size=%s mtime=%s sha256=%s\n' "$f" "$perm" "$owner" "$group" "$size" "$mtime" "$sha"
 }
 
-mk_dirs(){
-  say "== dirs =="
-  mkdir -p "$BASE_DIR" "$VAULT_DIR" "$ETC_DIR" "$LOG_DIR"
-  chmod 700 "$BASE_DIR" "$VAULT_DIR" "$ETC_DIR"
+extract_nginx(){
+  local vhost="/etc/nginx/sites-available/fireinners.online-ssl"
+  {
+    echo "== nginx -T (filtered) =="
+    if cmd_exists nginx; then
+      nginx -t 2>&1 || true
+    else
+      echo "nginx not found"
+    fi
+    echo
+    echo "== vhost: ${vhost} (extract: includes + locations for /wolverine + proxy_pass) =="
+    if [[ -f "$vhost" ]]; then
+      nl -ba "$vhost" | egrep -n 'include |location /wolverine|/wolverine|proxy_pass|auth_basic|upstream|listen 443|server_name' || true
+    else
+      echo "missing vhost file"
+    fi
+    echo
+    echo "== /etc/nginx/includes (extract: wolverine/crypto/engine/swap/evm/lifi/jup) =="
+    if [[ -d /etc/nginx/includes ]]; then
+      find /etc/nginx/includes -maxdepth 1 -type f -print0 2>/dev/null \
+        | xargs -0 -I{} bash -lc 'f="{}"; bn="$(basename "$f")"; if echo "$bn" | egrep -qi "wolverine|crypto|engine|swap|evm|lifi|jup|bundler|orion|trader|amcq"; then echo "--- $f"; nl -ba "$f" | sed -n "1,220p"; echo; fi' || true
+    else
+      echo "missing includes dir"
+    fi
+  } >"$NGX"
 }
 
-write_app(){
-  say "== write app =="
-  cat > "${BASE_DIR}/package.json" <<'JSON'
-{
-  "name": "cryptoengine-private",
-  "version": "1.0.0",
-  "type": "commonjs",
-  "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  },
-  "dependencies": {
-    "@solana/web3.js": "^1.98.0",
-    "bs58": "^6.0.0",
-    "express": "^4.19.2"
-  }
-}
-JSON
-
-  cat > "${BASE_DIR}/server.js" <<'JS'
-'use strict';
-
-const fs = require('fs');
-const path = require('path');
-const crypto = require('crypto');
-const express = require('express');
-const bs58 = require('bs58');
-
-const { Connection, Keypair, VersionedTransaction } = require('@solana/web3.js');
-
-const APP = 'cryptoengine-private';
-
-function nowISO(){ return new Date().toISOString(); }
-function j(x){ return JSON.stringify(x); }
-
-function mustEnv(k, fallback=null){
-  const v = process.env[k] ?? fallback;
-  if (v === null || v === undefined || v === '') throw new Error(`Missing env: ${k}`);
-  return v;
+list_ports(){
+  {
+    echo "== ss -lntp =="
+    if cmd_exists ss; then
+      ss -lntp || true
+    else
+      echo "ss not found"
+    fi
+    echo
+    echo "== ss -lunp =="
+    if cmd_exists ss; then
+      ss -lunp || true
+    fi
+  } >"$PORTS"
 }
 
-const CFG = {
-  HOST: process.env.HOST || '127.0.0.1',
-  PORT: parseInt(process.env.PORT || '9797', 10),
-  SOL_RPC: process.env.SOL_RPC || '',
-  JUP_QUOTE_URL: process.env.JUP_QUOTE_URL || 'https://quote-api.jup.ag/v6/quote',
-  JUP_SWAP_URL: process.env.JUP_SWAP_URL || 'https://quote-api.jup.ag/v6/swap',
-
-  // Sécurité / limites
-  ARM_TOKEN: mustEnv('ARM_TOKEN'),
-  ENABLE_TRADING: (process.env.ENABLE_TRADING || '0') === '1',
-
-  // Caps (sécurité)
-  MAX_TRADE_USDC: parseFloat(process.env.MAX_TRADE_USDC || '25'),   // taille max par trade
-  MAX_SLIPPAGE_BPS: parseInt(process.env.MAX_SLIPPAGE_BPS || '300', 10), // 3.00%
-  COOLDOWN_SEC: parseInt(process.env.COOLDOWN_SEC || '90', 10),
-
-  // Fichiers secrets
-  MASTER_FILE: process.env.MASTER_FILE || '/etc/cryptoengine-private/master.key',
-  KEY_ENC_FILE: process.env.KEY_ENC_FILE || '/opt/cryptoengine-private/vault/personal.key.enc',
-
-  // Autopilot (simple)
-  AUTO_ENABLED: (process.env.AUTO_ENABLED || '0') === '1',
-  AUTO_INTERVAL_SEC: parseInt(process.env.AUTO_INTERVAL_SEC || '25', 10),
-
-  // Input/Output mints (USDC->Token)
-  USDC_MINT: process.env.USDC_MINT || 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1',
-  // allowlist (comma)
-  ALLOW_MINTS: (process.env.ALLOW_MINTS || '').split(',').map(s=>s.trim()).filter(Boolean)
-};
-
-let ARMED = false;
-let LAST_TRADE_TS = 0;
-
-function readFileStrict(p){
-  return fs.readFileSync(p, 'utf8').trim();
+list_services(){
+  {
+    echo "== systemctl services (filtered) =="
+    systemctl list-units --type=service --all --no-pager 2>/dev/null \
+      | egrep -i 'crypto|engine|trader|wolverine|amcq|orion|bundler|swap|lifi|evm|dex|jup|price|ws|node|pm2' || true
+    echo
+    echo "== systemd unit files (grep likely) =="
+    ls -la /etc/systemd/system 2>/dev/null | egrep -i 'crypto|engine|trader|wolverine|amcq|orion|bundler|swap|lifi|evm|dex|jup|price' || true
+    echo
+    echo "== pm2 (if present) =="
+    if cmd_exists pm2; then
+      pm2 list || true
+      echo
+      pm2 jlist 2>/dev/null || true
+    else
+      echo "pm2 not installed"
+    fi
+  } >"$JSON"
 }
 
-function decryptKeypair(masterHex, encB64){
-  // Envelope simple: iv(12) + tag(16) + ciphertext
-  const buf = Buffer.from(encB64, 'base64');
-  if (buf.length < 12+16+1) throw new Error('enc blob too small');
-  const iv = buf.subarray(0, 12);
-  const tag = buf.subarray(12, 28);
-  const ct = buf.subarray(28);
-
-  const key = crypto.createHash('sha256').update(Buffer.from(masterHex, 'hex')).digest();
-  const dec = crypto.createDecipheriv('aes-256-gcm', key, iv);
-  dec.setAuthTag(tag);
-  const pt = Buffer.concat([dec.update(ct), dec.final()]);
-  const s = pt.toString('utf8').trim();
-  const secret = bs58.decode(s);
-  if (!(secret && secret.length === 64)) throw new Error('secret must be 64 bytes (base58 of Solana secretKey)');
-  return Keypair.fromSecretKey(secret);
+find_suspect_files(){
+  # Search for config/wallet/key/env files but do NOT output content.
+  # Paths limited to avoid scanning entire filesystem.
+  local roots=(/etc /opt /root /var/www)
+  {
+    echo "== suspect files (names only + metadata, no contents) =="
+    for r in "${roots[@]}"; do
+      [[ -d "$r" ]] || continue
+      echo "-- root: $r"
+      # likely secrets/configs
+      find "$r" -maxdepth 6 -type f \( \
+        -iname "*.env" -o -iname "*wallet*" -o -iname "*key*" -o -iname "*mnemonic*" -o -iname "*seed*" -o -iname "*secret*" \
+        -o -iname "*private*" -o -iname "*keystore*" -o -iname "*.json" -o -iname "*.yaml" -o -iname "*.yml" \
+      \) 2>/dev/null \
+      | egrep -i 'crypto|engine|trader|wolverine|amcq|orion|bundler|swap|evm|ethers|lifi|jup|solana|metamask|phantom|vault|key|seed|secret|keystore|mnemonic|private' \
+      | head -n 600 \
+      | while read -r f; do safe_stat_line "$f"; done
+      echo
+    done
+    echo "Note: list capped (head 600 per root) to keep report manageable."
+  } >"$FILES"
 }
 
-function loadSigner(){
-  const master = readFileStrict(CFG.MASTER_FILE);
-  const enc = readFileStrict(CFG.KEY_ENC_FILE);
-  const kp = decryptKeypair(master, enc);
-  return kp;
+scan_code_hits(){
+  # Look for known endpoints/libs in code without dumping secrets
+  local roots=(/opt /var/www /root)
+  {
+    echo "== code hits (grep) =="
+    for r in "${roots[@]}"; do
+      [[ -d "$r" ]] || continue
+      echo "-- root: $r"
+      if cmd_exists rg; then
+        rg -n --hidden --follow --no-ignore -S \
+          -g'!*node_modules/*' -g'!*.log' -g'!*.png' -g'!*.jpg' -g'!*.zip' -g'!*.gz' -g'!*.pdf' \
+          'quote-api\.jup\.ag|jup\.ag|dexscreener|ethers|viem|web3|0x\.org|1inch|lifi|walletconnect|metamask|privateKey|mnemonic|seed phrase|secretKey|solana/web3\.js' \
+          "$r" 2>/dev/null | head -n 500 || true
+      else
+        grep -RIn --exclude-dir=node_modules --exclude='*.log' --exclude='*.png' --exclude='*.jpg' --exclude='*.zip' --exclude='*.gz' --exclude='*.pdf' \
+          -E 'quote-api\.jup\.ag|jup\.ag|dexscreener|ethers|viem|web3|0x\.org|1inch|lifi|walletconnect|metamask|privateKey|mnemonic|seed phrase|secretKey|solana/web3\.js' \
+          "$r" 2>/dev/null | head -n 500 || true
+      fi
+      echo
+    done
+    echo "Note: output capped to 500 hits total per root."
+  } >"$CODEHITS"
 }
 
-function mustAllowMint(m){
-  if (!CFG.ALLOW_MINTS.length) return true; // si vide: allow-all (tu peux forcer par env)
-  return CFG.ALLOW_MINTS.includes(m);
+write_report(){
+  {
+    echo "DIAG CRYPTO ENGINES"
+    echo "ts: $(date -Is)"
+    echo "host: $(hostname)"
+    echo "kernel: $(uname -a)"
+    echo "user: $(id)"
+    echo
+
+    echo "== versions =="
+    if cmd_exists node; then echo "node: $(node -v)"; else echo "node: missing"; fi
+    if cmd_exists npm; then echo "npm:  $(npm -v)"; else echo "npm:  missing"; fi
+    if cmd_exists python3; then echo "python3: $(python3 -V 2>&1)"; else echo "python3: missing"; fi
+    if cmd_exists nginx; then echo "nginx: $(nginx -v 2>&1)"; else echo "nginx: missing"; fi
+    echo
+
+    echo "== key paths =="
+    echo "out_dir: $OUT_DIR"
+    echo "services: $JSON"
+    echo "ports:    $PORTS"
+    echo "nginx:    $NGX"
+    echo "files:    $FILES"
+    echo "code:     $CODEHITS"
+    echo
+
+    echo "== quick summary (top listeners) =="
+    if cmd_exists ss; then ss -lntp 2>/dev/null | head -n 60 || true; fi
+    echo
+
+    echo "== NEXT STEP =="
+    echo "If you see an existing EVM engine, send me:"
+    echo "  - its service name (systemd) or pm2 app name"
+    echo "  - its listen port"
+    echo "  - its base dir (/opt/...)"
+    echo "and I will align configs/caps (MAX_TRADE_USDC=50), add safe encryption, and wire it to your crypto motor."
+  } >"$REPORT"
 }
 
-async function fetchJson(url, opts={}, timeoutMs=12000){
-  const ac = new AbortController();
-  const t = setTimeout(()=>ac.abort(), timeoutMs);
-  try{
-    const r = await fetch(url, { ...opts, signal: ac.signal, cache: 'no-store' });
-    if (!r.ok){
-      const txt = await r.text().catch(()=> '');
-      throw new Error(`HTTP ${r.status} ${r.statusText} | ${txt.slice(0,240)}`);
-    }
-    return await r.json();
-  } finally {
-    clearTimeout(t);
-  }
-}
+main(){
+  need_root
+  mkdir -p "$OUT_DIR"
 
-async function jupQuote({inputMint, outputMint, amount, slippageBps}){
-  const u = new URL(CFG.JUP_QUOTE_URL);
-  u.searchParams.set('inputMint', inputMint);
-  u.searchParams.set('outputMint', outputMint);
-  u.searchParams.set('amount', String(amount)); // in smallest units
-  u.searchParams.set('slippageBps', String(slippageBps));
-  // optional: u.searchParams.set('onlyDirectRoutes','false');
-  return await fetchJson(u.toString());
-}
+  say "Collecting services..."
+  list_services
 
-async function jupSwap({quoteResponse, userPublicKey}){
-  const body = {
-    quoteResponse,
-    userPublicKey,
-    wrapUnwrapSOL: true,
-    dynamicComputeUnitLimit: true,
-    // prioritizationFeeLamports: "auto" // peut être activé si besoin
-  };
-  return await fetchJson(CFG.JUP_SWAP_URL, {
-    method: 'POST',
-    headers: {'content-type':'application/json'},
-    body: JSON.stringify(body)
-  }, 20000);
-}
+  say "Collecting ports..."
+  list_ports
 
-async function sendSwapTx(connection, signer, swapTransactionB64){
-  const raw = Buffer.from(swapTransactionB64, 'base64');
-  const tx = VersionedTransaction.deserialize(raw);
-  tx.sign([signer]);
-  const sig = await connection.sendTransaction(tx, {
-    skipPreflight: false,
-    maxRetries: 3
-  });
-  return sig;
-}
+  say "Extracting nginx..."
+  extract_nginx
 
-// ====================== Autopilot minimal ======================
-// Cible simple: trade USDC -> token pour un mint donné via endpoint API /targets
-const TARGETS = new Map(); // mint -> { mint, amountUsdc, createdAt }
+  say "Finding suspect files (metadata only, no secrets)..."
+  find_suspect_files
 
-function usdcToBaseUnits(usdc){
-  // USDC Solana = 6 decimals
-  return Math.floor(usdc * 1e6);
-}
+  say "Scanning code hits..."
+  scan_code_hits
 
-async function doBuy(mint, amountUsdc){
-  if (!CFG.ENABLE_TRADING) throw new Error('ENABLE_TRADING=0');
-  if (!ARMED) throw new Error('not armed');
-  if (!mustAllowMint(mint)) throw new Error('mint not allowed');
-  if (!(amountUsdc > 0)) throw new Error('amountUsdc invalid');
-  if (amountUsdc > CFG.MAX_TRADE_USDC) throw new Error(`amountUsdc exceeds MAX_TRADE_USDC=${CFG.MAX_TRADE_USDC}`);
+  say "Writing report..."
+  write_report
 
-  const t = Date.now();
-  if (t - LAST_TRADE_TS < CFG.COOLDOWN_SEC * 1000) throw new Error('cooldown active');
-  LAST_TRADE_TS = t;
+  chmod 700 "$OUT_DIR"
+  chmod 600 "$OUT_DIR"/* 2>/dev/null || true
 
-  const signer = loadSigner();
-  const connection = new Connection(CFG.SOL_RPC, 'confirmed');
-
-  const amount = usdcToBaseUnits(amountUsdc);
-  const quote = await jupQuote({
-    inputMint: CFG.USDC_MINT,
-    outputMint: mint,
-    amount,
-    slippageBps: CFG.MAX_SLIPPAGE_BPS
-  });
-
-  if (!quote || !quote.routePlan) throw new Error('bad quote');
-  const swap = await jupSwap({ quoteResponse: quote, userPublicKey: signer.publicKey.toBase58() });
-  if (!swap || !swap.swapTransaction) throw new Error('bad swap');
-
-  const sig = await sendSwapTx(connection, signer, swap.swapTransaction);
-  return { sig, payer: signer.publicKey.toBase58(), inputMint: CFG.USDC_MINT, outputMint: mint, amountUsdc };
-}
-
-async function autopilotTick(){
-  if (!CFG.AUTO_ENABLED) return;
-  if (!CFG.ENABLE_TRADING) return;
-  if (!ARMED) return;
-  // boucle targets
-  for (const [mint, t] of TARGETS.entries()){
-    try{
-      const r = await doBuy(mint, t.amountUsdc);
-      console.log(j({ts: nowISO(), type:'AUTO_BUY_OK', mint, amountUsdc: t.amountUsdc, sig: r.sig}));
-      TARGETS.delete(mint);
-      break; // 1 trade par tick
-    } catch(e){
-      console.log(j({ts: nowISO(), type:'AUTO_BUY_ERR', mint, err: String(e.message||e)}));
-    }
-  }
-}
-
-// ====================== API ======================
-const app = express();
-app.use(express.json({limit:'1mb'}));
-
-app.get('/health', (req,res)=> res.json({ok:true, app:APP, ts:nowISO()}));
-
-app.get('/status', (req,res)=>{
-  let pub='—';
-  try{
-    const kp = loadSigner();
-    pub = kp.publicKey.toBase58();
-  } catch(e){
-    return res.status(500).json({ok:false, err:'signer_not_ready', detail:String(e.message||e)});
-  }
-  res.json({
-    ok:true,
-    ts:nowISO(),
-    armed: ARMED,
-    enableTrading: CFG.ENABLE_TRADING,
-    autoEnabled: CFG.AUTO_ENABLED,
-    pubkey: pub,
-    caps: { maxTradeUsdc: CFG.MAX_TRADE_USDC, maxSlippageBps: CFG.MAX_SLIPPAGE_BPS, cooldownSec: CFG.COOLDOWN_SEC },
-    allowMints: CFG.ALLOW_MINTS
-  });
-});
-
-function authArm(req){
-  const t = req.headers['x-arm-token'];
-  if (!t || t !== CFG.ARM_TOKEN) throw new Error('bad arm token');
-}
-
-app.post('/arm/on', (req,res)=>{
-  try{
-    authArm(req);
-    ARMED = true;
-    res.json({ok:true, armed:true, ts:nowISO()});
-  } catch(e){
-    res.status(401).json({ok:false, err:String(e.message||e)});
-  }
-});
-app.post('/arm/off', (req,res)=>{
-  try{
-    authArm(req);
-    ARMED = false;
-    res.json({ok:true, armed:false, ts:nowISO()});
-  } catch(e){
-    res.status(401).json({ok:false, err:String(e.message||e)});
-  }
-});
-
-// Ajoute une cible (USDC->MINT) que l’autopilot achète automatiquement
-app.post('/targets/add', (req,res)=>{
-  try{
-    authArm(req);
-    const mint = String(req.body?.mint||'').trim();
-    const amountUsdc = Number(req.body?.amountUsdc||0);
-    if (!mint) throw new Error('mint required');
-    if (!mustAllowMint(mint)) throw new Error('mint not allowed');
-    if (!(amountUsdc>0)) throw new Error('amountUsdc invalid');
-    if (amountUsdc > CFG.MAX_TRADE_USDC) throw new Error('amountUsdc exceeds cap');
-    TARGETS.set(mint, {mint, amountUsdc, createdAt: nowISO()});
-    res.json({ok:true, added:true, mint, amountUsdc});
-  } catch(e){
-    res.status(400).json({ok:false, err:String(e.message||e)});
-  }
-});
-
-app.get('/targets', (req,res)=>{
-  const arr = Array.from(TARGETS.values());
-  res.json({ok:true, count: arr.length, targets: arr});
-});
-
-// Exécution immédiate (une fois) : USDC->MINT
-app.post('/trade/buy', async (req,res)=>{
-  try{
-    authArm(req);
-    const mint = String(req.body?.mint||'').trim();
-    const amountUsdc = Number(req.body?.amountUsdc||0);
-    const r = await doBuy(mint, amountUsdc);
-    res.json({ok:true, ...r});
-  } catch(e){
-    res.status(400).json({ok:false, err:String(e.message||e)});
-  }
-});
-
-const server = app.listen(CFG.PORT, CFG.HOST, ()=>{
-  console.log(j({ts: nowISO(), type:'BOOT', host:CFG.HOST, port:CFG.PORT}));
-});
-
-setInterval(()=>autopilotTick().catch(()=>{}), CFG.AUTO_INTERVAL_SEC*1000);
-JS
-
-  (cd "$BASE_DIR" && npm install --omit=dev >/dev/null)
-
-  say "== app installed =="
-}
-
-setup_secrets(){
-  say "== secrets (encrypted key) =="
-
-  # master key (hex) stored root-only
-  if [[ ! -f "${ETC_DIR}/master.key" ]]; then
-    rand_hex > "${ETC_DIR}/master.key"
-    chmod 600 "${ETC_DIR}/master.key"
-  fi
-
-  # if encrypted key already exists, keep it
-  if [[ -f "${VAULT_DIR}/personal.key.enc" ]]; then
-    chmod 600 "${VAULT_DIR}/personal.key.enc"
-    say "encrypted key already present: ${VAULT_DIR}/personal.key.enc"
-    return
-  fi
-
-  say "Paste ta SECRET KEY Solana en base58 (64 bytes)."
-  say "Ex: contenu de id.json converti en base58 (secretKey)."
-  read -r -s -p "SECRET_KEY_B58: " SECRET_KEY_B58
+  say "DONE"
+  say "Report: $REPORT"
   echo
-  [[ -n "${SECRET_KEY_B58}" ]] || die "SECRET_KEY_B58 vide."
-
-  MASTER_HEX="$(cat "${ETC_DIR}/master.key")"
-
-  # AES-256-GCM: iv(12)+tag(16)+ct -> base64
-  python3 - <<PY
-import base64, os, sys, hashlib
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-
-master_hex = open("${ETC_DIR}/master.key","r").read().strip()
-key = hashlib.sha256(bytes.fromhex(master_hex)).digest()
-
-secret_b58 = """${SECRET_KEY_B58}""".strip().encode()
-# plaintext = base58 secretKey (string)
-pt = secret_b58
-
-iv = os.urandom(12)
-aes = AESGCM(key)
-ct = aes.encrypt(iv, pt, None)  # returns ciphertext+tag at end
-# split tag
-ciphertext, tag = ct[:-16], ct[-16:]
-blob = iv + tag + ciphertext
-open("${VAULT_DIR}/personal.key.enc","wb").write(base64.b64encode(blob))
-PY
-
-  chmod 600 "${VAULT_DIR}/personal.key.enc"
-  say "OK: clé privée stockée chiffrée -> ${VAULT_DIR}/personal.key.enc"
+  sed -n '1,140p' "$REPORT" || true
 }
 
-write_env(){
-  say "== env =="
-  ARM_TOKEN="$(openssl rand -hex 24)"
+main "$@"
+BASH
 
-  cat > "${ETC_DIR}/${APP_NAME}.env" <<EOF
-# ${APP_NAME} env
-HOST=${HOST}
-PORT=${PORT}
-
-# Solana
-SOL_RPC=${DEFAULT_SOL_RPC}
-
-# Jupiter
-JUP_QUOTE_URL=${DEFAULT_JUP_QUOTE}
-JUP_SWAP_URL=${DEFAULT_JUP_SWAP}
-
-# Secrets
-ARM_TOKEN=${ARM_TOKEN}
-MASTER_FILE=${ETC_DIR}/master.key
-KEY_ENC_FILE=${VAULT_DIR}/personal.key.enc
-
-# Trading security switches
-ENABLE_TRADING=0
-AUTO_ENABLED=0
-
-# Caps
-MAX_TRADE_USDC=25
-MAX_SLIPPAGE_BPS=300
-COOLDOWN_SEC=90
-
-# USDC mint (Solana)
-USDC_MINT=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1
-
-# Allowlist (comma-separated). Vide = allow-all (tu peux remplir)
-ALLOW_MINTS=
-AUTO_INTERVAL_SEC=25
-EOF
-
-  chmod 600 "${ETC_DIR}/${APP_NAME}.env"
-
-  say "ARM_TOKEN (garde-le secret): ${ARM_TOKEN}"
-  echo "${ARM_TOKEN}" > "${ETC_DIR}/ARM_TOKEN.txt"
-  chmod 600 "${ETC_DIR}/ARM_TOKEN.txt"
-}
-
-setup_systemd(){
-  say "== systemd =="
-  cat > "$SVC" <<EOF
-[Unit]
-Description=${APP_NAME} (private hot wallet autopilot)
-After=network.target nginx.service
-
-[Service]
-Type=simple
-User=root
-WorkingDirectory=${BASE_DIR}
-EnvironmentFile=${ETC_DIR}/${APP_NAME}.env
-ExecStart=/usr/bin/node ${BASE_DIR}/server.js
-Restart=always
-RestartSec=2
-NoNewPrivileges=true
-LimitNOFILE=1048576
-StandardOutput=append:${LOG_DIR}/stdout.log
-StandardError=append:${LOG_DIR}/stderr.log
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-  systemctl daemon-reload
-  systemctl enable "${APP_NAME}.service" >/dev/null
-  systemctl restart "${APP_NAME}.service"
-  sleep 1
-  systemctl --no-pager status "${APP_NAME}.service" | sed -n '1,14p' || true
-}
-
-setup_nginx_basic_auth(){
-  say "== nginx (private route + basic auth) =="
-  mkdir -p "$NGX_INC_DIR"
-
-  BASIC_USER="dv"
-  BASIC_PASS="$(openssl rand -base64 18 | tr -d '\n' | tr '/+' 'Aa')"
-  HTPASS="${ETC_DIR}/htpasswd"
-
-  # create htpasswd
-  htpasswd -bc "$HTPASS" "$BASIC_USER" "$BASIC_PASS" >/dev/null 2>&1
-  chmod 600 "$HTPASS"
-
-  cat > "$NGX_INC_FILE" <<EOF
-# ${APP_NAME} include
-location /wolverine/${APP_NAME}/ {
-  auth_basic "Private";
-  auth_basic_user_file ${HTPASS};
-
-  proxy_http_version 1.1;
-  proxy_set_header Host \$host;
-  proxy_set_header X-Real-IP \$remote_addr;
-  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto \$scheme;
-
-  rewrite ^/wolverine/${APP_NAME}/(.*)$ /\$1 break;
-  proxy_pass http://${HOST}:${PORT};
-}
-EOF
-
-  if ! grep -qF "${NGX_INC_FILE}" "$NGX_VHOST"; then
-    cat >> "$NGX_VHOST" <<EOF
-
-  # include ${APP_NAME}
-  include ${NGX_INC_FILE};
-EOF
-  fi
-
-  nginx -t
-  systemctl reload nginx
-
-  say "BASIC AUTH:"
-  say "  user: ${BASIC_USER}"
-  say "  pass: ${BASIC_PASS}"
-  echo "${BASIC_USER}:${BASIC_PASS}" > "${ETC_DIR}/BASIC_AUTH.txt"
-  chmod 600 "${ETC_DIR}/BASIC_AUTH.txt"
-}
-
-smoke_test(){
-  say "== smoke test =="
-  curl -fsS "http://${HOST}:${PORT}/health" | jq .
-  curl -fsS "http://${HOST}:${PORT}/status" | jq . || true
-}
-
-final_notes(){
-  echo
-  say "============================================================"
-  say "INSTALL OK"
-  say "API (via nginx + basic auth):"
-  say "  https://fireinners.online/wolverine/${APP_NAME}/status"
-  say ""
-  say "ARM TOKEN (secret): ${ETC_DIR}/ARM_TOKEN.txt"
-  say "BASIC AUTH: ${ETC_DIR}/BASIC_AUTH.txt"
-  say ""
-  say "IMPORTANT (sécurité):"
-  say "  - ENABLE_TRADING=0 par défaut (aucun trade)."
-  say "  - Pour activer: edit ${ETC_DIR}/${APP_NAME}.env -> ENABLE_TRADING=1"
-  say "  - Autopilot loop: AUTO_ENABLED=1"
-  say "  - Puis: systemctl restart ${APP_NAME}"
-  say ""
-  say "ARM/DISARM (avec x-arm-token):"
-  say "  curl -u dv:PASS -H \"x-arm-token: \$(cat ${ETC_DIR}/ARM_TOKEN.txt)\" -X POST https://fireinners.online/wolverine/${APP_NAME}/arm/on"
-  say "  curl -u dv:PASS -H \"x-arm-token: \$(cat ${ETC_DIR}/ARM_TOKEN.txt)\" -X POST https://fireinners.online/wolverine/${APP_NAME}/arm/off"
-  say ""
-  say "TRADE IMMEDIAT (USDC->MINT):"
-  say "  curl -u dv:PASS -H \"x-arm-token: \$(cat ${ETC_DIR}/ARM_TOKEN.txt)\" -H \"content-type: application/json\" \\"
-  say "    -d '{\"mint\":\"<TOKEN_MINT>\",\"amountUsdc\":10}' \\"
-  say "    https://fireinners.online/wolverine/${APP_NAME}/trade/buy"
-  say ""
-  say "TARGET (autopilot achète 1 fois):"
-  say "  curl -u dv:PASS -H \"x-arm-token: \$(cat ${ETC_DIR}/ARM_TOKEN.txt)\" -H \"content-type: application/json\" \\"
-  say "    -d '{\"mint\":\"<TOKEN_MINT>\",\"amountUsdc\":10}' \\"
-  say "    https://fireinners.online/wolverine/${APP_NAME}/targets/add"
-  say "============================================================"
-}
-
-need_root
-ensure_pkgs
-ensure_node20
-mk_dirs
-write_app
-setup_secrets
-write_env
-setup_systemd
-setup_nginx_basic_auth
-smoke_test
-final_notes
+bash /root/MEGA_DIAG_CRYPTO_ENGINES_VPS.sh
