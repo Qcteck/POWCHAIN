@@ -4,62 +4,64 @@ set -euo pipefail
 umask 022
 export DEBIAN_FRONTEND=noninteractive
 
-# MEGA_AQUILATRADER_DEPLOY_V1.sh
-# One-shot root deploy:
-# - Publie AquilaTrader sur https://fireinners.online/aquilatrader/
-# - Réutilise (copie + adaptation) les routes nginx de /wolverine pour garder les mêmes upstreams backend
-# - Déploie le frontend depuis /opt/fireinners/frontend-react/app/dist/wolverine si présent
-# - Backups systématiques + nginx -t + reload + checks
+say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
+hr(){ echo "----------------------------------------------------------------"; }
+die(){ say "ERROR: $*"; exit 1; }
 
 TS="$(date +%Y%m%d_%H%M%S)"
-BK="/root/BK_AQUILATRADER_${TS}"
+BK="/root/AQUILATRADER_${TS}"
 mkdir -p "$BK"
 
-say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
-die(){ say "ERROR: $*"; exit 1; }
-hr(){ echo "----------------------------------------------------------------"; }
-
-# Canonical paths
-SRC_DIST="/opt/fireinners/frontend-react/app/dist/wolverine"
+# Paths
 WWW="/var/www/aquilatrader"
-VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
-INC_DIR="/etc/nginx/includes"
-WOLV_INC="${INC_DIR}/wolverine_routes.inc"
-AQ_INC="${INC_DIR}/aquilatrader_routes.inc"
+INDEX="$WWW/index.html"
 
-# Optional shared lib (read-only / safe update style)
+NGX_VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
+NGX_CONF="/etc/nginx/nginx.conf"
+NGX_INC_DIR="/etc/nginx/includes"
+NGX_INC_FILE="$NGX_INC_DIR/aquilatrader_routes.inc"
+
 ASKLIB="/opt/fireinners/sentinel/lib/askorupdate.sh"
-if [[ -f "$ASKLIB" ]]; then
+
+say "MEGA_AQUILATRADER_DEPLOY_V1 (static UI + nginx route /aquilatrader)"
+hr
+
+say "0) Preconditions"
+[ "$(id -u)" -eq 0 ] || die "Run as root"
+command -v nginx >/dev/null 2>&1 || die "nginx not found"
+[ -f "$NGX_VHOST" ] || die "Missing vhost: $NGX_VHOST"
+mkdir -p "$NGX_INC_DIR"
+
+# Load askorupdate if present (preferred), else fallback to direct writes
+ASK=0
+if [ -f "$ASKLIB" ]; then
   # shellcheck disable=SC1090
-  source "$ASKLIB" || true
+  source "$ASKLIB"
+  ASK=1
+  say "askorupdate: loaded ($ASKLIB)"
+else
+  say "askorupdate: not found ($ASKLIB) -> fallback direct writes"
 fi
 
 hr
-say "MEGA_AQUILATRADER_DEPLOY_V1 (root, idempotent)"
-say "Backup dir: $BK"
+say "1) Backup current state"
+if [ -d "$WWW" ]; then
+  say "Backup existing webroot: $WWW -> $BK/www_aquilatrader"
+  mkdir -p "$BK"
+  cp -a "$WWW" "$BK/www_aquilatrader" || true
+fi
+if [ -f "$NGX_VHOST" ]; then
+  cp -a "$NGX_VHOST" "$BK/fireinners.online-ssl.bak"
+fi
+if [ -f "$NGX_INC_FILE" ]; then
+  cp -a "$NGX_INC_FILE" "$BK/aquilatrader_routes.inc.bak"
+fi
 
 hr
-say "0) Sanity: required paths"
-[[ -f "$VHOST" ]] || die "Missing vhost: $VHOST"
-[[ -d "$INC_DIR" ]] || mkdir -p "$INC_DIR"
-
-hr
-say "1) Snapshot current state"
-cp -a "$VHOST" "$BK/$(basename "$VHOST").bak" || true
-[[ -f "$WOLV_INC" ]] && cp -a "$WOLV_INC" "$BK/$(basename "$WOLV_INC").bak" || true
-[[ -f "$AQ_INC" ]] && cp -a "$AQ_INC" "$BK/$(basename "$AQ_INC").bak" || true
-[[ -d "$WWW" ]] && cp -a "$WWW" "$BK/www_aquilatrader.bak" || true
-
-hr
-say "2) Deploy frontend to $WWW"
+say "2) Write AquilaTrader static page"
 mkdir -p "$WWW"
-if [[ -d "$SRC_DIST" && -f "$SRC_DIST/index.html" ]]; then
-  say "Using dist: $SRC_DIST -> $WWW (rsync --delete)"
-  command -v rsync >/dev/null 2>&1 || (apt-get update -y && apt-get install -y rsync)
-  rsync -a --delete "$SRC_DIST"/ "$WWW"/
-else
-  say "WARN: dist not found at $SRC_DIST. Generating minimal AquilaTrader index.html."
-  cat >"$WWW/index.html" <<'HTML'
+
+cat >"$INDEX" <<'HTML'
 <!doctype html>
 <html lang="fr">
 <head>
@@ -67,203 +69,231 @@ else
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>AquilaTrader</title>
   <style>
-    :root{color-scheme:dark}
-    body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;background:#0b1020;color:#eaf0ff}
-    .wrap{max-width:920px;margin:0 auto;padding:36px 18px}
-    h1{margin:0 0 14px 0;font-size:56px;letter-spacing:.5px}
-    .muted{opacity:.75}
-    .card{margin-top:22px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.08);border-radius:18px;padding:18px}
-    input{width:100%;font-size:20px;padding:18px 16px;border-radius:16px;border:1px solid rgba(255,255,255,.14);background:rgba(0,0,0,.18);color:#fff;outline:none}
-    .row{display:flex;gap:14px;flex-wrap:wrap;margin-top:14px}
-    button{font-size:18px;padding:14px 22px;border-radius:16px;border:1px solid rgba(255,255,255,.14);background:rgba(255,255,255,.92);cursor:pointer}
-    button.secondary{background:rgba(255,255,255,.12);color:#cfe1ff}
-    pre{white-space:pre-wrap;word-break:break-word;background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.08);padding:12px;border-radius:12px;margin-top:12px}
-    a{color:#a8c8ff}
+    :root{--bg:#060b16;--panel:#0b1020;--txt:#eaf0ff;--mut:#9fb1d8;--btn:#e9eefb;--btnTxt:#0b1020;}
+    html,body{height:100%}
+    body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;background:linear-gradient(180deg,#050816,#070b18 40%,#050816);color:var(--txt)}
+    .wrap{max-width:980px;margin:0 auto;padding:28px 18px}
+    h1{margin:0 0 14px;font-size:46px;letter-spacing:.2px}
+    .row{display:flex;gap:14px;flex-wrap:wrap;align-items:center}
+    .card{background:rgba(11,16,32,.9);border:1px solid rgba(255,255,255,.06);border-radius:14px;padding:16px}
+    .wallet{color:var(--mut);margin:10px 0 14px;font-size:18px}
+    input{width:min(760px,100%);height:56px;border-radius:14px;border:1px solid rgba(255,255,255,.10);background:rgba(0,0,0,.25);color:var(--txt);padding:0 16px;font-size:18px;outline:none}
+    button{height:52px;min-width:150px;border-radius:16px;border:0;background:var(--btn);color:var(--btnTxt);font-size:20px;cursor:pointer}
+    button.secondary{background:rgba(233,238,251,.85)}
+    button:disabled{opacity:.5;cursor:not-allowed}
+    .log{margin-top:16px;white-space:pre-wrap;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;color:#cfe0ff}
+    a{color:#7ab7ff}
+    .hint{color:var(--mut);font-size:14px;margin-top:10px}
+    .sep{height:1px;background:rgba(255,255,255,.06);margin:16px 0}
   </style>
 </head>
 <body>
   <div class="wrap">
     <h1>AquilaTrader</h1>
-    <div class="muted">Wallet: <span id="addr">-</span></div>
 
     <div class="card">
-      <input id="amount" value="1" inputmode="decimal" />
-      <div class="row">
+      <div class="row" style="justify-content:space-between">
+        <div>
+          <div class="wallet">Wallet: <span id="addr">-</span></div>
+          <div class="hint">Endpoints utilisés: <code>/wolverine/traderone/api/*</code></div>
+        </div>
+        <div class="row">
+          <button id="connect" class="secondary">Connect Wallet</button>
+          <button id="health" class="secondary">Health</button>
+        </div>
+      </div>
+
+      <div class="sep"></div>
+
+      <input id="amount" type="number" min="0" step="any" value="1" />
+
+      <div class="row" style="margin-top:14px">
         <button id="start">Start</button>
         <button id="stop" class="secondary">Stop</button>
         <button id="cash" class="secondary">Cash-out</button>
-        <button id="connect" class="secondary">Connect Phantom</button>
       </div>
-      <pre id="log">Ready.</pre>
-      <div class="muted" style="margin-top:10px">
-        Health:
-        <a href="/aquilatrader/traderone/api/health">api</a> ·
-        <a href="/aquilatrader/traderone/vault/health">vault</a> ·
-        <a href="/aquilatrader/vault-api/health">vault-api</a>
+
+      <div id="log" class="log"></div>
+      <div class="hint">
+        Tip: si Phantom est installé, le bouton Connect va récupérer l'adresse. Sinon, tu peux quand même tester Start/Stop/Health.
       </div>
+    </div>
+
+    <div class="hint" style="margin-top:14px">
+      Liens: <a href="/wolverine/traderone/api/health">/wolverine/traderone/api/health</a> •
+      <a href="/wolverine/traderone/vault/health">/wolverine/traderone/vault/health</a>
     </div>
   </div>
 
 <script>
 (function(){
-  const $ = s => document.querySelector(s);
-  const log = (m)=>{$("#log").textContent = (typeof m==="string"?m:JSON.stringify(m,null,2));};
-
+  const $ = (s)=>document.querySelector(s);
+  const logEl = $("#log");
+  const addrEl = $("#addr");
   let pub = "";
+
+  function log(msg){
+    const t = new Date().toLocaleTimeString('fr-CA',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
+    logEl.textContent = `[${t}] ${msg}\n` + logEl.textContent;
+  }
+
   async function post(url, body){
     const r = await fetch(url, {
       method:"POST",
-      headers: {"content-type":"application/json"},
-      body: JSON.stringify(body||{})
+      headers:{ "content-type":"application/json" },
+      body: JSON.stringify(body || {})
     });
-    const t = await r.text();
-    try { return JSON.parse(t); } catch { return { ok:r.ok, status:r.status, text:t }; }
-  }
-
-  async function connect(){
-    if (!window.solana || !window.solana.isPhantom) {
-      log("Phantom non détecté.");
-      return;
+    const txt = await r.text();
+    let data = txt;
+    try { data = JSON.parse(txt); } catch(_){}
+    if(!r.ok){
+      throw new Error(`HTTP ${r.status}: ${typeof data==="string"?data:JSON.stringify(data)}`);
     }
-    const res = await window.solana.connect();
-    pub = (res && res.publicKey) ? res.publicKey.toString() : (window.solana.publicKey ? window.solana.publicKey.toString() : "");
-    $("#addr").textContent = pub || "-";
-    log(pub ? ("Connected: " + pub) : "Connect failed.");
+    return data;
   }
 
-  $("#connect").onclick = connect;
+  async function get(url){
+    const r = await fetch(url, { method:"GET" });
+    const txt = await r.text();
+    let data = txt;
+    try { data = JSON.parse(txt); } catch(_){}
+    if(!r.ok) throw new Error(`HTTP ${r.status}: ${txt}`);
+    return data;
+  }
 
-  $("#start").onclick = async () => {
-    const amt = String($("#amount").value||"").trim();
-    const r = await post("/aquilatrader/traderone/api/start", { amount: amt, userPub: pub });
-    log(r);
-  };
-  $("#stop").onclick = async () => {
-    const r = await post("/aquilatrader/traderone/api/stop", { userPub: pub });
-    log(r);
-  };
-  $("#cash").onclick = async () => {
-    const r = await post("/aquilatrader/traderone/api/cashout", { userPub: pub });
-    log(r);
+  $("#connect").onclick = async ()=>{
+    try{
+      if(!window.solana || !window.solana.isPhantom){
+        log("Phantom non détecté (window.solana.isPhantom absent).");
+        return;
+      }
+      const res = await window.solana.connect({ onlyIfTrusted:false });
+      pub = (res && res.publicKey) ? res.publicKey.toString() : (window.solana.publicKey ? window.solana.publicKey.toString() : "");
+      if(pub){
+        addrEl.textContent = pub;
+        log("Wallet connecté: " + pub);
+      }else{
+        log("Connect ok mais pubkey introuvable.");
+      }
+    }catch(e){
+      log("Connect error: " + (e && e.message ? e.message : String(e)));
+    }
   };
 
+  $("#health").onclick = async ()=>{
+    try{
+      const d = await get("/wolverine/traderone/api/health");
+      log("health: " + (typeof d==="string"?d:JSON.stringify(d)));
+    }catch(e){
+      log("health error: " + (e && e.message ? e.message : String(e)));
+    }
+  };
+
+  $("#start").onclick = async ()=>{
+    try{
+      const amount = Number($("#amount").value || 0);
+      const d = await post("/wolverine/traderone/api/start", { amount, userPub: pub || "" });
+      log("started: " + (typeof d==="string"?d:JSON.stringify(d)));
+    }catch(e){
+      log("start error: " + (e && e.message ? e.message : String(e)));
+    }
+  };
+
+  $("#stop").onclick = async ()=>{
+    try{
+      const d = await post("/wolverine/traderone/api/stop", { userPub: pub || "" });
+      log("stopped: " + (typeof d==="string"?d:JSON.stringify(d)));
+    }catch(e){
+      log("stop error: " + (e && e.message ? e.message : String(e)));
+    }
+  };
+
+  $("#cash").onclick = async ()=>{
+    try{
+      const d = await post("/wolverine/traderone/api/cashout", { userPub: pub || "" });
+      log("cashout: " + (typeof d==="string"?d:JSON.stringify(d)));
+    }catch(e){
+      log("cashout error: " + (e && e.message ? e.message : String(e)));
+    }
+  };
+
+  log("AquilaTrader ready.");
 })();
 </script>
 </body>
 </html>
 HTML
-fi
+
+chmod 0644 "$INDEX"
+chown -R root:root "$WWW"
+find "$WWW" -type d -exec chmod 0755 {} \;
+find "$WWW" -type f -exec chmod 0644 {} \;
+
+say "OK: $INDEX written"
 
 hr
-say "3) Build nginx include for /aquilatrader routes"
-if [[ -f "$WOLV_INC" ]]; then
-  say "Found $WOLV_INC, generating $AQ_INC by prefix+path rewrite"
-  # Replace:
-  #  - route prefix /wolverine -> /aquilatrader
-  #  - static path /var/www/wolverine -> /var/www/aquilatrader
-  sed \
-    -e 's#/wolverine#\/aquilatrader#g' \
-    -e 's#/var/www/wolverine#\/var\/www\/aquilatrader#g' \
-    "$WOLV_INC" > "$AQ_INC.tmp"
-  mv -f "$AQ_INC.tmp" "$AQ_INC"
-else
-  say "WARN: Missing $WOLV_INC. Creating minimal static include + best-effort proxy hints."
-  cat >"$AQ_INC" <<EOF
-# aquilatrader_routes.inc (fallback)
-# NOTE: wolverine_routes.inc not found; adjust proxy_pass if needed.
+say "3) Write nginx include: $NGX_INC_FILE"
+cat >"$NGX_INC_FILE" <<EOF
+# aquilatrader_routes.inc (managed)
+# Static webroot: $WWW
 
-location = /aquilatrader { return 302 /aquilatrader/; }
+location = /aquilatrader { return 301 /aquilatrader/; }
+
 location ^~ /aquilatrader/ {
   alias $WWW/;
+  index index.html;
   try_files \$uri \$uri/ /aquilatrader/index.html;
+  add_header Cache-Control "no-store" always;
 }
-
-# Best-effort defaults (may need alignment with your upstreams):
-location ^~ /aquilatrader/traderone/api/ { proxy_pass http://127.0.0.1:3000/; }
-location ^~ /aquilatrader/traderone/vault/ { proxy_pass http://127.0.0.1:3005/; }
-location ^~ /aquilatrader/vault-api/ { proxy_pass http://127.0.0.1:3005/; }
 EOF
-fi
+chmod 0644 "$NGX_INC_FILE"
+chown root:root "$NGX_INC_FILE"
 
 hr
-say "4) Ensure vhost includes aquilatrader routes (no duplicate)"
-# Handle immutable attribute (best-effort)
-unlock_file(){
-  local f="$1"
-  if command -v lsattr >/dev/null 2>&1 && command -v chattr >/dev/null 2>&1; then
-    if lsattr "$f" 2>/dev/null | grep -q ' i '; then
-      say "chattr -i $f"
-      chattr -i "$f" || true
-    fi
+say "4) Ensure vhost includes aquilatrader include"
+# unlock immutable flags if any
+say "Unlock nginx files (chattr -i) if needed"
+chattr -i "$NGX_VHOST" 2>/dev/null || true
+chattr -i "$NGX_CONF" 2>/dev/null || true
+
+if ! grep -qF "include $NGX_INC_FILE;" "$NGX_VHOST"; then
+  say "Inject include line into vhost: $NGX_VHOST"
+  # Insert after wolverine include if present, else near top of server block.
+  if grep -qE 'include\s+/etc/nginx/includes/wolverine_routes\.inc;' "$NGX_VHOST"; then
+    perl -0777 -pe 's|(include\s+/etc/nginx/includes/wolverine_routes\.inc;)|$1\n  include /etc/nginx/includes/aquilatrader_routes.inc;|g' -i "$NGX_VHOST"
+  else
+    perl -0777 -pe 's|(server\s*\{)|$1\n  include /etc/nginx/includes/aquilatrader_routes.inc;|s' -i "$NGX_VHOST"
   fi
-}
-lock_file(){
-  local f="$1"
-  if command -v chattr >/dev/null 2>&1; then
-    say "chattr +i $f"
-    chattr +i "$f" || true
-  fi
-}
-
-unlock_file "$VHOST"
-
-if ! grep -qF "include $AQ_INC;" "$VHOST"; then
-  say "Inject include into $VHOST"
-  # Prefer insertion after existing wolverine includes if present, else add near top of server block
-  python3 - "$VHOST" "$AQ_INC" <<'PY'
-import sys,re
-path=sys.argv[1]
-inc=sys.argv[2]
-s=open(path,'r',encoding='utf-8',errors='ignore').read().splitlines(True)
-
-needle=f"include {inc};\n"
-if any(line.strip()==needle.strip() for line in s):
-    sys.exit(0)
-
-out=[]
-inserted=False
-for i,line in enumerate(s):
-    out.append(line)
-    if (not inserted) and ("include /etc/nginx/includes/wolverine_routes.inc" in line or "include /etc/nginx/includes/wolverine_static.inc" in line):
-        # insert right after first wolverine include
-        out.append("  " + needle)
-        inserted=True
-
-if not inserted:
-    # insert after first "server {" line
-    out2=[]
-    for line in out:
-        out2.append(line)
-        if (not inserted) and re.search(r'^\s*server\s*\{', line):
-            out2.append("  " + needle)
-            inserted=True
-    out=out2
-
-open(path,'w',encoding='utf-8').write(''.join(out))
-PY
 else
-  say "OK: include already present"
+  say "Vhost already includes aquilatrader include"
 fi
 
 hr
-say "5) nginx test + reload"
+say "5) nginx -t then reload"
 nginx -t
 systemctl reload nginx
 
-lock_file "$VHOST"
+# re-lock (best effort)
+say "Re-lock nginx files (chattr +i) best-effort"
+chattr +i "$NGX_VHOST" 2>/dev/null || true
+chattr +i "$NGX_CONF" 2>/dev/null || true
 
 hr
-say "6) Quick local checks (HTTPS via Host header)"
-curl -skI "https://127.0.0.1/aquilatrader/" -H "Host: fireinners.online" | head -n 12 || true
-curl -sk "https://127.0.0.1/aquilatrader/traderone/api/health" -H "Host: fireinners.online" | head -n 30 || true
-curl -sk "https://127.0.0.1/aquilatrader/traderone/vault/health" -H "Host: fireinners.online" | head -n 30 || true
-curl -sk "https://127.0.0.1/aquilatrader/vault-api/health" -H "Host: fireinners.online" | head -n 30 || true
+say "6) Local health checks (with Host header)"
+set +e
+curl -k -sS -D "$BK/curl_headers_aquilatrader.txt" "https://127.0.0.1/aquilatrader/" -H "Host: fireinners.online" | head -n 25 >"$BK/aquilatrader_head.html"
+RC1=$?
+curl -k -sS "https://127.0.0.1/wolverine/traderone/api/health" -H "Host: fireinners.online" >"$BK/traderone_api_health.txt"
+RC2=$?
+set -e
+
+say "curl aquilatrader rc=$RC1  (saved: $BK/aquilatrader_head.html + headers)"
+say "curl traderone health rc=$RC2 (saved: $BK/traderone_api_health.txt)"
 
 hr
 say "DONE"
-say "Backup saved: $BK"
-say "URL: https://fireinners.online/aquilatrader/"
-
+say "Open: https://fireinners.online/aquilatrader/"
+say "Backup: $BK"
 BASH
 
 bash /root/MEGA_AQUILATRADER_DEPLOY_V1.sh
