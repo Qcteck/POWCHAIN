@@ -1,1 +1,226 @@
-bash /root/MEGA_AQUILATRADER_INSTALL_V1.sh |& tee /root/MEGA_AQUILATRADER_INSTALL_V1.log
+python3 - <<'PY'
+p="/root/MEGA_AQUILATRADER_INSTALL.sh"
+s=r'''#!/usr/bin/env bash
+set -euo pipefail
+umask 022
+
+DOMAIN="fireinners.online"
+WWW="/var/www/aquilatrader"
+INDEX="$WWW/index.html"
+
+NGX_VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
+NGX_SE="/etc/nginx/sites-enabled"
+NGX_INC_DIR="/etc/nginx/includes"
+AQUILA_INC="$NGX_INC_DIR/aquilatrader_static.inc"
+
+TS="$(date +%Y%m%d_%H%M%S)"
+BK="/root/BK_AQUILATRADER_${TS}"
+LOG="/root/MEGA_AQUILATRADER_INSTALL_${TS}.log"
+mkdir -p "$BK"
+
+say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
+die(){ say "ERROR: $*"; exit 1; }
+
+# optional helper
+if [ -f /opt/fireinners/sentinel/lib/askorupdate.sh ]; then
+  # shellcheck disable=SC1091
+  . /opt/fireinners/sentinel/lib/askorupdate.sh || true
+fi
+
+unlock_if_immutable(){
+  local f="$1"
+  if command -v lsattr >/dev/null 2>&1 && command -v chattr >/dev/null 2>&1; then
+    if lsattr -d "$f" 2>/dev/null | awk '{print $1}' | grep -q 'i'; then
+      say "chattr -i $f"
+      chattr -i "$f" || true
+      echo "$f" >> "$BK/was_immutable.txt"
+    fi
+  fi
+}
+relock_immutable(){
+  if [ -f "$BK/was_immutable.txt" ] && command -v chattr >/dev/null 2>&1; then
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      say "chattr +i $f"
+      chattr +i "$f" || true
+    done < "$BK/was_immutable.txt"
+  fi
+}
+
+say "MEGA_AQUILATRADER_INSTALL"
+say "Goal: https://$DOMAIN/aquilatrader/ serves $INDEX"
+say "Backup: $BK"
+say "Log: $LOG"
+echo
+
+say "0) Preconditions"
+command -v nginx >/dev/null 2>&1 || die "nginx not found"
+[ -f "$NGX_VHOST" ] || die "Missing vhost: $NGX_VHOST"
+mkdir -p "$NGX_INC_DIR"
+
+say "1) Backup nginx files"
+cp -a "$NGX_VHOST" "$BK/$(basename "$NGX_VHOST").bak" 2>/dev/null || true
+cp -a /etc/nginx/nginx.conf "$BK/nginx.conf.bak" 2>/dev/null || true
+cp -a "$NGX_INC_DIR" "$BK/includes.bak" 2>/dev/null || true
+nginx -t >/dev/null 2>&1 || true
+echo
+
+say "2) Ensure webroot + index"
+mkdir -p "$WWW"
+if [ ! -f "$INDEX" ]; then
+  cat >"$INDEX" <<'HTML'
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>AquilaTrader</title>
+  <style>
+    body{margin:0;font-family:system-ui,Segoe UI,Roboto,Arial;background:#0b1020;color:#eaf0ff}
+    .wrap{max-width:780px;margin:36px auto;padding:0 16px}
+    .card{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);border-radius:16px;padding:18px}
+    h1{margin:0 0 10px;font-size:44px;letter-spacing:.4px}
+    .muted{opacity:.7;margin:0 0 14px}
+    .row{display:flex;gap:12px;flex-wrap:wrap}
+    input{flex:1;min-width:220px;padding:14px 14px;border-radius:12px;border:1px solid rgba(255,255,255,.18);background:rgba(0,0,0,.2);color:#eaf0ff;font-size:18px}
+    button{padding:12px 18px;border-radius:14px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.08);color:#7db2ff;font-size:18px;cursor:pointer}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>TraderOne</h1>
+    <p class="muted">AquilaTrader — UI minimal (Start / Stop / Cash-out)</p>
+    <div class="card">
+      <div class="muted">Wallet: -</div>
+      <div class="row"><input value="1"/></div>
+      <div class="row" style="margin-top:12px">
+        <button>Start</button><button>Stop</button><button>Cash-out</button>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
+HTML
+  say "Wrote $INDEX"
+else
+  say "Index exists: $INDEX (kept)"
+fi
+echo
+
+say "3) Write dedicated include (single source of truth)"
+# build include content
+cat > "$BK/aquilatrader_static.inc.new" <<NGX
+# BEGIN AQUILATRADER_MANAGED
+location ^~ /aquilatrader/ {
+  alias $WWW/;
+  try_files \$uri \$uri/ /aquilatrader/index.html;
+  add_header Cache-Control "no-store" always;
+}
+# END AQUILATRADER_MANAGED
+NGX
+
+unlock_if_immutable "$AQUILA_INC"
+if declare -F askorupdate_file >/dev/null 2>&1; then
+  askorupdate_file "$AQUILA_INC" "$BK/aquilatrader_static.inc.new"
+else
+  install -m 0644 "$BK/aquilatrader_static.inc.new" "$AQUILA_INC"
+fi
+echo
+
+say "4) Ensure vhost includes our include ONCE (and remove duplicates)"
+unlock_if_immutable "$NGX_VHOST"
+
+python3 - "$NGX_VHOST" "$AQUILA_INC" "$BK/vhost.patched" <<'PY'
+import sys,re
+vhost,inc,out = sys.argv[1], sys.argv[2], sys.argv[3]
+txt=open(vhost,'r',encoding='utf-8',errors='ignore').read().splitlines()
+
+# remove any previous aquilatrader includes/blocks
+clean=[]
+for line in txt:
+    if 'aquilatrader_static.inc' in line:
+        continue
+    clean.append(line)
+
+# inject include inside first server { } that contains server_name fireinners.online and listens 443
+res=[]
+i=0
+in_server=False
+brace=0
+target=False
+inserted=False
+while i < len(clean):
+    line=clean[i]
+    res.append(line)
+    if re.search(r'^\s*server\s*\{', line):
+        in_server=True
+        brace=1
+        target=False
+    elif in_server:
+        brace += line.count('{') - line.count('}')
+        if re.search(r'^\s*server_name\b', line) and 'fireinners.online' in line:
+            target=True
+        if target and (re.search(r'listen\s+443', line) or re.search(r'listen\s+\[::\]:443', line)):
+            # keep target true
+            pass
+        # insert right after first include lines or after server_name, before any location
+        if target and not inserted:
+            # if we are inside server and we see a blank line after server_name or first include, inject there
+            if re.search(r'^\s*server_name\b', line) or re.search(r'^\s*include\b', line):
+                # lookahead for next non-empty, inject after current line
+                res.append(f'    include {inc};')
+                inserted=True
+        if in_server and brace==0:
+            in_server=False
+    i+=1
+
+if not inserted:
+    # fallback: append include near top of file
+    res.insert(0,f'include {inc};')
+
+open(out,'w',encoding='utf-8').write("\n".join(res)+("\n" if res and not res[-1].endswith("\n") else ""))
+print("OK: patched vhost ->", out)
+PY
+
+# install patched vhost
+if declare -F askorupdate_file >/dev/null 2>&1; then
+  askorupdate_file "$NGX_VHOST" "$BK/vhost.patched"
+else
+  install -m 0644 "$BK/vhost.patched" "$NGX_VHOST"
+fi
+echo
+
+say "5) nginx -t then reload (rollback on failure)"
+set +e
+nginx -t
+RC=$?
+set -e
+if [ "$RC" -ne 0 ]; then
+  say "nginx -t FAILED -> rollback backups"
+  [ -f "$BK/$(basename "$NGX_VHOST").bak" ] && cp -a "$BK/$(basename "$NGX_VHOST").bak" "$NGX_VHOST" || true
+  [ -f "$BK/nginx.conf.bak" ] && cp -a "$BK/nginx.conf.bak" /etc/nginx/nginx.conf || true
+  if [ -d "$BK/includes.bak" ]; then
+    rm -rf "$NGX_INC_DIR"
+    cp -a "$BK/includes.bak" "$NGX_INC_DIR"
+  fi
+  nginx -t || true
+  relock_immutable
+  die "Rollback done. Fix not applied. Check $BK"
+fi
+
+systemctl reload nginx || true
+relock_immutable
+echo
+
+say "6) Quick local checks (Host header)"
+curl -sk "https://127.0.0.1/aquilatrader/" -H "Host: $DOMAIN" | head -n 8 || true
+echo
+say "DONE. Open: https://$DOMAIN/aquilatrader/"
+say "Backup: $BK"
+'''
+open(p,"w",encoding="utf-8").write(s)
+print("WROTE",p)
+PY
+chmod +x /root/MEGA_AQUILATRADER_INSTALL.sh
+
+bash /root/MEGA_AQUILATRADER_INSTALL.sh |& tee /root/MEGA_AQUILATRADER_INSTALL.log
