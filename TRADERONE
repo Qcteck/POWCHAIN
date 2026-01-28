@@ -1,198 +1,97 @@
-== LAST DIAG FOLDER + FILES ==
-LAST=/root/DIAG_CRYPTO_ENGINES_20260128_041355
-total 320
-drwx------   2 root root   4096 Jan 28 04:13 .
-drwx------ 315 root root  90112 Jan 28 04:19 ..
--rw-------   1 root root  57256 Jan 28 04:13 nginx_extract.txt
--rw-------   1 root root   3894 Jan 28 04:13 ports.txt
--rw-------   1 root root   6195 Jan 28 04:13 services.json
--rw-------   1 root root 141992 Jan 28 04:14 suspect_files.txt
-
-Try show hits file (auto-detect):
-hits_file=
-
-[04:19:16] DONE: /root/MAP_ENGINES_20260128_041915/report.txt
-root@srv1195584:~# cat >/root/MEGA_WOLVERINE_FLYSCAN_READONLY.sh <<'BASH'
+cat >/root/MEGA_WOLVERINE_UI_PUBLISH_DIST_TO_WWW.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 umask 022
 
 say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 hr(){ echo "----------------------------------------------------------------"; }
+die(){ say "ERROR: $*"; exit 1; }
 
-say "MEGA_WOLVERINE_FLYSCAN_READONLY (no secrets, no writes)"
+# What this does (one-shot):
+# - Backup current /var/www/wolverine
+# - Publish (rsync) the real built UI from: /opt/fireinners/frontend-react/app/dist/wolverine
+#   to the live webroot: /var/www/wolverine
+# - Test nginx config and reload nginx
+# - Run health checks through nginx routes
+
+SRC="/opt/fireinners/frontend-react/app/dist/wolverine"
+DST="/var/www/wolverine"
+VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
+TS="$(date +%Y%m%d_%H%M%S)"
+BK="/root/BK_WOLVERINE_UI_${TS}"
+
+ASKLIB="/opt/fireinners/sentinel/lib/askorupdate.sh"
+if [ -f "$ASKLIB" ]; then
+  # shellcheck disable=SC1090
+  . "$ASKLIB"
+fi
+
+say "MEGA_WOLVERINE_UI_PUBLISH_DIST_TO_WWW (backup -> publish -> nginx reload -> checks)"
 
 hr
-say "1) Host + OS + Node"
-uname -a || true
-lsb_release -a 2>/dev/null || true
-command -v node >/dev/null 2>&1 && node -v || echo "node: not found"
-command -v npm >/dev/null 2>&1 && npm -v || echo "npm: not found"
+say "0) Preconditions"
+[ -d "$SRC" ] || die "Missing source dist folder: $SRC"
+[ -d "$DST" ] || die "Missing destination webroot: $DST"
+[ -f "$VHOST" ] || die "Missing nginx vhost: $VHOST"
+command -v rsync >/dev/null 2>&1 || die "rsync not found"
+command -v nginx >/dev/null 2>&1 || die "nginx not found"
 
 hr
-say "2) Key paths existence"
-paths=(
-  "/opt/wolverine"
-  "/opt/WOLVERINE1_export"
-  "/var/www/wolverine"
-  "/var/www/wolverine/index.html"
-  "/opt/fireinners/frontend-react/app/dist/wolverine"
-  "/etc/nginx/sites-available/fireinners.online-ssl"
-)
-for p in "${paths[@]}"; do
-  if [ -e "$p" ]; then
-    say "OK  $p"
-  else
-    say "MISS $p"
-  fi
+say "1) Snapshot backup"
+mkdir -p "$BK"
+# Backup current live webroot (fast + readable)
+if command -v tar >/dev/null 2>&1; then
+  say "Creating tar backup: $BK/wolverine_www.tar.gz"
+  tar -C "$DST" -czf "$BK/wolverine_www.tar.gz" . || die "tar backup failed"
+else
+  say "tar not available, doing cp -a backup"
+  cp -a "$DST" "$BK/wolverine_www_copy" || die "cp backup failed"
+fi
+
+hr
+say "2) Publish dist -> /var/www/wolverine (rsync --delete)"
+say "SRC=$SRC"
+say "DST=$DST"
+rsync -a --delete --info=NAME,STATS2 "$SRC"/ "$DST"/
+
+hr
+say "3) Permissions sanity"
+chown -R root:root "$DST" >/dev/null 2>&1 || true
+find "$DST" -type d -exec chmod 0755 {} \; >/dev/null 2>&1 || true
+find "$DST" -type f -exec chmod 0644 {} \; >/dev/null 2>&1 || true
+
+hr
+say "4) Nginx config test + reload"
+nginx -t
+systemctl reload nginx
+
+hr
+say "5) Quick content check: /var/www/wolverine/index.html (first 40 lines)"
+sed -n '1,40p' "$DST/index.html" || true
+
+hr
+say "6) Health checks via nginx routes (localhost HTTPS with Host header)"
+# Use -k because cert may be valid; but localhost SNI sometimes differs. Host header forces vhost routing.
+# If your cert/SNI is strict, these still usually work with -k.
+for path in \
+  "/wolverine/" \
+  "/wolverine/traderone/api/health" \
+  "/wolverine/traderone/vault/health" \
+  "/wolverine/vault-api/health"
+do
+  say "GET https://127.0.0.1${path} (Host: fireinners.online)"
+  code="$(curl -k -sS -o /tmp/wolv_resp.txt -w "%{http_code}" -H "Host: fireinners.online" "https://127.0.0.1${path}" || true)"
+  say "HTTP $code"
+  head -n 5 /tmp/wolv_resp.txt | sed 's/\r$//' || true
+  hr
 done
 
 hr
-say "3) Live wolverine index candidates (first 5 found)"
-find /var/www /opt -maxdepth 5 -type f -name "index.html" 2>/dev/null | grep -i "wolverine" | head -n 5 || true
+say "7) Grep for frontend expected libs (solana web3 / walletconnect / lifi keywords) in live index"
+grep -iE 'solana|web3|walletconnect|lifi|phantom' -n "$DST/index.html" | head -n 60 || true
 
 hr
-say "4) Nginx: /wolverine routes (fireinners.online-ssl)"
-VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
-if [ -f "$VHOST" ]; then
-  grep -nE 'wolverine|traderone|proxy_pass|location\s+/wolverine|location\s+=\s+/wolverine' "$VHOST" || true
-else
-  say "VHOST not found: $VHOST"
-fi
+say "DONE. Backup at: $BK"
+BASH
 
-bash /root/MEGA_WOLVERINE_FLYSCAN_READONLY.shY.sh>/dev/null | grep -iE 'wolverine|traderone|backend|auth-phantom' | head -n 30 || true
-[04:26:28] MEGA_WOLVERINE_FLYSCAN_READONLY (no secrets, no writes)
-----------------------------------------------------------------
-[04:26:28] 1) Host + OS + Node
-Linux srv1195584 6.8.0-90-generic #91-Ubuntu SMP PREEMPT_DYNAMIC Tue Nov 18 14:14:30 UTC 2025 x86_64 x86_64 x86_64 GNU/Linux
-Distributor ID: Ubuntu
-Description:    Ubuntu 24.04.3 LTS
-Release:        24.04
-Codename:       noble
-v20.11.1
-10.2.4
-----------------------------------------------------------------
-[04:26:29] 2) Key paths existence
-[04:26:29] OK  /opt/wolverine
-[04:26:29] OK  /opt/WOLVERINE1_export
-[04:26:29] OK  /var/www/wolverine
-[04:26:29] OK  /var/www/wolverine/index.html
-[04:26:29] OK  /opt/fireinners/frontend-react/app/dist/wolverine
-[04:26:29] OK  /etc/nginx/sites-available/fireinners.online-ssl
-----------------------------------------------------------------
-[04:26:29] 3) Live wolverine index candidates (first 5 found)
-/var/www/wolverine_backup_1767859436/index.html
-/var/www/wolverine_fireinners_backup_1767858427/wallet/index.html
-/var/www/wolverine_fireinners_backup_1767858427/index.html
-/var/www/_BACKUP_WOLVERINE_UI_V4_20260108_103604/index.html
-/var/www/wolverine/index.html
-----------------------------------------------------------------
-[04:26:29] 4) Nginx: /wolverine routes (fireinners.online-ssl)
-7:# DISABLED_BY_WOLV_DEDUP   include /etc/nginx/snippets/wolverine_routes.conf;
-8:# DISABLED_BY_WOLV_DEDUP   include /etc/nginx/includes/wolverine_routes.inc;
-15:    include /etc/nginx/includes/wolverine_static.inc;
-17:  include /etc/nginx/includes/wolverine_routes.inc;
-----------------------------------------------------------------
-[04:26:29] 5) Nginx test (no reload)
-nginx: the configuration file /etc/nginx/nginx.conf syntax is ok
-nginx: configuration file /etc/nginx/nginx.conf test is successful
-----------------------------------------------------------------
-[04:26:29] 6) Listening ports (node/nginx)
-State  Recv-Q Send-Q Local Address:Port  Peer Address:PortProcess                                                                                
-LISTEN 0      511        127.0.0.1:9688       0.0.0.0:*    users:(("node",pid=3640494,fd=18))                                                    
-LISTEN 0      511        127.0.0.1:9697       0.0.0.0:*    users:(("node",pid=2340238,fd=21))                                                    
-LISTEN 0      511        127.0.0.1:9696       0.0.0.0:*    users:(("node",pid=1849662,fd=18))                                                    
-LISTEN 0      128          0.0.0.0:2222       0.0.0.0:*    users:(("sshd",pid=854017,fd=3))                                                      
-LISTEN 0      511        127.0.0.1:9797       0.0.0.0:*    users:(("node",pid=3956630,fd=18))                                                    
-LISTEN 0      511        127.0.0.1:12703      0.0.0.0:*    users:(("node",pid=1849654,fd=18))                                                    
-LISTEN 0      511        127.0.0.1:12713      0.0.0.0:*    users:(("node",pid=3174091,fd=18))                                                    
-LISTEN 0      511        127.0.0.1:12714      0.0.0.0:*    users:(("node",pid=2895762,fd=18))                                                    
-LISTEN 0      511        127.0.0.1:8484       0.0.0.0:*    users:(("node",pid=1848434,fd=18))                                                    
-LISTEN 0      4096       127.0.0.1:9050       0.0.0.0:*    users:(("tor",pid=230833,fd=6))                                                       
-LISTEN 0      511        127.0.0.1:13010      0.0.0.0:*    users:(("node",pid=2848286,fd=18))                                                    
-LISTEN 0      511        127.0.0.1:8787       0.0.0.0:*    users:(("node",pid=3542088,fd=18))                                                    
-LISTEN 0      511          0.0.0.0:80         0.0.0.0:*    users:(("nginx",pid=3661957,fd=5),("nginx",pid=955073,fd=5),("nginx",pid=955072,fd=5))
-LISTEN 0      511          0.0.0.0:443        0.0.0.0:*    users:(("nginx",pid=3661957,fd=6),("nginx",pid=955073,fd=6),("nginx",pid=955072,fd=6))
-LISTEN 0      4096       127.0.0.1:65529      0.0.0.0:*    users:(("monarx-agent",pid=1304082,fd=9))                                             
-LISTEN 0      4096         0.0.0.0:631        0.0.0.0:*    users:(("cupsd",pid=951701,fd=9))                                                     
-LISTEN 0      5         10.66.66.1:9696       0.0.0.0:*    users:(("python3",pid=524664,fd=3))                                                   
-LISTEN 0      511        127.0.0.1:6379       0.0.0.0:*    users:(("redis-server",pid=2106232,fd=6))                                             
-LISTEN 0      511        127.0.0.1:3000       0.0.0.0:*    users:(("node",pid=2229195,fd=18))                                                    
-LISTEN 0      511        127.0.0.1:3005       0.0.0.0:*    users:(("node",pid=1849661,fd=18))                                                    
-LISTEN 0      128             [::]:2222          [::]:*    users:(("sshd",pid=854017,fd=4))                                                      
-LISTEN 0      4096            [::]:631           [::]:*    users:(("cupsd",pid=951701,fd=10))                                                    
-----------------------------------------------------------------
-[04:26:29] 7) Systemd services possibly relevant
-  amcq.service                                   loaded activating auto-restart AMCQ API (loopback only)
-  fireinners-auth-phantom.service                loaded active     running      Fireinners Phantom Auth Service
-● fireinners-consensus.service                   loaded failed     failed       FIREINNERS Consensus Backend
-● fireinners-frontend.service                    loaded failed     failed       Fireinners Frontend
-  fireinners-solrpc-proxy.service                loaded active     running      FireInners Solana JSON-RPC proxy (CORS-safe, failover)
-  fireinners.service                             loaded activating auto-restart Fireinners Engine
-  kmod-static-nodes.service                      loaded active     exited       Create List of Static Device Nodes
-  probe.service                                  loaded active     running      Probe (local) for fireinners.online
-  systemd-tmpfiles-setup-dev-early.service       loaded active     exited       Create Static Device Nodes in /dev gracefully
-  systemd-tmpfiles-setup-dev.service             loaded active     exited       Create Static Device Nodes in /dev
-● traderone-api.service                          loaded failed     failed       TraderOne API (wrapper stable)
-  traderone-vault-api.service                    loaded active     running      TraderOne Vault API (Wolverine)
-  traderone.service                              loaded active     running      TraderOne Backend
-● vault-api.service                              loaded failed     failed       Wolverine Vault API
-● wolverine-api.service                          loaded failed     failed       Wolverine API
-  wolverine-solrpc-proxy.service                 loaded active     running      Wolverine Solana RPC Proxy (CORS-safe)
-● wolverine-solrpc.service                       loaded failed     failed       Wolverine Solana RPC Proxy (AQUILA)
-  wolverine-vault-api.service                    loaded active     running      Wolverine Vault API (create vault keypairs)
-  wolverine-vault.service                        loaded active     running      Wolverine Vault API (AQUILA)
-----------------------------------------------------------------
-[04:26:29] 8) PM2 (if installed)
-┌────┬───────────┬─────────────┬─────────┬─────────┬──────────┬────────┬──────┬───────────┬──────────┬──────────┬──────────┬──────────┐
-│ id │ name      │ namespace   │ version │ mode    │ pid      │ uptime │ ↺    │ status    │ cpu      │ mem      │ user     │ watching │
-└────┴───────────┴─────────────┴─────────┴─────────┴──────────┴────────┴──────┴───────────┴──────────┴──────────┴──────────┴──────────┘
-----------------------------------------------------------------
-[04:26:29] 9) Vendor libs expected by frontend: /wolverine/vendor/*
-[04:26:29] Listing /var/www/wolverine/vendor (if exists)
-[04:26:29] Listing dist/wolverine/vendor (if exists)
-----------------------------------------------------------------
-[04:26:29] 10) Quick grep in live index for vendor paths + solana web3 + lifi
-[04:26:29] File: /var/www/wolverine/index.html
-1:<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WOLVERINE OK</title><style>body{font-family:system-ui,Segoe UI,Roboto,Arial;margin:0;background:#0b0f14;color:#e6eef8}main{padding:24px}a{color:#7ab7ff}</style></head><body><main><h1>WOLVERINE OK</h1><p>Si tu vois cette page, <b>/wolverine/</b> sert bien le webroot.</p><p><a href="/wolverine/traderone/api/health">/wolverine/traderone/api/health</a> • <a href="/wolverine/traderone/vault/health">/wolverine/traderone/vault/health</a> • <a href="/wolverine/vault-api/health">/wolverine/vault-api/health</a></p></main></body></html>
-----------------------------------------------------------------
-[04:26:29] File: /opt/fireinners/frontend-react/app/dist/wolverine/index.html
-18:<script src="https://unpkg.com/@solana/web3.js@latest/lib/index.iife.min.js"></script>
-27:document.querySelector("#start").onclick=async()=>{await post("/api/start");log("started")};
-28:document.querySelector("#stop").onclick=async()=>{await post("/api/stop");log("stopped")};
-29:document.querySelector("#cash").onclick=async()=>{const r=await post("/api/cashout",{userPub:pub});log(JSON.stringify(r))};
-----------------------------------------------------------------
-----------------------------------------------------------------
-[04:26:29] 11) Backend candidates: server.js files
-/opt/wolverine-balance/server.js
-/opt/WOLVERINE1_export/solrpc-proxy/server.js
-/opt/WOLVERINE1_export/auth-phantom/server.js
-/opt/WOLVERINE1_export/backend-traderone/server.js
-/opt/wolverine-balances/server.js
-/opt/wolverine/server.js
-/opt/wolverine/api/server.js
-/opt/wolverine/solana-proxy/server.js
-/opt/wolverine/TRADERONE/server.js
-/opt/traderone/server.js
-/opt/traderone/api/server.js
-/opt/traderone-vault/server.js
-/opt/_wolverine_next_src/node_modules/next/server.js
-/opt/_wolverine_next_src/node_modules/react-dom/server.js
-/opt/fireinners/wolverine-vault-api/server.js
-/opt/fireinners/WOLVERINE/TRADERONE/server.js
-/opt/fireinners/wolverine-api/server.js
-/opt/fireinners/solrpc-proxy-wolverine/server.js
-/opt/fireinners/vault-api-wolverine/server.js
-/opt/fireinners/WOLVERINE_REPO/TRADERONE/server.js
-/opt/traderone-dashboard.BACKUP_20251227_083130/server.js
-/opt/traderone-opt/server.js
-/opt/traderone-opt/backend/server.js
-/opt/traderone-dashboard.BACKUP_20251227_083307/server.js
-/opt/wolverine-api/server.js
-/opt/traderone-vault-api/server.js
-/opt/wolverine-services/solana-rpc-proxy/server.js
-/opt/wolverine-services/vault-api/server.js
-/opt/traderone-dashboard/server.js
-/opt/fireinners-auth-phantom/server.js
-----------------------------------------------------------------
-[04:26:29] DONE (read-on
+bash /root/MEGA_WOLVERINE_UI_PUBLISH_DIST_TO_WWW.sh
