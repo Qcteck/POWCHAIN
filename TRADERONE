@@ -1,1 +1,159 @@
-tail -n 30 /root/TON_BATCH.log
+bash -lc 'cat >/root/MEGA_AQUILATRADER_FIX_100.sh <<'"'"'BASH'"'"'
+#!/usr/bin/env bash
+set -euo pipefail
+umask 022
+
+cat >/root/TON_BATCH.sh <<'"'"'EOS'"'"'
+#!/usr/bin/env bash
+set -euo pipefail
+umask 022
+
+DOMAIN="fireinners.online"
+VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
+INC_DIR="/etc/nginx/includes"
+AQUILA_INC="$INC_DIR/aquilatrader_static.inc"
+WWW="/var/www/aquilatrader"
+INDEX="$WWW/index.html"
+
+TS="$(date +%Y%m%d_%H%M%S)"
+BK="/root/BK_AQUILATRADER_${TS}"
+
+say(){ printf "[%s] %s\n" "$(date +%H:%M:%S)" "$*"; }
+die(){ say "ERROR: $*"; exit 1; }
+
+say "== AQUILATRADER FIX (force route) =="
+say "Goal: https://${DOMAIN}/aquilatrader/ -> ${INDEX}"
+say "Backup: ${BK}"
+mkdir -p "$BK"
+
+command -v nginx >/dev/null 2>&1 || die "nginx not found"
+[ -f "$VHOST" ] || die "missing vhost: $VHOST"
+
+# unlock immutable if present
+chattr -i /etc/nginx/nginx.conf 2>/dev/null || true
+chattr -i "$VHOST" 2>/dev/null || true
+chattr -i "$INC_DIR" 2>/dev/null || true
+[ -f "$AQUILA_INC" ] && chattr -i "$AQUILA_INC" 2>/dev/null || true
+
+# backups
+cp -a /etc/nginx/nginx.conf "$BK/nginx.conf.bak" 2>/dev/null || true
+cp -a "$VHOST" "$BK/$(basename "$VHOST").bak" 2>/dev/null || true
+cp -a "$INC_DIR" "$BK/includes.bak" 2>/dev/null || true
+
+say "1) Ensure webroot + index"
+mkdir -p "$WWW"
+cat >"$INDEX" <<'"'"'HTML'"'"'
+<!doctype html><html lang="fr"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>AquilaTrader</title><style>body{margin:0;background:#0b0f14;color:#e7eef8;font-family:system-ui,Segoe UI,Roboto,Arial}main{max-width:900px;margin:40px auto;padding:24px}h1{margin:0 0 12px;font-size:28px}a{color:#7ab7ff}code{background:#111a24;padding:2px 6px;border-radius:6px}</style></head><body><main><h1>AquilaTrader</h1><p>OK. Route <code>/aquilatrader/</code> servie par nginx.</p><p><a href="/wolverine/">Wolverine</a></p></main></body></html>
+HTML
+
+say "2) Write dedicated include: $AQUILA_INC"
+mkdir -p "$INC_DIR"
+cat >"$AQUILA_INC" <<'"'"'NGX'"'"'
+# BEGIN AQUILATRADER (managed)
+location ^~ /aquilatrader/ {
+  alias /var/www/aquilatrader/;
+  try_files $uri $uri/ /aquilatrader/index.html;
+  add_header Cache-Control "no-store" always;
+}
+# END AQUILATRADER (managed)
+NGX
+
+say "3) Purge any other /aquilatrader location blocks (dedupe)"
+python3 - <<'"'"'PY'"'"'
+import os,re,glob
+targets=set()
+targets.add("/etc/nginx/sites-available/fireinners.online-ssl")
+targets |= set(glob.glob("/etc/nginx/includes/*.inc"))
+targets |= set(glob.glob("/etc/nginx/snippets/*.conf")) | set(glob.glob("/etc/nginx/snippets/*.inc"))
+targets = [t for t in targets if os.path.isfile(t)]
+
+pat_start=re.compile(r'^\s*location\s+(\^~\s+)?/aquilatrader/?\s*\{')
+def clean(path):
+    s=open(path,'r',encoding='utf-8',errors='ignore').read().splitlines()
+    out=[]
+    skip=False
+    depth=0
+    removed=False
+    for ln in s:
+        if not skip and pat_start.search(ln):
+            skip=True
+            depth = ln.count("{")-ln.count("}")
+            removed=True
+            continue
+        if skip:
+            depth += ln.count("{")-ln.count("}")
+            if depth<=0:
+                skip=False
+            continue
+        out.append(ln)
+    if removed:
+        open(path,'w',encoding='utf-8').write("\n".join(out).rstrip()+"\n")
+        print("cleaned:",path)
+
+for t in targets:
+    if t == "/etc/nginx/includes/aquilatrader_static.inc":
+        continue
+    clean(t)
+PY
+
+say "4) Ensure vhost includes aquilatrader_static.inc exactly once"
+python3 - <<'"'"'PY'"'"'
+import re
+vhost="/etc/nginx/sites-available/fireinners.online-ssl"
+inc="/etc/nginx/includes/aquilatrader_static.inc"
+s=open(vhost,'r',encoding='utf-8',errors='ignore').read().splitlines()
+
+# remove any existing include lines for this include
+s=[ln for ln in s if not re.search(r'include\s+.+/aquilatrader_static\.inc\s*;', ln)]
+
+out=[]
+in_server=False
+depth=0
+inserted=False
+
+for ln in s:
+    out.append(ln)
+    if (not in_server) and re.match(r'^\s*server\s*\{', ln):
+        in_server=True
+        depth=1
+        continue
+    if in_server:
+        depth += ln.count("{")-ln.count("}")
+        # insert after the first include line inside server (clean and stable)
+        if (not inserted) and re.match(r'^\s*include\s+', ln):
+            out.append(f"    include {inc};")
+            inserted=True
+        if depth<=0:
+            if not inserted:
+                out.insert(len(out)-1, f"    include {inc};")
+                inserted=True
+            in_server=False
+
+open(vhost,'w',encoding='utf-8').write("\n".join(out).rstrip()+"\n")
+print("vhost patched:",vhost,"inserted=",inserted)
+PY
+
+say "5) nginx -t then reload"
+nginx -t
+systemctl reload nginx
+
+say "6) Quick checks (Host header + status code)"
+curl -sk -o /dev/null -w "HTTP:%{http_code}\n" "https://127.0.0.1/aquilatrader/" -H "Host: ${DOMAIN}" || true
+curl -sk "https://127.0.0.1/aquilatrader/" -H "Host: ${DOMAIN}" | head -n 12 || true
+
+# relock immutable (your practice)
+chattr +i /etc/nginx/nginx.conf 2>/dev/null || true
+chattr +i "$VHOST" 2>/dev/null || true
+
+say "DONE. Open: https://${DOMAIN}/aquilatrader/"
+say "Backup: ${BK}"
+EOS
+
+chmod +x /root/TON_BATCH.sh
+bash /root/TON_BATCH.sh |& tee /root/TON_BATCH.log
+
+echo "---- LAST 40 LINES OF LOG ----"
+tail -n 40 /root/TON_BATCH.log || true
+BASH
+chmod +x /root/MEGA_AQUILATRADER_FIX_100.sh
+bash /root/MEGA_AQUILATRADER_FIX_100.sh |& tee /root/MEGA_AQUILATRADER_FIX_100.log'
