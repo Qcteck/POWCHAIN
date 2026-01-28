@@ -1,222 +1,48 @@
-cat >/root/MEGA_DIAG_CRYPTO_ENGINES_VPS.sh <<'BASH'
+cat >/root/MEGA_SHOW_LAST_DIAG_CRYPTO_ENGINES.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 umask 077
-export DEBIAN_FRONTEND=noninteractive
-
-TS="$(date +%Y%m%d_%H%M%S)"
-OUT_DIR="/root/DIAG_CRYPTO_ENGINES_${TS}"
-REPORT="${OUT_DIR}/report.txt"
-JSON="${OUT_DIR}/services.json"
-PORTS="${OUT_DIR}/ports.txt"
-NGX="${OUT_DIR}/nginx_extract.txt"
-FILES="${OUT_DIR}/suspect_files.txt"
-CODEHITS="${OUT_DIR}/code_hits.txt"
 
 say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 die(){ say "ERROR: $*"; exit 1; }
 
-need_root(){ [[ "$(id -u)" == "0" ]] || die "Run as root."; }
+[[ "$(id -u)" == "0" ]] || die "Run as root."
 
-cmd_exists(){ command -v "$1" >/dev/null 2>&1; }
+BASE="/root"
+LAST="$(ls -1dt ${BASE}/DIAG_CRYPTO_ENGINES_* 2>/dev/null | head -n 1 || true)"
+[[ -n "$LAST" ]] || die "Aucun dossier DIAG_CRYPTO_ENGINES_* trouvé dans /root."
 
-safe_stat_line(){
-  local f="$1"
-  # Do NOT print file contents. Only metadata + sha256.
-  local perm owner group size mtime
-  perm="$(stat -c '%a' "$f" 2>/dev/null || echo '?')"
-  owner="$(stat -c '%U' "$f" 2>/dev/null || echo '?')"
-  group="$(stat -c '%G' "$f" 2>/dev/null || echo '?')"
-  size="$(stat -c '%s' "$f" 2>/dev/null || echo '?')"
-  mtime="$(stat -c '%y' "$f" 2>/dev/null | cut -d. -f1 || echo '?')"
-  local sha="(sha256 n/a)"
-  if cmd_exists sha256sum; then
-    sha="$(sha256sum "$f" 2>/dev/null | awk '{print $1}' || true)"
-    [[ -n "$sha" ]] || sha="(sha256 err)"
-  fi
-  printf '%s | perm=%s owner=%s:%s size=%s mtime=%s sha256=%s\n' "$f" "$perm" "$owner" "$group" "$size" "$mtime" "$sha"
-}
+REPORT="${LAST}/report.txt"
+SERV="${LAST}/services.json"
+PORTS="${LAST}/ports.txt"
+HITS="${LAST}/code_hits.txt"
 
-extract_nginx(){
-  local vhost="/etc/nginx/sites-available/fireinners.online-ssl"
-  {
-    echo "== nginx -T (filtered) =="
-    if cmd_exists nginx; then
-      nginx -t 2>&1 || true
-    else
-      echo "nginx not found"
-    fi
-    echo
-    echo "== vhost: ${vhost} (extract: includes + locations for /wolverine + proxy_pass) =="
-    if [[ -f "$vhost" ]]; then
-      nl -ba "$vhost" | egrep -n 'include |location /wolverine|/wolverine|proxy_pass|auth_basic|upstream|listen 443|server_name' || true
-    else
-      echo "missing vhost file"
-    fi
-    echo
-    echo "== /etc/nginx/includes (extract: wolverine/crypto/engine/swap/evm/lifi/jup) =="
-    if [[ -d /etc/nginx/includes ]]; then
-      find /etc/nginx/includes -maxdepth 1 -type f -print0 2>/dev/null \
-        | xargs -0 -I{} bash -lc 'f="{}"; bn="$(basename "$f")"; if echo "$bn" | egrep -qi "wolverine|crypto|engine|swap|evm|lifi|jup|bundler|orion|trader|amcq"; then echo "--- $f"; nl -ba "$f" | sed -n "1,220p"; echo; fi' || true
-    else
-      echo "missing includes dir"
-    fi
-  } >"$NGX"
-}
+say "LAST = $LAST"
+say "FILES:"
+ls -la "$LAST" | sed -n '1,200p'
 
-list_ports(){
-  {
-    echo "== ss -lntp =="
-    if cmd_exists ss; then
-      ss -lntp || true
-    else
-      echo "ss not found"
-    fi
-    echo
-    echo "== ss -lunp =="
-    if cmd_exists ss; then
-      ss -lunp || true
-    fi
-  } >"$PORTS"
-}
+echo
+say "===== report.txt (first 180 lines) ====="
+sed -n '1,180p' "$REPORT" || true
 
-list_services(){
-  {
-    echo "== systemctl services (filtered) =="
-    systemctl list-units --type=service --all --no-pager 2>/dev/null \
-      | egrep -i 'crypto|engine|trader|wolverine|amcq|orion|bundler|swap|lifi|evm|dex|jup|price|ws|node|pm2' || true
-    echo
-    echo "== systemd unit files (grep likely) =="
-    ls -la /etc/systemd/system 2>/dev/null | egrep -i 'crypto|engine|trader|wolverine|amcq|orion|bundler|swap|lifi|evm|dex|jup|price' || true
-    echo
-    echo "== pm2 (if present) =="
-    if cmd_exists pm2; then
-      pm2 list || true
-      echo
-      pm2 jlist 2>/dev/null || true
-    else
-      echo "pm2 not installed"
-    fi
-  } >"$JSON"
-}
+echo
+say "===== services.json (first 80 lines) ====="
+sed -n '1,80p' "$SERV" || true
 
-find_suspect_files(){
-  # Search for config/wallet/key/env files but do NOT output content.
-  # Paths limited to avoid scanning entire filesystem.
-  local roots=(/etc /opt /root /var/www)
-  {
-    echo "== suspect files (names only + metadata, no contents) =="
-    for r in "${roots[@]}"; do
-      [[ -d "$r" ]] || continue
-      echo "-- root: $r"
-      # likely secrets/configs
-      find "$r" -maxdepth 6 -type f \( \
-        -iname "*.env" -o -iname "*wallet*" -o -iname "*key*" -o -iname "*mnemonic*" -o -iname "*seed*" -o -iname "*secret*" \
-        -o -iname "*private*" -o -iname "*keystore*" -o -iname "*.json" -o -iname "*.yaml" -o -iname "*.yml" \
-      \) 2>/dev/null \
-      | egrep -i 'crypto|engine|trader|wolverine|amcq|orion|bundler|swap|evm|ethers|lifi|jup|solana|metamask|phantom|vault|key|seed|secret|keystore|mnemonic|private' \
-      | head -n 600 \
-      | while read -r f; do safe_stat_line "$f"; done
-      echo
-    done
-    echo "Note: list capped (head 600 per root) to keep report manageable."
-  } >"$FILES"
-}
+echo
+say "===== ports.txt (first 120 lines) ====="
+sed -n '1,120p' "$PORTS" || true
 
-scan_code_hits(){
-  # Look for known endpoints/libs in code without dumping secrets
-  local roots=(/opt /var/www /root)
-  {
-    echo "== code hits (grep) =="
-    for r in "${roots[@]}"; do
-      [[ -d "$r" ]] || continue
-      echo "-- root: $r"
-      if cmd_exists rg; then
-        rg -n --hidden --follow --no-ignore -S \
-          -g'!*node_modules/*' -g'!*.log' -g'!*.png' -g'!*.jpg' -g'!*.zip' -g'!*.gz' -g'!*.pdf' \
-          'quote-api\.jup\.ag|jup\.ag|dexscreener|ethers|viem|web3|0x\.org|1inch|lifi|walletconnect|metamask|privateKey|mnemonic|seed phrase|secretKey|solana/web3\.js' \
-          "$r" 2>/dev/null | head -n 500 || true
-      else
-        grep -RIn --exclude-dir=node_modules --exclude='*.log' --exclude='*.png' --exclude='*.jpg' --exclude='*.zip' --exclude='*.gz' --exclude='*.pdf' \
-          -E 'quote-api\.jup\.ag|jup\.ag|dexscreener|ethers|viem|web3|0x\.org|1inch|lifi|walletconnect|metamask|privateKey|mnemonic|seed phrase|secretKey|solana/web3\.js' \
-          "$r" 2>/dev/null | head -n 500 || true
-      fi
-      echo
-    done
-    echo "Note: output capped to 500 hits total per root."
-  } >"$CODEHITS"
-}
+echo
+say "===== code_hits.txt (first 180 lines) ====="
+sed -n '1,180p' "$HITS" || true
 
-write_report(){
-  {
-    echo "DIAG CRYPTO ENGINES"
-    echo "ts: $(date -Is)"
-    echo "host: $(hostname)"
-    echo "kernel: $(uname -a)"
-    echo "user: $(id)"
-    echo
-
-    echo "== versions =="
-    if cmd_exists node; then echo "node: $(node -v)"; else echo "node: missing"; fi
-    if cmd_exists npm; then echo "npm:  $(npm -v)"; else echo "npm:  missing"; fi
-    if cmd_exists python3; then echo "python3: $(python3 -V 2>&1)"; else echo "python3: missing"; fi
-    if cmd_exists nginx; then echo "nginx: $(nginx -v 2>&1)"; else echo "nginx: missing"; fi
-    echo
-
-    echo "== key paths =="
-    echo "out_dir: $OUT_DIR"
-    echo "services: $JSON"
-    echo "ports:    $PORTS"
-    echo "nginx:    $NGX"
-    echo "files:    $FILES"
-    echo "code:     $CODEHITS"
-    echo
-
-    echo "== quick summary (top listeners) =="
-    if cmd_exists ss; then ss -lntp 2>/dev/null | head -n 60 || true; fi
-    echo
-
-    echo "== NEXT STEP =="
-    echo "If you see an existing EVM engine, send me:"
-    echo "  - its service name (systemd) or pm2 app name"
-    echo "  - its listen port"
-    echo "  - its base dir (/opt/...)"
-    echo "and I will align configs/caps (MAX_TRADE_USDC=50), add safe encryption, and wire it to your crypto motor."
-  } >"$REPORT"
-}
-
-main(){
-  need_root
-  mkdir -p "$OUT_DIR"
-
-  say "Collecting services..."
-  list_services
-
-  say "Collecting ports..."
-  list_ports
-
-  say "Extracting nginx..."
-  extract_nginx
-
-  say "Finding suspect files (metadata only, no secrets)..."
-  find_suspect_files
-
-  say "Scanning code hits..."
-  scan_code_hits
-
-  say "Writing report..."
-  write_report
-
-  chmod 700 "$OUT_DIR"
-  chmod 600 "$OUT_DIR"/* 2>/dev/null || true
-
-  say "DONE"
-  say "Report: $REPORT"
-  echo
-  sed -n '1,140p' "$REPORT" || true
-}
-
-main "$@"
+echo
+say "DONE. If you want full files:"
+echo "  $REPORT"
+echo "  $SERV"
+echo "  $PORTS"
+echo "  $HITS"
 BASH
 
-bash /root/MEGA_DIAG_CRYPTO_ENGINES_VPS.sh
+bash /root/MEGA_SHOW_LAST_DIAG_CRYPTO_ENGINES.sh
