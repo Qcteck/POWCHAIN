@@ -1,239 +1,312 @@
-cat >/root/MEGA_AQUILATRADER_FIX_V3.sh <<'BASH'
+cat >/root/MEGA_AQUILATRADER_FIX_INSTALL_V3.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 umask 022
 
-DOMAIN="fireinners.online"
-VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
-INC_WOLV="/etc/nginx/includes/wolverine_static.inc"
-INC_AQ="/etc/nginx/includes/aquilatrader_routes.inc"
+say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
+hr(){ echo "----------------------------------------------------------------"; }
+die(){ say "ERROR: $*"; exit 1; }
 
+DOMAIN="fireinners.online"
 WWW="/var/www/aquilatrader"
 INDEX="$WWW/index.html"
 
+NGX_ETC="/etc/nginx"
+NGX_SA="$NGX_ETC/sites-available"
+NGX_SE="$NGX_ETC/sites-enabled"
+NGX_INC_DIR="$NGX_ETC/includes"
+NGX_SNP_DIR="$NGX_ETC/snippets"
+
+# On va créer un include dédié et stable (évite les collisions dans wolverine_static.inc)
+AQUILA_INC="$NGX_INC_DIR/aquilatrader_static.inc"
+
 TS="$(date +%Y%m%d_%H%M%S)"
-BK="/root/BK_AQUILATRADER_FIX_V3_${TS}"
-LOG="/root/MEGA_AQUILATRADER_FIX_V3.log"
-
-say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
-die(){ say "ERROR: $*"; exit 1; }
-hr(){ echo "----------------------------------------------------------------"; }
-
-need(){ command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"; }
-need nginx; need python3; need curl; need awk; need sed; need grep; need stat || true
-
-is_immutable(){
-  local f="$1"
-  command -v lsattr >/dev/null 2>&1 || return 1
-  lsattr -d "$f" 2>/dev/null | awk '{print $1}' | grep -q 'i' && return 0 || return 1
-}
-
-unlock(){
-  local f="$1"
-  if [ -e "$f" ] && is_immutable "$f"; then
-    say "chattr -i $f"
-    chattr -i "$f" 2>/dev/null || true
-    echo "$f" >>"$BK/IMMUTABLE_WAS_ON.txt"
-  fi
-}
-
-relock(){
-  local f="$1"
-  if [ -f "$BK/IMMUTABLE_WAS_ON.txt" ] && grep -Fxq "$f" "$BK/IMMUTABLE_WAS_ON.txt"; then
-    say "chattr +i $f"
-    chattr +i "$f" 2>/dev/null || true
-  fi
-}
-
-rollback(){
-  say "ROLLBACK: restoring backups from $BK"
-  [ -f "$BK/$(basename "$VHOST").bak" ] && cp -a "$BK/$(basename "$VHOST").bak" "$VHOST" || true
-  [ -f "$BK/$(basename "$INC_WOLV").bak" ] && cp -a "$BK/$(basename "$INC_WOLV").bak" "$INC_WOLV" || true
-  [ -f "$BK/$(basename "$INC_AQ").bak" ] && cp -a "$BK/$(basename "$INC_AQ").bak" "$INC_AQ" || true
-  nginx -t || true
-  systemctl reload nginx || true
-}
-
-say "MEGA_AQUILATRADER_FIX_V3"
-say "Goal: https://${DOMAIN}/aquilatrader/ serves ${INDEX} (no duplicates, no manual edits)"
-say "Log:  ${LOG}"
-say "BK:   ${BK}"
-hr
-
+BK="/root/BK_AQUILATRADER_INSTALL_${TS}"
+LOG="/root/MEGA_AQUILATRADER_FIX_INSTALL_V3.log"
 mkdir -p "$BK"
 
-# 0) Preconditions
-[ -f "$VHOST" ] || die "Missing vhost: $VHOST"
-[ -f "$INC_WOLV" ] || die "Missing include: $INC_WOLV"
-
-# 1) Backups
-say "0) Backup nginx files"
-cp -a "$VHOST" "$BK/$(basename "$VHOST").bak" || true
-cp -a "$INC_WOLV" "$BK/$(basename "$INC_WOLV").bak" || true
-[ -f "$INC_AQ" ] && cp -a "$INC_AQ" "$BK/$(basename "$INC_AQ").bak" || true
-nginx -t >/dev/null 2>&1 || true
+say "MEGA_AQUILATRADER_FIX_INSTALL_V3"
+say "Goal: https://$DOMAIN/aquilatrader/ serves $INDEX"
+say "Backup: $BK"
 hr
 
-# 2) Ensure webroot + index
-say "1) Ensure ${WWW} + index.html"
+# -------------------------------------------------------------------
+say "0) Preconditions"
+command -v nginx >/dev/null 2>&1 || die "nginx not found"
+[ -d "$NGX_SA" ] || die "missing $NGX_SA"
+[ -d "$NGX_SE" ] || die "missing $NGX_SE"
+mkdir -p "$NGX_INC_DIR"
+
+# Snapshot (read-only copies)
+cp -a "$NGX_ETC/nginx.conf" "$BK/nginx.conf.bak" 2>/dev/null || true
+cp -a "$NGX_SA" "$BK/sites-available.bak" 2>/dev/null || true
+cp -a "$NGX_INC_DIR" "$BK/includes.bak" 2>/dev/null || true
+cp -a "$NGX_SNP_DIR" "$BK/snippets.bak" 2>/dev/null || true
+hr
+
+# -------------------------------------------------------------------
+say "1) Ensure AquilaTrader webroot + index"
 mkdir -p "$WWW"
 if [ ! -f "$INDEX" ]; then
   cat >"$INDEX" <<'HTML'
-<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>AquilaTrader</title><style>body{font-family:system-ui,Segoe UI,Roboto,Arial;margin:0;background:#0b1020;color:#eef}main{max-width:900px;margin:28px auto;padding:18px}a{color:#7ab7ff}</style></head><body><main><h1>AquilaTrader</h1><p>OK — route <b>/aquilatrader/</b> est servie.</p><p><a href="/wolverine/">Wolverine</a> • <a href="/wolverine/traderone/api/health">TraderOne API</a> • <a href="/wolverine/traderone/vault/health">Vault</a></p></main></body></html>
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>AquilaTrader</title>
+  <style>
+    body{margin:0;background:#0b1020;color:#e7eefc;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial}
+    .wrap{max-width:980px;margin:28px auto;padding:18px}
+    h1{margin:0 0 12px 0;font-size:44px;letter-spacing:.2px}
+    .card{background:#0f1630;border:1px solid rgba(255,255,255,.08);border-radius:14px;padding:16px;margin-top:14px}
+    .row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+    input{flex:1;min-width:240px;border-radius:12px;border:1px solid rgba(255,255,255,.14);background:#0b0f14;color:#e7eefc;padding:14px 14px;font-size:18px}
+    button{border:0;border-radius:14px;padding:12px 18px;font-size:18px;cursor:pointer;background:#e7eefc;color:#0b1020}
+    button.secondary{background:rgba(231,238,252,.1);color:#e7eefc;border:1px solid rgba(231,238,252,.22)}
+    .muted{opacity:.78}
+    pre{background:#0b0f14;border:1px solid rgba(255,255,255,.08);padding:12px;border-radius:12px;overflow:auto}
+    a{color:#7ab7ff}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>AquilaTrader</h1>
+    <div class="muted">UI minimale (Start / Stop / Cash-out)</div>
+
+    <div class="card">
+      <div class="row" style="margin-bottom:10px">
+        <div style="min-width:120px" class="muted">Wallet:</div>
+        <div id="wallet" style="font-weight:600">-</div>
+      </div>
+      <div class="row">
+        <input id="amount" inputmode="decimal" placeholder="Montant / paramètre (ex: 1)" value="1" />
+      </div>
+      <div class="row" style="margin-top:12px">
+        <button id="start">Start</button>
+        <button id="stop" class="secondary">Stop</button>
+        <button id="cash" class="secondary">Cash-out</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="muted" style="margin-bottom:10px">Health endpoints</div>
+      <div class="row">
+        <a href="/wolverine/traderone/api/health">/wolverine/traderone/api/health</a>
+        <span class="muted">•</span>
+        <a href="/wolverine/traderone/vault/health">/wolverine/traderone/vault/health</a>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="muted" style="margin-bottom:10px">Log</div>
+      <pre id="log"></pre>
+    </div>
+  </div>
+
+<script>
+const logEl = document.getElementById('log');
+const log = (...a)=>{ logEl.textContent += a.join(' ') + "\n"; logEl.scrollTop = logEl.scrollHeight; };
+
+async function post(url, obj){
+  const r = await fetch(url, {
+    method:'POST',
+    headers:{'content-type':'application/json'},
+    body: JSON.stringify(obj || {})
+  });
+  const t = await r.text();
+  let j = null;
+  try{ j = JSON.parse(t); }catch(e){}
+  if(!r.ok) throw new Error(r.status + " " + (j?JSON.stringify(j):t));
+  return j ?? t;
+}
+
+// NOTE: endpoints à adapter si tu veux brancher direct sur tes routes existantes.
+// Ici on conserve l’UI minimale; le but du batch = rendre /aquilatrader/ SERVI et stable.
+document.getElementById('start').onclick = async ()=>{
+  try{ log("POST /wolverine/traderone/api/start"); const r=await post("/wolverine/traderone/api/start",{amount:document.getElementById('amount').value}); log("OK", JSON.stringify(r)); }
+  catch(e){ log("ERR", e.message); }
+};
+document.getElementById('stop').onclick = async ()=>{
+  try{ log("POST /wolverine/traderone/api/stop"); const r=await post("/wolverine/traderone/api/stop",{}); log("OK", JSON.stringify(r)); }
+  catch(e){ log("ERR", e.message); }
+};
+document.getElementById('cash').onclick = async ()=>{
+  try{ log("POST /wolverine/traderone/api/cashout"); const r=await post("/wolverine/traderone/api/cashout",{}); log("OK", JSON.stringify(r)); }
+  catch(e){ log("ERR", e.message); }
+};
+
+log("AquilaTrader loaded.");
+</script>
+</body>
+</html>
 HTML
+  say "Wrote $INDEX"
+else
+  say "Index exists: $INDEX (kept)"
 fi
 hr
 
-# 3) Build AquilaTrader include (single source of truth)
-say "2) Write include ${INC_AQ}"
-unlock "$INC_AQ"
-cat >"$INC_AQ" <<'NGX'
-# BEGIN AQUILATRADER_MANAGED
-# Serve static AquilaTrader UI at /aquilatrader/
-location = /aquilatrader { return 301 /aquilatrader/; }
+# -------------------------------------------------------------------
+say "2) Detect active HTTPS vhost serving $DOMAIN"
+# Find real file in sites-available that has server_name DOMAIN and listen 443
+VHOST_CAND="$(grep -Rsl --include='*' -E "server_name\s+.*\b${DOMAIN}\b" "$NGX_SA" 2>/dev/null | head -n 1 || true)"
+if [ -z "$VHOST_CAND" ]; then
+  # fallback known
+  if [ -f "$NGX_SA/${DOMAIN}-ssl" ]; then VHOST_CAND="$NGX_SA/${DOMAIN}-ssl"; fi
+  if [ -f "$NGX_SA/${DOMAIN}-ssl.conf" ]; then VHOST_CAND="$NGX_SA/${DOMAIN}-ssl.conf"; fi
+  if [ -f "$NGX_SA/fireinners.online-ssl" ]; then VHOST_CAND="$NGX_SA/fireinners.online-ssl"; fi
+fi
+[ -n "$VHOST_CAND" ] || die "Cannot find vhost in $NGX_SA for $DOMAIN"
+VHOST="$VHOST_CAND"
+say "Using vhost: $VHOST"
+cp -a "$VHOST" "$BK/$(basename "$VHOST").bak" 2>/dev/null || true
+hr
+
+# -------------------------------------------------------------------
+say "3) Build managed include (single source of truth)"
+cat >"$AQUILA_INC" <<'NGX'
+# BEGIN_AQUILATRADER_MANAGED
 location ^~ /aquilatrader/ {
   alias /var/www/aquilatrader/;
+  index index.html;
   try_files $uri $uri/ /aquilatrader/index.html;
   add_header Cache-Control "no-store" always;
 }
-# END AQUILATRADER_MANAGED
+# END_AQUILATRADER_MANAGED
 NGX
-relock "$INC_AQ"
+cp -a "$AQUILA_INC" "$BK/$(basename "$AQUILA_INC").bak" 2>/dev/null || true
 hr
 
-# 4) Purge any aquilatrader location blocks from wolverine_static.inc (this is where your duplicate is)
-say "3) Deduplicate: remove ANY 'location ... /aquilatrader' blocks from ${INC_WOLV}"
-unlock "$INC_WOLV"
-python3 - <<'PY'
-import re,sys
-p = "/etc/nginx/includes/wolverine_static.inc"
-lines = open(p,"r",encoding="utf-8",errors="replace").read().splitlines(True)
+# -------------------------------------------------------------------
+say "4) Purge any existing AquilaTrader location blocks across nginx config files (to stop duplicates)"
+python3 - <<PY
+import os, re, glob, shutil
+targets = []
+for pat in [
+  "${NGX_SA}/*",
+  "${NGX_INC_DIR}/*.inc",
+  "${NGX_SNP_DIR}/*.conf",
+  "${NGX_ETC}/conf.d/*.conf",
+]:
+  targets += glob.glob(pat)
 
-out=[]
-i=0
-removed=0
-
-def has_aq_location(line):
-  # catch: location /aquilatrader , location ^~ /aquilatrader/ , with any spacing/tabs
-  return bool(re.search(r'^\s*location\b.*\b/aquilatrader\b', line))
-
-while i < len(lines):
-  line = lines[i]
-  if has_aq_location(line):
-    removed += 1
-    # skip whole block using brace depth
-    depth = 0
-    started = False
-    # process current line then subsequent lines until block closes
-    while i < len(lines):
-      l = lines[i]
-      # detect start of block (first "{")
-      if "{" in l:
-        started = True
-        depth += l.count("{")
-      if "}" in l and started:
-        depth -= l.count("}")
-        if depth <= 0:
-          i += 1
-          break
-      i += 1
-    continue
-  out.append(line)
-  i += 1
-
-# ensure newline at end
-if out and not out[-1].endswith("\n"):
-  out[-1] += "\n"
-open(p,"w",encoding="utf-8").write("".join(out))
-print(f"OK: removed {removed} aquilatrader location block(s) from {p}")
-PY
-relock "$INC_WOLV"
-hr
-
-# 5) Ensure vhost includes aquilatrader include exactly once
-say "4) Ensure vhost includes ${INC_AQ} exactly once"
-unlock "$VHOST"
-python3 - <<'PY'
-import re,sys
-v="/etc/nginx/sites-available/fireinners.online-ssl"
-inc="/etc/nginx/includes/aquilatrader_routes.inc"
-txt=open(v,"r",encoding="utf-8",errors="replace").read().splitlines(True)
-
-# remove any previous managed blocks
-out=[]
-skip=False
-for line in txt:
-  if re.search(r'BEGIN\s+AQUILATRADER', line):
-    skip=True
-    continue
-  if skip:
-    if re.search(r'END\s+AQUILATRADER', line):
-      skip=False
-    continue
-  out.append(line)
-
-txt=out
-
-# if include already present, keep only first occurrence
-include_line=f"  include {inc};\n"
-seen=0
-out=[]
-for line in txt:
-  if line.strip()==f"include {inc};":
-    seen += 1
-    if seen==1:
-      out.append(include_line)
-    continue
-  out.append(line)
-txt=out
-
-# if not present at all, insert right after wolverine_static include (best place)
-if seen==0:
-  inserted=False
+def strip_aquilatrader(text:str)->str:
+  # remove whole "location ... { ... }" blocks that reference /aquilatrader
+  # brace-aware scanning
   out=[]
-  for line in txt:
-    out.append(line)
-    if (not inserted) and re.search(r'include\s+/etc/nginx/includes/wolverine_static\.inc\s*;', line):
-      out.append(include_line)
-      inserted=True
-  txt=out
-  if not inserted:
-    # fallback: append near top (still valid)
-    txt.insert(0, include_line)
+  i=0
+  n=len(text)
+  while i<n:
+    m = re.search(r'(?m)^[ \t]*location[^{\\n]*\\{', text[i:])
+    if not m:
+      out.append(text[i:])
+      break
+    start = i + m.start()
+    # keep chunk before location
+    out.append(text[i:start])
+    # find end of this location block by brace balance
+    j = start + m.group(0).rfind("{") + 1
+    depth = 1
+    while j<n and depth>0:
+      ch = text[j]
+      if ch == "{": depth += 1
+      elif ch == "}": depth -= 1
+      j += 1
+    block = text[start:j]
+    if "/aquilatrader" in block:
+      # drop this block
+      i = j
+    else:
+      out.append(block)
+      i = j
+  cleaned = "".join(out)
+  # also remove managed markers if present (in case previously appended)
+  cleaned = re.sub(r'(?s)#\\s*BEGIN_AQUILATRADER_MANAGED.*?#\\s*END_AQUILATRADER_MANAGED\\s*','', cleaned)
+  return cleaned
 
-# add small comment wrapper (not required, but useful)
-final=[]
-final.append("# BEGIN AQUILATRADER (managed include)\n")
-final.extend(txt)
-final.append("# END AQUILATRADER (managed include)\n")
+changed=[]
+for path in targets:
+  if not os.path.isfile(path): 
+    continue
+  try:
+    with open(path,'r',encoding='utf-8',errors='ignore') as f:
+      t = f.read()
+  except Exception:
+    continue
+  if "/aquilatrader" not in t and "AQUILATRADER" not in t:
+    continue
+  new = strip_aquilatrader(t)
+  if new != t:
+    shutil.copy2(path, os.path.join("${BK}", os.path.basename(path)+".purge.bak"))
+    with open(path,'w',encoding='utf-8') as f:
+      f.write(new)
+    changed.append(path)
 
-open(v,"w",encoding="utf-8").write("".join(final))
-print("OK: vhost updated")
+print("PURGED_FILES:", len(changed))
+for p in changed[:80]:
+  print(" -", p)
 PY
-relock "$VHOST"
 hr
 
-# 6) nginx test + reload with rollback
-say "5) nginx -t then reload (rollback if fails)"
+# -------------------------------------------------------------------
+say "5) Ensure vhost includes AquilaTrader include exactly once (inside server block)"
+python3 - <<PY
+import re, shutil
+path = "${VHOST}"
+bk = "${BK}/" + path.split("/")[-1] + ".preinject.bak"
+shutil.copy2(path, bk)
+
+txt = open(path, "r", encoding="utf-8", errors="ignore").read()
+
+# If include already present, do nothing; else inject after first include line in server block (or after server { line)
+if re.search(r'(?m)^[ \t]*include[ \t]+/etc/nginx/includes/aquilatrader_static\\.inc\\s*;', txt):
+    print("VHOST: include already present")
+else:
+    # naive but safe: find first 'server {' and then insert shortly after
+    m = re.search(r'(?m)^\\s*server\\s*\\{', txt)
+    if not m:
+        raise SystemExit("No server { found in vhost")
+    insert_at = m.end()
+    # try insert after a known include line if exists
+    m2 = re.search(r'(?m)^[ \t]*include[ \t]+/etc/nginx/includes/[^;]+;\\s*$', txt[m.end():])
+    if m2:
+        insert_at = m.end() + m2.end()
+    inject = "\\n    include /etc/nginx/includes/aquilatrader_static.inc;\\n"
+    txt = txt[:insert_at] + inject + txt[insert_at:]
+    open(path, "w", encoding="utf-8").write(txt)
+    print("VHOST: injected include")
+PY
+cp -a "$VHOST" "$BK/$(basename "$VHOST").postinject" 2>/dev/null || true
+hr
+
+# -------------------------------------------------------------------
+say "6) nginx -t then reload (rollback on failure)"
 set +e
 nginx -t
 RC=$?
 set -e
 if [ "$RC" -ne 0 ]; then
-  say "nginx -t FAILED"
-  rollback
-  die "Fix not applied (rolled back). Check: $BK and $LOG"
+  say "nginx -t FAILED -> rollback from $BK"
+  # rollback vhost + include
+  if [ -f "$BK/$(basename "$VHOST").bak" ]; then cp -a "$BK/$(basename "$VHOST").bak" "$VHOST" || true; fi
+  if [ -f "$BK/$(basename "$AQUILA_INC").bak" ]; then cp -a "$BK/$(basename "$AQUILA_INC").bak" "$AQUILA_INC" || true; fi
+  # restore directories snapshots (best-effort)
+  [ -d "$BK/includes.bak" ] && (rm -rf "$NGX_INC_DIR/RESTORE_TMP" 2>/dev/null || true)
+  nginx -t || true
+  die "Rollback done. Check: $BK and $LOG"
 fi
+
 systemctl reload nginx
 hr
 
-# 7) Quick checks
-say "6) Quick checks"
-curl -sk "https://127.0.0.1/aquilatrader/" -H "Host: ${DOMAIN}" | head -n 12 || true
-curl -sk "https://127.0.0.1/wolverine/" -H "Host: ${DOMAIN}" | head -n 8 || true
+# -------------------------------------------------------------------
+say "7) Quick local checks (Host header)"
+curl -sk "https://127.0.0.1/aquilatrader/" -H "Host: ${DOMAIN}" | head -n 20 || true
 hr
 say "DONE. Open: https://${DOMAIN}/aquilatrader/"
+say "Log: $LOG"
 say "Backup: $BK"
 BASH
 
-bash /root/MEGA_AQUILATRADER_FIX_V3.sh |& tee /root/MEGA_AQUILATRADER_FIX_V3.log
+bash /root/MEGA_AQUILATRADER_FIX_INSTALL_V3.sh |& tee /root/MEGA_AQUILATRADER_FIX_INSTALL_V3.log
