@@ -1,4 +1,4 @@
-cat >/root/MEGA_AQUILATRADER_INSTALL_FIX_V4.sh <<'BASH'
+cat >/root/MEGA_AQUILATRADER_INSTALL_V1.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 umask 022
@@ -7,266 +7,285 @@ say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 die(){ say "ERROR: $*"; exit 1; }
 
 DOMAIN="fireinners.online"
+VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
+
 WWW="/var/www/aquilatrader"
 INDEX="$WWW/index.html"
-NGX_INC_DIR="/etc/nginx/includes"
-NGX_INC="$NGX_INC_DIR/aquilatrader_static.inc"
-VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
-NGXCONF="/etc/nginx/nginx.conf"
+
+INC_DIR="/etc/nginx/includes"
+AQUILA_INC="$INC_DIR/aquilatrader_static.inc"
 
 TS="$(date +%Y%m%d_%H%M%S)"
-BK="/root/BK_AQUILATRADER_FIX_${TS}"
+BK="/root/BK_AQUILATRADER_INSTALL_${TS}"
+LOG="/root/MEGA_AQUILATRADER_INSTALL_V1.log"
 mkdir -p "$BK"
 
-need_root(){
-  [ "$(id -u)" -eq 0 ] || die "Run as root."
-}
+say "MEGA_AQUILATRADER_INSTALL_V1"
+say "Goal: https://${DOMAIN}/aquilatrader/ serves ${INDEX}"
+say "Backup: ${BK}"
+say "Log: ${LOG}"
+echo
 
-has_immutable(){
-  local f="$1"
-  command -v lsattr >/dev/null 2>&1 || return 1
-  lsattr -d "$f" 2>/dev/null | awk '{print $1}' | grep -q 'i'
-}
+command -v nginx >/dev/null 2>&1 || die "nginx not found"
 
-unfreeze_if_needed(){
-  local f="$1"
-  if [ -e "$f" ] && has_immutable "$f"; then
-    say "chattr -i $f"
-    chattr -i "$f" || die "Cannot chattr -i $f"
-    echo "$f" >>"$BK/was_immutable.txt"
-  fi
-}
+say "0) Backups"
+cp -a "$VHOST" "${BK}/$(basename "$VHOST").bak"
+cp -a /etc/nginx/nginx.conf "${BK}/nginx.conf.bak"
+mkdir -p "${BK}/includes"
+cp -a "${INC_DIR}/"*.inc "${BK}/includes/" 2>/dev/null || true
+echo
 
-refreeze_previous(){
-  [ -f "$BK/was_immutable.txt" ] || return 0
-  while IFS= read -r f; do
-    [ -e "$f" ] || continue
-    say "chattr +i $f"
-    chattr +i "$f" || true
-  done <"$BK/was_immutable.txt"
-}
+say "1) Ensure webroot + index"
+mkdir -p "$WWW"
+if [ ! -f "$INDEX" ]; then
+  cat >"$INDEX" <<'HTML'
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>AquilaTrader</title>
+  <style>
+    body{margin:0;background:#0b1020;color:#e6eef8;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial}
+    main{max-width:900px;margin:24px auto;padding:10px 14px}
+    h1{font-size:42px;margin:10px 0 18px}
+    .row{display:flex;gap:14px;align-items:center;flex-wrap:wrap}
+    input{flex:1;min-width:240px;background:#0f1622;color:#e6eef8;border:1px solid #2b3b52;border-radius:10px;padding:12px;font-size:18px}
+    button{background:#e6eef8;color:#0b1020;border:0;border-radius:12px;padding:12px 22px;font-size:18px;cursor:pointer}
+    .card{margin-top:18px;padding:14px;border:1px solid #22304a;border-radius:12px;background:#0f1622}
+    .muted{opacity:.75}
+    pre{white-space:pre-wrap;word-break:break-word}
+  </style>
+</head>
+<body>
+<main>
+  <h1>TraderOne</h1>
+  <div class="muted">AquilaTrader</div>
+  <div style="height:14px"></div>
 
-backup_file(){
-  local f="$1"
-  [ -e "$f" ] || return 0
-  cp -a "$f" "$BK/$(basename "$f").bak" 2>/dev/null || true
-}
+  <div class="row">
+    <div style="min-width:140px">Wallet:</div>
+    <div id="addr">-</div>
+  </div>
 
-# Remove any nginx "location ... /aquilatrader" blocks from a file (brace-aware)
-purge_aquilatrader_locations_in_file(){
-  local f="$1"
-  [ -f "$f" ] || return 0
-  # Skip our dedicated include
-  [ "$f" = "$NGX_INC" ] && return 0
+  <div style="height:10px"></div>
 
-  python3 - <<PY
-import re,sys
-p=sys.argv[1]
-s=open(p,'r',encoding='utf-8',errors='ignore').read().splitlines(True)
+  <div class="row">
+    <input id="budget" type="text" value="1" />
+  </div>
 
-def strip_locations(lines):
-    out=[]
-    i=0
-    changed=False
-    while i<len(lines):
-        line=lines[i]
-        # detect start of a location block that mentions aquilatrader
-        if re.search(r'^\s*location\b.*aquilatrader', line):
-            changed=True
-            # consume until brace-balanced end
-            depth=0
-            # if current line contains "{", count it
-            depth += line.count("{") - line.count("}")
-            i+=1
-            while i<len(lines) and depth>0:
-                depth += lines[i].count("{") - lines[i].count("}")
-                i+=1
-            continue
-        # also handle legacy marker blocks if present
-        if "AQUILATRADER_MANAGED" in line:
-            changed=True
-            # drop until END marker
-            i+=1
-            while i<len(lines) and "END AQUILATRADER_MANAGED" not in lines[i]:
-                i+=1
-            if i<len(lines): i+=1
-            continue
-        out.append(line); i+=1
-    return out, changed
+  <div style="height:12px"></div>
 
-out,changed=strip_locations(s)
-if changed:
-    open(p,'w',encoding='utf-8').write(''.join(out))
-    print("PURGED:",p)
-else:
-    print("NOOP:",p)
-PY
-}
+  <div class="row">
+    <button id="start">Start</button>
+    <button id="stop">Stop</button>
+    <button id="cash">Cash-out</button>
+  </div>
 
-ensure_include_once_in_vhost(){
-  [ -f "$VHOST" ] || die "Missing vhost: $VHOST"
+  <div class="card">
+    <div class="muted">Log</div>
+    <pre id="log">ready</pre>
+  </div>
 
-  python3 - <<PY
-import re,sys
-vhost=sys.argv[1]
-inc=sys.argv[2]
+<script>
+  // UI minimal : endpoints à adapter si besoin (garde ton backend actuel)
+  const $ = (q)=>document.querySelector(q);
+  const log = (t)=>{ $("#log").textContent = String(t); };
 
-lines=open(vhost,'r',encoding='utf-8',errors='ignore').read().splitlines(True)
+  async function post(url, obj){
+    const r = await fetch(url, {
+      method: "POST",
+      headers: {"content-type":"application/json"},
+      body: JSON.stringify(obj||{})
+    });
+    let j=null;
+    try{ j = await r.json(); }catch(e){}
+    if(!r.ok) throw new Error((j && (j.error||j.message)) || ("HTTP "+r.status));
+    return j;
+  }
 
-# already included?
-if any(re.search(r'^\s*include\s+'+re.escape(inc)+r'\s*;', ln) for ln in lines):
-    print("VHOST: include already present")
-    sys.exit(0)
+  // NOTE: à brancher selon ton API réelle
+  // Si tu veux conserver Wolverine, tu peux remplacer par /wolverine/traderone/api/start etc.
+  const API_START  = "/wolverine/traderone/api/start";
+  const API_STOP   = "/api/stop";      // placeholder
+  const API_CASH   = "/api/cashout";   // placeholder
 
-def find_server_blocks(lines):
-    blocks=[]
-    i=0
-    while i<len(lines):
-        if re.match(r'^\s*server\s*\{', lines[i]):
-            start=i
-            depth=lines[i].count("{")-lines[i].count("}")
-            i+=1
-            while i<len(lines) and depth>0:
-                depth += lines[i].count("{")-lines[i].count("}")
-                i+=1
-            end=i
-            blocks.append((start,end))
-        else:
-            i+=1
-    return blocks
-
-blocks=find_server_blocks(lines)
-
-def block_text(a,b):
-    return ''.join(lines[a:b])
-
-target=None
-for a,b in blocks:
-    t=block_text(a,b)
-    if re.search(r'listen\s+443', t) and re.search(r'\bserver_name\b[^;]*\bfireinners\.online\b', t):
-        target=(a,b); break
-
-if not target:
-    # fallback: first listen 443 server
-    for a,b in blocks:
-        t=block_text(a,b)
-        if re.search(r'listen\s+443', t):
-            target=(a,b); break
-
-if not target:
-    raise SystemExit("VHOST: no server { } block found")
-
-a,b=target
-# insert include just before the closing brace of that server block
-# find last line containing only "}" (or indented) within block end-1 backwards
-insert_at=None
-for j in range(b-1,a,-1):
-    if re.match(r'^\s*\}\s*$', lines[j]):
-        insert_at=j
-        break
-if insert_at is None:
-    raise SystemExit("VHOST: cannot find server closing brace")
-
-ins = f"    include {inc};\n"
-lines.insert(insert_at, ins)
-
-open(vhost,'w',encoding='utf-8').write(''.join(lines))
-print("VHOST: inserted include ->",inc)
-PY
-}
-
-main(){
-  need_root
-  command -v nginx >/dev/null 2>&1 || die "nginx not found"
-  command -v systemctl >/dev/null 2>&1 || die "systemctl not found"
-
-  say "MEGA_AQUILATRADER_INSTALL_FIX_V4"
-  say "Goal: https://${DOMAIN}/aquilatrader/ serves ${INDEX}"
-  say "Log: /root/MEGA_AQUILATRADER_INSTALL_FIX_V4.log"
-  say "Backup: ${BK}"
-  echo
-
-  say "0) Backup + unfreeze nginx files if immutable"
-  backup_file "$NGXCONF"
-  backup_file "$VHOST"
-  mkdir -p "$NGX_INC_DIR"
-  [ -f "$NGX_INC" ] && backup_file "$NGX_INC"
-  unfreeze_if_needed "$NGXCONF"
-  unfreeze_if_needed "$VHOST"
-  unfreeze_if_needed "$NGX_INC_DIR" || true
-  # unfreeze common includes that might contain old blocks
-  for f in /etc/nginx/includes/*.inc /etc/nginx/snippets/*.conf; do
-    [ -e "$f" ] || continue
-    unfreeze_if_needed "$f" || true
-  done
-
-  say "1) Ensure AquilaTrader webroot + index"
-  mkdir -p "$WWW"
-  if [ ! -f "$INDEX" ]; then
-    cat >"$INDEX" <<'HTML'
-<!doctype html><html lang="fr"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>AquilaTrader</title><style>body{margin:0;font-family:system-ui;background:#0b1020;color:#fff}main{max-width:780px;margin:40px auto;padding:0 18px}h1{margin:0 0 14px;font-size:44px}label{display:block;opacity:.85;margin:10px 0 8px}input{width:100%;padding:16px;border-radius:12px;border:1px solid #2b3552;background:#0f162c;color:#e7eeff;font-size:18px}button{padding:14px 22px;border-radius:14px;border:1px solid #2b3552;background:#f1f4ff;color:#1b2b5a;font-size:18px;cursor:pointer}button:hover{filter:brightness(.98)}.row{display:flex;gap:16px;margin-top:14px;flex-wrap:wrap}.muted{opacity:.85}</style></head><body><main><h1>AquilaTrader</h1><div class="muted">Wallet: <span id="addr">-</span></div><label>Montant / Param</label><input id="amt" value="1"/><div class="row"><button id="start">Start</button><button id="stop">Stop</button><button id="cash">Cash-out</button></div><pre id="log" style="margin-top:18px;white-space:pre-wrap;opacity:.9"></pre><script>
-const L=(m)=>{const el=document.getElementById('log');el.textContent+=(m+"\n");};
-async function post(u,o){return fetch(u,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(o||{})});}
-document.getElementById('start').onclick=async()=>{L("start...");try{await post("/wolverine/traderone/api/start",{amount:document.getElementById('amt').value});L("started");}catch(e){L("ERR "+e);}};
-document.getElementById('stop').onclick=async()=>{L("stop...");try{await post("/wolverine/traderone/api/stop",{});L("stopped");}catch(e){L("ERR "+e);}};
-document.getElementById('cash').onclick=async()=>{L("cashout...");try{const r=await post("/wolverine/traderone/api/cashout",{});L("cashout sent");}catch(e){L("ERR "+e);}};
-</script></main></body></html>
+  $("#start").onclick = async ()=>{
+    try{
+      const budget = $("#budget").value;
+      const out = await post(API_START, {budget});
+      log("started: "+JSON.stringify(out));
+    }catch(e){ log("ERROR start: "+e.message); }
+  };
+  $("#stop").onclick = async ()=>{
+    try{
+      const out = await post(API_STOP, {});
+      log("stopped: "+JSON.stringify(out));
+    }catch(e){ log("ERROR stop: "+e.message); }
+  };
+  $("#cash").onclick = async ()=>{
+    try{
+      const out = await post(API_CASH, {});
+      log("cashout: "+JSON.stringify(out));
+    }catch(e){ log("ERROR cashout: "+e.message); }
+  };
+</script>
+</main>
+</body>
+</html>
 HTML
-    say "Wrote $INDEX"
-  else
-    say "Index exists: $INDEX (kept)"
-  fi
+  say "Wrote $INDEX"
+else
+  say "Index exists: $INDEX (kept)"
+fi
+echo
 
-  say "2) Create dedicated nginx include (single source of truth)"
-  cat >"$NGX_INC" <<'NGX'
-# AquilaTrader static route (managed)
-location = /aquilatrader { return 301 /aquilatrader/; }
+say "2) Write dedicated include: $AQUILA_INC"
+mkdir -p "$INC_DIR"
+cat >"$AQUILA_INC" <<EOF
+# aquilatrader_static.inc (managed)
 location ^~ /aquilatrader/ {
-  alias /var/www/aquilatrader/;
-  try_files $uri $uri/ /aquilatrader/index.html;
+  alias ${WWW}/;
+  try_files \$uri \$uri/ /aquilatrader/index.html;
   add_header Cache-Control "no-store" always;
 }
-NGX
-  say "Wrote $NGX_INC"
+EOF
+echo
 
-  say "3) Purge old /aquilatrader location blocks from other nginx includes/snippets to stop duplicates"
-  # common places where old blocks were inserted
-  for f in /etc/nginx/includes/*.inc /etc/nginx/snippets/*.conf; do
-    [ -f "$f" ] || continue
-    purge_aquilatrader_locations_in_file "$f" || true
-  done
+say "3) Purge duplicate location /aquilatrader blocks across includes (*.inc)"
+python3 - <<'PY'
+import glob, re, os
 
-  say "4) Ensure vhost includes $NGX_INC exactly once"
-  ensure_include_once_in_vhost
+targets = glob.glob("/etc/nginx/includes/*.inc")
+loc_re = re.compile(r'^\s*location\s+\^~\s+/aquilatrader/\s*\{', re.I)
+out = []
+for path in targets:
+    if os.path.basename(path) == "aquilatrader_static.inc":
+        continue
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        lines = f.readlines()
+    changed = False
+    new = []
+    i = 0
+    while i < len(lines):
+        if loc_re.match(lines[i]):
+            # remove this location block (brace-balanced)
+            changed = True
+            depth = 0
+            # enter block on this line
+            while i < len(lines):
+                depth += lines[i].count("{")
+                depth -= lines[i].count("}")
+                i += 1
+                if depth <= 0:
+                    break
+            continue
+        new.append(lines[i])
+        i += 1
+    if changed:
+        with open(path, "w", encoding="utf-8") as f:
+            f.writelines(new)
+        print("purged:", path)
+PY
+echo
 
-  say "5) nginx -t then reload (rollback if fails)"
-  set +e
-  nginx -t >/dev/null 2>&1
-  RC=$?
-  set -e
-  if [ "$RC" -ne 0 ]; then
-    say "nginx -t FAILED -> rollback"
-    [ -f "$BK/$(basename "$VHOST").bak" ] && cp -a "$BK/$(basename "$VHOST").bak" "$VHOST" || true
-    [ -f "$BK/$(basename "$NGXCONF").bak" ] && cp -a "$BK/$(basename "$NGXCONF").bak" "$NGXCONF" || true
-    [ -f "$BK/$(basename "$NGX_INC").bak" ] && cp -a "$BK/$(basename "$NGX_INC").bak" "$NGX_INC" || true
-    nginx -t || true
-    refreeze_previous || true
-    die "Rollback done. nginx config invalid. Check: $BK"
-  fi
+say "4) Ensure vhost includes aquilatrader include exactly once inside the correct 443 server block"
+python3 - <<'PY'
+import re, sys
 
-  systemctl reload nginx
+vhost = "/etc/nginx/sites-available/fireinners.online-ssl"
+inc_line = "include /etc/nginx/includes/aquilatrader_static.inc;"
 
-  say "6) Quick local checks (Host header)"
-  curl -sk "https://127.0.0.1/aquilatrader/" -H "Host: ${DOMAIN}" | head -n 20 || true
-  echo
-  say "DONE. Open: https://${DOMAIN}/aquilatrader/"
-  say "Backup: $BK"
+with open(vhost, "r", encoding="utf-8", errors="ignore") as f:
+    lines = f.readlines()
 
-  refreeze_previous || true
-}
+# Find server blocks with brace tracking
+servers = []
+i=0
+while i < len(lines):
+    if re.match(r'^\s*server\s*\{', lines[i]):
+        start=i
+        depth=0
+        j=i
+        while j < len(lines):
+            depth += lines[j].count("{")
+            depth -= lines[j].count("}")
+            if depth==0 and j>start:
+                end=j
+                servers.append((start,end))
+                break
+            j+=1
+        i = j+1
+    else:
+        i+=1
 
-main "$@"
+if not servers:
+    raise SystemExit("No server{ } blocks found in vhost")
+
+def block_text(a,b):
+    return "".join(lines[a:b+1])
+
+# choose best match: listen 443 and server_name contains fireinners.online
+best=None
+for a,b in servers:
+    txt = block_text(a,b)
+    if re.search(r'^\s*listen\s+443\b', txt, re.M) and re.search(r'^\s*server_name\b.*\bfireinners\.online\b', txt, re.M):
+        best=(a,b); break
+
+if not best:
+    raise SystemExit("Could not find 443 server block with server_name fireinners.online in vhost")
+
+a,b = best
+block = lines[a:b+1]
+
+# Remove any existing include lines (anywhere in block) to avoid duplicates
+new_block=[]
+for ln in block:
+    if re.search(r'include\s+/etc/nginx/includes/aquilatrader_static\.inc;', ln):
+        continue
+    new_block.append(ln)
+
+# Insert include near end before closing brace
+# Determine indentation from other include lines or default two spaces
+indent="  "
+for ln in new_block:
+    m=re.match(r'^(\s*)include\s+', ln)
+    if m:
+        indent=m.group(1)
+        break
+
+# Insert before last line (which should contain "}")
+# Find the last line with only closing brace at end of server
+insert_at = len(new_block)-1
+# ensure last line contains }
+while insert_at>0 and "}" not in new_block[insert_at]:
+    insert_at -= 1
+# put include just before that line
+new_block.insert(insert_at, indent + inc_line + "\n")
+
+# Write back
+lines[a:b+1] = new_block
+with open(vhost, "w", encoding="utf-8") as f:
+    f.writelines(lines)
+
+print("OK: injected include into vhost server 443 block:", vhost)
+PY
+echo
+
+say "5) nginx -t then reload"
+nginx -t
+systemctl reload nginx
+echo
+
+say "6) Quick local checks (Host header)"
+curl -skI "https://127.0.0.1/aquilatrader/" -H "Host: ${DOMAIN}" | head -n 12 || true
+echo
+say "DONE. Open: https://${DOMAIN}/aquilatrader/"
+say "Backup: ${BK}"
 BASH
-chmod +x /root/MEGA_AQUILATRADER_INSTALL_FIX_V4.sh
 
-bash /root/MEGA_AQUILATRADER_INSTALL_FIX_V4.sh |& tee /root/MEGA_AQUILATRADER_INSTALL_FIX_V4.log
+chmod +x /root/MEGA_AQUILATRADER_INSTALL_V1.sh
+echo
+echo "OK. Run:"
+echo "bash /root/MEGA_AQUILATRADER_INSTALL_V1.sh |& tee /root/MEGA_AQUILATRADER_INSTALL_V1.log"
+BASH
