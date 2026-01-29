@@ -1,1 +1,104 @@
-bash /root/MEGA_EINSHSTEIN_PAIRSCAN_FIX.sh |& tee /root/MEGA_EINSHSTEIN_PAIRSCAN_FIX.log
+cat >/root/MEGA_EINSHSTEIN_PAIRSCAN_ROOT.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+
+say(){ echo "[PAIRSCAN] $*"; }
+
+### === CONFIG ===
+APP="/opt/einshtein-solana"
+TOOLS="$APP/tools"
+DATA="/var/www/ndjson_data"
+OUT="$DATA/events.ndjson"
+TOP=40
+
+### === PRECHECK ===
+command -v node >/dev/null || { echo "Node missing"; exit 1; }
+
+### === BACKUP ===
+TS=$(date +%Y%m%d_%H%M%S)
+BK="/root/BK_EINSHSTEIN_PAIRSCAN_$TS"
+mkdir -p "$BK"
+[ -d "$APP" ] && cp -a "$APP" "$BK/app" || true
+[ -f "$OUT" ] && cp -a "$OUT" "$BK/events.ndjson" || true
+
+### === DIRS ===
+mkdir -p "$TOOLS" "$DATA"
+touch "$OUT"
+chmod 755 "$APP" "$TOOLS" "$DATA"
+chmod 644 "$OUT"
+
+### === WRITE PAIR SCANNER (NODE) ===
+cat >"$TOOLS/scan_pairs_direct.js" <<'JS'
+"use strict";
+const https = require("https");
+
+function jget(url){
+  return new Promise((res,rej)=>{
+    https.get(url,r=>{
+      let d="";
+      r.on("data",c=>d+=c);
+      r.on("end",()=>{
+        if(r.statusCode>=200 && r.statusCode<300){
+          try{ res(JSON.parse(d)); }
+          catch(e){ rej(e); }
+        } else rej(new Error("HTTP "+r.statusCode));
+      });
+    }).on("error",rej);
+  });
+}
+
+function score(p){
+  const liq = p.liquidity?.usd || 0;
+  const vol = p.volume?.h24 || 0;
+  const tx  = (p.txns?.h24?.buys||0)+(p.txns?.h24?.sells||0);
+  return Math.log10(1+liq)*3 + Math.log10(1+vol)*2 + Math.log10(1+tx);
+}
+
+(async()=>{
+  const profiles = await jget("https://api.dexscreener.com/token-profiles/latest/v1");
+  const sol = profiles.filter(x=>x.chainId==="solana");
+
+  const rows = [];
+  for(const t of sol){
+    try{
+      const js = await jget("https://api.dexscreener.com/latest/dex/tokens/"+t.tokenAddress);
+      for(const p of (js.pairs||[])){
+        if(p.chainId!=="solana") continue;
+        rows.push({
+          ts:new Date().toISOString(),
+          type:"pair",
+          base:p.baseToken?.symbol||"",
+          quote:p.quoteToken?.symbol||"",
+          pair:p.pairAddress,
+          dex:p.dexId,
+          price:p.priceUsd,
+          liq:p.liquidity?.usd||0,
+          vol:p.volume?.h24||0,
+          tx:(p.txns?.h24?.buys||0)+(p.txns?.h24?.sells||0),
+          score:score(p)
+        });
+      }
+    }catch(e){}
+  }
+
+  rows.sort((a,b)=>b.score-a.score);
+  const top = rows.slice(0, Number(process.argv[2]||40));
+
+  for(const r of top){
+    process.stdout.write(JSON.stringify(r)+"\n");
+  }
+})();
+JS
+
+chmod +x "$TOOLS/scan_pairs_direct.js"
+
+### === RUN ===
+say "Running pair scan (TOP=$TOP)…"
+node "$TOOLS/scan_pairs_direct.js" "$TOP" >>"$OUT"
+
+say "DONE. Lines in NDJSON:"
+wc -l "$OUT"
+BASH
+
+chmod +x /root/MEGA_EINSHSTEIN_PAIRSCAN_ROOT.sh
