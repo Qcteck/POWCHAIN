@@ -1,1 +1,441 @@
-npm run build
+#!/usr/bin/env bash
+set -euo pipefail
+umask 022
+export DEBIAN_FRONTEND=noninteractive
+
+TS="$(date +%Y%m%d_%H%M%S)"
+LOG="/root/AT_AQUILATRADER_SAFE_${TS}.log"
+
+say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$LOG" ; }
+die(){ say "ERROR: $*"; exit 1; }
+
+# --- Fixed targets (Fireinners VPS doctrine) ---
+WWW="/var/www/aquilatrader"
+APP="/opt/aquilatrader_safe"
+API_PORT="9697"
+API_HOST="127.0.0.1"
+NGX_VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
+NGX_INC_DIR="/etc/nginx/includes"
+NGX_INC_FILE="$NGX_INC_DIR/aquilatrader_routes.inc"
+SVC="/etc/systemd/system/aquilatrader-safe.service"
+
+# --- Inputs / constraints ---
+EXCLUDE_MINT="AhSGcUDNK2MKkWQe4Mz7rCPSyTJNxvtGCTuJnpUjpump" # user requested to remove this mint from scans
+FEE_ADDR="ufii1UUsd1FM8ByD6XyvuamGhGjeJdTM7PAbrj4uZDj"
+
+# --- Data sources ---
+DS_PROFILE_LATEST="https://api.dexscreener.com/token-profiles/latest/v1"
+DS_TOKEN="https://api.dexscreener.com/latest/dex/tokens/"
+GT_BASE="https://api.geckoterminal.com/api/v2"
+
+say "AQUILATRADER SAFE • deploy UI + API(backtest) + nginx route"
+say "WWW=$WWW | APP=$APP | API=http://$API_HOST:$API_PORT | vhost=$NGX_VHOST"
+say "Fee transparency address: $FEE_ADDR"
+
+# --- Packages ---
+say "Install deps..."
+apt-get update -y >>"$LOG" 2>&1
+apt-get install -y nginx python3 python3-venv python3-pip ca-certificates curl jq nodejs npm >>"$LOG" 2>&1 || true
+
+# If node is missing or too old, install NodeSource 20.x (minimal + common)
+if ! command -v node >/dev/null 2>&1; then
+  say "Node missing; installing Node 20.x..."
+  curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >>"$LOG" 2>&1
+  apt-get install -y nodejs >>"$LOG" 2>&1
+fi
+
+mkdir -p "$WWW" "$APP" "$NGX_INC_DIR"
+
+# --- UI: /var/www/aquilatrader/index.html ---
+say "Write UI..."
+cat >"$WWW/index.html" <<'HTML'
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AquilaTrader • SAFE (Read-only)</title><style>:root{--bg:#070a0f;--fg:#d9e6ff;--mut:#7ea3d7;--b:#142033;--g:#20ff7a;--r:#ff3b3b;--y:#ffd23a;--c:#3cc7ff;--p:#b06cff;--o:#ff8a3d}*{box-sizing:border-box;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial}body{margin:0;background:var(--bg);color:var(--fg)}a{color:#8fc3ff;text-decoration:none}a:hover{text-decoration:underline}#top{position:sticky;top:0;background:rgba(7,10,15,.92);backdrop-filter:blur(8px);border-bottom:1px solid var(--b);padding:12px;z-index:5}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.btn{cursor:pointer;border:1px solid var(--b);background:#0b1220;color:var(--fg);padding:9px 11px;border-radius:12px;font-size:13px}.btn:hover{border-color:#2b4a7a}.chip{padding:4px 10px;border:1px solid var(--b);border-radius:999px;font-size:12px;color:var(--mut)}.card{border:1px solid var(--b);background:#0b1220;border-radius:16px;padding:12px}.grid{display:grid;grid-template-columns:1.1fr .9fr;gap:12px;padding:12px;max-width:1200px;margin:0 auto}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.kpi{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.k{border:1px solid var(--b);border-radius:14px;padding:10px;background:#060a12}.k b{display:block;font-size:18px}.mut{color:var(--mut)}.small{font-size:12px}.hr{height:1px;background:var(--b);margin:10px 0}input,select{border:1px solid var(--b);background:#060a12;color:var(--fg);border-radius:12px;padding:9px 10px;font-size:13px;outline:none}label{display:flex;gap:8px;align-items:center;font-size:13px;color:var(--mut)}#log{white-space:pre-wrap;max-height:240px;overflow:auto;border:1px solid var(--b);border-radius:14px;background:#060a12;padding:10px}table{width:100%;border-collapse:separate;border-spacing:0 8px}thead th{font-size:12px;color:var(--mut);text-align:left;padding:0 8px}tbody td{padding:10px 8px;background:#060a12;border-top:1px solid var(--b);border-bottom:1px solid var(--b)}tbody tr td:first-child{border-left:1px solid var(--b);border-top-left-radius:14px;border-bottom-left-radius:14px}tbody tr td:last-child{border-right:1px solid var(--b);border-top-right-radius:14px;border-bottom-right-radius:14px}.ok{color:var(--g)}.bad{color:var(--r)}.warn{color:var(--y)}.p{color:var(--p)}.o{color:var(--o)}</style></head><body><div id="top"><div class="row"><div class="mono" style="letter-spacing:.08em;font-weight:700">AQUILATRADER • SAFE (Read-only)</div><span class="chip" id="st">idle</span><span class="chip" id="langchip">EN</span><button class="btn" id="lang">EN/FR</button><span class="chip mono">/aquilatrader/</span><a class="chip mono" href="/aquilatrader/api/health" target="_blank">api/health</a></div><div class="row" style="margin-top:10px"><button class="btn" id="run">RUN BACKTEST 2022→2026</button><button class="btn" id="refresh">REFRESH REPORT</button><span class="chip">UI does not decide. Einshtein decides in engine. Here = simulation executive.</span></div></div><div class="grid"><div class="card"><div class="row"><div class="mono" style="font-weight:700">User Frame</div><span class="chip" id="mode">SAFE</span></div><div class="hr"></div><div class="row"><label>Risk % <input id="risk" type="number" min="0.1" max="100" step="0.1" value="10"></label><label>Budget floor % <input id="floor" type="number" min="0" max="100" step="0.1" value="25"></label><label>Pairs scan (DexScreener) <input id="topn" type="number" min="10" max="250" step="1" value="90"></label></div><div class="row"><label>Timeframe <select id="tf"><option value="day" selected>day</option><option value="hour">hour</option></select></label><label>Aggregate <input id="agg" type="number" min="1" max="24" step="1" value="1"></label><label>Noise threshold |r|% <input id="rth" type="number" min="0.01" max="5" step="0.01" value="0.35"></label></div><div class="hr"></div><div class="card" style="background:#050a12"><div class="mono" style="font-weight:700">Fee transparency</div><div class="small mut" id="feetxt"></div></div><div class="hr"></div><div class="mono small mut">Important: no wallet key here, no trades here. This is an executive simulation runner.</div></div><div class="card"><div class="mono" style="font-weight:700">Backtest KPIs</div><div class="hr"></div><div class="kpi"><div class="k"><div class="mut small">Net PnL (sim)</div><b id="pnl">—</b></div><div class="k"><div class="mut small">Max Drawdown</div><b id="dd">—</b></div><div class="k"><div class="mut small">Trades</div><b id="tr">—</b></div></div><div class="hr"></div><div id="log" class="mono small">ready</div></div></div><div style="max-width:1200px;margin:0 auto;padding:0 12px 16px"><div class="card"><div class="mono" style="font-weight:700">Top pairs used (from DexScreener → then OHLCV from GeckoTerminal if pool exists)</div><div class="hr"></div><table><thead><tr><th>#</th><th>Pair</th><th>Symbol</th><th>Status</th><th>Link</th></tr></thead><tbody id="tb"></tbody></table></div></div><script>const $=s=>document.querySelector(s),fmt=n=>Number.isFinite(n)?n.toLocaleString("en-US",{maximumFractionDigits:2}):"—";let LANG="EN";const TXT={EN:{idle:"idle",run:"RUN BACKTEST 2022→2026",refresh:"REFRESH REPORT",risk:"Risk %",floor:"Budget floor %",pairs:"Pairs scan",fee:`Fees are applied in the engine (real trading mode). In SAFE simulation we only compute them.\n- 2% per trade → internal investment (future projects)\n- 4% per trade → Einshtein improvement power\nAddress: `},FR:{idle:"idle",run:"LANCER BACKTEST 2022→2026",refresh:"RAFRAICHIR RAPPORT",risk:"Risque %",floor:"Plancher budget %",pairs:"Scan paires",fee:`Les frais sont appliqués dans le moteur (mode trading réel). Ici SAFE = on les calcule seulement.\n- 2% par trade → investissement interne (projets futurs)\n- 4% par trade → amélioration Einshtein\nAdresse: `}};function setLang(){const t=TXT[LANG];$("#langchip").textContent=LANG;$("#run").textContent=t.run;$("#refresh").textContent=t.refresh;$("#feetxt").textContent=t.fee+"ufii1UUsd1FM8ByD6XyvuamGhGjeJdTM7PAbrj4uZDj"}function log(m){const el=$("#log");el.textContent=(new Date()).toLocaleString()+" | "+m+"\n"+el.textContent.slice(0,5000)}async function j(u,opt){const r=await fetch(u,opt);if(!r.ok)throw new Error("HTTP "+r.status);return await r.json()}function renderPairs(pairs){const tb=$("#tb");tb.innerHTML=(pairs||[]).map((x,i)=>{const st=x.ok?`<span class="ok">OK</span>`:`<span class="bad">SKIP</span>`;const a=x.url?`<a href="${x.url}" target="_blank">DS</a>`:"—";return `<tr><td class="mono">#${i+1}</td><td class="mono">${x.pair||"—"}</td><td>${x.sym||"—"}</td><td>${st}</td><td>${a}</td></tr>`}).join("")}async function refresh(){try{$("#st").textContent="loading...";const js=await j("/aquilatrader/api/backtest/report");$("#pnl").textContent=fmt(js.kpi?.net_pnl_usd);$("#dd").textContent=fmt(js.kpi?.max_drawdown_pct)+"%";$("#tr").textContent=fmt(js.kpi?.trades);renderPairs(js.pairs||[]);log("report loaded");$("#st").textContent="ready"}catch(e){log("refresh error: "+e.message);$("#st").textContent="err"}}async function run(){try{$("#st").textContent="running...";const body={risk_pct:parseFloat($("#risk").value||"10"),floor_pct:parseFloat($("#floor").value||"25"),topn:parseInt($("#topn").value||"90",10),timeframe:$("#tf").value,aggregate:parseInt($("#agg").value||"1",10),rth_pct:parseFloat($("#rth").value||"0.35")};log("run: "+JSON.stringify(body));await j("/aquilatrader/api/backtest/run",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});log("run complete");await refresh()}catch(e){log("run error: "+e.message);$("#st").textContent="err"}}$("#lang").onclick=()=>{LANG=(LANG==="EN"?"FR":"EN");setLang()};$("#run").onclick=()=>run();$("#refresh").onclick=()=>refresh();setLang();refresh();</script></body></html>
+HTML
+
+# --- Backend (Node) + Python backtester ---
+say "Write backend..."
+cat >"$APP/server.js" <<'JS'
+"use strict";
+const http=require("http"),url=require("url"),fs=require("fs"),path=require("path");
+const {spawn}=require("child_process");
+
+const HOST=process.env.HOST||"127.0.0.1";
+const PORT=parseInt(process.env.PORT||"9697",10);
+const APP=__dirname;
+const PY=path.join(APP,"venv","bin","python3");
+const REPORT=path.join(APP,"report.json");
+const LOCK=path.join(APP,"RUNNING.lock");
+
+function send(res,code,obj,headers={}){
+  const b=Buffer.from(JSON.stringify(obj));
+  res.writeHead(code,Object.assign({"content-type":"application/json","content-length":b.length},headers));
+  res.end(b);
+}
+function readBody(req){
+  return new Promise((resolve,reject)=>{
+    let d=""; req.on("data",c=>{d+=c; if(d.length>2e6) req.destroy();});
+    req.on("end",()=>{try{resolve(d?JSON.parse(d):{});}catch(e){reject(e);} });
+  });
+}
+function runBacktest(params){
+  return new Promise((resolve,reject)=>{
+    if(fs.existsSync(LOCK)) return reject(new Error("Already running"));
+    fs.writeFileSync(LOCK,String(Date.now()));
+    const p=spawn(PY,[path.join(APP,"backtest.py"),JSON.stringify(params||{})],{stdio:["ignore","pipe","pipe"]});
+    let out="",err="";
+    p.stdout.on("data",c=>out+=c.toString());
+    p.stderr.on("data",c=>err+=c.toString());
+    p.on("close",(code)=>{
+      try{fs.unlinkSync(LOCK);}catch(_){}
+      if(code===0) resolve({ok:true,log:out.slice(-4000),err:err.slice(-4000)});
+      else reject(new Error("backtest failed code="+code+" | "+err.slice(-1200)));
+    });
+  });
+}
+
+const srv=http.createServer(async (req,res)=>{
+  const u=url.parse(req.url,true);
+  if(u.pathname==="/health") return send(res,200,{ok:true,service:"aquilatrader-safe",ts:new Date().toISOString()});
+  if(u.pathname==="/backtest/report"){
+    if(!fs.existsSync(REPORT)) return send(res,200,{ok:false,msg:"no report yet",kpi:{},pairs:[]});
+    try{const js=JSON.parse(fs.readFileSync(REPORT,"utf8")); return send(res,200,js);}catch(e){return send(res,500,{ok:false,error:String(e)});}
+  }
+  if(u.pathname==="/backtest/run" && req.method==="POST"){
+    try{
+      const body=await readBody(req);
+      const r=await runBacktest(body);
+      return send(res,200,{ok:true,result:r});
+    }catch(e){return send(res,500,{ok:false,error:String(e.message||e)});}
+  }
+  send(res,404,{ok:false,error:"not found"});
+});
+srv.listen(PORT,HOST,()=>console.log("API listening on http://"+HOST+":"+PORT));
+JS
+
+cat >"$APP/backtest.py" <<'PY'
+import json,sys,time,math,os,urllib.request
+from datetime import datetime,timezone
+
+DS_PROFILE_LATEST="https://api.dexscreener.com/token-profiles/latest/v1"
+DS_TOKEN="https://api.dexscreener.com/latest/dex/tokens/"
+GT_BASE="https://api.geckoterminal.com/api/v2"
+
+EXCLUDE_MINT="AhSGcUDNK2MKkWQe4Mz7rCPSyTJNxvtGCTuJnpUjpump"
+REPORT=os.path.join(os.path.dirname(__file__),"report.json")
+
+def jget(u,timeout=20):
+  req=urllib.request.Request(u,headers={"accept":"application/json","user-agent":"aquilatrader-safe/1.0"})
+  with urllib.request.urlopen(req,timeout=timeout) as r:
+    return json.load(r)
+
+def pick_best_pair(pairs):
+  best=None;bs=-1
+  for p in pairs or []:
+    liq=(p.get("liquidity") or {}).get("usd") or 0
+    v5=(p.get("volume") or {}).get("m5") or 0
+    tx5=((p.get("txns") or {}).get("m5") or {})
+    t=(tx5.get("buys") or 0)+(tx5.get("sells") or 0)
+    price=p.get("priceUsd")
+    try: price=float(price)
+    except: price=0
+    if price<=0: continue
+    s=(math.log10(1+liq)*3)+(math.log10(1+v5)*2)+(math.log10(1+t))
+    if s>bs: bs=s;best=p
+  return best
+
+def epoch_s(dtstr):
+  dt=datetime.fromisoformat(dtstr.replace("Z","+00:00"))
+  return int(dt.timestamp())
+
+def gt_ohlcv(network,pool,timeframe="day",aggregate=1,before_ts=None,limit=1000,currency="usd"):
+  # /networks/{network}/pools/{pool_address}/ohlcv/{timeframe}?aggregate=1&before_timestamp=...&limit=...
+  q=f"aggregate={int(aggregate)}&limit={int(limit)}&currency={currency}"
+  if before_ts is not None: q+=f"&before_timestamp={int(before_ts)}"
+  u=f"{GT_BASE}/networks/{network}/pools/{pool}/ohlcv/{timeframe}?{q}"
+  return jget(u,timeout=25)
+
+def clamp(x,a,b): return max(a,min(b,x))
+
+def backtest_one(candles, risk_pct, floor_pct, rth_pct):
+  # candles: list [ts, open, high, low, close, volume] (GeckoTerminal style)
+  # Strategy (executive simulation):
+  # - compute r = (c - prev_c)/prev_c
+  # - S = consecutive silence count where |r| <= rth
+  # - breakout: c > max(high last N) * (1+0.006) and S>=25 (scaled for day)
+  # - exit: stop -7.5% or take profits +12%, +25% staged (simplified)
+  # Fees (sim only): 2% + 4% of notional per trade
+  if not candles or len(candles)<80: return None
+  # sort ascending by ts
+  candles=sorted(candles,key=lambda x:x[0])
+  eq=100.0
+  peak=eq
+  maxdd=0.0
+  pos=0.0
+  entry=0.0
+  trades=0
+  wins=0
+  fees_total=0.0
+
+  # convert daily S threshold from microcap UI: keep same "25" notion as regime; for daily, use 10
+  S=0
+  N=20
+  buf=0.006
+  tp1=0.12
+  tp2=0.25
+  sl=0.075
+  tp1done=False
+
+  for i in range(1,len(candles)):
+    ts,op,hi,lo,cl,vol=candles[i]
+    _,_,_,_,prev, _ = candles[i-1]
+    if prev<=0: continue
+    r=(cl-prev)/prev*100.0
+    silent=abs(r)<=rth_pct
+    S=S+1 if silent else 0
+
+    # budget floor: if equity would drop below (100*(floor_pct/100)), disallow new entries
+    floor_eq=100.0*(floor_pct/100.0)
+    allow_new = eq>floor_eq
+
+    # rolling range high
+    if i>N:
+      hiN=max(c[2] for c in candles[i-N:i])
+    else:
+      hiN=max(c[2] for c in candles[:i])
+
+    if pos==0.0 and allow_new:
+      if S>=10 and cl>hiN*(1.0+buf) and r>0:  # day regime threshold
+        # enter with risk_pct of equity
+        notional=eq*(risk_pct/100.0)
+        fee = notional*(0.02+0.04) # 2% + 4% per trade
+        fees_total+=fee
+        notional-=fee
+        pos=notional/cl
+        entry=cl
+        tp1done=False
+        trades+=1
+    else:
+      # manage position
+      if entry>0:
+        ch=(cl-entry)/entry
+        if (not tp1done) and ch>=tp1:
+          # take half
+          sell_qty=pos*0.5
+          notional=sell_qty*cl
+          fee=notional*(0.02+0.04)
+          fees_total+=fee
+          eq += (notional-fee)
+          pos-=sell_qty
+          tp1done=True
+        elif tp1done and ch>=tp2:
+          # close rest (simplified)
+          notional=pos*cl
+          fee=notional*(0.02+0.04)
+          fees_total+=fee
+          eq += (notional-fee)
+          pos=0.0
+          wins += 1 if cl>entry else 0
+        elif ch<=-sl:
+          notional=pos*cl
+          fee=notional*(0.02+0.04)
+          fees_total+=fee
+          eq += (notional-fee)
+          pos=0.0
+
+    peak=max(peak,eq)
+    dd=(peak-eq)/peak*100.0
+    maxdd=max(maxdd,dd)
+
+  # close at end if open
+  if pos>0:
+    cl=candles[-1][4]
+    notional=pos*cl
+    fee=notional*(0.02+0.04)
+    fees_total+=fee
+    eq += (notional-fee)
+    wins += 1 if cl>entry else 0
+    trades += 0
+    pos=0.0
+
+  return {"net_pnl_usd":eq-100.0,"max_drawdown_pct":maxdd,"trades":trades,"wins":wins,"fees_total_usd":fees_total}
+
+def main():
+  params={}
+  if len(sys.argv)>1:
+    try: params=json.loads(sys.argv[1])
+    except: params={}
+  risk_pct=float(params.get("risk_pct",10))
+  floor_pct=float(params.get("floor_pct",25))
+  topn=int(params.get("topn",90))
+  timeframe=str(params.get("timeframe","day"))
+  aggregate=int(params.get("aggregate",1))
+  rth_pct=float(params.get("rth_pct",0.35))
+
+  # Backtest window 2022-01-01 to 2026-12-31 (inclusive)
+  start_ts=int(datetime(2022,1,1,tzinfo=timezone.utc).timestamp())
+  end_ts=int(datetime(2026,12,31,23,59,59,tzinfo=timezone.utc).timestamp())
+
+  # 1) DexScreener token profiles (solana), then resolve best pair per token (pairAddress)
+  prof=jget(DS_PROFILE_LATEST,timeout=20)
+  sol=[x for x in prof if str(x.get("chainId","")).lower()=="solana"]
+  mints=[]
+  for x in sol:
+    a=x.get("tokenAddress")
+    if not a or a==EXCLUDE_MINT: continue
+    mints.append(a)
+    if len(mints)>=max(10,min(250,topn)): break
+
+  pairs=[]
+  for a in mints:
+    try:
+      tok=jget(DS_TOKEN+a,timeout=20)
+      pair=pick_best_pair(tok.get("pairs") or [])
+      if not pair: continue
+      paddr=pair.get("pairAddress") or ""
+      sym=((pair.get("baseToken") or {}).get("symbol") or "")[:12]
+      url=pair.get("url") or ""
+      if paddr:
+        pairs.append({"pair":paddr,"sym":sym,"url":url})
+    except Exception:
+      continue
+
+  # 2) For each pair address, try GeckoTerminal OHLCV (treat pairAddress as pool address)
+  # Respect public rate limit ~30/min: do small set + backoff
+  used=[]
+  results=[]
+  kpi_acc={"net_pnl_usd":0.0,"max_drawdown_pct":0.0,"trades":0,"wins":0,"fees_total_usd":0.0,"tested_pools":0,"skipped":0}
+  tested=0
+
+  for i,p in enumerate(pairs[:min(len(pairs),60)]): # keep it sane under rate limit
+    pool=p["pair"]
+    ok=False
+    candles=[]
+    try:
+      before=end_ts
+      allc=[]
+      # paginate backwards: stop when oldest <= start_ts or no more
+      for _ in range(8):
+        js=gt_ohlcv("solana",pool,timeframe=timeframe,aggregate=aggregate,before_ts=before,limit=1000,currency="usd")
+        data=((js.get("data") or {}).get("attributes") or {}).get("ohlcv_list") or []
+        if not data: break
+        # GeckoTerminal returns newest->older; keep and move before
+        for row in data:
+          # row: [timestamp, open, high, low, close, volume]
+          if row and isinstance(row,list) and len(row)>=6:
+            ts=int(row[0])
+            if ts<start_ts: continue
+            if ts> end_ts: continue
+            allc.append([int(row[0]),float(row[1]),float(row[2]),float(row[3]),float(row[4]),float(row[5])])
+        oldest=min(int(r[0]) for r in data)
+        before=oldest-1
+        if before<=start_ts: break
+        time.sleep(2.2) # rate limit friendly
+      candles=allc
+      r=backtest_one(candles,risk_pct,floor_pct,rth_pct)
+      if r:
+        ok=True
+        tested+=1
+        kpi_acc["net_pnl_usd"]+=r["net_pnl_usd"]
+        kpi_acc["max_drawdown_pct"]=max(kpi_acc["max_drawdown_pct"],r["max_drawdown_pct"])
+        kpi_acc["trades"]+=r["trades"]
+        kpi_acc["wins"]+=r["wins"]
+        kpi_acc["fees_total_usd"]+=r["fees_total_usd"]
+        results.append({"pool":pool,"sym":p["sym"],"ok":True,"url":p["url"],"kpi":r,"candles":len(candles)})
+      else:
+        kpi_acc["skipped"]+=1
+        results.append({"pool":pool,"sym":p["sym"],"ok":False,"url":p["url"],"reason":"not enough candles"})
+    except Exception as e:
+      kpi_acc["skipped"]+=1
+      results.append({"pool":pool,"sym":p["sym"],"ok":False,"url":p["url"],"reason":str(e)[:180]})
+    # hard throttle
+    time.sleep(2.2)
+
+  kpi_acc["tested_pools"]=tested
+  winrate=(kpi_acc["wins"]/kpi_acc["trades"]*100.0) if kpi_acc["trades"]>0 else 0.0
+  kpi_acc["winrate_pct"]=winrate
+
+  out={
+    "ok":True,
+    "ts":datetime.now(timezone.utc).isoformat(),
+    "window":{"start":"2022-01-01","end":"2026-12-31"},
+    "params":{"risk_pct":risk_pct,"floor_pct":floor_pct,"topn":topn,"timeframe":timeframe,"aggregate":aggregate,"rth_pct":rth_pct},
+    "fees":{"per_trade":{"internal_invest_pct":2.0,"einshtein_improve_pct":4.0},"address":"ufii1UUsd1FM8ByD6XyvuamGhGjeJdTM7PAbrj4uZDj","note":"SAFE mode computes only; real trading engine would execute transfers."},
+    "kpi":kpi_acc,
+    "pairs":[{"pair":x.get("pool") or x.get("pair"),"sym":x.get("sym"),"ok":bool(x.get("ok")), "url":x.get("url","")} for x in results[:60]],
+    "details":results[:60]
+  }
+  with open(REPORT,"w",encoding="utf-8") as f:
+    json.dump(out,f,ensure_ascii=False,indent=2)
+  print("REPORT_WRITTEN",REPORT)
+  print("TESTED_POOLS",tested,"TRADES",kpi_acc["trades"],"NET_PNL",kpi_acc["net_pnl_usd"],"MAXDD",kpi_acc["max_drawdown_pct"],"FEES",kpi_acc["fees_total_usd"])
+  return 0
+
+if __name__=="__main__":
+  sys.exit(main())
+PY
+
+# --- Python venv ---
+say "Python venv..."
+python3 -m venv "$APP/venv" >>"$LOG" 2>&1
+"$APP/venv/bin/pip" -q install --upgrade pip >>"$LOG" 2>&1
+
+# --- systemd service ---
+say "Install systemd service..."
+cat >"$SVC" <<EOF
+[Unit]
+Description=AquilaTrader SAFE API (Backtest / Simulation)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=$APP
+Environment=HOST=$API_HOST
+Environment=PORT=$API_PORT
+ExecStart=/usr/bin/node $APP/server.js
+Restart=always
+RestartSec=2
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload >>"$LOG" 2>&1
+systemctl enable --now aquilatrader-safe.service >>"$LOG" 2>&1
+
+# --- nginx route include (idempotent) ---
+say "Configure nginx include..."
+cat >"$NGX_INC_FILE" <<'NGINX'
+# aquilatrader_routes.inc
+location ^~ /aquilatrader/api/ {
+  proxy_pass http://127.0.0.1:9697/;
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+}
+location ^~ /aquilatrader/ {
+  root /var/www;
+  index index.html;
+  try_files $uri $uri/ /aquilatrader/index.html;
+}
+NGINX
+
+# Ensure vhost includes it once
+if ! grep -q "aquilatrader_routes.inc" "$NGX_VHOST"; then
+  say "Inject include into vhost: $NGX_VHOST"
+  # insert near top of server { ... } block after first server {
+  perl -0777 -i -pe 's/(server\s*\{)/$1\n  include \/etc\/nginx\/includes\/aquilatrader_routes.inc;\n/s' "$NGX_VHOST"
+fi
+
+say "nginx -t + reload..."
+nginx -t >>"$LOG" 2>&1
+systemctl reload nginx >>"$LOG" 2>&1
+
+say "DONE"
+say "Public UI: https://www.fireinners.online/aquilatrader/"
+say "API health: https://www.fireinners.online/aquilatrader/api/health"
+say "Report: https://www.fireinners.online/aquilatrader/api/backtest/report"
+say "Log: $LOG"
