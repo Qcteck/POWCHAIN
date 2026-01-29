@@ -1,4 +1,4 @@
-cat >/root/MEGA_NDJSON_FIREINNERS_FIX_V2.sh <<'BASH'
+cat >/root/MEGA_NDJSON_ROUTE_HARDPATCH_V3.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 umask 022
@@ -6,23 +6,24 @@ TS="$(date +%Y%m%d_%H%M%S)"
 say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 die(){ say "ERROR: $*"; exit 1; }
 
-VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
 INC_DIR="/etc/nginx/includes"
 INC="$INC_DIR/ndjson_fireinners.inc"
 WWW_UI="/var/www/ndjson"
 WWW_DATA="/var/www/ndjson_data"
 TEST_ND="$WWW_DATA/events.ndjson"
-BK="/root/BK_NDJSON_FIX_${TS}"
+BK="/root/BK_NDJSON_V3_${TS}"
 
 say "Backup -> $BK"
 mkdir -p "$BK"
-cp -a "$VHOST" "$BK/$(basename "$VHOST")" 2>/dev/null || true
 cp -a /etc/nginx/nginx.conf "$BK/nginx.conf" 2>/dev/null || true
 cp -a "$INC_DIR" "$BK/includes" 2>/dev/null || true
+cp -a /etc/nginx/sites-available "$BK/sites-available" 2>/dev/null || true
+cp -a /etc/nginx/sites-enabled "$BK/sites-enabled" 2>/dev/null || true
 
 say "Unfreeze nginx (best-effort chattr -i)"
 chattr -i /etc/nginx/nginx.conf 2>/dev/null || true
-chattr -i "$VHOST" 2>/dev/null || true
+chattr -i /etc/nginx/sites-available/* 2>/dev/null || true
+chattr -i /etc/nginx/sites-enabled/* 2>/dev/null || true
 chattr -i "$INC_DIR"/*.inc 2>/dev/null || true
 
 say "Prepare dirs/files"
@@ -36,7 +37,6 @@ HTML
 fi
 
 touch "$TEST_ND"
-# append une ligne test si fichier vide
 if [ ! -s "$TEST_ND" ]; then
   printf '{"ts":"%s","src":"ndjson","event":"init","ok":true}\n' "$(date -Is)" >>"$TEST_ND"
 fi
@@ -45,11 +45,9 @@ chmod 644 "$TEST_ND" || true
 say "Write include: $INC"
 cat >"$INC" <<'NGINX'
 # --- NDJSON UI + DATA (Fireinners) ---
-# Safari/mobile safety: force trailing slash
 location = /ndjson { return 301 /ndjson/; }
 location = /data  { return 301 /data/; }
 
-# UI
 location ^~ /ndjson/ {
   alias /var/www/ndjson/;
   index index.html;
@@ -57,7 +55,6 @@ location ^~ /ndjson/ {
   add_header Cache-Control "no-store" always;
 }
 
-# NDJSON data
 location ^~ /data/ {
   alias /var/www/ndjson_data/;
   add_header Cache-Control "no-store" always;
@@ -66,43 +63,59 @@ location ^~ /data/ {
 NGINX
 chmod 644 "$INC"
 
-[ -f "$VHOST" ] || die "VHOST introuvable: $VHOST"
+say "Find ACTIVE HTTPS vhosts for fireinners.online"
+mapfile -t CANDS < <(
+  grep -RIl --include='*' -E 'server_name[^;]*fireinners\.online' /etc/nginx/sites-enabled /etc/nginx/sites-available 2>/dev/null \
+  | sort -u
+)
+[ "${#CANDS[@]}" -gt 0 ] || die "Aucun fichier nginx avec server_name fireinners.online trouvé."
 
-say "Ensure include is inside server{} of $VHOST (idempotent)"
-# 1) supprime toute ancienne ligne include ndjson_fireinners.inc
-sed -i '\|include[[:space:]]\+etc/nginx/includes/ndjson_fireinners\.inc;|d' "$VHOST"
+# garde seulement ceux qui ont listen 443 (ssl ou http2) OU ceux de sites-enabled (priorité)
+TARGETS=()
+for f in "${CANDS[@]}"; do
+  if grep -Eq 'listen[[:space:]]+443' "$f"; then
+    TARGETS+=("$f")
+  fi
+done
+if [ "${#TARGETS[@]}" -eq 0 ]; then
+  # fallback: patch tout ce qui match server_name
+  TARGETS=("${CANDS[@]}")
+fi
 
-# 2) injecte juste après l'ouverture du premier server { (dans ce vhost)
-#    (ça garantit que les 'location =' et 'location ^~' sont bien dans server{})
-awk -v inc="    include etc/nginx/includes/ndjson_fireinners.inc;" '
-BEGIN{done=0}
-{
-  print
-  if(!done && $0 ~ /^[[:space:]]*server[[:space:]]*\{[[:space:]]*$/){
-    print inc
-    done=1
-  }
-}
-END{
-  if(!done){ exit 2 }
-}' "$VHOST" >"$VHOST.tmp" || die "Injection awk a échoué"
-mv "$VHOST.tmp" "$VHOST"
+say "Targets:"
+for f in "${TARGETS[@]}"; do echo " - $f"; done
+
+say "Inject include into each target server{} (idempotent)"
+for f in "${TARGETS[@]}"; do
+  # remove any old include line
+  sed -i '\|include[[:space:]]\+etc/nginx/includes/ndjson_fireinners\.inc;|d' "$f" || true
+
+  # inject after first 'server {' occurrence
+  awk -v inc="    include etc/nginx/includes/ndjson_fireinners.inc;" '
+  BEGIN{done=0}
+  {print}
+  (!done && $0 ~ /^[[:space:]]*server[[:space:]]*\{[[:space:]]*$/){ print inc; done=1 }
+  END{ if(!done) exit 3 }' "$f" >"$f.tmp" || die "Injection échouée dans $f"
+  mv "$f.tmp" "$f"
+done
 
 say "Test + reload nginx"
 nginx -t
 systemctl reload nginx
 
-say "Refreeze nginx (best-effort chattr +i)"
-chattr +i "$VHOST" 2>/dev/null || true
-chattr +i /etc/nginx/nginx.conf 2>/dev/null || true
+say "Quick tests (origin, bypass Cloudflare using --resolve)"
+# --resolve force DNS to 127.0.0.1 locally (origin direct), so we know nginx routing is correct
+echo "== ORIGIN /ndjson (should be 301) =="
+curl -skI --resolve fireinners.online:443:127.0.0.1 https://fireinners.online/ndjson | head -n 20 || true
+echo "== ORIGIN /ndjson/ (should be 200) =="
+curl -skI --resolve fireinners.online:443:127.0.0.1 https://fireinners.online/ndjson/ | head -n 20 || true
+echo "== ORIGIN /data/events.ndjson (should output JSON line) =="
+curl -sk --resolve fireinners.online:443:127.0.0.1 https://fireinners.online/data/events.ndjson | head -n 3 || true
 
-say "Quick tests (server-side)"
-echo "== curl /ndjson (headers) =="
-curl -sI https://fireinners.online/ndjson | head -n 20 || true
-echo "== curl /ndjson/ (status line) =="
-curl -sI https://fireinners.online/ndjson/ | head -n 5 || true
-echo "== curl /data/events.ndjson (first lines) =="
-curl -s https://fireinners.online/data/events.ndjson | head -n 5 || true
+say "Refreeze nginx (best-effort chattr +i)"
+chattr +i /etc/nginx/nginx.conf 2>/dev/null || true
+chattr +i /etc/nginx/sites-available/* 2>/dev/null || true
+chattr +i /etc/nginx/sites-enabled/* 2>/dev/null || true
 
 say "DONE."
 say "UI:   https://fireinners.online/ndjson/"
@@ -110,4 +123,4 @@ say "DATA: https://fireinners.online/data/events.ndjson"
 say "Backup: $BK"
 BASH
 
-bash /root/MEGA_NDJSON_FIREINNERS_FIX_V2.sh |& tee /root/MEGA_NDJSON_FIREINNERS_FIX_V2.log
+bash /root/MEGA_NDJSON_ROUTE_HARDPATCH_V3.sh |& tee /root/MEGA_NDJSON_ROUTE_HARDPATCH_V3.log
