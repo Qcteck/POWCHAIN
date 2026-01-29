@@ -1,90 +1,146 @@
-cat >/root/MEGA_FIX_AQUILATRADER_ROUTES_GHOST.sh <<'BASH'
+cat >/root/MEGA_ENABLE_AQUILATRADER_BACKEND_HUB.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 umask 022
 
 TS="$(date +%Y%m%d_%H%M%S)"
-BK="/root/BK_NGINX_AQUILA_GHOST_$TS"
+BK="/root/BK_AQUILA_HUB_$TS"
 mkdir -p "$BK"
 
 say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 
+NGX_VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
 INC_DIR="/etc/nginx/includes"
-GHOST="$INC_DIR/aquilatrader_routes.inc"
-CANON="$INC_DIR/aquilatrader.inc"
-WWW="/var/www/aquilatrader"
-IDX="$WWW/index.html"
+INC_FILE="$INC_DIR/wolverine_traderone_proxy.inc"
 
-say "Backup /etc/nginx (full)..."
-cp -a /etc/nginx "$BK/etc_nginx" 2>/dev/null || true
+APP_DIR="/opt/aquilatrader-hub"
+APP_JS="$APP_DIR/server.js"
+SVC="/etc/systemd/system/aquilatrader-hub.service"
 
-say "Unfreeze nginx files (best effort)..."
+say "Backup nginx + systemd..."
+cp -a "$NGX_VHOST" "$BK/" 2>/dev/null || true
+cp -a "$INC_DIR" "$BK/includes" 2>/dev/null || true
+cp -a "$SVC" "$BK/" 2>/dev/null || true
+
+say "Install Node if missing (best effort)..."
+if ! command -v node >/dev/null 2>&1; then
+  apt-get update -y
+  apt-get install -y ca-certificates curl
+  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+  apt-get install -y nodejs
+fi
+
+say "Create backend hub..."
+mkdir -p "$APP_DIR"
+cat >"$APP_JS" <<'JS'
+"use strict";
+const http=require("http");
+const url=require("url");
+const PORT=3000;
+
+function json(res,code,obj){
+  const b=Buffer.from(JSON.stringify(obj));
+  res.writeHead(code,{
+    "content-type":"application/json; charset=utf-8",
+    "cache-control":"no-store",
+    "content-length":String(b.length),
+  });
+  res.end(b);
+}
+
+function notFound(res){ json(res,404,{ok:false,error:"NOT_FOUND"}); }
+
+const srv=http.createServer(async (req,res)=>{
+  const u=url.parse(req.url,true);
+  const p=u.pathname||"/";
+
+  // health
+  if(p==="/api/health") return json(res,200,{ok:true,service:"aquilatrader-hub",part:"api"});
+  if(p==="/vault/health") return json(res,200,{ok:true,service:"aquilatrader-hub",part:"vault"});
+
+  // simple POST handlers (safe dummies)
+  if(req.method==="POST" && p==="/api/start") return json(res,200,{ok:true,action:"start",note:"dummy-safe"});
+  if(req.method==="POST" && p==="/api/stop") return json(res,200,{ok:true,action:"stop",note:"dummy-safe"});
+  if(req.method==="POST" && p==="/api/withdraw") return json(res,200,{ok:true,action:"withdraw",note:"dummy-safe"});
+
+  // optional: echo
+  if(p==="/api/info") return json(res,200,{ok:true,ts:Date.now(),ip:req.socket.remoteAddress});
+
+  return notFound(res);
+});
+
+srv.listen(PORT,"127.0.0.1",()=>console.log("aquilatrader-hub listening on 127.0.0.1:"+PORT));
+JS
+chmod 755 "$APP_JS"
+
+say "Create systemd service..."
+cat >"$SVC" <<EOF
+[Unit]
+Description=AquilaTrader Hub API (API+VAULT)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=$APP_DIR
+ExecStart=$(command -v node) $APP_JS
+Restart=always
+RestartSec=1
+User=root
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+say "Enable + start service..."
+systemctl daemon-reload
+systemctl enable --now aquilatrader-hub.service
+
+say "Unfreeze nginx (best effort)..."
+chattr -i "$NGX_VHOST" 2>/dev/null || true
 chattr -i /etc/nginx/nginx.conf 2>/dev/null || true
-chattr -i /etc/nginx/sites-available/* 2>/dev/null || true
-chattr -i /etc/nginx/sites-enabled/* 2>/dev/null || true
-chattr -i /etc/nginx/conf.d/* 2>/dev/null || true
-chattr -i /etc/nginx/includes/*.inc 2>/dev/null || true
+chattr -i "$INC_DIR"/*.inc 2>/dev/null || true
 
-say "Ensure /etc/nginx/includes exists..."
-mkdir -p "$INC_DIR"
-
-say "1) Create the missing include file (hard stop for 'No such file' forever)..."
-cat >"$GHOST" <<'NGINX'
-# AQUILATRADER_ROUTES_GHOST_FILE
-# This file exists to prevent nginx failing on missing include.
-# Real routing is in /etc/nginx/includes/aquilatrader.inc
-NGINX
-chmod 0644 "$GHOST" || true
-
-say "2) Purge any reference to aquilatrader_routes.inc across ALL nginx configs..."
-# Remove every line containing aquilatrader_routes.inc anywhere under /etc/nginx
-# (sites-available, sites-enabled, nginx.conf, includes, conf.d, snippets, etc.)
-grep -RIl --exclude-dir='.git' 'aquilatrader_routes\.inc' /etc/nginx 2>/dev/null | while read -r f; do
-  sed -i '\|aquilatrader_routes\.inc|d' "$f" || true
-done
-
-say "Ensure AquilaTrader canonical route include exists..."
-if [ ! -f "$CANON" ]; then
-  cat >"$CANON" <<'NGINX'
-# AQUILATRADER_CANONICAL_FINAL
-location = /aquilatrader { return 301 /aquilatrader/; }
-location ^~ /aquilatrader/ {
-    alias /var/www/aquilatrader/;
-    try_files $uri $uri/ /index.html;
+say "Write nginx proxy include for traderone endpoints..."
+cat >"$INC_FILE" <<'NGINX'
+# WOLVERINE_TRADERONE_PROXY_V1
+location ^~ /wolverine/traderone/api/ {
+    proxy_pass http://127.0.0.1:3000/api/;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    add_header Cache-Control "no-store" always;
+}
+location ^~ /wolverine/traderone/vault/ {
+    proxy_pass http://127.0.0.1:3000/vault/;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     add_header Cache-Control "no-store" always;
 }
 NGINX
-  chmod 0644 "$CANON" || true
-fi
+chmod 644 "$INC_FILE"
 
-say "Ensure /var/www/aquilatrader exists with an index.html..."
-mkdir -p "$WWW"
-if [ ! -f "$IDX" ]; then
-  cat >"$IDX" <<'HTML'
-<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AquilaTrader</title></head><body style="margin:0;font-family:system-ui;background:#070a10;color:#d7e3ff;display:flex;min-height:100vh;align-items:center;justify-content:center"><div><h1 style="margin:0 0 8px">AquilaTrader</h1><div style="opacity:.75">Route /aquilatrader/ en service.</div></div></body></html>
-HTML
-  chmod 0644 "$IDX" || true
-fi
-chown -R www-data:www-data "$WWW" 2>/dev/null || true
-
-say "Ensure vhost includes aquilatrader.inc (inject into fireinners.online-ssl if present)..."
-VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
-if [ -f "$VHOST" ]; then
-  grep -q "include /etc/nginx/includes/aquilatrader.inc;" "$VHOST" 2>/dev/null || \
-  sed -i '/server\s*{/a\    include /etc/nginx/includes/aquilatrader.inc;' "$VHOST"
-fi
+say "Ensure include is loaded in vhost..."
+grep -q "wolverine_traderone_proxy.inc" "$NGX_VHOST" || \
+sed -i '/server\s*{/a\    include /etc/nginx/includes/wolverine_traderone_proxy.inc;' "$NGX_VHOST"
 
 say "Test + reload nginx..."
 nginx -t
 systemctl reload nginx
 
-say "Refreeze core files (best effort)..."
+say "Refreeze (best effort)..."
+chattr +i "$NGX_VHOST" 2>/dev/null || true
 chattr +i /etc/nginx/nginx.conf 2>/dev/null || true
-[ -f "$VHOST" ] && chattr +i "$VHOST" 2>/dev/null || true
 
-say "DONE. AquilaTrader should be reachable at: https://fireinners.online/aquilatrader/"
+say "DONE."
+say "Backend: 127.0.0.1:3000"
+say "Health API:  https://fireinners.online/wolverine/traderone/api/health"
+say "Health VAULT:https://fireinners.online/wolverine/traderone/vault/health"
 say "Backup: $BK"
 BASH
 
-chmod +x /root/MEGA_FIX_AQUILATRADER_ROUTES_GHOST.sh
-bash /root/MEGA_FIX_AQUILATRADER_ROUTES_GHOST.sh |& tee /root/MEGA_FIX_AQUILATRADER_ROUTES_GHOST.log
+chmod +x /root/MEGA_ENABLE_AQUILATRADER_BACKEND_HUB.sh
+bash /root/MEGA_ENABLE_AQUILATRADER_BACKEND_HUB.sh |& tee /root/MEGA_ENABLE_AQUILATRADER_BACKEND_HUB.log
