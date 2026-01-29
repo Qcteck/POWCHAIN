@@ -1,146 +1,64 @@
-cat >/root/MEGA_ENABLE_AQUILATRADER_BACKEND_HUB.sh <<'BASH'
+cat >/root/FIX_AQUILATRADER_405_POST.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
-umask 022
 
-TS="$(date +%Y%m%d_%H%M%S)"
-BK="/root/BK_AQUILA_HUB_$TS"
-mkdir -p "$BK"
+INC="/etc/nginx/includes/wolverine_traderone_proxy.inc"
+VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
 
-say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
-
-NGX_VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
-INC_DIR="/etc/nginx/includes"
-INC_FILE="$INC_DIR/wolverine_traderone_proxy.inc"
-
-APP_DIR="/opt/aquilatrader-hub"
-APP_JS="$APP_DIR/server.js"
-SVC="/etc/systemd/system/aquilatrader-hub.service"
-
-say "Backup nginx + systemd..."
-cp -a "$NGX_VHOST" "$BK/" 2>/dev/null || true
-cp -a "$INC_DIR" "$BK/includes" 2>/dev/null || true
-cp -a "$SVC" "$BK/" 2>/dev/null || true
-
-say "Install Node if missing (best effort)..."
-if ! command -v node >/dev/null 2>&1; then
-  apt-get update -y
-  apt-get install -y ca-certificates curl
-  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-  apt-get install -y nodejs
-fi
-
-say "Create backend hub..."
-mkdir -p "$APP_DIR"
-cat >"$APP_JS" <<'JS'
-"use strict";
-const http=require("http");
-const url=require("url");
-const PORT=3000;
-
-function json(res,code,obj){
-  const b=Buffer.from(JSON.stringify(obj));
-  res.writeHead(code,{
-    "content-type":"application/json; charset=utf-8",
-    "cache-control":"no-store",
-    "content-length":String(b.length),
-  });
-  res.end(b);
-}
-
-function notFound(res){ json(res,404,{ok:false,error:"NOT_FOUND"}); }
-
-const srv=http.createServer(async (req,res)=>{
-  const u=url.parse(req.url,true);
-  const p=u.pathname||"/";
-
-  // health
-  if(p==="/api/health") return json(res,200,{ok:true,service:"aquilatrader-hub",part:"api"});
-  if(p==="/vault/health") return json(res,200,{ok:true,service:"aquilatrader-hub",part:"vault"});
-
-  // simple POST handlers (safe dummies)
-  if(req.method==="POST" && p==="/api/start") return json(res,200,{ok:true,action:"start",note:"dummy-safe"});
-  if(req.method==="POST" && p==="/api/stop") return json(res,200,{ok:true,action:"stop",note:"dummy-safe"});
-  if(req.method==="POST" && p==="/api/withdraw") return json(res,200,{ok:true,action:"withdraw",note:"dummy-safe"});
-
-  // optional: echo
-  if(p==="/api/info") return json(res,200,{ok:true,ts:Date.now(),ip:req.socket.remoteAddress});
-
-  return notFound(res);
-});
-
-srv.listen(PORT,"127.0.0.1",()=>console.log("aquilatrader-hub listening on 127.0.0.1:"+PORT));
-JS
-chmod 755 "$APP_JS"
-
-say "Create systemd service..."
-cat >"$SVC" <<EOF
-[Unit]
-Description=AquilaTrader Hub API (API+VAULT)
-After=network.target
-
-[Service]
-Type=simple
-WorkingDirectory=$APP_DIR
-ExecStart=$(command -v node) $APP_JS
-Restart=always
-RestartSec=1
-User=root
-Environment=NODE_ENV=production
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-say "Enable + start service..."
-systemctl daemon-reload
-systemctl enable --now aquilatrader-hub.service
-
-say "Unfreeze nginx (best effort)..."
-chattr -i "$NGX_VHOST" 2>/dev/null || true
+echo "== UNFREEZE =="
+chattr -i "$INC" 2>/dev/null || true
+chattr -i "$VHOST" 2>/dev/null || true
 chattr -i /etc/nginx/nginx.conf 2>/dev/null || true
-chattr -i "$INC_DIR"/*.inc 2>/dev/null || true
 
-say "Write nginx proxy include for traderone endpoints..."
-cat >"$INC_FILE" <<'NGINX'
-# WOLVERINE_TRADERONE_PROXY_V1
+echo "== WRITE POST-SAFE PROXY =="
+cat >"$INC" <<'NGINX'
+# WOLVERINE_TRADERONE_PROXY_V2_POST_SAFE
+
+# API
 location ^~ /wolverine/traderone/api/ {
     proxy_pass http://127.0.0.1:3000/api/;
     proxy_http_version 1.1;
+
     proxy_set_header Host $host;
     proxy_set_header X-Real-IP $remote_addr;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+
+    # Allow all methods
+    proxy_method $request_method;
+    proxy_pass_request_body on;
+    proxy_set_header Content-Length $content_length;
+
     add_header Cache-Control "no-store" always;
 }
+
+# VAULT
 location ^~ /wolverine/traderone/vault/ {
     proxy_pass http://127.0.0.1:3000/vault/;
     proxy_http_version 1.1;
+
     proxy_set_header Host $host;
     proxy_set_header X-Real-IP $remote_addr;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+
+    proxy_method $request_method;
+    proxy_pass_request_body on;
+    proxy_set_header Content-Length $content_length;
+
     add_header Cache-Control "no-store" always;
 }
 NGINX
-chmod 644 "$INC_FILE"
 
-say "Ensure include is loaded in vhost..."
-grep -q "wolverine_traderone_proxy.inc" "$NGX_VHOST" || \
-sed -i '/server\s*{/a\    include /etc/nginx/includes/wolverine_traderone_proxy.inc;' "$NGX_VHOST"
-
-say "Test + reload nginx..."
+echo "== TEST + RELOAD =="
 nginx -t
 systemctl reload nginx
 
-say "Refreeze (best effort)..."
-chattr +i "$NGX_VHOST" 2>/dev/null || true
+echo "== REFREEZE =="
+chattr +i "$INC" 2>/dev/null || true
+chattr +i "$VHOST" 2>/dev/null || true
 chattr +i /etc/nginx/nginx.conf 2>/dev/null || true
 
-say "DONE."
-say "Backend: 127.0.0.1:3000"
-say "Health API:  https://fireinners.online/wolverine/traderone/api/health"
-say "Health VAULT:https://fireinners.online/wolverine/traderone/vault/health"
-say "Backup: $BK"
+echo "== DONE: POST ENABLED =="
 BASH
 
-chmod +x /root/MEGA_ENABLE_AQUILATRADER_BACKEND_HUB.sh
-bash /root/MEGA_ENABLE_AQUILATRADER_BACKEND_HUB.sh |& tee /root/MEGA_ENABLE_AQUILATRADER_BACKEND_HUB.log
+chmod +x /root/FIX_AQUILATRADER_405_POST.sh
+bash /root/FIX_AQUILATRADER_405_POST.sh |& tee /root/FIX_AQUILATRADER_405_POST.log
