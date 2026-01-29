@@ -1,129 +1,33 @@
-cat >/root/MEGA_NDJSON_TRADERONE_ALGO.sh <<'BASH'
+cat >/root/FIX_NDJSON_SLASH_REDIRECT.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
-umask 022
-export DEBIAN_FRONTEND=noninteractive
-TS="$(date +%Y%m%d_%H%M%S)"
-say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
-die(){ say "ERROR: $*"; exit 1; }
 
-# --- paths (Fireinners) ---
-VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
-INC_DIR="/etc/nginx/includes"
-HTTP_CONFD="/etc/nginx/conf.d"
-DATA_DIR="/var/www/ndjson_data"
-UI_DIR="/var/www/ndjson"
-NDJSON_FILE="$DATA_DIR/events.ndjson"
-FMT_CONF="$HTTP_CONFD/ndjson_logformat.conf"
-ACCESS_INC="$INC_DIR/ndjson_access.inc"
+INC="/etc/nginx/includes/ndjson_fireinners.inc"
+NGX="/etc/nginx/nginx.conf"
 
-# --- pick an include that contains the /wolverine/traderone/ location ---
-CANDIDATES=(
-  "$INC_DIR/wolverine_api_priority.inc"
-  "$INC_DIR/wolverine.inc"
-  "$INC_DIR/wolverine_static.inc"
-  "$INC_DIR/wolverine_routes.inc"
-)
-TARGET_INC=""
-for f in "${CANDIDATES[@]}"; do
-  if [ -f "$f" ] && grep -qE 'location\s+\^~\s+/wolverine/traderone/' "$f"; then TARGET_INC="$f"; break; fi
-done
-# fallback: search any include
-if [ -z "${TARGET_INC}" ]; then
-  while IFS= read -r f; do
-    if grep -qE 'location\s+\^~\s+/wolverine/traderone/' "$f"; then TARGET_INC="$f"; break; fi
-  done < <(ls -1 "$INC_DIR"/*.inc 2>/dev/null || true)
-fi
-[ -n "${TARGET_INC}" ] || die "Impossible de trouver le bloc nginx 'location ^~ /wolverine/traderone/' dans $INC_DIR/*.inc"
+echo "[1/4] Unfreeze nginx (best effort)..."
+chattr -i "$NGX" 2>/dev/null || true
+chattr -i /etc/nginx/includes/*.inc 2>/dev/null || true
 
-BK="/root/BK_NDJSON_TRADERONE_${TS}"
-mkdir -p "$BK"
-say "Backup -> $BK"
-cp -a "$VHOST" "$BK/$(basename "$VHOST")" 2>/dev/null || true
-cp -a /etc/nginx/nginx.conf "$BK/nginx.conf" 2>/dev/null || true
-cp -a "$INC_DIR" "$BK/includes" 2>/dev/null || true
+echo "[2/4] Patch ndjson include (slash redirect)..."
+cat >>"$INC" <<'NGINX'
 
-say "Unfreeze nginx (best effort chattr -i)..."
-chattr -i /etc/nginx/nginx.conf 2>/dev/null || true
-chattr -i "$VHOST" 2>/dev/null || true
-chattr -i "$INC_DIR"/*.inc 2>/dev/null || true
-chattr -i "$HTTP_CONFD"/*.conf 2>/dev/null || true
+# --- NDJSON slash safety (mobile / Safari) ---
+location = /ndjson {
+  return 301 /ndjson/;
+}
+location = /data {
+  return 301 /data/;
+}
+NGINX
 
-say "Prepare NDJSON dirs/files..."
-mkdir -p "$DATA_DIR" "$UI_DIR"
-touch "$NDJSON_FILE"
-chmod 755 "$DATA_DIR" "$UI_DIR"
-chmod 644 "$NDJSON_FILE"
-# nginx user needs write
-chown -R www-data:www-data "$DATA_DIR" 2>/dev/null || true
-
-say "Write NDJSON log_format in http context..."
-mkdir -p "$HTTP_CONFD"
-cat >"$FMT_CONF" <<'NG'
-# NDJSON access logs (one JSON per line) for fireinners.online
-# NOTE: log_format must be in http {} context -> /etc/nginx/conf.d/*.conf is ok
-log_format ndjson escape=json
-  '{'
-    '"ts":"$time_iso8601",'
-    '"host":"$host",'
-    '"remote":"$remote_addr",'
-    '"xff":"$http_x_forwarded_for",'
-    '"method":"$request_method",'
-    '"uri":"$uri",'
-    '"args":"$args",'
-    '"status":$status,'
-    '"bytes":$body_bytes_sent,'
-    '"rt":$request_time,'
-    '"ua":"$http_user_agent"'
-  '}';
-NG
-chmod 644 "$FMT_CONF"
-
-say "Write access_log snippet (no location here, only directives)..."
-cat >"$ACCESS_INC" <<NG
-# Injected access logging for TraderOne endpoints -> NDJSON
-access_log $NDJSON_FILE ndjson buffer=32k flush=1s;
-add_header Cache-Control "no-store" always;
-NG
-chmod 644 "$ACCESS_INC"
-
-say "Inject include into target location block once (idempotent)..."
-# If already included anywhere in that file, skip.
-if grep -qF "include $ACCESS_INC;" "$TARGET_INC"; then
-  say "Already present in: $TARGET_INC"
-else
-  # insert right after the 'location ^~ /wolverine/traderone/' line
-  TMP="$(mktemp)"
-  awk -v inc="include $ACCESS_INC;" '
-    BEGIN{done=0}
-    {
-      print
-      if(!done && $0 ~ /location[[:space:]]+\^~[[:space:]]+\/wolverine\/traderone\//){
-        print "    " inc
-        done=1
-      }
-    }
-  ' "$TARGET_INC" >"$TMP"
-  mv "$TMP" "$TARGET_INC"
-  say "Injected into: $TARGET_INC"
-fi
-
-say "Nginx test + reload..."
+echo "[3/4] Test nginx..."
 nginx -t
+
+echo "[4/4] Reload nginx..."
 systemctl reload nginx
 
-say "Refreeze nginx (best effort chattr +i)..."
-chattr +i "$VHOST" 2>/dev/null || true
-chattr +i /etc/nginx/nginx.conf 2>/dev/null || true
-
-say "DONE"
-say "NDJSON live (our algo via endpoints): https://fireinners.online/data/events.ndjson"
-say "Viewer: https://fireinners.online/ndjson/"
-say "Target include patched: $TARGET_INC"
-say "Backup: $BK"
-say "Quick test (server-side):"
-say "  curl -sS https://fireinners.online/wolverine/traderone/api/health >/dev/null || true"
-say "  tail -n 5 $NDJSON_FILE || true"
+echo "DONE: NDJSON slash redirect fixed"
 BASH
 
-bash /root/MEGA_NDJSON_TRADERONE_ALGO.sh |& tee /root/MEGA_NDJSON_TRADERONE_ALGO.log
+bash /root/FIX_NDJSON_SLASH_REDIRECT.sh |& tee /root/FIX_NDJSON_SLASH_REDIRECT.log
