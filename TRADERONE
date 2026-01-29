@@ -1,2 +1,440 @@
-touch /opt/einshtein-solana/ARM_ON
+cat >/root/MEGA_EINSHSTEIN_SOLANA_1234_V1.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+umask 022
+export DEBIAN_FRONTEND=noninteractive
+
+say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
+die(){ say "ERROR: $*"; exit 1; }
+REQ(){ command -v "$1" >/dev/null 2>&1 || die "Missing: $1"; }
+
+REQ nginx; REQ node; REQ npm; REQ systemctl; REQ curl
+
+TS="$(date +%Y%m%d_%H%M%S)"
+BK="/root/BK_EINSHSTEIN_1234_${TS}"
+mkdir -p "$BK"
+
+APP="/opt/einshtein-solana"
+DATA="/var/www/ndjson_data"
+ND="$DATA/events.ndjson"
+CFG="$APP/config.json"
+WATCH="$APP/watchlist.json"
+SVC="/etc/systemd/system/einshtein-solana.service"
+
+ARM="$APP/ARM_ON"
+EXEC="$APP/EXEC_ON"   # <- sécurité: ARM = prêt / EXEC = autorise réellement les appels TraderOne
+
+say "== BACKUP =="
+mkdir -p "$BK/app" "$BK/www" "$BK/systemd"
+[ -d "$APP" ] && cp -a "$APP" "$BK/app/" || true
+[ -d "$DATA" ] && cp -a "$DATA" "$BK/www/" || true
+[ -f "$SVC" ] && cp -a "$SVC" "$BK/systemd/" || true
+
+say "== DIRS =="
+mkdir -p "$APP" "$DATA"
+touch "$ND"
+chmod 755 "$APP" "$DATA"
+chmod 644 "$ND"
+
+say "== DEFAULT watchlist (idempotent) =="
+if [ ! -f "$WATCH" ]; then
+  cat >"$WATCH" <<'JSON'
+{"mints":["AhSGcUDNK2MKkWQe4Mz7rCPSyTJNxvtGCTuJnpUjpump"]}
+JSON
+fi
+
+say "== CONFIG (merge-safe) =="
+if [ ! -f "$CFG" ]; then
+  cat >"$CFG" <<'JSON'
+{
+  "poll_ms": 20000,
+  "universe_top": 120,
+  "min_liq_usd": 25000,
+  "min_vol5_usd": 5000,
+  "min_tx5": 10,
+  "max_spread_est": 0.05,
+
+  "zoneA_dd_min": -0.15,
+  "zoneA_dd_max": -0.08,
+  "tp1": 0.06,
+  "tp2": 0.09,
+  "tp3": 0.12,
+
+  "ndjson_path": "/var/www/ndjson_data/events.ndjson",
+
+  "dex_profiles_latest": "https://api.dexscreener.com/token-profiles/latest/v1",
+  "dex_token": "https://api.dexscreener.com/latest/dex/tokens/",
+
+  "jup_quote": "https://quote-api.jup.ag/v6/quote",
+  "usdc_mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1",
+  "quote_amount_usdc": 10000000,
+
+  "coingecko_simple": "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,solana&vs_currencies=usd",
+
+  "traderone_api_local": "http://127.0.0.1:3000",
+  "traderone_api_public": "https://fireinners.online/wolverine/traderone/api",
+
+  "max_positions": 3,
+  "base_budget_usd": 50,
+  "cluster_caps": {"tiny":1,"small":1,"mid":1},
+  "execute_enabled": false
+}
+JSON
+fi
+
+say "== WRITE Einshtein 1-2-3-4 server.js =="
+cat >"$APP/server.js" <<'JS'
+"use strict";
+const fs=require("fs");
+
+const APP="/opt/einshtein-solana";
+const cfgPath=APP+"/config.json";
+const watchPath=APP+"/watchlist.json";
+const armFlag=APP+"/ARM_ON";
+const execFlag=APP+"/EXEC_ON";
+const statePath=APP+"/state.json";
+const memPath=APP+"/market_memory.json";
+
+const nowISO=()=>new Date().toISOString();
+const jread=(p,fb)=>{try{return JSON.parse(fs.readFileSync(p,"utf8"));}catch(e){return fb;}};
+const jwrite=(p,o)=>fs.writeFileSync(p,JSON.stringify(o,null,2));
+const append=(cfg,obj)=>{try{fs.appendFileSync(cfg.ndjson_path,JSON.stringify({ts:nowISO(),...obj})+"\n");}catch(e){}};
+
+const clamp=(x,a,b)=>Math.max(a,Math.min(b,x));
+const safeNum=(x)=>{const n=Number(x);return Number.isFinite(n)?n:null;};
+const pct=(a,b)=>{a=safeNum(a);b=safeNum(b);if(a===null||b===null||b===0)return null;return (a-b)/b;};
+
+async function fetchJson(url,ms=10000){
+  const ac=new AbortController(); const t=setTimeout(()=>ac.abort(),ms);
+  try{
+    const r=await fetch(url,{signal:ac.signal,headers:{"user-agent":"einshtein-solana/1234"}});
+    const txt=await r.text();
+    let js=null; try{js=JSON.parse(txt);}catch(e){}
+    return {ok:r.ok,status:r.status,js,txt};
+  }catch(e){return {ok:false,status:0,js:null,txt:String(e)};}
+  finally{clearTimeout(t);}
+}
+
+function ewma(prev,val,alpha){
+  if(prev===null||prev===undefined||!Number.isFinite(prev)) return val;
+  return alpha*val + (1-alpha)*prev;
+}
+
+function spreadEst(liq){
+  liq=safeNum(liq)||0;
+  const lf=clamp(liq/80000,0,1);
+  return 0.006 + 0.02*(1-lf); // proxy
+}
+
+function pickBestPair(pairs){
+  let best=null,bs=-1;
+  for(const p of pairs||[]){
+    const liq=safeNum(p?.liquidity?.usd)||0;
+    const v5=safeNum(p?.volume?.m5)||0;
+    const tx5=(p?.txns?.m5?.buys||0)+(p?.txns?.m5?.sells||0);
+    const px=safeNum(p?.priceUsd);
+    if(!px||px<=0) continue;
+    const s=(Math.log10(1+liq)*3)+(Math.log10(1+v5)*2)+(Math.log10(1+tx5));
+    if(s>bs){bs=s;best=p;}
+  }
+  return best;
+}
+
+function clusterOf(liq){
+  if(liq>=250000) return "mid";
+  if(liq>=80000) return "small";
+  return "tiny";
+}
+
+function canExecute(cfg){
+  const armed=fs.existsSync(armFlag);
+  const exec=fs.existsSync(execFlag);
+  return Boolean(armed && exec && cfg.execute_enabled);
+}
+
+async function macro(cfg,STATE){
+  const r=await fetchJson(cfg.coingecko_simple,8000);
+  if(!r.ok||!r.js) return null;
+  const btc=safeNum(r.js?.bitcoin?.usd);
+  const sol=safeNum(r.js?.solana?.usd);
+  if(!btc||!sol) return null;
+
+  const prev=STATE.macro||{};
+  const btcCh=prev.btc? (btc-prev.btc)/prev.btc : 0;
+  const solCh=prev.sol? (sol-prev.sol)/prev.sol : 0;
+  const score=Math.round(50 + btcCh*500 + solCh*300);
+  const risk=score>=55?"on":(score<=45?"off":"neutral");
+  const m={btc,sol,score:clamp(score,0,100),risk,at:Date.now()};
+  STATE.macro=m;
+  return m;
+}
+
+async function jupTradable(cfg,outputMint){
+  const u=new URL(cfg.jup_quote);
+  u.searchParams.set("inputMint",cfg.usdc_mint);
+  u.searchParams.set("outputMint",outputMint);
+  u.searchParams.set("amount",String(cfg.quote_amount_usdc));
+  u.searchParams.set("slippageBps","200");
+  const r=await fetchJson(u.toString(),9000);
+  if(!r.ok||!r.js) return {ok:false,reason:"JUP_HTTP_"+r.status};
+  const out=safeNum(r.js?.outAmount);
+  if(!out||out<=0) return {ok:false,reason:"NO_ROUTE"};
+  return {ok:true,outAmount:out,routeCount:(r.js?.routePlan||[]).length};
+}
+
+function updateMemory(MEM, row){
+  const mint=row.mint;
+  const m=MEM.mints[mint]||{n:0,liq_ewma:null,vol5_ewma:null,tx5_ewma:null,spread_ewma:null,route_ok_rate:0,cluster:row.cluster,last:null};
+  m.n++;
+  const a=0.12;
+  m.liq_ewma=ewma(m.liq_ewma,row.liq_usd||0,a);
+  m.vol5_ewma=ewma(m.vol5_ewma,row.vol5_usd||0,a);
+  m.tx5_ewma=ewma(m.tx5_ewma,row.tx5||0,a);
+  m.spread_ewma=ewma(m.spread_ewma,row.spread_est||0,a);
+  m.route_ok_rate=ewma(m.route_ok_rate,row.route_ok?1:0,0.10);
+  m.cluster=row.cluster;
+  m.last={ts:row.ts,px:row.px};
+  MEM.mints[mint]=m;
+
+  // cluster aggregates
+  const c=MEM.clusters[row.cluster]||{n:0,route_ok:0,spread:0,liq:0,vol5:0,tx5:0};
+  c.n++; c.route_ok+=row.route_ok?1:0; c.spread+=row.spread_est||0; c.liq+=row.liq_usd||0; c.vol5+=row.vol5_usd||0; c.tx5+=row.tx5||0;
+  MEM.clusters[row.cluster]=c;
+}
+
+function cycleSignals(MEM){
+  // (3) micro -> macro: stress/flow from live universe stats
+  const cl=MEM.clusters||{};
+  const out={};
+  let totN=0,routeOk=0,spreadSum=0,liqSum=0,vol5Sum=0,tx5Sum=0;
+  for(const k of Object.keys(cl)){
+    const c=cl[k]; if(!c||!c.n) continue;
+    totN+=c.n; routeOk+=c.route_ok; spreadSum+=c.spread; liqSum+=c.liq; vol5Sum+=c.vol5; tx5Sum+=c.tx5;
+  }
+  if(!totN) return null;
+  const routeRate=routeOk/totN;
+  const spreadAvg=spreadSum/totN;
+  const liqAvg=liqSum/totN;
+  const vol5Avg=vol5Sum/totN;
+  const tx5Avg=tx5Sum/totN;
+
+  // stress proxy: low route rate OR high spread
+  const stress=clamp((1-routeRate)*70 + (spreadAvg/0.05)*30,0,100);
+  // flow proxy: vol/tx vs liq
+  const flow=clamp((Math.log10(1+vol5Avg)+Math.log10(1+tx5Avg))*12 - Math.log10(1+liqAvg)*8 + 50,0,100);
+
+  return {routeRate,spreadAvg,liqAvg,vol5Avg,tx5Avg,stress,flow};
+}
+
+function portfolioGate(cfg,STATE,cluster){
+  // (4) portefeuille vivant: caps par cluster + max positions total
+  const pos=STATE.positions||{};
+  const keys=Object.keys(pos);
+  if(keys.length>=cfg.max_positions) return {ok:false,reason:"MAX_POS"};
+  const cap=cfg.cluster_caps?.[cluster] ?? 1;
+  const inC=keys.filter(k=>pos[k]?.cluster===cluster).length;
+  if(inC>=cap) return {ok:false,reason:"CLUSTER_CAP"};
+  return {ok:true};
+}
+
+async function callTraderOne(cfg,endpoint,body){
+  const tries=[cfg.traderone_api_local,cfg.traderone_api_public].filter(Boolean);
+  let last=null;
+  for(const base of tries){
+    try{
+      const url=base.replace(/\/$/,"")+endpoint;
+      const r=await fetch(url,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body||{})});
+      const txt=await r.text();
+      last={ok:r.ok,status:r.status,txt,base,url};
+      if(r.ok) return last;
+    }catch(e){
+      last={ok:false,status:0,txt:String(e),base};
+    }
+  }
+  return last||{ok:false,status:0,txt:"no_tries"};
+}
+
+async function tickMint(cfg,STATE,MEM,mint,macroState){
+  const dr=await fetchJson(cfg.dex_token+mint,9000);
+  if(!dr.ok||!dr.js) { append(cfg,{type:"err",where:"dex",mint,status:dr.status}); return; }
+  const best=pickBestPair(dr.js.pairs||[]);
+  if(!best){ append(cfg,{type:"err",where:"pairs",mint,reason:"no_pairs"}); return; }
+
+  const px=safeNum(best.priceUsd);
+  const liq=safeNum(best.liquidity?.usd)||0;
+  const vol5=safeNum(best.volume?.m5)||0;
+  const tx5=(best.txns?.m5?.buys||0)+(best.txns?.m5?.sells||0);
+  if(!px||px<=0){ append(cfg,{type:"err",where:"price",mint,reason:"no_price"}); return; }
+
+  const spread=spreadEst(liq);
+  const cluster=clusterOf(liq);
+
+  // (1) DISPONIBLE = JUP quote OK
+  const jq=await jupTradable(cfg,mint);
+  const route_ok=jq.ok;
+
+  const row={
+    ts:nowISO(),
+    type:"micro",
+    chain:"solana",
+    mint,
+    sym:(best.baseToken?.symbol||"").slice(0,12),
+    px,liq_usd:liq,vol5_usd:vol5,tx5,
+    spread_est:spread,
+    cluster,
+    route_ok,
+    route_count:jq.routeCount||0,
+    macro_risk:macroState?.risk||null
+  };
+
+  updateMemory(MEM,row);
+  append(cfg,row);
+
+  // zoneA logic (present)
+  const s=STATE.series?.[mint]||{px:[],pivot:null,lastSignal:null};
+  s.px.push(px); if(s.px.length>cfg.pivot_lookback) s.px.shift();
+  s.pivot=Math.max(...s.px);
+  const dd=pct(px,s.pivot);
+  STATE.series=STATE.series||{}; STATE.series[mint]=s;
+
+  const inZoneA=(dd!==null && dd>=cfg.zoneA_dd_min && dd<=cfg.zoneA_dd_max);
+  const okDoors = (liq>=cfg.min_liq_usd && vol5>=cfg.min_vol5_usd && tx5>=cfg.min_tx5 && spread<=cfg.max_spread_est);
+  const macroOK = (macroState?.risk!=="off");
+  const available = (route_ok===true);
+
+  // (2) “learning” minimal live: route_ok_rate from MEM governs aggressiveness
+  const mm=MEM.mints[mint];
+  const routeRate=mm?.route_ok_rate ?? 0;
+
+  // decide buy intent
+  if(inZoneA && okDoors && macroOK && available){
+    const gate=portfolioGate(cfg,STATE,cluster);
+    const reasons=["zoneA","doorsOK","macroOK","routeOK","cluster:"+cluster,"routeRate:"+routeRate.toFixed(2)];
+    append(cfg,{type:"signal",side:"buy",mint,px,dd,cluster,reason:reasons,execute_allowed:canExecute(cfg)});
+    if(canExecute(cfg) && gate.ok){
+      // record position intent
+      STATE.positions=STATE.positions||{};
+      STATE.positions[mint]={entry:px,at:Date.now(),cluster,dd0:dd};
+      const budget = cfg.base_budget_usd; // future: adapt by macro/cluster/stress
+      const res=await callTraderOne(cfg,"/start",{chain:"solana",mint,mode:"einshtein1234",budget_usd:budget});
+      append(cfg,{type:"exec",action:"start",mint,ok:res.ok,status:res.status,base:res.base||null});
+    } else if(canExecute(cfg) && !gate.ok){
+      append(cfg,{type:"exec_block",mint,reason:gate.reason});
+    }
+  }
+
+  // TP logic (simple)
+  const pos=STATE.positions?.[mint];
+  if(pos){
+    const up=pct(px,pos.entry);
+    if(up!==null){
+      if(up>=cfg.tp3){
+        append(cfg,{type:"signal",side:"sell",level:"tp3",mint,px,up,execute_allowed:canExecute(cfg)});
+        if(canExecute(cfg)){
+          const res=await callTraderOne(cfg,"/stop",{chain:"solana",mint,mode:"einshtein1234"});
+          append(cfg,{type:"exec",action:"stop",mint,ok:res.ok,status:res.status,base:res.base||null});
+        }
+        delete STATE.positions[mint];
+      }
+    }
+  }
+}
+
+async function universe(cfg){
+  const r=await fetchJson(cfg.dex_profiles_latest,12000);
+  if(!r.ok||!r.js) return [];
+  return r.js
+    .filter(x=>String(x.chainId).toLowerCase()==="solana" && x.tokenAddress)
+    .slice(0,cfg.universe_top||120)
+    .map(x=>x.tokenAddress);
+}
+
+async function loop(){
+  const cfg=jread(cfgPath,null);
+  if(!cfg) return;
+
+  // pivot lookback default
+  if(!cfg.pivot_lookback) cfg.pivot_lookback=40;
+
+  let STATE=jread(statePath,{series:{},positions:{},macro:null});
+  let MEM=jread(memPath,{mints:{},clusters:{},created:Date.now()});
+
+  // ARM/EXEC enforcement
+  const armed=fs.existsSync(armFlag);
+  const exec=fs.existsSync(execFlag);
+  const wantExec = Boolean(armed && exec);
+  if(cfg.execute_enabled!==wantExec){ cfg.execute_enabled=wantExec; jwrite(cfgPath,cfg); }
+
+  append(cfg,{type:"status",status:"einshtein-1234",armed,exec,execute_enabled:cfg.execute_enabled});
+
+  const mac=await macro(cfg,STATE);
+  if(mac) append(cfg,{type:"macro",btc:mac.btc,sol:mac.sol,risk:mac.risk,score:mac.score});
+
+  // universe = DS latest + watchlist merged (so your token is always tracked)
+  const wl=(jread(watchPath,{mints:[]}).mints||[]).filter(x=>typeof x==="string");
+  const uni=await universe(cfg);
+  const set=new Set([...wl,...uni]);
+
+  // reset cluster aggregates each loop (rolling snapshot)
+  MEM.clusters={};
+
+  for(const mint of set){
+    if(typeof mint==="string" && mint.length>20) await tickMint(cfg,STATE,MEM,mint,mac);
+  }
+
+  // (3) cycle anticipation output
+  const cyc=cycleSignals(MEM);
+  if(cyc) append(cfg,{type:"cycle",chain:"solana",...cyc,macro_risk:mac?.risk||null});
+
+  // persist
+  jwrite(statePath,STATE);
+  jwrite(memPath,MEM);
+}
+
+(function boot(){
+  const cfg=jread(cfgPath,null);
+  if(!cfg){ console.error("missing config"); process.exit(1); }
+  append(cfg,{type:"status",status:"einshtein-1234-start"});
+  const ms=cfg.poll_ms||20000;
+  setInterval(()=>loop().catch(e=>append(cfg,{type:"err",where:"loop",msg:String(e)})),ms);
+  loop().catch(e=>append(cfg,{type:"err",where:"boot",msg:String(e)}));
+})();
+JS
+
+say "== SYSTEMD service =="
+cat >"$SVC" <<EOF
+[Unit]
+Description=Einshtein Solana 1-2-3-4 (NDJSON + market memory + cycle + portfolio)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=$APP
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/node $APP/server.js
+Restart=always
+RestartSec=2
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+say "== ENABLE + RESTART =="
+systemctl daemon-reload
+systemctl enable --now einshtein-solana.service
 systemctl restart einshtein-solana.service
+
+say "== DONE =="
+say "NDJSON:  $ND"
+say "MEM:     $APP/market_memory.json"
+say "STATE:   $APP/state.json"
+say "ARM:     touch $ARM   (arms system)"
+say "EXEC:    touch $EXEC  (allows real /start /stop calls)"
+say "DISARM:  rm -f $ARM $EXEC"
+say "LOGS:    journalctl -u einshtein-solana -n 120 --no-pager"
+BASH
+
+chmod +x /root/MEGA_EINSHSTEIN_SOLANA_1234_V1.sh
+bash /root/MEGA_EINSHSTEIN_SOLANA_1234_V1.sh |& tee /root/MEGA_EINSHSTEIN_SOLANA_1234_V1.log
