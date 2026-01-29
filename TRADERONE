@@ -1,50 +1,132 @@
-cat >/root/FIX_WOLVERINE_API_PRIORITY.sh <<'BASH'
+cat >/root/MEGA_RESET_AQUILA_HUB_AND_ROUTES.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
+umask 022
 
-INC="/etc/nginx/includes/wolverine_api_priority.inc"
+say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
+
+TS="$(date +%Y%m%d_%H%M%S)"
+BK="/root/BK_AQUILA_RESET_$TS"
+mkdir -p "$BK"
+
 VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
+INC_DIR="/etc/nginx/includes"
+INC_PRI="$INC_DIR/wolverine_api_priority.inc"
 
-echo "== UNFREEZE =="
+APP="/opt/aquilatrader-hub"
+JS="$APP/server.js"
+SVC="/etc/systemd/system/aquilatrader-hub.service"
+
+say "Backup..."
+cp -a "$VHOST" "$BK/" 2>/dev/null || true
+cp -a "$INC_DIR" "$BK/includes" 2>/dev/null || true
+cp -a "$SVC" "$BK/" 2>/dev/null || true
+mkdir -p "$APP"
+cp -a "$JS" "$BK/server.js" 2>/dev/null || true
+
+say "Unfreeze nginx (best effort)..."
 chattr -i "$VHOST" 2>/dev/null || true
 chattr -i /etc/nginx/nginx.conf 2>/dev/null || true
-chattr -i /etc/nginx/includes/*.inc 2>/dev/null || true
+chattr -i "$INC_DIR"/*.inc 2>/dev/null || true
 
-echo "== WRITE PRIORITY API LOCATION =="
-cat >"$INC" <<'NGINX'
-# PRIORITY API ROUTING (MUST COME BEFORE /wolverine/ alias)
+say "Ensure Node..."
+if ! command -v node >/dev/null 2>&1; then
+  apt-get update -y
+  apt-get install -y ca-certificates curl
+  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+  apt-get install -y nodejs
+fi
+
+say "Write backend hub (hard reset)..."
+cat >"$JS" <<'JS'
+"use strict";
+const http=require("http"), url=require("url");
+const HOST="127.0.0.1", PORT=3000;
+
+function json(res,code,obj){
+  const b=Buffer.from(JSON.stringify(obj));
+  res.writeHead(code,{
+    "content-type":"application/json; charset=utf-8",
+    "cache-control":"no-store",
+    "content-length":String(b.length),
+  });
+  res.end(b);
+}
+
+const srv=http.createServer((req,res)=>{
+  const u=url.parse(req.url,true);
+  const p=u.pathname||"/";
+
+  if(p==="/api/health") return json(res,200,{ok:true,service:"aquilatrader-hub",part:"api"});
+  if(p==="/vault/health") return json(res,200,{ok:true,service:"aquilatrader-hub",part:"vault"});
+
+  if(req.method==="POST" && p==="/api/start") return json(res,200,{ok:true,action:"start",note:"pipeline-ok"});
+  if(req.method==="POST" && p==="/api/stop") return json(res,200,{ok:true,action:"stop",note:"pipeline-ok"});
+  if(req.method==="POST" && p==="/api/withdraw") return json(res,200,{ok:true,action:"withdraw",note:"pipeline-ok"});
+
+  return json(res,404,{ok:false,error:"NOT_FOUND",path:p,method:req.method});
+});
+
+srv.listen(PORT,HOST,()=>console.log("aquilatrader-hub listening on "+HOST+":"+PORT));
+JS
+chmod 755 "$JS"
+
+say "Write/refresh systemd..."
+cat >"$SVC" <<EOF
+[Unit]
+Description=AquilaTrader Hub API (API+VAULT)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=$APP
+ExecStart=$(command -v node) $JS
+Restart=always
+RestartSec=1
+User=root
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+say "Restart service..."
+systemctl daemon-reload
+systemctl enable aquilatrader-hub.service >/dev/null 2>&1 || true
+systemctl restart aquilatrader-hub.service
+
+say "Write PRIORITY nginx routing for /wolverine/traderone/ ..."
+cat >"$INC_PRI" <<'NGINX'
+# PRIORITY API ROUTING V2 (FORCE /wolverine/traderone/* -> 127.0.0.1:3000)
 location ^~ /wolverine/traderone/ {
     proxy_pass http://127.0.0.1:3000/;
     proxy_http_version 1.1;
-
     proxy_set_header Host $host;
     proxy_set_header X-Real-IP $remote_addr;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-
     proxy_pass_request_body on;
-    proxy_set_header Content-Length $content_length;
-
     add_header Cache-Control "no-store" always;
 }
 NGINX
-chmod 644 "$INC"
+chmod 644 "$INC_PRI"
 
-echo "== ENSURE include is FIRST inside server {} =="
-# remove any previous inclusion
+say "Ensure include is FIRST inside server {}..."
 sed -i '\|wolverine_api_priority\.inc|d' "$VHOST"
-# inject right after server {
 sed -i '/server\s*{/a\    include /etc/nginx/includes/wolverine_api_priority.inc;' "$VHOST"
 
-echo "== TEST + RELOAD =="
+say "Reload nginx..."
 nginx -t
 systemctl reload nginx
 
-echo "== REFREEZE =="
+say "Refreeze nginx core files (best effort)..."
 chattr +i "$VHOST" 2>/dev/null || true
 chattr +i /etc/nginx/nginx.conf 2>/dev/null || true
 
-echo "== DONE: API PRIORITY FIXED =="
+say "DONE -> try:"
+say "  https://fireinners.online/wolverine/traderone/api/health"
+say "  https://fireinners.online/wolverine/traderone/vault/health"
+say "Backup: $BK"
 BASH
 
-chmod +x /root/FIX_WOLVERINE_API_PRIORITY.sh
-bash /root/FIX_WOLVERINE_API_PRIORITY.sh |& tee /root/FIX_WOLVERINE_API_PRIORITY.log
+chmod +x /root/MEGA_RESET_AQUILA_HUB_AND_ROUTES.sh
+bash /root/MEGA_RESET_AQUILA_HUB_AND_ROUTES.sh |& tee /root/MEGA_RESET_AQUILA_HUB_AND_ROUTES.log
