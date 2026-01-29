@@ -1,1 +1,366 @@
-bash /root/FIX_NDJSON_FORCE_ALL_SERVERS.sh |& tee /root/FIX_NDJSON_FORCE_ALL_SERVERS.log
+cat >/root/MEGA_EINSHSTEIN_SOLANA_LIVE_V1.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+umask 022
+export DEBIAN_FRONTEND=noninteractive
+
+TS="$(date +%Y%m%d_%H%M%S)"
+BK="/root/BK_EINSHSTEIN_SOLANA_${TS}"
+mkdir -p "$BK"
+
+say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
+die(){ say "ERROR: $*"; exit 1; }
+
+REQ(){ command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"; }
+
+say "== PRECHECK =="
+REQ bash
+REQ nginx
+REQ node
+REQ npm
+REQ systemctl
+REQ curl
+
+VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
+INC_DIR="/etc/nginx/includes"
+INC_FILE="$INC_DIR/einshtein_sol.inc"
+
+APP_DIR="/opt/einshtein-solana"
+DATA_DIR="/var/www/ndjson_data"
+NDJSON_FILE="$DATA_DIR/events.ndjson"
+WATCH="$APP_DIR/watchlist.json"
+CFG="$APP_DIR/config.json"
+ARM_FLAG="$APP_DIR/ARM_ON"
+SVC="/etc/systemd/system/einshtein-solana.service"
+
+say "== BACKUP =="
+cp -a "$VHOST" "$BK/$(basename "$VHOST")" 2>/dev/null || true
+cp -a /etc/nginx/nginx.conf "$BK/nginx.conf" 2>/dev/null || true
+mkdir -p "$BK/includes" && cp -a "$INC_DIR"/*.inc "$BK/includes/" 2>/dev/null || true
+mkdir -p "$BK/app" && cp -a "$APP_DIR" "$BK/app/" 2>/dev/null || true
+mkdir -p "$BK/www" && cp -a "$DATA_DIR" "$BK/www/" 2>/dev/null || true
+
+say "== UNFREEZE nginx (best effort) =="
+chattr -i /etc/nginx/nginx.conf 2>/dev/null || true
+chattr -i "$VHOST" 2>/dev/null || true
+chattr -i "$INC_DIR"/*.inc 2>/dev/null || true
+
+say "== DIRS =="
+mkdir -p "$INC_DIR" "$APP_DIR" "$DATA_DIR"
+chmod 755 "$APP_DIR" "$DATA_DIR"
+
+say "== WRITE default watchlist (idempotent) =="
+if [ ! -f "$WATCH" ]; then
+  cat >"$WATCH" <<'JSON'
+{
+  "mints": [
+    "AhSGcUDNK2MKkWQe4Mz7rCPSyTJNxvtGCTuJnpUjpump"
+  ]
+}
+JSON
+fi
+
+say "== WRITE default config (idempotent) =="
+if [ ! -f "$CFG" ]; then
+  cat >"$CFG" <<'JSON'
+{
+  "chain": "solana",
+  "poll_ms": 20000,
+  "zoneA_dd_min": -0.15,
+  "zoneA_dd_max": -0.08,
+  "tp1": 0.06,
+  "tp2": 0.09,
+  "tp3": 0.12,
+  "min_liq_usd": 5000,
+  "max_spread": 0.05,
+  "pivot_lookback": 40,
+  "ndjson_path": "/var/www/ndjson_data/events.ndjson",
+  "coingecko": { "simple": "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,solana&vs_currencies=usd" },
+  "dexscreener": { "token": "https://api.dexscreener.com/latest/dex/tokens/" },
+  "traderone_api_local": "http://127.0.0.1:3000",
+  "traderone_api_public": "https://fireinners.online/wolverine/traderone/api",
+  "execute_enabled": false
+}
+JSON
+fi
+
+say "== INIT NDJSON file =="
+touch "$NDJSON_FILE"
+chmod 644 "$NDJSON_FILE"
+
+say "== WRITE app (server.js) =="
+cat >"$APP_DIR/server.js" <<'JS'
+"use strict";
+const fs=require("fs"),path=require("path");
+const cfgPath=process.env.CFG||"/opt/einshtein-solana/config.json";
+const watchPath=process.env.WATCH||"/opt/einshtein-solana/watchlist.json";
+const armFlag=process.env.ARM||"/opt/einshtein-solana/ARM_ON";
+function nowISO(){return new Date().toISOString();}
+function jread(p,fb){try{return JSON.parse(fs.readFileSync(p,"utf8"));}catch(e){return fb;}}
+function jwrite(p,o){fs.writeFileSync(p,JSON.stringify(o,null,2));}
+const statePath="/opt/einshtein-solana/state.json";
+let CFG=jread(cfgPath,null); if(!CFG) throw new Error("Missing config.json");
+let STATE=jread(statePath,{m:{}});
+function appendND(obj){
+  const line=JSON.stringify(Object.assign({ts:nowISO()},obj))+"\n";
+  try{fs.appendFileSync(CFG.ndjson_path,line,{encoding:"utf8"});}catch(e){}
+}
+async function fetchJson(url,timeoutMs=8000){
+  const ac=new AbortController(); const t=setTimeout(()=>ac.abort(),timeoutMs);
+  try{
+    const r=await fetch(url,{signal:ac.signal,headers:{"user-agent":"einshtein-solana/1.0"}});
+    const txt=await r.text();
+    let js=null; try{js=JSON.parse(txt);}catch(e){}
+    return {ok:r.ok,status:r.status,js,txt};
+  } finally { clearTimeout(t); }
+}
+function clamp(n,a,b){return Math.max(a,Math.min(b,n));}
+function pct(a,b){ if(!isFinite(a)||!isFinite(b)||b===0) return null; return (a-b)/b; }
+function safeNum(x){ const n=Number(x); return isFinite(n)?n:null; }
+
+function estimateSpread(pair){
+  // Dexscreener n'expose pas toujours bid/ask; on approx via priceChange ou via liquidity/vol proxy.
+  // On garde simple: spread estimé = min(max_spread, 0.5% + 2%*(1 - liqFactor))
+  const liq=safeNum(pair?.liquidity?.usd)||0;
+  const liqFactor=clamp(liq/50000,0,1);
+  const est=0.005 + 0.02*(1-liqFactor);
+  return est;
+}
+
+async function macro(){
+  const r=await fetchJson(CFG.coingecko.simple,8000);
+  if(!r.ok||!r.js) return {ok:false};
+  const btc=safeNum(r.js?.bitcoin?.usd);
+  const sol=safeNum(r.js?.solana?.usd);
+  if(!btc||!sol) return {ok:false};
+  // trend ultra-simple: compare vs last snapshot (STATE.macro)
+  const prev=STATE.macro||{};
+  const btcCh=prev.btc? (btc-prev.btc)/prev.btc : 0;
+  const solCh=prev.sol? (sol-prev.sol)/prev.sol : 0;
+  const score=Math.round(50 + (btcCh*500) + (solCh*300)); // sensitivités
+  const risk=score>=55?"on":(score<=45?"off":"neutral");
+  STATE.macro={btc,sol,score:risk==="on"?Math.min(100,score):Math.max(0,score),risk,at:Date.now()};
+  return {ok:true,btc,sol,score:STATE.macro.score,risk};
+}
+
+function pivotUpdate(mint,px){
+  const m=STATE.m[mint]||{px:[],pos:null,lastSignal:null};
+  m.px.push(px);
+  if(m.px.length>CFG.pivot_lookback) m.px.shift();
+  const pivot=Math.max(...m.px);
+  m.pivot=pivot;
+  STATE.m[mint]=m;
+  return m;
+}
+
+function canExecute(){
+  // ARM file gates execution + config execute_enabled true
+  const armed=fs.existsSync(armFlag);
+  return Boolean(armed && CFG.execute_enabled);
+}
+
+async function callTraderOne(endpoint,body){
+  // Try local then public
+  const tries=[CFG.traderone_api_local,CFG.traderone_api_public].filter(Boolean);
+  let last=null;
+  for(const base of tries){
+    try{
+      const url=base.replace(/\/$/,"")+endpoint;
+      const r=await fetch(url,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body||{})});
+      const txt=await r.text();
+      last={ok:r.ok,status:r.status,txt,base,url};
+      if(r.ok) return last;
+    }catch(e){
+      last={ok:false,status:0,txt:String(e),base};
+    }
+  }
+  return last||{ok:false,status:0,txt:"no-tries"};
+}
+
+function decide(mint,info,macroState){
+  const m=STATE.m[mint];
+  const px=info.px, liq=info.liq, vol=info.vol, spread=info.spread;
+  const dd=pct(px,m.pivot); // (px - pivot)/pivot (negative if drawdown)
+  const inZoneA=(dd!==null && dd>=CFG.zoneA_dd_min && dd<=CFG.zoneA_dd_max);
+  const liqOK=(liq===null?false:liq>=CFG.min_liq_usd);
+  const spreadOK=(spread===null?false:spread<=CFG.max_spread);
+  const macroRisk=macroState?.risk||"unknown";
+  const macroOK=(macroRisk!=="off"); // simple rule
+  const reasons=[];
+  if(inZoneA) reasons.push("zoneA");
+  if(liqOK) reasons.push("liqOK"); else reasons.push("liqLOW");
+  if(spreadOK) reasons.push("spreadOK"); else reasons.push("spreadHIGH");
+  if(macroOK) reasons.push("macroOK"); else reasons.push("macroOFF");
+
+  // SELL logic if we have an open pos
+  let pos=m.pos;
+  if(pos){
+    const up=pct(px,pos.entry);
+    const hit1=up!==null && up>=CFG.tp1;
+    const hit2=up!==null && up>=CFG.tp2;
+    const hit3=up!==null && up>=CFG.tp3;
+    if(hit3) return {signal:"sell",level:"tp3",up,dd,px,reasons:["tp3",macroRisk]};
+    if(hit2) return {signal:"sell",level:"tp2",up,dd,px,reasons:["tp2",macroRisk]};
+    if(hit1) return {signal:"sell",level:"tp1",up,dd,px,reasons:["tp1",macroRisk]};
+  }
+
+  // BUY signal
+  if(inZoneA && liqOK && spreadOK){
+    // if macro off -> reduce/skip, here we still allow signal but with caution
+    return {signal:"buy",dd,px,reasons};
+  }
+  return {signal:null,dd,px,reasons};
+}
+
+async function tickMint(mint,macroState){
+  const r=await fetchJson(CFG.dexscreener.token+mint,9000);
+  if(!r.ok||!r.js) { appendND({type:"err",where:"dexscreener",mint,status:r.status}); return; }
+  const pairs=r.js.pairs||[];
+  // pick best pair: highest liquidity.usd
+  let best=null, bestL=0;
+  for(const p of pairs){
+    const liq=safeNum(p?.liquidity?.usd)||0;
+    if(liq>bestL){bestL=liq;best=p;}
+  }
+  if(!best){ appendND({type:"err",where:"pairs",mint,reason:"no_pairs"}); return; }
+
+  const px=safeNum(best?.priceUsd);
+  const liq=safeNum(best?.liquidity?.usd);
+  const vol=safeNum(best?.volume?.h24);
+  const spread=estimateSpread(best);
+  if(!px){ appendND({type:"err",where:"price",mint,reason:"no_price"}); return; }
+
+  const m=pivotUpdate(mint,px);
+  const dd=pct(px,m.pivot);
+  appendND({type:"price",chain:"solana",mint,px,liq_usd:liq,vol24:vol,pivot:m.pivot,dd,spread_est:spread,macro:(macroState?.risk||null)});
+
+  const d=decide(mint,{px,liq,vol,spread},macroState);
+  if(d.signal){
+    // de-dup: avoid repeating same signal too often
+    const k=d.signal+":"+(d.level||"");
+    const last=m.lastSignal||{k:null,t:0};
+    const now=Date.now();
+    if(last.k===k && (now-last.t)<(CFG.poll_ms*3)) return;
+
+    m.lastSignal={k,t:now};
+    STATE.m[mint]=m;
+
+    appendND({type:"signal",side:d.signal,level:d.level||null,chain:"solana",mint,px:d.px,dd:d.dd,reason:d.reasons,execute_allowed:canExecute()});
+
+    // execution (gated)
+    if(canExecute()){
+      if(d.signal==="buy"){
+        // record pos locally first (optimistic; real fill handled by TraderOne)
+        m.pos={entry:d.px,at:now};
+        STATE.m[mint]=m;
+        // call start endpoint (TraderOne decides actual routing)
+        const res=await callTraderOne("/start",{chain:"solana",mint,mode:"einshtein",budget_usd:50});
+        appendND({type:"exec",action:"start",mint,ok:res.ok,status:res.status,base:res.base||null});
+      } else if(d.signal==="sell"){
+        // call stop/withdraw depending strategy; here stop then withdraw is safer (but we only stop by default)
+        const res=await callTraderOne("/stop",{chain:"solana",mint,mode:"einshtein"});
+        appendND({type:"exec",action:"stop",mint,ok:res.ok,status:res.status,base:res.base||null});
+        // clear pos locally
+        m.pos=null; STATE.m[mint]=m;
+      }
+    }
+  }
+}
+
+async function loop(){
+  try{
+    CFG=jread(cfgPath,CFG);
+    // sync execute_enabled with ARM existence (hard gate)
+    const armed=fs.existsSync(armFlag);
+    if(armed && !CFG.execute_enabled){ CFG.execute_enabled=true; jwrite(cfgPath,CFG); }
+    if(!armed && CFG.execute_enabled){ CFG.execute_enabled=false; jwrite(cfgPath,CFG); }
+
+    const wl=jread(watchPath,{mints:[]}).mints||[];
+    const mac=await macro();
+    if(mac.ok) appendND({type:"macro",btc:mac.btc,sol:mac.sol,risk:mac.risk,score:mac.score});
+    for(const mint of wl){
+      if(typeof mint==="string" && mint.length>20) await tickMint(mint,mac.ok?mac:null);
+    }
+    fs.writeFileSync(statePath,JSON.stringify(STATE,null,2));
+  } catch(e){
+    appendND({type:"err",where:"loop",msg:String(e)});
+  }
+}
+appendND({type:"status",status:"einshtein-solana-start"});
+setInterval(loop,CFG.poll_ms||20000);
+loop();
+JS
+
+say "== WRITE systemd service =="
+cat >"$SVC" <<EOF
+[Unit]
+Description=Einshtein Solana Live (NDJSON + optional TraderOne exec gated by ARM_ON)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=$APP_DIR
+Environment=NODE_ENV=production
+Environment=CFG=$CFG
+Environment=WATCH=$WATCH
+Environment=ARM=$ARM_FLAG
+ExecStart=/usr/bin/node $APP_DIR/server.js
+Restart=always
+RestartSec=2
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+say "== NGINX include for /ndjson and /data alias (safe, idempotent) =="
+# Viewer UI served from /var/www/ndjson (if you already have it, we keep it)
+if [ ! -d /var/www/ndjson ]; then
+  mkdir -p /var/www/ndjson
+  cat >/var/www/ndjson/index.html <<'HTML'
+<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>NDJSON LIVE</title><style>html,body{margin:0;background:#0b0f14;color:#bfe9b9;font:16px/1.4 ui-monospace,Menlo,Consolas,monospace}pre{padding:16px;white-space:pre-wrap;word-break:break-word}h1{margin:0;padding:16px;color:#38ff4a}</style><h1>NDJSON LIVE</h1><pre id="p">loading…</pre><script>
+const P=document.getElementById("p");async function f(){try{const r=await fetch("/data/events.ndjson?ts="+Date.now(),{cache:"no-store"});const t=await r.text();const lines=t.trim().split("\n").slice(-30).join("\n");P.textContent=lines||"(empty)";}catch(e){P.textContent="ERR "+e;}}setInterval(f,1500);f();
+</script>
+HTML
+  chmod 644 /var/www/ndjson/index.html
+fi
+
+cat >"$INC_FILE" <<'NGINX'
+# Einshtein NDJSON UI + data alias
+location = /ndjson { return 301 /ndjson/; }
+location ^~ /ndjson/ { alias /var/www/ndjson/; try_files $uri $uri/ /ndjson/index.html; add_header Cache-Control "no-store" always; }
+location = /data { return 301 /data/; }
+location ^~ /data/ { alias /var/www/ndjson_data/; try_files $uri =404; add_header Cache-Control "no-store" always; }
+NGINX
+chmod 644 "$INC_FILE"
+
+say "== ENSURE include is inside server{} of vhost (idempotent) =="
+grep -q "include $INC_FILE;" "$VHOST" 2>/dev/null || {
+  # inject after first 'server {'
+  sed -i "0,/server[[:space:]]*{/{s/server[[:space:]]*{/server {\\n    include $INC_FILE;\\n/}" "$VHOST"
+}
+
+say "== NGINX test + reload =="
+nginx -t
+systemctl reload nginx
+
+say "== SYSTEMD enable + restart =="
+systemctl daemon-reload
+systemctl enable --now einshtein-solana.service
+systemctl restart einshtein-solana.service
+
+say "== REFREEZE nginx (best effort) =="
+chattr +i /etc/nginx/nginx.conf 2>/dev/null || true
+chattr +i "$VHOST" 2>/dev/null || true
+
+say "== DONE =="
+say "UI:    https://fireinners.online/ndjson/"
+say "DATA:  https://fireinners.online/data/events.ndjson"
+say "APP:   $APP_DIR  (watchlist.json, config.json, ARM_ON gate)"
+say "ARM:   touch $ARM_FLAG  (enables exec) ; rm -f $ARM_FLAG (observer only)"
+say "Logs:  journalctl -u einshtein-solana -n 200 --no-pager"
+BASH
+
+chmod +x /root/MEGA_EINSHSTEIN_SOLANA_LIVE_V1.sh
+bash /root/MEGA_EINSHSTEIN_SOLANA_LIVE_V1.sh |& tee /root/MEGA_EINSHSTEIN_SOLANA_LIVE_V1.log
