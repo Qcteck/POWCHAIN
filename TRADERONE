@@ -1,2 +1,113 @@
-curl -s https://fireinners.online/wolverine/traderone/api/health >/dev/null || true
-curl -s https://fireinners.online/wolverine/traderone/vault/health >/dev/null || true
+cat >/root/MEGA_NDJSON_FIREINNERS_FIX_V2.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+umask 022
+TS="$(date +%Y%m%d_%H%M%S)"
+say(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
+die(){ say "ERROR: $*"; exit 1; }
+
+VHOST="/etc/nginx/sites-available/fireinners.online-ssl"
+INC_DIR="/etc/nginx/includes"
+INC="$INC_DIR/ndjson_fireinners.inc"
+WWW_UI="/var/www/ndjson"
+WWW_DATA="/var/www/ndjson_data"
+TEST_ND="$WWW_DATA/events.ndjson"
+BK="/root/BK_NDJSON_FIX_${TS}"
+
+say "Backup -> $BK"
+mkdir -p "$BK"
+cp -a "$VHOST" "$BK/$(basename "$VHOST")" 2>/dev/null || true
+cp -a /etc/nginx/nginx.conf "$BK/nginx.conf" 2>/dev/null || true
+cp -a "$INC_DIR" "$BK/includes" 2>/dev/null || true
+
+say "Unfreeze nginx (best-effort chattr -i)"
+chattr -i /etc/nginx/nginx.conf 2>/dev/null || true
+chattr -i "$VHOST" 2>/dev/null || true
+chattr -i "$INC_DIR"/*.inc 2>/dev/null || true
+
+say "Prepare dirs/files"
+mkdir -p "$INC_DIR" "$WWW_UI" "$WWW_DATA"
+chmod 755 "$WWW_UI" "$WWW_DATA"
+
+if [ ! -s "$WWW_UI/index.html" ]; then
+  cat >"$WWW_UI/index.html" <<'HTML'
+<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>NDJSON</title></head><body style="margin:0;background:#0b0f14;color:#e7eef7;font:14px system-ui"><div style="max-width:900px;margin:40px auto;padding:16px;border:1px solid #1e2a3f;border-radius:12px;background:#0f1520"><h2 style="margin:0 0 8px">NDJSON Viewer</h2><p style="margin:0 0 12px;opacity:.8">URL NDJSON: <code>/data/events.ndjson</code></p><p style="margin:0">Si tu vois cette page, /ndjson/ est servi correctement ✅</p></div></body></html>
+HTML
+fi
+
+touch "$TEST_ND"
+# append une ligne test si fichier vide
+if [ ! -s "$TEST_ND" ]; then
+  printf '{"ts":"%s","src":"ndjson","event":"init","ok":true}\n' "$(date -Is)" >>"$TEST_ND"
+fi
+chmod 644 "$TEST_ND" || true
+
+say "Write include: $INC"
+cat >"$INC" <<'NGINX'
+# --- NDJSON UI + DATA (Fireinners) ---
+# Safari/mobile safety: force trailing slash
+location = /ndjson { return 301 /ndjson/; }
+location = /data  { return 301 /data/; }
+
+# UI
+location ^~ /ndjson/ {
+  alias /var/www/ndjson/;
+  index index.html;
+  try_files $uri $uri/ /ndjson/index.html;
+  add_header Cache-Control "no-store" always;
+}
+
+# NDJSON data
+location ^~ /data/ {
+  alias /var/www/ndjson_data/;
+  add_header Cache-Control "no-store" always;
+  autoindex off;
+}
+NGINX
+chmod 644 "$INC"
+
+[ -f "$VHOST" ] || die "VHOST introuvable: $VHOST"
+
+say "Ensure include is inside server{} of $VHOST (idempotent)"
+# 1) supprime toute ancienne ligne include ndjson_fireinners.inc
+sed -i '\|include[[:space:]]\+etc/nginx/includes/ndjson_fireinners\.inc;|d' "$VHOST"
+
+# 2) injecte juste après l'ouverture du premier server { (dans ce vhost)
+#    (ça garantit que les 'location =' et 'location ^~' sont bien dans server{})
+awk -v inc="    include etc/nginx/includes/ndjson_fireinners.inc;" '
+BEGIN{done=0}
+{
+  print
+  if(!done && $0 ~ /^[[:space:]]*server[[:space:]]*\{[[:space:]]*$/){
+    print inc
+    done=1
+  }
+}
+END{
+  if(!done){ exit 2 }
+}' "$VHOST" >"$VHOST.tmp" || die "Injection awk a échoué"
+mv "$VHOST.tmp" "$VHOST"
+
+say "Test + reload nginx"
+nginx -t
+systemctl reload nginx
+
+say "Refreeze nginx (best-effort chattr +i)"
+chattr +i "$VHOST" 2>/dev/null || true
+chattr +i /etc/nginx/nginx.conf 2>/dev/null || true
+
+say "Quick tests (server-side)"
+echo "== curl /ndjson (headers) =="
+curl -sI https://fireinners.online/ndjson | head -n 20 || true
+echo "== curl /ndjson/ (status line) =="
+curl -sI https://fireinners.online/ndjson/ | head -n 5 || true
+echo "== curl /data/events.ndjson (first lines) =="
+curl -s https://fireinners.online/data/events.ndjson | head -n 5 || true
+
+say "DONE."
+say "UI:   https://fireinners.online/ndjson/"
+say "DATA: https://fireinners.online/data/events.ndjson"
+say "Backup: $BK"
+BASH
+
+bash /root/MEGA_NDJSON_FIREINNERS_FIX_V2.sh |& tee /root/MEGA_NDJSON_FIREINNERS_FIX_V2.log
